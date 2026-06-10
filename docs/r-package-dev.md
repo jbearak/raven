@@ -79,24 +79,28 @@ If the DESCRIPTION does not declare testthat, no implicit attachment happens —
 the diagnostic stays as "undefined variable" until the user either adds
 `Suggests: testthat` (the conventional fix) or adds an explicit `library(testthat)`.
 
-#### Helper files (`tests/testthat/helper*.R`)
+#### Helper and setup files (`tests/testthat/helper*.R`, `setup*.R`)
 
-`testthat::source_test_helpers` sources files matching `^helper.*\.[Rr]$`
-in `sort()` order before each test runs. Raven mirrors this:
+Before any test runs, `testthat::source_test_helpers` sources files matching
+`^helper.*\.[Rr]$` in `sort()` order, and then `source_test_setup` sources
+files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
 
-- Top-level definitions in any `tests/testthat/helper*.R` file are visible
-  from `test-*.R` (and other non-helper test files), because by the time a
-  test runs all helpers have been sourced.
-- Between helpers, visibility follows sourcing order: a helper sees
-  earlier-sorted peers but not later ones. For example, `helper-b.R`
-  sees `helper-a.R`'s top-level defs, but `helper-a.R` does NOT see
-  `helper-b.R`'s — `helper-b.R` is sourced strictly later.
-- Helpers are matched by filename only at the top level of
+- Top-level definitions in any `tests/testthat/helper*.R` or `setup*.R` file
+  are visible from `test-*.R` (and other non-helper/setup test files),
+  because by the time a test runs all helper and setup files have been
+  sourced. For example, a setup file defining `CLEAN <- SETUP <- FALSE` makes
+  both `CLEAN` and `SETUP` visible to every test file.
+- Between helper/setup files, visibility follows sourcing order: a file sees
+  earlier-sourced peers but not later ones. Helpers are sourced before setup
+  files, and each group in `sort()` order — so `helper-b.R` sees
+  `helper-a.R`'s top-level defs but not `helper-c.R`'s, and every setup file
+  sees all helpers.
+- Helper/setup files are matched by filename only at the top level of
   `tests/testthat/`; files in subdirectories (e.g.
   `tests/testthat/sub/helper-x.R`) are not auto-sourced by testthat and
   are NOT treated as helpers here either.
-- Helper defs never propagate into `R/` (the one-way visibility into `R/`
-  stays asymmetric).
+- Helper/setup defs never propagate into `R/` (the one-way visibility into
+  `R/` stays asymmetric).
 
 ```r
 # tests/testthat/helper-fixtures.R
@@ -108,8 +112,8 @@ test_that("works on demo_input", {
 })
 ```
 
-Setup files (`setup-*.R`, `teardown-*.R`) are not currently treated as helpers
-for visibility purposes; declare any cross-file fixtures in `helper*.R`.
+Teardown files (`teardown*.R`) run only after all tests have finished, so
+their top-level bindings are never visible to test code and are not injected.
 
 ### Dev-context directories (`demo/`, `data-raw/`, `vignettes/`, `man/`)
 

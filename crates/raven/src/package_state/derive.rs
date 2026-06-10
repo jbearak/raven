@@ -68,9 +68,10 @@ fn build_scope_contribution(
     // driven by the canonical `RFileKind` classification carried in
     // `RFileFacts`, not by a path-prefix check.
     //
-    // test_helper_symbols: union of top_level_defs from `tests/testthat/helper-*.R`
-    // (kind == Test AND filename starts with "helper"), keyed by file path so
-    // the scope-injection layer can skip a helper's own self-injection.
+    // test_helper_symbols: union of top_level_defs from test-preamble files
+    // (`tests/testthat/helper*.R` and `setup*.R` — kind == Test AND filename
+    // starts with "helper" or "setup"), keyed by file path so the
+    // scope-injection layer can skip a preamble file's own self-injection.
     // Visible to peer test files; never injected into R/.
     //
     // Known limitation (matches `r_internal_symbols`): both sets are built
@@ -98,26 +99,27 @@ fn build_scope_contribution(
                 }
             }
             RFileKind::Test => {
-                // Helpers must be direct children of `tests/testthat/` —
-                // `testthat::source_test_helpers` uses non-recursive
-                // `dir(path, pattern = "^helper.*\\.[Rr]$")`, so files in
+                // Preamble files must be direct children of `tests/testthat/`
+                // — `testthat::source_test_helpers` / `source_test_setup` use
+                // non-recursive `dir(path, pattern = "^helper.*\\.[Rr]$")` /
+                // `dir(path, pattern = "^setup.*\\.[Rr]$")`, so files in
                 // subdirectories (e.g. `tests/testthat/sub/helper-x.R`)
-                // are never auto-sourced. Treating them as helpers here
+                // are never auto-sourced. Treating them as preamble here
                 // would silently mute legitimate undefined-variable
                 // diagnostics for any symbol they define.
                 let direct_child = ws.root.join("tests").join("testthat");
                 let is_direct_child_of_testthat = path.parent() == Some(direct_child.as_path());
-                let is_helper = is_direct_child_of_testthat
+                let is_preamble = is_direct_child_of_testthat
                     && path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map(super::is_test_helper_filename)
+                        .map(super::is_test_preamble_filename)
                         .unwrap_or(false);
-                if is_helper {
-                    // Reuse the helper's `top_level_defs` `Arc` rather than
-                    // cloning into a fresh set — keeps `derive_package_state`
-                    // O(helper-file count) on the cached path instead of
-                    // O(total helper defs).
+                if is_preamble {
+                    // Reuse the preamble file's `top_level_defs` `Arc` rather
+                    // than cloning into a fresh set — keeps
+                    // `derive_package_state` O(preamble-file count) on the
+                    // cached path instead of O(total preamble defs).
                     test_helper_symbols.insert(path.clone(), facts.top_level_defs.clone());
                 }
             }
@@ -1014,6 +1016,51 @@ foo <- function() 1
                 .r_internal_symbols
                 .contains("test_local")
         );
+    }
+
+    /// testthat sources `setup*.R` files (`^setup.*\.[rR]$`) before any test
+    /// runs, so their top-level bindings are visible to test files exactly
+    /// like helper defs. Real-world FP this guards against: googledrive's
+    /// `tests/testthat/setup-testing.R` line 1 is `CLEAN <- SETUP <- FALSE`,
+    /// referenced by 17 `test-*.R` files — without setup recognition Raven
+    /// emitted 34 "Undefined variable: CLEAN/SETUP" diagnostics.
+    #[test]
+    fn scope_contribution_collects_setup_top_level_defs() {
+        let setup_path: PathBuf = "/work/pkg/tests/testthat/setup-testing.R".into();
+        let setup_text: Arc<str> = "CLEAN <- SETUP <- FALSE\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            setup_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: setup_text.clone(),
+                content_digest: ContentDigest::of(&setup_text),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        for sym in ["CLEAN", "SETUP"] {
+            assert!(
+                s.scope_contribution
+                    .test_helper_symbols
+                    .values()
+                    .any(|syms| syms.contains(sym)),
+                "setup-file top-level def `{sym}` must populate test_helper_symbols: {:?}",
+                s.scope_contribution.test_helper_symbols,
+            );
+            // Setup defs never leak into R/ (one-way visibility stays
+            // asymmetric, same as helpers).
+            assert!(
+                !s.scope_contribution.r_internal_symbols.contains(sym),
+                "setup-file def `{sym}` must NOT enter r_internal_symbols",
+            );
+        }
     }
 
     /// Multiple helper files contribute their union — peer helpers see each

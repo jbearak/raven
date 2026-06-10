@@ -1370,6 +1370,25 @@ impl PackageLibrary {
                         }
                     }
                 }
+
+                // Step 3c: Embedded dataset floor (issue #276). INDEX entries
+                // are help *topics*, and a multi-object topic hides the
+                // individual objects it documents (`state` covers state.x77 /
+                // state.region / ..., `stackloss` covers stack.x / stack.loss).
+                // The embedded base table shipped with Raven carries the
+                // accurate per-object list, so union it in as a floor; the
+                // disk-derived names above still merge on top.
+                if let Some(embedded) = crate::package_db::embedded_base::packages()
+                    .iter()
+                    .find(|p| p.name == *package && !p.datasets.is_empty())
+                {
+                    for sym in embedded.datasets {
+                        if is_attached_base {
+                            all_base_exports.insert((*sym).to_string());
+                        }
+                        pkg_exports.insert((*sym).to_string());
+                    }
+                }
             }
         }
 
@@ -3164,6 +3183,88 @@ mod tests {
                 name,
                 lib.lib_paths(),
                 lib.base_exports().len(),
+            );
+        }
+    }
+
+    /// Regression test for issue #276: INDEX *topics* under-enumerate
+    /// multi-object datasets.
+    ///
+    /// When `datasets` bundles its data into `Rdata.rdb`, `initialize()` falls
+    /// back to INDEX help topics — but a topic like `state` covers several
+    /// objects (`state.x77`, `state.region`, `state.abb`, ...) and `stackloss`
+    /// covers `stack.x` / `stack.loss`. The embedded base table shipped with
+    /// Raven carries the accurate per-object list, so the installed path must
+    /// union it in as a floor under the disk-derived names.
+    #[tokio::test]
+    async fn test_initialize_unions_embedded_datasets_under_index_topics() {
+        let lib_root = tempfile::tempdir().unwrap();
+
+        for pkg in [
+            "base",
+            "methods",
+            "utils",
+            "grDevices",
+            "graphics",
+            "stats",
+            "datasets",
+        ] {
+            let dir = lib_root.path().join(pkg);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("DESCRIPTION"),
+                format!("Package: {}\nVersion: 4.6.0\nPriority: base\n", pkg),
+            )
+            .unwrap();
+            if pkg != "base" {
+                std::fs::write(
+                    dir.join("NAMESPACE"),
+                    "# minimal NAMESPACE for fake-library test\n",
+                )
+                .unwrap();
+            }
+        }
+
+        // Like a real install: data bundled into Rdata.rdb, so enumeration
+        // falls back to INDEX topics — which list `state` and `stackloss`
+        // rather than the individual objects they document.
+        let datasets_dir = lib_root.path().join("datasets");
+        let data_dir = datasets_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            datasets_dir.join("INDEX"),
+            "mtcars                  Motor Trend Car Road Tests\n\
+             state                   US State Facts and Figures\n\
+             stackloss               Brownlee's Stack Loss Plant Data\n",
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("Rdata.rdx"), b"").unwrap();
+        std::fs::write(data_dir.join("Rdata.rdb"), b"").unwrap();
+        std::fs::write(data_dir.join("Rdata.rds"), b"").unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        // Disk-derived INDEX topics still merge on top...
+        assert!(
+            lib.is_base_export("mtcars"),
+            "single-object INDEX topic should still be enumerated"
+        );
+        // ...and the embedded floor supplies the per-object names that the
+        // multi-object INDEX topics hide.
+        for name in [
+            "state.x77",
+            "state.region",
+            "state.abb",
+            "stack.x",
+            "stack.loss",
+        ] {
+            assert!(
+                lib.is_base_export(name),
+                "Expected `{}` in base_exports via the embedded datasets floor \
+                 (issue #276: INDEX topic `state`/`stackloss` hides it)",
+                name
             );
         }
     }
