@@ -93,28 +93,6 @@ start_character = 33
 end_line = 17
 end_character = 39
 [[false_positive]]
-package = "stats"
-path = "tests/ts-tests.R"
-message = "Undefined variable: Seatbelts"
-reason = "dataset from datasets package (default-attached)"
-
-[false_positive.range]
-start_line = 179
-start_character = 11
-end_line = 179
-end_character = 20
-[[false_positive]]
-package = "stats"
-path = "tests/ts-tests.R"
-message = "Undefined variable: Seatbelts"
-reason = "dataset from datasets package (default-attached)"
-
-[false_positive.range]
-start_line = 182
-start_character = 55
-end_line = 182
-end_character = 64
-[[false_positive]]
 package = "cluster"
 path = "R/medoids.R"
 message = "Undefined variable: pam"
@@ -235,39 +213,6 @@ start_line = 8
 start_character = 5
 end_line = 8
 end_character = 13
-[[false_positive]]
-package = "lattice"
-path = "demo/lattice.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 33
-start_character = 21
-end_line = 33
-end_character = 30
-[[false_positive]]
-package = "lattice"
-path = "demo/lattice.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 34
-start_character = 43
-end_line = 34
-end_character = 52
-[[false_positive]]
-package = "lattice"
-path = "demo/lattice.R"
-message = "Undefined variable: state.region"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 35
-start_character = 43
-end_line = 35
-end_character = 55
 [[false_positive]]
 package = "lattice"
 path = "tests/MASSch04.R"
@@ -590,28 +535,6 @@ end_character = 6
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch02.R"
-message = "Undefined variable: state.center"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 102
-start_character = 13
-end_line = 102
-end_character = 25
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch02.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 103
-start_character = 20
-end_line = 103
-end_character = 30
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch02.R"
 message = "Undefined variable: Colour"
 reason = "test/script scope: variable from data() or library() or package namespace"
 
@@ -851,226 +774,6 @@ start_line = 185
 start_character = 23
 end_line = 185
 end_character = 26
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 111
-start_character = 10
-end_line = 111
-end_character = 20
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 113
-start_character = 21
-end_line = 113
-end_character = 31
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 114
-start_character = 21
-end_line = 114
-end_character = 31
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 116
-start_character = 12
-end_line = 116
-end_character = 22
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 117
-start_character = 15
-end_line = 117
-end_character = 25
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 118
-start_character = 0
-end_line = 118
-end_character = 10
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: state.name"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 118
-start_character = 26
-end_line = 118
-end_character = 36
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 162
-start_character = 6
-end_line = 162
-end_character = 11
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 163
-start_character = 6
-end_line = 163
-end_character = 11
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 164
-start_character = 6
-end_line = 164
-end_character = 11
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 166
-start_character = 16
-end_line = 166
-end_character = 21
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 168
-start_character = 34
-end_line = 168
-end_character = 39
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 169
-start_character = 36
-end_line = 169
-end_character = 41
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 171
-start_character = 32
-end_line = 171
-end_character = 37
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 172
-start_character = 28
-end_line = 172
-end_character = 33
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 174
-start_character = 21
-end_line = 174
-end_character = 26
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 175
-start_character = 6
-end_line = 175
-end_character = 11
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch03.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 176
-start_character = 10
-end_line = 176
-end_character = 15
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch04.R"
-message = "Undefined variable: mdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 14
-start_character = 34
-end_line = 14
-end_character = 41
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch04.R"
-message = "Undefined variable: fdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 14
-start_character = 43
-end_line = 14
-end_character = 50
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch04.R"
@@ -3109,39 +2812,6 @@ end_character = 11
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch11.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 14
-start_character = 12
-end_line = 14
-end_character = 17
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 14
-start_character = 24
-end_line = 14
-end_character = 29
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 14
-start_character = 36
-end_line = 14
-end_character = 41
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
 message = "Undefined variable: xgobi"
 reason = "test/script scope: variable from data() or library() or package namespace"
 
@@ -3219,28 +2889,6 @@ end_character = 11
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch11.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 110
-start_character = 9
-end_line = 110
-end_character = 18
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
-message = "Undefined variable: state.abb"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 110
-start_character = 47
-end_line = 110
-end_character = 56
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
 message = "Undefined variable: fastICA"
 reason = "test/script scope: variable from data() or library() or package namespace"
 
@@ -3252,28 +2900,6 @@ end_character = 20
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch11.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 124
-start_character = 6
-end_line = 124
-end_character = 15
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 126
-start_character = 9
-end_line = 126
-end_character = 18
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch11.R"
 message = "Undefined variable: oblimin"
 reason = "test/script scope: variable from data() or library() or package namespace"
 
@@ -3282,39 +2908,6 @@ start_line = 193
 start_character = 21
 end_line = 193
 end_character = 28
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch12.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 15
-start_character = 12
-end_line = 15
-end_character = 17
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch12.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 15
-start_character = 24
-end_line = 15
-end_character = 29
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch12.R"
-message = "Undefined variable: iris3"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 15
-start_character = 36
-end_line = 15
-end_character = 41
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch12.R"
@@ -3480,50 +3073,6 @@ start_line = 247
 start_character = 12
 end_line = 247
 end_character = 15
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch14.R"
-message = "Undefined variable: mdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 19
-start_character = 16
-end_line = 19
-end_character = 23
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch14.R"
-message = "Undefined variable: fdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 19
-start_character = 25
-end_line = 19
-end_character = 32
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch14.R"
-message = "Undefined variable: mdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 31
-start_character = 13
-end_line = 31
-end_character = 20
-[[false_positive]]
-package = "MASS"
-path = "inst/scripts/ch14.R"
-message = "Undefined variable: fdeaths"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 31
-start_character = 22
-end_line = 31
-end_character = 29
 [[false_positive]]
 package = "MASS"
 path = "inst/scripts/ch14.R"
@@ -4481,94 +4030,6 @@ start_line = 13
 start_character = 34
 end_line = 13
 end_character = 38
-[[false_positive]]
-package = "rpart"
-path = "tests/cptest.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 1
-start_character = 22
-end_line = 1
-end_character = 31
-[[false_positive]]
-package = "rpart"
-path = "tests/cptest.R"
-message = "Undefined variable: state.region"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 1
-start_character = 47
-end_line = 1
-end_character = 59
-[[false_positive]]
-package = "rpart"
-path = "tests/testall.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 42
-start_character = 22
-end_line = 42
-end_character = 31
-[[false_positive]]
-package = "rpart"
-path = "tests/testall.R"
-message = "Undefined variable: state.region"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 42
-start_character = 47
-end_line = 42
-end_character = 59
-[[false_positive]]
-package = "rpart"
-path = "tests/treble2.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 6
-start_character = 22
-end_line = 6
-end_character = 31
-[[false_positive]]
-package = "rpart"
-path = "tests/treble2.R"
-message = "Undefined variable: state.region"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 6
-start_character = 47
-end_line = 6
-end_character = 59
-[[false_positive]]
-package = "rpart"
-path = "tests/usersplits.R"
-message = "Undefined variable: state.x77"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 6
-start_character = 22
-end_line = 6
-end_character = 31
-[[false_positive]]
-package = "rpart"
-path = "tests/usersplits.R"
-message = "Undefined variable: state.region"
-reason = "test/script scope: variable from data() or library() or package namespace"
-
-[false_positive.range]
-start_line = 6
-start_character = 47
-end_line = 6
-end_character = 59
 [[false_positive]]
 package = "survival"
 path = "R/xtras.R"
@@ -20191,17 +19652,6 @@ start_line = 1230
 start_character = 28
 end_line = 1230
 end_character = 34
-[[false_positive]]
-package = "parallel"
-path = "R/RngStream.R"
-message = "Undefined variable: .Random.seed"
-reason = "global R RNG state (.Random.seed set by RNG operations)"
-
-[false_positive.range]
-start_line = 44
-start_character = 19
-end_line = 44
-end_character = 31
 [[false_positive]]
 package = "rlang"
 path = "man/rmd/topic-data-mask-ambiguity.Rmd"
