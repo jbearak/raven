@@ -187,6 +187,8 @@ Always on whenever diagnostics are enabled; not configurable per rule. Applies t
 | Suspicious assignment target | warning | Target is something R technically accepts, but the binding is almost always unintended: a string literal (`"foo" <- 1` — R binds the value to a variable named `foo`) or a dots argument (`... <- 1`, `..1 <- 1` — R creates a binding the standard `...` / `..N` accessors can't reach) |
 
 **Not flagged:**
+- `"[.Surv" <- function(x, i) …`, `"coef<-.varPower" <- function(…) …`, `"area" <- function(r) …` — a quoted-string target whose assigned value is a function definition is idiomatic R (S3/replacement/operator methods for syntactically invalid names, and old-S-style definitions), semantically identical to the backtick form. Exempt for every assignment spelling, including chained definitions (`"coef<-" <- "coefficients<-" <- function(…) …`) and `.Primitive(…)` values; any other non-function value on a string target is still flagged.
+- `"iris" <- <value>` at top level of a package's `data/*.R` file — the canonical form `data()` expects for registering dataset objects (used throughout R-core's `datasets` package). String-target assignments nested inside functions in those files are still flagged.
 - `T <- FALSE` / `F <- TRUE` — `T` and `F` are ordinary bindings that default to `TRUE`/`FALSE`; R accepts the assignment. Use the [`T` / `F` symbol](#style-lints) style lint if you want these reported.
 - `f(name = value)` — named-argument syntax inside a call, not assignment.
 - `function(x = TRUE)` — default values in formal parameters, not assignment.

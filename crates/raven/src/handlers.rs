@@ -461,6 +461,7 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_invalid_assignment_targets(
         snapshot.tree.root_node(),
         &snapshot.text,
+        is_package_data_file(uri),
         &mut diagnostics,
         if track_unused {
             Some(&mut suppressed_pairs)
@@ -10695,7 +10696,7 @@ mod invalid_assignment_target_tests {
     fn collect(code: &str) -> Vec<Diagnostic> {
         let tree = parse_r(code);
         let mut diagnostics = Vec::new();
-        collect_invalid_assignment_targets(tree.root_node(), code, &mut diagnostics, None);
+        collect_invalid_assignment_targets(tree.root_node(), code, false, &mut diagnostics, None);
         diagnostics
     }
 
@@ -11104,6 +11105,163 @@ mod invalid_assignment_target_tests {
         // `TRUE` starts at column 7 in UTF-16: 🦀(2) + " <- ("(5) = 7.
         assert_eq!(diags[0].range.start.character, 7);
         assert_eq!(diags[0].range.end.character, 11);
+    }
+
+    // ---- Idiomatic quoted-string LHS defining a function ----------------------
+
+    #[test]
+    fn string_lhs_with_function_rhs_not_flagged() {
+        // Quoted-string LHS defining a function is idiomatic R, semantically
+        // identical to the backtick form: S3 methods for syntactically
+        // invalid generics ("[.Surv"), replacement methods ("coef<-.varPower"),
+        // operators ('%+%'), and plain old-S-style definitions ("area").
+        assert_none("\"[.Surv\" <- function(x, i, drop = FALSE) x");
+        assert_none("\"coef<-.varPower\" <- function(object, value) object");
+        assert_none("\"area\" <- function(r) pi * r^2");
+        assert_none("'%+%' <- function(a, b) paste0(a, b)");
+        // R 4.1 backslash-lambda is a function_definition too.
+        assert_none("\"f\" <- \\(x) x + 1");
+        // All assignment spellings, not just `<-`.
+        assert_none("\"f\" = function(x) x");
+        assert_none("\"f\" <<- function(x) x");
+        assert_none("(function(x) x) -> \"f\"");
+    }
+
+    #[test]
+    fn string_lhs_with_parenthesized_function_rhs_not_flagged() {
+        assert_none("\"f\" <- (function(x) x)");
+        // Parens on both sides.
+        assert_none("(\"f\") <- (function(x) x)");
+    }
+
+    #[test]
+    fn chained_string_lhs_function_rhs_not_flagged() {
+        // nlme's R/newGenerics.R defines two generics in one statement:
+        // `"coef<-" <- "coefficients<-" <- function(...) ...`. The value of
+        // the outer assignment is the inner assignment, whose value is the
+        // function — both targets are function bindings.
+        assert_none(
+            "\"coef<-\" <- \"coefficients<-\" <- function(object, ..., value) UseMethod(\"coef<-\")",
+        );
+        // Chained through `=` and a backtick inner target too.
+        assert_none("\"f\" <- `g` <- function(x) x");
+    }
+
+    #[test]
+    fn chained_string_lhs_non_function_rhs_still_flagged() {
+        // Both string targets in a chained non-function assignment warn.
+        let diags = collect("\"a\" <- \"b\" <- 1");
+        assert_eq!(diags.len(), 2, "got {diags:?}");
+    }
+
+    #[test]
+    fn string_lhs_with_primitive_rhs_not_flagged() {
+        // `.Primitive(...)` always returns a function; R-core's methods
+        // package defines `"el<-" <- .Primitive("[[<-")` this way.
+        assert_none("\"el<-\" <- .Primitive(\"[[<-\")");
+    }
+
+    #[test]
+    fn string_lhs_with_other_call_rhs_still_flagged() {
+        // Arbitrary calls may or may not return functions — only the
+        // always-a-function `.Primitive` is exempt.
+        assert_one_with_severity(
+            "\"f\" <- match.fun(\"sum\")",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn string_lhs_with_function_rhs_inside_function_body_not_flagged() {
+        // Old-S-style local function definitions are the same idiom.
+        assert_none("outer <- function() {\n  \"helper\" <- function(x) x\n  helper(1)\n}");
+    }
+
+    #[test]
+    fn string_lhs_with_non_function_rhs_inside_function_body_still_flagged() {
+        assert_one_with_severity(
+            "f <- function() {\n  \"x\" <- 1\n}",
+            DiagnosticSeverity::WARNING,
+            "string literal",
+        );
+    }
+
+    #[test]
+    fn dots_lhs_with_function_rhs_still_flagged() {
+        // The function-RHS exemption is for string-literal targets only;
+        // `... <- function(x) x` is still a binding the `...` accessors
+        // can't reach.
+        assert_one_with_severity(
+            "... <- function(x) x",
+            DiagnosticSeverity::WARNING,
+            "`...` accessors",
+        );
+    }
+
+    // ---- Package data/*.R files ------------------------------------------------
+
+    fn collect_in_data_file(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r(code);
+        let mut diagnostics = Vec::new();
+        collect_invalid_assignment_targets(tree.root_node(), code, true, &mut diagnostics, None);
+        diagnostics
+    }
+
+    #[test]
+    fn data_file_top_level_string_assign_not_flagged() {
+        // R-core datasets' canonical data/*.R form: `"iris" <- <value>` at
+        // top level registers the dataset object when `data()` sources the
+        // file.
+        let diags = collect_in_data_file("\"iris\" <- structure(list(), class = \"data.frame\")");
+        assert!(diags.is_empty(), "got {diags:?}");
+        let diags = collect_in_data_file("\"BJsales\" <- ts(c(1, 2, 3))");
+        assert!(diags.is_empty(), "got {diags:?}");
+    }
+
+    #[test]
+    fn data_file_nested_string_assign_still_flagged() {
+        // Only the top-level registration form is canonical; a string-target
+        // assignment inside a function body in a data file is as suspicious
+        // as anywhere else.
+        let diags = collect_in_data_file("f <- function() {\n  \"x\" <- 1\n}");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("string literal"));
+    }
+
+    #[test]
+    fn data_file_error_tier_targets_still_flagged() {
+        let diags = collect_in_data_file("TRUE <- 1");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn package_data_file_uri_detection() {
+        use super::is_package_data_file;
+        use tower_lsp::lsp_types::Url;
+        let yes = |s: &str| {
+            assert!(
+                is_package_data_file(&Url::parse(s).unwrap()),
+                "expected data file: {s}"
+            )
+        };
+        let no = |s: &str| {
+            assert!(
+                !is_package_data_file(&Url::parse(s).unwrap()),
+                "expected non-data file: {s}"
+            )
+        };
+        yes("file:///pkg/data/iris.R");
+        yes("file:///pkg/data/iris.r");
+        no("file:///pkg/R/iris.R");
+        // `data()` only sources files directly under data/, not subdirs.
+        no("file:///pkg/data/sub/iris.R");
+        // A file literally named data.R is not in a data/ directory.
+        no("file:///data.R");
+        // R requires the directory to be lowercase `data`.
+        no("file:///pkg/Data/iris.R");
+        no("file:///pkg/data/iris.csv");
     }
 }
 
@@ -11525,6 +11683,13 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// `...` / `..N` accessors can't reach). Suppressible via `# @lsp-ignore`
 /// when the binding really is intentional.
 ///
+/// Two idiomatic string-target forms are exempt from the WARNING tier:
+/// a quoted-string target whose assigned value is a function definition
+/// (`"[.Surv" <- function(x, i) ...` — see [`is_function_definition_value`]),
+/// and, when `in_package_data_file` is set (see [`is_package_data_file`]),
+/// top-level string assignments — the canonical `data/*.R` dataset
+/// registration form (`"iris" <- <value>`).
+///
 /// Covers the LHS of `<-`, `<<-`, `=` and the RHS of `->`, `->>`. Cases
 /// tree-sitter reports as an `ERROR` node (`if <- 1`, `for <- 1`,
 /// `while <- 1`, `function <- 1`) are deliberately left to
@@ -11532,9 +11697,36 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// `=` inside a call (`f(name = value)`) is skipped, matching the existing
 /// assignment-operator lint's logic. `T <- FALSE` is **not** flagged: `T`
 /// and `F` are regular bindings, not reserved words.
+/// True when a document URI points at a top-level `data/*.R` file — the
+/// canonical place where R packages register datasets via the quoted-name
+/// form (`"iris" <- <value>`); `data()` sources exactly these files. Used to
+/// exempt that idiom from the assign-to-string-literal diagnostic.
+///
+/// Heuristic on the path alone (no filesystem access from the diagnostics
+/// path, so no DESCRIPTION check): the file's immediate parent directory must
+/// be literally `data` (R requires lowercase) and the extension `.R`/`.r`.
+/// Files in subdirectories of `data/` are not sourced by `data()` and don't
+/// qualify.
+fn is_package_data_file(uri: &Url) -> bool {
+    let Some(mut segments) = uri.path_segments() else {
+        return false;
+    };
+    let Some(file) = segments.next_back() else {
+        return false;
+    };
+    let Some(dir) = segments.next_back() else {
+        return false;
+    };
+    dir == "data"
+        && std::path::Path::new(file)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("r"))
+}
+
 fn collect_invalid_assignment_targets(
     node: Node,
     text: &str,
+    in_package_data_file: bool,
     diagnostics: &mut Vec<Diagnostic>,
     mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
@@ -11542,6 +11734,7 @@ fn collect_invalid_assignment_targets(
     collect_invalid_assignment_targets_inner(
         node,
         text,
+        in_package_data_file,
         &ignored,
         diagnostics,
         &mut suppressed_out,
@@ -11551,16 +11744,31 @@ fn collect_invalid_assignment_targets(
 fn collect_invalid_assignment_targets_inner(
     node: Node,
     text: &str,
+    in_package_data_file: bool,
     ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
     suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
 ) {
     if node.kind() == "binary_operator" {
-        check_invalid_assignment_target(node, text, ignored, diagnostics, suppressed_out);
+        check_invalid_assignment_target(
+            node,
+            text,
+            in_package_data_file,
+            ignored,
+            diagnostics,
+            suppressed_out,
+        );
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_invalid_assignment_targets_inner(child, text, ignored, diagnostics, suppressed_out);
+        collect_invalid_assignment_targets_inner(
+            child,
+            text,
+            in_package_data_file,
+            ignored,
+            diagnostics,
+            suppressed_out,
+        );
     }
 }
 
@@ -11756,6 +11964,7 @@ fn classify_lsp_ignore_marker(
 fn check_invalid_assignment_target(
     binop: Node,
     text: &str,
+    in_package_data_file: bool,
     ignored: &std::collections::HashMap<u32, crate::cross_file::types::LineSuppression>,
     diagnostics: &mut Vec<Diagnostic>,
     suppressed_out: &mut Option<&mut Vec<(u32, String)>>,
@@ -11764,9 +11973,15 @@ fn check_invalid_assignment_target(
         return;
     };
     let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-    let target = match op_text {
-        "<-" | "<<-" | "=" => binop.child_by_field_name("lhs"),
-        "->" | "->>" => binop.child_by_field_name("rhs"),
+    let (target, value) = match op_text {
+        "<-" | "<<-" | "=" => (
+            binop.child_by_field_name("lhs"),
+            binop.child_by_field_name("rhs"),
+        ),
+        "->" | "->>" => (
+            binop.child_by_field_name("rhs"),
+            binop.child_by_field_name("lhs"),
+        ),
         _ => return,
     };
     // No special case for named-argument `=`: tree-sitter-r parses a valid
@@ -11792,6 +12007,29 @@ fn check_invalid_assignment_target(
     let Some(classification) = classify_target(target, text) else {
         return;
     };
+
+    // Idiomatic exemption: a quoted-string LHS whose assigned value is a
+    // function definition (`"[.Surv" <- function(x, i) ...`,
+    // `"coef<-.varPower" <- function(...) ...`, `"area" <- function(r) ...`)
+    // is semantically identical to the backtick form and standard in
+    // base/survival/nlme/MASS/lattice. Only the WARNING-tier string-literal
+    // classification is exempt — `... <- function(x) x` stays flagged, and
+    // ERROR-tier targets R itself rejects are unaffected.
+    if classification.label == "string literal"
+        && value.is_some_and(|v| is_function_definition_value(v, text))
+    {
+        return;
+    }
+
+    // Idiomatic exemption: R-core packages register datasets in data/*.R
+    // files with `"name" <- <value>` at top level (`data()` sources these
+    // files). Nested string-target assignments in such files stay flagged.
+    if classification.label == "string literal"
+        && in_package_data_file
+        && binop.parent().is_some_and(|p| p.kind() == "program")
+    {
+        return;
+    }
 
     let row = target.start_position().row as u32;
     if ignored
@@ -11958,6 +12196,41 @@ fn unary_operator_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// True when an assignment's value node is a function definition, possibly
+/// parenthesized (`"f" <- (function(x) x)`) or reached through a chained
+/// assignment (`"coef<-" <- "coefficients<-" <- function(...) ...`, as in
+/// nlme's `R/newGenerics.R` — the value of the outer assignment is the inner
+/// assignment, whose value is the function). Covers both the `function`
+/// keyword and the R 4.1 backslash-lambda — tree-sitter-r normalizes both
+/// into `function_definition` — plus `.Primitive(...)` calls, which always
+/// return a function (R-core's methods package uses
+/// `"el<-" <- .Primitive("[[<-")`). Other calls are NOT treated as function
+/// values: they may return anything, and exempting them would gut the
+/// warning.
+fn is_function_definition_value(node: Node, text: &str) -> bool {
+    match node.kind() {
+        "function_definition" => true,
+        "parenthesized_expression" => node
+            .child_by_field_name("body")
+            .is_some_and(|inner| is_function_definition_value(inner, text)),
+        "call" => node
+            .child_by_field_name("function")
+            .is_some_and(|callee| node_text(callee, text) == ".Primitive"),
+        "binary_operator" => {
+            let Some(op) = node.child_by_field_name("operator") else {
+                return false;
+            };
+            let value = match op.kind() {
+                "<-" | "<<-" | "=" => node.child_by_field_name("rhs"),
+                "->" | "->>" => node.child_by_field_name("lhs"),
+                _ => return false,
+            };
+            value.is_some_and(|v| is_function_definition_value(v, text))
+        }
+        _ => false,
+    }
 }
 
 /// Classify an assignment-target node as suspicious (R accepts, but the
@@ -22190,9 +22463,11 @@ clean_data <- function(x) {
     }
 
     /// R accepts string-literal assignment targets (`"foo<-" <- function(...)`)
-    /// and binds the value to that name. Raven should still warn about the
-    /// unusual assignment syntax, but scope resolution must treat it as a real
-    /// binding so later replacement-call syntax resolves.
+    /// and binds the value to that name. Defining a function through a quoted
+    /// name is idiomatic R (semantically identical to the backtick form), so
+    /// no assign-to-string-literal warning is emitted, and scope resolution
+    /// must treat it as a real binding so later replacement-call syntax
+    /// resolves.
     #[test]
     fn test_diagnostic_suppresses_string_literal_replacement_function_binding() {
         use crate::state::{Document, WorldState};
@@ -22218,8 +22493,8 @@ clean_data <- function(x) {
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m.contains("string literal")),
-            "string-literal assignment should still be warned about; messages: {messages:?}"
+            !messages.iter().any(|m| m.contains("string literal")),
+            "quoted-string LHS defining a function is idiomatic and must not be flagged; messages: {messages:?}"
         );
         assert!(
             !messages.iter().any(|m| m == "Undefined variable: foo"),

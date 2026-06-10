@@ -787,8 +787,13 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
     let fp_fixture = FalsePositiveFixture {
         false_positives: vec![],
     };
-    let classification =
-        classify_observed(&[accepted, unclassified.clone()], &fixture, &fp_fixture);
+    let run_packages = BTreeSet::from(["pkg"]);
+    let classification = classify_observed(
+        &[accepted, unclassified.clone()],
+        &run_packages,
+        &fixture,
+        &fp_fixture,
+    );
 
     assert_eq!(classification.unclassified, vec![unclassified]);
     assert_eq!(classification.stale_acceptances.len(), 1);
@@ -796,6 +801,52 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
         classification.stale_acceptances[0].message,
         "Undefined variable: stale"
     );
+}
+
+/// A package that was checked but produced zero diagnostics must still have
+/// its ledger entries reported as stale — scoping the stale sweep to packages
+/// with observed diagnostics would silently skip exactly the packages a fix
+/// fully cleared.
+#[test]
+fn stale_entries_reported_for_run_package_with_no_diagnostics() {
+    let fixture: TriageFixture = toml::from_str(
+        r#"
+        [[diagnostic]]
+        package = "cleared"
+        path = "R/old.R"
+        message = "Undefined variable: gone"
+        evidence = "was real once"
+        [diagnostic.range]
+        start_line = 0
+        start_character = 0
+        end_line = 0
+        end_character = 4
+        "#,
+    )
+    .unwrap();
+    let fp_fixture: FalsePositiveFixture = toml::from_str(
+        r#"
+        [[false_positive]]
+        package = "cleared"
+        path = "R/methods.R"
+        message = "Assigning to string literal \"f\"; ..."
+        reason = "idiomatic"
+        [false_positive.range]
+        start_line = 3
+        start_character = 0
+        end_line = 3
+        end_character = 3
+        "#,
+    )
+    .unwrap();
+
+    let run_packages = BTreeSet::from(["cleared"]);
+    let classification = classify_observed(&[], &run_packages, &fixture, &fp_fixture);
+
+    assert!(classification.unclassified.is_empty());
+    assert_eq!(classification.stale_acceptances.len(), 1);
+    assert_eq!(classification.stale_false_positives.len(), 1);
+    assert_eq!(classification.stale_false_positives[0].path, "R/methods.R");
 }
 
 #[test]
@@ -1271,11 +1322,20 @@ fn classify_reports(
         .iter()
         .flat_map(|report| report.diagnostics.iter().cloned())
         .collect::<Vec<_>>();
-    classify_observed(&observed, fixture, fp_fixture)
+    // Scope the stale sweep to every package that was actually checked, not
+    // just packages with surviving diagnostics — a package a fix fully
+    // cleared (zero observed diagnostics) is exactly where ledger entries go
+    // stale.
+    let run_packages: BTreeSet<&str> = reports
+        .iter()
+        .map(|report| report.package.as_str())
+        .collect();
+    classify_observed(&observed, &run_packages, fixture, fp_fixture)
 }
 
 fn classify_observed(
     observed: &[ObservedDiagnostic],
+    run_packages: &BTreeSet<&str>,
     fixture: &TriageFixture,
     fp_fixture: &FalsePositiveFixture,
 ) -> Classification {
@@ -1308,14 +1368,14 @@ fn classify_observed(
     let stale_acceptances = fixture
         .diagnostics
         .iter()
-        .filter(|diag| observed_packages.contains(diag.package.as_str()))
+        .filter(|diag| run_packages.contains(diag.package.as_str()))
         .map(TriageDiagnostic::key)
         .filter(|key| !observed_keys.contains(key))
         .collect();
     let stale_false_positives = fp_fixture
         .false_positives
         .iter()
-        .filter(|fp| observed_packages.contains(fp.package.as_str()))
+        .filter(|fp| run_packages.contains(fp.package.as_str()))
         .map(|fp| DiagnosticKey {
             package: fp.package.clone(),
             path: fp.path.clone(),

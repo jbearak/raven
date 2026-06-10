@@ -19,7 +19,7 @@ The runner lives in `crates/raven/tests/package_corpus.rs`, with fixtures under 
 
 Env vars: `RAVEN_CORPUS_GROUPS`, `RAVEN_CORPUS_PACKAGES`, `RAVEN_CORPUS_ALL`, `RAVEN_CORPUS_LIMIT`, `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`, `RAVEN_CORPUS_KEEP_TEMP`, `RAVEN_CORPUS_REPORT_DIR`.
 
-The accepted-real fixture (`accepted_real_diagnostics.toml`) records 71 confirmed diagnostics (post-reclassification; see below). The known-false-positives fixture (`known_false_positives.toml`) records 2576 entries.
+The accepted-real fixture (`accepted_real_diagnostics.toml`) records 72 confirmed diagnostics (post-reclassification; see below). The known-false-positives fixture (`known_false_positives.toml`) records 2422 entries.
 
 ## Triage status
 
@@ -59,7 +59,9 @@ The accepted-real fixture (`accepted_real_diagnostics.toml`) records 71 confirme
 
 ## Ledger reclassification (prod-test)
 
-153 entries were moved from `accepted_real_diagnostics.toml` to `known_false_positives.toml`. All had the message `Assigning to string literal "…"` and fell into one of two idiom classes that Raven over-flags: (a) S3/replacement/operator method definitions via quoted-string LHS (e.g. `"[.Surv" <- function(...)`, `"coef<-.varPower" <- function(...)`) — semantically identical to the backtick form and standard R practice; (b) R-core's datasets package `data/*.R` files (`"iris" <- ...`, `"AirPassengers" <- ...` — 55 entries) which use the canonical quoted-name form. The underlying diagnostic gap (no function-RHS exemption in `suspicious_target_kind`) is pre-existing behavior tracked for a follow-up fix. Post-reclassification counts: **71 accepted-real**, **2576 known-FP**.
+153 entries were moved from `accepted_real_diagnostics.toml` to `known_false_positives.toml`. All had the message `Assigning to string literal "…"` and fell into one of two idiom classes that Raven over-flagged: (a) S3/replacement/operator method definitions via quoted-string LHS (e.g. `"[.Surv" <- function(...)`, `"coef<-.varPower" <- function(...)`) — semantically identical to the backtick form and standard R practice; (b) R-core's datasets package `data/*.R` files (`"iris" <- ...`, `"AirPassengers" <- ...` — 55 entries) which use the canonical quoted-name form.
+
+The follow-up fix has since landed: `check_invalid_assignment_target` exempts string-literal targets whose assigned value is a function definition (including parenthesized, chained `"a" <- "b" <- function(...)`, and `.Primitive(...)` forms), and top-level string assignments in package `data/*.R` files (URI-based, see `is_package_data_file`). A 16-package corpus re-run (survival, nlme, MASS, datasets, tcltk, lattice, base, methods, stats, dbplyr, foreign, ggplot2, httr, lubridate, mgcv, stringr) confirmed the entries are no longer emitted; 152 were pruned from the FP ledger and 1 (`base R/all.equal.R` `"__all.eq.E__" <- environment()` — a dynGet sentinel, not a function definition) was moved back to accepted-real alongside its sibling sentinel entries. The stale-FP report now also covers run packages with zero observed diagnostics — previously a fully-cleared package was silently skipped by the staleness sweep. Post-fix counts: **72 accepted-real**, **2422 known-FP** (a full-corpus strict run subsequently pruned one dead `tools R/install.R` `File not found: 'install.libs.R'` entry — SVN-trunk line drift had left two entries for the same diagnostic at old and new positions, and only the newer one still matches).
 
 ## Validation
 
@@ -68,6 +70,7 @@ The accepted-real fixture (`accepted_real_diagnostics.toml`) records 71 confirme
 - 4488 lib + 11 regression + 103 indent + 7 corpus + 3 pkg_db + 55 other = 4667 tests pass
 - `base` corpus: strict mode pass (10 accepted reals, 0 unclassified)
 - DT corpus: strict mode pass (0 diagnostics)
+- Full strict run, all four groups (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse,dt`, release binary, no `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`): 61 packages, 2494 observed diagnostics — base 111 (28 accepted / 83 known-FP), recommended 1392 (39 / 1353), tidyverse 991 (5 / 986), DT 0 — **0 unclassified, 0 stale acceptances, 0 stale FPs** after pruning the drift entry above.
 
 ## Remaining work
 

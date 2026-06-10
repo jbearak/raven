@@ -84,6 +84,19 @@ end_line = 342
 end_character = 42
 [[diagnostic]]
 package = "base"
+path = "R/all.equal.R"
+message = "Assigning to string literal \"__all.eq.E__\"; R will bind the value to the variable named by the string. Was this intentional?"
+evidence = "Same dynGet-sentinel idiom as the accepted `__library_can_mask__` / `__NameSpacesLoading__` / `__LoadingNamespaceInfo__` entries: `\"__all.eq.E__\" <- environment()` inside a function body, read back via `dynGet(\"__all.eq.E__\", NULL)`. The value is not a function, so the idiomatic function-definition exemption deliberately does not apply; the backtick-quoted spelling would silence it."
+source = "R SVN trunk src/library/base"
+minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__all.eq.E__` <- environment() ``."
+
+[diagnostic.range]
+start_line = 268
+start_character = 1
+end_line = 268
+end_character = 15
+[[diagnostic]]
+package = "base"
 path = "R/match.fun.R"
 message = "Mixed `&&` and `||` without parentheses; `&&` binds tighter than `||`. Add parentheses to clarify intent: `(a && b) || c` or `a && (b || c)`."
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: adding precedence-preserving parentheses removed this mixed-logical diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
