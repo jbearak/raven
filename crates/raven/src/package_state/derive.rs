@@ -627,8 +627,10 @@ mod tests {
     }
 
     /// Issue #431: the scope contribution must carry the package's own name
-    /// (from DESCRIPTION `Package:`) so the diagnostics collector can add it to
-    /// the NSE in-play set for the package's own files.
+    /// (from DESCRIPTION `Package:`) so the diagnostics collector can consult
+    /// the package's own NSE policies for its own files. This name feeds the
+    /// policy lookup only — it is NOT added to the NSE in-play package set used
+    /// for standard-eval export resolution.
     #[test]
     fn scope_contribution_carries_package_name() {
         let inputs = with_description(PackageMode::Auto, "Package: dplyr\n");
