@@ -1194,3 +1194,16 @@ start_line = 22
 start_character = 26
 end_line = 22
 end_character = 27
+[[diagnostic]]
+package = "tidyr"
+path = "tests/testthat/test-gather.R"
+message = "Undefined variable: d"
+evidence = "Confirmed real in the tidyverse/tidyr git checkout: the test defines `df` then calls `gather(d, key, val, -x)` (a `df`->`d` typo in an `expect_error` block). Editing the call to `gather(df, key, val, -x)` and rerunning `target/debug/raven check --workspace <checkout> --format json --max-severity error --no-config` removed the diagnostic. Surfaced by issue #431: the package's own `gather` now resolves to its NSE policy, which checks the `data` argument."
+source = "tidyverse/tidyr git HEAD"
+minimal_edit = "Fix the typo: `gather(d, key, val, -x)` -> `gather(df, key, val, -x)`."
+
+[diagnostic.range]
+start_line = 139
+start_character = 22
+end_line = 139
+end_character = 23

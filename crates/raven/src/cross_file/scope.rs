@@ -20003,6 +20003,7 @@ mod package_contribution_tests {
             .map(|s| (s.to_string(), BTreeSet::new()))
             .collect();
         PackageScopeContribution {
+            package_name: None,
             workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
             r_internal_symbols: Arc::new(r_internal_symbols),
             imported_symbols: Arc::new(imported_symbols),
@@ -21205,6 +21206,7 @@ mod package_contribution_tests {
         let r_internal_symbols: BTreeSet<String> = internal.iter().map(|s| s.to_string()).collect();
         let dataset_symbols: BTreeSet<String> = datasets.iter().map(|s| s.to_string()).collect();
         PackageScopeContribution {
+            package_name: None,
             workspace_root: Some(std::path::PathBuf::from(workspace_root_path)),
             r_internal_symbols: Arc::new(r_internal_symbols),
             imported_symbols: Arc::new(BTreeMap::new()),

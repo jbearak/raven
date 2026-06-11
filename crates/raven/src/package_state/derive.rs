@@ -156,6 +156,7 @@ fn build_scope_contribution(
     let test_attached_packages = compute_test_attached_packages(description);
     PackageScopeContribution {
         workspace_root: Some(ws.root.clone()),
+        package_name: Some(ws.name.clone()),
         r_internal_symbols: Arc::new(r_internal_symbols),
         imported_symbols: Arc::new(imported_symbols),
         full_imports: Arc::new(full_imports),
@@ -623,6 +624,26 @@ mod tests {
         let pkgs = s.scope_contribution.imported_symbols.get("filter").unwrap();
         assert!(pkgs.contains("dplyr"));
         assert!(pkgs.contains("stats"));
+    }
+
+    /// Issue #431: the scope contribution must carry the package's own name
+    /// (from DESCRIPTION `Package:`) so the diagnostics collector can consult
+    /// the package's own NSE policies for its own files. This name feeds the
+    /// policy lookup only — it is NOT added to the NSE in-play package set used
+    /// for standard-eval export resolution.
+    #[test]
+    fn scope_contribution_carries_package_name() {
+        let inputs = with_description(PackageMode::Auto, "Package: dplyr\n");
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert_eq!(
+            s.scope_contribution.package_name.as_deref(),
+            Some("dplyr"),
+            "scope_contribution must carry the DESCRIPTION Package name"
+        );
     }
 
     #[test]

@@ -733,6 +733,22 @@ pub struct PackageScopeContribution {
     /// scope-injection logic (Phase 5) can check whether the queried file is
     /// under `R/` or `tests/testthat/` without requiring a separate parameter.
     pub workspace_root: Option<PathBuf>,
+    /// The package's own name (DESCRIPTION `Package:` field), if known.
+    ///
+    /// Threaded here (issue #431) so the undefined-variable collector can
+    /// consult the package's own NSE argument policies when analyzing its OWN
+    /// files (R/, tests/, vignettes/, man/rmd). Without this, a verb the package
+    /// itself exports (e.g. dplyr's `filter`) loses its data-masking policy
+    /// inside the package's own test suite / vignettes, so mask arguments like
+    /// `x` in `filter(df, x > 1)` are analyzed as ordinary code and falsely
+    /// flagged. This feeds ONLY the policy lookup (`NseAnalysis.self_nse_package`,
+    /// resolver step 2.5) and is deliberately never added to the in-play package
+    /// set used for standard-eval export resolution — so a self-package verb
+    /// with no known policy stays conservatively arg-suppressed rather than
+    /// being newly checked. `None` when no package workspace is detected, and
+    /// `"unknown"` for a package-mode workspace whose DESCRIPTION omits
+    /// `Package:` (harmless — no policy is keyed on `"unknown"`).
+    pub package_name: Option<String>,
     pub r_internal_symbols: Arc<BTreeSet<String>>,
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
     pub full_imports: Arc<BTreeSet<String>>,
