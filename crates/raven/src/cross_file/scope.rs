@@ -1733,9 +1733,13 @@ pub fn scope_at_position(
                 }
             }
             ScopeEvent::DataLoad { .. } => {
-                // expansion handled at query time (issue #429); recording-only
-                // for now. The literal stems are already bound via their Def
-                // events above.
+                // No `data()` alias expansion here (issue #429): these
+                // single-file helpers take no `DataAliasProvider`, so they
+                // cannot resolve dataset object names; they are test-only. The
+                // literal stems are already bound via their `Def` events above.
+                // Production diagnostics / completion flow through
+                // `scope_at_position_with_graph[_cached]` / `ScopeStream`, which
+                // DO expand.
             }
         }
     }
@@ -1958,9 +1962,13 @@ where
                 }
             }
             ScopeEvent::DataLoad { .. } => {
-                // expansion handled at query time (issue #429); recording-only
-                // for now. The literal stems are already bound via their Def
-                // events above.
+                // No `data()` alias expansion here (issue #429): these
+                // single-file helpers take no `DataAliasProvider`, so they
+                // cannot resolve dataset object names; they are test-only. The
+                // literal stems are already bound via their `Def` events above.
+                // Production diagnostics / completion flow through
+                // `scope_at_position_with_graph[_cached]` / `ScopeStream`, which
+                // DO expand.
             }
         }
     }
@@ -2266,7 +2274,7 @@ fn collect_definitions(
         // fallback; this event is recording-only for now (consumed by a later
         // task). `function_scope: None` is annotated later by
         // `annotate_event_function_scopes`, matching the Def idiom above.
-        if let Some((stems, package)) = data_call_info {
+        if let Some(DataCallInfo { stems, package }) = data_call_info {
             let (line, column) = node_start_position_utf16(node, line_index);
             artifacts.timeline.push(ScopeEvent::DataLoad {
                 line,
@@ -3355,6 +3363,20 @@ fn try_extract_literal_load_call_definition(
     Some((symbol, visible_line, visible_column))
 }
 
+/// Parsed `data(...)` / `utils::data(...)` call info used to record and later
+/// expand a [`ScopeEvent::DataLoad`] (issue #429).
+///
+/// `stems` are the positional dataset names exactly as written (`data(api)` →
+/// `["api"]`); `package` is the `package = "..."` string-literal argument when
+/// present, else `None`. Replaces the former bare `(Vec<String>,
+/// Option<String>)` tuple that the recorder, extractor, and interface-hash all
+/// passed around.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DataCallInfo {
+    pub stems: Vec<String>,
+    pub package: Option<String>,
+}
+
 /// Extract dataset names bound by a `data(...)` or `utils::data(...)` call.
 ///
 /// `data(foo, "bar")` binds `foo` and `bar` in the calling environment from
@@ -3363,16 +3385,15 @@ fn try_extract_literal_load_call_definition(
 /// (`package=`, `envir=`, `list=`, etc.) are skipped for the literal binding.
 ///
 /// Returns the bound `ScopedSymbol`s (the no-R fallback binding, byte-for-byte
-/// unchanged) plus, when at least one positional dataset is present, the call
-/// info `(stems, package)` used to record a [`ScopeEvent::DataLoad`] for
-/// query-time data-file-alias expansion (issue #429). `package` captures a
+/// unchanged) plus, when at least one positional dataset is present, the
+/// [`DataCallInfo`] used to record a [`ScopeEvent::DataLoad`] for query-time
+/// data-file-alias expansion (issue #429). The `package` field captures a
 /// `package = "..."` string-literal named argument when present.
-#[allow(clippy::type_complexity)]
 fn try_extract_data_call_definitions(
     node: Node,
     line_index: &LineIndex,
     uri: &Url,
-) -> (Vec<ScopedSymbol>, Option<(Vec<String>, Option<String>)>) {
+) -> (Vec<ScopedSymbol>, Option<DataCallInfo>) {
     let func_node = match node.child_by_field_name("function") {
         Some(f) => f,
         None => return (Vec::new(), None),
@@ -3446,7 +3467,7 @@ fn try_extract_data_call_definitions(
     let call_info = if stems.is_empty() {
         None
     } else {
-        Some((stems, package))
+        Some(DataCallInfo { stems, package })
     };
     (symbols, call_info)
 }
@@ -4008,7 +4029,7 @@ fn extract_top_level_removals(timeline: &[ScopeEvent]) -> Vec<(String, u32)> {
 /// [`extract_top_level_removals`]. Callers must invoke this AFTER
 /// `annotate_event_function_scopes` so `function_scope` is populated. Used to
 /// feed `compute_interface_hash` for issue #429.
-fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<(Vec<String>, Option<String>)> {
+fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
     let mut out = Vec::new();
     for event in timeline {
         if let ScopeEvent::DataLoad {
@@ -4018,7 +4039,10 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<(Vec<String>, Op
             ..
         } = event
         {
-            out.push((stems.clone(), package.clone()));
+            out.push(DataCallInfo {
+                stems: stems.clone(),
+                package: package.clone(),
+            });
         }
     }
     out
@@ -4062,7 +4086,7 @@ fn compute_interface_hash(
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
     top_level_removals: &[TopLevelRemoval<'_>],
-    data_loads: &[(Vec<String>, Option<String>)],
+    data_loads: &[DataCallInfo],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -4110,14 +4134,93 @@ fn compute_interface_hash(
     // doc comment above for why the `package =` argument and stem set must
     // feed the hash (issue #429). Stems are hashed in source order (data()
     // argument order is meaningful); the pairs are sorted as a whole.
-    let mut sorted_data_loads: Vec<&(Vec<String>, Option<String>)> = data_loads.iter().collect();
+    let mut sorted_data_loads: Vec<&DataCallInfo> = data_loads.iter().collect();
     sorted_data_loads.sort();
-    for (stems, package) in sorted_data_loads {
+    for DataCallInfo { stems, package } in sorted_data_loads {
         stems.hash(&mut hasher);
         package.hash(&mut hasher);
     }
 
     hasher.finish()
+}
+
+/// Provider for expanding [`ScopeEvent::DataLoad`] events at scope query time
+/// (issue #429): maps a `(package, file-stem)` to the dataset object names that
+/// file binds, and exposes the default-attached base package names that a bare
+/// `data(stem)` (no `package =`) must also search.
+///
+/// Production wires `lookup` to
+/// [`crate::package_library::PackageLibrary::data_objects_for_stem_sync`] and
+/// `base_packages` to `PackageLibrary::base_packages()`, both reading the
+/// ArcSwap'd cache without locking or LRU promotion. `None` (tests and paths
+/// with no package access) disables expansion; the literal-stem `Def` fallback
+/// remains.
+pub struct DataAliasProvider<'a> {
+    /// `(package, stem)` → dataset object names; empty for unknown package/stem.
+    pub lookup: &'a dyn Fn(&str, &str) -> Vec<String>,
+    /// Default-attached base package names, searched for bare `data(stem)`.
+    pub base_packages: &'a HashSet<String>,
+}
+
+/// Expand one `data(...)` call's file-stem aliases to the dataset object
+/// names it binds, as lowest-precedence [`SymbolKind::Variable`] symbols
+/// attributed to a `package:`-style source URI (issue #429).
+///
+/// Semantics (exact, per the issue spec):
+/// - `package = Some(pkg)`: for each stem, bind every name in `pkg`'s
+///   `data_aliases[stem]`. The package need not be attached — `data(api,
+///   package = "survey")` works without `library(survey)`.
+/// - `package = None`: for each stem, search every package in
+///   `attached_packages` (the packages attached at-or-before the call, which
+///   the caller supplies) PLUS the default-attached `base_packages`, binding
+///   all matches from each.
+/// - Unknown package / empty aliases / no provider contribute nothing; the
+///   literal-stem `Def` fallback (recorded at artifact time) is unaffected.
+///
+/// Returns `(name, ScopedSymbol)` pairs the caller binds with lowest
+/// precedence (`entry().or_insert(...)`), so local defs and explicit package
+/// symbols always win. Shared by the recursive resolver and the streaming
+/// path so both agree on what a `data()` call makes visible.
+fn expand_data_load(
+    stems: &[String],
+    package: &Option<String>,
+    attached_packages: &HashSet<String>,
+    provider: &DataAliasProvider<'_>,
+) -> Vec<(Arc<str>, ScopedSymbol)> {
+    let mut out = Vec::new();
+    let push_objects = |pkg: &str, stem: &str, out: &mut Vec<(Arc<str>, ScopedSymbol)>| {
+        let package_uri = Url::parse(&format!("package:{}", pkg))
+            .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+        for obj in (provider.lookup)(pkg, stem) {
+            let name: Arc<str> = Arc::from(obj.as_str());
+            out.push((
+                name.clone(),
+                ScopedSymbol {
+                    name,
+                    kind: SymbolKind::Variable,
+                    source_uri: package_uri.clone(),
+                    defined_line: 0,
+                    defined_column: 0,
+                    signature: None,
+                    is_declared: false,
+                },
+            ));
+        }
+    };
+    for stem in stems {
+        match package {
+            Some(pkg) => push_objects(pkg, stem, &mut out),
+            None => {
+                for pkg in attached_packages
+                    .iter()
+                    .chain(provider.base_packages.iter())
+                {
+                    push_objects(pkg, stem, &mut out);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Extended scope resolution that also uses dependency graph edges.
@@ -4147,6 +4250,8 @@ pub fn scope_at_position_with_graph<F, G>(
     // and imported symbols can be resolved via the standard scope engine
     // (Phase 5a wires the actual scope injection).
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // `data()` file-stem alias provider (issue #429); see [`DataAliasProvider`].
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4182,6 +4287,7 @@ where
         true,
         None,
         package_contribution,
+        data_alias_provider,
     )
 }
 
@@ -4249,6 +4355,8 @@ pub fn scope_at_position_with_graph_cached<F, G>(
     // Package-mode contribution. When `Some`, synthetic package-internal and
     // imported symbols are injected into the root-file scope (Phase 5a).
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // `data()` file-stem alias provider (issue #429); see [`DataAliasProvider`].
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4337,6 +4445,7 @@ where
         true,
         Some(&prefix_arc),
         package_contribution,
+        data_alias_provider,
     )
 }
 
@@ -4555,6 +4664,14 @@ where
             false,
             None,
             None,
+            // Parent-prefix walk does not expand `data()` aliases (issue #429):
+            // the prefix is cached in a provider-independent `ParentPrefixCache`
+            // keyed only by `(uri, inside)`, so threading a provider here would
+            // poison the cache across Some/None callers. A parent file's
+            // `data()` expansion is therefore not inherited cross-file — out of
+            // scope for the issue's single-file acceptance criteria; the
+            // literal-stem `Def` fallback still flows through the prefix.
+            None,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -4759,6 +4876,12 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // Internal recursive calls (forward source children, parent walks) always
     // receive `None` — the contribution applies only to the root query file.
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // Provider expanding `data()` file-stem aliases to dataset object names
+    // (issue #429). Threaded to forward-source children (a sourced file's
+    // `data()` call expands too). The backward parent-prefix walk does NOT
+    // receive it — that prefix is cached provider-independently, so it always
+    // passes `None`. `None` disables expansion (literal-stem `Def` fallback).
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -5164,6 +5287,7 @@ where
                                 true,
                                 None,
                                 None,
+                                data_alias_provider,
                             )
                         } else {
                             scope_at_position_with_graph_recursive(
@@ -5186,6 +5310,7 @@ where
                                 false,
                                 None,
                                 None,
+                                data_alias_provider,
                             )
                         };
                         extend_visible_positions(
@@ -5340,10 +5465,42 @@ where
                         .or_insert_with(|| symbol.clone());
                 }
             }
-            ScopeEvent::DataLoad { .. } => {
-                // expansion handled at query time (issue #429); recording-only
-                // for now. The literal stems are already bound via their Def
-                // events above.
+            ScopeEvent::DataLoad {
+                line: dl_line,
+                column: dl_col,
+                stems,
+                package,
+                function_scope,
+            } => {
+                // Expand `data()` file-stem aliases to the dataset object names
+                // they bind (issue #429). Mirrors the PackageLoad arm above for
+                // position/function-scope gating; binds the expanded names at
+                // lowest precedence (`entry().or_insert`) so local defs and
+                // package symbols always win. `attached_packages` for the bare
+                // `data(stem)` form is the set attached at-or-before this event:
+                // packages loaded earlier in this file's timeline (already in
+                // `scope.loaded_packages`) plus inherited ones.
+                if let Some(provider) = data_alias_provider {
+                    let passes_position = (*dl_line, *dl_col) <= (line, column);
+                    let should_include = match function_scope {
+                        None => passes_position || query_inside_function,
+                        Some(dl_scope) => {
+                            passes_position && active_function_scopes.contains(dl_scope)
+                        }
+                    };
+                    if should_include {
+                        let attached: HashSet<String> = scope
+                            .loaded_packages
+                            .iter()
+                            .chain(scope.inherited_packages.iter())
+                            .cloned()
+                            .collect();
+                        for (name, symbol) in expand_data_load(stems, package, &attached, provider)
+                        {
+                            scope.symbols.entry(name).or_insert(symbol);
+                        }
+                    }
+                }
             }
         }
     }
@@ -5994,6 +6151,14 @@ where
     /// excluded (per-file keying in `test_helper_symbols`) so
     /// forward-reference diagnostics inside the preamble file still fire.
     contribution_symbol_names: HashSet<Arc<str>>,
+
+    /// `data()` file-stem alias provider (issue #429). When `Some`, the
+    /// `DataLoad` arms of `apply_event_to_strict` / `apply_event_to_late` bind
+    /// the expanded dataset object names into the event's frame at lowest
+    /// precedence. `None` disables expansion (literal-stem `Def` fallback
+    /// stays). Mirrors the recursive resolver's `data_alias_provider` so the
+    /// two paths agree on what a `data()` call makes visible.
+    data_alias_provider: Option<&'a DataAliasProvider<'a>>,
 }
 
 impl<'a, F, G> ScopeStream<'a, F, G>
@@ -6022,6 +6187,7 @@ where
         is_cancelled: &'a dyn Fn() -> bool,
         prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+        data_alias_provider: Option<&'a DataAliasProvider<'a>>,
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
@@ -6113,6 +6279,7 @@ where
             prefix_cache,
             package_contribution,
             contribution_symbol_names,
+            data_alias_provider,
         })
     }
 
@@ -6311,12 +6478,51 @@ where
                     }
                 }
             }
-            ScopeEvent::DataLoad { .. } => {
-                // expansion handled at query time (issue #429); recording-only
-                // for now. The literal stems are already applied via their Def
-                // events.
+            ScopeEvent::DataLoad {
+                line: _,
+                column: _,
+                stems,
+                package,
+                function_scope,
+            } => {
+                // Expand `data()` file-stem aliases to dataset object names
+                // (issue #429), mirroring the recursive resolver's DataLoad arm.
+                // `advance_to` only reaches this event when its effect position
+                // is <= the cursor, so position gating is already satisfied; the
+                // frame chosen by `pick_frame_mut` handles function-scope gating
+                // (a function-scoped `data()` binds only inside that frame). The
+                // bare `data(stem)` form searches the packages attached
+                // at-or-before this point — every frame's `packages` plus the
+                // prefix's `inherited_packages` — matching the recursive path's
+                // running `scope.loaded_packages ∪ inherited_packages`. Names are
+                // inserted with lowest precedence (`entry().or_insert`) so local
+                // defs and explicit package symbols win.
+                if let Some(provider) = self.data_alias_provider {
+                    let attached = self.attached_packages_so_far();
+                    let expanded = expand_data_load(&stems, &package, &attached, provider);
+                    if let Some(frame) = self.pick_frame_mut(function_scope) {
+                        for (name, symbol) in expanded {
+                            frame.removed_names.remove(&name);
+                            frame.symbols.entry(name).or_insert(symbol);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Set of packages attached at the cursor so far: every frame's
+    /// `packages` (global + active function frames) plus the prefix's
+    /// `inherited_packages`. Used by the `DataLoad` arm to resolve the bare
+    /// `data(stem)` form, mirroring the recursive resolver's running
+    /// `scope.loaded_packages ∪ scope.inherited_packages` at the event.
+    fn attached_packages_so_far(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = self.global_strict_frame.packages.iter().cloned().collect();
+        for (_iv, frame) in &self.function_stack {
+            out.extend(frame.packages.iter().cloned());
+        }
+        out.extend(self.choose_prefix().inherited_packages.iter().cloned());
+        out
     }
 
     /// Pick the frame to apply an event with the given `function_scope` to.
@@ -6776,10 +6982,28 @@ where
                     frame.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             },
-            ScopeEvent::DataLoad { .. } => {
-                // expansion handled at query time (issue #429); recording-only
-                // for now. The literal stems are already applied via their Def
-                // events.
+            ScopeEvent::DataLoad {
+                stems,
+                package,
+                function_scope,
+                ..
+            } => {
+                // Global `data()` calls only (late frame is the hoisted global
+                // scope). Expand into the late frame at lowest precedence,
+                // mirroring `apply_event_to_strict`'s DataLoad arm. Attached
+                // packages for the bare form are the late frame's own global
+                // packages plus the prefix's inherited packages.
+                if function_scope.is_some() {
+                    return;
+                }
+                if let Some(provider) = self.data_alias_provider {
+                    let mut attached: HashSet<String> = frame.packages.iter().cloned().collect();
+                    attached.extend(self.choose_prefix().inherited_packages.iter().cloned());
+                    for (name, symbol) in expand_data_load(stems, package, &attached, provider) {
+                        frame.removed_names.remove(&name);
+                        frame.symbols.entry(name).or_insert(symbol);
+                    }
+                }
             }
         }
     }
@@ -6922,6 +7146,7 @@ where
             true,
             Some(&child_prefix),
             None,
+            self.data_alias_provider,
         );
 
         // Forward-source leak rule (same-file + parent-prefix-only) lives in
@@ -7013,6 +7238,7 @@ where
         is_cancelled,
         prefix_cache,
         package_contribution,
+        None,
     ) {
         Some(stream) => stream,
         None => return 0,
@@ -8131,6 +8357,7 @@ mod tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
@@ -8298,6 +8525,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -8324,6 +8552,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -8401,6 +8630,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_inside_function.symbols.contains_key("child_var"),
@@ -8429,6 +8659,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -8543,6 +8774,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
@@ -8621,6 +8853,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -8743,6 +8976,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -8889,6 +9123,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -8995,6 +9230,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -9109,6 +9345,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
@@ -9199,6 +9436,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -11423,6 +11661,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("helper_func"),
@@ -11444,6 +11683,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -11464,6 +11704,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -11545,6 +11786,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("func_a"),
@@ -11573,6 +11815,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -11712,6 +11955,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_at_x.symbols.contains_key("z"),
@@ -11808,6 +12052,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -11900,6 +12145,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -11985,6 +12231,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_after_source.symbols.contains_key("helper_func"),
@@ -12006,6 +12253,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("helper_func"),
@@ -12026,6 +12274,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -12114,6 +12363,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_after_rm.symbols.contains_key("func_a"),
@@ -12201,6 +12451,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_in_child.symbols.contains_key("helper_func"),
@@ -12221,6 +12472,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -12326,6 +12578,7 @@ outside_var <- 2"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             scope_before_rm.symbols.contains_key("deep_func"),
@@ -12346,6 +12599,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -12460,6 +12714,7 @@ outside_var <- 2"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -14264,6 +14519,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited dplyr from parent
@@ -14344,6 +14600,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Child should NOT have dplyr (it was loaded after source() call)
@@ -14423,6 +14680,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -14509,6 +14767,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Child should NOT have dplyr (it's function-scoped in parent)
@@ -14583,6 +14842,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -14669,6 +14929,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Parent should have dplyr (loaded in child, available after source())
@@ -14750,6 +15011,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -14871,6 +15133,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Grandparent should have stringr (loaded in grandchild, propagated via loaded_packages)
@@ -14893,6 +15156,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -14975,6 +15239,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child SHOULD have dplyr (propagated from parent)
@@ -14997,6 +15262,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -15155,6 +15421,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -15258,6 +15525,7 @@ x <- 1"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -15281,6 +15549,7 @@ x <- 1"#;
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -15872,6 +16141,7 @@ y <- filter(df)"#;
                     &is_cancelled,
                     &prefix_cache,
                     None,
+                    None,
                 ).expect("stream construction must succeed");
 
                 for &(line, col) in &positions {
@@ -15893,6 +16163,7 @@ y <- filter(df)"#;
                         crate::cross_file::config::BackwardDependencyMode::Auto,
                         &is_cancelled,
                         &mut throwaway,
+                        None,
                         None,
                     );
 
@@ -16107,6 +16378,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
 
@@ -16130,6 +16402,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -16262,6 +16535,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(3, 0);
@@ -16282,6 +16556,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -16384,6 +16659,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(1, 0);
@@ -16404,6 +16680,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -16542,6 +16819,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(2, 0);
@@ -16562,6 +16840,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -16715,6 +16994,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(2, 0);
@@ -16735,6 +17015,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -16935,6 +17216,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(0, 0);
@@ -16961,6 +17243,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &mut throwaway_early,
                 None,
+                None,
             );
 
             // Direct resolver at the late position (after source fires).
@@ -16979,6 +17262,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway_late,
+                None,
                 None,
             );
 
@@ -17207,6 +17491,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &prefix_cache,
                 None,
+                None,
             )
             .expect("stream construction must succeed");
             stream.advance_to(2, 0);
@@ -17228,6 +17513,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -17365,6 +17651,7 @@ y <- filter(df)"#;
                 &is_cancelled,
                 &mut cache,
                 None,
+                None,
             );
 
             // Uncached resolver (seeds visited at the REAL (line, column)).
@@ -17381,6 +17668,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
+                None,
                 None,
             );
 
@@ -17630,6 +17918,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -17651,6 +17940,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -17704,6 +17994,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -17836,6 +18127,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -17924,6 +18216,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -18074,6 +18367,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -18215,6 +18509,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -18345,6 +18640,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -18485,6 +18781,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -18603,6 +18900,7 @@ y <- filter(df)"#;
                 false, // hoisting OFF
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -18738,6 +19036,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -18843,6 +19142,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -18959,6 +19259,7 @@ y <- filter(df)"#;
                 true, // hoisting ON, but query is at global level
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -19112,6 +19413,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -19252,6 +19554,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -19344,6 +19647,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
                 None,
             );
 
@@ -19470,6 +19774,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -19555,6 +19860,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -19692,6 +19998,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
                 None,
+                None,
             );
 
             assert!(
@@ -19719,6 +20026,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
                 None,
             );
 
@@ -19805,6 +20113,7 @@ y <- filter(df)"#;
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
                 None,
             );
 
@@ -19948,6 +20257,7 @@ y <- filter(df)"#;
             &|| false,
             &mut cache,
             None,
+            None,
         );
 
         // Query 2: inside child's function body (line 2 col 4).
@@ -19965,6 +20275,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             &mut cache,
+            None,
             None,
         );
 
@@ -20057,6 +20368,7 @@ y <- filter(df)"#;
                 &|| false,
                 &mut cache,
                 None,
+                None,
             );
             let direct = scope_at_position_with_graph(
                 &child_uri,
@@ -20071,6 +20383,7 @@ y <- filter(df)"#;
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &|| false,
+                None,
                 None,
             );
 
@@ -20167,6 +20480,7 @@ y <- filter(df)"#;
             &is_cancelled,
             &prefix_cache,
             None,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -20197,6 +20511,7 @@ y <- filter(df)"#;
                 crate::cross_file::config::BackwardDependencyMode::Auto,
                 &is_cancelled,
                 &mut throwaway,
+                None,
                 None,
             );
 
@@ -20302,6 +20617,7 @@ y <- filter(df)"#;
             &is_cancelled,
             &prefix_cache,
             None,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -20362,6 +20678,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &prefix_cache,
+            None,
             None,
         )
         .expect("stream construction must succeed");
@@ -20436,6 +20753,7 @@ y <- filter(df)"#;
             &is_cancelled,
             &prefix_cache,
             None,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -20462,6 +20780,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &mut throwaway,
+            None,
             None,
         );
         assert!(
@@ -20527,6 +20846,7 @@ y <- filter(df)"#;
             &is_cancelled,
             &prefix_cache,
             None,
+            None,
         )
         .expect("stream construction must succeed");
 
@@ -20565,6 +20885,7 @@ y <- filter(df)"#;
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &is_cancelled,
             &mut throwaway,
+            None,
             None,
         );
         assert!(
@@ -20705,6 +21026,221 @@ y <- filter(df)"#;
         assert!(
             after.symbols.contains_key("mtcars"),
             "data(mtcars) binding must be visible after the call (no-R fallback)"
+        );
+    }
+
+    // ---- data() alias expansion at query time (issue #429) ----
+
+    /// Build a fake `DataAliasProvider` over a static `(pkg, stem) -> objects`
+    /// map, with a configurable base-package set. Mirrors what production wires
+    /// from `PackageLibrary::data_objects_for_stem_sync` /
+    /// `PackageLibrary::base_packages`.
+    fn fake_alias_lookup(pkg: &str, stem: &str) -> Vec<String> {
+        match (pkg, stem) {
+            ("survey", "api") => vec!["apiclus1".into(), "apistrat".into()],
+            ("survival", "lung") => vec!["lung".into()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Resolve `uri` at EOF through the graph entry point with a `data()` alias
+    /// provider over `fake_alias_lookup` and the given base-package set.
+    fn scope_with_data_provider(
+        uri: &Url,
+        arts: &Arc<ScopeArtifacts>,
+        base_packages: &HashSet<String>,
+    ) -> ScopeAtPosition {
+        let get_artifacts =
+            |u: &Url| -> Option<Arc<ScopeArtifacts>> { (u == uri).then(|| arts.clone()) };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages,
+        };
+        scope_at_position_with_graph(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            Some(&provider),
+        )
+    }
+
+    #[test]
+    fn data_load_expands_explicit_package() {
+        // `data(api, package = "survey")` binds apiclus1/apistrat AND keeps the
+        // literal `api` binding.
+        let uri = test_uri();
+        let code = "data(api, package = \"survey\")\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        assert!(
+            scope.symbols.contains_key("apiclus1"),
+            "expected apiclus1 in scope: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(scope.symbols.contains_key("apistrat"));
+        assert!(
+            scope.symbols.contains_key("api"),
+            "literal stem `api` must still bind (no-R fallback)"
+        );
+    }
+
+    #[test]
+    fn data_load_bare_form_searches_attached_packages() {
+        // `library(survey)` then `data(api)` → bare form searches attached pkgs.
+        let uri = test_uri();
+        let code = "library(survey)\ndata(api)\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        assert!(
+            scope.symbols.contains_key("apiclus1"),
+            "bare data(api) after library(survey) must expand: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn data_load_empty_provider_keeps_literal_only() {
+        // Provider returns nothing for an unknown package → only `api` binds.
+        let uri = test_uri();
+        let code = "data(api, package = \"nonesuch\")\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        assert!(
+            !scope.symbols.contains_key("apiclus1"),
+            "unknown package must not expand"
+        );
+        assert!(
+            scope.symbols.contains_key("api"),
+            "literal stem `api` still binds"
+        );
+    }
+
+    #[test]
+    fn data_load_bare_form_without_library_does_not_expand() {
+        // `data(api)` with NO library(survey) and survey NOT base-attached →
+        // apiclus1 not in scope (attached-only search; base is exempt).
+        let uri = test_uri();
+        let code = "data(api)\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        assert!(
+            !scope.symbols.contains_key("apiclus1"),
+            "bare data(api) without library(survey) must NOT expand"
+        );
+        assert!(scope.symbols.contains_key("api"));
+    }
+
+    #[test]
+    fn data_load_bare_form_searches_base_packages() {
+        // Base default-attached packages ARE searched for the bare form.
+        // Model `survival` as base-attached so `data(lung)` expands via it.
+        let uri = test_uri();
+        let code = "data(lung)\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let base: HashSet<String> = ["survival".to_string()].into_iter().collect();
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &base);
+        assert!(
+            scope.symbols.contains_key("lung"),
+            "data(lung) must expand via base-attached survival"
+        );
+    }
+
+    #[test]
+    fn data_load_no_provider_keeps_literal() {
+        // Without a provider, expansion is disabled but the literal binds.
+        let uri = test_uri();
+        let code = "data(api, package = \"survey\")\n";
+        let arts = Arc::new(compute_artifacts(&uri, &parse_r(code), code));
+        let get_artifacts =
+            |u: &Url| -> Option<Arc<ScopeArtifacts>> { (u == &uri).then(|| arts.clone()) };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let scope = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!scope.symbols.contains_key("apiclus1"));
+        assert!(scope.symbols.contains_key("api"));
+    }
+
+    // ---- data() recorder edge cases (issue #429 gaps) ----
+
+    #[test]
+    fn data_call_zero_args_records_no_event() {
+        let code = "data()\n";
+        let arts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        assert!(
+            !arts
+                .timeline
+                .iter()
+                .any(|e| matches!(e, ScopeEvent::DataLoad { .. })),
+            "data() with no positional args must record no DataLoad event"
+        );
+    }
+
+    #[test]
+    fn data_call_nonliteral_package_records_package_none() {
+        // `package = pkg_var` is not a string literal → event records package: None.
+        let code = "data(api, package = pkg_var)\n";
+        let arts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let ev = arts.timeline.iter().find_map(|e| match e {
+            ScopeEvent::DataLoad { stems, package, .. } => Some((stems.clone(), package.clone())),
+            _ => None,
+        });
+        let (stems, package) = ev.expect("DataLoad event recorded");
+        assert_eq!(stems, vec!["api".to_string()]);
+        assert_eq!(package, None, "non-literal package must record None");
+    }
+
+    #[test]
+    fn data_call_function_scoped_excluded_from_top_level() {
+        // A `data()` inside a function body is function-scoped and must be
+        // excluded from `extract_top_level_data_loads`.
+        let code = "f <- function() {\n  data(api, package = \"survey\")\n}\n";
+        let arts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let fn_scoped = arts.timeline.iter().any(|e| {
+            matches!(
+                e,
+                ScopeEvent::DataLoad {
+                    function_scope: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            fn_scoped,
+            "data() inside function must have Some(function_scope)"
+        );
+        assert!(
+            extract_top_level_data_loads(&arts.timeline).is_empty(),
+            "function-scoped data() must not appear in top-level data loads"
         );
     }
 
@@ -20929,6 +21465,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_no_contrib.symbols.contains_key("helper"),
@@ -20951,6 +21488,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope_with_contrib.symbols.contains_key("helper"),
@@ -21009,6 +21547,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_no_contrib.symbols.contains_key("filter"),
@@ -21031,6 +21570,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope_with_contrib.symbols.contains_key("filter"),
@@ -21080,6 +21620,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("helper"),
@@ -21137,6 +21678,7 @@ mod package_contribution_tests {
                 super::super::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 Some(&contrib),
+                None,
             );
             assert!(
                 scope.symbols.contains_key("pkg_fn"),
@@ -21187,6 +21729,7 @@ mod package_contribution_tests {
                 super::super::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 Some(&contrib),
+                None,
             );
             scope.symbols.contains_key("pkg_fn")
         };
@@ -21255,6 +21798,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         // Package symbols ARE injected
         assert!(
@@ -21312,6 +21856,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("nonexistent_fn"),
@@ -21367,6 +21912,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("inst_only_fn"),
@@ -21416,6 +21962,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_no_contrib.symbols.contains_key("helper"),
@@ -21439,6 +21986,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope_with_contrib.symbols.contains_key("helper"),
@@ -21500,6 +22048,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(contrib),
+            None,
         )
     }
 
@@ -21696,6 +22245,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("test_helper"),
@@ -21746,6 +22296,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         let sym = scope.symbols.get("helper").expect("helper must be visible");
         // Local definition wins: source_uri should be the file URI, not package:
@@ -21802,6 +22353,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope.symbols.contains_key("Cholesky"),
@@ -21858,6 +22410,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("test_only_fn"),
@@ -21917,6 +22470,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         // Package symbols are injected
         assert!(
@@ -21984,6 +22538,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         // r_internal_symbols still injected (testit IS a recognized test dir).
         assert!(
@@ -22042,6 +22597,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         // `local_fn` must NOT be visible at line 0 (used before defined).
         assert!(
@@ -22113,6 +22669,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope.symbols.contains_key("mpg"),
@@ -22155,6 +22712,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope.symbols.contains_key("starwars"),
@@ -22192,6 +22750,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             scope.symbols.contains_key("mpg"),
@@ -22229,6 +22788,7 @@ mod package_contribution_tests {
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(&contrib),
+            None,
         );
         assert!(
             !scope.symbols.contains_key("mpg"),

@@ -2148,6 +2148,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_at_start.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should be available at start due to backward directive");
@@ -2165,6 +2166,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_at_middle.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should still be available");
@@ -2179,6 +2181,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(scope_at_end.symbols.contains_key(parent_symbol.as_str()),
@@ -2252,6 +2255,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(scope.symbols.contains_key(parent_symbol.as_str()),
@@ -2350,6 +2354,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // symbol_before (defined on line 0) should be available (before call site)
@@ -2437,6 +2442,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Default is "end", so all parent symbols should be included
@@ -2522,6 +2528,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(scope_with_end.symbols.contains_key(parent_symbol.as_str()),
@@ -5773,6 +5780,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm()");
@@ -5784,6 +5792,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm()");
@@ -5794,6 +5803,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_eof.symbols.contains_key(symbol.as_str()),
@@ -5854,6 +5864,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_to_remove.as_str()),
@@ -5918,6 +5929,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should be in scope before rm()");
@@ -5932,6 +5944,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
@@ -5990,6 +6003,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_before_remove.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before remove()");
@@ -6000,6 +6014,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_after_remove.symbols.contains_key(symbol.as_str()),
@@ -6054,6 +6069,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm(list=...)");
@@ -6064,6 +6080,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
@@ -6129,6 +6146,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should NOT be in scope after rm(list=c(...))");
@@ -6189,6 +6207,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_after_source.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after source() but before rm()");
@@ -6200,6 +6219,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm() but before redefinition");
@@ -6210,6 +6230,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(scope_after_redef.symbols.contains_key(symbol.as_str()),
@@ -6265,6 +6286,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
         prop_assert!(scope_in_child.symbols.contains_key(symbol.as_str()),
             "Symbol should still be in scope in child file (child's own definition)");
@@ -6275,6 +6297,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
         prop_assert!(!scope_in_parent.symbols.contains_key(symbol.as_str()),
@@ -8458,6 +8481,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited the package from parent
@@ -8524,6 +8548,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -8595,6 +8620,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -8675,6 +8701,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited pkg_before (loaded before source())
@@ -8754,6 +8781,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -8838,6 +8866,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited the package from grandparent (through parent)
@@ -8896,6 +8925,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -8984,6 +9014,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Parent should have the package (loaded in child, available after source())
@@ -9066,6 +9097,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Grandparent should have the package (loaded in grandchild)
@@ -9082,6 +9114,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -9153,6 +9186,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -9236,6 +9270,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child SHOULD have parent's package (forward propagation works)
@@ -9251,6 +9286,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -9309,6 +9345,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -9379,6 +9416,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -18435,6 +18473,7 @@ proptest! {
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             prop_assert!(
@@ -18461,6 +18500,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -18618,6 +18658,7 @@ proptest! {
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
                 None,
+                None,
             );
 
             prop_assert!(
@@ -18645,6 +18686,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -18796,6 +18838,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         prop_assert!(
@@ -18824,6 +18867,7 @@ proptest! {
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -18974,6 +19018,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         prop_assert!(
@@ -18998,6 +19043,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -21103,6 +21149,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited the declared symbol from parent (Requirement 9.1)
@@ -21196,6 +21243,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Child should NOT have the declared symbol (declaration is after source() call)
@@ -21287,6 +21335,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -21384,6 +21433,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -21513,6 +21563,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
 
         // Child should have inherited the declared symbol from grandparent through parent (Requirement 9.3)
@@ -21601,6 +21652,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -21699,6 +21751,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
 
@@ -22318,6 +22371,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Requirement 12.2: Declared symbol from indexed child should be available in parent's scope
@@ -22467,6 +22521,7 @@ proptest! {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         // Requirement 12.3: After opening, new declared symbol should be available
@@ -22597,6 +22652,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -22739,6 +22795,7 @@ proptest! {
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 

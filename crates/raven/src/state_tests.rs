@@ -592,6 +592,7 @@ mod package_testthat_visibility_tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(contribution),
+            None,
         );
         scope.symbols
     }
@@ -1028,6 +1029,7 @@ mod package_testthat_visibility_tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(state.package_state.scope_contribution()),
+            None,
         );
 
         assert!(
@@ -1090,6 +1092,7 @@ mod package_testthat_visibility_tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(state.package_state.scope_contribution()),
+            None,
         );
 
         assert!(
@@ -1173,6 +1176,7 @@ mod package_testthat_visibility_tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(state.package_state.scope_contribution()),
+            None,
         );
 
         assert!(
@@ -1259,6 +1263,7 @@ mod package_testthat_visibility_tests {
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(state.package_state.scope_contribution()),
+            None,
         );
         let symbols_b = scope_b.symbols;
         assert!(

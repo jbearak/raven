@@ -669,6 +669,11 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
         };
         if let Some(doc) = state.workspace_index.get(&uri) {
             packages.extend(doc.loaded_packages.iter().cloned());
+            // Issue #429: warm packages named in `data(..., package = "pkg")`
+            // so the diagnostics-time `data()` alias expansion can resolve the
+            // dataset object names. Unlike `library()` these are not attached,
+            // but their `data/` enumeration must be cached.
+            packages.extend(doc.data_packages.iter().cloned());
         } else if is_chunk_file(path) {
             // Chunk files are outside the R-only scan, so they have no index
             // entry. Read + construct a throwaway Document best-effort so its
@@ -681,6 +686,7 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
                 let doc =
                     crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
                 packages.extend(doc.loaded_packages.iter().cloned());
+                packages.extend(doc.data_packages.iter().cloned());
             }
         }
     }

@@ -727,6 +727,24 @@ impl PackageLibrary {
         self.packages.load().contains_key(name)
     }
 
+    /// Synchronous lookup of the object names a `data()` file-stem binds in a
+    /// package, for `data()` alias expansion in cross-file scope (issue #429).
+    ///
+    /// Returns the names in `package`'s `data_aliases[stem]` (e.g. survey's
+    /// `api` → `["apiclus1", "apistrat", ...]`), or an empty `Vec` when the
+    /// package is not cached, has no `data/` enumeration, or the stem is
+    /// unknown. Reads the current immutable `packages` snapshot via ArcSwap
+    /// `load()` (no promotion, no locking), matching the hot-path discipline of
+    /// [`is_cached_sync`] / [`is_symbol_from_loaded_packages`].
+    pub fn data_objects_for_stem_sync(&self, package: &str, stem: &str) -> Vec<String> {
+        let cache = self.packages.load();
+        cache
+            .get(package)
+            .and_then(|info| info.data_aliases.get(stem))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Get the number of cached packages
     pub async fn cached_count(&self) -> usize {
         let cache = self.packages.load();

@@ -180,6 +180,12 @@ pub struct Document {
     pub contents: Rope,
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
+    /// Packages named in `data(..., package = "pkg")` calls (issue #429). These
+    /// are NOT attached like `library()` packages, but their `data/` enumeration
+    /// must be warmed so `data()` alias expansion can resolve the dataset object
+    /// names at diagnostics time. Extracted from the same `(tree, text)` pair as
+    /// `loaded_packages`. Distinct field because the attachment semantics differ.
+    pub data_packages: Vec<String>,
     pub file_type: FileType,
     /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`/`.qmd` documents
     /// and for untitled buffers whose `languageId` is `rmd`/`quarto`; `R`
@@ -249,10 +255,12 @@ impl Document {
         // Extract from the SAME text the tree was parsed from, so `library()`
         // calls inside chunks are found and prose mentions are not.
         let loaded_packages = extract_loaded_packages(&tree, analysis_text);
+        let data_packages = extract_data_packages(&tree, analysis_text);
         Self {
             contents,
             tree,
             loaded_packages,
+            data_packages,
             file_type,
             chunk_kind,
             masked_text,
@@ -306,6 +314,7 @@ impl Document {
 
         self.tree = parse_document_text(analysis_text, self.file_type);
         self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
+        self.data_packages = extract_data_packages(&self.tree, analysis_text);
     }
 
     pub fn text(&self) -> String {
@@ -407,6 +416,60 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
                                 packages.push(pkg_name.to_string());
                                 break;
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        let child_count = node.child_count();
+        for i in (0..child_count).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    packages
+}
+
+/// Extract package names from `data(..., package = "pkg")` / `utils::data(...)`
+/// calls (issue #429). Mirrors [`extract_loaded_packages`] but targets the
+/// `package =` string-literal named argument of `data()` calls so the CLI can
+/// warm those packages' `data/` enumeration for alias expansion. Only
+/// string-literal `package =` values are collected (a variable package arg
+/// can't be resolved statically).
+fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
+    let Some(tree) = tree else {
+        return Vec::new();
+    };
+
+    let mut packages = Vec::new();
+    let mut stack = vec![tree.root_node()];
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call"
+            && let Some(func_node) = node.child_by_field_name("function")
+        {
+            let is_data = match func_node.kind() {
+                "identifier" => &text[func_node.byte_range()] == "data",
+                "namespace_operator" => func_node
+                    .child_by_field_name("rhs")
+                    .is_some_and(|rhs| &text[rhs.byte_range()] == "data"),
+                _ => false,
+            };
+            if is_data && let Some(args_node) = node.child_by_field_name("arguments") {
+                for i in 0..args_node.child_count() {
+                    if let Some(child) = args_node.child(i as u32)
+                        && child.kind() == "argument"
+                        && let Some(name_node) = child.child_by_field_name("name")
+                        && &text[name_node.byte_range()] == "package"
+                        && let Some(value_node) = child.child_by_field_name("value")
+                        && value_node.kind() == "string"
+                    {
+                        let pkg = text[value_node.byte_range()]
+                            .trim_matches(|c: char| c == '"' || c == '\'');
+                        if !pkg.is_empty() {
+                            packages.push(pkg.to_string());
                         }
                     }
                 }

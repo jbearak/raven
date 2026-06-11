@@ -3741,6 +3741,10 @@ impl LanguageServer for Backend {
                     probe.backward_dependencies,
                     &|| false,
                     Some(&probe.scope_contribution),
+                    // Package-scope probe reads only `inherited_packages` /
+                    // `loaded_packages`, never `scope.symbols`, so `data()`
+                    // alias expansion (issue #429) is unnecessary here.
+                    None,
                 );
 
                 let mut pkgs = scope.inherited_packages;
@@ -4278,6 +4282,9 @@ impl LanguageServer for Backend {
                         probe.backward_dependencies,
                         &|| false,
                         Some(&probe.scope_contribution),
+                        // Probe reads only packages, not `scope.symbols`;
+                        // no `data()` alias expansion needed (issue #429).
+                        None,
                     );
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
@@ -7241,6 +7248,9 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             probe.backward_dependencies,
             &|| false,
             Some(&probe.scope_contribution),
+            // Probe reads only packages, not `scope.symbols`; no `data()`
+            // alias expansion needed (issue #429).
+            None,
         );
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
@@ -7624,6 +7634,9 @@ async fn run_libpath_consumer(
                             probe.backward_dependencies,
                             &|| false,
                             Some(&probe.scope_contribution),
+                            // Probe reads only packages, not `scope.symbols`;
+                            // no `data()` alias expansion needed (issue #429).
+                            None,
                         );
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
@@ -10278,6 +10291,7 @@ mod refresh_packages_tests {
             snapshot.backward_dependencies,
             &|| false,
             Some(&snapshot.scope_contribution),
+            None,
         );
         // dplyr appears in loaded_packages (from forward source() chain),
         // not inherited_packages (which come from backward/parent edges).

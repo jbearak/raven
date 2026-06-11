@@ -177,6 +177,7 @@ fn bench_scope_resolution(c: &mut Criterion) {
                     raven::cross_file::config::BackwardDependencyMode::Explicit,
                     &|| false,
                     None,
+                    None,
                 ))
             })
         });
@@ -307,6 +308,7 @@ fn bench_diagnostic_sweep(c: &mut Criterion) {
                             &is_cancelled,
                             &mut prefix_cache,
                             None,
+                            None,
                         );
                         for name in names {
                             if scope.symbols.contains_key(*name) {
@@ -340,6 +342,7 @@ fn bench_diagnostic_sweep(c: &mut Criterion) {
                             true,
                             raven::cross_file::config::BackwardDependencyMode::Explicit,
                             &is_cancelled,
+                            None,
                             None,
                         );
                         for name in names {
@@ -411,6 +414,7 @@ fn bench_scope_hotspots(c: &mut Criterion) {
                         true,
                         raven::cross_file::config::BackwardDependencyMode::Explicit,
                         &|| false,
+                        None,
                         None,
                     ))
                 })

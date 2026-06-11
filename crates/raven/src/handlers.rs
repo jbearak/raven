@@ -390,6 +390,19 @@ impl DiagnosticsSnapshot {
 
         let is_cancelled = || cancel.is_cancelled();
 
+        // `data()` alias expansion provider (issue #429): bind the dataset
+        // object names a `data()` call enumerates so they aren't flagged
+        // undefined. Disabled until the package library is ready (and packages
+        // are enabled) so we never expand against an empty cache.
+        let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+            self.package_library.data_objects_for_stem_sync(pkg, stem)
+        };
+        let data_provider = (self.cross_file_config.packages_enabled && self.package_library_ready)
+            .then(|| scope::DataAliasProvider {
+                lookup: &data_lookup,
+                base_packages: self.package_library.base_packages(),
+            });
+
         let mut cache = self.parent_prefix_cache.borrow_mut();
         scope::scope_at_position_with_graph_cached(
             uri,
@@ -406,6 +419,7 @@ impl DiagnosticsSnapshot {
             &is_cancelled,
             &mut cache,
             Some(&self.scope_contribution),
+            data_provider.as_ref(),
         )
     }
 }
@@ -3391,6 +3405,16 @@ pub(crate) fn get_cross_file_scope(
     let base_exports = cross_file_base_exports(state);
     let is_cancelled = || cancel.is_cancelled();
 
+    // `data()` alias expansion provider (issue #429); see `get_scope`.
+    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+        state.package_library.data_objects_for_stem_sync(pkg, stem)
+    };
+    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
+        .then(|| scope::DataAliasProvider {
+            lookup: &data_lookup,
+            base_packages: state.package_library.base_packages(),
+        });
+
     scope::scope_at_position_with_graph(
         uri,
         line,
@@ -3405,6 +3429,7 @@ pub(crate) fn get_cross_file_scope(
         state.cross_file_config.backward_dependencies,
         &is_cancelled,
         package_contribution,
+        data_provider.as_ref(),
     )
 }
 
@@ -3445,6 +3470,16 @@ pub(crate) fn get_cross_file_scope_with_cache(
     let base_exports = cross_file_base_exports(state);
     let is_cancelled = || cancel.is_cancelled();
 
+    // `data()` alias expansion provider (issue #429); see `get_scope`.
+    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+        state.package_library.data_objects_for_stem_sync(pkg, stem)
+    };
+    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
+        .then(|| scope::DataAliasProvider {
+            lookup: &data_lookup,
+            base_packages: state.package_library.base_packages(),
+        });
+
     scope::scope_at_position_with_graph_cached(
         uri,
         line,
@@ -3460,6 +3495,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         &is_cancelled,
         prefix_cache,
         package_contribution,
+        data_provider.as_ref(),
     )
 }
 
@@ -4866,6 +4902,9 @@ fn collect_max_depth_diagnostics_from_snapshot(
         snapshot.cross_file_config.backward_dependencies,
         &|| cancel.is_cancelled(),
         Some(&snapshot.scope_contribution),
+        // No `data()` alias expansion (issue #429): this pass only reads
+        // `scope_result.depth_exceeded`, never `scope.symbols`.
+        None,
     );
 
     {
@@ -5244,6 +5283,19 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         };
     let is_cancelled_fn = || cancel.is_cancelled();
 
+    // `data()` alias expansion provider (issue #429); see `get_scope`.
+    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+        snapshot
+            .package_library
+            .data_objects_for_stem_sync(pkg, stem)
+    };
+    let data_provider = (snapshot.cross_file_config.packages_enabled
+        && snapshot.package_library_ready)
+        .then(|| scope::DataAliasProvider {
+            lookup: &data_lookup,
+            base_packages: snapshot.package_library.base_packages(),
+        });
+
     let mut stream_opt = scope::ScopeStream::new(
         uri,
         &get_artifacts,
@@ -5257,6 +5309,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &is_cancelled_fn,
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
+        data_provider.as_ref(),
     );
 
     // Pre-compute the names of test-attached packages (testthat under
@@ -5846,6 +5899,19 @@ fn collect_undefined_variables_from_snapshot(
         };
     let is_cancelled_fn = || cancel.is_cancelled();
 
+    // `data()` alias expansion provider (issue #429); see `get_scope`.
+    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+        snapshot
+            .package_library
+            .data_objects_for_stem_sync(pkg, stem)
+    };
+    let data_provider = (snapshot.cross_file_config.packages_enabled
+        && snapshot.package_library_ready)
+        .then(|| scope::DataAliasProvider {
+            lookup: &data_lookup,
+            base_packages: snapshot.package_library.base_packages(),
+        });
+
     let mut stream_opt = scope::ScopeStream::new(
         uri,
         &get_artifacts,
@@ -5859,6 +5925,7 @@ fn collect_undefined_variables_from_snapshot(
         &is_cancelled_fn,
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
+        data_provider.as_ref(),
     );
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.
@@ -26103,6 +26170,172 @@ y <- totally_undefined_baseline()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    // ---- data() alias expansion end-to-end (issue #429) ----
+
+    /// Run `collect_undefined_variables_from_snapshot` over `code` for a
+    /// document that loads/uses datasets from a synthetic package carrying
+    /// `data_aliases`. Returns the diagnostic messages. Deterministic — no R.
+    async fn undefined_messages_with_data_pkg(code: &str) -> Vec<String> {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        // The provider is gated on `package_library_ready` (and packages
+        // enabled, which is the default), so flip readiness on.
+        state.package_library_ready = true;
+
+        // Synthetic `survey` package: data-file `api` enumerates apiclus1 /
+        // apistrat (a multi-object data file — the case file-stem `lazy_data`
+        // can't cover).
+        let mut info = PackageInfo::new("survey".to_string(), std::collections::HashSet::new());
+        info.data_aliases.insert(
+            "api".to_string(),
+            vec!["apiclus1".to_string(), "apistrat".to_string()],
+        );
+        state.package_library.insert_package(info).await;
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = parse_r_code(code);
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    #[tokio::test]
+    async fn data_call_explicit_package_expands_e2e() {
+        // `data(api, package = "survey")` → apiclus1 resolves (not undefined).
+        let msgs =
+            undefined_messages_with_data_pkg("data(api, package = \"survey\")\nnrow(apiclus1)\n")
+                .await;
+        assert!(
+            !msgs.iter().any(|m| m.contains("apiclus1")),
+            "apiclus1 must resolve after data(api, package=survey); got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_call_bare_after_attach_expands_e2e() {
+        // `library(survey)` then `data(api)` → bare form searches attached pkgs.
+        let msgs =
+            undefined_messages_with_data_pkg("library(survey)\ndata(api)\nnrow(apistrat)\n").await;
+        assert!(
+            !msgs.iter().any(|m| m.contains("apistrat")),
+            "apistrat must resolve after library(survey)+data(api); got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_call_unrelated_name_still_flags_e2e() {
+        // NEGATIVE: a name the data file does NOT enumerate stays undefined.
+        let msgs =
+            undefined_messages_with_data_pkg("data(api, package = \"survey\")\nnrow(not_in_api)\n")
+                .await;
+        assert!(
+            msgs.iter().any(|m| m.contains("not_in_api")),
+            "a non-enumerated name must still flag; got: {msgs:?}"
+        );
+    }
+
+    /// R-gated end-to-end acceptance (issue #429). Builds a real package
+    /// library via the local R, runs `raven check`-equivalent diagnostics, and
+    /// asserts the three acceptance cases. Skips when R or a required package is
+    /// absent. The `emojis` negative (cli's sysdata must NOT leak) is asserted
+    /// whenever cli is present.
+    #[tokio::test]
+    async fn data_alias_acceptance_with_real_r() {
+        use crate::state::{Document, WorldState};
+
+        let outcome = crate::package_library::build_package_library(None, &[], None, true).await;
+        if !outcome.consumer_ready() {
+            eprintln!("skipping data_alias_acceptance_with_real_r: R/package library not ready");
+            return;
+        }
+        let lib = outcome.library;
+
+        async fn run(
+            lib: &std::sync::Arc<crate::package_library::PackageLibrary>,
+            code: &str,
+            attach_pkgs: &[&str],
+        ) -> Vec<String> {
+            // Warm the packages the snippet attaches AND any data(package=) pkgs.
+            let warm: Vec<String> = attach_pkgs.iter().map(|s| s.to_string()).collect();
+            lib.prefetch_packages(&warm).await;
+
+            let mut state = WorldState::new();
+            state.workspace_scan_complete = true;
+            state.package_library_ready = true;
+            state.package_library = lib.clone();
+
+            let uri = Url::parse("file:///acc.R").unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            let tree = parse_r_code(code);
+            let mut diagnostics = Vec::new();
+            let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+            collect_undefined_variables_from_snapshot(
+                &snapshot,
+                &uri,
+                tree.root_node(),
+                code,
+                DiagnosticSeverity::WARNING,
+                &mut diagnostics,
+                &mut std::collections::HashMap::new(),
+                &DiagCancelToken::never(),
+                None,
+            );
+            diagnostics.into_iter().map(|d| d.message).collect()
+        }
+
+        // t1: library(survival) → lung resolves (LazyData fold).
+        if lib.package_exists("survival") {
+            let msgs = run(&lib, "library(survival)\nlung\n", &["survival"]).await;
+            assert!(
+                !msgs.iter().any(|m| m.contains("lung")),
+                "lung must resolve after library(survival); got: {msgs:?}"
+            );
+        }
+
+        // t2: data(api, package = "survey") → apiclus1 resolves.
+        if lib.package_exists("survey") {
+            let msgs = run(
+                &lib,
+                "data(api, package = \"survey\")\napiclus1\n",
+                &["survey"],
+            )
+            .await;
+            assert!(
+                !msgs.iter().any(|m| m.contains("apiclus1")),
+                "apiclus1 must resolve after data(api, package=survey); got: {msgs:?}"
+            );
+        }
+
+        // t3 NEGATIVE: library(cli) → emojis (cli sysdata) STILL flags.
+        if lib.package_exists("cli") {
+            let msgs = run(&lib, "library(cli)\nemojis\n", &["cli"]).await;
+            assert!(
+                msgs.iter().any(|m| m.contains("emojis")),
+                "cli sysdata `emojis` must NOT leak — must still flag; got: {msgs:?}"
+            );
+        }
     }
 
     /// Sysdata symbols suppress undefined-variable in R/ source files.
@@ -51922,6 +52155,7 @@ source(\"helpers.R\")
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
         assert!(
             !scope_at.symbols.contains_key("xyz"),
@@ -52036,6 +52270,7 @@ source(\"helpers.R\")
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
             None,
+            None,
         );
         let in_loaded = scope_at.loaded_packages.contains("somepkg");
         let in_inherited = scope_at.inherited_packages.contains("somepkg");
@@ -52063,6 +52298,7 @@ source(\"helpers.R\")
             true,
             crate::cross_file::config::BackwardDependencyMode::Auto,
             &|| false,
+            None,
             None,
         );
         assert!(
@@ -52132,6 +52368,7 @@ source(\"helpers.R\")
                 &|| false,
                 &mut cache,
                 None,
+                None,
             );
             let direct = crate::cross_file::scope::scope_at_position_with_graph(
                 &uri,
@@ -52146,6 +52383,7 @@ source(\"helpers.R\")
                 snapshot.cross_file_config.hoist_globals_in_functions,
                 snapshot.cross_file_config.backward_dependencies,
                 &|| false,
+                None,
                 None,
             );
 
@@ -52375,6 +52613,7 @@ source(\"helpers.R\")
             &|| false,
             &mut cache,
             None,
+            None,
         );
 
         // The same-file leak filter must keep `xyz` out of scope at its own RHS.
@@ -52405,6 +52644,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
             None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();
@@ -52488,6 +52728,7 @@ source(\"helpers.R\")
             &|| false,
             &mut cache,
             None,
+            None,
         );
 
         assert!(
@@ -52515,6 +52756,7 @@ source(\"helpers.R\")
             snapshot.cross_file_config.hoist_globals_in_functions,
             snapshot.cross_file_config.backward_dependencies,
             &|| false,
+            None,
             None,
         );
         let cached_keys: BTreeSet<&str> = cached.symbols.keys().map(|n| n.as_ref()).collect();

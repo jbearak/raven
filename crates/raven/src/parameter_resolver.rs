@@ -768,6 +768,17 @@ fn get_scope(
         crate::handlers::empty_base_exports().clone()
     };
 
+    // `data()` alias expansion provider (issue #429); gated on package-library
+    // readiness so we never expand against an empty cache.
+    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+        state.package_library.data_objects_for_stem_sync(pkg, stem)
+    };
+    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
+        .then(|| scope::DataAliasProvider {
+            lookup: &data_lookup,
+            base_packages: state.package_library.base_packages(),
+        });
+
     scope::scope_at_position_with_graph(
         uri,
         position.line,
@@ -782,6 +793,7 @@ fn get_scope(
         state.cross_file_config.backward_dependencies,
         &|| false, // non-diagnostic path, no cancellation,
         Some(state.package_state.scope_contribution()),
+        data_provider.as_ref(),
     )
 }
 

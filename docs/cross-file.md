@@ -85,6 +85,8 @@ Base R packages are always available without explicit `library()` calls: **base*
 
 Lazy-loaded datasets are a related special case that does *not* require R. Packages expose data objects — `mtcars` and `iris` from the base `datasets` package, `flights` from **nycflights13**, `diamonds` from **ggplot2** — that appear in neither `NAMESPACE` `export()` lines nor `getNamespaceExports()`. Raven discovers these statically, by walking the package's `data/` directory and `INDEX` file, so they resolve as symbols with no subprocess. Base-package datasets are always available (auto-attached at startup); a non-base package's datasets become available after its `library()` call, exactly like its function exports, and resolve transitively through `Depends` and meta-packages (`library(tidyverse); diamonds`).
 
+`data()` calls bind a dataset's objects from the call onward, mirroring R. `data(api, package = "survey")` puts every object that the package's `api` data file binds — `apiclus1`, `apistrat`, … — in scope, even when a single data file ships several differently-named objects (the file stem and the object names differ). The bare form `data(api)` (no `package =`) searches every package attached at-or-before the call plus the default-attached base packages. The literal argument (`api`) is always bound too, so the behavior degrades gracefully when R is unavailable. Resolving the *object* names (beyond the file stem) requires a `data/` enumeration, captured when the package is loaded; `raven check` warms the packages named in `data(package = …)` for this. A package's `:::`-internal `sysdata` objects are never exposed this way.
+
 ### Position-Aware Loading
 
 Package exports are only available after the `library()` call:
