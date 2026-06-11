@@ -2880,6 +2880,30 @@ fn callee_leaf_name<'a>(func: Node<'a>, text: &'a str) -> Option<&'a str> {
     }
 }
 
+/// The namespace qualifier of a call's `function` node: `Some("pkg")` for a
+/// `pkg::fn` / `pkg:::fn` namespace operator, or `None` for a bare identifier.
+/// Lets recognizers of namespace-specific verbs (e.g. `utils::globalVariables`,
+/// `rlang::env_bind_lazy`) accept the bare or correctly-qualified call while
+/// rejecting an unrelated package that happens to export the same name.
+fn callee_namespace<'a>(func: Node<'a>, text: &'a str) -> Option<&'a str> {
+    if func.kind() == "namespace_operator" {
+        func.child_by_field_name("lhs")
+            .map(|lhs| node_text(lhs, text))
+    } else {
+        None
+    }
+}
+
+/// True when a call's callee is bare (no `::`) or qualified by one of the
+/// `allowed` namespaces. Used to keep namespace-specific recognizers from
+/// honoring a same-named function from an unrelated package.
+fn callee_namespace_allowed(func: Node, text: &str, allowed: &[&str]) -> bool {
+    match callee_namespace(func, text) {
+        None => true,
+        Some(ns) => allowed.contains(&ns),
+    }
+}
+
 /// Extract the names declared by a `globalVariables(...)` /
 /// `utils::globalVariables(...)` call.
 ///
@@ -2898,7 +2922,9 @@ fn try_extract_global_variables_definitions(
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
     };
-    if callee_leaf_name(func_node, line_index.text) != Some("globalVariables") {
+    if callee_leaf_name(func_node, line_index.text) != Some("globalVariables")
+        || !callee_namespace_allowed(func_node, line_index.text, &["utils"])
+    {
         return Vec::new();
     }
 
@@ -2998,7 +3024,9 @@ fn try_extract_env_bind_definitions(
         return Vec::new();
     };
     let verb = callee_leaf_name(func_node, line_index.text);
-    if !matches!(verb, Some("env_bind_active" | "env_bind_lazy")) {
+    if !matches!(verb, Some("env_bind_active" | "env_bind_lazy"))
+        || !callee_namespace_allowed(func_node, line_index.text, &["rlang"])
+    {
         return Vec::new();
     }
     // `.eval_env` is a control formal of `env_bind_lazy` only; `env_bind_active`
@@ -3026,7 +3054,9 @@ fn try_extract_env_bind_definitions(
                 && let Some(f) = value.child_by_field_name("function")
             {
                 // Accept both bare `current_env()` and `rlang::current_env()`.
-                if callee_leaf_name(f, line_index.text) == Some("current_env") {
+                if callee_leaf_name(f, line_index.text) == Some("current_env")
+                    && callee_namespace_allowed(f, line_index.text, &["rlang"])
+                {
                     first_positional_is_current_env = true;
                 }
             }
@@ -7761,6 +7791,37 @@ mod tests {
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
         assert!(artifacts.exported_interface.contains_key(".eval_env"));
+    }
+
+    #[test]
+    fn test_global_variables_wrong_namespace_not_honored() {
+        // `globalVariables` is `utils::globalVariables`; an unrelated package
+        // that happens to export the name must NOT suppress diagnostics.
+        let code = r#"otherpkg::globalVariables(c("x", "y"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(!artifacts.exported_interface.contains_key("x"));
+        assert!(!artifacts.exported_interface.contains_key("y"));
+    }
+
+    #[test]
+    fn test_env_bind_wrong_namespace_not_bound() {
+        // `env_bind_lazy` is rlang's; a same-named function from another
+        // package must NOT create bindings.
+        let code = r#"notrlang::env_bind_lazy(current_env(), foo = 1)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(!artifacts.exported_interface.contains_key("foo"));
+    }
+
+    #[test]
+    fn test_env_bind_current_env_wrong_namespace_not_bound() {
+        // The target environment must be rlang's `current_env()`; qualifying it
+        // with another namespace means the target is unknown, so nothing binds.
+        let code = r#"env_bind_lazy(notrlang::current_env(), foo = 1)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(!artifacts.exported_interface.contains_key("foo"));
     }
 
     #[test]
