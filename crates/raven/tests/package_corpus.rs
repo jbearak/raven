@@ -16,6 +16,41 @@
 //! `RAVEN_CORPUS_GROUPS=base RAVEN_CORPUS_ALLOW_UNCLASSIFIED=1 cargo test -p raven --test package_corpus -- --ignored --nocapture`
 //! Add `RAVEN_CORPUS_KEEP_TEMP=1` to preserve fetched package sources for
 //! minimal-edit confirmation.
+//!
+//! # Provisioning the analysis environment
+//!
+//! Raven resolves a `library()`-attached package's exported symbols only when
+//! that package is **installed** in the R library the analysis environment sees.
+//! A strict run is therefore only reproducible on a machine with the packages
+//! the corpus sources attach installed; otherwise their symbols surface as
+//! `Undefined variable` diagnostics that don't match the ledger. Install them
+//! once from a CRAN mirror:
+//!
+//! ```r
+//! install.packages(c(
+//!   "AER", "Kendall", "Lahman", "bench", "betareg", "biglm", "binGroup",
+//!   "cliapp", "cmprsk", "datapasta", "devoid", "docopt", "drake", "drc",
+//!   "epiR", "ergm", "formattable", "gapminder", "geepack", "glmnet",
+//!   "glmnetUtils", "gmm", "joineRML", "lavaan", "lmodel2", "lsmeans",
+//!   "magick", "margins", "mclust", "mediation", "metafor", "mfx", "mlogit",
+//!   "modeltests", "muhaz", "multcomp", "nycflights13", "ordinal", "parsedate",
+//!   "pkgcache", "plm", "poLCA", "rcorpora", "repurrrsive", "spatialreg",
+//!   "speedglm", "systemfit", "tidycensus", "tidymodels", "tseries", "vars"
+//! ))
+//! ```
+//!
+//! `magick` additionally needs system ImageMagick first: on macOS,
+//! `brew install imagemagick` before `install.packages("magick")` (the R
+//! `magick` package builds against the system library — there is no `magick`
+//! Homebrew formula). The ledger assumes `magick` is installed (ragg's
+//! `image_*` symbols resolve through it); skipping it leaves three `image_*`
+//! diagnostics in ragg's `vignettes/ragg_quality.Rmd` unclassified.
+//!
+//! Four packages are not installable from CRAN and keep their ledger entries
+//! permanently: `async` and `css` (GitHub-only r-lib internals), `googlesheets`
+//! (archived), and `revdepcheck` (GitHub-only). Their symbols are correctly
+//! classified as functions from packages not installed in the analysis
+//! environment.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
