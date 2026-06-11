@@ -671,9 +671,147 @@ mod package_testthat_visibility_tests {
     }
 
     // ------------------------------------------------------------------
-    // Test B: R/ file does NOT see test-only symbol (asymmetry enforced)
+    // load_all(): a script calling devtools::load_all() sees package symbols
     // ------------------------------------------------------------------
 
+    /// End-to-end: a script under `internal/` (neither R/ nor a dev-context
+    /// dir) that calls `devtools::load_all()` sees the package's own R/
+    /// internal symbols, modeling the attach of the package under development.
+    #[test]
+    fn load_all_script_sees_package_internal_symbols() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .r_internal_symbols
+                .contains("drive_find")
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let script_uri = Url::parse("file:///work/pkg/internal/demo.R").unwrap();
+        let script_code = "devtools::load_all()\ndrive_find()\n";
+        let script_arts = make_artifacts(&script_uri, script_code);
+        assert!(
+            script_arts.calls_dev_load_all,
+            "compute_artifacts must flag the load_all() call"
+        );
+
+        let symbols = resolve_symbols(
+            &script_uri,
+            script_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            symbols.contains_key("drive_find"),
+            "package internal symbol must be visible after devtools::load_all(). visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Negative: a file OUTSIDE the package root that calls `load_all()` must
+    /// NOT pull in this package's internals. `load_all()` models attaching the
+    /// package only for files within its own source tree; a sibling scratch
+    /// file in the same workspace must still get real undefined-name
+    /// diagnostics.
+    #[test]
+    fn out_of_root_load_all_script_does_not_see_package_symbols() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // Sibling file under /work, OUTSIDE the package root /work/pkg.
+        let script_uri = Url::parse("file:///work/scratch.R").unwrap();
+        let script_code = "devtools::load_all()\ndrive_find()\n";
+        let script_arts = make_artifacts(&script_uri, script_code);
+        assert!(
+            script_arts.calls_dev_load_all,
+            "the load_all() call is still flagged regardless of path"
+        );
+
+        let symbols = resolve_symbols(
+            &script_uri,
+            script_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            !symbols.contains_key("drive_find"),
+            "an out-of-root file calling load_all() must not see package internals. visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Negative: the SAME `internal/` script WITHOUT a `load_all()` call does
+    /// NOT see the package's internal symbols — the injection is gated on the
+    /// call, not the path.
+    #[test]
+    fn internal_script_without_load_all_does_not_see_package_symbols() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let script_uri = Url::parse("file:///work/pkg/internal/demo.R").unwrap();
+        let script_code = "drive_find()\n";
+        let script_arts = make_artifacts(&script_uri, script_code);
+        assert!(!script_arts.calls_dev_load_all);
+
+        let symbols = resolve_symbols(
+            &script_uri,
+            script_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            !symbols.contains_key("drive_find"),
+            "without load_all(), an internal/ script must not see package internals"
+        );
+    }
+
+    /// Bare `load_all(".")` (pkgload re-export, no namespace qualifier) also
+    /// triggers the package-attach modeling.
+    #[test]
+    fn bare_load_all_call_is_detected() {
+        let uri = Url::parse("file:///work/pkg/internal/x.R").unwrap();
+        let arts = make_artifacts(&uri, "load_all(\".\")\nfoo()\n");
+        assert!(arts.calls_dev_load_all);
+    }
+
+    /// The `pkgload::load_all()` qualified form (devtools re-exports it) is
+    /// detected as well; an unrelated `somepkg::load_all()` is not.
+    #[test]
+    fn pkgload_load_all_detected_other_namespace_not() {
+        let uri = Url::parse("file:///work/pkg/internal/x.R").unwrap();
+        assert!(make_artifacts(&uri, "pkgload::load_all()\n").calls_dev_load_all);
+        assert!(!make_artifacts(&uri, "somepkg::load_all()\n").calls_dev_load_all);
+    }
+
+    // ------------------------------------------------------------------
+    // Test B: R/ file does NOT see test-only symbol (asymmetry enforced)
+    // ------------------------------------------------------------------
     /// End-to-end: a symbol defined only in tests/testthat/ must NOT appear
     /// in scope when resolving inside R/main.R — confirming the asymmetry.
     #[test]
