@@ -661,6 +661,85 @@ fn parse_multi_exports_output(
     Ok(result)
 }
 
+/// One dataset object enumerated by `data(package = ...)`.
+///
+/// R's `Item` column is `name` for a dataset whose object name matches its
+/// data-file stem, or `name (stem)` when a multi-object data file binds
+/// differently-named objects (e.g. survey's `data/api.rda` → `apiclus1 (api)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataObject {
+    /// The R object name bound by `data()` / lazy-loading (e.g. `apiclus1`).
+    pub name: String,
+    /// The data-file stem the object loads from (e.g. `api`); equals `name`
+    /// when the Item carried no parenthesized topic.
+    pub file_stem: String,
+}
+
+/// Parse one `Item` line from `data(package=)$results` into a [`DataObject`].
+#[allow(dead_code)] // used by get_multiple_package_datasets, added in the next commit
+fn parse_data_item(line: &str) -> Option<DataObject> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if let Some((name, rest)) = line.split_once(" (")
+        && let Some(stem) = rest.strip_suffix(')')
+    {
+        let (name, stem) = (name.trim(), stem.trim());
+        if !name.is_empty() && !stem.is_empty() {
+            return Some(DataObject {
+                name: name.to_string(),
+                file_stem: stem.to_string(),
+            });
+        }
+    }
+    Some(DataObject {
+        name: line.to_string(),
+        file_stem: line.to_string(),
+    })
+}
+
+/// Parse the marker-structured output of `get_multiple_package_datasets()`.
+/// Same framing as [`parse_multi_exports_output`]: a `__RAVEN_MULTI_DATASETS__`
+/// header, one `__PKG:name__` line per package, `__RAVEN_END__` terminator.
+#[allow(dead_code)] // used by get_multiple_package_datasets, added in the next commit
+fn parse_multi_datasets_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
+    let mut result = std::collections::HashMap::new();
+    let start = output
+        .find("__RAVEN_MULTI_DATASETS__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_DATASETS__ marker in R output"))?;
+    let section = &output[start + "__RAVEN_MULTI_DATASETS__".len()..];
+    let mut current_package: Option<String> = None;
+    let mut current_items: Vec<DataObject> = Vec::new();
+    for line in section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("__PKG:") && line.ends_with("__") {
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_items));
+            }
+            current_package = Some(line[6..line.len() - 2].to_string());
+        } else if line == "__RAVEN_END__" {
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_items));
+            }
+            break;
+        } else if current_package.is_some()
+            && let Some(obj) = parse_data_item(line)
+        {
+            current_items.push(obj);
+        }
+    }
+    if let Some(pkg) = current_package {
+        result.insert(pkg, std::mem::take(&mut current_items));
+    }
+    Ok(result)
+}
+
 /// Parse newline-separated R library paths into a vector of existing `PathBuf`s.
 ///
 /// Trims each line, ignores empty lines, converts each remaining line into a `PathBuf`,
@@ -1888,6 +1967,71 @@ mod tests {
             params.iter().any(|p| p.is_dots),
             "sum should have a ... parameter"
         );
+    }
+
+    #[test]
+    fn test_parse_data_item_plain() {
+        assert_eq!(
+            parse_data_item("lung"),
+            Some(DataObject {
+                name: "lung".to_string(),
+                file_stem: "lung".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_data_item_aliased() {
+        assert_eq!(
+            parse_data_item("apiclus1 (api)"),
+            Some(DataObject {
+                name: "apiclus1".to_string(),
+                file_stem: "api".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_data_item_empty_and_whitespace() {
+        assert_eq!(parse_data_item(""), None);
+        assert_eq!(parse_data_item("   "), None);
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_two_packages() {
+        let output = "\
+__RAVEN_MULTI_DATASETS__
+__PKG:survival__
+lung
+ovarian
+__PKG:survey__
+apiclus1 (api)
+apistrat (api)
+__RAVEN_END__
+";
+        let result = parse_multi_datasets_output(output).unwrap();
+        assert_eq!(result["survival"].len(), 2);
+        assert_eq!(result["survival"][0].name, "lung");
+        assert_eq!(
+            result["survey"][0],
+            DataObject {
+                name: "apiclus1".into(),
+                file_stem: "api".into()
+            }
+        );
+        assert_eq!(result["survey"][1].file_stem, "api");
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_empty_package() {
+        let output = "__RAVEN_MULTI_DATASETS__\n__PKG:cli__\n__RAVEN_END__\n";
+        let result = parse_multi_datasets_output(output).unwrap();
+        assert!(result["cli"].is_empty());
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_missing_marker() {
+        assert!(parse_multi_datasets_output("no marker here").is_err());
     }
 }
 
