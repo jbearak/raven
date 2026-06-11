@@ -4787,6 +4787,51 @@ where
     scope
 }
 
+/// Iterate the preamble-file entries of a `tests/testthat` contribution map
+/// (`test_helper_symbols` or `test_helper_attached_packages`) that are
+/// *visible* to `queried_path`, applying testthat's sourcing-order gate:
+///
+/// - a preamble file is only visible to test files in its OWN directory.
+///   testthat sources `helper*.R`/`setup*.R` for the tests in the same
+///   `tests/testthat/` directory; a file under `tests/testit/` (or any other
+///   directory) never sources them, so cross-directory entries are skipped —
+///   without this a `tests/testit/` file would inherit `tests/testthat/`
+///   preamble defs/attaches and silently mute legitimate diagnostics;
+/// - a preamble file never sees its OWN entry (its own defs/attaches are
+///   handled by the standard position-aware in-file path, preserving
+///   forward-reference diagnostics), and
+/// - when the queried file is itself a preamble file, it only sees preamble
+///   files testthat sources strictly before it (byte-lexicographic `<`, which
+///   reproduces `sort()` order and the helpers-before-setup phase because
+///   `"helper" < "setup"`).
+///
+/// `test-*.R` and other non-preamble test files in the same directory
+/// (`queried_is_preamble == false`) see every entry there. This is the single
+/// source of truth for the gate; [`compute_contribution_symbol_names`] and
+/// [`append_package_contribution`] both consume it so `is_visible` agrees with
+/// `snapshot()`.
+fn visible_preamble_entries<'a, V>(
+    map: &'a std::collections::BTreeMap<std::path::PathBuf, V>,
+    queried_path: &'a std::path::Path,
+    queried_is_preamble: bool,
+) -> impl Iterator<Item = &'a V> + 'a {
+    map.iter().filter_map(move |(preamble_path, value)| {
+        if preamble_path.as_path() == queried_path {
+            return None;
+        }
+        // Preambles only propagate to test files in the same directory — the
+        // directory testthat actually sources them for. Blocks leakage into
+        // `tests/testit/` (and any nested subdir) when both frameworks coexist.
+        if preamble_path.parent() != queried_path.parent() {
+            return None;
+        }
+        if queried_is_preamble && preamble_path.as_path() >= queried_path {
+            return None;
+        }
+        Some(value)
+    })
+}
+
 /// Compute the set of symbol names the package contribution would inject
 /// for `queried_uri`, mirroring [`append_package_contribution`]'s path /
 /// `RFileKind` gating. Returns an empty set when there's no contribution
@@ -4867,13 +4912,11 @@ fn compute_contribution_symbol_names(
             .and_then(|n| n.to_str())
             .map(crate::package_state::is_test_preamble_filename)
             .unwrap_or(false);
-        for (preamble_path, syms) in contrib.test_helper_symbols.iter() {
-            if preamble_path == &path {
-                continue;
-            }
-            if queried_is_preamble && preamble_path >= &path {
-                continue;
-            }
+        for syms in visible_preamble_entries(
+            &contrib.test_helper_symbols,
+            path.as_path(),
+            queried_is_preamble,
+        ) {
             for sym in syms.iter() {
                 out.insert(Arc::from(sym.as_str()));
             }
@@ -4917,6 +4960,11 @@ pub fn is_package_internal_uri(uri: &Url) -> bool {
 /// - Every package in `contrib.test_attached_packages` is added to
 ///   `scope.inherited_packages`, modelling the implicit `library(testthat)`
 ///   that `tests/testthat.R` performs before sourcing each test file.
+/// - Every package in `contrib.test_helper_attached_packages` (top-level
+///   `library()`/`require()` attaches in the testthat preamble files) is added
+///   to `scope.inherited_packages`, modelling testthat sourcing those preamble
+///   files before each test. Gated by the same per-path skip + source-order
+///   rule as `test_helper_symbols`.
 ///
 /// Names already present in `symbols` are NOT overwritten — local and cross-file
 /// definitions always take precedence. `full_imports` entries are intentionally
@@ -5108,10 +5156,13 @@ pub(crate) fn append_package_contribution(
 
     // Test-only contributions: only inject when the queried file is under
     // `tests/testthat/` or `tests/testit/` (NOT plain `tests/*.R`). Helper
-    // symbols are visible to peer test files; attached packages model
-    // `testthat::test_check`'s implicit `library(testthat)` before sourcing
-    // tests. Neither propagates into R/ or plain test scripts — that
-    // asymmetry is preserved by gating on `is_testthat_or_testit_test` here.
+    // symbols are visible to peer test files in the SAME directory; attached
+    // packages model `testthat::test_check`'s implicit `library(testthat)`
+    // before sourcing tests. Neither propagates into R/ or plain test scripts
+    // — that asymmetry is preserved by gating on `is_testthat_or_testit_test`
+    // here. Preamble defs/attaches are further restricted to their own
+    // directory by `visible_preamble_entries`, so `tests/testit/` files never
+    // inherit `tests/testthat/` preambles when both frameworks coexist.
     if kind == crate::package_state::RFileKind::Test
         && crate::package_state::is_testthat_or_testit_test(&path, root)
     {
@@ -5130,26 +5181,20 @@ pub(crate) fn append_package_contribution(
         // top-level code never sees `helper-c.R`'s defs, and no helper
         // sees any setup file's defs. For non-preamble test files
         // (`test-*.R`, etc.), all preamble files have already been
-        // sourced by the time the test runs, so all are visible.
+        // sourced by the time the test runs, so all are visible. The
+        // shared `visible_preamble_entries` gate is the single source of
+        // truth for this ordering (also used by
+        // `compute_contribution_symbol_names`).
         let queried_is_preamble = path
             .file_name()
             .and_then(|n| n.to_str())
             .map(crate::package_state::is_test_preamble_filename)
             .unwrap_or(false);
-        for (preamble_path, syms) in contrib.test_helper_symbols.iter() {
-            if preamble_path == &path {
-                continue;
-            }
-            // When the queried file is itself a preamble file, restrict
-            // visibility to preamble files that sort strictly before it
-            // (testthat's source order). `PathBuf` comparison is
-            // byte-lexicographic, which matches what `sort()` produces
-            // for the typical flat `tests/testthat/` layout — and since
-            // "helper" < "setup" byte-wise, it also reproduces the
-            // helpers-before-setup phase ordering.
-            if queried_is_preamble && preamble_path >= &path {
-                continue;
-            }
+        for syms in visible_preamble_entries(
+            &contrib.test_helper_symbols,
+            path.as_path(),
+            queried_is_preamble,
+        ) {
             for sym in syms.iter() {
                 let name: Arc<str> = Arc::from(sym.as_str());
                 scope
@@ -5168,6 +5213,25 @@ pub(crate) fn append_package_contribution(
         }
         for pkg in contrib.test_attached_packages.iter() {
             scope.inherited_packages.insert(pkg.clone());
+        }
+        // Issue #432: packages attached by testthat preamble files via a
+        // top-level `library()`/`require()` propagate to sibling tests, exactly
+        // like preamble top-level defs above. Same `visible_preamble_entries`
+        // gate: a preamble file never inherits its OWN attach here (the
+        // standard position-aware `library()` path already handles that, so a
+        // use BEFORE the attach in the same file still fires), and only sees
+        // attaches from preamble files testthat sources strictly before it.
+        // `test-*.R` and other non-preamble test files see them all. These feed
+        // `inherited_packages` (not the symbol set) — the attached package's
+        // exports are resolved by the package library like any other attach.
+        for pkgs in visible_preamble_entries(
+            &contrib.test_helper_attached_packages,
+            path.as_path(),
+            queried_is_preamble,
+        ) {
+            for pkg in pkgs.iter() {
+                scope.inherited_packages.insert(pkg.clone());
+            }
         }
     }
 }
@@ -19945,6 +20009,7 @@ mod package_contribution_tests {
             full_imports: Arc::new(BTreeSet::new()),
             test_attached_packages: Arc::new(BTreeSet::new()),
             test_helper_symbols: Arc::new(std::collections::BTreeMap::new()),
+            test_helper_attached_packages: Arc::new(std::collections::BTreeMap::new()),
             dataset_symbols: Arc::new(BTreeSet::new()),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),
@@ -20527,6 +20592,195 @@ mod package_contribution_tests {
         );
     }
 
+    /// Build a contribution carrying `test_helper_attached_packages` entries
+    /// (preamble-path → attached packages).
+    fn make_contribution_with_helper_attaches(
+        workspace_root_path: &str,
+        attaches: &[(&str, &[&str])],
+    ) -> PackageScopeContribution {
+        let mut contrib = make_contribution(workspace_root_path, &[], &[]);
+        let mut map: BTreeMap<std::path::PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
+        for (path, pkgs) in attaches {
+            let set: BTreeSet<String> = pkgs.iter().map(|p| p.to_string()).collect();
+            map.insert(std::path::PathBuf::from(path), Arc::new(set));
+        }
+        contrib.test_helper_attached_packages = Arc::new(map);
+        contrib
+    }
+
+    fn resolve_with_contrib(
+        uri: &Url,
+        code: &str,
+        contrib: &PackageScopeContribution,
+    ) -> ScopeAtPosition {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let arts = artifacts_for(uri, code);
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == uri { Some(arts.clone()) } else { None }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        scope_at_position_with_graph(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(contrib),
+        )
+    }
+
+    /// Issue #432: a package attached by a testthat preamble file is inherited
+    /// by sibling `test-*.R` files (via `scope.inherited_packages`).
+    #[test]
+    fn helper_attached_package_inherited_by_sibling_test() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-lib.R", &["tidyr"])],
+        );
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-a.R").unwrap();
+        let scope = resolve_with_contrib(&test_uri, "df <- pivot_wider(x)\n", &contrib);
+        assert!(
+            scope.inherited_packages.contains("tidyr"),
+            "test-a.R must inherit tidyr attached by helper-lib.R; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    /// One-way visibility: a preamble attach must NOT reach `R/` files.
+    #[test]
+    fn helper_attached_package_not_inherited_by_r_file() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-lib.R", &["tidyr"])],
+        );
+        let r_uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+        let scope = resolve_with_contrib(&r_uri, "df <- pivot_wider(x)\n", &contrib);
+        assert!(
+            !scope.inherited_packages.contains("tidyr"),
+            "R/ files must NOT inherit preamble attaches; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    /// Plain `tests/*.R` scripts are not testthat-managed, so preamble attaches
+    /// must not reach them.
+    #[test]
+    fn helper_attached_package_not_inherited_by_plain_test_script() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-lib.R", &["tidyr"])],
+        );
+        let plain_uri = Url::parse("file:///work/pkg/tests/Simple.R").unwrap();
+        let scope = resolve_with_contrib(&plain_uri, "df <- pivot_wider(x)\n", &contrib);
+        assert!(
+            !scope.inherited_packages.contains("tidyr"),
+            "plain tests/*.R must NOT inherit testthat preamble attaches; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    /// Source-order gate: a preamble file does NOT inherit its OWN attach via
+    /// the contribution (the standard position-aware `library()` path handles
+    /// that), and only sees attaches from preamble files sourced strictly
+    /// before it. `helper-a.R` therefore does not inherit `helper-z.R`'s attach,
+    /// while `helper-z.R` inherits `helper-a.R`'s.
+    #[test]
+    fn helper_attached_package_respects_source_order_between_preamble_files() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[
+                ("/work/pkg/tests/testthat/helper-a.R", &["dplyr"]),
+                ("/work/pkg/tests/testthat/helper-z.R", &["tidyr"]),
+            ],
+        );
+
+        // helper-a.R (sourced first): sees neither its own attach nor the
+        // later helper-z.R's.
+        let a_uri = Url::parse("file:///work/pkg/tests/testthat/helper-a.R").unwrap();
+        let scope_a = resolve_with_contrib(&a_uri, "x <- 1\n", &contrib);
+        assert!(
+            !scope_a.inherited_packages.contains("dplyr"),
+            "helper-a.R must not inherit its OWN attach via the contribution: {:?}",
+            scope_a.inherited_packages,
+        );
+        assert!(
+            !scope_a.inherited_packages.contains("tidyr"),
+            "helper-a.R must not see later-sourced helper-z.R's attach: {:?}",
+            scope_a.inherited_packages,
+        );
+
+        // helper-z.R (sourced later): inherits helper-a.R's attach.
+        let z_uri = Url::parse("file:///work/pkg/tests/testthat/helper-z.R").unwrap();
+        let scope_z = resolve_with_contrib(&z_uri, "x <- 1\n", &contrib);
+        assert!(
+            scope_z.inherited_packages.contains("dplyr"),
+            "helper-z.R must inherit earlier helper-a.R's attach: {:?}",
+            scope_z.inherited_packages,
+        );
+    }
+
+    /// Cross-phase source order: testthat sources all `helper*.R` (sorted)
+    /// THEN all `setup*.R` (sorted). Byte-lexicographically `"helper" <
+    /// "setup"`, so a helper file must NOT see a setup file's attach, while a
+    /// setup file sees all helpers' attaches.
+    #[test]
+    fn helper_attached_package_helpers_sourced_before_setups() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[
+                ("/work/pkg/tests/testthat/helper-a.R", &["dplyr"]),
+                ("/work/pkg/tests/testthat/setup-env.R", &["tidyr"]),
+            ],
+        );
+
+        // helper-a.R is sourced in the helpers phase, before any setup file:
+        // it must not see setup-env.R's tidyr attach.
+        let helper_uri = Url::parse("file:///work/pkg/tests/testthat/helper-a.R").unwrap();
+        let scope_helper = resolve_with_contrib(&helper_uri, "x <- 1\n", &contrib);
+        assert!(
+            !scope_helper.inherited_packages.contains("tidyr"),
+            "helper-a.R must not see later setup-env.R's attach: {:?}",
+            scope_helper.inherited_packages,
+        );
+
+        // setup-env.R is sourced after all helpers: it sees helper-a.R's dplyr.
+        let setup_uri = Url::parse("file:///work/pkg/tests/testthat/setup-env.R").unwrap();
+        let scope_setup = resolve_with_contrib(&setup_uri, "x <- 1\n", &contrib);
+        assert!(
+            scope_setup.inherited_packages.contains("dplyr"),
+            "setup-env.R must inherit helper-a.R's attach (helpers precede setups): {:?}",
+            scope_setup.inherited_packages,
+        );
+    }
+
+    /// Issue #432 leak guard: `tests/testit/` files do NOT source
+    /// `tests/testthat/` preambles, so a testthat helper's attach must not be
+    /// inherited by a testit sibling (the directory differs).
+    /// `visible_preamble_entries`' same-directory gate enforces this.
+    #[test]
+    fn helper_attached_package_does_not_leak_from_testthat_to_testit() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-lib.R", &["tidyr"])],
+        );
+        let testit_uri = Url::parse("file:///work/pkg/tests/testit/test-x.R").unwrap();
+        let scope = resolve_with_contrib(&testit_uri, "df <- pivot_wider(x)\n", &contrib);
+        assert!(
+            !scope.inherited_packages.contains("tidyr"),
+            "tests/testit/ file must NOT inherit a tests/testthat/ preamble attach: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
     // ------------------------------------------------------------------
     // Test: test-file symbols do NOT pollute contribution seen by R/ files
     // ------------------------------------------------------------------
@@ -20817,6 +21071,68 @@ mod package_contribution_tests {
         );
     }
 
+    /// Issue #432 leak guard (definitions, PR #427): a `tests/testthat/`
+    /// preamble's top-level defs must not leak to a `tests/testit/` sibling —
+    /// testit does not source testthat preambles. The same-directory gate in
+    /// the shared `visible_preamble_entries` helper enforces this for defs
+    /// exactly as it does for attaches.
+    #[test]
+    fn testthat_helper_defs_do_not_leak_to_testit() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let testit_uri = Url::parse("file:///work/pkg/tests/testit/test-x.R").unwrap();
+        let test_code = "result <- use_helper()";
+        let test_arts = artifacts_for(&testit_uri, test_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &testit_uri {
+                Some(test_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+
+        // A testthat preamble (different directory) defines `use_helper`.
+        let mut contrib = make_contribution("/work/pkg", &["Cholesky"], &[]);
+        let mut helpers = std::collections::BTreeMap::new();
+        let mut helper_syms = BTreeSet::new();
+        helper_syms.insert("use_helper".to_string());
+        helpers.insert(
+            std::path::PathBuf::from("/work/pkg/tests/testthat/helper-utils.R"),
+            Arc::new(helper_syms),
+        );
+        contrib.test_helper_symbols = Arc::new(helpers);
+
+        let scope = scope_at_position_with_graph(
+            &testit_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+        );
+        // r_internal_symbols still injected (testit IS a recognized test dir).
+        assert!(
+            scope.symbols.contains_key("Cholesky"),
+            "testit file should see r_internal_symbols"
+        );
+        // But the testthat-directory helper def must NOT cross into testit.
+        assert!(
+            !scope.symbols.contains_key("use_helper"),
+            "tests/testit/ file must NOT receive tests/testthat/ helper defs. visible: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
     // ------------------------------------------------------------------
     // Test: used-before-defined preserved in plain test file
     // ------------------------------------------------------------------
@@ -20895,6 +21211,7 @@ mod package_contribution_tests {
             full_imports: Arc::new(BTreeSet::new()),
             test_attached_packages: Arc::new(BTreeSet::new()),
             test_helper_symbols: Arc::new(BTreeMap::new()),
+            test_helper_attached_packages: Arc::new(BTreeMap::new()),
             dataset_symbols: Arc::new(dataset_symbols),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),

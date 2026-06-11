@@ -102,6 +102,32 @@ files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
 - Helper/setup defs never propagate into `R/` (the one-way visibility into
   `R/` stays asymmetric).
 
+A preamble file's top-level `library()` / `require()` calls **attach** their
+packages for sibling test files too, mirroring the same sourcing semantics. A
+`tests/testthat/helper-lib.R` containing `library(tidyr)` makes tidyr's exports
+(`pivot_wider`, `tibble`, …) usable by bare name in every `test-*.R` file —
+without each test repeating the `library()` call — exactly as if testthat had
+attached tidyr before the test ran. `require(pkg, quietly = TRUE)` counts as an
+attach too. Neither `loadNamespace()` nor `requireNamespace()` attaches (they
+only enable qualified `pkg::fn` access), a `library()` call nested inside a
+function body does not attach until that function runs, and a call captured by a
+quoting wrapper (`quote()`, `bquote()`, `rlang::expr()`, …) is never evaluated —
+so none of these propagate.
+These attaches follow the same visibility rules as the defs above: source-order
+between preamble files, visible to test files **in the same directory**
+(`tests/testthat/` preambles never reach `tests/testit/` siblings, which don't
+source them), and **never** propagated into `R/`.
+
+```r
+# tests/testthat/helper-lib.R
+library(tidyr)
+
+# tests/testthat/test-a.R
+test_that("reshaping works", {
+  wide <- pivot_wider(long)  # No diagnostic — tidyr attached by the helper
+})
+```
+
 ```r
 # tests/testthat/helper-fixtures.R
 demo_input <- c(1, 2, 3)

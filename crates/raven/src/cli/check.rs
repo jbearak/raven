@@ -617,12 +617,16 @@ async fn maybe_init_r(
 /// relative to the editor.
 ///
 /// In package mode, also covers NAMESPACE whole-package `import(pkg)`
-/// directives (`scope_contribution.full_imports`). The undefined-variable
-/// check resolves both call- and value-position uses of a full import's
-/// exports via `is_package_export`, which needs the cache warm; without this
+/// directives (`scope_contribution.full_imports`) and packages attached by
+/// testthat preamble files (`scope_contribution.test_helper_attached_packages`,
+/// issue #432). For both, the undefined-variable
+/// check resolves call- and value-position uses of the package's exports via
+/// `is_package_export`, which needs the cache warm; without this
 /// the "pending" heuristic suppresses only call-position uses, so
 /// value-position references (default args, bare identifiers) would emit
 /// false "Undefined variable" diagnostics — an asymmetry the editor avoids.
+/// (The helper-attach union is flat; the source-order gate that governs
+/// visibility is irrelevant to warming.)
 ///
 /// Cross-file *inherited* packages (attached in a `source()`d file) and
 /// packages of non-chunk targets the scan did not index are not prefetched
@@ -644,6 +648,21 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
             .iter()
             .cloned(),
     );
+    // Package mode: packages attached by testthat preamble files
+    // (`helper*.R`/`setup*.R`) via `library()`/`require()` propagate to sibling
+    // test files (issue #432), so warm their exports too — the undefined-
+    // variable check resolves them via `is_package_export` reading the
+    // (preamble-injected) `inherited_packages`, which needs the cache warm.
+    // Warming is a union, so the source-order gate that governs *visibility*
+    // (see `append_package_contribution`) is irrelevant here.
+    for pkgs in state
+        .package_state
+        .scope_contribution()
+        .test_helper_attached_packages
+        .values()
+    {
+        packages.extend(pkgs.iter().cloned());
+    }
     for path in targets {
         let Ok(uri) = Url::from_file_path(path) else {
             continue;

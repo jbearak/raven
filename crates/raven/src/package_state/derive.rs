@@ -74,6 +74,12 @@ fn build_scope_contribution(
     // scope-injection layer can skip a preamble file's own self-injection.
     // Visible to peer test files; never injected into R/.
     //
+    // test_helper_attached_packages: same preamble files, but their top-level
+    // `library()`/`require()` *attaches* (see `RFileFacts::attached_packages`),
+    // also keyed by file path. Sibling tests inherit these packages because
+    // testthat sources the preamble before each test runs. Same one-way
+    // visibility as the defs: peer test files only, never R/.
+    //
     // Known limitation (matches `r_internal_symbols`): both sets are built
     // from `top_level_defs`, which captures every top-level assignment
     // without applying timeline-level `rm()` / `remove()`. A helper that
@@ -88,6 +94,8 @@ fn build_scope_contribution(
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
     let mut onload_all: BTreeSet<String> = BTreeSet::new();
     let mut test_helper_symbols: BTreeMap<PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
+    let mut test_helper_attached_packages: BTreeMap<PathBuf, Arc<BTreeSet<String>>> =
+        BTreeMap::new();
     for (path, facts) in r_file_facts {
         match facts.kind {
             RFileKind::Source => {
@@ -121,6 +129,15 @@ fn build_scope_contribution(
                     // `derive_package_state` O(preamble-file count) on the
                     // cached path instead of O(total preamble defs).
                     test_helper_symbols.insert(path.clone(), facts.top_level_defs.clone());
+                    // Same for top-level `library()`/`require()` attaches — a
+                    // helper/setup file's attaches propagate to sibling tests
+                    // (testthat sources the preamble before each test). Skip
+                    // the entry entirely when there are no attaches so the map
+                    // stays sparse (most preamble files attach nothing).
+                    if !facts.attached_packages.is_empty() {
+                        test_helper_attached_packages
+                            .insert(path.clone(), facts.attached_packages.clone());
+                    }
                 }
             }
         }
@@ -144,6 +161,7 @@ fn build_scope_contribution(
         full_imports: Arc::new(full_imports),
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
+        test_helper_attached_packages: Arc::new(test_helper_attached_packages),
         dataset_symbols: Arc::new(dataset_names.clone()),
         sysdata_symbols: Arc::new(sysdata_names.clone()),
         onload_symbols: Arc::new(onload_all),
@@ -255,6 +273,15 @@ fn derive_r_file_facts(
                 onload_bindings: Arc::new(crate::package_state::sysdata::extract_onload_bindings(
                     &file.text,
                 )),
+                // Only Test-kind files can contribute testthat-preamble attaches;
+                // skip the extra parse for Source files (their `library()` calls
+                // are handled by the standard position-aware scope path).
+                attached_packages: match file.kind {
+                    RFileKind::Test => Arc::new(
+                        crate::cross_file::source_detect::extract_attached_packages(&file.text),
+                    ),
+                    RFileKind::Source => Arc::new(BTreeSet::new()),
+                },
                 content_digest: file.content_digest,
             },
         };
@@ -1205,6 +1232,158 @@ foo <- function() 1
         let b_syms = map.get(&helper_b).expect("helper-b entry");
         assert!(b_syms.contains("fixture_b"));
         assert!(!b_syms.contains("fixture_a"));
+    }
+
+    /// Issue #432: a testthat preamble file's top-level `library()` attach
+    /// must populate `test_helper_attached_packages` (keyed by the preamble
+    /// path) so sibling test files inherit the attach. `loadNamespace()` and
+    /// attaches nested inside a function body must NOT count.
+    #[test]
+    fn scope_contribution_collects_helper_attached_packages() {
+        let helper_path: PathBuf = "/work/pkg/tests/testthat/helper-lib.R".into();
+        let helper_text: Arc<str> = concat!(
+            "library(tidyr)\n",
+            "require(dplyr)\n",
+            "loadNamespace(\"data.table\")\n",
+            "f <- function() library(stringr)\n",
+        )
+        .into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_path.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: helper_text.clone(),
+                content_digest: ContentDigest::of(&helper_text),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        let attached = s
+            .scope_contribution
+            .test_helper_attached_packages
+            .get(&helper_path)
+            .expect("helper-lib.R must have an attached-packages entry");
+        assert!(attached.contains("tidyr"), "got: {attached:?}");
+        assert!(attached.contains("dplyr"), "got: {attached:?}");
+        // loadNamespace does not attach.
+        assert!(!attached.contains("data.table"), "got: {attached:?}");
+        // Nested (function-body) library() does not attach at source time.
+        assert!(!attached.contains("stringr"), "got: {attached:?}");
+    }
+
+    /// Setup files attach packages for sibling tests too (testthat sources
+    /// `^setup.*\.[rR]$` before tests run).
+    #[test]
+    fn scope_contribution_collects_setup_attached_packages() {
+        let setup_path: PathBuf = "/work/pkg/tests/testthat/setup-pkgs.R".into();
+        let setup_text: Arc<str> = "library(tidyr)\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            setup_path.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: setup_text.clone(),
+                content_digest: ContentDigest::of(&setup_text),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert!(
+            s.scope_contribution
+                .test_helper_attached_packages
+                .get(&setup_path)
+                .is_some_and(|p| p.contains("tidyr")),
+            "setup file attach must be collected: {:?}",
+            s.scope_contribution.test_helper_attached_packages,
+        );
+    }
+
+    /// A `library()` attach in a NON-preamble test file (`test-*.R`) must NOT
+    /// populate `test_helper_attached_packages` — only preamble files are
+    /// sourced before sibling tests. (The test file's own attach is handled
+    /// by the standard position-aware `library()` path.) Likewise, attaches in
+    /// `R/*.R` never enter the contribution (one-way visibility).
+    #[test]
+    fn scope_contribution_excludes_non_preamble_and_source_attaches() {
+        let test_path: PathBuf = "/work/pkg/tests/testthat/test-a.R".into();
+        let r_path: PathBuf = "/work/pkg/R/f.R".into();
+        let test_text: Arc<str> = "library(tidyr)\n".into();
+        let r_text: Arc<str> = "library(dplyr)\nf <- function() 1\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            test_path,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: test_text.clone(),
+                content_digest: ContentDigest::of(&test_text),
+            },
+        );
+        inputs.r_files.insert(
+            r_path,
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+
+        assert!(
+            s.scope_contribution
+                .test_helper_attached_packages
+                .is_empty(),
+            "neither test-*.R nor R/*.R attaches should enter the contribution: {:?}",
+            s.scope_contribution.test_helper_attached_packages,
+        );
+    }
+
+    /// Subdirectory helpers are not auto-sourced by testthat, so their
+    /// attaches must not be collected either (mirrors the def behavior).
+    #[test]
+    fn helper_attaches_in_subdirectories_are_not_collected() {
+        let nested: PathBuf = "/work/pkg/tests/testthat/sub/helper-deep.R".into();
+        let nested_text: Arc<str> = "library(tidyr)\n".into();
+
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            nested,
+            RFileInput {
+                kind: RFileKind::Test,
+                text: nested_text.clone(),
+                content_digest: ContentDigest::of(&nested_text),
+            },
+        );
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            s.scope_contribution
+                .test_helper_attached_packages
+                .is_empty(),
+            "subdir helper attaches must NOT be collected: {:?}",
+            s.scope_contribution.test_helper_attached_packages,
+        );
     }
 
     // ------------------------------------------------------------------
