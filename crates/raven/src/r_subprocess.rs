@@ -780,6 +780,9 @@ fn parse_multi_datasets_output(
     if let Some(pkg) = current_package {
         result.insert(pkg, std::mem::take(&mut current_items));
     }
+
+    log::trace!("Multi-datasets query: {} packages", result.len());
+
     Ok(result)
 }
 
@@ -2103,10 +2106,9 @@ __RAVEN_END__
 
     #[tokio::test]
     async fn test_get_multiple_package_datasets_rejects_invalid_name() {
-        // Validation is pre-spawn, so this does not require R.
-        // We still use the same skip-if-absent idiom for consistency, but
-        // even if R is absent the validation error fires before any subprocess
-        // is launched, so this test always exercises the validation path.
+        // Validation fires before any subprocess is spawned, but constructing
+        // `RSubprocess` still requires R on PATH, so the test is skipped
+        // (like its neighbors) when R is absent.
         let Some(sub) = RSubprocess::new(None) else {
             eprintln!("R not available, skipping");
             return;
