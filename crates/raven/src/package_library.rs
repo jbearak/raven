@@ -130,6 +130,14 @@ pub struct PackageInfo {
     /// separate route: `initialize` merges them into `base_exports`, so their
     /// `PackageInfo.lazy_data` is left empty by design.
     pub lazy_data: Vec<String>,
+    /// Map from data-file stem to the object names that file binds, from R's
+    /// `data(package=)` enumeration (issue #429). Covers multi-object files
+    /// (survey: `api` → `apiclus1`, `apistrat`, ...). Populated for any
+    /// package with a `data/` dir when the R subprocess is available; empty
+    /// otherwise. Consumed only by `data()` call alias expansion in
+    /// cross-file scope — never injected after bare `library()` for
+    /// non-LazyData packages.
+    pub data_aliases: HashMap<String, Vec<String>>,
 }
 
 impl PackageInfo {
@@ -144,6 +152,7 @@ impl PackageInfo {
             is_meta_package,
             attached_packages,
             lazy_data: Vec::new(),
+            data_aliases: HashMap::new(),
         }
     }
 
@@ -163,6 +172,7 @@ impl PackageInfo {
             is_meta_package,
             attached_packages,
             lazy_data,
+            data_aliases: HashMap::new(),
         }
     }
 }
@@ -183,6 +193,33 @@ async fn package_info_from_dir(
 ) -> PackageInfo {
     let lazy_data = parse_data_symbols(pkg_dir).await;
     PackageInfo::with_details(name, exports, depends, lazy_data)
+}
+
+/// Fold R's `data(package=)` enumeration into a freshly-built `PackageInfo`.
+///
+/// `has_lazy_data_db` is the `data/Rdata.rdb` check: that DB exists iff
+/// DESCRIPTION sets LazyData, and only then does `library(pkg)` attach the
+/// datasets — so enumerated names replace `lazy_data` only in that case.
+/// Non-LazyData packages keep their static file-stem `lazy_data` (deliberately
+/// permissive; see issue #429 scope decisions). `data_aliases` is filled for
+/// both, feeding `data()` call alias expansion.
+fn apply_enumerated_data(
+    info: &mut PackageInfo,
+    enumerated: &[crate::r_subprocess::DataObject],
+    has_lazy_data_db: bool,
+) {
+    if enumerated.is_empty() {
+        return;
+    }
+    if has_lazy_data_db {
+        info.lazy_data = enumerated.iter().map(|d| d.name.clone()).collect();
+    }
+    for d in enumerated {
+        info.data_aliases
+            .entry(d.file_stem.clone())
+            .or_default()
+            .push(d.name.clone());
+    }
 }
 
 /// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
@@ -891,11 +928,57 @@ impl PackageLibrary {
             pattern_packages.len()
         );
 
+        // Issue #429: one batched dataset enumeration call for all packages
+        // that have a `data/` dir (both static and pattern paths below use it).
+        // Each R spawn is 75-350ms, so we batch once up front.
+        let mut datasets_map: HashMap<String, Vec<crate::r_subprocess::DataObject>> =
+            HashMap::new();
+        if let Some(ref r_subprocess) = self.r_subprocess {
+            // Collect names of packages with a data/ dir from both categories.
+            let mut data_pkgs: Vec<String> = Vec::new();
+            for (name, pkg_dir, _) in &static_packages {
+                if pkg_dir.join("data").is_dir() {
+                    data_pkgs.push(name.clone());
+                }
+            }
+            for pkg_name in &pattern_packages {
+                if let Some(pkg_dir) = self.find_package_directory(pkg_name)
+                    && pkg_dir.join("data").is_dir()
+                {
+                    data_pkgs.push(pkg_name.clone());
+                }
+            }
+            if !data_pkgs.is_empty() {
+                match r_subprocess.get_multiple_package_datasets(&data_pkgs).await {
+                    Ok(map) => {
+                        log::trace!(
+                            "Batched dataset enumeration returned {} entries for {} packages",
+                            map.values().map(|v| v.len()).sum::<usize>(),
+                            map.len()
+                        );
+                        datasets_map = map;
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "Batched dataset() enumeration failed: {} (static fallback for all)",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Step 1: Load static packages immediately (no R subprocess needed)
         for (name, pkg_dir, parse_result) in static_packages {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
-            let info =
+            let mut info =
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
+
+            // Apply dataset enumeration if available for this package.
+            if let Some(enumerated) = datasets_map.remove(&name) {
+                let has_db = pkg_dir.join("data").join("Rdata.rdb").is_file();
+                apply_enumerated_data(&mut info, &enumerated, has_db);
+            }
 
             log::trace!(
                 "Loaded {} exports + {} datasets for package '{}' statically",
@@ -926,18 +1009,25 @@ impl PackageLibrary {
                             // Depends and datasets come from the on-disk dir: the
                             // batched R export result carries neither. Datasets
                             // live under `data/`, not in `getNamespaceExports()`.
-                            let info = match self.find_package_directory(&pkg_name) {
+                            let mut info = match self.find_package_directory(&pkg_name) {
                                 Some(pkg_dir) => {
                                     let depends =
                                         parse_description_depends(&pkg_dir.join("DESCRIPTION"))
                                             .unwrap_or_default();
-                                    package_info_from_dir(
+                                    let mut i = package_info_from_dir(
                                         pkg_name.clone(),
                                         &pkg_dir,
                                         exports_set,
                                         depends,
                                     )
-                                    .await
+                                    .await;
+                                    // Apply dataset enumeration if available.
+                                    if let Some(enumerated) = datasets_map.remove(&pkg_name) {
+                                        let has_db =
+                                            pkg_dir.join("data").join("Rdata.rdb").is_file();
+                                        apply_enumerated_data(&mut i, &enumerated, has_db);
+                                    }
+                                    i
                                 }
                                 None => {
                                     // No on-disk directory for this package. When R
@@ -963,6 +1053,11 @@ impl PackageLibrary {
                                     })
                                 }
                             };
+                            // For packages that had no on-disk dir but still have
+                            // dataset entries, apply now (rare but consistent).
+                            if let Some(enumerated) = datasets_map.remove(&pkg_name) {
+                                apply_enumerated_data(&mut info, &enumerated, false);
+                            }
                             log::trace!(
                                 "Cached {} exports + {} datasets for pattern package '{}' from R",
                                 info.exports.len(),
@@ -1627,8 +1722,31 @@ impl PackageLibrary {
         };
 
         // Step 5: Create PackageInfo (incl. datasets from `data/`) and cache it.
-        let info =
+        let mut info =
             package_info_from_dir(name.to_string(), &pkg_dir, exports, parse_result.depends).await;
+
+        // Issue #429: enumerate lazy-data objects via R when the package ships data/.
+        let data_dir = pkg_dir.join("data");
+        if data_dir.is_dir()
+            && let Some(ref r_subprocess) = self.r_subprocess
+        {
+            let pkgs = vec![name.to_string()];
+            match r_subprocess.get_multiple_package_datasets(&pkgs).await {
+                Ok(mut map) => {
+                    if let Some(enumerated) = map.remove(name) {
+                        let has_db = data_dir.join("Rdata.rdb").is_file();
+                        apply_enumerated_data(&mut info, &enumerated, has_db);
+                    }
+                }
+                Err(e) => {
+                    log::trace!(
+                        "data() enumeration failed for '{}': {} (static fallback)",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
 
         log::trace!(
             "Created PackageInfo for '{}': {} exports, {} depends, is_meta_package={}",
@@ -4177,6 +4295,77 @@ mod tests {
         assert!(
             info.lazy_data.contains(&"planes".to_string()),
             "lazy_data should contain `planes`, got {:?}",
+            info.lazy_data
+        );
+    }
+
+    // ============================================================================
+    // Tests for apply_enumerated_data and data_aliases (issue #429)
+    // ============================================================================
+
+    #[test]
+    fn test_package_info_data_aliases_default_empty() {
+        let info = PackageInfo::new("pkg".to_string(), HashSet::new());
+        assert!(info.data_aliases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apply_enumerated_data_lazydata_package() {
+        // Rdata.rdb present → lazy_data replaced by enumerated names; aliases mapped.
+        let enumerated = vec![
+            crate::r_subprocess::DataObject {
+                name: "apiclus1".into(),
+                file_stem: "api".into(),
+            },
+            crate::r_subprocess::DataObject {
+                name: "apistrat".into(),
+                file_stem: "api".into(),
+            },
+            crate::r_subprocess::DataObject {
+                name: "lung".into(),
+                file_stem: "lung".into(),
+            },
+        ];
+        let mut info = PackageInfo::new("survey".to_string(), HashSet::new());
+        info.lazy_data = vec!["api".to_string()]; // static stem discovery result
+        apply_enumerated_data(&mut info, &enumerated, /* has_lazy_data_db */ true);
+        assert_eq!(info.lazy_data, vec!["apiclus1", "apistrat", "lung"]);
+        assert_eq!(info.data_aliases["api"], vec!["apiclus1", "apistrat"]);
+        assert_eq!(info.data_aliases["lung"], vec!["lung"]);
+    }
+
+    #[tokio::test]
+    async fn test_apply_enumerated_data_non_lazydata_package() {
+        // No Rdata.rdb → lazy_data untouched (permissive static stems stay); aliases still mapped.
+        let enumerated = vec![crate::r_subprocess::DataObject {
+            name: "apiclus1".into(),
+            file_stem: "api".into(),
+        }];
+        let mut info = PackageInfo::new("survey".to_string(), HashSet::new());
+        info.lazy_data = vec!["api".to_string()];
+        apply_enumerated_data(&mut info, &enumerated, false);
+        assert_eq!(info.lazy_data, vec!["api"]);
+        assert_eq!(info.data_aliases["api"], vec!["apiclus1"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_package_enumerates_datasets_with_r() {
+        // survival ships an Rdata.rdb with no datalist; its `lung` dataset is
+        // invisible to static stem discovery, so this exercises enumeration.
+        let r_subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let lib = PackageLibrary::new(Some(r_subprocess)).await;
+
+        let Some(info) = lib.get_package("survival").await else {
+            eprintln!("survival not installed, skipping");
+            return;
+        };
+        assert!(
+            info.lazy_data.contains(&"lung".to_string()),
+            "lazy_data should contain `lung`, got {:?}",
             info.lazy_data
         );
     }
