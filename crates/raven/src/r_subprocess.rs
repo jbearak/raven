@@ -500,6 +500,51 @@ cat("__RAVEN_END__\n")
         parse_multi_exports_output(&output)
     }
 
+    /// Enumerate dataset objects for multiple packages in one R call via
+    /// `data(package = "pkg")$results[, "Item"]` (issue #429).
+    ///
+    /// Items are `name` or `name (stem)`; both halves are preserved in
+    /// [`DataObject`] so callers can map file stems to bound object names.
+    /// Packages that error (not installed, no data) yield empty lists.
+    pub async fn get_multiple_package_datasets(
+        &self,
+        packages: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
+        if packages.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        for pkg in packages {
+            if !is_valid_package_name(pkg) {
+                return Err(anyhow!(
+                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                    pkg
+                ));
+            }
+        }
+        let packages_vector = packages
+            .iter()
+            .map(|p| format!("\"{}\"", p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let r_code = format!(
+            r#"
+pkgs <- c({})
+cat("__RAVEN_MULTI_DATASETS__\n")
+for (pkg in pkgs) {{
+    cat(paste0("__PKG:", pkg, "__\n"))
+    tryCatch({{
+        items <- suppressWarnings(data(package = pkg)$results)
+        if (length(items)) writeLines(items[, "Item"])
+    }}, error = function(e) {{}})
+}}
+cat("__RAVEN_END__\n")
+"#,
+            packages_vector
+        );
+        let output = self.execute_r_code(&r_code).await?;
+        parse_multi_datasets_output(&output)
+    }
+
     /// Query function parameters using `formals()`.
     ///
     /// Resolves the function object and extracts its formal parameters.
@@ -676,7 +721,6 @@ pub struct DataObject {
 }
 
 /// Parse one `Item` line from `data(package=)$results` into a [`DataObject`].
-#[allow(dead_code)] // used by get_multiple_package_datasets, added in the next commit
 fn parse_data_item(line: &str) -> Option<DataObject> {
     let line = line.trim();
     if line.is_empty() {
@@ -702,7 +746,6 @@ fn parse_data_item(line: &str) -> Option<DataObject> {
 /// Parse the marker-structured output of `get_multiple_package_datasets()`.
 /// Same framing as [`parse_multi_exports_output`]: a `__RAVEN_MULTI_DATASETS__`
 /// header, one `__PKG:name__` line per package, `__RAVEN_END__` terminator.
-#[allow(dead_code)] // used by get_multiple_package_datasets, added in the next commit
 fn parse_multi_datasets_output(
     output: &str,
 ) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
@@ -2032,6 +2075,47 @@ __RAVEN_END__
     #[test]
     fn test_parse_multi_datasets_output_missing_marker() {
         assert!(parse_multi_datasets_output("no marker here").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_multiple_package_datasets_base_datasets() {
+        // `datasets` ships with every R install; `state.abb (state)` exercises aliases.
+        let Some(sub) = RSubprocess::new(None) else {
+            eprintln!("R not available, skipping");
+            return;
+        };
+        let result = sub
+            .get_multiple_package_datasets(&["datasets".to_string()])
+            .await
+            .expect("query should succeed");
+        let items = &result["datasets"];
+        assert!(
+            items
+                .iter()
+                .any(|d| d.name == "mtcars" && d.file_stem == "mtcars")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|d| d.name == "state.abb" && d.file_stem == "state")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_multiple_package_datasets_rejects_invalid_name() {
+        // Validation is pre-spawn, so this does not require R.
+        // We still use the same skip-if-absent idiom for consistency, but
+        // even if R is absent the validation error fires before any subprocess
+        // is launched, so this test always exercises the validation path.
+        let Some(sub) = RSubprocess::new(None) else {
+            eprintln!("R not available, skipping");
+            return;
+        };
+        assert!(
+            sub.get_multiple_package_datasets(&["bad; system('x')".to_string()])
+                .await
+                .is_err()
+        );
     }
 }
 
