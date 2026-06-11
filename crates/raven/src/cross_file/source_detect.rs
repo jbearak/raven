@@ -1682,7 +1682,11 @@ mod tests {
     #[test]
     fn extract_attached_packages_empty_on_unparseable() {
         // Robustness: never panics, returns empty on garbage.
-        let _ = extract_attached_packages("library(\n");
+        let result = extract_attached_packages("library(\n");
+        assert!(
+            result.is_empty(),
+            "malformed input must yield no attached packages: {result:?}"
+        );
     }
 
     #[test]
