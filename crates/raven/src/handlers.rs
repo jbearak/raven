@@ -13710,7 +13710,7 @@ fn is_functional_sequence_head_dot(node: Node, text: &str) -> bool {
 
 /// True when `node` (an identifier `.`) is lexically inside the argument list
 /// of a `do(...)`, `all_vars(...)`, or `any_vars(...)` call (bare or
-/// `dplyr::`/`dbplyr::`-qualified). In `dplyr::do()` the `.` is the
+/// namespace-qualified). In `dplyr::do()` the `.` is the
 /// current-group data frame; in the scoped-verb predicates `all_vars()` /
 /// `any_vars()` it is the column under evaluation. Either way it is always
 /// bound, not a free variable.
@@ -13724,13 +13724,7 @@ fn is_inside_dplyr_dot_context(node: Node, text: &str) -> bool {
         if parent.kind() == "call"
             && let Some(func) = parent.child_by_field_name("function")
         {
-            let fn_name = match func.kind() {
-                "identifier" => Some(node_text(func, text)),
-                "namespace_operator" => func
-                    .child_by_field_name("rhs")
-                    .map(|rhs| node_text(rhs, text)),
-                _ => None,
-            };
+            let fn_name = callee_leaf_name(func, text);
             if matches!(fn_name, Some("do" | "all_vars" | "any_vars"))
                 && let Some(args) = parent.child_by_field_name("arguments")
                 && args.byte_range().contains(&node.start_byte())

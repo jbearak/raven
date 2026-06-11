@@ -2850,6 +2850,22 @@ fn try_extract_delayed_assign_call(
     })
 }
 
+/// The leaf name of a call's `function` node: the identifier itself, or the
+/// right-hand side of a `pkg::fn` / `pkg:::fn` namespace operator. Returns
+/// `None` for any other callee shape (e.g. a computed function). Mirrors the
+/// file-local helpers of the same name in `handlers.rs` and
+/// `cross_file::source_detect` — used by the recognizers that accept a verb
+/// regardless of which namespace qualifies it.
+fn callee_leaf_name<'a>(func: Node<'a>, text: &'a str) -> Option<&'a str> {
+    match func.kind() {
+        "identifier" => Some(node_text(func, text)),
+        "namespace_operator" => func
+            .child_by_field_name("rhs")
+            .map(|rhs| node_text(rhs, text)),
+        _ => None,
+    }
+}
+
 /// Extract the names declared by a `globalVariables(...)` /
 /// `utils::globalVariables(...)` call.
 ///
@@ -2868,14 +2884,7 @@ fn try_extract_global_variables_definitions(
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
     };
-    let is_global_variables = match func_node.kind() {
-        "identifier" => node_text(func_node, line_index.text) == "globalVariables",
-        "namespace_operator" => func_node
-            .child_by_field_name("rhs")
-            .is_some_and(|rhs| node_text(rhs, line_index.text) == "globalVariables"),
-        _ => false,
-    };
-    if !is_global_variables {
+    if callee_leaf_name(func_node, line_index.text) != Some("globalVariables") {
         return Vec::new();
     }
 
@@ -2959,10 +2968,13 @@ fn try_extract_global_variables_definitions(
 ///
 /// rlang's `env_bind_active`/`env_bind_lazy` install active/lazy bindings into
 /// the environment given as their first argument; every *named* argument
-/// becomes a binding of that name. We recognize only the `current_env()` form,
-/// where the target is the enclosing environment, so the new names are visible
-/// in the scope containing the call (from the end of the call onward). Binding
-/// into some other environment is not modeled — the names would not be local.
+/// becomes a binding of that name — except rlang's own control formals, which
+/// are not bindings (`.env`, the target environment, for both verbs; and
+/// `.eval_env`, the evaluation environment, for `env_bind_lazy` only). We
+/// recognize only the `current_env()` form, where the target is the enclosing
+/// environment, so the new names are visible in the scope containing the call
+/// (from the end of the call onward). Binding into some other environment is
+/// not modeled — the names would not be local.
 fn try_extract_env_bind_definitions(
     node: Node,
     line_index: &LineIndex,
@@ -2971,22 +2983,13 @@ fn try_extract_env_bind_definitions(
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
     };
-    let is_env_bind = match func_node.kind() {
-        "identifier" => matches!(
-            node_text(func_node, line_index.text),
-            "env_bind_active" | "env_bind_lazy"
-        ),
-        "namespace_operator" => func_node.child_by_field_name("rhs").is_some_and(|rhs| {
-            matches!(
-                node_text(rhs, line_index.text),
-                "env_bind_active" | "env_bind_lazy"
-            )
-        }),
-        _ => false,
-    };
-    if !is_env_bind {
+    let verb = callee_leaf_name(func_node, line_index.text);
+    if !matches!(verb, Some("env_bind_active" | "env_bind_lazy")) {
         return Vec::new();
     }
+    // `.eval_env` is a control formal of `env_bind_lazy` only; `env_bind_active`
+    // has no such formal, so a named `.eval_env` there IS a genuine binding.
+    let is_lazy = verb == Some("env_bind_lazy");
 
     let Some(args_node) = node.child_by_field_name("arguments") else {
         return Vec::new();
@@ -3009,14 +3012,7 @@ fn try_extract_env_bind_definitions(
                 && let Some(f) = value.child_by_field_name("function")
             {
                 // Accept both bare `current_env()` and `rlang::current_env()`.
-                let is_current_env = match f.kind() {
-                    "identifier" => node_text(f, line_index.text) == "current_env",
-                    "namespace_operator" => f
-                        .child_by_field_name("rhs")
-                        .is_some_and(|rhs| node_text(rhs, line_index.text) == "current_env"),
-                    _ => false,
-                };
-                if is_current_env {
+                if callee_leaf_name(f, line_index.text) == Some("current_env") {
                     first_positional_is_current_env = true;
                 }
             }
@@ -3033,6 +3029,14 @@ fn try_extract_env_bind_definitions(
         if let Some(name_node) = arg.child_by_field_name("name") {
             let name = node_text(name_node, line_index.text);
             if name.is_empty() {
+                continue;
+            }
+            // rlang's own control formals are not bindings: `.env` (the target
+            // environment, for both verbs) and `.eval_env` (env_bind_lazy's
+            // evaluation environment — only for the lazy variant). Modeling
+            // either as a new symbol would be a spurious definition, so skip
+            // them — every *other* named argument is a genuine binding.
+            if name == ".env" || (is_lazy && name == ".eval_env") {
                 continue;
             }
             symbols.push(ScopedSymbol {
@@ -7658,6 +7662,19 @@ mod tests {
     }
 
     #[test]
+    fn test_global_variables_c_vector_mixed_literal_and_non_literal() {
+        // Only the string-literal members of the c(...) are collected; a
+        // non-literal member (`dyn_name`) is silently skipped, not flagged.
+        let code = r#"globalVariables(c("alpha", dyn_name, "beta"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("alpha"));
+        assert!(artifacts.exported_interface.contains_key("beta"));
+        assert!(!artifacts.exported_interface.contains_key("dyn_name"));
+        assert_eq!(artifacts.exported_interface.len(), 2);
+    }
+
+    #[test]
     fn test_global_variables_dot_pronoun_not_honored() {
         // Packages list "." in globalVariables() to silence R CMD check, but
         // Raven resolves `.` by context; honoring it would mask real bugs.
@@ -7702,6 +7719,34 @@ mod tests {
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
         assert!(artifacts.exported_interface.contains_key("foo"));
+    }
+
+    #[test]
+    fn test_env_bind_lazy_control_formals_not_bound() {
+        // rlang's own control formals `.eval_env` (and `.env`) are NOT
+        // bindings; only the genuine named binding (`foo`) is modeled.
+        let code = r#"env_bind_lazy(current_env(), foo = catcher(x), .eval_env = parent.frame())"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.contains_key("foo"),
+            "the genuine binding must still be modeled"
+        );
+        assert!(
+            !artifacts.exported_interface.contains_key(".eval_env"),
+            "rlang control formal .eval_env must not become a symbol"
+        );
+    }
+
+    #[test]
+    fn test_env_bind_active_eval_env_is_a_binding() {
+        // `env_bind_active` has no `.eval_env` control formal, so a named
+        // `.eval_env` there is a genuine active binding and IS modeled. (The
+        // `.eval_env` skip is scoped to `env_bind_lazy`.)
+        let code = r#"env_bind_active(current_env(), .eval_env = function() 1)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key(".eval_env"));
     }
 
     #[test]
