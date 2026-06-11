@@ -666,6 +666,22 @@ pub enum ScopeEvent {
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
     },
+    /// A `data(...)` / `utils::data(...)` call. Carries the literal dataset
+    /// stems and the `package =` argument (when a string literal) so
+    /// query-time resolution can expand multi-object data-file aliases via
+    /// `PackageInfo.data_aliases` (issue #429). The literal stems are ALSO
+    /// bound as ordinary `Def` events at artifact time — that is the no-R
+    /// fallback and must not be removed.
+    DataLoad {
+        line: u32,
+        column: u32,
+        /// Positional dataset names exactly as written (`data(api)` → `["api"]`).
+        stems: Vec<String>,
+        /// `package = "..."` string-literal argument, if present.
+        package: Option<String>,
+        /// Function scope if inside a function (None = global)
+        function_scope: Option<FunctionScopeInterval>,
+    },
     /// A symbol declared via @lsp-var or @lsp-func directive.
     /// These directives allow users to declare symbols that cannot be statically
     /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
@@ -971,6 +987,7 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
         // events use just above.
         ScopeEvent::Removal { line, column, .. } => (*line, column.saturating_add(1)),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
         ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     }
 }
@@ -1080,6 +1097,18 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
                 function_scope,
                 ..
             } => {
+                *function_scope =
+                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+            }
+            ScopeEvent::DataLoad {
+                line,
+                column,
+                function_scope,
+                ..
+            } => {
+                // Annotate so query-time expansion (issue #429) can apply the
+                // same function-scope visibility as the Def events the literal
+                // stems produce.
                 *function_scope =
                     find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
             }
@@ -1236,8 +1265,14 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // F3: hash only the top-level interface (function-scope-filtered) so a
     // function-local rename never invalidates dependents that source this file.
     let top_level = top_level_interface(&artifacts);
-    artifacts.interface_hash =
-        compute_interface_hash(&top_level, &loaded_packages, &[], &removal_refs);
+    let data_loads = extract_top_level_data_loads(&artifacts.timeline);
+    artifacts.interface_hash = compute_interface_hash(
+        &top_level,
+        &loaded_packages,
+        &[],
+        &removal_refs,
+        &data_loads,
+    );
 
     artifacts
 }
@@ -1532,11 +1567,13 @@ pub fn compute_artifacts_with_metadata(
     // F3: hash only the top-level interface (function-scope-filtered) so a
     // function-local rename never invalidates dependents that source this file.
     let top_level = top_level_interface(&artifacts);
+    let data_loads = extract_top_level_data_loads(&artifacts.timeline);
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
         &declared_symbols,
         &removal_refs,
+        &data_loads,
     );
 
     artifacts
@@ -1694,6 +1731,11 @@ pub fn scope_at_position(
                         })
                         .or_insert_with(|| symbol.clone());
                 }
+            }
+            ScopeEvent::DataLoad { .. } => {
+                // expansion handled at query time (issue #429); recording-only
+                // for now. The literal stems are already bound via their Def
+                // events above.
             }
         }
     }
@@ -1914,6 +1956,11 @@ where
                         })
                         .or_insert_with(|| symbol.clone());
                 }
+            }
+            ScopeEvent::DataLoad { .. } => {
+                // expansion handled at query time (issue #429); recording-only
+                // for now. The literal stems are already bound via their Def
+                // events above.
             }
         }
     }
@@ -2195,7 +2242,8 @@ fn collect_definitions(
     // calling environment. Model each positional identifier/string arg as a
     // binding visible from the call's end position.
     if call_callee == Some("data") {
-        let data_symbols = try_extract_data_call_definitions(node, line_index, uri);
+        let (data_symbols, data_call_info) =
+            try_extract_data_call_definitions(node, line_index, uri);
         if !data_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
             for symbol in data_symbols {
@@ -2212,6 +2260,21 @@ fn collect_definitions(
                     .exported_interface
                     .insert(symbol.name.clone(), symbol);
             }
+        }
+        // Record the call as a DataLoad event for query-time data-file-alias
+        // expansion (issue #429). The literal stems above are the no-R
+        // fallback; this event is recording-only for now (consumed by a later
+        // task). `function_scope: None` is annotated later by
+        // `annotate_event_function_scopes`, matching the Def idiom above.
+        if let Some((stems, package)) = data_call_info {
+            let (line, column) = node_start_position_utf16(node, line_index);
+            artifacts.timeline.push(ScopeEvent::DataLoad {
+                line,
+                column,
+                stems,
+                package,
+                function_scope: None,
+            });
         }
     }
 
@@ -3297,15 +3360,22 @@ fn try_extract_literal_load_call_definition(
 /// `data(foo, "bar")` binds `foo` and `bar` in the calling environment from
 /// the call onward — the same semantics as `load()`. Only positional arguments
 /// that are bare identifiers or string literals are recognized; named arguments
-/// (`package=`, `envir=`, `list=`, etc.) are skipped.
+/// (`package=`, `envir=`, `list=`, etc.) are skipped for the literal binding.
+///
+/// Returns the bound `ScopedSymbol`s (the no-R fallback binding, byte-for-byte
+/// unchanged) plus, when at least one positional dataset is present, the call
+/// info `(stems, package)` used to record a [`ScopeEvent::DataLoad`] for
+/// query-time data-file-alias expansion (issue #429). `package` captures a
+/// `package = "..."` string-literal named argument when present.
+#[allow(clippy::type_complexity)]
 fn try_extract_data_call_definitions(
     node: Node,
     line_index: &LineIndex,
     uri: &Url,
-) -> Vec<ScopedSymbol> {
+) -> (Vec<ScopedSymbol>, Option<(Vec<String>, Option<String>)>) {
     let func_node = match node.child_by_field_name("function") {
         Some(f) => f,
-        None => return Vec::new(),
+        None => return (Vec::new(), None),
     };
 
     let is_data = match func_node.kind() {
@@ -3316,23 +3386,34 @@ fn try_extract_data_call_definitions(
         _ => false,
     };
     if !is_data {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let args_node = match node.child_by_field_name("arguments") {
         Some(a) => a,
-        None => return Vec::new(),
+        None => return (Vec::new(), None),
     };
 
     let (line, column) = node_start_position_utf16(node, line_index);
     let mut symbols = Vec::new();
+    let mut stems: Vec<String> = Vec::new();
+    let mut package: Option<String> = None;
 
     for child in args_node.children(&mut args_node.walk()) {
         if child.kind() != "argument" {
             continue;
         }
-        // Skip named arguments
-        if child.child_by_field_name("name").is_some() {
+        // Named arguments are not bound as datasets, but capture a
+        // `package = "..."` string literal for query-time alias expansion.
+        if let Some(name_node) = child.child_by_field_name("name") {
+            if node_text(name_node, line_index.text) == "package"
+                && let Some(value_node) = child.child_by_field_name("value")
+                && value_node.kind() == "string"
+                && let Some(pkg) = string_literal_content(value_node, line_index.text)
+                && !pkg.is_empty()
+            {
+                package = Some(pkg.to_string());
+            }
             continue;
         }
         let value_node = match child.child_by_field_name("value") {
@@ -3350,6 +3431,7 @@ fn try_extract_data_call_definitions(
         if name.is_empty() {
             continue;
         }
+        stems.push(name.to_string());
         symbols.push(ScopedSymbol {
             name: Arc::from(name),
             kind: SymbolKind::Variable,
@@ -3361,7 +3443,12 @@ fn try_extract_data_call_definitions(
         });
     }
 
-    symbols
+    let call_info = if stems.is_empty() {
+        None
+    } else {
+        Some((stems, package))
+    };
+    (symbols, call_info)
 }
 
 fn string_literal_content<'a>(node: Node<'a>, content: &'a str) -> Option<&'a str> {
@@ -3913,6 +4000,30 @@ fn extract_top_level_removals(timeline: &[ScopeEvent]) -> Vec<(String, u32)> {
     out
 }
 
+/// Extract top-level `data(...)` call infos `(stems, package)` from a
+/// finalized timeline.
+///
+/// Only events with `function_scope = None` are returned — `data()` inside a
+/// function body is delayed-evaluation and has no cross-file effect, mirroring
+/// [`extract_top_level_removals`]. Callers must invoke this AFTER
+/// `annotate_event_function_scopes` so `function_scope` is populated. Used to
+/// feed `compute_interface_hash` for issue #429.
+fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<(Vec<String>, Option<String>)> {
+    let mut out = Vec::new();
+    for event in timeline {
+        if let ScopeEvent::DataLoad {
+            stems,
+            package,
+            function_scope: None,
+            ..
+        } = event
+        {
+            out.push((stems.clone(), package.clone()));
+        }
+    }
+    out
+}
+
 /// Compute a deterministic hash of the exported interface and loaded packages.
 ///
 /// Symbols are incorporated deterministically by sorting the interface keys before hashing each
@@ -3930,13 +4041,28 @@ fn extract_top_level_removals(timeline: &[ScopeEvent]) -> Vec<(String, u32)> {
 ///
 /// # Returns
 ///
+/// `data_loads` is the set of top-level `data(...)` call infos
+/// `(stems, package)` extracted from [`ScopeEvent::DataLoad`] events. Including
+/// them is required for issue #429: the literal stems already flow into the
+/// hash via their `Def` symbols in `interface`, but the `package =` argument
+/// does NOT. Once query-time expansion (a later task) binds additional
+/// cross-file-visible objects via `PackageInfo.data_aliases` keyed off
+/// `(stems, package)`, a change ONLY in `package =` (or in the set of stems)
+/// would alter what dependent files see while leaving the literal-symbol hash
+/// unchanged — leaving stale diagnostics in sourced files. Hashing the pairs
+/// here is the conservative fix that keeps cross-file revalidation correct
+/// before that expansion lands.
+///
+/// # Returns
+///
 /// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
-/// and `top_level_removals`.
+/// `top_level_removals`, and `data_loads`.
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
     top_level_removals: &[TopLevelRemoval<'_>],
+    data_loads: &[(Vec<String>, Option<String>)],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -3978,6 +4104,17 @@ fn compute_interface_hash(
     for (name, line) in sorted_removals {
         name.hash(&mut hasher);
         line.hash(&mut hasher);
+    }
+
+    // Include top-level data() call infos (sorted for determinism). See the
+    // doc comment above for why the `package =` argument and stem set must
+    // feed the hash (issue #429). Stems are hashed in source order (data()
+    // argument order is meaningful); the pairs are sorted as a whole.
+    let mut sorted_data_loads: Vec<&(Vec<String>, Option<String>)> = data_loads.iter().collect();
+    sorted_data_loads.sort();
+    for (stems, package) in sorted_data_loads {
+        stems.hash(&mut hasher);
+        package.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -5203,6 +5340,11 @@ where
                         .or_insert_with(|| symbol.clone());
                 }
             }
+            ScopeEvent::DataLoad { .. } => {
+                // expansion handled at query time (issue #429); recording-only
+                // for now. The literal stems are already bound via their Def
+                // events above.
+            }
         }
     }
 
@@ -6169,6 +6311,11 @@ where
                     }
                 }
             }
+            ScopeEvent::DataLoad { .. } => {
+                // expansion handled at query time (issue #429); recording-only
+                // for now. The literal stems are already applied via their Def
+                // events.
+            }
         }
     }
 
@@ -6629,6 +6776,11 @@ where
                     frame.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             },
+            ScopeEvent::DataLoad { .. } => {
+                // expansion handled at query time (issue #429); recording-only
+                // for now. The literal stems are already applied via their Def
+                // events.
+            }
         }
     }
 
@@ -8526,6 +8678,7 @@ outside_var <- 2"#;
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
             ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
@@ -8662,6 +8815,7 @@ outside_var <- 2"#;
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
             ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
@@ -10047,6 +10201,7 @@ outside_var <- 2"#;
                 ScopeEvent::FunctionScope { .. } => "FunctionScope",
                 ScopeEvent::Removal { .. } => "Removal",
                 ScopeEvent::PackageLoad { .. } => "PackageLoad",
+                ScopeEvent::DataLoad { .. } => "DataLoad",
                 ScopeEvent::Declaration { .. } => "Declaration",
             })
             .collect();
@@ -10065,6 +10220,7 @@ outside_var <- 2"#;
                 ScopeEvent::FunctionScope { start_line, .. } => *start_line,
                 ScopeEvent::Removal { line, .. } => *line,
                 ScopeEvent::PackageLoad { line, .. } => *line,
+                ScopeEvent::DataLoad { line, .. } => *line,
                 ScopeEvent::Declaration { line, .. } => *line,
             })
             .collect();
@@ -10676,6 +10832,7 @@ outside_var <- 2"#;
                 ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
                 ScopeEvent::Removal { line, .. } => ("Removal", *line),
                 ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
+                ScopeEvent::DataLoad { line, .. } => ("DataLoad", *line),
                 ScopeEvent::Declaration { line, .. } => ("Declaration", *line),
             })
             .collect();
@@ -20503,6 +20660,51 @@ y <- filter(df)"#;
         assert!(
             after.symbols.contains_key("lung"),
             "data() binding must be visible after the call"
+        );
+    }
+
+    #[test]
+    fn test_data_call_records_dataload_event_with_package() {
+        let code = r#"data(api, package = "survey")"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let ev = artifacts.timeline.iter().find_map(|e| match e {
+            ScopeEvent::DataLoad { stems, package, .. } => Some((stems.clone(), package.clone())),
+            _ => None,
+        });
+        let (stems, package) = ev.expect("DataLoad event recorded");
+        assert_eq!(stems, vec!["api".to_string()]);
+        assert_eq!(package.as_deref(), Some("survey"));
+    }
+
+    #[test]
+    fn test_data_call_records_dataload_event_bare() {
+        let code = "data(mtcars)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let ev = artifacts.timeline.iter().find_map(|e| match e {
+            ScopeEvent::DataLoad { stems, package, .. } => Some((stems.clone(), package.clone())),
+            _ => None,
+        });
+        let (stems, package) = ev.expect("DataLoad event recorded");
+        assert_eq!(stems, vec!["mtcars".to_string()]);
+        assert_eq!(package, None);
+    }
+
+    #[test]
+    fn test_data_call_literal_binding_unchanged() {
+        // The literal names still bind as Variable symbols (no-R fallback).
+        let code = "data(mtcars)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts.exported_interface.contains_key("mtcars"),
+            "data(mtcars) literal name must still bind"
+        );
+        let after = scope_at_position(&artifacts, 0, 12, false);
+        assert!(
+            after.symbols.contains_key("mtcars"),
+            "data(mtcars) binding must be visible after the call (no-R fallback)"
         );
     }
 
