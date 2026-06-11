@@ -222,6 +222,21 @@ fn apply_enumerated_data(
     }
 }
 
+/// Removes the dataset entry for `name` from `map` (if any) and applies it to
+/// `info` via [`apply_enumerated_data`].  The `has_db` flag is derived from the
+/// package directory here so callers don't repeat that derivation.
+fn apply_enumeration_from(
+    map: &mut HashMap<String, Vec<crate::r_subprocess::DataObject>>,
+    name: &str,
+    pkg_dir: &std::path::Path,
+    info: &mut PackageInfo,
+) {
+    if let Some(enumerated) = map.remove(name) {
+        let has_db = pkg_dir.join("data").join("Rdata.rdb").is_file();
+        apply_enumerated_data(info, &enumerated, has_db);
+    }
+}
+
 /// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
 ///
 /// This struct separates explicit exports (from `export()` and `S3method()` directives)
@@ -975,10 +990,7 @@ impl PackageLibrary {
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
 
             // Apply dataset enumeration if available for this package.
-            if let Some(enumerated) = datasets_map.remove(&name) {
-                let has_db = pkg_dir.join("data").join("Rdata.rdb").is_file();
-                apply_enumerated_data(&mut info, &enumerated, has_db);
-            }
+            apply_enumeration_from(&mut datasets_map, &name, &pkg_dir, &mut info);
 
             log::trace!(
                 "Loaded {} exports + {} datasets for package '{}' statically",
@@ -1009,7 +1021,7 @@ impl PackageLibrary {
                             // Depends and datasets come from the on-disk dir: the
                             // batched R export result carries neither. Datasets
                             // live under `data/`, not in `getNamespaceExports()`.
-                            let mut info = match self.find_package_directory(&pkg_name) {
+                            let info = match self.find_package_directory(&pkg_name) {
                                 Some(pkg_dir) => {
                                     let depends =
                                         parse_description_depends(&pkg_dir.join("DESCRIPTION"))
@@ -1022,11 +1034,12 @@ impl PackageLibrary {
                                     )
                                     .await;
                                     // Apply dataset enumeration if available.
-                                    if let Some(enumerated) = datasets_map.remove(&pkg_name) {
-                                        let has_db =
-                                            pkg_dir.join("data").join("Rdata.rdb").is_file();
-                                        apply_enumerated_data(&mut i, &enumerated, has_db);
-                                    }
+                                    apply_enumeration_from(
+                                        &mut datasets_map,
+                                        &pkg_name,
+                                        &pkg_dir,
+                                        &mut i,
+                                    );
                                     i
                                 }
                                 None => {
@@ -1053,11 +1066,6 @@ impl PackageLibrary {
                                     })
                                 }
                             };
-                            // For packages that had no on-disk dir but still have
-                            // dataset entries, apply now (rare but consistent).
-                            if let Some(enumerated) = datasets_map.remove(&pkg_name) {
-                                apply_enumerated_data(&mut info, &enumerated, false);
-                            }
                             log::trace!(
                                 "Cached {} exports + {} datasets for pattern package '{}' from R",
                                 info.exports.len(),
