@@ -102,12 +102,56 @@ itself, not a preamble file) and are unaffected by this fix.
 
 The follow-up fix has since landed: `check_invalid_assignment_target` exempts string-literal targets whose assigned value is a function definition (including parenthesized, chained `"a" <- "b" <- function(...)`, and `.Primitive(...)` forms), and top-level string assignments in package `data/*.R` files (URI-based, see `is_package_data_file`). A 16-package corpus re-run (survival, nlme, MASS, datasets, tcltk, lattice, base, methods, stats, dbplyr, foreign, ggplot2, httr, lubridate, mgcv, stringr) confirmed the entries are no longer emitted; 152 were pruned from the FP ledger and 1 (`base R/all.equal.R` `"__all.eq.E__" <- environment()` — a dynGet sentinel, not a function definition) was moved back to accepted-real alongside its sibling sentinel entries. The stale-FP report now also covers run packages with zero observed diagnostics — previously a fully-cleared package was silently skipped by the staleness sweep. Post-fix counts: **72 accepted-real**, **2422 known-FP** (a full-corpus strict run subsequently pruned one dead `tools R/install.R` `File not found: 'install.libs.R'` entry — SVN-trunk line drift had left two entries for the same diagnostic at old and new positions, and only the newer one still matches).
 
+## Environment provisioning and ledger reconcile (#428)
+
+The corpus only produces a reproducible strict run on a machine where the
+packages the corpus sources `library()`-attach are installed: Raven resolves an
+attached package's exported symbols only when that package is installed in the
+analysis environment's R library. The provisioning step (the `install.packages`
+list, the `magick` → system-ImageMagick prerequisite, and the four
+not-installable packages — `async`, `css`, `googlesheets`, `revdepcheck`) is
+documented at the top of the corpus runner module (`crates/raven/tests/package_corpus.rs`),
+where a contributor sees it alongside the run commands.
+
+After installing the CRAN-available corpus packages (50 of 51; `magick` still
+needs system ImageMagick), a full four-group strict run was reconciled against
+the ledger:
+
+- **998 stale false-positive entries pruned** — symbols that now resolve because
+  their package is installed (and entries re-anchored after upstream git-source
+  line drift). Stale FPs are informational in the runner, so this is a manual
+  sweep driven by the `stale-fp:` report.
+- **93 newly-surfaced diagnostics classified**, all false positives, by idiom:
+  29 lazy-loaded datasets of installed packages (the #429 LazyData gap —
+  `lung`, `ovarian`, `dat.bcg`, `HolzingerSwineford1939`, `wine`, …); 27
+  data-masked column names in model-fitting NSE (`metafor::escalc`/`rma`,
+  `drc::drm`); 20 objects loaded from a binary `.rda` fixture via
+  `load(test_path(...))` (broom's joineRML tests); 15 drake NSE references
+  (`drake_plan()` target cross-references and `readd()`/`loadd()` target names)
+  in pillar's revdep scripts; 2 cli symbols attached by `library()` inside a
+  `load_packages()` helper function.
+- **38 entries re-reasoned** to drop a now-false "package not installed" claim:
+  32 dataset entries whose packages are installed (datasets shift to the
+  lazy-data idiom rather than clearing — `starwars`→dplyr, `gapminder`→gapminder,
+  `dat.yusuf1985`→metadat, `pigs`/`oranges`/`auto.noise`→emmeans, `diamonds`→
+  ggplot2, `heart.valve`→joineRML), plus 6 function entries (broom `test-car.R`
+  `leveneTest` — car is installed but attached only via an earlier test file's
+  Depends chain, not in this file; dtplyr `benchmark.R` `summarise_at` — dplyr is
+  installed but the standalone script has no `library()` attach). After this, no
+  ledger entry claims a package is uninstalled when it is installed: the only
+  remaining "not installed" function symbols belong to genuinely uninstalled
+  packages (`magick`, `revdepcheck`, `googlesheets`, `robust`, in-repo fixtures).
+
+Ledger size: `known_false_positives.toml` 3336 → 2431 entries (998 pruned, 93
+added). `accepted_real_diagnostics.toml` unchanged (0 stale acceptances).
+
 ## Validation
 
 - `cargo fmt --all --check` ✓
 - `cargo clippy --workspace --all-targets --features test-support -- -D warnings` ✓ (zero warnings)
-- `cargo test -p raven`: 4739 lib + auxiliary suites, 0 failures
-- Full strict run, all four groups (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse,dt`, release binary, no `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`): 61 packages, 3642 observed diagnostics — base 108 (28 accepted / 80 known-FP), recommended 1345 (39 / 1306), tidyverse 2189 (35 / 2154), DT 0 — **0 unclassified, 0 stale acceptances, 0 stale FPs**. Observed counts grew vs. the previous checkpoint because warming NAMESPACE `import()` exports removed an accidental call-position suppression of uninstalled-package symbols (classified per idiom); the six triage fixes and the embedded-datasets floor cleared 293 previously-recorded FP entries (243 tidyverse + 50 base/recommended `state.*`/`Seatbelts`/`iris3` INDEX-topic gaps).
+- `cargo test -p raven`: full lib + auxiliary suites, 0 failures
+- Corpus non-ignored tests (`fp_fixture_is_parseable`, `triage_fixture_is_parseable_and_unique`, `manifest_*`) ✓
+- Full strict run, all four groups (`RAVEN_CORPUS_GROUPS=base,recommended,tidyverse,dt`, release binary, no `RAVEN_CORPUS_ALLOW_UNCLASSIFIED`): **0 unclassified, 0 stale acceptances, 0 stale FPs** on the provisioned machine.
 
 ## Remaining work
 
