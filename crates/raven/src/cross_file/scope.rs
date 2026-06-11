@@ -1239,47 +1239,41 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts.interface_hash =
         compute_interface_hash(&top_level, &loaded_packages, &[], &removal_refs);
 
-    // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
-    // calls, which attach the package under development (see the field doc).
-    artifacts.calls_dev_load_all = detect_dev_load_all(tree.root_node(), content);
-
     artifacts
 }
 
-/// Scan the AST for a `load_all(...)` call — bare, or qualified as
-/// `devtools::load_all` / `pkgload::load_all`. `devtools::load_all()` re-exports
-/// `pkgload::load_all()`; both load the package under development into the
-/// session, so a script that calls either sees the package's own internal and
-/// exported symbols.
-fn detect_dev_load_all(node: Node, content: &str) -> bool {
-    if node.kind() == "call"
-        && let Some(func) = node.child_by_field_name("function")
-    {
-        let is_load_all = match func.kind() {
-            "identifier" => node_text(func, content) == "load_all",
-            "namespace_operator" => {
-                let lhs_ok = func
-                    .child_by_field_name("lhs")
-                    .map(|lhs| node_text(lhs, content))
-                    .is_some_and(|p| matches!(p, "devtools" | "pkgload"));
-                let rhs_ok = func
-                    .child_by_field_name("rhs")
-                    .is_some_and(|rhs| node_text(rhs, content) == "load_all");
-                lhs_ok && rhs_ok
-            }
-            _ => false,
-        };
-        if is_load_all {
-            return true;
-        }
+/// True when `node` is a `load_all(...)` call — bare, or qualified as
+/// `devtools::load_all` / `pkgload::load_all`. `devtools::load_all()`
+/// re-exports `pkgload::load_all()`; both load the package under development
+/// into the session, so a script that calls either sees the package's own
+/// internal and exported symbols.
+///
+/// This is a per-node predicate (no recursion): the whole-tree search is
+/// folded into [`collect_definitions`]'s existing traversal so artifact
+/// computation does not pay for a separate full walk. The namespace LHS is
+/// validated here, so it deliberately does not use `callee_leaf_name` (which
+/// discards the qualifier).
+fn call_is_dev_load_all(node: Node, content: &str) -> bool {
+    if node.kind() != "call" {
+        return false;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if detect_dev_load_all(child, content) {
-            return true;
+    let Some(func) = node.child_by_field_name("function") else {
+        return false;
+    };
+    match func.kind() {
+        "identifier" => node_text(func, content) == "load_all",
+        "namespace_operator" => {
+            let lhs_ok = func
+                .child_by_field_name("lhs")
+                .map(|lhs| node_text(lhs, content))
+                .is_some_and(|p| matches!(p, "devtools" | "pkgload"));
+            let rhs_ok = func
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| node_text(rhs, content) == "load_all");
+            lhs_ok && rhs_ok
         }
+        _ => false,
     }
-    false
 }
 
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
@@ -1544,11 +1538,6 @@ pub fn compute_artifacts_with_metadata(
         &declared_symbols,
         &removal_refs,
     );
-
-    // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
-    // calls (see the field doc on `ScopeArtifacts::calls_dev_load_all`). Kept in
-    // lockstep with `compute_artifacts`.
-    artifacts.calls_dev_load_all = detect_dev_load_all(tree.root_node(), content);
 
     artifacts
 }
@@ -2019,7 +2008,21 @@ fn collect_definitions(
     // an immediately-evaluated expression (R does not introspect strings here),
     // so the RHS-before-binding rule always applies — the new binding becomes
     // visible at the end of the call.
-    if node.kind() == "call"
+    // For a call node, resolve the callee's leaf name (the identifier, or the
+    // `pkg::fn` right-hand side) once, then dispatch the call-shaped
+    // recognizers by name. Each recognizer still performs its own exact check
+    // (bare vs namespaced, argument shapes), so gating on the leaf name is a
+    // behavior-preserving fast path: a call whose callee matches none of these
+    // names skips them all, instead of re-fetching `child_by_field_name` and
+    // re-deriving the callee name once per recognizer (~9 times per call).
+    let call_callee: Option<&str> = if node.kind() == "call" {
+        node.child_by_field_name("function")
+            .and_then(|f| callee_leaf_name(f, line_index.text))
+    } else {
+        None
+    };
+
+    if call_callee == Some("assign")
         && let Some(symbol) = try_extract_assign_call(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2037,10 +2040,21 @@ fn collect_definitions(
             .insert(symbol.name.clone(), symbol);
     }
 
+    // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
+    // (see the field doc on `ScopeArtifacts::calls_dev_load_all`). Folded into
+    // this traversal rather than run as a separate full-tree walk; the
+    // `!already-set` guard makes every node after the first hit a no-op.
+    if !artifacts.calls_dev_load_all
+        && call_callee == Some("load_all")
+        && call_is_dev_load_all(node, line_index.text)
+    {
+        artifacts.calls_dev_load_all = true;
+    }
+
     // Check for delayedAssign("name", expr) calls. The promise binds `name` in
     // the calling environment; like assign(), the binding becomes visible at
     // the end of the call.
-    if node.kind() == "call"
+    if call_callee == Some("delayedAssign")
         && let Some(symbol) = try_extract_delayed_assign_call(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2061,7 +2075,7 @@ fn collect_definitions(
     // Check for utils::globalVariables(c("a", "b")) declarations. Each listed
     // name is declared bound at runtime (R's own R-CMD-check suppression
     // mechanism); model each as a definition visible from the end of the call.
-    if node.kind() == "call" {
+    if call_callee == Some("globalVariables") {
         let global_var_symbols = try_extract_global_variables_definitions(node, line_index, uri);
         if !global_var_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2086,7 +2100,7 @@ fn collect_definitions(
     // env_bind_lazy(current_env(), name = ...) calls. Every named argument
     // binds that name in the enclosing environment, visible from the end of
     // the call.
-    if node.kind() == "call" {
+    if matches!(call_callee, Some("env_bind_active" | "env_bind_lazy")) {
         let env_bind_symbols = try_extract_env_bind_definitions(node, line_index, uri);
         if !env_bind_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2112,7 +2126,7 @@ fn collect_definitions(
     // file stem is the restored object name. Model only that narrow, static
     // shape so common fixtures like load("anorexia.rda"); anorexia resolve
     // without broadly suppressing unknown post-load names.
-    if node.kind() == "call"
+    if call_callee == Some("load")
         && let Some((symbol, visible_line, visible_column)) =
             try_extract_literal_load_call_definition(node, line_index, uri)
     {
@@ -2136,7 +2150,7 @@ fn collect_definitions(
     // packages (e.g. Matrix, where generics live in R/00_Generic.R and are used
     // throughout) produce spurious "undefined variable" diagnostics for every
     // generic. The name argument is always a string literal in practice.
-    if node.kind() == "call"
+    if matches!(call_callee, Some("setGeneric" | "setGroupGeneric"))
         && let Some(symbol) = try_extract_set_generic_definition(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2159,7 +2173,7 @@ fn collect_definitions(
     // environment to accumulate written output; later uses of that name must
     // resolve. Read mode (the default) treats the first argument as data, not a
     // variable name, so it is deliberately not modeled.
-    if node.kind() == "call"
+    if call_callee == Some("textConnection")
         && let Some(symbol) = try_extract_text_connection_definition(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2180,7 +2194,7 @@ fn collect_definitions(
     // Check for data() calls. `data(foo, "bar")` loads named datasets into the
     // calling environment. Model each positional identifier/string arg as a
     // binding visible from the call's end position.
-    if node.kind() == "call" {
+    if call_callee == Some("data") {
         let data_symbols = try_extract_data_call_definitions(node, line_index, uri);
         if !data_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);

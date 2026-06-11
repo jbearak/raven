@@ -84,6 +84,11 @@ harness = false
 required-features = ["test-support"]
 
 [[bench]]
+name = "artifact_compute"
+harness = false
+required-features = ["test-support"]
+
+[[bench]]
 name = "libpath_capture"
 harness = false
 required-features = ["test-support"]
