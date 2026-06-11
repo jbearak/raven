@@ -8,6 +8,7 @@
 //! Part 2: `.onLoad`/`.onAttach` body scanning for namespace-level bindings:
 //! - `assign("x", ..., envir = ...)` at top level inside the hook
 //! - `ns$x <- ...` / `topenv()$x <- ...` inside the hook
+//! - `makeActiveBinding("x", fn, <namespace-env>)` inside the hook
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -331,12 +332,15 @@ fn collect_namespace_bound_idents(
 }
 
 /// Check if a node is an expression that produces a namespace environment:
-/// `topenv(...)`, `asNamespace(...)`, `getNamespace(...)`, or
-/// `parent.env(environment())`. `parent.env` only qualifies when its first
-/// argument is itself a namespace-shaped expression — `parent.env` of an
-/// arbitrary local environment is NOT the namespace, so treating every
-/// `parent.env(...)` as namespace-producing would over-collect and mute real
-/// undefined-variable diagnostics.
+/// `topenv(...)`, `asNamespace(...)`, `getNamespace(...)`,
+/// `parent.env(environment())`, or `environment(<package-level identifier>)`.
+/// `parent.env` only qualifies when its first argument is itself a
+/// namespace-shaped expression — `parent.env` of an arbitrary local
+/// environment is NOT the namespace, so treating every `parent.env(...)` as
+/// namespace-producing would over-collect and mute real undefined-variable
+/// diagnostics. Likewise `environment(<identifier>)` only qualifies for a
+/// package-level function, not one defined locally in the hook (see
+/// `environment_arg_is_identifier`).
 fn is_namespace_creating_expr(node: Node, content: &str, local_fns: &BTreeSet<String>) -> bool {
     if node.kind() != "call" {
         return false;
@@ -409,8 +413,23 @@ fn parent_env_arg_is_namespace_shaped(
             let Some(f) = value_node.child_by_field_name("function") else {
                 return false;
             };
-            return node_text(f, content) == "environment"
-                || is_namespace_creating_expr(value_node, content, local_fns);
+            if node_text(f, content) == "environment" {
+                // Only a *bare* `environment()` is namespace-shaped here. An
+                // `environment(<expr>)` form falls through to
+                // `is_namespace_creating_expr`, which excludes locally-defined
+                // functions so we don't mute real undefined-name diagnostics.
+                let Some(inner_args) = value_node.child_by_field_name("arguments") else {
+                    return false;
+                };
+                let mut inner_cursor = inner_args.walk();
+                let is_bare = !inner_args
+                    .children(&mut inner_cursor)
+                    .any(|n| n.kind() == "argument");
+                if is_bare {
+                    return true;
+                }
+            }
+            return is_namespace_creating_expr(value_node, content, local_fns);
         }
     }
     false
@@ -1209,6 +1228,52 @@ bar <- 42
         assert!(
             !syms.contains("local_pe_dollar"),
             "parent.env(local) $ assign must not be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_parent_env_environment_of_local_function_not_collected() {
+        // `parent.env(environment(local_fun))`: `environment(local_fun)` is the
+        // hook's own frame (local_fun is defined inside .onLoad), so its parent
+        // is NOT the package namespace. The local-function exclusion must hold
+        // through the `parent.env(...)` wrapper too.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  local_fun <- function() NULL
+  ns <- parent.env(environment(local_fun))
+  assign("pe_local", 1, envir = ns)
+  ns$pe_local_dollar <- 2
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            !syms.contains("pe_local"),
+            "parent.env(environment(local_fun)) assign must not be collected: {:?}",
+            syms
+        );
+        assert!(
+            !syms.contains("pe_local_dollar"),
+            "parent.env(environment(local_fun)) $ assign must not be collected: {:?}",
+            syms
+        );
+    }
+
+    #[test]
+    fn onload_parent_env_environment_of_external_function_collected() {
+        // `parent.env(environment(pkg_fun))` where `pkg_fun` is a package-level
+        // (external) function: `environment(pkg_fun)` is the namespace, so its
+        // parent qualifies as namespace-shaped and the binding is collected.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  ns <- parent.env(environment(pkg_fun))
+  assign("pe_ext", 1, envir = ns)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(
+            syms.contains("pe_ext"),
+            "parent.env(environment(external_fun)) assign should be collected: {:?}",
             syms
         );
     }
