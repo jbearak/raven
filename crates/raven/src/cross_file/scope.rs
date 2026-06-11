@@ -5489,12 +5489,18 @@ where
                         }
                     };
                     if should_include {
-                        let attached: HashSet<String> = scope
-                            .loaded_packages
-                            .iter()
-                            .chain(scope.inherited_packages.iter())
-                            .cloned()
-                            .collect();
+                        // Only the bare `data(stem)` form consults the attached
+                        // set; skip building it for explicit `package =` calls.
+                        let attached: HashSet<String> = if package.is_none() {
+                            scope
+                                .loaded_packages
+                                .iter()
+                                .chain(scope.inherited_packages.iter())
+                                .cloned()
+                                .collect()
+                        } else {
+                            HashSet::new()
+                        };
                         for (name, symbol) in expand_data_load(stems, package, &attached, provider)
                         {
                             scope.symbols.entry(name).or_insert(symbol);
@@ -6498,7 +6504,13 @@ where
                 // inserted with lowest precedence (`entry().or_insert`) so local
                 // defs and explicit package symbols win.
                 if let Some(provider) = self.data_alias_provider {
-                    let attached = self.attached_packages_so_far();
+                    // Only the bare `data(stem)` form consults the attached
+                    // set; skip building it for explicit `package =` calls.
+                    let attached = if package.is_none() {
+                        self.attached_packages_so_far()
+                    } else {
+                        HashSet::new()
+                    };
                     let expanded = expand_data_load(&stems, &package, &attached, provider);
                     if let Some(frame) = self.pick_frame_mut(function_scope) {
                         for (name, symbol) in expanded {
@@ -6997,8 +7009,13 @@ where
                     return;
                 }
                 if let Some(provider) = self.data_alias_provider {
-                    let mut attached: HashSet<String> = frame.packages.iter().cloned().collect();
-                    attached.extend(self.choose_prefix().inherited_packages.iter().cloned());
+                    // Only the bare `data(stem)` form consults the attached
+                    // set; skip building it for explicit `package =` calls.
+                    let mut attached: HashSet<String> = HashSet::new();
+                    if package.is_none() {
+                        attached.extend(frame.packages.iter().cloned());
+                        attached.extend(self.choose_prefix().inherited_packages.iter().cloned());
+                    }
                     for (name, symbol) in expand_data_load(stems, package, &attached, provider) {
                         frame.removed_names.remove(&name);
                         frame.symbols.entry(name).or_insert(symbol);
