@@ -312,8 +312,34 @@ fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
     match node_text(func_node, content) {
         "topenv" | "asNamespace" | "getNamespace" => true,
         "parent.env" => parent_env_arg_is_namespace_shaped(node, content),
+        "environment" => environment_arg_is_identifier(node, content),
         _ => false,
     }
+}
+
+/// `environment(<identifier>)` returns the environment a closure was defined
+/// in; for a top-level package function (the conventional `environment(dummy)`
+/// idiom in `.onLoad`) that is the package namespace. Only the single-bare-
+/// identifier form qualifies — `environment()` (the current local frame) and
+/// `environment(<complex expr>)` do not.
+fn environment_arg_is_identifier(call: Node, _content: &str) -> bool {
+    let Some(args_node) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args_node.walk();
+    let mut args = args_node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument");
+    let Some(first) = args.next() else {
+        return false;
+    };
+    // Exactly one positional argument that is a bare identifier.
+    if args.next().is_some() || first.child_by_field_name("name").is_some() {
+        return false;
+    }
+    first
+        .child_by_field_name("value")
+        .is_some_and(|v| v.kind() == "identifier")
 }
 
 /// The first positional argument of a `parent.env(...)` call is namespace-shaped:
@@ -362,6 +388,7 @@ fn visit_body_for_bindings(
     match node.kind() {
         "call" if !inside_nested_function => {
             try_extract_assign_call(node, content, symbols, ns_idents);
+            try_extract_make_active_binding_call(node, content, symbols, ns_idents);
             for child in node.children(&mut node.walk()) {
                 visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
             }
@@ -419,6 +446,75 @@ fn try_extract_assign_call(
             }
             return;
         }
+    }
+}
+
+/// Match `makeActiveBinding("sym", fun, env)` — extract "sym" only when the
+/// `env` target (3rd positional argument or named `env =`) is namespace-like.
+///
+/// `makeActiveBinding(sym, fun, env)` installs an active binding named `sym`
+/// in `env`. In `.onLoad` the conventional `env` is the package namespace
+/// (e.g. cli's `pkgenv <- environment(dummy)`), so the binding is a
+/// package-internal symbol. Only the statically-safe shape is recognized: the
+/// `sym` argument (1st positional or named `sym =`) is a string literal and
+/// the `env` target is namespace-like — mirroring [`try_extract_assign_call`].
+fn try_extract_make_active_binding_call(
+    node: Node,
+    content: &str,
+    symbols: &mut BTreeSet<String>,
+    ns_idents: &BTreeSet<String>,
+) {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return;
+    };
+    if node_text(func_node, content) != "makeActiveBinding" {
+        return;
+    }
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return;
+    };
+
+    // Resolve the `sym` (name) and `env` (target) arguments, honoring both
+    // positional order (sym, fun, env) and explicit names.
+    let mut sym_value = None;
+    let mut env_value = None;
+    let mut positional_index = 0;
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            match node_text(name_node, content) {
+                "sym" => sym_value = child.child_by_field_name("value"),
+                "env" => env_value = child.child_by_field_name("value"),
+                _ => {}
+            }
+        } else {
+            match positional_index {
+                0 => sym_value = child.child_by_field_name("value"),
+                2 => env_value = child.child_by_field_name("value"),
+                _ => {}
+            }
+            positional_index += 1;
+        }
+    }
+
+    // The target environment must be namespace-like.
+    let Some(env_node) = env_value else {
+        return;
+    };
+    if !is_namespace_like(env_node, content, ns_idents) {
+        return;
+    }
+
+    let Some(sym_node) = sym_value else {
+        return;
+    };
+    if let Some(name) = extract_string_literal(sym_node, content)
+        && !name.is_empty()
+    {
+        symbols.insert(name);
     }
 }
 
@@ -751,6 +847,76 @@ mod tests {
 "#;
         let syms = extract_onload_bindings(code);
         assert!(syms.contains("greeting"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_make_active_binding_environment_idiom_extracts() {
+        // cli's idiom: `pkgenv <- environment(dummy)` then makeActiveBinding
+        // into pkgenv. The literal name becomes a package-internal symbol.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  pkgenv <- environment(dummy)
+  makeActiveBinding(
+    "symbol",
+    function() compute(),
+    pkgenv
+  )
+  makeActiveBinding("pb_bar", cli__pb_bar, pkgenv)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(syms.contains("symbol"), "got: {:?}", syms);
+        assert!(syms.contains("pb_bar"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_make_active_binding_named_args_extracts() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  ns <- topenv(environment())
+  makeActiveBinding(sym = "active_sym", fun = function() 1, env = ns)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(syms.contains("active_sym"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_make_active_binding_non_ns_env_not_collected() {
+        // Binding into a fresh local environment is not a package symbol.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  e <- new.env(parent = emptyenv())
+  makeActiveBinding("tmp", function() 1, e)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(!syms.contains("tmp"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_make_active_binding_dynamic_name_ignored() {
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  ns <- topenv(environment())
+  makeActiveBinding(name_var, function() 1, ns)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(syms.is_empty(), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn make_active_binding_outside_onload_ignored() {
+        // makeActiveBinding is only scanned inside .onLoad/.onAttach hooks.
+        let code = r#"
+my_func <- function() {
+  ns <- topenv(environment())
+  makeActiveBinding("x", function() 1, ns)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(!syms.contains("x"), "got: {:?}", syms);
     }
 
     #[test]

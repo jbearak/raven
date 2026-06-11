@@ -104,6 +104,12 @@ Raven also recognizes a few call forms that bind a name at runtime, so the bound
 - Inside an S4 method body (`setMethod("Ops"|"Math"|"Summary"|…, ...)`) or an S3 method bound to a `generic.class` name, the dispatcher-injected specials `.Generic`, `.Method`, and `.Class` are in scope.
 - Inside an R6 class method body — a function value within the `public`, `private`, or `active` list arguments of `R6Class(...)` or `R6::R6Class(...)`, or within an unnamed `list(...)` passed positionally among the call's first four arguments (`R6Class(classname, public, private, active)`) — the pronouns `self`, `private`, and `super` are in scope (R6 injects them at construction time). A top-level definition of `R6Class` in the same file shadows the package function and disables this treatment.
 - Base R's implicit search-path globals resolve as bare names: `.Autoloaded` (the startup `Autoloads` environment) and `.Random.seed` after a visible prior `set.seed()` call.
+- `delayedAssign("x", expr)` binds the promise `x` from the call onward (at top level it becomes a package-internal symbol; inside a function body it stays local, matching R's default `assign.env`). The name must be a string literal.
+- rlang's `env_bind_active(current_env(), a = ..., b = ...)` and `env_bind_lazy(current_env(), ...)` bind each *named* argument (`a`, `b`) in the enclosing environment. Only the `current_env()` form is modeled — binding into some other environment is not assumed local.
+- `utils::globalVariables(c("a", "b"))` (R's own mechanism for declaring names bound at runtime, used to silence `R CMD check`) makes each listed name resolve package-wide. The bare `.` pronoun is deliberately **not** honored this way — Raven resolves `.` precisely by context (see below), and accepting a blanket `globalVariables(".")` would mask genuine `.`-misuse bugs.
+- An active binding installed in a package's `.onLoad`/`.onAttach` hook via `makeActiveBinding("name", fn, env)` — when `env` is the package namespace (e.g. `asNamespace(...)`, `topenv(...)`, or `environment(<a package function>)`) — contributes `name` to the package's internal scope, alongside the existing `assign("name", ..., envir = ns)` and `ns$name <- ...` recognition.
+
+When you are developing an R package, a script anywhere in its source tree (`inst/`, `tools/`, `data-raw/`, `debug/`, …) that calls `devtools::load_all()` / `pkgload::load_all()` (or a bare `load_all()`) is modeled as attaching the package under development: the package's own internal, exported, sysdata, and `.onLoad`/`.onAttach`-bound symbols become visible in that file, mirroring what `load_all()` does at runtime. Genuinely-undefined names not provided by the package still flag.
 
 Windows-only base functions (`shell.exec`, `Sys.junction`, `readRegistry`, the `win*`/clipboard helpers, …) are recognized as builtins even though Raven's builtin list is generated on non-Windows hosts, so platform-guarded code does not draw a false positive.
 
@@ -122,6 +128,18 @@ Raven checks identifiers inside ordinary call arguments and `[` / `[[` indices b
 For `[`, base subscripting is standard-eval, so indices are checked unless the indexed object is data.table-like: a known `data.table()` / `as.data.table()` / `fread()` object, or an unresolved object when data.table is detectably in play (a `library(data.table)` call, a `data.table::` reference, or a package `Imports:`/`importFrom`). `[[` is always checked — `DT[[x]]` references `x` as a real variable.
 
 data.table's by-reference converters are also recognized: a statement-level `setDT(x)` flips `x` to a data.table from that line onward (so a later `x[, newcol := val]` no longer flags `newcol`/`val`), `setDF(x)` flips it back to a plain data.frame, and `setattr(x, "class", ...)` sets the class explicitly. The transition is positional — a `[` *above* the converter keeps the object's prior classification.
+
+#### The magrittr dot, pipe placeholders, and exposition
+
+Raven recognizes the special placeholders used by magrittr and dplyr so they are never flagged as undefined, while keeping them tightly scoped so genuine bugs still surface:
+
+- The magrittr dot `.` on the **right** of a `%>%` pipe (`df %>% nrow(.)`, `df %>% { .$x }`) is the piped value.
+- The **leading** `.` of a magrittr functional sequence (`f <- . %>% step1() %>% step2()`) is the anonymous function's formal.
+- `.` inside `dplyr::do(...)` (the current-group data frame) and inside the scoped-verb predicates `all_vars(...)` / `any_vars(...)` (the column under evaluation).
+- Every free identifier on the right of the exposition operator `lhs %$% rhs` (semantically `with(lhs, rhs)`), since `rhs` is evaluated in a data mask of `lhs` — e.g. `mtcars %$% cor(cyl, am)` resolves `cyl` and `am` as columns while still checking `mtcars`.
+- The native-pipe placeholder `_` on the right of a `|>` pipe (R 4.2+).
+
+These are scoped to the magrittr/`do()`/`all_vars()` contexts only — a bare `.` used as a **native** `|>` placeholder (a common `%>%`→`|>` migration mistake, e.g. `x |> f(.)`) is *not* one of these forms and stays flagged.
 
 #### Shiny deferred-expression scopes
 

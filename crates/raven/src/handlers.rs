@@ -13456,10 +13456,32 @@ fn collect_usages_with_analysis<'a>(
         if references_formal_from_default_expression(node, text) {
             return;
         }
+        // Magrittr exposition operator: `lhs %$% rhs` evaluates `rhs` in a
+        // data mask of `lhs` (semantically `with(lhs, rhs)`), so every free
+        // identifier in the RHS resolves to a column of `lhs`, not a free
+        // variable. This is checked before the `.`-specific rules because it
+        // suppresses *all* identifiers in the RHS, not just `.`.
+        if is_inside_exposition_rhs(node, text) {
+            return;
+        }
         // Magrittr dot pronoun: `.` on the RHS of `%>%` is the piped value,
         // not a free variable. Walk up to find a binary_operator parent whose
         // operator is `%>%` and whose RHS contains this node.
         if node_text(node, text) == "." && is_inside_magrittr_rhs(node, text) {
+            return;
+        }
+        // Magrittr functional-sequence head: a leading `.` that is the LHS of a
+        // `%>%` chain (`. %>% step1() %>% ...`) is the formal of the anonymous
+        // function the sequence builds, not a free variable.
+        if node_text(node, text) == "." && is_functional_sequence_head_dot(node, text) {
+            return;
+        }
+        // dplyr current-group / scoped-verb dot: `.` inside `do(...)`,
+        // `all_vars(...)`, or `any_vars(...)` is the current-group data frame
+        // (or the column under evaluation), not a free variable. Scoped to
+        // these calls only — a `.` used as a native-`|>` placeholder outside
+        // them is a genuine bug and stays flagged.
+        if node_text(node, text) == "." && is_inside_dplyr_dot_context(node, text) {
             return;
         }
         // Native pipe placeholder: `_` on the RHS of `|>` (R 4.2+) is the
@@ -13627,6 +13649,93 @@ fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
                 if has_magrittr {
                     return true;
                 }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// True when `node` is inside the RHS of a magrittr exposition operator
+/// (`lhs %$% rhs`). The exposition operator evaluates its RHS inside a data
+/// mask of the LHS — `mtcars %$% cor(cyl, am)` is `with(mtcars, cor(cyl, am))`
+/// — so every free identifier in the RHS names a component of `lhs`, not a
+/// free variable. Scoped strictly to the `%$%` operator; ordinary `%>%`/`|>`
+/// pipes are unaffected.
+fn is_inside_exposition_rhs(node: Node, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "binary_operator" {
+            let is_rhs = parent
+                .child_by_field_name("rhs")
+                .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
+            if is_rhs {
+                let mut cursor = parent.walk();
+                let has_exposition = parent
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "special" && node_text(child, text) == "%$%");
+                if has_exposition {
+                    return true;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// True when `node` (an identifier `.`) is the head of a magrittr functional
+/// sequence: the LHS of a `%>%` operator, as in `. %>% step1() %>% step2()`.
+/// Such a leading `.` is the formal of the anonymous function the sequence
+/// builds (magrittr lambda syntax), not a free variable. The RHS dots of a
+/// pipe are handled separately by [`is_inside_magrittr_rhs`].
+fn is_functional_sequence_head_dot(node: Node, text: &str) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_operator" {
+        return false;
+    }
+    let is_lhs = parent
+        .child_by_field_name("lhs")
+        .is_some_and(|lhs| lhs.id() == node.id());
+    if !is_lhs {
+        return false;
+    }
+    let mut cursor = parent.walk();
+    parent
+        .children(&mut cursor)
+        .any(|child| child.kind() == "special" && node_text(child, text) == "%>%")
+}
+
+/// True when `node` (an identifier `.`) is lexically inside the argument list
+/// of a `do(...)`, `all_vars(...)`, or `any_vars(...)` call (bare or
+/// `dplyr::`/`dbplyr::`-qualified). In `dplyr::do()` the `.` is the
+/// current-group data frame; in the scoped-verb predicates `all_vars()` /
+/// `any_vars()` it is the column under evaluation. Either way it is always
+/// bound, not a free variable.
+///
+/// Deliberately scoped to these calls — a `.` used as a native `|>`
+/// placeholder elsewhere (a common `%>%`→`|>` migration bug) is NOT inside
+/// such a call and stays flagged.
+fn is_inside_dplyr_dot_context(node: Node, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "call"
+            && let Some(func) = parent.child_by_field_name("function")
+        {
+            let fn_name = match func.kind() {
+                "identifier" => Some(node_text(func, text)),
+                "namespace_operator" => func
+                    .child_by_field_name("rhs")
+                    .map(|rhs| node_text(rhs, text)),
+                _ => None,
+            };
+            if matches!(fn_name, Some("do" | "all_vars" | "any_vars"))
+                && let Some(args) = parent.child_by_field_name("arguments")
+                && args.byte_range().contains(&node.start_byte())
+            {
+                return true;
             }
         }
         current = parent;
@@ -20078,6 +20187,120 @@ mod tests {
         assert!(
             was_collected(&used, "."),
             "dot without pipe context must still be collected as a usage"
+        );
+    }
+
+    /// `.` inside `dplyr::do(...)` is the current-group data frame.
+    #[test]
+    fn dplyr_do_dot_placeholder_suppressed() {
+        // Namespace-qualified so the callee resolves as standard-eval (no
+        // blanket WholeCall suppression), forcing the `.` through the
+        // is_inside_dplyr_dot_context recognizer under test.
+        let code = "mf |> dplyr::do(head(.))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot inside do() must be suppressed (current-group data frame)"
+        );
+    }
+
+    /// Named `do()` args still suppress the dot inside each value expression.
+    #[test]
+    fn dplyr_do_dot_named_args_suppressed() {
+        let code = "mf |> dplyr::do(nrow = nrow(.), ncol = ncol(.))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot inside named do() args must be suppressed"
+        );
+    }
+
+    /// `.` inside `dplyr::all_vars(...)` / `any_vars(...)` is the column under
+    /// evaluation.
+    #[test]
+    fn dplyr_all_vars_dot_placeholder_suppressed() {
+        let code = "dplyr::all_vars(!is.na(.))";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot inside all_vars() must be suppressed"
+        );
+    }
+
+    #[test]
+    fn dplyr_any_vars_dot_placeholder_suppressed() {
+        let code = "dplyr::any_vars(. > 0)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "dot inside any_vars() must be suppressed"
+        );
+    }
+
+    /// A `.` used as a native `|>` placeholder OUTSIDE do()/all_vars() is a
+    /// genuine `%>%`→`|>` migration bug and must stay flagged.
+    #[test]
+    fn native_pipe_dot_outside_dplyr_context_still_flagged() {
+        let code = "x |> identity(.)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "."),
+            "a bare `.` in a native |> pipe (not in do()/all_vars) must stay flagged"
+        );
+    }
+
+    /// Magrittr functional-sequence head: the leading `.` in `. %>% f %>% g`
+    /// is the lambda formal, not a free variable.
+    #[test]
+    fn magrittr_functional_sequence_head_dot_suppressed() {
+        let code = "a <- . %>% cos %>% sin %>% tan";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["magrittr"], &mut used);
+        assert!(
+            !was_collected(&used, "."),
+            "leading dot of a functional sequence must be suppressed"
+        );
+    }
+
+    /// The exposition operator `%$%` data-masks its RHS with the LHS columns.
+    #[test]
+    fn magrittr_exposition_rhs_columns_suppressed() {
+        let code = "mtcars %$% cor(cyl, am)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["magrittr"], &mut used);
+        assert!(
+            !was_collected(&used, "cyl"),
+            "%$% RHS column cyl suppressed"
+        );
+        assert!(!was_collected(&used, "am"), "%$% RHS column am suppressed");
+    }
+
+    /// The LHS of `%$%` is a normal reference and must NOT be suppressed.
+    #[test]
+    fn magrittr_exposition_lhs_still_checked() {
+        let code = "mydata %$% mean(value)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["magrittr"], &mut used);
+        assert!(
+            was_collected(&used, "mydata"),
+            "the LHS object of %$% must still be checked as a reference"
+        );
+        assert!(
+            !was_collected(&used, "value"),
+            "the RHS column of %$% must be suppressed"
         );
     }
 

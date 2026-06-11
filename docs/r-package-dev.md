@@ -179,6 +179,29 @@ exception is installed test suites: R files under `inst/tinytest/` and
 `inst/unitTests/` are treated as **test files** (one-way package R/ visibility),
 since those suites run with the package loaded.
 
+### Scripts that call `devtools::load_all()`
+
+A script **anywhere** in the package source tree (including non-standard
+locations like `inst/`, `tools/`, `debug/`, or `internal/`) that calls
+`devtools::load_all()` / `pkgload::load_all()` — or a bare `load_all()` — is
+modeled as attaching the package under development. Raven then makes the
+package's own symbols visible throughout the file: internal and exported `R/`
+definitions, `R/sysdata.rda` objects, names bound in `.onLoad`/`.onAttach`, and
+NAMESPACE imports. This matches what `load_all()` does at runtime, so the
+exploratory and maintenance scripts package authors keep in these directories
+don't draw false positives for their own package's functions.
+
+```r
+# internal/scratch.R
+devtools::load_all()
+result <- my_internal_helper(data)  # No diagnostic — load_all() attached the package
+typo_helper()                       # Still flagged — not a package symbol
+```
+
+The injection is gated on the call, not the path: the same file *without* a
+`load_all()` call (and outside the dev-context directories above) sees only the
+normal global/`library()` scope.
+
 ### Build commands
 
 When the workspace is detected as an R package (DESCRIPTION with a non-empty

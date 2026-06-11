@@ -700,6 +700,14 @@ pub struct ScopeArtifacts {
     pub interface_hash: u64,
     /// Interval tree for O(log n) function scope queries
     pub function_scope_tree: FunctionScopeTree,
+    /// `true` when this file contains a `devtools::load_all()` /
+    /// `pkgload::load_all()` / bare `load_all()` call. Such a call attaches the
+    /// package under development — exposing its internal and exported symbols —
+    /// so in package mode the file is granted the package's own
+    /// `r_internal_symbols` (plus sysdata/onload/imported) regardless of where
+    /// it sits in the source tree (`internal/`, `tools/`, `debug/`, …). See
+    /// [`append_package_contribution`].
+    pub calls_dev_load_all: bool,
 }
 
 impl Default for ScopeArtifacts {
@@ -723,6 +731,7 @@ impl Default for ScopeArtifacts {
             timeline: Vec::new(),
             interface_hash: 0,
             function_scope_tree: FunctionScopeTree::default(),
+            calls_dev_load_all: false,
         }
     }
 }
@@ -1230,7 +1239,47 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts.interface_hash =
         compute_interface_hash(&top_level, &loaded_packages, &[], &removal_refs);
 
+    // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
+    // calls, which attach the package under development (see the field doc).
+    artifacts.calls_dev_load_all = detect_dev_load_all(tree.root_node(), content);
+
     artifacts
+}
+
+/// Scan the AST for a `load_all(...)` call — bare, or qualified as
+/// `devtools::load_all` / `pkgload::load_all`. `devtools::load_all()` re-exports
+/// `pkgload::load_all()`; both load the package under development into the
+/// session, so a script that calls either sees the package's own internal and
+/// exported symbols.
+fn detect_dev_load_all(node: Node, content: &str) -> bool {
+    if node.kind() == "call"
+        && let Some(func) = node.child_by_field_name("function")
+    {
+        let is_load_all = match func.kind() {
+            "identifier" => node_text(func, content) == "load_all",
+            "namespace_operator" => {
+                let lhs_ok = func
+                    .child_by_field_name("lhs")
+                    .map(|lhs| node_text(lhs, content))
+                    .is_some_and(|p| matches!(p, "devtools" | "pkgload"));
+                let rhs_ok = func
+                    .child_by_field_name("rhs")
+                    .is_some_and(|rhs| node_text(rhs, content) == "load_all");
+                lhs_ok && rhs_ok
+            }
+            _ => false,
+        };
+        if is_load_all {
+            return true;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if detect_dev_load_all(child, content) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
@@ -1495,6 +1544,11 @@ pub fn compute_artifacts_with_metadata(
         &declared_symbols,
         &removal_refs,
     );
+
+    // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
+    // calls (see the field doc on `ScopeArtifacts::calls_dev_load_all`). Kept in
+    // lockstep with `compute_artifacts`.
+    artifacts.calls_dev_load_all = detect_dev_load_all(tree.root_node(), content);
 
     artifacts
 }
@@ -1981,6 +2035,76 @@ fn collect_definitions(
         artifacts
             .exported_interface
             .insert(symbol.name.clone(), symbol);
+    }
+
+    // Check for delayedAssign("name", expr) calls. The promise binds `name` in
+    // the calling environment; like assign(), the binding becomes visible at
+    // the end of the call.
+    if node.kind() == "call"
+        && let Some(symbol) = try_extract_delayed_assign_call(node, line_index, uri)
+    {
+        let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+        let event = ScopeEvent::Def {
+            line: symbol.defined_line,
+            column: symbol.defined_column,
+            visible_from_line: visible_line,
+            visible_from_column: visible_column,
+            symbol: symbol.clone(),
+            function_scope: None,
+        };
+        artifacts.timeline.push(event);
+        artifacts
+            .exported_interface
+            .insert(symbol.name.clone(), symbol);
+    }
+
+    // Check for utils::globalVariables(c("a", "b")) declarations. Each listed
+    // name is declared bound at runtime (R's own R-CMD-check suppression
+    // mechanism); model each as a definition visible from the end of the call.
+    if node.kind() == "call" {
+        let global_var_symbols = try_extract_global_variables_definitions(node, line_index, uri);
+        if !global_var_symbols.is_empty() {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+            for symbol in global_var_symbols {
+                let event = ScopeEvent::Def {
+                    line: symbol.defined_line,
+                    column: symbol.defined_column,
+                    visible_from_line: visible_line,
+                    visible_from_column: visible_column,
+                    symbol: symbol.clone(),
+                    function_scope: None,
+                };
+                artifacts.timeline.push(event);
+                artifacts
+                    .exported_interface
+                    .insert(symbol.name.clone(), symbol);
+            }
+        }
+    }
+
+    // Check for env_bind_active(current_env(), name = ...) /
+    // env_bind_lazy(current_env(), name = ...) calls. Every named argument
+    // binds that name in the enclosing environment, visible from the end of
+    // the call.
+    if node.kind() == "call" {
+        let env_bind_symbols = try_extract_env_bind_definitions(node, line_index, uri);
+        if !env_bind_symbols.is_empty() {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+            for symbol in env_bind_symbols {
+                let event = ScopeEvent::Def {
+                    line: symbol.defined_line,
+                    column: symbol.defined_column,
+                    visible_from_line: visible_line,
+                    visible_from_column: visible_column,
+                    symbol: symbol.clone(),
+                    function_scope: None,
+                };
+                artifacts.timeline.push(event);
+                artifacts
+                    .exported_interface
+                    .insert(symbol.name.clone(), symbol);
+            }
+        }
     }
 
     // Check for load("name.rda") calls. R's load() restores objects into the
@@ -2662,6 +2786,267 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
         signature: None,
         is_declared: false,
     })
+}
+
+/// Extract the symbol name bound by a `delayedAssign("name", expr)` call.
+///
+/// `delayedAssign(x, value)` installs a promise named by the string literal
+/// `x` in the calling environment (its default `assign.env`). Modeling it as a
+/// definition visible from the end of the call lets later references resolve —
+/// at top level this becomes a package-internal symbol; inside a function body
+/// the position-based scope annotation keeps it local, matching R's semantics.
+/// Only the common, statically-safe shape is handled: the first positional
+/// argument (or named `x=`) is a non-empty string literal.
+fn try_extract_delayed_assign_call(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Option<ScopedSymbol> {
+    let func_node = node.child_by_field_name("function")?;
+    if node_text(func_node, line_index.text) != "delayedAssign" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    let mut name_arg = None;
+    let mut positional_index = 0;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            if node_text(name_node, line_index.text) == "x" {
+                name_arg = child.child_by_field_name("value");
+                break;
+            }
+        } else {
+            // First positional argument is the symbol name.
+            if positional_index == 0 {
+                name_arg = child.child_by_field_name("value");
+                break;
+            }
+            positional_index += 1;
+        }
+    }
+
+    let name_node = name_arg?;
+    if name_node.kind() != "string" {
+        return None;
+    }
+    let name_str = string_literal_content(name_node, line_index.text)?;
+    if name_str.is_empty() {
+        return None;
+    }
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    Some(ScopedSymbol {
+        name: Arc::from(name_str),
+        kind: SymbolKind::Variable,
+        source_uri: uri.clone(),
+        defined_line: line,
+        defined_column: column,
+        signature: None,
+        is_declared: false,
+    })
+}
+
+/// Extract the names declared by a `globalVariables(...)` /
+/// `utils::globalVariables(...)` call.
+///
+/// `utils::globalVariables(c("a", "b"))` is R's own mechanism for telling
+/// `R CMD check` that the listed names are bound at runtime (data-masked
+/// columns, lazy-loaded internals, etc.) and must not be flagged as undefined
+/// globals. Honoring it suppresses the same false positives Raven would
+/// otherwise raise. The first positional argument may be a single string
+/// literal or a `c(...)` of string literals; only string-literal members are
+/// collected. At top level these become package-internal symbols.
+fn try_extract_global_variables_definitions(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Vec<ScopedSymbol> {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let is_global_variables = match func_node.kind() {
+        "identifier" => node_text(func_node, line_index.text) == "globalVariables",
+        "namespace_operator" => func_node
+            .child_by_field_name("rhs")
+            .is_some_and(|rhs| node_text(rhs, line_index.text) == "globalVariables"),
+        _ => false,
+    };
+    if !is_global_variables {
+        return Vec::new();
+    }
+
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+
+    // Locate the `names` vector: the first positional argument, or the
+    // explicitly named `names =` argument.
+    let mut names_value = None;
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if let Some(name_node) = child.child_by_field_name("name") {
+            if node_text(name_node, line_index.text) == "names" {
+                names_value = child.child_by_field_name("value");
+                break;
+            }
+        } else if names_value.is_none() {
+            names_value = child.child_by_field_name("value");
+            break;
+        }
+    }
+    let Some(names_value) = names_value else {
+        return Vec::new();
+    };
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    let mut string_nodes = Vec::new();
+    match names_value.kind() {
+        "string" => string_nodes.push(names_value),
+        "call" => {
+            // `c("a", "b", ...)` — collect every string-literal positional arg.
+            if let Some(c_func) = names_value.child_by_field_name("function")
+                && c_func.kind() == "identifier"
+                && node_text(c_func, line_index.text) == "c"
+                && let Some(c_args) = names_value.child_by_field_name("arguments")
+            {
+                for child in c_args.children(&mut c_args.walk()) {
+                    if child.kind() == "argument"
+                        && let Some(value) = child.child_by_field_name("value")
+                        && value.kind() == "string"
+                    {
+                        string_nodes.push(value);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut symbols = Vec::new();
+    for string_node in string_nodes {
+        if let Some(name_str) = string_literal_content(string_node, line_index.text)
+            && !name_str.is_empty()
+            // The bare `.` pronoun is deliberately NOT honored here. Packages
+            // (e.g. broom) list `"."` in globalVariables() as a blunt way to
+            // silence R CMD check for their magrittr usage, but Raven resolves
+            // `.` precisely by context (magrittr/`do()`/`all_vars()`); accepting
+            // a package-wide `.` declaration would mask genuine `.`-misuse bugs.
+            && name_str != "."
+        {
+            symbols.push(ScopedSymbol {
+                name: Arc::from(name_str),
+                kind: SymbolKind::Variable,
+                source_uri: uri.clone(),
+                defined_line: line,
+                defined_column: column,
+                signature: None,
+                is_declared: false,
+            });
+        }
+    }
+    symbols
+}
+
+/// Extract the names bound by an `env_bind_active(current_env(), name = ...)`
+/// or `env_bind_lazy(current_env(), name = ...)` call (bare or `rlang::`-
+/// qualified).
+///
+/// rlang's `env_bind_active`/`env_bind_lazy` install active/lazy bindings into
+/// the environment given as their first argument; every *named* argument
+/// becomes a binding of that name. We recognize only the `current_env()` form,
+/// where the target is the enclosing environment, so the new names are visible
+/// in the scope containing the call (from the end of the call onward). Binding
+/// into some other environment is not modeled — the names would not be local.
+fn try_extract_env_bind_definitions(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+) -> Vec<ScopedSymbol> {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let is_env_bind = match func_node.kind() {
+        "identifier" => matches!(
+            node_text(func_node, line_index.text),
+            "env_bind_active" | "env_bind_lazy"
+        ),
+        "namespace_operator" => func_node.child_by_field_name("rhs").is_some_and(|rhs| {
+            matches!(
+                node_text(rhs, line_index.text),
+                "env_bind_active" | "env_bind_lazy"
+            )
+        }),
+        _ => false,
+    };
+    if !is_env_bind {
+        return Vec::new();
+    }
+
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+
+    // The first positional argument must be a `current_env()` call.
+    let mut first_positional_is_current_env = false;
+    let mut seen_positional = false;
+    let mut named_args: Vec<Node> = Vec::new();
+    for child in args_node.children(&mut args_node.walk()) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            named_args.push(child);
+        } else if !seen_positional {
+            seen_positional = true;
+            if let Some(value) = child.child_by_field_name("value")
+                && value.kind() == "call"
+                && let Some(f) = value.child_by_field_name("function")
+            {
+                // Accept both bare `current_env()` and `rlang::current_env()`.
+                let is_current_env = match f.kind() {
+                    "identifier" => node_text(f, line_index.text) == "current_env",
+                    "namespace_operator" => f
+                        .child_by_field_name("rhs")
+                        .is_some_and(|rhs| node_text(rhs, line_index.text) == "current_env"),
+                    _ => false,
+                };
+                if is_current_env {
+                    first_positional_is_current_env = true;
+                }
+            }
+        }
+    }
+
+    if !first_positional_is_current_env {
+        return Vec::new();
+    }
+
+    let (line, column) = node_start_position_utf16(node, line_index);
+    let mut symbols = Vec::new();
+    for arg in named_args {
+        if let Some(name_node) = arg.child_by_field_name("name") {
+            let name = node_text(name_node, line_index.text);
+            if name.is_empty() {
+                continue;
+            }
+            symbols.push(ScopedSymbol {
+                name: Arc::from(name),
+                kind: SymbolKind::Variable,
+                source_uri: uri.clone(),
+                defined_line: line,
+                defined_column: column,
+                signature: None,
+                is_declared: false,
+            });
+        }
+    }
+    symbols
 }
 
 /// Extract the generic name defined by a `setGeneric("name", ...)` or
@@ -4781,7 +5166,10 @@ where
     if current_depth == 0
         && let Some(contrib) = package_contribution
     {
-        append_package_contribution(&mut scope, uri, contrib);
+        let dev_load_all = get_artifacts(uri)
+            .map(|a| a.calls_dev_load_all)
+            .unwrap_or(false);
+        append_package_contribution(&mut scope, uri, contrib, dev_load_all);
     }
 
     scope
@@ -4850,6 +5238,7 @@ fn visible_preamble_entries<'a, V>(
 fn compute_contribution_symbol_names(
     queried_uri: &Url,
     contribution: Option<&crate::package_state::PackageScopeContribution>,
+    dev_load_all: bool,
 ) -> HashSet<Arc<str>> {
     let mut out: HashSet<Arc<str>> = HashSet::new();
     let Some(contrib) = contribution else {
@@ -4871,7 +5260,9 @@ fn compute_contribution_symbol_names(
 
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        if is_dev_context {
+        // Dev-context dirs and any file that calls `devtools::load_all()` see
+        // the package's own internal/exported/sysdata/onload/imported symbols.
+        if is_dev_context || dev_load_all {
             for sym in contrib.r_internal_symbols.iter() {
                 out.insert(Arc::from(sym.as_str()));
             }
@@ -4974,6 +5365,7 @@ pub(crate) fn append_package_contribution(
     scope: &mut ScopeAtPosition,
     uri: &Url,
     contrib: &crate::package_state::PackageScopeContribution,
+    dev_load_all: bool,
 ) {
     let Some(root) = contrib.workspace_root.as_ref() else {
         return;
@@ -5012,11 +5404,13 @@ pub(crate) fn append_package_contribution(
     // vignettes/, man/).
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        if !is_dev_context {
+        // Dev-context dirs and any file that calls `devtools::load_all()`
+        // (modeled as attaching the package under development) see
+        // r_internal_symbols + sysdata + onload + imported_symbols but NOT
+        // test_helper_symbols or test_attached_packages.
+        if !is_dev_context && !dev_load_all {
             return;
         }
-        // Dev-context files see r_internal_symbols + imported_symbols but
-        // NOT test_helper_symbols or test_attached_packages.
         for sym in contrib.r_internal_symbols.iter() {
             let name: Arc<str> = Arc::from(sym.as_str());
             scope
@@ -5491,8 +5885,11 @@ where
         // `queried_uri`. Doing it once at construction keeps
         // `is_visible`/`symbol_for` O(1) hash lookups instead of repeatedly
         // walking the BTreeMap of helper files.
-        let contribution_symbol_names =
-            compute_contribution_symbol_names(queried_uri, package_contribution);
+        let contribution_symbol_names = compute_contribution_symbol_names(
+            queried_uri,
+            package_contribution,
+            artifacts.calls_dev_load_all,
+        );
 
         Some(Self {
             queried_uri,
@@ -5954,7 +6351,12 @@ where
         // visibility check route through `parent_symbol_names` (computed via
         // the recursive path at position (0, 0)).
         if let Some(contrib) = self.package_contribution {
-            append_package_contribution(&mut scope, self.queried_uri, contrib);
+            append_package_contribution(
+                &mut scope,
+                self.queried_uri,
+                contrib,
+                self.artifacts.calls_dev_load_all,
+            );
         }
 
         scope
@@ -7177,6 +7579,138 @@ mod tests {
 
         // Dynamic name should not be treated as a definition
         assert_eq!(artifacts.exported_interface.len(), 0);
+    }
+
+    #[test]
+    fn test_delayed_assign_top_level_literal() {
+        let code = r#"delayedAssign("shared_empty", period())"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("shared_empty"));
+        // Top-level delayedAssign is a package-visible export.
+        assert!(live_top_level_exports(&artifacts).contains("shared_empty"));
+    }
+
+    #[test]
+    fn test_delayed_assign_named_x_arg() {
+        let code = r#"delayedAssign(x = "lazy_sym", value = compute())"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("lazy_sym"));
+    }
+
+    #[test]
+    fn test_delayed_assign_dynamic_name_ignored() {
+        let code = r#"delayedAssign(name_var, value)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert_eq!(artifacts.exported_interface.len(), 0);
+    }
+
+    #[test]
+    fn test_delayed_assign_inside_function_is_local() {
+        // delayedAssign's default assign.env is the caller's env, so a call
+        // inside a function body binds locally, NOT at package scope.
+        let code = "f <- function() {\n  delayedAssign(\"loc\", expr())\n  loc\n}\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        // The binding IS created (present in the scope-blind exported_interface)…
+        assert!(
+            artifacts.exported_interface.contains_key("loc"),
+            "the delayedAssign binding should still be recorded"
+        );
+        // …but it is function-scoped, so it is NOT a package-visible export.
+        assert!(
+            !live_top_level_exports(&artifacts).contains("loc"),
+            "function-local delayedAssign must not become a top-level export"
+        );
+    }
+
+    #[test]
+    fn test_global_variables_single_string() {
+        let code = r#"utils::globalVariables("vec_unspecified_cast")"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(
+            artifacts
+                .exported_interface
+                .contains_key("vec_unspecified_cast")
+        );
+        assert!(live_top_level_exports(&artifacts).contains("vec_unspecified_cast"));
+    }
+
+    #[test]
+    fn test_global_variables_c_vector() {
+        let code = r#"globalVariables(c("name", "value", "weight"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        for n in ["name", "value", "weight"] {
+            assert!(artifacts.exported_interface.contains_key(n), "missing {n}");
+        }
+    }
+
+    #[test]
+    fn test_global_variables_non_literal_ignored() {
+        let code = r#"globalVariables(some_names)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert_eq!(artifacts.exported_interface.len(), 0);
+    }
+
+    #[test]
+    fn test_global_variables_dot_pronoun_not_honored() {
+        // Packages list "." in globalVariables() to silence R CMD check, but
+        // Raven resolves `.` by context; honoring it would mask real bugs.
+        let code = r#"globalVariables(c(".", ".fitted", "value"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(!artifacts.exported_interface.contains_key("."));
+        assert!(artifacts.exported_interface.contains_key(".fitted"));
+        assert!(artifacts.exported_interface.contains_key("value"));
+    }
+
+    #[test]
+    fn test_env_bind_active_current_env_named_args() {
+        let code = r#"env_bind_active(current_env(), foo = function() abort("msg"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("foo"));
+    }
+
+    #[test]
+    fn test_env_bind_lazy_current_env_named_args() {
+        let code = r#"env_bind_lazy(current_env(), do = catcher(x))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("do"));
+    }
+
+    #[test]
+    fn test_env_bind_active_non_current_env_ignored() {
+        // Binding into some other environment is not modeled — `bar` is not
+        // necessarily local to the call site.
+        let code = r#"env_bind_active(other_env, bar = function() 1)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(!artifacts.exported_interface.contains_key("bar"));
+    }
+
+    #[test]
+    fn test_env_bind_active_rlang_qualified_current_env() {
+        // Both the verb and current_env() may be namespace-qualified.
+        let code = r#"rlang::env_bind_active(rlang::current_env(), foo = function() 1)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("foo"));
+    }
+
+    #[test]
+    fn test_global_variables_named_names_arg() {
+        let code = r#"globalVariables(names = c("alpha", "beta"))"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        assert!(artifacts.exported_interface.contains_key("alpha"));
+        assert!(artifacts.exported_interface.contains_key("beta"));
     }
 
     #[test]
