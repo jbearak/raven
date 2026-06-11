@@ -96,7 +96,14 @@ The CRAN/Bioconductor portion of `names.db` is built from [r-universe](https://r
 
 Base and recommended packages (**base**, **methods**, **utils**, **stats**, **datasets**, …) are normally read from your R installation. In CI without R they aren't on disk, so Raven falls back to the **embedded base table** compiled into the binary — a `// @generated` per-package record for all 14 of R's base-priority packages. Only the default-attached **Base-7** (`base`, `methods`, `utils`, `grDevices`, `graphics`, `stats`, `datasets`) are always in scope; the other 7 (compiler, grid, parallel, splines, stats4, tcltk, tools) sit in the per-package cache so `library(grid)` and friends resolve offline once explicitly loaded. This embedded table is the floor for base symbols; no database file is needed for base coverage. Recommended packages (such as **MASS**, **Matrix**, **survival**, …) are not embedded — they remain in `names.db` and resolve via Tier 3 when the database is present. Base **datasets** — `mtcars`, `iris`, and the like — are resolved via the embedded `datasets` records, so they resolve in CI too. A real R install still wins: these fallbacks are only consulted when the base packages aren't found locally.
 
-**Non-base package datasets** (e.g. `flights` from **nycflights13**, `diamonds` from **ggplot2**) are captured as `lazy_data` in every tier's records. Resolving them as symbols is handled by [raven#350](https://github.com/jbearak/raven/issues/350) (the package-dataset / lazy-data resolution mechanism, already landed): once a record carries its datasets, that path folds them into the resolvable set automatically — so package datasets resolve in CI with no extra work here.
+**Non-base package datasets** (e.g. `flights` from **nycflights13**, `diamonds` from **ggplot2**) are captured as a `lazy_data` list in every tier's records and folded into the resolvable set when the package's exports are collected, so they resolve in CI with no extra work here.
+
+How the dataset list is assembled at capture time (Tier 1 or Tier 2 generation) depends on the package:
+
+- **LazyData packages** (`DESCRIPTION` sets `LazyData: true`; identifiable by `data/Rdata.rdb`) build a binary database of all data objects, so their `data/` file stems alone don't give a complete or authoritative list. For these packages Raven queries the R subprocess — `data(package = "pkg")$results` — to enumerate the dataset object names. Without R, the static file-stem walk is used as a fallback (reduced fidelity; package like **survival** may be missing unlisted datasets like `lung`).
+- **Non-LazyData packages** store individual `.rda`/`.RData` files in `data/`. Raven collects dataset names by walking those files and the `INDEX` file — no subprocess needed.
+
+`raven packages build-shipped-db --capture-reference` also routes through this path, so the Tier 3 reference-R capture picks up authoritative dataset lists for LazyData packages when R is available at build time.
 
 ## Names vs. install status
 
