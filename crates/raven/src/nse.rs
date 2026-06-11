@@ -33,11 +33,13 @@
 //! `stats` model-fitting `subset`/`weights` data-masking, dplyr/tidyr
 //! data-masking and tidy-select verbs, `tibble`/`targets` constructors and
 //! target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes`
-//! step/role column captures, ggplot2 mapping helpers, rlang capture helpers,
-//! and a few established DSLs); it is intentionally extensible rather than
-//! exhaustive. A handful of large, uniform export families (`recipes::step_*`,
-//! `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name prefix rather than
-//! enumerated, since every member shares one empirically verified contract.
+//! step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`),
+//! `tidytext`/`modelr`/`drake` column- and target-name captures, rlang capture
+//! helpers, and a few established DSLs); it is intentionally extensible rather
+//! than exhaustive. A handful of large, uniform export families
+//! (`recipes::step_*`, `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name
+//! prefix rather than enumerated, since every member shares one empirically
+//! verified contract.
 
 /// What to do with the arguments of a resolved call when collecting
 /// undefined-variable candidates.
@@ -276,6 +278,20 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
         "tibble" => tibble_policy(name)?,
         "ggplot2" => match name {
             "aes" | "vars" => ArgPolicy::WholeCall,
+            // qplot(x, y, ..., data, ...): the x/y aesthetics and any further
+            // aesthetic mappings absorbed by `...` (e.g. `colour =`, `size =`)
+            // are evaluated in the `data` mask, so they are suppressed. `data`
+            // and the literal plot controls (`facets`/`xlim`/`main`/…), which
+            // sit after `...` and bind by name only, stay checked. Verified
+            // against ggplot2 + R 4.6.0.
+            "qplot" => ArgPolicy::per_formal(
+                &[
+                    "x", "y", "...", "data", "facets", "margins", "geom", "xlim", "ylim", "log",
+                    "main", "xlab", "ylab", "asp", "stat", "position",
+                ],
+                &["x", "y"],
+                true,
+            ),
             _ => return None,
         },
         "rlang" => match name {
@@ -323,6 +339,60 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
                 &["data1", "data2", "id", "...", "tstart", "tstop", "options"],
                 &["id", "tstart", "tstop"],
                 true,
+            ),
+            _ => return None,
+        },
+        "tidytext" => match name {
+            // unnest_tokens(tbl, output, input, ...): `output` (the new
+            // token column's name) and `input` (the source text column) are
+            // bare data-masked symbols. The trailing `...` is forwarded to the
+            // tokenizer (e.g. `n` for ngrams) and evaluated, so dots stay
+            // checked. Verified against tidytext 0.4.x + R 4.6.0.
+            "unnest_tokens" => ArgPolicy::per_formal(
+                &[
+                    "tbl", "output", "input", "token", "format", "to_lower", "drop", "collapse",
+                    "...",
+                ],
+                &["output", "input"],
+                false,
+            ),
+            // bind_tf_idf(tbl, term, document, n): `term`/`document`/`n` are
+            // bare column references evaluated in the `tbl` mask; `tbl` checked.
+            "bind_tf_idf" => ArgPolicy::per_formal(
+                &["tbl", "term", "document", "n"],
+                &["term", "document", "n"],
+                false,
+            ),
+            _ => return None,
+        },
+        "modelr" => match name {
+            // data_grid(data, ..., .model): the `...` `name = expression`
+            // pairs are evaluated in the `data` mask (like `tidyr::expand`),
+            // so they are suppressed; `data` and `.model` stay checked.
+            // Verified against modelr 0.1.x + R 4.6.0.
+            "data_grid" => ArgPolicy::per_formal(&["data", "...", ".model"], &[], true),
+            _ => return None,
+        },
+        "drake" => match name {
+            // readd(target, ...): `target` is a bare drake target name (the
+            // same NSE shape as `targets::tar_read`'s `name`). Everything else
+            // (`character_only`, `path`, `cache`, …) is evaluated normally.
+            // Verified against drake 7.x + R 4.6.0.
+            "readd" => ArgPolicy::per_formal(
+                &[
+                    "target",
+                    "character_only",
+                    "path",
+                    "search",
+                    "cache",
+                    "namespace",
+                    "verbose",
+                    "show_source",
+                    "subtargets",
+                    "subtarget_list",
+                ],
+                &["target"],
+                false,
             ),
             _ => return None,
         },
@@ -822,15 +892,51 @@ fn tidyr_policy(name: &str) -> Option<ArgPolicy> {
             ArgPolicy::per_formal(&["data", "col", "into", "..."], &["col"], false)
         }
         "unnest" => ArgPolicy::per_formal(&["data", "cols", "..."], &["cols"], true),
+        // gather(data, key, value, ..., na.rm, convert, factor_key): `key` and
+        // `value` are bare OUTPUT column names captured as symbols, and the
+        // `...` columns to gather are tidy-selected. `data` and the literal
+        // controls (`na.rm`/`convert`/`factor_key`) stay checked. Verified
+        // against tidyr 1.3.x + R 4.6.0.
+        "gather" => ArgPolicy::per_formal(
+            &[
+                "data",
+                "key",
+                "value",
+                "...",
+                "na.rm",
+                "convert",
+                "factor_key",
+            ],
+            &["key", "value"],
+            true,
+        ),
         "unnest_wider" | "unnest_longer" => {
             ArgPolicy::per_formal(&["data", "col", "..."], &["col"], false)
         }
         "hoist" => ArgPolicy::per_formal(&[".data", ".col", "..."], &[".col"], true),
-        "nest" | "fill" | "drop_na" | "complete" | "expand" => {
+        // nest(.data, ..., .by, .key, .names_sep): the `name = selection`
+        // pairs in `...` are tidy-selected; `.by` selects grouping columns
+        // (data-masked, like dplyr); `.key` is the deprecated bare/string output
+        // column name (NSE). `.names_sep` is a literal string and stays checked.
+        // Verified against tidyr (`nest()` source) + R 4.6.0.
+        "nest" => ArgPolicy::per_formal(
+            &[".data", "...", ".by", ".key", ".names_sep"],
+            &[".by", ".key"],
+            true,
+        ),
+        "fill" | "drop_na" | "complete" | "expand" => {
             ArgPolicy::per_formal(&["data", "..."], &[], true)
         }
         // chop/unchop/separate_wider_*: `cols` is tidy-selected; data + controls checked.
-        "chop" => ArgPolicy::per_formal(&["data", "cols", "...", "error_call"], &["cols"], false),
+        // chop(data, ..., cols, by, error_call): `cols`/`by` tidy-select the
+        // packed columns; the deprecated positional cols land in `...`. All are
+        // data-masked; `data` and `error_call` stay checked. Verified against
+        // tidyr (`chop()` source) + R 4.6.0.
+        "chop" => ArgPolicy::per_formal(
+            &["data", "...", "cols", "by", "error_call"],
+            &["cols", "by"],
+            true,
+        ),
         "unchop" => ArgPolicy::per_formal(
             &["data", "cols", "...", "keep_empty", "ptype", "error_call"],
             &["cols"],
@@ -1273,6 +1379,71 @@ mod tests {
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![true, true]);
     }
+
+    #[test]
+    fn ggplot2_qplot_suppresses_aesthetics_checks_data_and_controls() {
+        // qplot(mpg, wt, colour = cyl, data = mtcars, main = "t"): x/y
+        // positionals and the unmatched aesthetic `colour` are data-masked
+        // (suppressed); `data` and the literal control `main` stay checked.
+        let p = package_policy("ggplot2", "qplot").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, None, Some("colour"), Some("data"), Some("main")]),
+            false,
+        );
+        assert_eq!(mask, vec![true, true, true, false, false]);
+    }
+
+    #[test]
+    fn tidyr_gather_captures_key_value_and_columns_checks_data() {
+        // gather(df, mykey, myval, a, b, na.rm = TRUE): data checked;
+        // key/value bare output names suppressed; the gathered columns (dots)
+        // suppressed; `na.rm` checked.
+        let p = package_policy("tidyr", "gather").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, None, None, None, None, Some("na.rm")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, true, true, true, true, false]);
+    }
+
+    #[test]
+    fn tidytext_unnest_tokens_captures_output_input_checks_dots() {
+        // df %>% unnest_tokens(word, text, token = "ngrams", n = 2): pipe
+        // supplies `tbl`; output/input bare columns suppressed; `token` and the
+        // tokenizer dot `n` stay checked (forwarded, not masked).
+        let p = package_policy("tidytext", "unnest_tokens").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, None, Some("token"), Some("n")]), true);
+        assert_eq!(mask, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn tidytext_bind_tf_idf_captures_term_document_n() {
+        // bind_tf_idf(d, term, document, n): tbl checked; the three column
+        // references suppressed.
+        let p = package_policy("tidytext", "bind_tf_idf").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, None, None, None]), false);
+        assert_eq!(mask, vec![false, true, true, true]);
+    }
+
+    #[test]
+    fn modelr_data_grid_suppresses_dots_checks_data_and_model() {
+        // data_grid(df, a = seq_range(a, 5), .model = mod): data checked; the
+        // `...` expression suppressed (data mask); `.model` checked.
+        let p = package_policy("modelr", "data_grid").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, Some("a"), Some(".model")]), false);
+        assert_eq!(mask, vec![false, true, false]);
+    }
+
+    #[test]
+    fn drake_readd_captures_target_only() {
+        // readd(my_target, character_only = FALSE): target suppressed; control checked.
+        let p = package_policy("drake", "readd").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, Some("character_only")]), false);
+        assert_eq!(mask, vec![true, false]);
+    }
+
     #[test]
     fn htmltools_with_tags_captures_tag_expression() {
         let p = package_policy("htmltools", "withTags").unwrap();
@@ -1577,6 +1748,34 @@ mod tests {
     }
 
     #[test]
+    fn tidyr_nest_captures_by_and_key_checks_names_sep() {
+        // nest(df, x, .by = g, .key = k, .names_sep = "_"): `.data` is supplied
+        // positionally (df checked); the bare `x` is a packed column (dots,
+        // captured); `.by` (grouping columns) and `.key` (bare output name) are
+        // captured; `.names_sep` is a literal string and stays checked.
+        let p = package_policy("tidyr", "nest").unwrap();
+        let mask = suppressed_arguments(
+            &p,
+            &labels(&[None, None, Some(".by"), Some(".key"), Some(".names_sep")]),
+            false,
+        );
+        assert_eq!(mask, vec![false, true, true, true, false]);
+    }
+
+    #[test]
+    fn tidyr_chop_captures_named_cols_and_by() {
+        // chop(df, cols = c(a, b), by = g): data checked; the `cols` and `by`
+        // tidy-selections are captured.
+        let p = package_policy("tidyr", "chop").unwrap();
+        let mask = suppressed_arguments(&p, &labels(&[None, Some("cols"), Some("by")]), false);
+        assert_eq!(mask, vec![false, true, true]);
+        // chop(df, x, y): the deprecated positional cols land in `...` and are
+        // captured; `data` checked.
+        let mask = suppressed_arguments(&p, &labels(&[None, None, None]), false);
+        assert_eq!(mask, vec![false, true, true]);
+    }
+
+    #[test]
     fn tidyr_sweep_additions() {
         // chop(df, c(a, b)): cols suppressed, data checked.
         let p = package_policy("tidyr", "chop").unwrap();
@@ -1858,6 +2057,7 @@ mod tests {
             ("drop_na", PerFormal),
             ("complete", PerFormal),
             ("expand", PerFormal),
+            ("gather", PerFormal),
             ("replace_na", None),
         ];
         for (name, want) in cases {
@@ -1875,6 +2075,7 @@ mod tests {
         let cases: &[(&str, &str, Shape)] = &[
             ("ggplot2", "aes", WholeCall),
             ("ggplot2", "vars", WholeCall),
+            ("ggplot2", "qplot", PerFormal),
             ("ggplot2", "geom_point", None),
             ("rlang", "enquo", PerFormal),
             ("rlang", "enexpr", PerFormal),
@@ -1904,6 +2105,13 @@ mod tests {
             ("tibble", "tribble", None),
             ("dplyr", "join_by", WholeCall),
             ("dplyr", "tibble", PerFormal),
+            ("tidytext", "unnest_tokens", PerFormal),
+            ("tidytext", "bind_tf_idf", PerFormal),
+            ("tidytext", "cast_dtm", None),
+            ("modelr", "data_grid", PerFormal),
+            ("modelr", "add_predictions", None),
+            ("drake", "readd", PerFormal),
+            ("drake", "loadd", None),
             // Unknown package -> always None.
             ("nonesuch", "filter", None),
         ];

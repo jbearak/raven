@@ -5608,6 +5608,26 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     packages
 }
 
+/// Issue #431: the name of the package under development, but only when the
+/// queried file (`uri`) belongs to that package's own tree (R/, tests,
+/// vignettes, man/rmd — anything [`crate::package_state::is_package_workspace_r_file`]
+/// recognizes). `None` otherwise (no package workspace, or a file outside the
+/// package tree merely open in the same window).
+///
+/// Threaded into [`NseAnalysis`] as `self_nse_package` and consulted ONLY for
+/// the NSE policy lookup (so a verb the package itself exports — e.g. dplyr's
+/// `filter` — keeps its data-masking policy inside the package's own files).
+/// Deliberately separate from [`collect_in_play_packages`]: a self-package verb
+/// with no known policy must stay conservatively arg-suppressed rather than be
+/// resolved to standard-eval, which would re-introduce the data-masking false
+/// positives this fix removes.
+fn self_nse_package_for_file(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Option<String> {
+    let name = snapshot.scope_contribution.package_name.as_ref()?;
+    let root = snapshot.scope_contribution.workspace_root.as_ref()?;
+    let path = uri.to_file_path().ok()?;
+    crate::package_state::is_package_workspace_r_file(&path, root).then(|| name.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
@@ -5652,6 +5672,7 @@ fn collect_undefined_variables_from_snapshot(
             .cross_file_config
             .undefined_variable_in_bracket_indices,
         in_play_packages,
+        self_nse_package_for_file(snapshot, uri),
         Some(snapshot.package_library.as_ref()),
         Some(snapshot.base_exports.as_ref()),
     );
@@ -12516,6 +12537,17 @@ pub(crate) struct NseAnalysis<'a> {
     /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
     /// packages. A loaded package shadows base when classifying a bare callee.
     in_play_packages: Vec<String>,
+    /// Issue #431: the name of the package under development, set only when the
+    /// queried file belongs to that package's own tree (any `.R`/`.Rmd`/`.qmd`
+    /// file under the workspace root — `R/`, `tests/`, vignettes, `man/`,
+    /// `inst/`, `data-raw/`, …; see `is_package_workspace_r_file`). Consulted **only** for the NSE *policy* lookup (so the
+    /// package's own data-masking verbs like dplyr's `filter` keep their policy
+    /// inside the package's own files), and deliberately NOT treated as a
+    /// "loaded package" for standard-eval export resolution: a self-package verb
+    /// with no known policy (e.g. dplyr's superseded `mutate_at`, `do`) stays
+    /// conservatively arg-suppressed rather than flipping to checked — which
+    /// would surface the very data-masking false positives this issue removes.
+    self_nse_package: Option<String>,
     /// Whether data.table is detectably in play (Phase 3).
     data_table_in_play: bool,
     /// Variable names whose defining RHS is a data.table constructor/converter.
@@ -12549,12 +12581,17 @@ impl<'a> NseAnalysis<'a> {
     /// Walk `root` once to gather the file-local facts (local function policies,
     /// data.table-like objects, `data.table::` qualified usage) and bundle them
     /// with the supplied config flags and package context.
+    // Distinct analysis inputs (config flags, in-play vs self-package sets,
+    // library/base-export refs); grouping them into a struct would only move the
+    // argument list to the call site.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         root: Node,
         text: &str,
         call_args_enabled: bool,
         bracket_indices_enabled: bool,
         in_play_packages: Vec<String>,
+        self_nse_package: Option<String>,
         package_library: Option<&'a crate::package_library::PackageLibrary>,
         base_exports: Option<&'a HashSet<String>>,
     ) -> Self {
@@ -12593,6 +12630,7 @@ impl<'a> NseAnalysis<'a> {
             bracket_indices_enabled,
             local_function_policies,
             in_play_packages,
+            self_nse_package,
             data_table_in_play,
             data_table_objects,
             non_data_table_objects,
@@ -13275,6 +13313,20 @@ fn resolve_call_arg_policy(
             return policy;
         }
     }
+    // 2.5 (issue #431). When analyzing a package's OWN files, consult the
+    //     package's own NSE policy too, so its own data-masking verbs (e.g.
+    //     dplyr's `filter` inside dplyr's test suite) keep their policy even
+    //     though no `library()` attaches the package under development. This is
+    //     intentionally a POLICY-ONLY lookup: unlike an in-play package, the
+    //     self-package is never used to flip an unrecognized verb to
+    //     standard-eval (step 4 below), so a self-package verb with no known
+    //     policy stays conservatively arg-suppressed (the prior behavior),
+    //     rather than newly checking its data-masked columns.
+    if let Some(self_pkg) = &analysis.self_nse_package
+        && let Some(policy) = crate::nse::package_policy(self_pkg, name)
+    {
+        return policy;
+    }
     // 3. Base / builtin NSE policy.
     if let Some(policy) = crate::nse::base_policy(name) {
         return policy;
@@ -13685,7 +13737,7 @@ fn collect_usages_with_context<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    let analysis = NseAnalysis::build(node, text, true, true, Vec::new(), None, None);
+    let analysis = NseAnalysis::build(node, text, true, true, Vec::new(), None, None, None);
     collect_usages_with_analysis(node, text, &analysis, context, used);
 }
 
@@ -19666,7 +19718,7 @@ mod tests {
         used: &mut Vec<(String, Node<'a>)>,
     ) {
         let in_play: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
-        let analysis = NseAnalysis::build(root, text, true, true, in_play, None, None);
+        let analysis = NseAnalysis::build(root, text, true, true, in_play, None, None, None);
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
 
@@ -19678,7 +19730,16 @@ mod tests {
         brackets: bool,
         used: &mut Vec<(String, Node<'a>)>,
     ) {
-        let analysis = NseAnalysis::build(root, text, call_args, brackets, Vec::new(), None, None);
+        let analysis = NseAnalysis::build(
+            root,
+            text,
+            call_args,
+            brackets,
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
 
@@ -19860,6 +19921,7 @@ mod tests {
             true,
             true,
             in_play,
+            None,
             Some(&lib),
             None,
         );
@@ -19911,6 +19973,7 @@ mod tests {
             true,
             true,
             in_play,
+            None,
             Some(&lib),
             None,
         );
@@ -20104,6 +20167,7 @@ mod tests {
             true,
             true,
             Vec::new(),
+            None,
             None,
             Some(&base_exports),
         );
@@ -21718,6 +21782,7 @@ clean_data <- function(x) {
                 .set_from(crate::package_state::PackageState {
                     scope_contribution: PackageScopeContribution {
                         workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        package_name: None,
                         r_internal_symbols: std::sync::Arc::new(internal),
                         imported_symbols: Default::default(),
                         full_imports: Default::default(),
@@ -21801,6 +21866,7 @@ clean_data <- function(x) {
                 .set_from(crate::package_state::PackageState {
                     scope_contribution: PackageScopeContribution {
                         workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        package_name: None,
                         r_internal_symbols: Default::default(),
                         imported_symbols: Default::default(),
                         full_imports: std::sync::Arc::new(full),
@@ -21871,6 +21937,7 @@ clean_data <- function(x) {
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: std::sync::Arc::new(imported),
                     full_imports: Default::default(),
@@ -22251,6 +22318,7 @@ clean_data <- function(x) {
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: std::sync::Arc::new(full_imports),
@@ -24226,6 +24294,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: std::sync::Arc::new(internal),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24311,6 +24380,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24364,6 +24434,176 @@ y <- totally_undefined_baseline()
         );
     }
 
+    /// Issue #431: when analyzing the package's OWN test file, the package's
+    /// own NSE verbs must keep their data-masking policy. A package named
+    /// `dplyr` whose `tests/testthat/test-a.R` calls `filter(df, x > 1)` must
+    /// NOT flag the masked column `x`. Red before the fix (the package's own
+    /// name was never added to the in-play set), green after.
+    #[tokio::test]
+    async fn own_package_nse_policy_suppresses_mask_arg_in_test_file() {
+        let diagnostics = run_self_package_diag(
+            "dplyr",
+            "file:///work/pkg/tests/testthat/test-a.R",
+            "df <- data.frame(x = 1:3)\nfilter(df, x > 1)\n",
+        )
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: x"),
+            "the package's own `filter` must data-mask `x` in its own tests. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #431 negative case: including the package's own name must NOT
+    /// silence a genuinely-undefined bare symbol that sits OUTSIDE any mask
+    /// position. `filter`'s masked `x` is suppressed, but `bogus_symbol` in an
+    /// ordinary expression still flags.
+    #[tokio::test]
+    async fn own_package_nse_policy_keeps_genuine_undefined_flagged() {
+        let diagnostics = run_self_package_diag(
+            "dplyr",
+            "file:///work/pkg/tests/testthat/test-a.R",
+            "df <- data.frame(x = 1:3)\nfilter(df, x > 1)\ny <- bogus_symbol + 1\n",
+        )
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: x"),
+            "masked `x` must stay suppressed. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: bogus_symbol"),
+            "a genuine undefined outside any mask position must still flag. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #431: the self-package policy also applies to files under `R/`
+    /// (a sibling source file calling the package's own verb), not only tests.
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn own_package_nse_policy_suppresses_mask_arg_in_R_file() {
+        let diagnostics = run_self_package_diag(
+            "dplyr",
+            "file:///work/pkg/R/helpers.R",
+            "df <- data.frame(x = 1:3)\nfilter(df, x > 1)\n",
+        )
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: x"),
+            "the package's own `filter` must data-mask `x` in its own R/ files. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #431: a file OUTSIDE the package tree must NOT inherit the
+    /// package's own NSE policy. With `dplyr` as the workspace package name but
+    /// the queried file outside `<root>`, `filter`'s masked `x` is analyzed as
+    /// ordinary code and flags — confirming the gate is the file's membership
+    /// in the package tree, not merely the workspace having a package name.
+    #[tokio::test]
+    async fn own_package_nse_policy_not_applied_outside_package_tree() {
+        let diagnostics = run_self_package_diag(
+            "dplyr",
+            "file:///elsewhere/script.R",
+            "df <- data.frame(x = 1:3)\nfilter(df, x > 1)\n",
+        )
+        .await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: x"),
+            "a file outside the package tree must not inherit the self-package \
+             policy. messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Shared harness for the issue #431 self-package tests: derive diagnostics
+    /// for `code` at `uri` with a package workspace rooted at `/work/pkg` whose
+    /// own name is `package_name`. No `library()` call attaches the package —
+    /// the only way its NSE policy can apply is the self-package inclusion.
+    async fn run_self_package_diag(package_name: &str, uri: &str, code: &str) -> Vec<Diagnostic> {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: Some(package_name.to_string()),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let uri = Url::parse(uri).unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        diagnostics
+    }
+
     /// Issue #275 asymmetry: `test_helper_symbols` must NOT suppress the
     /// undefined-variable diagnostic for files under `R/` — the same one-way
     /// visibility that excludes `tests/testthat/` defs from
@@ -24392,6 +24632,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24636,6 +24877,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24730,6 +24972,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24820,6 +25063,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -24935,6 +25179,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(workspace_path.to_path_buf()),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25059,6 +25304,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(workspace_path.to_path_buf()),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25164,6 +25410,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(workspace_path.to_path_buf()),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25241,6 +25488,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(workspace_path.to_path_buf()),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25333,6 +25581,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25408,6 +25657,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25477,6 +25727,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25546,6 +25797,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25617,6 +25869,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -25688,6 +25941,7 @@ y <- totally_undefined_baseline()
             .set_from(crate::package_state::PackageState {
                 scope_contribution: PackageScopeContribution {
                     workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: None,
                     r_internal_symbols: Default::default(),
                     imported_symbols: Default::default(),
                     full_imports: Default::default(),
@@ -29675,6 +29929,7 @@ result <- data %>% filter(x > 0)
                 .set_from(crate::package_state::PackageState {
                     scope_contribution: crate::package_state::PackageScopeContribution {
                         workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                        package_name: None,
                         r_internal_symbols: std::sync::Arc::new(internal),
                         imported_symbols: std::sync::Arc::new(BTreeMap::new()),
                         full_imports: Default::default(),
