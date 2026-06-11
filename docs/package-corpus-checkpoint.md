@@ -151,6 +151,30 @@ Installing the R `magick` package (against system ImageMagick) pruned the last
 3 of those entries — ragg's `image_read`/`image_crop`/`image_sample` in
 `vignettes/ragg_quality.Rmd` now resolve.
 
+## Lazy-data ledger prune (#429) — 2026-06-11
+
+This branch's lazy-data enumeration plus `data()` alias expansion lets Raven
+resolve a large class of dataset symbols it previously flagged. A full
+four-group strict run reported **677 stale false-positive entries** — symbols
+Raven no longer emits — which were pruned in a single sweep keyed on the
+runner's `stale-fp:` report (package + path + start position + message):
+survival 540, broom 81, lattice 15, forcats 12, MASS 6, googlesheets4 5,
+reprex 4, dplyr 4, stats 3, KernSmooth 3, rpart 2, readr 1, ragg 1.
+
+Sysdata triage: all 25 remaining `R/sysdata.rda` entries (cli's `emojis`,
+`spinners`, `rstudio_themes`, `gfycat_*`, `wide_chars`; readr's `date_symbols`)
+are referenced from within their owning package's own `R/` sources, where the
+objects are namespace-internal but in-scope under package/`load_all` semantics.
+None is a user-level reference, so none was reclassified to `AcceptedReal`;
+they remain false positives and a known package-mode machinery gap (Raven does
+not yet treat a package's own `sysdata.rda` objects as in-scope for its `R/`
+code).
+
+Ledger size: `known_false_positives.toml` 2151 → 1474 entries (677 pruned, 0
+reclassified). `accepted_real_diagnostics.toml` unchanged (0 stale
+acceptances). The re-run is clean: 0 unclassified, 0 stale acceptances, 0 stale
+FPs.
+
 ## Validation
 
 - `cargo fmt --all --check` ✓
