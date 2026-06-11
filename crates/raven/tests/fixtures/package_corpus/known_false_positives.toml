@@ -15108,39 +15108,6 @@ start_character = 12
 end_line = 468
 end_character = 20
 [[false_positive]]
-package = "ragg"
-path = "vignettes/ragg_quality.Rmd"
-message = "Undefined variable: image_read"
-reason = "function from a library()-attached package not installed in the analysis environment"
-
-[false_positive.range]
-start_line = 27
-start_character = 9
-end_line = 27
-end_character = 19
-[[false_positive]]
-package = "ragg"
-path = "vignettes/ragg_quality.Rmd"
-message = "Undefined variable: image_crop"
-reason = "function from a library()-attached package not installed in the analysis environment"
-
-[false_positive.range]
-start_line = 28
-start_character = 9
-end_line = 28
-end_character = 19
-[[false_positive]]
-package = "ragg"
-path = "vignettes/ragg_quality.Rmd"
-message = "Undefined variable: image_sample"
-reason = "function from a library()-attached package not installed in the analysis environment"
-
-[false_positive.range]
-start_line = 29
-start_character = 9
-end_line = 29
-end_character = 21
-[[false_positive]]
 package = "readr"
 path = "R/date-symbols.R"
 message = "Undefined variable: date_symbols"

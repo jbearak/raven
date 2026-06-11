@@ -40,8 +40,11 @@
 //! ```
 //!
 //! `magick` additionally needs system ImageMagick first: on macOS,
-//! `brew install imagemagick` before `install.packages("magick")`. Without it,
-//! ragg's `image_*` diagnostics remain in the false-positive ledger.
+//! `brew install imagemagick` before `install.packages("magick")` (the R
+//! `magick` package builds against the system library — there is no `magick`
+//! Homebrew formula). The ledger assumes `magick` is installed (ragg's
+//! `image_*` symbols resolve through it); skipping it leaves three `image_*`
+//! diagnostics in ragg's `vignettes/ragg_quality.Rmd` unclassified.
 //!
 //! Four packages are not installable from CRAN and keep their ledger entries
 //! permanently: `async` and `css` (GitHub-only r-lib internals), `googlesheets`

@@ -113,11 +113,13 @@ not-installable packages — `async`, `css`, `googlesheets`, `revdepcheck`) is
 documented at the top of the corpus runner module (`crates/raven/tests/package_corpus.rs`),
 where a contributor sees it alongside the run commands.
 
-After installing the CRAN-available corpus packages (50 of 51; `magick` still
-needs system ImageMagick), a full four-group strict run was reconciled against
-the ledger:
+After installing the CRAN-available corpus packages (51 of 51, including
+`magick` once system ImageMagick is present), a full four-group strict run was
+reconciled against the ledger:
 
-- **998 stale false-positive entries pruned** — symbols that now resolve because
+- **998 stale false-positive entries pruned** in the main strict-run sweep (a
+  further 3 ragg `image_*` entries pruned afterwards once `magick` was
+  installed — see below) — symbols that now resolve because
   their package is installed (and entries re-anchored after upstream git-source
   line drift). Stale FPs are informational in the runner, so this is a manual
   sweep driven by the `stale-fp:` report.
@@ -140,10 +142,13 @@ the ledger:
   installed but the standalone script has no `library()` attach). After this, no
   ledger entry claims a package is uninstalled when it is installed: the only
   remaining "not installed" function symbols belong to genuinely uninstalled
-  packages (`magick`, `revdepcheck`, `googlesheets`, `robust`, in-repo fixtures).
+  packages (`revdepcheck`, `googlesheets`, `robust`, in-repo fixtures).
 
-Ledger size: `known_false_positives.toml` 3336 → 2431 entries (998 pruned, 93
+Ledger size: `known_false_positives.toml` 3336 → 2428 entries (1001 pruned, 93
 added). `accepted_real_diagnostics.toml` unchanged (0 stale acceptances).
+Installing the R `magick` package (against system ImageMagick) pruned the last
+3 of those entries — ragg's `image_read`/`image_crop`/`image_sample` in
+`vignettes/ragg_quality.Rmd` now resolve.
 
 ## Validation
 
