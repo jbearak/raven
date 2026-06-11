@@ -100,7 +100,7 @@ Base and recommended packages (**base**, **methods**, **utils**, **stats**, **da
 
 How the dataset list is assembled at capture time (Tier 1 or Tier 2 generation) depends on the package:
 
-- **LazyData packages** (`DESCRIPTION` sets `LazyData: true`; identifiable by `data/Rdata.rdb`) build a binary database of all data objects, so their `data/` file stems alone don't give a complete or authoritative list. For these packages Raven queries the R subprocess — `data(package = "pkg")$results` — to enumerate the dataset object names. Without R, the static file-stem walk is used as a fallback (reduced fidelity; package like **survival** may be missing unlisted datasets like `lung`).
+- **LazyData packages** (`DESCRIPTION` sets `LazyData: true`; identifiable by `data/Rdata.rdb`) build a binary database of all data objects, so their `data/` file stems alone don't give a complete or authoritative list. For these packages Raven queries the R subprocess — `data(package = "pkg")$results` — to enumerate the dataset object names. Without R, the static file-stem walk is used as a fallback (reduced fidelity; a package like **survival** may be missing unlisted datasets like `lung`).
 - **Non-LazyData packages** store individual `.rda`/`.RData` files in `data/`. Raven collects dataset names by walking those files and the `INDEX` file — no subprocess needed.
 
 `raven packages build-shipped-db --capture-reference` also routes through this path, so the Tier 3 reference-R capture picks up authoritative dataset lists for LazyData packages when R is available at build time.
