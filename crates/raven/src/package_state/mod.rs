@@ -715,6 +715,15 @@ pub struct RFileFacts {
     pub top_level_defs: Arc<BTreeSet<String>>,
     /// Symbols bound inside `.onLoad`/`.onAttach` hooks in this file.
     pub onload_bindings: Arc<BTreeSet<String>>,
+    /// Packages this file *attaches* via a top-level `library()`/`require()`
+    /// call (see [`crate::cross_file::source_detect::extract_attached_packages`]).
+    /// Only populated for `Test`-kind files — the sole consumer is
+    /// `build_scope_contribution`, which collects the attaches of testthat
+    /// preamble files (`helper*.R`/`setup*.R`) so sibling test files inherit
+    /// them. Always empty for `Source` files (their `library()` calls are
+    /// handled by the standard position-aware scope path, not the package
+    /// contribution).
+    pub attached_packages: Arc<BTreeSet<String>>,
     pub content_digest: ContentDigest,
 }
 
@@ -756,6 +765,26 @@ pub struct PackageScopeContribution {
     /// deterministic so cached `PackageState` equality (used by the
     /// proptest machine) is stable across runs.
     pub test_helper_symbols: Arc<BTreeMap<PathBuf, Arc<BTreeSet<String>>>>,
+
+    /// Packages *attached* (via top-level `library()`/`require()`) by testthat
+    /// preamble files — `tests/testthat/helper*.R` and `setup*.R` (see
+    /// [`is_test_preamble_filename`]) — keyed by the preamble file's path.
+    ///
+    /// testthat sources preamble files at the top level before any test runs,
+    /// so a `library(tidyr)` in `helper-lib.R` attaches tidyr for every sibling
+    /// test file. The scope-injection layer adds these packages to the queried
+    /// file's `inherited_packages` (NOT to the symbol set — their exports are
+    /// resolved by the package library like any other attached package).
+    ///
+    /// Keyed by path — and consumed with the same source-order gate as
+    /// `test_helper_symbols` — so a preamble file only inherits attaches from
+    /// preamble files testthat sources strictly before it, and a preamble
+    /// file's own attach is left to the standard position-aware `library()`
+    /// path (never re-injected). Visible from any file under
+    /// `<root>/tests/testthat/`; never injected into `R/`. This is the
+    /// explicit-`library()` analogue of `test_attached_packages` (which models
+    /// testthat's own implicit attach).
+    pub test_helper_attached_packages: Arc<BTreeMap<PathBuf, Arc<BTreeSet<String>>>>,
 
     /// Dataset names from the package's own `data/` directory. These are
     /// visible to any `.R` file under the workspace root — R/, tests/,

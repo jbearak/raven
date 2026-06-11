@@ -760,6 +760,153 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     library_calls
 }
 
+/// Parse `text` and return the set of packages it *attaches* via a
+/// **top-level** `library()` / `require()` call.
+///
+/// "Attaches" excludes `loadNamespace()` (which loads a namespace for
+/// qualified `pkg::fn` access but does not put exports on the search path —
+/// see [`LibraryCall::attaches`]). "Top-level" excludes calls nested inside a
+/// function body, which do not attach until that function runs. Calls inside a
+/// non-evaluating quoting wrapper (`quote`/`bquote`/`substitute`/`expression`,
+/// rlang's `expr`/`quo`/…) are likewise excluded — they capture code without
+/// evaluating it.
+///
+/// This models a testthat preamble file (`tests/testthat/helper*.R` /
+/// `setup*.R`): testthat sources such files at the top level before any test
+/// runs, so a top-level `library(tidyr)` in a helper attaches tidyr for every
+/// sibling test file. The top-level-only gate parallels
+/// [`crate::roxygen::extract_top_level_defs`] (both filter to top level),
+/// though the justification differs: `extract_top_level_defs` captures only
+/// definitions that exist at source time, whereas this excludes function-body
+/// `library()` calls because they don't attach until the function runs.
+///
+/// `requireNamespace()` is NOT a match (it isn't a `library`/`require`/
+/// `loadNamespace` call), so it never attaches here.
+///
+/// Returns an empty set when the text cannot be parsed.
+///
+/// # Examples
+///
+/// ```
+/// use raven::cross_file::source_detect::extract_attached_packages;
+///
+/// let pkgs = extract_attached_packages("library(tidyr)\nrequire(dplyr)\n");
+/// assert!(pkgs.contains("tidyr"));
+/// assert!(pkgs.contains("dplyr"));
+///
+/// // loadNamespace does not attach; a nested call does not attach at source time.
+/// let none = extract_attached_packages("loadNamespace(\"tidyr\")\nf <- function() library(dplyr)\n");
+/// assert!(none.is_empty());
+/// ```
+pub fn extract_attached_packages(text: &str) -> std::collections::BTreeSet<String> {
+    use tree_sitter::Parser;
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return std::collections::BTreeSet::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return std::collections::BTreeSet::new();
+    };
+    let root = tree.root_node();
+    let var_lookup = collect_var_bindings(root, text);
+    let mut calls = Vec::new();
+    visit_node_for_top_level_library(root, text, &var_lookup, false, false, &mut calls);
+    calls
+        .into_iter()
+        .filter(|call| call.attaches && !call.package.is_empty())
+        .map(|call| call.package)
+        .collect()
+}
+
+/// Like [`visit_node_for_library`], but only collects package loads that are
+/// NOT lexically inside a `function_definition` and NOT inside a non-evaluating
+/// quoting wrapper (`quote`/`bquote`/`substitute`/`expression`, rlang's
+/// `expr`/`quo`/…). Function-body calls don't attach until the enclosing
+/// function is called, and quoted expressions capture code without evaluating
+/// it, so neither attaches when testthat sources the preamble file's top-level
+/// code (`local({ ... })` blocks DO attach — they evaluate immediately).
+/// `inside_fn` latches once an ancestor `function_definition` is entered;
+/// `inside_quote` latches once an ancestor quoting call is entered.
+fn visit_node_for_top_level_library(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+    inside_fn: bool,
+    inside_quote: bool,
+    library_calls: &mut Vec<LibraryCall>,
+) {
+    // Identifier nodes have no children and cannot be calls.
+    if node.kind() == "identifier" {
+        return;
+    }
+    // Tree-sitter normalizes R 4.1+ lambdas (`\(x) ...`) into
+    // `function_definition` nodes too, so this single check covers both.
+    let inside_fn = inside_fn || node.kind() == "function_definition";
+    // A `library()` nested inside a quoting call (e.g. `quote(library(x))`)
+    // captures code but never evaluates it, so it does not attach at source
+    // time. Latch so all descendants are likewise excluded.
+    let inside_quote = inside_quote || is_nonevaluating_quote_call(node, content);
+    if !inside_fn && !inside_quote && node.kind() == "call" {
+        if let Some(lib_call) = try_parse_library_call(node, content) {
+            library_calls.push(lib_call);
+        } else {
+            library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        visit_node_for_top_level_library(
+            child,
+            content,
+            var_lookup,
+            inside_fn,
+            inside_quote,
+            library_calls,
+        );
+    }
+}
+
+/// Whether `node` is a call to a quoting/capturing function that does NOT
+/// evaluate its arguments — `quote`, `bquote`, `substitute`, `expression`, and
+/// rlang's `expr`/`quo`/`quos`/`exprs`/`enquo`/`enquos`/`enexpr`/`enexprs`. A
+/// `library()`/`require()` syntactically nested inside one of these is captured
+/// as unevaluated code and never attaches at source time, so
+/// [`visit_node_for_top_level_library`] must not record it.
+///
+/// Any namespace qualifier (`rlang::expr`, `base::quote`) is stripped before
+/// matching. This is deliberately limited to statically recognizable quoting
+/// wrappers; expressions built dynamically (e.g. `eval(parse(text = …))`) are
+/// out of scope.
+fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let func_text = node_text(func_node, content);
+    // Strip an optional `pkg::` / `pkg:::` namespace qualifier (the trailing
+    // segment after the last colon is the bare function name).
+    let name = func_text.rsplit(':').next().unwrap_or(func_text);
+    matches!(
+        name,
+        "quote"
+            | "bquote"
+            | "substitute"
+            | "expression"
+            | "expr"
+            | "quo"
+            | "quos"
+            | "exprs"
+            | "enquo"
+            | "enquos"
+            | "enexpr"
+            | "enexprs"
+    )
+}
+
 /// Recursively traverses an AST subtree and collects statically determinable
 /// package loads — both direct `library`/`require`/`loadNamespace` calls and
 /// apply-family calls whose FUN is `library`/`require`. Direct calls push at
@@ -1421,6 +1568,125 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // extract_attached_packages (issue #432): top-level attaching
+    // library()/require() only; loadNamespace and function-body calls excluded.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_attached_packages_direct_library_and_require() {
+        let pkgs = extract_attached_packages("library(tidyr)\nrequire(dplyr)\n");
+        assert!(pkgs.contains("tidyr"), "got: {pkgs:?}");
+        assert!(pkgs.contains("dplyr"), "got: {pkgs:?}");
+        assert_eq!(pkgs.len(), 2, "got: {pkgs:?}");
+    }
+
+    #[test]
+    fn extract_attached_packages_string_and_named_arg() {
+        let pkgs = extract_attached_packages("library(\"tidyr\")\nlibrary(package = dplyr)\n");
+        assert!(pkgs.contains("tidyr"), "got: {pkgs:?}");
+        assert!(pkgs.contains("dplyr"), "got: {pkgs:?}");
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_load_namespace() {
+        // loadNamespace loads the namespace for qualified access but does not
+        // attach exports to the search path.
+        let pkgs = extract_attached_packages("loadNamespace(\"tidyr\")\n");
+        assert!(pkgs.is_empty(), "loadNamespace must not attach: {pkgs:?}");
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_function_body_calls() {
+        // A library() inside a function body does not attach until the function
+        // is called, so testthat sourcing the preamble does not attach it.
+        let pkgs = extract_attached_packages("f <- function() library(stringr)\n");
+        assert!(
+            pkgs.is_empty(),
+            "function-body library() must not attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_lambda_body_calls() {
+        // R 4.1+ lambda bodies are `function_definition` nodes too.
+        let pkgs = extract_attached_packages("g <- \\() library(stringr)\n");
+        assert!(
+            pkgs.is_empty(),
+            "lambda-body library() must not attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_includes_top_level_local_block() {
+        // `local({ ... })` evaluates immediately when the file is sourced, so a
+        // `library()` inside it DOES attach (it is not a function body).
+        let pkgs = extract_attached_packages("local({\n  library(tidyr)\n})\n");
+        assert!(
+            pkgs.contains("tidyr"),
+            "top-level local() library() must attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_includes_top_level_if_block() {
+        let pkgs = extract_attached_packages("if (TRUE) {\n  library(tidyr)\n}\n");
+        assert!(
+            pkgs.contains("tidyr"),
+            "top-level if-block library() must attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_includes_suppress_messages_wrapper() {
+        // A wrapper call at top level (e.g. suppressMessages(library(x))) still
+        // attaches — the inner library() is reached on recursion, no function
+        // body intervenes.
+        let pkgs = extract_attached_packages("suppressMessages(library(tidyr))\n");
+        assert!(
+            pkgs.contains("tidyr"),
+            "suppressMessages(library()) must attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_quote_wrapper() {
+        // `quote()` captures the call as an unevaluated expression; sourcing the
+        // preamble never attaches the package.
+        let pkgs = extract_attached_packages("quote(library(tidyr))\n");
+        assert!(
+            pkgs.is_empty(),
+            "quote(library()) must not attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_rlang_expr_wrapper() {
+        // Namespace-qualified rlang quoting function: also non-evaluating.
+        let pkgs = extract_attached_packages("e <- rlang::expr(library(tidyr))\n");
+        assert!(
+            pkgs.is_empty(),
+            "rlang::expr(library()) must not attach: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_bquote_and_expression() {
+        assert!(extract_attached_packages("bquote(library(tidyr))\n").is_empty());
+        assert!(extract_attached_packages("expression(library(tidyr))\n").is_empty());
+        assert!(extract_attached_packages("substitute(library(tidyr))\n").is_empty());
+    }
+
+    #[test]
+    fn extract_attached_packages_empty_on_unparseable() {
+        // Robustness: never panics, returns empty on garbage.
+        let result = extract_attached_packages("library(\n");
+        assert!(
+            result.is_empty(),
+            "malformed input must yield no attached packages: {result:?}"
+        );
     }
 
     #[test]

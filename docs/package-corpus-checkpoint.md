@@ -55,6 +55,40 @@ The accepted-real fixture (`accepted_real_diagnostics.toml`) records 102 confirm
 
 3. **Clippy cleanup:** Fixed 8 pre-existing lints (`nonminimal_bool`, `collapsible_if`, `too_many_arguments`, `redundant_closure`) in `handlers.rs` and `source_detect.rs`.
 
+## Follow-up fix: testthat helper `library()` attach propagation (#432)
+
+PR #427 made top-level **definitions** in `tests/testthat/helper*.R` / `setup*.R`
+visible to sibling test files, but `library()`/`require()` **attaches** in those
+same preamble files still didn't propagate. Issue #432 closes that gap: a
+top-level attach in a preamble file (e.g. dtplyr's
+`tests/testthat/helpers-library.R` attaching dplyr + tidyr) now flows into the
+`inherited_packages` of every sibling test file, mirroring testthat sourcing the
+preamble before each test. One-way visibility is preserved (attaches never reach
+`R/`), the source-order gate matches the helper-symbol path, and the
+CLI/editor export prefetch is fed so the attached package's exports are warmed.
+
+Two correctness refinements from pre-PR review: (1) attaches captured by a
+non-evaluating quoting wrapper (`quote()`/`bquote()`/`substitute()`/
+`expression()`, rlang's `expr`/`quo`/…) are excluded — they never evaluate at
+source time, so propagating them would falsely suppress diagnostics; (2)
+propagation is restricted to test files in the *same directory* as the preamble,
+so `tests/testthat/` preambles never leak into `tests/testit/` siblings (testit
+does not source them). The same-directory gate lives in the shared
+`visible_preamble_entries` helper, so it applies to preamble *definitions*
+(PR #427) as well as attaches — closing the same latent cross-framework leak for
+both.
+
+Ledger impact: the 204 dtplyr known-FP entries carrying
+`reason = "function from a package attached by a testthat helper file, package
+not installed in the analysis environment"` (203) and
+`"package attached via library() in testthat helper file"` (1) were pruned —
+the "not installed" framing was wrong (dplyr/tidyr are installed); the actual
+cause was the attach-propagation gap, now fixed. The remaining 8 dtplyr entries
+(data-masked columns, an `enquo()` default, a standalone vignette script) are
+unrelated idioms and stay. Other groups' "library()-attached package not
+installed" entries are a *different* idiom (attach in the test/script file
+itself, not a preamble file) and are unaffected by this fix.
+
 ## Prior fixes (from earlier checkpoint)
 
 - `.Internal(remove(...))` no longer creates synthetic scope-removal events.

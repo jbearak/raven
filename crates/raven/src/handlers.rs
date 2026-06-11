@@ -14149,20 +14149,38 @@ fn is_package_export(
 
 /// Return the list of test-attached package names that apply to `uri` —
 /// i.e. the packages the snapshot's `scope_contribution.test_attached_packages`
-/// declares, but only when `uri` is under `<root>/tests/testthat/`. Empty
-/// otherwise (R/ files and non-package workspaces).
+/// declares (testthat's implicit attach) UNION the packages attached by
+/// testthat preamble files via `library()`/`require()`
+/// (`scope_contribution.test_helper_attached_packages`, issue #432) that live
+/// in the SAME directory as `uri`. Empty unless `uri` is a testthat/testit
+/// test file (R/ files, plain `tests/*.R`, and non-package workspaces get an
+/// empty set). The same-directory restriction on the helper-attach union keeps
+/// `tests/testthat/` preambles from leaking into `tests/testit/` siblings,
+/// which never source them.
 ///
 /// Used by the out-of-scope diagnostic collector to suppress
-/// misattribution of testthat exports to a later `source()` call.
+/// misattribution of these packages' exports to a later `source()` call.
 /// The undefined-variable collector achieves the same effect via
 /// `scope.inherited_packages` (which `append_package_contribution`
 /// populates), but `ScopeStream::is_visible` only consults the symbol
 /// set, so the out-of-scope path needs this explicit guard.
+///
+/// The helper-attached union is flattened across all preamble files (no
+/// source-order gate): the out-of-scope collector only fires when a *later*
+/// `source()` exports the same name, so flattening can at worst skip that one
+/// narrow misattribution for a name that a preamble attaches later — and the
+/// undefined-variable collector (which IS source-order-gated via
+/// `append_package_contribution`) still reports the genuine case. This matches
+/// the flat treatment of `test_attached_packages` (testthat itself).
 fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
     if snapshot
         .scope_contribution
         .test_attached_packages
         .is_empty()
+        && snapshot
+            .scope_contribution
+            .test_helper_attached_packages
+            .is_empty()
     {
         return Vec::new();
     }
@@ -14176,12 +14194,26 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
         Some(crate::package_state::RFileKind::Test)
             if crate::package_state::is_testthat_or_testit_test(&path, root) =>
         {
-            snapshot
+            let mut packages: std::collections::BTreeSet<String> = snapshot
                 .scope_contribution
                 .test_attached_packages
                 .iter()
                 .cloned()
-                .collect()
+                .collect();
+            // Only union helper attaches from preamble files in the SAME
+            // directory as `uri` — the directory testthat sources them for.
+            // Without this a `tests/testit/` file would pick up
+            // `tests/testthat/` preamble attaches (testit never sources them).
+            for (preamble_path, pkgs) in snapshot
+                .scope_contribution
+                .test_helper_attached_packages
+                .iter()
+            {
+                if preamble_path.parent() == path.parent() {
+                    packages.extend(pkgs.iter().cloned());
+                }
+            }
+            packages.into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -21691,6 +21723,7 @@ clean_data <- function(x) {
                         full_imports: Default::default(),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        test_helper_attached_packages: Default::default(),
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
@@ -21773,6 +21806,7 @@ clean_data <- function(x) {
                         full_imports: std::sync::Arc::new(full),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        test_helper_attached_packages: Default::default(),
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
@@ -21842,6 +21876,7 @@ clean_data <- function(x) {
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -22221,6 +22256,7 @@ clean_data <- function(x) {
                     full_imports: std::sync::Arc::new(full_imports),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24195,6 +24231,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24279,6 +24316,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24359,6 +24397,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: std::sync::Arc::new(helpers),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24602,6 +24641,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24641,6 +24681,190 @@ y <- totally_undefined_baseline()
                 .iter()
                 .any(|d| d.message.contains("test_that") || d.message.contains("expect_equal")),
             "testthat exports must not trigger undefined-variable in tests/testthat/. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #432: a package attached by a testthat preamble file via
+    /// `library()` must suppress undefined-variable diagnostics for that
+    /// package's exports in sibling `test-*.R` files — mirroring testthat
+    /// sourcing the preamble before each test. This is the end-to-end repro
+    /// from the issue (helper attaches tidyr; test uses `pivot_wider`/`tibble`).
+    #[tokio::test]
+    async fn test_diagnostic_suppresses_helper_attached_package_export_in_sibling_test() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // Seed `tidyr` exports so `is_package_export` recognizes them.
+        let mut tidyr_exports = HashSet::new();
+        tidyr_exports.insert("pivot_wider".to_string());
+        tidyr_exports.insert("tibble".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("tidyr".to_string(), tidyr_exports))
+            .await;
+
+        // helper-lib.R attaches tidyr.
+        let helper_path = std::path::PathBuf::from("/work/pkg/tests/testthat/helper-lib.R");
+        let mut helper_attached = BTreeSet::new();
+        helper_attached.insert("tidyr".to_string());
+        let mut helper_map: BTreeMap<std::path::PathBuf, std::sync::Arc<BTreeSet<String>>> =
+            BTreeMap::new();
+        helper_map.insert(helper_path, std::sync::Arc::new(helper_attached));
+
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: std::sync::Arc::new(helper_map),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "df2 <- pivot_wider(data.frame(x = 1))\ntb <- tibble(a = 1)\n";
+        let uri = Url::parse("file:///work/pkg/tests/testthat/test-a.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("pivot_wider") || d.message.contains("tibble")),
+            "helper-attached tidyr exports must not trigger undefined-variable in sibling test. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Counterpart to the suppression test: a preamble attach must NOT leak
+    /// into `R/`. An `R/*.R` file using a helper-attached package's export by
+    /// bare name still gets the undefined-variable diagnostic (one-way
+    /// visibility — `R/` never inherits test preamble attaches).
+    #[tokio::test]
+    async fn test_diagnostic_helper_attached_package_does_not_leak_into_r_dir() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut tidyr_exports = HashSet::new();
+        tidyr_exports.insert("pivot_wider".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("tidyr".to_string(), tidyr_exports))
+            .await;
+
+        let helper_path = std::path::PathBuf::from("/work/pkg/tests/testthat/helper-lib.R");
+        let mut helper_attached = BTreeSet::new();
+        helper_attached.insert("tidyr".to_string());
+        let mut helper_map: BTreeMap<std::path::PathBuf, std::sync::Arc<BTreeSet<String>>> =
+            BTreeMap::new();
+        helper_map.insert(helper_path, std::sync::Arc::new(helper_attached));
+
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: std::sync::Arc::new(helper_map),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        let code = "f <- function() pivot_wider(data.frame(x = 1))\n";
+        let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("pivot_wider")),
+            "preamble attach must NOT leak into R/: pivot_wider should be undefined in R/f.R. \
              messages: {:?}",
             diagnostics
                 .iter()
@@ -24716,6 +24940,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24776,6 +25001,195 @@ y <- totally_undefined_baseline()
         );
     }
 
+    /// Issue #432 (out-of-scope path): a package attached by a testthat
+    /// preamble file must also suppress the "used before it's available
+    /// (sourced on line N)" misattribution when a later `source()` happens to
+    /// redefine the same name. `test_attached_packages_for_uri` unions the
+    /// helper-attached packages; without that union the out-of-scope collector
+    /// would blame the later `source()` for `pivot_wider`.
+    #[tokio::test]
+    async fn test_out_of_scope_suppresses_helper_attached_export_in_testthat_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let testthat_dir = workspace_path.join("tests").join("testthat");
+        std::fs::create_dir_all(&testthat_dir).unwrap();
+        let main_path = testthat_dir.join("test-foo.R");
+        let other_path = testthat_dir.join("test-other.R");
+
+        let main_code = "df <- pivot_wider(x)\nsource('test-other.R')\n";
+        let other_code = "pivot_wider <- function(...) NULL\n";
+        std::fs::write(&other_path, other_code).unwrap();
+        std::fs::write(&main_path, main_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let other_url = Url::from_file_path(&other_path).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut tidyr_exports = HashSet::new();
+        tidyr_exports.insert("pivot_wider".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("tidyr".to_string(), tidyr_exports))
+            .await;
+
+        // tidyr attached by helper-lib.R (a preamble file), not by an
+        // implicit testthat attach — so it must flow through
+        // `test_helper_attached_packages`, not `test_attached_packages`.
+        let helper_path = testthat_dir.join("helper-lib.R");
+        let mut helper_attached = BTreeSet::new();
+        helper_attached.insert("tidyr".to_string());
+        let mut helper_map: BTreeMap<std::path::PathBuf, std::sync::Arc<BTreeSet<String>>> =
+            BTreeMap::new();
+        helper_map.insert(helper_path, std::sync::Arc::new(helper_attached));
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(workspace_path.to_path_buf()),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: std::sync::Arc::new(helper_map),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state
+            .documents
+            .insert(other_url.clone(), Document::new(other_code, None));
+
+        // Wire the source() edge so the out-of-scope collector has a target to
+        // (potentially) misattribute against — otherwise the guard would never
+        // be exercised even if broken.
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &other_url,
+            &crate::cross_file::extract_metadata(other_code),
+            None,
+            |_| None,
+        );
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for test-foo.R");
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("pivot_wider") && d.message.contains("used before")),
+            "helper-attached tidyr exports must not be reported as used-before-sourced. \
+             messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #432 leak guard (out-of-scope path): `test_attached_packages_for_uri`
+    /// must NOT report a `tests/testthat/` preamble's attach for a
+    /// `tests/testit/` file — testit never sources testthat preambles, so a
+    /// later `source()` redefining the export must stay reportable there.
+    #[tokio::test]
+    async fn test_attached_packages_for_uri_does_not_leak_helper_attach_to_testit() {
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeMap, BTreeSet};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let testthat_dir = workspace_path.join("tests").join("testthat");
+        let testit_dir = workspace_path.join("tests").join("testit");
+        std::fs::create_dir_all(&testthat_dir).unwrap();
+        std::fs::create_dir_all(&testit_dir).unwrap();
+        let testit_path = testit_dir.join("test-x.R");
+        let testit_code = "df <- pivot_wider(x)\n";
+        std::fs::write(&testit_path, testit_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let testit_url = Url::from_file_path(&testit_path).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+
+        // tidyr attached by a testthat preamble (helper-lib.R), keyed under
+        // tests/testthat/ — a different directory than the queried testit file.
+        let helper_path = testthat_dir.join("helper-lib.R");
+        let mut helper_attached = BTreeSet::new();
+        helper_attached.insert("tidyr".to_string());
+        let mut helper_map: BTreeMap<std::path::PathBuf, std::sync::Arc<BTreeSet<String>>> =
+            BTreeMap::new();
+        helper_map.insert(helper_path, std::sync::Arc::new(helper_attached));
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(workspace_path.to_path_buf()),
+                    r_internal_symbols: Default::default(),
+                    imported_symbols: Default::default(),
+                    full_imports: Default::default(),
+                    test_attached_packages: Default::default(),
+                    test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: std::sync::Arc::new(helper_map),
+                    dataset_symbols: Default::default(),
+                    sysdata_symbols: Default::default(),
+                    onload_symbols: Default::default(),
+                },
+                ..Default::default()
+            });
+
+        state
+            .documents
+            .insert(testit_url.clone(), Document::new(testit_code, None));
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &testit_url)
+            .expect("snapshot built for testit file");
+        let attached = test_attached_packages_for_uri(&snapshot, &testit_url);
+        assert!(
+            !attached.contains(&"tidyr".to_string()),
+            "tests/testthat/ preamble attach must not propagate to tests/testit/; got: {attached:?}",
+        );
+    }
+
     /// Codex follow-up #2: the pending-cache fallback in the out-of-scope
     /// guard must only treat uncached packages as pending when they
     /// actually exist on disk. A declared-but-uninstalled testthat would
@@ -24832,6 +25246,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24923,6 +25338,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: std::sync::Arc::new(attached),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -24997,6 +25413,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -25065,6 +25482,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -25133,6 +25551,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
@@ -25203,6 +25622,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: std::sync::Arc::new(sysdata),
                     onload_symbols: Default::default(),
@@ -25273,6 +25693,7 @@ y <- totally_undefined_baseline()
                     full_imports: Default::default(),
                     test_attached_packages: Default::default(),
                     test_helper_symbols: Default::default(),
+                    test_helper_attached_packages: Default::default(),
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: std::sync::Arc::new(onload),
@@ -29259,6 +29680,7 @@ result <- data %>% filter(x > 0)
                         full_imports: Default::default(),
                         test_attached_packages: Default::default(),
                         test_helper_symbols: Default::default(),
+                        test_helper_attached_packages: Default::default(),
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
