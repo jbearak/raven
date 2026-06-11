@@ -13461,7 +13461,12 @@ fn collect_usages_with_analysis<'a>(
         // identifier in the RHS resolves to a column of `lhs`, not a free
         // variable. This is checked before the `.`-specific rules because it
         // suppresses *all* identifiers in the RHS, not just `.`.
-        if is_inside_exposition_rhs(node, text) {
+        //
+        // Exception: an identifier in function-call position (`df %$% f(col)`)
+        // is NOT a column — R looks up the callee as a function in the lexical
+        // scope, so an undefined function name still errors at runtime. Keep
+        // checking call heads so genuine undefined-function bugs are reported.
+        if is_inside_exposition_rhs(node, text) && !is_call_function_head(node) {
             return;
         }
         // Magrittr dot pronoun: `.` on the RHS of `%>%` is the piped value,
@@ -13654,6 +13659,20 @@ fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
         current = parent;
     }
     false
+}
+
+/// True when `node` is the `function` child of a `call` — i.e. the callee in
+/// call position (`f` in `f(x)`). Used to keep call heads checked even where a
+/// surrounding construct (e.g. the `%$%` data mask) otherwise suppresses free
+/// identifiers: a column reference is never in call position, but an undefined
+/// function name is, and it still errors at runtime.
+fn is_call_function_head(node: Node) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|f| f.id() == node.id())
+    })
 }
 
 /// True when `node` is inside the RHS of a magrittr exposition operator
@@ -20295,6 +20314,25 @@ mod tests {
         assert!(
             !was_collected(&used, "value"),
             "the RHS column of %$% must be suppressed"
+        );
+    }
+
+    /// A function name in call position inside `%$%` RHS is NOT a column — R
+    /// looks it up as a function, so an undefined call head must still be
+    /// checked even though column references are suppressed.
+    #[test]
+    fn magrittr_exposition_rhs_call_head_still_checked() {
+        let code = "mtcars %$% typo(cyl)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["magrittr"], &mut used);
+        assert!(
+            was_collected(&used, "typo"),
+            "the call head in %$% RHS must still be checked"
+        );
+        assert!(
+            !was_collected(&used, "cyl"),
+            "the column argument in %$% RHS must still be suppressed"
         );
     }
 

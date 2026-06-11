@@ -718,6 +718,46 @@ mod package_testthat_visibility_tests {
         );
     }
 
+    /// Negative: a file OUTSIDE the package root that calls `load_all()` must
+    /// NOT pull in this package's internals. `load_all()` models attaching the
+    /// package only for files within its own source tree; a sibling scratch
+    /// file in the same workspace must still get real undefined-name
+    /// diagnostics.
+    #[test]
+    fn out_of_root_load_all_script_does_not_see_package_symbols() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // Sibling file under /work, OUTSIDE the package root /work/pkg.
+        let script_uri = Url::parse("file:///work/scratch.R").unwrap();
+        let script_code = "devtools::load_all()\ndrive_find()\n";
+        let script_arts = make_artifacts(&script_uri, script_code);
+        assert!(
+            script_arts.calls_dev_load_all,
+            "the load_all() call is still flagged regardless of path"
+        );
+
+        let symbols = resolve_symbols(
+            &script_uri,
+            script_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            !symbols.contains_key("drive_find"),
+            "an out-of-root file calling load_all() must not see package internals. visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Negative: the SAME `internal/` script WITHOUT a `load_all()` call does
     /// NOT see the package's internal symbols — the injection is gated on the
     /// call, not the path.

@@ -5307,10 +5307,13 @@ fn compute_contribution_symbol_names(
     }
 
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
+    // See `append_package_contribution`: `load_all()` exposes internals only to
+    // files inside the package source tree, never to an out-of-root sibling.
+    let under_package_root = path.strip_prefix(root).is_ok();
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs and any file that calls `devtools::load_all()` see
-        // the package's own internal/exported/sysdata/onload/imported symbols.
-        if is_dev_context || dev_load_all {
+        // Dev-context dirs and any in-tree file that calls `devtools::load_all()`
+        // see the package's own internal/exported/sysdata/onload/imported symbols.
+        if is_dev_context || (dev_load_all && under_package_root) {
             for sym in contrib.r_internal_symbols.iter() {
                 out.insert(Arc::from(sym.as_str()));
             }
@@ -5451,12 +5454,17 @@ pub(crate) fn append_package_contribution(
     // <root>/R/, <root>/tests/, or dev-context dirs (demo/, data-raw/,
     // vignettes/, man/).
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
+    // `devtools::load_all()` only models attaching THIS package, so it may only
+    // expose internals to files inside the package source tree. A scratch/
+    // sibling file outside the root that happens to call `load_all()` must not
+    // pull in this package's internals (it would mute real diagnostics there).
+    let under_package_root = path.strip_prefix(root).is_ok();
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs and any file that calls `devtools::load_all()`
+        // Dev-context dirs and any in-tree file that calls `devtools::load_all()`
         // (modeled as attaching the package under development) see
         // r_internal_symbols + sysdata + onload + imported_symbols but NOT
         // test_helper_symbols or test_attached_packages.
-        if !is_dev_context && !dev_load_all {
+        if !(is_dev_context || (dev_load_all && under_package_root)) {
             return;
         }
         for sym in contrib.r_internal_symbols.iter() {

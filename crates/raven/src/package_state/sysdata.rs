@@ -268,16 +268,51 @@ fn is_onload_definition(node: Node, content: &str) -> bool {
 }
 
 fn extract_bindings_from_body(body: Node, content: &str, symbols: &mut BTreeSet<String>) {
+    // Functions defined *locally* within the hook body: `environment(<fn>)` for
+    // one of these returns the hook's own execution frame, NOT the package
+    // namespace, so such an identifier must not be treated as namespace-like.
+    let local_fns = collect_local_function_names(body, content);
     // First pass: identify identifiers bound to the namespace env via
     // `<ident> <- topenv(...)` / `asNamespace(...)` / `getNamespace(...)`.
-    let ns_idents = collect_namespace_bound_idents(body, content);
-    visit_body_for_bindings(body, content, symbols, &ns_idents, false);
+    let ns_idents = collect_namespace_bound_idents(body, content, &local_fns);
+    visit_body_for_bindings(body, content, symbols, &ns_idents, &local_fns, false);
+}
+
+/// Collect the names of functions defined locally within the hook body
+/// (`name <- function(...)` at any depth). `environment(name)` for such a
+/// local function yields the hook's own frame, not the package namespace, so
+/// these names must be excluded from the `environment(<identifier>)` idiom.
+fn collect_local_function_names(body: Node, content: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_local_function_names_rec(body, content, &mut names);
+    names
+}
+
+fn collect_local_function_names_rec(node: Node, content: &str, names: &mut BTreeSet<String>) {
+    if node.kind() == "binary_operator"
+        && let Some(op) = node.child_by_field_name("operator")
+        && matches!(node_text(op, content), "<-" | "=" | "<<-")
+        && let Some(lhs) = node.child_by_field_name("lhs")
+        && lhs.kind() == "identifier"
+        && let Some(rhs) = node.child_by_field_name("rhs")
+        && rhs.kind() == "function_definition"
+    {
+        names.insert(node_text(lhs, content).to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_local_function_names_rec(child, content, names);
+    }
 }
 
 /// Scan top-level assignments in the hook body for patterns that bind an
 /// identifier to the namespace environment (e.g. `ns <- topenv(environment())`).
 /// Returns the set of identifier names that can be treated as namespace-like.
-fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String> {
+fn collect_namespace_bound_idents(
+    body: Node,
+    content: &str,
+    local_fns: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut idents = BTreeSet::new();
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
@@ -287,7 +322,7 @@ fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String>
             && let Some(lhs) = child.child_by_field_name("lhs")
             && lhs.kind() == "identifier"
             && let Some(rhs) = child.child_by_field_name("rhs")
-            && is_namespace_creating_expr(rhs, content)
+            && is_namespace_creating_expr(rhs, content, local_fns)
         {
             idents.insert(node_text(lhs, content).to_string());
         }
@@ -302,7 +337,7 @@ fn collect_namespace_bound_idents(body: Node, content: &str) -> BTreeSet<String>
 /// arbitrary local environment is NOT the namespace, so treating every
 /// `parent.env(...)` as namespace-producing would over-collect and mute real
 /// undefined-variable diagnostics.
-fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
+fn is_namespace_creating_expr(node: Node, content: &str, local_fns: &BTreeSet<String>) -> bool {
     if node.kind() != "call" {
         return false;
     }
@@ -311,8 +346,8 @@ fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
     };
     match node_text(func_node, content) {
         "topenv" | "asNamespace" | "getNamespace" => true,
-        "parent.env" => parent_env_arg_is_namespace_shaped(node, content),
-        "environment" => environment_arg_is_identifier(node, content),
+        "parent.env" => parent_env_arg_is_namespace_shaped(node, content, local_fns),
+        "environment" => environment_arg_is_identifier(node, content, local_fns),
         _ => false,
     }
 }
@@ -321,8 +356,11 @@ fn is_namespace_creating_expr(node: Node, content: &str) -> bool {
 /// in; for a top-level package function (the conventional `environment(dummy)`
 /// idiom in `.onLoad`) that is the package namespace. Only the single-bare-
 /// identifier form qualifies — `environment()` (the current local frame) and
-/// `environment(<complex expr>)` do not.
-fn environment_arg_is_identifier(call: Node, _content: &str) -> bool {
+/// `environment(<complex expr>)` do not. A function defined *locally* within
+/// the hook body is also excluded: its closure environment is the hook's own
+/// execution frame, not the namespace, so binding into it would mute real
+/// undefined-name diagnostics.
+fn environment_arg_is_identifier(call: Node, content: &str, local_fns: &BTreeSet<String>) -> bool {
     let Some(args_node) = call.child_by_field_name("arguments") else {
         return false;
     };
@@ -337,15 +375,25 @@ fn environment_arg_is_identifier(call: Node, _content: &str) -> bool {
     if args.next().is_some() || first.child_by_field_name("name").is_some() {
         return false;
     }
-    first
-        .child_by_field_name("value")
-        .is_some_and(|v| v.kind() == "identifier")
+    let Some(value) = first.child_by_field_name("value") else {
+        return false;
+    };
+    if value.kind() != "identifier" {
+        return false;
+    }
+    // A locally-defined function's environment is the hook frame, not the
+    // namespace — only an external (package-level) function qualifies.
+    !local_fns.contains(node_text(value, content))
 }
 
 /// The first positional argument of a `parent.env(...)` call is namespace-shaped:
 /// a bare `environment()` (whose parent in `.onLoad` is the namespace) or a
 /// nested namespace-producing call.
-fn parent_env_arg_is_namespace_shaped(call: Node, content: &str) -> bool {
+fn parent_env_arg_is_namespace_shaped(
+    call: Node,
+    content: &str,
+    local_fns: &BTreeSet<String>,
+) -> bool {
     let Some(args_node) = call.child_by_field_name("arguments") else {
         return false;
     };
@@ -362,7 +410,7 @@ fn parent_env_arg_is_namespace_shaped(call: Node, content: &str) -> bool {
                 return false;
             };
             return node_text(f, content) == "environment"
-                || is_namespace_creating_expr(value_node, content);
+                || is_namespace_creating_expr(value_node, content, local_fns);
         }
     }
     false
@@ -370,9 +418,14 @@ fn parent_env_arg_is_namespace_shaped(call: Node, content: &str) -> bool {
 
 /// Check if a node is a namespace-like expression: a namespace-producing call
 /// or an identifier previously bound to the namespace.
-fn is_namespace_like(node: Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
+fn is_namespace_like(
+    node: Node,
+    content: &str,
+    ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
+) -> bool {
     match node.kind() {
-        "call" => is_namespace_creating_expr(node, content),
+        "call" => is_namespace_creating_expr(node, content, local_fns),
         "identifier" => ns_idents.contains(node_text(node, content)),
         _ => false,
     }
@@ -383,30 +436,52 @@ fn visit_body_for_bindings(
     content: &str,
     symbols: &mut BTreeSet<String>,
     ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
     inside_nested_function: bool,
 ) {
     match node.kind() {
         "call" if !inside_nested_function => {
-            try_extract_assign_call(node, content, symbols, ns_idents);
-            try_extract_make_active_binding_call(node, content, symbols, ns_idents);
+            try_extract_assign_call(node, content, symbols, ns_idents, local_fns);
+            try_extract_make_active_binding_call(node, content, symbols, ns_idents, local_fns);
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
+                visit_body_for_bindings(
+                    child,
+                    content,
+                    symbols,
+                    ns_idents,
+                    local_fns,
+                    inside_nested_function,
+                );
             }
         }
         "binary_operator" if !inside_nested_function => {
-            try_extract_dollar_assignment(node, content, symbols, ns_idents);
+            try_extract_dollar_assignment(node, content, symbols, ns_idents, local_fns);
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
+                visit_body_for_bindings(
+                    child,
+                    content,
+                    symbols,
+                    ns_idents,
+                    local_fns,
+                    inside_nested_function,
+                );
             }
         }
         "function_definition" => {
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, ns_idents, true);
+                visit_body_for_bindings(child, content, symbols, ns_idents, local_fns, true);
             }
         }
         _ => {
             for child in node.children(&mut node.walk()) {
-                visit_body_for_bindings(child, content, symbols, ns_idents, inside_nested_function);
+                visit_body_for_bindings(
+                    child,
+                    content,
+                    symbols,
+                    ns_idents,
+                    local_fns,
+                    inside_nested_function,
+                );
             }
         }
     }
@@ -419,6 +494,7 @@ fn try_extract_assign_call(
     content: &str,
     symbols: &mut BTreeSet<String>,
     ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
 ) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
@@ -430,7 +506,7 @@ fn try_extract_assign_call(
         return;
     };
     // Check envir arg is namespace-like
-    if !envir_is_namespace_like(&args_node, content, ns_idents) {
+    if !envir_is_namespace_like(&args_node, content, ns_idents, local_fns) {
         return;
     }
     // First positional arg should be a string literal with the name
@@ -463,6 +539,7 @@ fn try_extract_make_active_binding_call(
     content: &str,
     symbols: &mut BTreeSet<String>,
     ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
 ) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
@@ -504,7 +581,7 @@ fn try_extract_make_active_binding_call(
     let Some(env_node) = env_value else {
         return;
     };
-    if !is_namespace_like(env_node, content, ns_idents) {
+    if !is_namespace_like(env_node, content, ns_idents, local_fns) {
         return;
     }
 
@@ -519,7 +596,12 @@ fn try_extract_make_active_binding_call(
 }
 
 /// Check if the `envir` named argument is a namespace-like expression.
-fn envir_is_namespace_like(args_node: &Node, content: &str, ns_idents: &BTreeSet<String>) -> bool {
+fn envir_is_namespace_like(
+    args_node: &Node,
+    content: &str,
+    ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
+) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
         if child.kind() == "argument"
@@ -527,7 +609,7 @@ fn envir_is_namespace_like(args_node: &Node, content: &str, ns_idents: &BTreeSet
             && node_text(name_node, content) == "envir"
             && let Some(value_node) = child.child_by_field_name("value")
         {
-            return is_namespace_like(value_node, content, ns_idents);
+            return is_namespace_like(value_node, content, ns_idents, local_fns);
         }
     }
     false
@@ -540,6 +622,7 @@ fn try_extract_dollar_assignment(
     content: &str,
     symbols: &mut BTreeSet<String>,
     ns_idents: &BTreeSet<String>,
+    local_fns: &BTreeSet<String>,
 ) {
     // Must be an assignment operator
     let Some(op) = node.child_by_field_name("operator") else {
@@ -563,7 +646,7 @@ fn try_extract_dollar_assignment(
         return;
     }
     // Check that the receiver (children[0]) is namespace-like
-    if !is_namespace_like(children[0], content, ns_idents) {
+    if !is_namespace_like(children[0], content, ns_idents, local_fns) {
         return;
     }
     let field = &children[2];
@@ -892,6 +975,37 @@ mod tests {
 "#;
         let syms = extract_onload_bindings(code);
         assert!(!syms.contains("tmp"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_environment_of_local_function_not_namespace() {
+        // `local_fun` is defined inside .onLoad, so `environment(local_fun)` is
+        // the hook's own frame, NOT the package namespace. A binding into it
+        // must not be collected as a package symbol (would mute real
+        // undefined-name diagnostics elsewhere).
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  local_fun <- function() NULL
+  env <- environment(local_fun)
+  makeActiveBinding("x", function() 1, env)
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(!syms.contains("x"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn onload_environment_of_local_function_direct_form_not_namespace() {
+        // Same as above but the local-function environment is passed inline as
+        // the makeActiveBinding target.
+        let code = r#"
+.onLoad <- function(libname, pkgname) {
+  local_fun <- function() NULL
+  makeActiveBinding("x", function() 1, environment(local_fun))
+}
+"#;
+        let syms = extract_onload_bindings(code);
+        assert!(!syms.contains("x"), "got: {:?}", syms);
     }
 
     #[test]
