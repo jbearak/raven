@@ -6,12 +6,12 @@
 //
 // # Safety invariants for callers
 //
-// Any code that spawns an R subprocess (here or in sibling modules like
-// `package_library`) MUST observe:
+// Any code that spawns an R subprocess to evaluate code or query R state (here
+// or in sibling modules like `package_library`) MUST observe:
 //
 // 1. **Validate user-controlled inputs** (e.g. package names) before they
 //    reach the spawn. Package-name validation is the canonical example.
-// 2. **Wrap every R subprocess call in `tokio::time::timeout()`.** A hung
+// 2. **Wrap every R subprocess query in `tokio::time::timeout()`.** A hung
 //    R process must not block the LSP indefinitely. Routing through
 //    `execute_r_code{,_with_timeout}` satisfies both this and the global
 //    concurrency bound below; do not spawn `R` directly past those helpers.
@@ -21,7 +21,11 @@
 //    Each spawn is CPU-heavy (base-package loading alone is 6–11s and pins a
 //    core); without the cap a burst of callers oversubscribes every core and
 //    starves the latency-sensitive 5s `formals()` queries past their timeout.
-// 4. **Never interpolate user-controlled strings into R code.** Pass values
+// 4. `RSubprocess::new` is the one direct-spawn carve-out: it may probe
+//    candidate executables with `R --version` before an `RSubprocess` exists.
+//    Keep that path side-effect-free: no `-e`, no package loading, and no
+//    user-controlled R code.
+// 5. **Never interpolate user-controlled strings into R code.** Pass values
 //    as `Command` args instead. `help()` uses NSE for `package`, so any
 //    variable argument MUST be wrapped in parens to force evaluation:
 //    `help(topic, package = (pkg))`. Without the parens R reads the symbol

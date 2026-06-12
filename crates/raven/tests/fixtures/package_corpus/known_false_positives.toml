@@ -1,7 +1,7 @@
 # Known false positives in the base + recommended package corpus.
 # These are Raven diagnostics that are incorrect but not yet fixed.
 # Tractable cases have been converted to Raven fixes and removed; the
-# remainder are documented in docs/package-corpus-fp-reexamination.md.
+# remainder are documented in docs/package-corpus-checkpoint.md.
 # False positives do not belong in accepted_real_diagnostics.toml.
 [[false_positive]]
 package = "compiler"
