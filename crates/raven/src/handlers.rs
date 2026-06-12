@@ -6570,7 +6570,7 @@ fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
     let Some(formal_name) = parameter_node_name(parameter, text) else {
         return false;
     };
-    let Some(fn_def) = nearest_enclosing_function_definition(parameter) else {
+    let Some(fn_def) = containing_function_definition(parameter) else {
         return false;
     };
     let Some(body) = function_body_node(fn_def) else {
@@ -6578,23 +6578,12 @@ fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
     };
     // Only this one formal matters, so scan the body against a single-element
     // formals slice — `collect_captured_formals` filters every capture shape
-    // against it, skipping the work for the function's other formals.
+    // against it, skipping the work for the function's other formals (and
+    // stopping at the first hit, see the single-formal early exit there).
     let target = [formal_name.to_string()];
     let mut captured = CapturedFormals::default();
     collect_captured_formals(body, text, &target, &mut captured);
     captured.defused.iter().any(|c| c == formal_name)
-}
-
-/// The nearest `function_definition` ancestor of `node`, if any.
-fn nearest_enclosing_function_definition(node: Node) -> Option<Node> {
-    let mut current = node;
-    loop {
-        let parent = current.parent()?;
-        if parent.kind() == "function_definition" {
-            return Some(parent);
-        }
-        current = parent;
-    }
 }
 
 fn containing_default_parameter(node: Node) -> Option<Node> {
@@ -12814,23 +12803,22 @@ impl<'a> NseAnalysis<'a> {
         }
         let mut dots_upgrades: Vec<(String, crate::nse::ArgPolicy)> = Vec::new();
         for (name, fn_def) in &local_function_defs {
-            let baseline = analysis.local_function_policies.get(name);
-            if matches!(
-                baseline,
+            // The baseline borrow stays valid through the detection below —
+            // both borrow `analysis` immutably; mutation happens after the
+            // loop via the staged upgrades.
+            let baseline = match analysis.local_function_policies.get(name) {
                 Some(crate::nse::ArgPolicy::PerFormal {
                     captured_dots: true,
                     ..
-                })
-            ) {
-                continue;
-            }
+                }) => continue,
+                Some(crate::nse::ArgPolicy::PerFormal {
+                    formals, captured, ..
+                }) => Some((formals, captured)),
+                _ => None,
+            };
             let has_dots_formal = match baseline {
-                Some(crate::nse::ArgPolicy::PerFormal { formals, .. }) => {
-                    formals.iter().any(|f| f == "...")
-                }
-                _ => function_formal_names(*fn_def, text)
-                    .iter()
-                    .any(|f| f == "..."),
+                Some((formals, _)) => formals.iter().any(|f| f == "..."),
+                None => function_has_dots_formal(*fn_def, text),
             };
             if !has_dots_formal {
                 continue;
@@ -12838,14 +12826,17 @@ impl<'a> NseAnalysis<'a> {
             let Some(body) = function_body_node(*fn_def) else {
                 continue;
             };
-            let mut body_shadows = HashSet::new();
-            function_binding_names(body, text, &mut body_shadows);
-            if body_forwards_dots_to_covered_verb(body, text, &analysis, &body_shadows) {
-                let (formals, captured) = match analysis.local_function_policies.get(name) {
-                    Some(crate::nse::ArgPolicy::PerFormal {
-                        formals, captured, ..
-                    }) => (formals.clone(), captured.clone()),
-                    _ => (function_formal_names(*fn_def, text), Vec::new()),
+            // Shadow sources for the covered-verb resolution: function-valued
+            // bindings inside the body, plus the wrapper's own formals — a
+            // parameter named after a covered verb (`function(filter, ...)
+            // filter(d, ...)`) is the caller's function, not the verb.
+            let mut shadows = HashSet::new();
+            function_binding_names(body, text, &mut shadows);
+            shadows.extend(function_formal_names(*fn_def, text));
+            if body_forwards_dots_to_covered_verb(body, text, &analysis, &shadows) {
+                let (formals, captured) = match baseline {
+                    Some((formals, captured)) => (formals.clone(), captured.clone()),
+                    None => (function_formal_names(*fn_def, text), Vec::new()),
                 };
                 dots_upgrades.push((
                     name.clone(),
@@ -12857,9 +12848,7 @@ impl<'a> NseAnalysis<'a> {
                 ));
             }
         }
-        for (name, policy) in dots_upgrades {
-            analysis.local_function_policies.insert(name, policy);
-        }
+        analysis.local_function_policies.extend(dots_upgrades);
         analysis
     }
 
@@ -13356,20 +13345,19 @@ fn user_defined_call_policy(fn_def: Node, text: &str) -> crate::nse::ArgPolicy {
     }
     // `found.dots` is already gated on `...` being among the in-scope formals
     // (`function(x) enquos(...)` parses but has no dots of its own to defuse).
-    let captured_dots = found.dots;
     let mut captured = found.defused;
     for name in found.native {
         if !captured.contains(&name) {
             captured.push(name);
         }
     }
-    if captured.is_empty() && !captured_dots {
+    if captured.is_empty() && !found.dots {
         crate::nse::ArgPolicy::Standard
     } else {
         crate::nse::ArgPolicy::PerFormal {
             formals,
             captured,
-            captured_dots,
+            captured_dots: found.dots,
         }
     }
 }
@@ -13377,12 +13365,7 @@ fn user_defined_call_policy(fn_def: Node, text: &str) -> crate::nse::ArgPolicy {
 /// Ordered formal-parameter names of a `function_definition`, robust to the
 /// tree-sitter-r field/kind variations the scope engine also handles.
 fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
-    let Some(params) = fn_def.child_by_field_name("parameters").or_else(|| {
-        let mut cursor = fn_def.walk();
-        fn_def
-            .children(&mut cursor)
-            .find(|c| c.is_named() && c.kind() == "parameters")
-    }) else {
+    let Some(params) = function_parameters_node(fn_def) else {
         return Vec::new();
     };
     let mut names = Vec::new();
@@ -13395,6 +13378,30 @@ fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// True when the function declares a `...` formal — the allocation-free
+/// yes/no twin of [`function_formal_names`] for the hot paths that only need
+/// this one fact.
+fn function_has_dots_formal(fn_def: Node, text: &str) -> bool {
+    let Some(params) = function_parameters_node(fn_def) else {
+        return false;
+    };
+    let mut cursor = params.walk();
+    params
+        .children(&mut cursor)
+        .any(|child| child.is_named() && parameter_node_name(child, text) == Some("..."))
+}
+
+/// The `parameters` node of a `function_definition`, robust to the
+/// tree-sitter-r field/kind variations the scope engine also handles.
+fn function_parameters_node(fn_def: Node) -> Option<Node> {
+    fn_def.child_by_field_name("parameters").or_else(|| {
+        let mut cursor = fn_def.walk();
+        fn_def
+            .children(&mut cursor)
+            .find(|c| c.is_named() && c.kind() == "parameters")
+    })
 }
 
 /// The body node of a `function_definition`, robust to tree-sitter-r variants.
@@ -13452,16 +13459,38 @@ impl CapturedFormals {
 /// (`function(x) { plot(x); filter(df, {{ x }}) }`) is still suppressed at
 /// call sites.
 ///
-/// Tidy-eval defusal is lexical, so the walk descends into nested function
+/// Tidy-eval injection is lexical, so the walk descends into nested function
 /// definitions (`lapply(xs, function(d) filter(d, {{ cond }}))` defuses the
 /// outer `cond`) — minus whatever names the nested function's own formals
-/// shadow, with a nested `...` shadowing the outer dots the same way.
+/// shadow, with a nested `...` shadowing the outer dots the same way. Inside a
+/// nested closure only the lexical shapes count: embrace and the plural
+/// capture helpers (whose dots lookup follows the environment chain).
+/// `substitute()` / `enquo()`-family singular helpers and `.Call` routine
+/// forwarding are frame-local — `substitute(x)` inside a closure inspects the
+/// closure's own frame, not the outer function's — so they capture only at the
+/// top level, as before.
 fn collect_captured_formals(
     node: Node,
     text: &str,
     formals: &[String],
     found: &mut CapturedFormals,
 ) {
+    collect_captured_formals_inner(node, text, formals, found, false);
+}
+
+fn collect_captured_formals_inner(
+    node: Node,
+    text: &str,
+    formals: &[String],
+    found: &mut CapturedFormals,
+    in_nested_closure: bool,
+) {
+    // The single-target scan from `default_of_defused_formal` can stop at the
+    // first hit: with one formal there is nothing further to discover (`...`
+    // cannot be embraced, and `native` duplicates would join the same set).
+    if formals.len() == 1 && !found.defused.is_empty() {
+        return;
+    }
     if node.kind() == "function_definition" {
         let nested = function_formal_names(node, text);
         let remaining: Vec<String> = formals
@@ -13473,7 +13502,7 @@ fn collect_captured_formals(
             return;
         }
         if let Some(body) = function_body_node(node) {
-            collect_captured_formals(body, text, &remaining, found);
+            collect_captured_formals_inner(body, text, &remaining, found, true);
         }
         return;
     }
@@ -13482,7 +13511,7 @@ fn collect_captured_formals(
         && let Some(helper) = callee_leaf_name(func, text)
         && let Some(args) = node.child_by_field_name("arguments")
     {
-        if let Some(value) = first_positional_arg_value(args) {
+        if !in_nested_closure && let Some(value) = first_positional_arg_value(args) {
             if crate::nse::is_capture_helper(helper) && value.kind() == "identifier" {
                 let name = node_text(value, text);
                 if formals.iter().any(|f| f == name) {
@@ -13516,7 +13545,7 @@ fn collect_captured_formals(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_captured_formals(child, text, formals, found);
+        collect_captured_formals_inner(child, text, formals, found, in_nested_closure);
     }
 }
 
@@ -13728,11 +13757,13 @@ fn table_verb_policy(
 /// wrappers, and `...` must be a *direct* argument value — forwarding to an
 /// unknown or standard-eval function (e.g. `paste(...)`) is not mask
 /// forwarding, and dots buried deeper in an argument expression
-/// (`summarise(d, across(c(...)))`) are not recognized. A bare callee shadowed
-/// by a local definition — top-level (`local_shadows`, from
-/// `local_function_policies`) or bound inside the wrapper body itself
-/// (`body_shadows`) — is skipped entirely, preserving the "local definition
-/// shadows any package / base policy" rule the direct-call resolver applies.
+/// (`summarise(d, across(c(...)))`) are not recognized. A bare callee that is
+/// locally shadowed — by a top-level definition (`local_function_policies`) or
+/// by an entry in `shadows` (function-valued bindings inside the wrapper body
+/// plus the wrapper's own formal names; see the upgrade loop in
+/// [`NseAnalysis::build`]) — is skipped entirely, preserving the "local
+/// definition shadows any package / base policy" rule the direct-call resolver
+/// applies.
 ///
 /// Nested function definitions are descended into unless they declare their
 /// own `...` (R's dots are lexical, so `function(...) function() filter(d,
@@ -13744,11 +13775,9 @@ fn body_forwards_dots_to_covered_verb(
     node: Node,
     text: &str,
     analysis: &NseAnalysis,
-    body_shadows: &HashSet<String>,
+    shadows: &HashSet<String>,
 ) -> bool {
-    if node.kind() == "function_definition"
-        && function_formal_names(node, text).iter().any(|f| f == "...")
-    {
+    if node.kind() == "function_definition" && function_has_dots_formal(node, text) {
         return false;
     }
     if node.kind() == "call"
@@ -13760,7 +13789,7 @@ fn body_forwards_dots_to_covered_verb(
             && (analysis
                 .local_function_policies
                 .contains_key(node_text(func, text))
-                || body_shadows.contains(node_text(func, text))))
+                || shadows.contains(node_text(func, text))))
         && let Some(policy) = table_verb_policy(func, text, analysis)
     {
         let verb_captures_dots = matches!(
@@ -13784,7 +13813,7 @@ fn body_forwards_dots_to_covered_verb(
     }
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis, body_shadows))
+        .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis, shadows))
 }
 
 /// Collect every name bound to a function definition anywhere inside `node`
@@ -16643,7 +16672,7 @@ fn is_parameter_name(node: Node) -> bool {
 fn enclosing_named_function_line(param_node: Node) -> Option<u32> {
     // The parameter list is a direct child of its function_definition, so the
     // nearest function_definition ancestor is the one that owns this parameter.
-    let func_def = nearest_enclosing_function_definition(param_node)?;
+    let func_def = containing_function_definition(param_node)?;
 
     // A function carries roxygen only when bound to a name: it must be the
     // *value* side of an assignment. Since `func_def` is a direct operand of its
@@ -21548,6 +21577,93 @@ mod tests {
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
         assert!(!was_collected(&used, "typo_df"));
+    }
+
+    /// A wrapper formal named after a covered verb shadows it: the call goes
+    /// to the caller-supplied function, not the package verb, so forwarding
+    /// `...` to it is not mask forwarding.
+    #[test]
+    fn nse_wrapper_formal_shadowing_verb_disables_forwarding() {
+        let code = "wrap <- function(filter, ...) filter(d2, ...)\nwrap(my_fn, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// `substitute()` is frame-local: inside a nested closure it inspects the
+    /// closure's own frame, so it does not defuse an OUTER formal. (Contrast
+    /// with the embrace/enquos lexical shapes pinned above.)
+    #[test]
+    fn nse_substitute_in_nested_closure_does_not_capture_outer() {
+        let code =
+            "f <- function(x) {\n  g <- function() substitute(x)\n  x * 2\n}\nf(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// A subscript embrace nested INSIDE a call argument still counts (the
+    /// climb in `is_inside_call_argument` passes through subset arguments).
+    #[test]
+    fn nse_wrapper_embrace_in_subscript_inside_call_argument_captures() {
+        let code = "f <- function(data, i) filter(data, x2[{{ i }}] > 0)\nf(df, masked_col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "masked_col"));
+    }
+
+    /// A nested closure shadowing only SOME outer formals: the shadowed one is
+    /// rebound (not captured), the unshadowed one still embraces through.
+    #[test]
+    fn nse_nested_closure_partial_shadow() {
+        let code = "outer <- function(a, b) sapply(z2, function(a) filter(a, {{ b }}))\n\
+                    outer(typo_a, masked_b)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "typo_a"),
+            "shadowed formal is the nested function's own; outer `a` stays checked"
+        );
+        assert!(
+            !was_collected(&used, "masked_b"),
+            "unshadowed formal embraces through the closure"
+        );
+    }
+
+    /// `...` forwarded as a NAMED argument: a WholeCall verb suppresses it by
+    /// position, and a PerFormal verb's unmatched named argument falls into
+    /// its captured dots — both upgrade the wrapper.
+    #[test]
+    fn nse_wrapper_dots_forwarded_as_named_argument() {
+        for (body, label) in [
+            ("join_by(by = ...)", "WholeCall verb"),
+            (
+                "dplyr::summarise(d2, out = ...)",
+                "PerFormal named fallback",
+            ),
+        ] {
+            let code = format!("w <- function(...) {body}\nw(x == y)");
+            let tree = parse_r_code(&code);
+            let mut used = Vec::new();
+            collect_with_packages(tree.root_node(), &code, &["dplyr"], &mut used);
+            assert!(!was_collected(&used, "x"), "{label}: x must be suppressed");
+        }
+    }
+
+    /// Intent pin: a triple-brace block wrapping a single formal inside a call
+    /// argument still matches the embrace shape at its middle layer
+    /// (suppression-leaning; rlang itself would reject the extra braces).
+    #[test]
+    fn nse_wrapper_triple_brace_in_argument_pins_capture() {
+        let code = "f <- function(x) filter(df2, { {{ x }} })\nf(masked_col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "masked_col"));
     }
 
     /// An embrace inside a *nested* function definition binds the nested

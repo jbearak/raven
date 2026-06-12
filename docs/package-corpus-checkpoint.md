@@ -226,8 +226,9 @@ Ledger impact: 71 entries pruned (1441 → 1370) — dplyr test helpers and
 vignettes (`programming.Rmd`, `rowwise.Rmd`, `test-join-by.R` dots-forwarding
 wrappers, `test-conditions.R` embraces), dbplyr `test-tidyeval-across.R`,
 dtplyr, haven (`col_select = {{ x }}`), ggplot2 `ggplot2-in-packages.qmd`, and
-the rlang `man/rmd` topic examples. Full 4-group strict run stays green
-(0 unclassified / 0 stale acceptances / 0 stale FPs).
+rlang — both the `man/rmd` topic examples and the `tests/testthat`
+defuse-wrapper suites (`test-nse-defuse.R`, `test-eval.R`). Full 4-group
+strict run stays green (0 unclassified / 0 stale acceptances / 0 stale FPs).
 
 ## Validation
 
