@@ -12,7 +12,15 @@
 // 1. **Validate user-controlled inputs** (e.g. package names) before they
 //    reach the spawn. Package-name validation is the canonical example.
 // 2. **Wrap every R subprocess call in `tokio::time::timeout()`.** A hung
-//    R process must not block the LSP indefinitely.
+//    R process must not block the LSP indefinitely. Routing through
+//    `execute_r_code{,_with_timeout}` satisfies both this and the global
+//    concurrency bound below; do not spawn `R` directly past those helpers.
+// 4. **Go through `execute_r_code`/`execute_r_code_with_timeout`** rather than
+//    spawning `R` by hand. They hold a global semaphore (see
+//    `r_subprocess_semaphore`) that caps how many R processes run at once.
+//    Each spawn is CPU-heavy (base-package loading alone is 6–11s and pins a
+//    core); without the cap a burst of callers oversubscribes every core and
+//    starves the latency-sensitive 5s `formals()` queries past their timeout.
 // 3. **Never interpolate user-controlled strings into R code.** Pass values
 //    as `Command` args instead. `help()` uses NSE for `package`, so any
 //    variable argument MUST be wrapped in parens to force evaluation:
@@ -21,9 +29,39 @@
 
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 use crate::parameter_resolver::ParameterInfo;
+
+/// Global bound on the number of R subprocesses running concurrently.
+///
+/// Every R spawn is CPU-heavy (loading the base packages alone takes
+/// 6–11s of wall time and pins a core). Nothing previously limited how many
+/// ran at once, so under high task concurrency (e.g. a 16-way test run, or a
+/// burst of LSP requests each warming packages) dozens of R processes would
+/// saturate every core simultaneously. That CPU starvation made short,
+/// latency-sensitive queries — the 5s-budget `formals()` completion lookups —
+/// blow past their own timeout, and starved unrelated CPU-bound work on the
+/// same machine. Bounding concurrency to roughly the core count keeps each R
+/// process making progress instead of thrashing, which both stabilises the
+/// 5s timeout and protects co-scheduled CPU work.
+///
+/// The permit is acquired *outside* the per-call `tokio::time::timeout`, so
+/// queue-wait never counts against a query's timeout — the timeout continues
+/// to bound only the actual spawn-and-wait, preserving the "a hung R process
+/// must not block the LSP indefinitely" invariant.
+fn r_subprocess_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
+        Semaphore::new(permits)
+    })
+}
 
 /// R subprocess interface for package queries
 pub struct RSubprocess {
@@ -246,6 +284,15 @@ impl RSubprocess {
         r_code: &str,
         timeout: std::time::Duration,
     ) -> Result<String> {
+        // Bound the number of R processes running at once (see
+        // `r_subprocess_semaphore`). Acquired before — and held across — the
+        // timeout below so queue-wait is excluded from the per-call timeout
+        // budget. The semaphore is never closed, so `acquire` cannot error.
+        let _permit = r_subprocess_semaphore()
+            .acquire()
+            .await
+            .expect("R subprocess semaphore is never closed");
+
         let start = std::time::Instant::now();
         crate::perf::increment_r_subprocess_calls();
 
