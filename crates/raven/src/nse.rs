@@ -1052,6 +1052,15 @@ pub(crate) fn is_capture_helper(name: &str) -> bool {
     matches!(name, "substitute" | "enquo" | "enexpr" | "ensym")
 }
 
+/// The rlang plural capture helpers that defuse every element of `...` they
+/// receive. A local function body passing its own `...` to one of these defuses
+/// the caller's arguments, so the Phase 2.5 / issue #433 inference in
+/// `handlers.rs` marks the function's dots captured. `syms()` is deliberately
+/// absent: it evaluates its argument (a character vector), it does not defuse.
+pub(crate) fn is_plural_capture_helper(name: &str) -> bool {
+    matches!(name, "enquos" | "enexprs" | "ensyms" | "quos" | "exprs")
+}
+
 /// True for Shiny deferred-expression helpers whose expression body is
 /// evaluated later in a child lexical environment: `reactive`, `observe`,
 /// `observeEvent`, `eventReactive`, and the `render*()` family (e.g.
