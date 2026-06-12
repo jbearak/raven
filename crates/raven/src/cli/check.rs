@@ -637,6 +637,22 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
     if !state.package_library_ready {
         return;
     }
+    let packages: Vec<String> = reported_packages_to_warm(state, targets)
+        .into_iter()
+        .filter(|p| crate::r_subprocess::is_valid_package_name(p))
+        .collect();
+    // `prefetch_packages` is a no-op on an empty slice, so no length guard here.
+    state.package_library.prefetch_packages(&packages).await;
+}
+
+/// Pure (R-free) computation of the package set [`prefetch_reported_packages`]
+/// warms, before the validity filter and the async cache prefetch. Extracted so
+/// the warming wiring is unit-testable without an R subprocess. Reads target
+/// files from disk for chunk files (best-effort), but performs no R calls.
+fn reported_packages_to_warm(
+    state: &crate::state::WorldState,
+    targets: &[PathBuf],
+) -> std::collections::HashSet<String> {
     let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
     // scope for the package's own R files, so warm those exports too.
@@ -690,12 +706,7 @@ async fn prefetch_reported_packages(state: &crate::state::WorldState, targets: &
             }
         }
     }
-    let packages: Vec<String> = packages
-        .into_iter()
-        .filter(|p| crate::r_subprocess::is_valid_package_name(p))
-        .collect();
-    // `prefetch_packages` is a no-op on an empty slice, so no length guard here.
-    state.package_library.prefetch_packages(&packages).await;
+    packages
 }
 
 fn has_package_metadata_sensitive_undefined_diagnostic(
@@ -1310,6 +1321,54 @@ mod tests {
                 .iter()
                 .map(|(_, d)| (d.range.start.line, d.message.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// R-free coverage that the CLI warming wiring extends the warm set with a
+    /// document's `data(..., package = "pkg")` packages (issue #429). Deleting
+    /// either `doc.data_packages` extend in `reported_packages_to_warm`
+    /// regresses this. Builds the workspace index (no R subprocess) and inspects
+    /// the pure package-set computation directly.
+    fn warm_set_for(root: &Path) -> std::collections::HashSet<String> {
+        let canon = std::fs::canonicalize(root).unwrap();
+        let workspace_url = Url::from_file_path(&canon).unwrap();
+        let state = build_indexed_state(&canon, &workspace_url, true, None).unwrap();
+        let mut operator_error = false;
+        let targets = collect_report_targets(&[], &canon, &mut operator_error);
+        reported_packages_to_warm(&state, &targets)
+    }
+
+    #[test]
+    fn warming_includes_data_package_from_indexed_r_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("analysis.R"),
+            "data(api, package = \"survey\")\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("survey"),
+            "data(api, package = \"survey\") in an indexed R file must contribute \
+             `survey` to the warm set: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn warming_includes_data_package_from_chunk_file() {
+        // Chunk files are outside the R-only index, so the chunk-file branch of
+        // `reported_packages_to_warm` reads them from disk and masks the body.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("report.Rmd"),
+            "# Title\n\n```{r}\ndata(lung, package = \"survival\")\n```\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("survival"),
+            "data(lung, package = \"survival\") in an Rmd chunk must contribute \
+             `survival` to the warm set: {warm:?}"
         );
     }
 

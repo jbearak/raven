@@ -15,13 +15,13 @@
 //    R process must not block the LSP indefinitely. Routing through
 //    `execute_r_code{,_with_timeout}` satisfies both this and the global
 //    concurrency bound below; do not spawn `R` directly past those helpers.
-// 4. **Go through `execute_r_code`/`execute_r_code_with_timeout`** rather than
+// 3. **Go through `execute_r_code`/`execute_r_code_with_timeout`** rather than
 //    spawning `R` by hand. They hold a global semaphore (see
 //    `r_subprocess_semaphore`) that caps how many R processes run at once.
 //    Each spawn is CPU-heavy (base-package loading alone is 6–11s and pins a
 //    core); without the cap a burst of callers oversubscribes every core and
 //    starves the latency-sensitive 5s `formals()` queries past their timeout.
-// 3. **Never interpolate user-controlled strings into R code.** Pass values
+// 4. **Never interpolate user-controlled strings into R code.** Pass values
 //    as `Command` args instead. `help()` uses NSE for `package`, so any
 //    variable argument MUST be wrapped in parens to force evaluation:
 //    `help(topic, package = (pkg))`. Without the parens R reads the symbol
@@ -55,12 +55,19 @@ use crate::parameter_resolver::ParameterInfo;
 fn r_subprocess_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
     SEM.get_or_init(|| {
-        let permits = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 8);
+        let permits = semaphore_permits(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        );
         Semaphore::new(permits)
     })
+}
+
+/// Permit count for the global R-subprocess semaphore: the machine's
+/// available parallelism (fallback 4 when unknown), clamped to [2, 8].
+fn semaphore_permits(parallelism: usize) -> usize {
+    parallelism.clamp(2, 8)
 }
 
 /// R subprocess interface for package queries
@@ -1130,6 +1137,18 @@ pub fn get_fallback_lib_paths() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_semaphore_permits_clamps_to_range() {
+        // Below the floor clamps up to 2.
+        assert_eq!(semaphore_permits(1), 2);
+        assert_eq!(semaphore_permits(2), 2);
+        // Within range passes through unchanged.
+        assert_eq!(semaphore_permits(4), 4);
+        assert_eq!(semaphore_permits(8), 8);
+        // Above the ceiling clamps down to 8.
+        assert_eq!(semaphore_permits(16), 8);
+    }
 
     #[test]
     fn test_new_with_none_discovers_r() {

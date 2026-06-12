@@ -21207,6 +21207,77 @@ y <- filter(df)"#;
         assert!(scope.symbols.contains_key("api"));
     }
 
+    #[test]
+    fn data_load_global_expansion_visible_inside_function_late_arm() {
+        // Streaming-resolver coverage for `ScopeStream::apply_event_to_late`'s
+        // DataLoad arm: a GLOBAL `data(api, package = "survey")` must be hoisted
+        // into the late frame so its expanded objects (apiclus1/apistrat) are
+        // visible when the cursor is INSIDE a function body with
+        // `hoist_globals=true`. The late frame is built only on that in-function
+        // query path, so this is the only route that exercises the arm.
+        let uri = test_uri();
+        // Line 0: global data() call. Lines 1-3: function body referencing
+        // apiclus1 and an unrelated name. The query lands inside the body.
+        let code =
+            "data(api, package = \"survey\")\nf <- function() {\n  apiclus1\n  notathing\n}\n";
+        let arts = Arc::new(compute_artifacts(&uri, &parse_r(code), code));
+
+        let uri_for_artifacts = uri.clone();
+        let arts_for_closure = arts.clone();
+        let get_artifacts = move |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            (u == &uri_for_artifacts).then(|| arts_for_closure.clone())
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports: HashSet<String> = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let is_cancelled = || false;
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_exports,
+        };
+
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true, // hoist_globals
+            super::super::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .expect("stream construction must succeed");
+
+        // (2, 2) — inside f's body, at the `apiclus1` reference. Being inside a
+        // function with hoist_globals builds the late frame via
+        // `apply_event_to_late`, expanding the global data() call.
+        stream.advance_to(2, 2);
+        let scope = stream.snapshot();
+        assert!(
+            scope.symbols.contains_key("apiclus1"),
+            "global data(api, package = \"survey\") must hoist apiclus1 into the \
+             late frame visible inside the function body: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("apistrat"),
+            "the explicit-package expansion must also bind apistrat"
+        );
+        // Negative: an unrelated name the provider never yields is still unbound.
+        assert!(
+            !scope.symbols.contains_key("notathing"),
+            "an unrelated name must remain unresolved"
+        );
+    }
+
     // ---- data() recorder edge cases (issue #429 gaps) ----
 
     #[test]
