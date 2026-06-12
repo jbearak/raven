@@ -13485,10 +13485,13 @@ fn collect_captured_formals_inner(
     found: &mut CapturedFormals,
     in_nested_closure: bool,
 ) {
-    // The single-target scan from `default_of_defused_formal` can stop at the
-    // first hit: with one formal there is nothing further to discover (`...`
-    // cannot be embraced, and `native` duplicates would join the same set).
-    if formals.len() == 1 && !found.defused.is_empty() {
+    // The single-target scan from `default_of_defused_formal` can stop once
+    // THE one in-scope formal is itself defused — nothing further to discover
+    // (`...` cannot be embraced, and `native` duplicates would join the same
+    // set). The hit must be that formal: nested-closure descent can narrow
+    // `formals` to one name while `found.defused` holds a different,
+    // earlier-captured formal of the same function.
+    if formals.len() == 1 && found.defused.iter().any(|c| c == &formals[0]) {
         return;
     }
     if node.kind() == "function_definition" {
@@ -21613,6 +21616,21 @@ mod tests {
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
         assert!(!was_collected(&used, "masked_col"));
+    }
+
+    /// An earlier capture of a DIFFERENT formal must not abort the scan when a
+    /// nested closure narrows the in-scope formals to one: `enquo(a)` defuses
+    /// `a`, the lambda shadows `a`, and `{{ b }}` inside it must still defuse
+    /// `b` (regression: the single-formal early exit fired on the wrong hit).
+    #[test]
+    fn nse_partial_shadow_after_earlier_capture_still_defuses() {
+        let code = "f <- function(a, b) {\n  q <- enquo(a)\n  \
+                    lapply(xs2, function(a) filter(a, {{ b }}))\n}\n\
+                    f(da, masked_b > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "masked_b"));
     }
 
     /// A nested closure shadowing only SOME outer formals: the shadowed one is
