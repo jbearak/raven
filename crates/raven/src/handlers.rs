@@ -15364,11 +15364,19 @@ fn detect_dollar_member_completion_context(
         token_end += 1;
     }
 
-    if token_start == 0 || bytes[token_start - 1] != b'$' {
+    let follows_dollar = token_start > 0 && bytes[token_start - 1] == b'$';
+    let follows_dollar_backtick =
+        token_start >= 2 && bytes[token_start - 1] == b'`' && bytes[token_start - 2] == b'$';
+    if !follows_dollar && !follows_dollar_backtick {
         return None;
     }
 
-    let op_byte = token_start - 1;
+    let has_typed_opening_backtick = follows_dollar_backtick;
+    let op_byte = if has_typed_opening_backtick {
+        token_start - 2
+    } else {
+        token_start - 1
+    };
     // The container path comes from the AST subexpression ending just before the
     // trigger `$`. This keeps the text scan only for the parts tree-sitter parses
     // poorly (the trigger, typed prefix, and replace range) and gives full
@@ -15377,7 +15385,12 @@ fn detect_dollar_member_completion_context(
     let path = lhs_path_ending_at(tree, text, line_idx, op_byte)?;
 
     let typed_prefix = line[token_start..cursor_byte].to_string();
-    let start_character = crate::utf16::byte_offset_to_utf16_column(line, token_start);
+    let replace_start = if has_typed_opening_backtick {
+        token_start - 1
+    } else {
+        token_start
+    };
+    let start_character = crate::utf16::byte_offset_to_utf16_column(line, replace_start);
     let end_character = crate::utf16::byte_offset_to_utf16_column(line, token_end);
 
     Some(DollarMemberCompletionContext {
@@ -15453,6 +15466,32 @@ fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
+fn is_syntactic_r_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '.' {
+        return false;
+    }
+    if first == '.'
+        && let Some(second) = chars.clone().next()
+        && second.is_ascii_digit()
+    {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
+        && !crate::reserved_words::is_reserved_word(name)
+}
+
+fn accessor_member_insert_text(name: &str) -> String {
+    if is_syntactic_r_name(name) || name.contains('`') {
+        name.to_string()
+    } else {
+        format!("`{name}`")
+    }
+}
+
 /// Render a container path for completion-item detail text, e.g.
 /// `alpha`, `alpha$beta`, `alpha@slot$beta`.
 fn render_qualified_path(path: &crate::qualified_resolve::QualifiedPath) -> String {
@@ -15484,9 +15523,14 @@ fn dollar_member_completion_items(
     )
     .into_iter()
     .filter(|candidate| {
-        context.typed_prefix.is_empty() || candidate.name.starts_with(&context.typed_prefix)
+        let label = unquote_backtick_name(&candidate.name).unwrap_or(&candidate.name);
+        context.typed_prefix.is_empty() || label.starts_with(&context.typed_prefix)
     })
     .map(|candidate| {
+        let label = unquote_backtick_name(&candidate.name)
+            .unwrap_or(&candidate.name)
+            .to_string();
+        let new_text = accessor_member_insert_text(&label);
         let detail = if candidate.uri == *uri {
             format!("member of {}", rendered_path)
         } else {
@@ -15495,13 +15539,14 @@ fn dollar_member_completion_items(
             format!("member of {} from {}", rendered_path, relative_path)
         };
         CompletionItem {
-            label: candidate.name.clone(),
+            label: label.clone(),
             kind: Some(CompletionItemKind::FIELD),
             detail: Some(detail),
-            sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, candidate.name)),
+            filter_text: Some(label.clone()),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_SCOPE, label)),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: context.replace_range,
-                new_text: candidate.name,
+                new_text,
             })),
             ..Default::default()
         }
@@ -55610,6 +55655,51 @@ mod dollar_member_completion_tests {
             other => panic!("expected text edit for beta completion, got {:?}", other),
         }
     }
+
+    #[test]
+    fn dollar_member_completion_backtick_quotes_non_syntactic_insert_text() {
+        let items = completion_items("foo <- list(`alpha beta` = 1)\nfoo$|");
+
+        assert_eq!(sorted_labels(&items), vec!["alpha beta"]);
+        let item = items
+            .iter()
+            .find(|item| item.label == "alpha beta")
+            .unwrap();
+        assert_eq!(item.filter_text.as_deref(), Some("alpha beta"));
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.new_text, "`alpha beta`");
+            }
+            other => panic!(
+                "expected text edit for non-syntactic member completion, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn dollar_member_completion_replaces_typed_leading_backtick_prefix() {
+        let items = completion_items("foo <- list(`alpha beta` = 1)\nfoo$`alp|");
+
+        assert_eq!(sorted_labels(&items), vec!["alpha beta"]);
+        let item = items
+            .iter()
+            .find(|item| item.label == "alpha beta")
+            .unwrap();
+        assert_eq!(item.filter_text.as_deref(), Some("alpha beta"));
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range.start, Position::new(1, 4));
+                assert_eq!(edit.range.end, Position::new(1, 8));
+                assert_eq!(edit.new_text, "`alpha beta`");
+            }
+            other => panic!(
+                "expected text edit for backtick-prefixed member completion, got {:?}",
+                other
+            ),
+        }
+    }
+
     #[test]
     fn dollar_member_completion_detects_lhs_after_dollar_chain() {
         let (code, position) = code_and_position("foo$bar$|");
