@@ -4537,50 +4537,6 @@ end_line = 87
 end_character = 53
 [[false_positive]]
 package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: gfycat_animals"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 464
-start_character = 20
-end_line = 464
-end_character = 34
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: gfycat_adjectives"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 465
-start_character = 20
-end_line = 465
-end_character = 37
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: gfycat_adjectives"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 478
-start_character = 4
-end_line = 478
-end_character = 21
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: gfycat_animals"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 479
-start_character = 4
-end_line = 479
-end_character = 18
-[[false_positive]]
-package = "cli"
 path = "R/keypress.R"
 message = "Undefined variable: cli_keypress"
 reason = "native routine registered via .Call/useDynLib at load time"
@@ -4601,182 +4557,6 @@ start_line = 82
 start_character = 22
 end_line = 82
 end_character = 37
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 346
-start_character = 25
-end_line = 346
-end_character = 39
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 347
-start_character = 13
-end_line = 347
-end_character = 27
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 349
-start_character = 40
-end_line = 349
-end_character = 54
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 351
-start_character = 13
-end_line = 351
-end_character = 27
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 362
-start_character = 24
-end_line = 362
-end_character = 38
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 374
-start_character = 2
-end_line = 374
-end_character = 16
-[[false_positive]]
-package = "cli"
-path = "R/prettycode.R"
-message = "Undefined variable: rstudio_themes"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 424
-start_character = 8
-end_line = 424
-end_character = 22
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 54
-start_character = 24
-end_line = 54
-end_character = 32
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 57
-start_character = 17
-end_line = 57
-end_character = 25
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 58
-start_character = 15
-end_line = 58
-end_character = 23
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 83
-start_character = 2
-end_line = 83
-end_character = 10
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 379
-start_character = 18
-end_line = 379
-end_character = 26
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 380
-start_character = 12
-end_line = 380
-end_character = 20
-[[false_positive]]
-package = "cli"
-path = "R/spinner.R"
-message = "Undefined variable: spinners"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 381
-start_character = 22
-end_line = 381
-end_character = 30
-[[false_positive]]
-package = "cli"
-path = "R/unicode.R"
-message = "Undefined variable: wide_chars"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 31
-start_character = 21
-end_line = 31
-end_character = 31
-[[false_positive]]
-package = "cli"
-path = "R/unicode.R"
-message = "Undefined variable: wide_chars"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 32
-start_character = 15
-end_line = 32
-end_character = 25
 [[false_positive]]
 package = "cli"
 path = "exec/news.R"
@@ -6097,28 +5877,6 @@ start_line = 175
 start_character = 0
 end_line = 175
 end_character = 3
-[[false_positive]]
-package = "readr"
-path = "R/date-symbols.R"
-message = "Undefined variable: date_symbols"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 47
-start_character = 13
-end_line = 47
-end_character = 25
-[[false_positive]]
-package = "readr"
-path = "R/date-symbols.R"
-message = "Undefined variable: date_symbols"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 58
-start_character = 8
-end_line = 58
-end_character = 20
 [[false_positive]]
 package = "readxl"
 path = "revdep/v1.0.0/check.R"
@@ -8023,39 +7781,6 @@ start_line = 235
 start_character = 60
 end_line = 235
 end_character = 65
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: emojis"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 319
-start_character = 15
-end_line = 319
-end_character = 21
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: emojis"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 328
-start_character = 9
-end_line = 328
-end_character = 15
-[[false_positive]]
-package = "cli"
-path = "R/hash.R"
-message = "Undefined variable: emojis"
-reason = "internal data from R/sysdata.rda"
-
-[false_positive.range]
-start_line = 329
-start_character = 9
-end_line = 329
-end_character = 15
 [[false_positive]]
 package = "cli"
 path = "inst/examples/apps/news.R"
@@ -12251,28 +11976,6 @@ end_line = 103
 end_character = 64
 [[false_positive]]
 package = "tools"
-path = "R/RdConv2.R"
-message = "Undefined variable: IANA_URI_scheme_db"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 740
-start_character = 32
-end_line = 740
-end_character = 50
-[[false_positive]]
-package = "tools"
-path = "R/doitools.R"
-message = "Undefined variable: table_of_HTTP_status_codes"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 158
-start_character = 17
-end_line = 158
-end_character = 43
-[[false_positive]]
-package = "tools"
 path = "R/install.R"
 message = "Undefined variable: do_install"
 reason = "variable defined in sibling/nested function scope (leak fix unmasked)"
@@ -12282,72 +11985,6 @@ start_line = 44
 start_character = 10
 end_line = 44
 end_character = 20
-[[false_positive]]
-package = "tools"
-path = "R/urltools.R"
-message = "Undefined variable: table_of_HTTP_status_codes"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 516
-start_character = 30
-end_line = 516
-end_character = 56
-[[false_positive]]
-package = "tools"
-path = "R/urltools.R"
-message = "Undefined variable: table_of_HTTP_status_codes"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 520
-start_character = 19
-end_line = 520
-end_character = 45
-[[false_positive]]
-package = "tools"
-path = "R/urltools.R"
-message = "Undefined variable: IANA_URI_scheme_db"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 631
-start_character = 25
-end_line = 631
-end_character = 43
-[[false_positive]]
-package = "utils"
-path = "R/citation.R"
-message = "Undefined variable: MARC_relator_db"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 198
-start_character = 35
-end_line = 198
-end_character = 50
-[[false_positive]]
-package = "utils"
-path = "R/citation.R"
-message = "Undefined variable: MARC_relator_db"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 201
-start_character = 30
-end_line = 201
-end_character = 45
-[[false_positive]]
-package = "utils"
-path = "R/citation.R"
-message = "Undefined variable: MARC_relator_db"
-reason = "lazily loaded dataset in tools package"
-
-[false_positive.range]
-start_line = 203
-start_character = 31
-end_line = 203
-end_character = 46
 [[false_positive]]
 package = "utils"
 path = "R/debugger.R"
