@@ -6474,22 +6474,30 @@ fn is_structural_non_reference(node: Node) -> bool {
     is_assignment_target(node) || is_structural_label(node)
 }
 
-/// Returns true when `node` is an identifier inside a default-parameter
-/// expression that names one of the containing function's formal parameters.
+/// Returns true when `node` is a default-parameter-expression identifier that
+/// is not a free-variable reference, for either of two reasons — one ancestor
+/// walk answers both. Shared by the undefined-variable and use-before-source
+/// pipelines so the two cannot disagree about default expressions.
 ///
-/// In R, default expressions are evaluated in the function call frame, where
-/// all formals are bound as promises. That means `function(y, x = y)` and even
-/// `function(x = y, y = 1)` are valid name lookups for `y`. This is narrower
-/// than treating every default-expression identifier as locally defined:
-/// `function(x = missing)` must still allow undefined-variable diagnostics,
-/// and `function(a = x)` must still allow source-order diagnostics when `x` is
-/// only provided by a later `source()`.
-fn references_formal_from_default_expression(node: Node, text: &str) -> bool {
+/// 1. It names one of the containing function's formal parameters. In R,
+///    default expressions are evaluated in the function call frame, where all
+///    formals are bound as promises: `function(y, x = y)` and even
+///    `function(x = y, y = 1)` are valid name lookups for `y`.
+/// 2. (Issue #433) It belongs to the default of a *defused* formal, which is
+///    quoted into a data mask rather than evaluated in the enclosing scope —
+///    see [`default_of_defused_formal`].
+///
+/// This is narrower than treating every default-expression identifier as
+/// locally defined: `function(x = missing)` must still allow
+/// undefined-variable diagnostics, and `function(a = x)` must still allow
+/// source-order diagnostics when `x` is only provided by a later `source()`.
+fn default_expression_exemption(node: Node, text: &str) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
     let Some(parameter) = default_value_parameter(node) else {
         return false;
     };
     default_references_sibling_formal(parameter, node, text)
+        || default_of_defused_formal(parameter, node, text)
 }
 
 /// The parameter node whose **default expression** contains `node`, or `None`
@@ -6508,7 +6516,7 @@ fn default_value_parameter(node: Node) -> Option<Node> {
 
 /// True when the default-expression identifier `node` (inside `parameter`'s
 /// default) names one of the containing function's formals. See
-/// [`references_formal_from_default_expression`] for the semantics.
+/// [`default_expression_exemption`] for the semantics.
 fn default_references_sibling_formal(parameter: Node, node: Node, text: &str) -> bool {
     let Some(parameters) = parameter.parent().filter(|n| n.kind() == "parameters") else {
         return false;
@@ -6565,14 +6573,15 @@ fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
     let Some(fn_def) = nearest_enclosing_function_definition(parameter) else {
         return false;
     };
-    let formals = function_formal_names(fn_def, text);
-    if formals.is_empty() {
+    let Some(body) = function_body_node(fn_def) else {
         return false;
-    }
+    };
+    // Only this one formal matters, so scan the body against a single-element
+    // formals slice — `collect_captured_formals` filters every capture shape
+    // against it, skipping the work for the function's other formals.
+    let target = [formal_name.to_string()];
     let mut captured = CapturedFormals::default();
-    if let Some(body) = function_body_node(fn_def) {
-        collect_captured_formals(body, text, &formals, &mut captured);
-    }
+    collect_captured_formals(body, text, &target, &mut captured);
     captured.defused.iter().any(|c| c == formal_name)
 }
 
@@ -6800,7 +6809,7 @@ fn collect_identifier_usages_utf16<'a>(
             return;
         }
 
-        if references_formal_from_default_expression(node, text) {
+        if default_expression_exemption(node, text) {
             return;
         }
 
@@ -12666,8 +12675,12 @@ pub(crate) struct NseAnalysis<'a> {
     /// indices are blanket-suppressed (escape hatch).
     bracket_indices_enabled: bool,
     /// File-local `name <- function(...)` definitions, mapping the bound name
-    /// to the argument policy inferred from that function's captured formals
-    /// (Phase 2.5). A local definition shadows any package / base policy.
+    /// to the argument policy inferred for that function: the context-free
+    /// Phase 2.5 captured-formals baseline plus the issue #433 context-aware
+    /// dots-forwarding upgrade (which consults in-play packages and the
+    /// package library, so the map is finalized only at the end of
+    /// [`NseAnalysis::build`]). A local definition shadows any package / base
+    /// policy.
     local_function_policies: HashMap<String, crate::nse::ArgPolicy>,
     /// Packages detectably in play across the file/workspace: `library()` /
     /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
@@ -12714,9 +12727,13 @@ pub(crate) struct NseAnalysis<'a> {
 }
 
 impl<'a> NseAnalysis<'a> {
-    /// Walk `root` once to gather the file-local facts (local function policies,
-    /// data.table-like objects, `data.table::` qualified usage) and bundle them
-    /// with the supplied config flags and package context.
+    /// Walk `root` once to gather the file-local facts (top-level function
+    /// definitions, data.table-like objects, `data.table::` qualified usage),
+    /// bundle them with the supplied config flags and package context, then
+    /// infer the local function policies in two passes: the context-free
+    /// Phase 2.5 baseline per definition, followed by the issue #433
+    /// dots-forwarding upgrade, which resolves each body's inner callees
+    /// against the assembled package context.
     // Distinct analysis inputs (config flags, in-play vs self-package sets,
     // library/base-export refs); grouping them into a struct would only move the
     // argument list to the call site.
@@ -12790,25 +12807,46 @@ impl<'a> NseAnalysis<'a> {
         // baseline analysis so inner callees resolve one level deep through
         // the built-in tables only, never through other local wrappers. The
         // upgraded policies are staged and applied afterwards because the
-        // detection borrows `analysis` immutably.
+        // detection borrows `analysis` immutably. Skipped entirely when call
+        // arguments are blanket-suppressed (the policies would never be read).
+        if !call_args_enabled {
+            return analysis;
+        }
         let mut dots_upgrades: Vec<(String, crate::nse::ArgPolicy)> = Vec::new();
         for (name, fn_def) in &local_function_defs {
-            let (formals, captured) = match analysis.local_function_policies.get(name) {
+            let baseline = analysis.local_function_policies.get(name);
+            if matches!(
+                baseline,
                 Some(crate::nse::ArgPolicy::PerFormal {
                     captured_dots: true,
                     ..
-                }) => continue,
-                Some(crate::nse::ArgPolicy::PerFormal {
-                    formals, captured, ..
-                }) => (formals.clone(), captured.clone()),
-                _ => (function_formal_names(*fn_def, text), Vec::new()),
-            };
-            if !formals.iter().any(|f| f == "...") {
+                })
+            ) {
                 continue;
             }
-            if function_body_node(*fn_def)
-                .is_some_and(|body| body_forwards_dots_to_covered_verb(body, text, &analysis))
-            {
+            let has_dots_formal = match baseline {
+                Some(crate::nse::ArgPolicy::PerFormal { formals, .. }) => {
+                    formals.iter().any(|f| f == "...")
+                }
+                _ => function_formal_names(*fn_def, text)
+                    .iter()
+                    .any(|f| f == "..."),
+            };
+            if !has_dots_formal {
+                continue;
+            }
+            let Some(body) = function_body_node(*fn_def) else {
+                continue;
+            };
+            let mut body_shadows = HashSet::new();
+            function_binding_names(body, text, &mut body_shadows);
+            if body_forwards_dots_to_covered_verb(body, text, &analysis, &body_shadows) {
+                let (formals, captured) = match analysis.local_function_policies.get(name) {
+                    Some(crate::nse::ArgPolicy::PerFormal {
+                        formals, captured, ..
+                    }) => (formals.clone(), captured.clone()),
+                    _ => (function_formal_names(*fn_def, text), Vec::new()),
+                };
                 dots_upgrades.push((
                     name.clone(),
                     crate::nse::ArgPolicy::PerFormal {
@@ -13316,9 +13354,9 @@ fn user_defined_call_policy(fn_def: Node, text: &str) -> crate::nse::ArgPolicy {
     if let Some(body) = function_body_node(fn_def) {
         collect_captured_formals(body, text, &formals, &mut found);
     }
-    // A plural capture helper only defuses dots the function actually declares
+    // `found.dots` is already gated on `...` being among the in-scope formals
     // (`function(x) enquos(...)` parses but has no dots of its own to defuse).
-    let captured_dots = found.dots && formals.iter().any(|f| f == "...");
+    let captured_dots = found.dots;
     let mut captured = found.defused;
     for name in found.native {
         if !captured.contains(&name) {
@@ -13406,18 +13444,37 @@ impl CapturedFormals {
 /// to be a covered verb's masked argument (the issue #433 sketch) would break
 /// the issue's own acceptance repro — a bare `filter` with no `library(dplyr)`
 /// resolves Standard through the builtin registry (`stats::filter`), so no
-/// covered position would exist. The accepted trade-off: a doubled-brace block
-/// wrapping a single formal inside a standard-eval call argument (plain nested
-/// blocks, e.g. `paste0({{ x }})`) is indistinguishable from tidy-eval intent
-/// and is suppressed too.
+/// covered position would exist. Two accepted trade-offs follow: a
+/// doubled-brace block wrapping a single formal inside a standard-eval call
+/// argument (plain nested blocks, e.g. `paste0({{ x }})`) is indistinguishable
+/// from tidy-eval intent and is suppressed too; and capture is per formal
+/// *name*, so a formal that is both embraced and used in an evaluated position
+/// (`function(x) { plot(x); filter(df, {{ x }}) }`) is still suppressed at
+/// call sites.
+///
+/// Tidy-eval defusal is lexical, so the walk descends into nested function
+/// definitions (`lapply(xs, function(d) filter(d, {{ cond }}))` defuses the
+/// outer `cond`) — minus whatever names the nested function's own formals
+/// shadow, with a nested `...` shadowing the outer dots the same way.
 fn collect_captured_formals(
     node: Node,
     text: &str,
     formals: &[String],
     found: &mut CapturedFormals,
 ) {
-    // A nested function has its own formals; its capture calls do not bind ours.
     if node.kind() == "function_definition" {
+        let nested = function_formal_names(node, text);
+        let remaining: Vec<String> = formals
+            .iter()
+            .filter(|f| !nested.iter().any(|n| n == *f))
+            .cloned()
+            .collect();
+        if remaining.is_empty() {
+            return;
+        }
+        if let Some(body) = function_body_node(node) {
+            collect_captured_formals(body, text, &remaining, found);
+        }
         return;
     }
     if node.kind() == "call"
@@ -13426,11 +13483,11 @@ fn collect_captured_formals(
         && let Some(args) = node.child_by_field_name("arguments")
     {
         if let Some(value) = first_positional_arg_value(args) {
-            if crate::nse::is_capture_helper(helper)
-                && value.kind() == "identifier"
-                && formals.iter().any(|f| f == node_text(value, text))
-            {
-                found.push_defused(node_text(value, text));
+            if crate::nse::is_capture_helper(helper) && value.kind() == "identifier" {
+                let name = node_text(value, text);
+                if formals.iter().any(|f| f == name) {
+                    found.push_defused(name);
+                }
             } else if is_native_interface_callee(helper)
                 && let Some(name) = native_routine_formal_value(value, text, formals)
                 && !found.native.iter().any(|c| c == name)
@@ -13439,8 +13496,13 @@ fn collect_captured_formals(
             }
         }
         // `enquos(...)` etc.: the body defuses its own dots, so the caller's
-        // arguments absorbed by `...` are captured (issue #433).
-        if crate::nse::is_plural_capture_helper(helper) && call_args_contain_dots(args) {
+        // arguments absorbed by `...` are captured (issue #433). Gated on the
+        // in-scope formals so a function without `...` (or a nested closure
+        // whose own `...` shadows the outer dots) defuses nothing here.
+        if crate::nse::is_plural_capture_helper(helper)
+            && call_args_contain_dots(args)
+            && formals.iter().any(|f| f == "...")
+        {
             found.dots = true;
         }
     }
@@ -13471,9 +13533,21 @@ fn embraced_formal_name<'f>(node: Node, text: &str, formals: &'f [String]) -> Op
     formals.iter().find(|f| *f == name).map(String::as_str)
 }
 
-/// The node's only named child, or `None` when it has zero or several.
+/// The node's only named non-comment child, or `None` when it has zero or
+/// several. Comments are tree-sitter "extra" nodes that the R parser would
+/// strip, so `{{ cond  # why }}` is still the embrace shape.
 fn single_named_child(node: Node) -> Option<Node> {
-    (node.named_child_count() == 1).then(|| node.named_child(0))?
+    let mut cursor = node.walk();
+    let mut only = None;
+    for child in node.children(&mut cursor) {
+        if child.is_named() && child.kind() != "comment" {
+            if only.is_some() {
+                return None;
+            }
+            only = Some(child);
+        }
+    }
+    only
 }
 
 /// True when `node` sits inside a `call` argument value, reached before any
@@ -13637,29 +13711,44 @@ fn table_verb_policy(
 }
 
 /// Issue #433, context-aware half of the wrapper inference: true when the
-/// function body passes its own `...` as a direct argument in a position that
-/// a covered verb's NSE policy suppresses (e.g. `function(data, ...)
-/// filter(data, ...)` with dplyr in play, or `function(...) join_by(...)`).
-/// The wrapper's dots then absorb data-masked expressions, so call-site
-/// arguments bound to `...` must be exempted exactly like the verb's own.
+/// function body passes its own `...` as a direct argument to a covered verb
+/// such that some forwarded element lands in a position the verb's NSE policy
+/// suppresses (e.g. `function(data, ...) filter(data, ...)` with dplyr in
+/// play, or `function(...) join_by(...)`). The wrapper's dots then absorb
+/// data-masked expressions, so call-site arguments bound to `...` must be
+/// exempted exactly like the verb's own.
+///
+/// A forwarded `...` counts when its own argument position is suppressed, or
+/// when it is positional and the verb captures its own dots — splicing spreads
+/// across the remaining formals, so in `function(...) filter(...)` the single
+/// `...` feeds `.data` *and* overflows into filter's captured `...`.
 ///
 /// Deliberately one level deep: the inner callee is resolved against the
 /// built-in tables only ([`table_verb_policy`]), never against other local
 /// wrappers, and `...` must be a *direct* argument value — forwarding to an
 /// unknown or standard-eval function (e.g. `paste(...)`) is not mask
-/// forwarding. A bare callee shadowed by a local definition is skipped
-/// entirely, preserving the "local definition shadows any package / base
-/// policy" rule the direct-call resolver applies. Nested function definitions
-/// are skipped; their dots are their own.
+/// forwarding, and dots buried deeper in an argument expression
+/// (`summarise(d, across(c(...)))`) are not recognized. A bare callee shadowed
+/// by a local definition — top-level (`local_shadows`, from
+/// `local_function_policies`) or bound inside the wrapper body itself
+/// (`body_shadows`) — is skipped entirely, preserving the "local definition
+/// shadows any package / base policy" rule the direct-call resolver applies.
 ///
-/// The walk does descend into captured argument subtrees, so a covered verb
-/// inside another captured argument still counts — necessary because a
-/// data-masked argument is eventually evaluated (`mutate(d, across(c(...)))`
-/// genuinely forwards), at the cost of also matching purely quoted contexts
-/// (`quote(filter(d, ...))`), which lean toward suppression like the rest of
-/// the NSE machinery.
-fn body_forwards_dots_to_covered_verb(node: Node, text: &str, analysis: &NseAnalysis) -> bool {
-    if node.kind() == "function_definition" {
+/// Nested function definitions are descended into unless they declare their
+/// own `...` (R's dots are lexical, so `function(...) function() filter(d,
+/// ...)` forwards the factory's dots). The walk also descends into captured
+/// argument subtrees — a data-masked argument is eventually evaluated, at the
+/// cost of also matching purely quoted contexts (`quote(filter(d, ...))`),
+/// which lean toward suppression like the rest of the NSE machinery.
+fn body_forwards_dots_to_covered_verb(
+    node: Node,
+    text: &str,
+    analysis: &NseAnalysis,
+    body_shadows: &HashSet<String>,
+) -> bool {
+    if node.kind() == "function_definition"
+        && function_formal_names(node, text).iter().any(|f| f == "...")
+    {
         return false;
     }
     if node.kind() == "call"
@@ -13668,24 +13757,54 @@ fn body_forwards_dots_to_covered_verb(node: Node, text: &str, analysis: &NseAnal
         // Cheap pre-filter: most body calls pass no `...` at all.
         && call_args_contain_dots(args)
         && !(func.kind() == "identifier"
-            && analysis
+            && (analysis
                 .local_function_policies
-                .contains_key(node_text(func, text)))
+                .contains_key(node_text(func, text))
+                || body_shadows.contains(node_text(func, text))))
         && let Some(policy) = table_verb_policy(func, text, analysis)
-        && call_argument_suppression(args, text, &policy, call_is_pipe_fed(node, text))
+    {
+        let verb_captures_dots = matches!(
+            &policy,
+            crate::nse::ArgPolicy::PerFormal {
+                captured_dots: true,
+                ..
+            }
+        );
+        let forwards = call_argument_suppression(args, text, &policy, call_is_pipe_fed(node, text))
             .iter()
             .any(|(arg, suppressed)| {
-                *suppressed
-                    && arg
-                        .child_by_field_name("value")
-                        .is_some_and(|value| value.kind() == "dots")
-            })
-    {
-        return true;
+                arg.child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "dots")
+                    && (*suppressed
+                        || (verb_captures_dots && arg.child_by_field_name("name").is_none()))
+            });
+        if forwards {
+            return true;
+        }
     }
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis))
+        .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis, body_shadows))
+}
+
+/// Collect every name bound to a function definition anywhere inside `node`
+/// (the wrapper body), at any depth. Used by the dots-forwarding inference to
+/// honor body-local shadowing of covered verbs: `function(...) { filter <-
+/// function(x, ...) x; filter(d, ...) }` calls the local standard-eval
+/// `filter`, not dplyr's. Deliberately position-blind (a definition after the
+/// call still disables the upgrade) — erring toward keeping diagnostics.
+fn function_binding_names(node: Node, text: &str, names: &mut HashSet<String>) {
+    if let Some(target) = assignment_target_node(node)
+        && target.kind() == "identifier"
+        && let Some(value) = assignment_value_node(node)
+        && unwrap_parenthesized(value).kind() == "function_definition"
+    {
+        names.insert(node_text(target, text).to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        function_binding_names(child, text, names);
+    }
 }
 
 /// Resolve a `call` node's argument policy by classifying its callee against
@@ -13831,14 +13950,7 @@ fn collect_usages_with_analysis<'a>(
         if is_destructuring_assignment_target(node, text) {
             return;
         }
-        // Default-parameter expressions, one ancestor walk for both
-        // exemptions: a default naming a sibling formal resolves through the
-        // call frame, and (issue #433) the default of a defused formal is
-        // quoted into a data mask, never evaluated in the enclosing scope.
-        if let Some(parameter) = default_value_parameter(node)
-            && (default_references_sibling_formal(parameter, node, text)
-                || default_of_defused_formal(parameter, node, text))
-        {
+        if default_expression_exemption(node, text) {
             return;
         }
         // Magrittr exposition operator: `lhs %$% rhs` evaluates `rhs` in a
@@ -14220,8 +14332,11 @@ fn apply_arg_policy<'a>(
 /// virtually all R modeling functions (lm, glm, svyglm, survival::coxph, …),
 /// regardless of whether the callee has an explicit NSE policy. Both the
 /// call-site walk ([`apply_arg_policy`]) and the issue #433 dots-forwarding
-/// inference ([`body_forwards_dots_to_covered_verb`]) consume this, so the two
-/// can never disagree about which positions are masked.
+/// inference ([`body_forwards_dots_to_covered_verb`]) consume this, so for any
+/// callee both reach they agree about which positions are masked. (The
+/// forwarding pass only reaches it for table-covered verbs, so a `subset = ...`
+/// forwarded to an *uncovered* callee is masked here at the call site but does
+/// not upgrade the wrapper.)
 fn call_argument_suppression<'a>(
     args_node: Node<'a>,
     text: &str,
@@ -21282,6 +21397,157 @@ mod tests {
             was_collected(&used_bare, "x"),
             "bare quos(...) without rlang in play must not capture dots"
         );
+    }
+
+    /// Tidy-eval defusal is lexical: an embrace of an OUTER formal inside a
+    /// nested lambda (the `lapply(xs, function(d) filter(d, {{ cond }}))`
+    /// idiom) still marks the outer formal defused.
+    #[test]
+    fn nse_wrapper_embrace_through_nested_lambda() {
+        let code = "outer <- function(data, cond) lapply(data, function(d) filter(d, {{ cond }}))\n\
+                    outer(lst, x > 30)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(was_collected(&used, "lst"), "data argument stays checked");
+    }
+
+    /// Dots are lexical too: a dots-less nested closure defusing `enquos(...)`
+    /// defuses the OUTER function's dots.
+    #[test]
+    fn nse_wrapper_dots_defused_in_nested_closure() {
+        let code = "f <- function(...) {\n  g <- function() enquos(...)\n  g()\n}\nf(x > 2)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+    }
+
+    /// A factory returning a closure that forwards the factory's `...` into a
+    /// covered verb is itself dots-forwarding.
+    #[test]
+    fn nse_factory_dots_forwarded_in_returned_closure() {
+        let code = "make <- function(...) function() dplyr::filter(d2, ...)\nmake(x > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+    }
+
+    /// A nested closure declaring its OWN `...` shadows the outer dots: its
+    /// `enquos(...)` defuses its own arguments, not the outer function's.
+    #[test]
+    fn nse_nested_closure_own_dots_do_not_defuse_outer() {
+        let code = "f <- function(x) {\n  g <- function(...) enquos(...)\n  g(x)\n}\nf(typo_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "typo_arg"));
+    }
+
+    /// An embrace containing a comment is still the embrace shape (the R
+    /// parser strips comments).
+    #[test]
+    fn nse_wrapper_embrace_with_comment_still_captures() {
+        let code = "f <- function(data, cond) filter(data, {{ cond # cond\n }})\nf(df, x > 2)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+    }
+
+    /// The pass-everything wrapper `function(...) verb(...)`: the single
+    /// positional `...` feeds the verb's data formal AND overflows into the
+    /// verb's own captured dots, so the wrapper is dots-forwarding.
+    #[test]
+    fn nse_wrapper_dots_first_positional_overflow_forwards() {
+        let code = "my_filter <- function(...) filter(...)\nmy_filter(df, x > 2)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(!was_collected(&used, "x"));
+    }
+
+    /// A body-local redefinition of the covered verb shadows it inside the
+    /// wrapper body, so forwarding `...` to it is not mask forwarding.
+    #[test]
+    fn nse_wrapper_body_local_shadow_disables_forwarding() {
+        let code = "wrap <- function(...) {\n  filter <- function(x, ...) x\n  filter(d2, ...)\n}\nwrap(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// Named call-site arguments map onto the wrapper's formals: the embraced
+    /// `cond` is suppressed and the `data` argument is checked, regardless of
+    /// argument order.
+    #[test]
+    fn nse_wrapper_named_call_site_arguments() {
+        let code = "my_filter <- function(data, cond) filter(data, {{ cond }})\n\
+                    my_filter(cond = x > 2, data = df)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(was_collected(&used, "df"));
+    }
+
+    /// The last top-level definition of a name wins, in both directions:
+    /// wrapper-then-standard re-enables checking, standard-then-wrapper
+    /// suppresses.
+    #[test]
+    fn nse_wrapper_last_definition_wins() {
+        let wrapper_last = "f <- function(x) x\n\
+                            f <- function(cond) filter(df2, {{ cond }})\n\
+                            f(maybe_col > 1)";
+        let tree = parse_r_code(wrapper_last);
+        let mut used = Vec::new();
+        collect_usages_with_context(
+            tree.root_node(),
+            wrapper_last,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(!was_collected(&used, "maybe_col"));
+
+        let standard_last = "f <- function(cond) filter(df2, {{ cond }})\n\
+                             f <- function(x) x\n\
+                             f(maybe_col > 1)";
+        let tree = parse_r_code(standard_last);
+        let mut used = Vec::new();
+        collect_usages_with_context(
+            tree.root_node(),
+            standard_last,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(was_collected(&used, "maybe_col"));
+    }
+
+    /// A pipe-fed call to a dots-first wrapper: `per_formal_mask` must not
+    /// pre-consume the leading `...`, so the piped helper still suppresses.
+    #[test]
+    fn nse_wrapper_pipe_fed_dots_first_wrapper() {
+        let code = "test_by <- function(...) join_by(...)\ndf %>% test_by(x == y)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(!was_collected(&used, "x"));
+        assert!(!was_collected(&used, "y"));
+    }
+
+    /// Intent pin: capture is per formal *name*, so a formal that is both
+    /// embraced and used in an evaluated position is still suppressed at call
+    /// sites (suppression-leaning; see the `collect_captured_formals` doc).
+    #[test]
+    fn nse_wrapper_embrace_also_evaluated_position_pins_suppression() {
+        let code = "f <- function(x) {\n  print(x)\n  filter(df2, {{ x }})\n}\nf(typo_df)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "typo_df"));
     }
 
     /// An embrace inside a *nested* function definition binds the nested
@@ -52227,6 +52493,35 @@ source(\"helpers.R\")
             !names.contains(&"z"),
             "LHS target of `z <- 3` must continue to be skipped. Collected usages: {:?}",
             names
+        );
+    }
+
+    /// Issue #433: both diagnostics pipelines share
+    /// `default_expression_exemption`, so the use-before-source collector also
+    /// exempts the default of a defused formal (here `value`, quoted into the
+    /// data mask) while still listing an ordinary default identifier.
+    #[test]
+    fn test_collect_identifier_usages_utf16_exempts_defused_default() {
+        use crate::handlers::collect_identifier_usages_utf16;
+
+        let code = "my_pivot <- function(data, values_from = value) \
+                    tidyr::pivot_wider(data, values_from = {{ values_from }})\n\
+                    plain <- function(a = later_def) a\n";
+        let tree = parse_r_code(code);
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(code.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let mut usages: Vec<(String, u32, u32, tree_sitter::Node)> = Vec::new();
+        collect_identifier_usages_utf16(tree.root_node(), code, &line_starts, &mut usages);
+
+        let names: Vec<&str> = usages.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"value"),
+            "default of a defused formal must be exempt. Collected: {names:?}"
+        );
+        assert!(
+            names.contains(&"later_def"),
+            "ordinary default identifiers stay listed. Collected: {names:?}"
         );
     }
 
