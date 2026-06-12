@@ -4054,6 +4054,8 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 /// ScopedSymbol; package names are included sorted as well. The resulting hash is suitable for
 /// cache invalidation when a file's exported symbols or loaded packages change.
 ///
+/// # Arguments
+///
 /// `top_level_removals` is the set of (symbol_name, line) pairs extracted
 /// from top-level `rm()`/`remove()` calls. They are hashed sorted so the
 /// digest is stable across timeline event ordering. Including them is
@@ -4062,8 +4064,6 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 /// symbol is still in `exported_interface` (which captures all
 /// definitions) and the hash would not change, leaving stale
 /// undefined-variable diagnostics in the sourced file.
-///
-/// # Returns
 ///
 /// `data_loads` is the set of top-level `data(...)` call infos
 /// `(stems, package)` extracted from [`ScopeEvent::DataLoad`] events. Including

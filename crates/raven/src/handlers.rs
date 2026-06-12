@@ -26279,7 +26279,9 @@ y <- totally_undefined_baseline()
             code: &str,
             attach_pkgs: &[&str],
         ) -> Vec<String> {
-            // Warm the packages the snippet attaches AND any data(package=) pkgs.
+            // Warm only the packages passed in `attach_pkgs` via
+            // `prefetch_packages`; callers must include any `data(package=)`
+            // packages in that list explicitly (this block does not derive them).
             let warm: Vec<String> = attach_pkgs.iter().map(|s| s.to_string()).collect();
             lib.prefetch_packages(&warm).await;
 

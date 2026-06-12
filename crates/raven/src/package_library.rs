@@ -879,19 +879,33 @@ impl PackageLibrary {
     /// cache them. Shared by the two `prefetch_packages` branches that need it
     /// — no R subprocess available, and a batched R query that failed — which
     /// otherwise do byte-identical per-package work.
-    async fn prefetch_pattern_packages_via_index(&self, pattern_packages: &[String]) {
+    ///
+    /// `datasets_map` carries any dataset enumeration already fetched up front
+    /// (issue #429). When the batched export query fails *after* a successful
+    /// `get_multiple_package_datasets`, those results would otherwise be
+    /// discarded; applying them here preserves each package's enumerated
+    /// `lazy_data`/`data_aliases`. Entries are consumed via
+    /// [`apply_enumeration_from`] (which `remove`s the matching key), so the
+    /// `&mut` borrow is required. The no-R branch passes an empty map.
+    async fn prefetch_pattern_packages_via_index(
+        &self,
+        pattern_packages: &[String],
+        datasets_map: &mut HashMap<String, Vec<crate::r_subprocess::DataObject>>,
+    ) {
         for pkg_name in pattern_packages {
             if let Some(pkg_dir) = self.find_package_directory(pkg_name)
                 && let Some(parse_result) = self.parse_package_static(&pkg_dir)
             {
                 let exports = self.load_with_index_fallback(&pkg_dir, &parse_result).await;
-                let info = package_info_from_dir(
+                let mut info = package_info_from_dir(
                     pkg_name.clone(),
                     &pkg_dir,
                     exports,
                     parse_result.depends,
                 )
                 .await;
+                // Preserve any pre-fetched dataset enumeration for this package.
+                apply_enumeration_from(datasets_map, pkg_name, &pkg_dir, &mut info);
                 self.insert_package(info).await;
             }
         }
@@ -1099,9 +1113,14 @@ impl PackageLibrary {
                             e
                         );
 
-                        // Fall back to INDEX + explicit exports for pattern packages
-                        self.prefetch_pattern_packages_via_index(&pattern_packages)
-                            .await;
+                        // Fall back to INDEX + explicit exports for pattern
+                        // packages, preserving any dataset enumeration already
+                        // fetched into `datasets_map` (issue #429).
+                        self.prefetch_pattern_packages_via_index(
+                            &pattern_packages,
+                            &mut datasets_map,
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -1111,7 +1130,7 @@ impl PackageLibrary {
                     pattern_packages.len()
                 );
 
-                self.prefetch_pattern_packages_via_index(&pattern_packages)
+                self.prefetch_pattern_packages_via_index(&pattern_packages, &mut datasets_map)
                     .await;
             }
         }
