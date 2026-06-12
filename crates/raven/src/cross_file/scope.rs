@@ -21181,6 +21181,31 @@ y <- filter(df)"#;
     }
 
     #[test]
+    fn data_load_alias_overwritten_by_later_top_level_local() {
+        // Mirror of `data_load_alias_overwrites_same_named_top_level_local`:
+        // because data() binds at its timeline position (not at lowest
+        // precedence), a *later* same-named assignment overwrites the data()
+        // alias again, matching R's environment-loading order. Guards the
+        // "later timeline events can overwrite the aliases again" half of the
+        // overwrite doc comment on the recursive resolver's DataLoad arm.
+        let uri = test_uri();
+        let code = "data(api, package = \"survey\")\napiclus1 <- 99\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        let symbol = scope
+            .symbols
+            .get("apiclus1")
+            .expect("apiclus1 must be bound");
+        assert_eq!(
+            symbol.source_uri.as_str(),
+            uri.as_str(),
+            "a later local assignment must overwrite the data() alias again, \
+             not the other way around"
+        );
+        assert_ne!(symbol.source_uri.as_str(), "package:survey");
+    }
+
+    #[test]
     fn data_load_bare_form_searches_attached_packages() {
         // `library(survey)` then `data(api)` → bare form searches attached pkgs.
         let uri = test_uri();
@@ -21353,6 +21378,72 @@ y <- filter(df)"#;
         );
     }
 
+    #[test]
+    fn data_load_global_overwrites_earlier_global_local_late_arm() {
+        // Streaming late-arm coverage for the OVERWRITE semantics (issue #442):
+        // a global `apiclus1 <- 1` followed by a global `data(api, package =
+        // "survey")` must hoist into the late frame with the data object
+        // winning (package:survey), observed from inside a function body.
+        // Guards `frame.symbols.insert` (vs the old `entry().or_insert`) in
+        // `apply_event_to_late`'s DataLoad arm — reverting it makes the earlier
+        // global local win and fails this test.
+        let uri = test_uri();
+        let code =
+            "apiclus1 <- 1\ndata(api, package = \"survey\")\nf <- function() {\n  apiclus1\n}\n";
+        let arts = Arc::new(compute_artifacts(&uri, &parse_r(code), code));
+
+        let uri_for_artifacts = uri.clone();
+        let arts_for_closure = arts.clone();
+        let get_artifacts = move |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            (u == &uri_for_artifacts).then(|| arts_for_closure.clone())
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports: HashSet<String> = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let is_cancelled = || false;
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_exports,
+        };
+
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true, // hoist_globals
+            super::super::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .expect("stream construction must succeed");
+
+        // (3, 2) — inside f's body at the `apiclus1` reference. The late frame
+        // hoists the global def (line 0) then the global data() call (line 1);
+        // the data() call sorts after the assignment and must overwrite it.
+        stream.advance_to(3, 2);
+        let scope = stream.snapshot();
+        let symbol = scope
+            .symbols
+            .get("apiclus1")
+            .expect("apiclus1 must be bound in the late frame");
+        assert_eq!(
+            symbol.source_uri.as_str(),
+            "package:survey",
+            "global data() must overwrite the earlier global apiclus1 in the \
+             hoisted late frame: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
     // ---- data() recorder edge cases (issue #429 gaps) ----
 
     #[test]
@@ -21501,6 +21592,71 @@ y <- filter(df)"#;
         assert!(
             !scope.symbols.contains_key("notathing"),
             "an unrelated name must remain unresolved"
+        );
+    }
+
+    #[test]
+    fn data_load_function_scoped_overwrites_earlier_local_streaming() {
+        // Streaming strict-arm coverage for the OVERWRITE semantics (issue
+        // #442): a function-local `apiclus1 <- 1` followed by a
+        // function-scoped `data(api, package = "survey")` must leave apiclus1
+        // bound to the data object (package:survey), not the earlier local.
+        // Guards `frame.symbols.insert` (vs the old `entry().or_insert`) in
+        // `apply_event_to_strict`'s DataLoad arm — reverting it makes the
+        // earlier local win and fails this test.
+        let uri = test_uri();
+        let code = "f <- function() {\n  apiclus1 <- 1\n  data(api, package = \"survey\")\n  apiclus1\n}\n";
+        let arts = Arc::new(compute_artifacts(&uri, &parse_r(code), code));
+
+        let uri_for_artifacts = uri.clone();
+        let arts_for_closure = arts.clone();
+        let get_artifacts = move |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            (u == &uri_for_artifacts).then(|| arts_for_closure.clone())
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports: HashSet<String> = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let is_cancelled = || false;
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_exports,
+        };
+
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .expect("stream construction must succeed");
+
+        // (3, 2) — inside f's body at the `apiclus1` reference, after both the
+        // function-local def (line 1) and the function-scoped data() call
+        // (line 2).
+        stream.advance_to(3, 2);
+        let scope = stream.snapshot();
+        let symbol = scope
+            .symbols
+            .get("apiclus1")
+            .expect("apiclus1 must be bound inside f");
+        assert_eq!(
+            symbol.source_uri.as_str(),
+            "package:survey",
+            "function-scoped data() must overwrite the earlier function-local \
+             apiclus1: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 
