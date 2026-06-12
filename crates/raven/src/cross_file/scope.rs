@@ -4179,10 +4179,12 @@ pub struct DataAliasProvider<'a> {
 /// - Unknown package / empty aliases / no provider contribute nothing; the
 ///   literal-stem `Def` fallback (recorded at artifact time) is unaffected.
 ///
-/// Returns `(name, ScopedSymbol)` pairs the caller binds with lowest
-/// precedence (`entry().or_insert(...)`), so local defs and explicit package
-/// symbols always win. Shared by the recursive resolver and the streaming
-/// path so both agree on what a `data()` call makes visible.
+/// Returns `(name, ScopedSymbol)` pairs the caller binds at the `data()` call's
+/// timeline position. Existing bindings are overwritten, matching R's
+/// environment-loading behavior (`data()` loads objects into the calling
+/// environment), while later timeline events can overwrite the aliases again.
+/// Shared by the recursive resolver and the streaming path so both agree on
+/// what a `data()` call makes visible.
 fn expand_data_load(
     stems: &[String],
     package: &Option<String>,
@@ -5476,12 +5478,14 @@ where
             } => {
                 // Expand `data()` file-stem aliases to the dataset object names
                 // they bind (issue #429). Mirrors the PackageLoad arm above for
-                // position/function-scope gating; binds the expanded names at
-                // lowest precedence (`entry().or_insert`) so local defs and
-                // package symbols always win. `attached_packages` for the bare
-                // `data(stem)` form is the set attached at-or-before this event:
-                // packages loaded earlier in this file's timeline (already in
-                // `scope.loaded_packages`) plus inherited ones.
+                // position/function-scope gating; binds the expanded names as
+                // definitions at this timeline point. That means `data()` can
+                // overwrite earlier locals/package symbols in the same
+                // environment, matching R, and later local defs can overwrite
+                // the aliases again. `attached_packages` for the bare
+                // `data(stem)` form is the set attached at-or-before this
+                // event: packages loaded earlier in this file's timeline
+                // (already in `scope.loaded_packages`) plus inherited ones.
                 if let Some(provider) = data_alias_provider {
                     let passes_position = (*dl_line, *dl_col) <= (line, column);
                     let should_include = match function_scope {
@@ -5505,7 +5509,8 @@ where
                         };
                         for (name, symbol) in expand_data_load(stems, package, &attached, provider)
                         {
-                            scope.symbols.entry(name).or_insert(symbol);
+                            scope.parent_prefix_symbol_names.remove(&name);
+                            scope.symbols.insert(name, symbol);
                         }
                     }
                 }
@@ -6162,10 +6167,10 @@ where
 
     /// `data()` file-stem alias provider (issue #429). When `Some`, the
     /// `DataLoad` arms of `apply_event_to_strict` / `apply_event_to_late` bind
-    /// the expanded dataset object names into the event's frame at lowest
-    /// precedence. `None` disables expansion (literal-stem `Def` fallback
-    /// stays). Mirrors the recursive resolver's `data_alias_provider` so the
-    /// two paths agree on what a `data()` call makes visible.
+    /// the expanded dataset object names into the event's frame at the call's
+    /// timeline position. `None` disables expansion (literal-stem `Def`
+    /// fallback stays). Mirrors the recursive resolver's `data_alias_provider`
+    /// so the two paths agree on what a `data()` call makes visible.
     data_alias_provider: Option<&'a DataAliasProvider<'a>>,
 }
 
@@ -6502,9 +6507,10 @@ where
                 // bare `data(stem)` form searches the packages attached
                 // at-or-before this point — every frame's `packages` plus the
                 // prefix's `inherited_packages` — matching the recursive path's
-                // running `scope.loaded_packages ∪ inherited_packages`. Names are
-                // inserted with lowest precedence (`entry().or_insert`) so local
-                // defs and explicit package symbols win.
+                // running `scope.loaded_packages ∪ inherited_packages`. Names
+                // are inserted as definitions at this timeline point: they
+                // overwrite earlier bindings in the same frame, and later
+                // timeline events can overwrite them again.
                 if let Some(provider) = self.data_alias_provider {
                     // Only the bare `data(stem)` form consults the attached
                     // set; skip building it for explicit `package =` calls.
@@ -6517,7 +6523,7 @@ where
                     if let Some(frame) = self.pick_frame_mut(function_scope) {
                         for (name, symbol) in expanded {
                             frame.removed_names.remove(&name);
-                            frame.symbols.entry(name).or_insert(symbol);
+                            frame.symbols.insert(name, symbol);
                         }
                     }
                 }
@@ -7003,10 +7009,10 @@ where
                 ..
             } => {
                 // Global `data()` calls only (late frame is the hoisted global
-                // scope). Expand into the late frame at lowest precedence,
-                // mirroring `apply_event_to_strict`'s DataLoad arm. Attached
-                // packages for the bare form are the late frame's own global
-                // packages plus the prefix's inherited packages.
+                // scope). Expand into the late frame as definitions at this
+                // timeline point, mirroring `apply_event_to_strict`'s DataLoad
+                // arm. Attached packages for the bare form are the late frame's
+                // own global packages plus the prefix's inherited packages.
                 if function_scope.is_some() {
                     return;
                 }
@@ -7020,7 +7026,7 @@ where
                     }
                     for (name, symbol) in expand_data_load(stems, package, &attached, provider) {
                         frame.removed_names.remove(&name);
-                        frame.symbols.entry(name).or_insert(symbol);
+                        frame.symbols.insert(name, symbol);
                     }
                 }
             }
@@ -21086,11 +21092,14 @@ y <- filter(df)"#;
         }
     }
 
-    /// Resolve `uri` at EOF through the graph entry point with a `data()` alias
-    /// provider over `fake_alias_lookup` and the given base-package set.
-    fn scope_with_data_provider(
+    /// Resolve `uri` at a position through the graph entry point with a
+    /// `data()` alias provider over `fake_alias_lookup` and the given
+    /// base-package set.
+    fn scope_with_data_provider_at(
         uri: &Url,
         arts: &Arc<ScopeArtifacts>,
+        line: u32,
+        column: u32,
         base_packages: &HashSet<String>,
     ) -> ScopeAtPosition {
         let get_artifacts =
@@ -21105,8 +21114,8 @@ y <- filter(df)"#;
         };
         scope_at_position_with_graph(
             uri,
-            u32::MAX,
-            u32::MAX,
+            line,
+            column,
             &get_artifacts,
             &get_metadata,
             &graph,
@@ -21119,6 +21128,16 @@ y <- filter(df)"#;
             None,
             Some(&provider),
         )
+    }
+
+    /// Resolve `uri` at EOF through the graph entry point with a `data()` alias
+    /// provider over `fake_alias_lookup` and the given base-package set.
+    fn scope_with_data_provider(
+        uri: &Url,
+        arts: &Arc<ScopeArtifacts>,
+        base_packages: &HashSet<String>,
+    ) -> ScopeAtPosition {
+        scope_with_data_provider_at(uri, arts, u32::MAX, u32::MAX, base_packages)
     }
 
     #[test]
@@ -21138,6 +21157,26 @@ y <- filter(df)"#;
         assert!(
             scope.symbols.contains_key("api"),
             "literal stem `api` must still bind (no-R fallback)"
+        );
+    }
+
+    #[test]
+    fn data_load_alias_overwrites_same_named_top_level_local() {
+        // R loads `data(api, package = "survey")` objects into the calling
+        // environment. A dataset object with the same name as an earlier
+        // top-level local therefore overwrites that binding.
+        let uri = test_uri();
+        let code = "apiclus1 <- 1\ndata(api, package = \"survey\")\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &HashSet::new());
+        let symbol = scope
+            .symbols
+            .get("apiclus1")
+            .expect("apiclus1 must be bound by data(api)");
+        assert_eq!(
+            symbol.source_uri.as_str(),
+            "package:survey",
+            "data() loads objects into the current environment, overwriting earlier locals"
         );
     }
 
@@ -21365,6 +21404,38 @@ y <- filter(df)"#;
         assert!(
             extract_top_level_data_loads(&arts.timeline).is_empty(),
             "function-scoped data() must not appear in top-level data loads"
+        );
+    }
+
+    #[test]
+    fn data_load_function_scoped_does_not_leak_to_global_recursive() {
+        // Recursive resolver coverage for the DataLoad `Some(function_scope)`
+        // exclusion path: a data() call inside f() must not bind its aliases at
+        // global scope after f() has been defined.
+        let uri = test_uri();
+        let code =
+            "f <- function() {\n  data(api, package = \"survey\")\n  apiclus1\n}\napiclus1\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider_at(&uri, &Arc::new(arts), 4, 0, &HashSet::new());
+        assert!(
+            !scope.symbols.contains_key("apiclus1"),
+            "function-scoped data() aliases must not leak to global scope: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn data_load_function_scoped_does_not_leak_to_sibling_recursive() {
+        // Same recursive resolver exclusion path, but from a sibling function:
+        // f()'s data() load must not become visible inside g().
+        let uri = test_uri();
+        let code = "f <- function() {\n  data(api, package = \"survey\")\n}\ng <- function() {\n  apiclus1\n}\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let scope = scope_with_data_provider_at(&uri, &Arc::new(arts), 4, 2, &HashSet::new());
+        assert!(
+            !scope.symbols.contains_key("apiclus1"),
+            "function-scoped data() aliases must not leak to sibling functions: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 
