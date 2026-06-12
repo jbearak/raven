@@ -4069,13 +4069,12 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 /// `(stems, package)` extracted from [`ScopeEvent::DataLoad`] events. Including
 /// them is required for issue #429: the literal stems already flow into the
 /// hash via their `Def` symbols in `interface`, but the `package =` argument
-/// does NOT. Once query-time expansion (a later task) binds additional
+/// does NOT. Query-time expansion ([`expand_data_load`]) binds additional
 /// cross-file-visible objects via `PackageInfo.data_aliases` keyed off
-/// `(stems, package)`, a change ONLY in `package =` (or in the set of stems)
+/// `(stems, package)`, so a change ONLY in `package =` (or in the set of stems)
 /// would alter what dependent files see while leaving the literal-symbol hash
 /// unchanged — leaving stale diagnostics in sourced files. Hashing the pairs
-/// here is the conservative fix that keeps cross-file revalidation correct
-/// before that expansion lands.
+/// here keeps cross-file revalidation correct for that expansion.
 ///
 /// # Returns
 ///
