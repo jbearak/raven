@@ -2753,4 +2753,81 @@ mod tests {
             "must resolve into the new lib path, got {resolved_path:?}"
         );
     }
+
+    // ========================================================================
+    // extract_data_packages unit tests (issue #429)
+    // ========================================================================
+
+    #[test]
+    fn extract_data_packages_double_quote() {
+        // data(api, package = "survey") → ["survey"]
+        let doc = Document::new("data(api, package = \"survey\")\n", None);
+        assert_eq!(doc.data_packages, vec!["survey".to_string()]);
+    }
+
+    #[test]
+    fn extract_data_packages_namespace_single_quote() {
+        // utils::data(x, package = 'foo') → ["foo"]
+        let doc = Document::new("utils::data(x, package = 'foo')\n", None);
+        assert_eq!(doc.data_packages, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn extract_data_packages_bare_no_package_arg() {
+        // data(api) — no package= argument → empty
+        let doc = Document::new("data(api)\n", None);
+        assert!(
+            doc.data_packages.is_empty(),
+            "bare data() call must not produce any package names; got: {:?}",
+            doc.data_packages
+        );
+    }
+
+    #[test]
+    fn extract_data_packages_non_literal_package_arg() {
+        // data(api, package = pkg_var) — variable, not a string literal → empty
+        let doc = Document::new("data(api, package = pkg_var)\n", None);
+        assert!(
+            doc.data_packages.is_empty(),
+            "non-literal package= must not produce any package names; got: {:?}",
+            doc.data_packages
+        );
+    }
+
+    #[test]
+    fn extract_data_packages_multi_call() {
+        // Two data() calls in one document: both packages must be collected.
+        let doc = Document::new(
+            "data(a, package = \"p1\")\ndata(b, package = \"p2\")\n",
+            None,
+        );
+        // The function does NOT deduplicate; assert the actual contract: both
+        // packages appear in order (one entry per call site).
+        assert_eq!(
+            doc.data_packages,
+            vec!["p1".to_string(), "p2".to_string()],
+            "both package names must appear; got: {:?}",
+            doc.data_packages
+        );
+    }
+
+    #[test]
+    fn extract_data_packages_recomputed_on_edit() {
+        // Editing the document must recompute data_packages.
+        let mut doc = Document::new("data(x, package = \"aaa\")\n", None);
+        assert_eq!(doc.data_packages, vec!["aaa".to_string()]);
+
+        // Full-document replacement (no range = full sync).
+        doc.apply_change(TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "data(x, package = \"bbb\")\n".to_string(),
+        });
+        assert_eq!(
+            doc.data_packages,
+            vec!["bbb".to_string()],
+            "data_packages must follow the edit; got: {:?}",
+            doc.data_packages
+        );
+    }
 }

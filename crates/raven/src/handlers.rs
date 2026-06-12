@@ -26257,8 +26257,12 @@ y <- totally_undefined_baseline()
     /// R-gated end-to-end acceptance (issue #429). Builds a real package
     /// library via the local R, runs `raven check`-equivalent diagnostics, and
     /// asserts the three acceptance cases. Skips when R or a required package is
-    /// absent. The `emojis` negative (cli's sysdata must NOT leak) is asserted
-    /// whenever cli is present.
+    /// absent.
+    ///
+    /// Required for full coverage: R + survival + survey + cli.
+    /// - survival: t1 — LazyData fold (lung dataset)
+    /// - survey:   t2 — data(api, package=) alias expansion (apiclus1)
+    /// - cli:      t3 (negative) — sysdata (emojis) must NOT leak
     #[tokio::test]
     async fn data_alias_acceptance_with_real_r() {
         use crate::state::{Document, WorldState};
@@ -26312,6 +26316,8 @@ y <- totally_undefined_baseline()
                 !msgs.iter().any(|m| m.contains("lung")),
                 "lung must resolve after library(survival); got: {msgs:?}"
             );
+        } else {
+            eprintln!("skip: survival not installed — t1 (LazyData fold / lung) not exercised");
         }
 
         // t2: data(api, package = "survey") → apiclus1 resolves.
@@ -26326,6 +26332,8 @@ y <- totally_undefined_baseline()
                 !msgs.iter().any(|m| m.contains("apiclus1")),
                 "apiclus1 must resolve after data(api, package=survey); got: {msgs:?}"
             );
+        } else {
+            eprintln!("skip: survey not installed — t2 (data alias / apiclus1) not exercised");
         }
 
         // t3 NEGATIVE: library(cli) → emojis (cli sysdata) STILL flags.
@@ -26335,6 +26343,8 @@ y <- totally_undefined_baseline()
                 msgs.iter().any(|m| m.contains("emojis")),
                 "cli sysdata `emojis` must NOT leak — must still flag; got: {msgs:?}"
             );
+        } else {
+            eprintln!("skip: cli not installed — t3 (sysdata negative / emojis) not exercised");
         }
     }
 

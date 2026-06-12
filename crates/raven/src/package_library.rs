@@ -1759,10 +1759,7 @@ impl PackageLibrary {
             let pkgs = vec![name.to_string()];
             match r_subprocess.get_multiple_package_datasets(&pkgs).await {
                 Ok(mut map) => {
-                    if let Some(enumerated) = map.remove(name) {
-                        let has_db = data_dir.join("Rdata.rdb").is_file();
-                        apply_enumerated_data(&mut info, &enumerated, has_db);
-                    }
+                    apply_enumeration_from(&mut map, name, &pkg_dir, &mut info);
                 }
                 Err(e) => {
                     log::trace!(
