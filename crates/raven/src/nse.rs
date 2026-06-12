@@ -1055,10 +1055,18 @@ pub(crate) fn is_capture_helper(name: &str) -> bool {
 /// The rlang plural capture helpers that defuse every element of `...` they
 /// receive. A local function body passing its own `...` to one of these defuses
 /// the caller's arguments, so the Phase 2.5 / issue #433 inference in
-/// `handlers.rs` marks the function's dots captured. `syms()` is deliberately
-/// absent: it evaluates its argument (a character vector), it does not defuse.
+/// `handlers.rs` marks the function's dots captured.
+///
+/// Deliberately restricted to the unambiguous `en`-prefixed names. `quos` /
+/// `exprs` defuse too, but their short names collide with standard-eval
+/// exports elsewhere (most prominently `Biobase::exprs`, the ExpressionSet
+/// accessor), and this check is context-free — it cannot confirm rlang is in
+/// play. When rlang *is* in play, `quos(...)` / `exprs(...)` forwarding is
+/// still recognized through their `WholeCall` table policies by the
+/// covered-verb dots pass. `syms()` is absent for a different reason: it
+/// evaluates its argument (a character vector), it does not defuse.
 pub(crate) fn is_plural_capture_helper(name: &str) -> bool {
-    matches!(name, "enquos" | "enexprs" | "ensyms" | "quos" | "exprs")
+    matches!(name, "enquos" | "enexprs" | "ensyms")
 }
 
 /// True for Shiny deferred-expression helpers whose expression body is
