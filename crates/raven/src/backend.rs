@@ -1769,6 +1769,21 @@ pub(crate) fn initialize_package_inputs_from_state(
     state.resolve_system_file_in_workspace();
 }
 
+/// Shared trigger predicate for the sysdata R fallback: the AST scan of
+/// `data-raw/` found nothing AND a binary `R/sysdata.rda` exists on disk
+/// (e.g. sources that commit the `.rda` with no generating script, like
+/// r-lib/cli). Single-sourced here so the LSP startup path and `raven check`
+/// cannot drift on when the fallback fires.
+pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
+    let has_sysdata_rda = state
+        .package_inputs
+        .workspace_root
+        .as_ref()
+        .map(|r| r.join("R").join("sysdata.rda").is_file())
+        .unwrap_or(false);
+    state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
+}
+
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
 /// per-trigger cap before any force-republish markers are created.
 fn cap_watched_file_revalidations(
@@ -2629,13 +2644,7 @@ impl LanguageServer for Backend {
         {
             let needs_fallback = {
                 let state = self.state.read().await;
-                let has_sysdata_rda = state
-                    .package_inputs
-                    .workspace_root
-                    .as_ref()
-                    .map(|r| r.join("R").join("sysdata.rda").is_file())
-                    .unwrap_or(false);
-                state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
+                sysdata_r_fallback_needed(&state)
             };
             if needs_fallback {
                 let state_arc = self.state.clone();

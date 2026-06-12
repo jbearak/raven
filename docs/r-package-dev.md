@@ -32,6 +32,10 @@ run_analysis <- function(data) {
 
 Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in mutual visibility — but they get one-way read access to `R/` symbols (see below).
 
+### Internal data (`R/sysdata.rda`)
+
+Objects stored in `R/sysdata.rda` are namespace-internal and available to your package's own code at runtime, so Raven treats them as in scope for files under `R/` (and everywhere else package symbols are visible, like testthat tests). The names are discovered by scanning `data-raw/` for the generating `usethis::use_data(..., internal = TRUE)` / `save(..., file = "R/sysdata.rda")` call; if no generating script exists (the `.rda` is committed directly), Raven loads the file via R to enumerate its objects. Both the editor and `raven check` apply this. Sysdata objects are *not* exported, so a script outside the package that does `library(yourpkg)` and references one still gets a diagnostic — matching R.
+
 ### Tests directory awareness
 
 Files under `tests/testthat/` get one-way read access to package-internal

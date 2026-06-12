@@ -74,13 +74,20 @@ fn visit_for_sysdata(node: Node, content: &str, symbols: &mut BTreeSet<String>) 
     }
 }
 
-/// Match `usethis::use_data(a, b, internal = TRUE)` or `use_data(a, b, internal = TRUE)`.
+/// Match `usethis::use_data(a, b, internal = TRUE)`, `devtools::use_data(...)`,
+/// or bare `use_data(a, b, internal = TRUE)`.
 fn try_extract_use_data_internal(node: Node, content: &str, symbols: &mut BTreeSet<String>) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
     let func_text = node_text(func_node, content);
-    if func_text != "use_data" && func_text != "usethis::use_data" {
+    // `devtools::use_data` is the historic re-export of `usethis::use_data`
+    // (e.g. readr's data-raw/date-symbols.R); all three spellings write the
+    // same R/sysdata.rda.
+    if func_text != "use_data"
+        && func_text != "usethis::use_data"
+        && func_text != "devtools::use_data"
+    {
         return;
     }
     let Some(args_node) = node.child_by_field_name("arguments") else {
@@ -820,6 +827,16 @@ mod tests {
         extract_sysdata_names_from_source(code, &mut syms);
         assert!(syms.contains("x"), "got: {:?}", syms);
         assert!(syms.contains("y"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn devtools_use_data_internal_true_extracts_symbols() {
+        // readr's data-raw/date-symbols.R idiom: the historic devtools::use_data
+        // re-export must be recognized like usethis::use_data.
+        let code = r#"devtools::use_data(date_symbols, internal = TRUE, overwrite = TRUE)"#;
+        let mut syms = BTreeSet::new();
+        extract_sysdata_names_from_source(code, &mut syms);
+        assert!(syms.contains("date_symbols"), "got: {:?}", syms);
     }
 
     #[test]

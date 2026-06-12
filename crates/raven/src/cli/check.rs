@@ -295,6 +295,11 @@ pub async fn run(args: CheckArgs) -> i32 {
     // and additionalLibraryPaths).
     state.resolve_system_file_in_workspace();
 
+    // R fallback for sysdata: when the AST scan found nothing AND
+    // R/sysdata.rda exists, load it via the R subprocess (see
+    // `maybe_load_sysdata_fallback`).
+    maybe_load_sysdata_fallback(&mut state).await;
+
     // Resolve which files to report diagnostics for. A named path that does not
     // exist is an operator error (exit 2), matching `raven lint`.
     let mut operator_error = false;
@@ -595,6 +600,38 @@ async fn maybe_init_r(
         ),
     }
     shipped_db_load
+}
+
+/// `raven check`'s counterpart of the LSP startup's sysdata R fallback (the
+/// "R fallback for sysdata" block in `backend.rs`): when the AST scan of
+/// `data-raw/` found nothing but a binary `R/sysdata.rda` exists on disk
+/// (e.g. r-lib/cli commits the `.rda` with no generating script), load it via
+/// the package library's R subprocess so the package's own `R/` code can
+/// reference its internal data objects without false undefined-variable
+/// findings. The trigger predicate is shared
+/// ([`crate::backend::sysdata_r_fallback_needed`]) so the two paths can't
+/// drift. The names feed only package-mode scope (`contrib.sysdata_symbols`);
+/// a user script that attaches the package still flags these objects —
+/// `library(cli); emojis` remains a real R error.
+///
+/// Must run after [`maybe_init_r`] (needs the library's R subprocess) and
+/// before diagnostics. Fail-soft: no R, no `.rda`, or a load failure leaves
+/// the AST-scan result in place.
+async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
+    if !crate::backend::sysdata_r_fallback_needed(state) {
+        return;
+    }
+    let Some(root) = state.package_inputs.workspace_root.clone() else {
+        return;
+    };
+    let names = match state.package_library.r_subprocess() {
+        Some(r) => crate::package_state::sysdata::load_sysdata_via_r(r, &root).await,
+        None => return,
+    };
+    if !names.is_empty() {
+        state.package_inputs.sysdata_names = names;
+        state.apply_package_event(&crate::package_state::PackageInputDelta::DataDirChanged);
+    }
 }
 
 /// Warm the package-export cache for the packages the reported files attach,
@@ -1238,6 +1275,47 @@ mod tests {
     }
 
     #[test]
+    fn package_own_sysdata_objects_resolve_without_data_raw() {
+        // A fetched/committed package source can ship a binary `R/sysdata.rda`
+        // with no `data-raw/` generating script at all (e.g. r-lib/cli). The
+        // AST scan then finds nothing, so `raven check` must fall back to
+        // loading the .rda via the R subprocess — otherwise the package's own
+        // R/ code referencing its internal data flags as undefined (issue #429
+        // corpus: cli's `emojis`, `spinners`, readr's `date_symbols`).
+        let Some(_) = crate::r_subprocess::RSubprocess::new(None) else {
+            eprintln!(
+                "skipping package_own_sysdata_objects_resolve_without_data_raw: R not available"
+            );
+            return;
+        };
+        let fixture_rda =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sysdata_pkg/R/sysdata.rda");
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::copy(&fixture_rda, tmp.path().join("R/sysdata.rda")).unwrap();
+        fs::write(tmp.path().join("NAMESPACE"), "export(get_internal)\n").unwrap();
+        fs::write(
+            tmp.path().join("R/main.R"),
+            "get_internal <- function() sysdata_var1\n",
+        )
+        .unwrap();
+
+        let args = base_args(tmp.path());
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: sysdata_var1"),
+            "a package's own R/ code must see its R/sysdata.rda objects via the \
+             R fallback even with no data-raw/ script. Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn clean_file_exits_ok() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("clean.R"), "x <- 1\ny <- x + 1\n").unwrap();
@@ -1261,6 +1339,7 @@ mod tests {
             }
             maybe_init_r(&mut state, &root).await;
             state.resolve_system_file_in_workspace();
+            maybe_load_sysdata_fallback(&mut state).await;
             let mut operator_error = false;
             let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
             prefetch_reported_packages(&state, &targets).await;
