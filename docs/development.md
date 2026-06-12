@@ -314,7 +314,7 @@ All R subprocess calls must:
 - use timeouts to avoid hangs
 - route through `RSubprocess::execute_r_code{,_with_timeout}` rather than spawning `R` directly
 
-Each `R` spawn is CPU-heavy — loading the base packages alone is 6–11s and pins a core. A global semaphore (`r_subprocess_semaphore` in `r_subprocess.rs`, sized to ~the core count) caps how many R processes run at once, so a burst of callers (a 16-way test run, or many documents warming packages at once) cannot oversubscribe every core and starve the latency-sensitive 5s `formals()` queries past their timeout. The permit is taken outside the per-call timeout, so queue-wait never counts against a query's budget. If you see R-gated tests time out only under heavy machine load, suspect spawn volume, not the timeout value.
+Each `R` spawn is CPU-heavy — loading the base packages alone is 6–11s and pins a core. A global semaphore (`r_subprocess_semaphore` in `r_subprocess.rs`, sized to the available parallelism clamped to the range 2–8) caps how many R processes run at once, so a burst of callers (a 16-way test run, or many documents warming packages at once) cannot oversubscribe every core and starve the latency-sensitive 5s `formals()` queries past their timeout. The permit is taken outside the per-call timeout, so queue-wait never counts against a query's budget. If you see R-gated tests time out only under heavy machine load, suspect spawn volume, not the timeout value.
 
 See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`.
 

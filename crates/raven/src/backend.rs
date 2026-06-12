@@ -61,6 +61,23 @@ fn extract_loaded_packages_from_library_calls(
     packages
 }
 
+/// Direct package warm set for a single edited document: its validated
+/// `library()`/`require()` loads plus the packages named in its
+/// `data(..., package = "pkg")` calls (issue #429). Warming the latter lets the
+/// diagnostics-time `data()` alias expansion resolve those packages' dataset
+/// objects on live edits — parity with did_open and `raven check`, which both
+/// warm `doc.data_packages`. `data_packages` names are validated downstream by
+/// the `is_valid_package_name` filter the caller applies to the merged
+/// prefetch set (mirroring the did_open path). Extracted for unit testing.
+fn edited_document_warm_packages(
+    library_calls: &[crate::cross_file::LibraryCall],
+    doc: &crate::state::Document,
+) -> Vec<String> {
+    let mut packages = extract_loaded_packages_from_library_calls(library_calls);
+    packages.extend(doc.data_packages.iter().cloned());
+    packages
+}
+
 /// Parameters for the raven/activeDocumentsChanged notification
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3717,18 +3734,25 @@ impl LanguageServer for Backend {
             let _ = self.ensure_package_library_initialized().await;
 
             let (package_library, package_library_ready, scope_packages) = {
-                let (probe, pkg_lib, ready) = {
+                let (probe, pkg_lib, ready, data_packages) = {
                     let state = self.state.read().await;
-                    let last_line = state
-                        .documents
-                        .get(&uri)
+                    let doc = state.documents.get(&uri);
+                    let last_line = doc
                         .map(|d| d.text().lines().count().saturating_sub(1) as u32)
                         .unwrap_or(0);
+                    // Issue #429: capture `data(..., package = "pkg")` packages
+                    // to warm so the diagnostics-time `data()` alias expansion
+                    // can resolve their dataset objects (parity with `raven
+                    // check`). Validated by the `is_valid_package_name` filter
+                    // applied to the merged set below.
+                    let data_packages: Vec<String> =
+                        doc.map(|d| d.data_packages.clone()).unwrap_or_default();
                     let snapshot = state.build_package_scope_snapshot(&[(uri.clone(), last_line)]);
                     (
                         snapshot,
                         state.package_library.clone(),
                         state.package_library_ready,
+                        data_packages,
                     )
                 }; // read lock released
 
@@ -3758,6 +3782,10 @@ impl LanguageServer for Backend {
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
+                // Issue #429: warm `data(..., package = "pkg")` packages too, so
+                // the diagnostics-time `data()` alias expansion resolves their
+                // dataset object names in the editor (parity with `raven check`).
+                pkgs.extend(data_packages);
                 // Filter the merged set so suspicious names from inherited
                 // packages (which originate in parents' library_calls and
                 // are not pre-validated) cannot reach the R subprocess /
@@ -3954,7 +3982,10 @@ impl LanguageServer for Backend {
                 // Collect package names for prefetch (validate names to
                 // reject suspicious inputs before R subprocess calls)
                 let pkgs: Vec<String> = if packages_enabled {
-                    extract_loaded_packages_from_library_calls(&meta.library_calls)
+                    match state.documents.get(&uri_clone) {
+                        Some(doc) => edited_document_warm_packages(&meta.library_calls, doc),
+                        None => extract_loaded_packages_from_library_calls(&meta.library_calls),
+                    }
                 } else {
                     Vec::new()
                 };
@@ -7206,6 +7237,36 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-open-document package warm set plus scope-probe seeds.
+///
+/// For every open document this unions its `library()`/`require()` loads with
+/// its `data(..., package = "pkg")` arguments (issue #429) — the latter so the
+/// diagnostics-time `data()` alias expansion can resolve those packages'
+/// dataset object names in the editor, matching what `raven check` already
+/// warms via `doc.data_packages`. Also returns each document's `(uri,
+/// last_line)` for scope-probe seeding. Extracted from
+/// [`prefetch_packages_for_open_documents`] so the warm-set composition is
+/// unit-testable without the async/scope-resolution pipeline. Names are
+/// validated by the caller's `is_valid_package_name` filter before reaching the
+/// R subprocess / filesystem.
+fn collect_open_document_packages(
+    state: &WorldState,
+) -> (std::collections::HashSet<String>, Vec<(Url, u32)>) {
+    let mut doc_pkgs = std::collections::HashSet::new();
+    let mut docs = Vec::new();
+    for (uri, doc) in &state.documents {
+        for p in &doc.loaded_packages {
+            doc_pkgs.insert(p.clone());
+        }
+        for p in &doc.data_packages {
+            doc_pkgs.insert(p.clone());
+        }
+        let line = doc.text().lines().count().saturating_sub(1) as u32;
+        docs.push((uri.clone(), line));
+    }
+    (doc_pkgs, docs)
+}
+
 /// Collect effective packages for all open documents (direct `library()` calls
 /// plus inherited packages from parent `source()` chains, plus — in package
 /// mode — NAMESPACE whole-package `import(pkg)` directives from
@@ -7220,15 +7281,7 @@ pub(crate) async fn prefetch_packages_for_open_documents(
 ) {
     let (doc_packages, probe) = {
         let state = state_arc.read().await;
-        let mut doc_pkgs = std::collections::HashSet::new();
-        let mut docs = Vec::new();
-        for (uri, doc) in &state.documents {
-            for p in &doc.loaded_packages {
-                doc_pkgs.insert(p.clone());
-            }
-            let line = doc.text().lines().count().saturating_sub(1) as u32;
-            docs.push((uri.clone(), line));
-        }
+        let (doc_pkgs, docs) = collect_open_document_packages(&state);
         let snapshot = state.build_package_scope_snapshot(&docs);
         (doc_pkgs, snapshot)
     }; // read lock released
@@ -9989,6 +10042,101 @@ mod refresh_packages_tests {
         let cleared = refresh_packages_command_body(&lib, &[]).await;
         assert_eq!(cleared, 2);
         assert_eq!(lib.cached_count().await, 0);
+    }
+
+    /// Regression for the issue #429 editor/CLI parity gap: the open-document
+    /// warm set must include packages named in `data(..., package = "pkg")` —
+    /// not just `library()`/`require()` loads — so the diagnostics-time `data()`
+    /// alias expansion can resolve those packages' dataset objects in the editor
+    /// (matching what `raven check` warms via `doc.data_packages`). Without the
+    /// fix, `survey` is absent from the warm set and `apiclus1`-style objects
+    /// flag as undefined. Deterministic: pure set composition, no fs or R.
+    #[test]
+    fn open_document_warm_set_includes_data_package_args() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::Url;
+
+        let mut state = WorldState::new();
+        state.documents.insert(
+            Url::from_file_path("/work/a.R").unwrap(),
+            Document::new("library(dplyr)\ndata(api, package = \"survey\")\n", Some(1)),
+        );
+
+        let (pkgs, docs) = collect_open_document_packages(&state);
+
+        assert!(
+            pkgs.contains("dplyr"),
+            "library() package must be in the warm set"
+        );
+        assert!(
+            pkgs.contains("survey"),
+            "data(package = \"survey\") package must be in the warm set (issue #429 editor/CLI parity); got {:?}",
+            pkgs
+        );
+        assert_eq!(docs.len(), 1, "one open document → one scope-probe seed");
+    }
+
+    /// Regression for the issue #429 did_change parity gap: the live-editing
+    /// warm path must include packages named in `data(..., package = "pkg")`,
+    /// not just `library()`/`require()` loads, so the diagnostics-time `data()`
+    /// alias expansion resolves their dataset objects as the user types
+    /// (parity with did_open and `raven check`). Without the fix, a freshly
+    /// typed `data(x, package = "pkg")` leaves its dataset objects flagged
+    /// undefined until the file is reopened. Deterministic: pure composition,
+    /// no `LibraryCall` construction needed (empty library_calls isolates the
+    /// data_packages contribution).
+    #[test]
+    fn edited_document_warm_set_includes_data_package_args() {
+        use crate::state::Document;
+
+        let doc = Document::new("data(api, package = \"survey\")\n", Some(1));
+        let pkgs = edited_document_warm_packages(&[], &doc);
+
+        assert!(
+            pkgs.contains(&"survey".to_string()),
+            "did_change warm set must include data(package=) packages (issue #429); got {:?}",
+            pkgs
+        );
+    }
+
+    /// Deterministic (R-free) coverage of the issue #429 sysdata fallback gate
+    /// `sysdata_r_fallback_needed`, which is otherwise only touched via an
+    /// R-gated acceptance test. The predicate fires iff the AST scan found no
+    /// sysdata names AND a binary `R/sysdata.rda` exists on disk; this exercises
+    /// the true branch and both false branches.
+    #[test]
+    fn sysdata_r_fallback_needed_gate_branches() {
+        use crate::state::WorldState;
+        use std::collections::BTreeSet;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let r_dir = tmp.path().join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+
+        let mut state = WorldState::new();
+        state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+
+        // Empty sysdata names but no R/sysdata.rda yet → no fallback.
+        state.package_inputs.sysdata_names = BTreeSet::new();
+        assert!(
+            !sysdata_r_fallback_needed(&state),
+            "no R/sysdata.rda on disk → fallback must not fire"
+        );
+
+        // Create R/sysdata.rda → empty names + rda present → fallback fires.
+        std::fs::write(r_dir.join("sysdata.rda"), b"").unwrap();
+        assert!(
+            sysdata_r_fallback_needed(&state),
+            "empty sysdata names + R/sysdata.rda present → fallback must fire"
+        );
+
+        // AST scan already found sysdata names → no R fallback even with the rda.
+        state.package_inputs.sysdata_names = BTreeSet::from(["internal_obj".to_string()]);
+        assert!(
+            !sysdata_r_fallback_needed(&state),
+            "non-empty sysdata names → fallback must not fire (AST scan sufficed)"
+        );
     }
 
     /// Regression for review finding #1: `raven.refreshPackages` must

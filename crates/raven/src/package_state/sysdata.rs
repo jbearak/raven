@@ -746,7 +746,9 @@ static SYSDATA_R_CACHE: std::sync::LazyLock<SysdataCache> =
 ///
 /// # Safety invariants (per `r_subprocess` module doc)
 /// - No user-controlled input is interpolated into the R code.
-/// - The call is wrapped in `tokio::time::timeout()` by the caller.
+/// - Runs through `execute_r_code_with_timeout` (10s), so the R-subprocess
+///   concurrency-semaphore permit is acquired outside the timeout and the call
+///   is bounded against hung processes.
 pub async fn load_sysdata_via_r(
     r_subprocess: &crate::r_subprocess::RSubprocess,
     workspace_root: &Path,
@@ -790,14 +792,18 @@ pub async fn load_sysdata_via_r(
         escaped_path
     );
 
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        r_subprocess.execute_r_code(&r_code),
-    )
-    .await
+    // Use `execute_r_code_with_timeout` (not an outer `tokio::time::timeout`
+    // around `execute_r_code`) so the global R-subprocess semaphore permit is
+    // acquired OUTSIDE the timeout: queue-wait under R-subprocess contention
+    // must not count against this 10s budget, otherwise a busy session could
+    // time out here and fail-soft to an empty set, reintroducing the very
+    // package-internal-sysdata false positives this fallback exists to prevent.
+    let result = match r_subprocess
+        .execute_r_code_with_timeout(&r_code, std::time::Duration::from_secs(10))
+        .await
     {
-        Ok(Ok(stdout)) => stdout,
-        _ => return BTreeSet::new(),
+        Ok(stdout) => stdout,
+        Err(_) => return BTreeSet::new(),
     };
 
     let symbols: BTreeSet<String> = result

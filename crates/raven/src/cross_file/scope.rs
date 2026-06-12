@@ -2271,8 +2271,11 @@ fn collect_definitions(
         }
         // Record the call as a DataLoad event for query-time data-file-alias
         // expansion (issue #429). The literal stems above are the no-R
-        // fallback; this event is recording-only for now (consumed by a later
-        // task). `function_scope: None` is annotated later by
+        // fallback; this event is consumed two ways: `extract_top_level_data_loads`
+        // folds `(stems, package)` into `compute_interface_hash` (so a `package =`
+        // edit revalidates dependents), and `expand_data_load` binds the aliased
+        // object names into scope at query time (recursive resolver + both
+        // `ScopeStream` arms). `function_scope: None` is annotated later by
         // `annotate_event_function_scopes`, matching the Def idiom above.
         if let Some(DataCallInfo { stems, package }) = data_call_info {
             let (line, column) = node_start_position_utf16(node, line_index);
@@ -8007,6 +8010,31 @@ mod tests {
         assert_eq!(
             artifacts1.interface_hash, artifacts2.interface_hash,
             "rm() inside a function body must not change interface_hash"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_data_call_package_arg_changes() {
+        // A change ONLY in the `package =` argument of a top-level data() call
+        // must change interface_hash. The literal stem `api` binds the same
+        // `Def` symbol either way, so the `interface` contribution is byte-for-
+        // byte identical between the two; the sole difference is the
+        // `DataCallInfo.package` field. Query-time expansion (`expand_data_load`)
+        // binds DIFFERENT objects depending on the package, which dependent
+        // files see — so without folding `package` into the hash (issue #429),
+        // cross-file revalidation would not fire on this edit and sourced files
+        // would keep stale undefined-variable diagnostics. This test fails if
+        // `package.hash()` is dropped from `compute_interface_hash`.
+        let code1 = "data(api, package = \"survey\")\nsource(\"child.R\")";
+        let code2 = "data(api, package = \"datasets\")\nsource(\"child.R\")";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must change when only the data() package= argument changes"
         );
     }
 
@@ -21054,7 +21082,6 @@ y <- filter(df)"#;
     fn fake_alias_lookup(pkg: &str, stem: &str) -> Vec<String> {
         match (pkg, stem) {
             ("survey", "api") => vec!["apiclus1".into(), "apistrat".into()],
-            ("survival", "lung") => vec!["lung".into()],
             _ => Vec::new(),
         }
     }
@@ -21163,15 +21190,25 @@ y <- filter(df)"#;
     #[test]
     fn data_load_bare_form_searches_base_packages() {
         // Base default-attached packages ARE searched for the bare form.
-        // Model `survival` as base-attached so `data(lung)` expands via it.
+        // Model `survey` as base-attached and assert the DISTINCT objects it
+        // binds (apiclus1/apistrat) rather than the stem name `api`: those
+        // names cannot come from the literal-stem no-R fallback, so the
+        // assertion fails if the base-package search branch of
+        // `expand_data_load` regresses. (Asserting the stem name itself would
+        // be tautological — the literal fallback binds it regardless.)
         let uri = test_uri();
-        let code = "data(lung)\n";
+        let code = "data(api)\n";
         let arts = compute_artifacts(&uri, &parse_r(code), code);
-        let base: HashSet<String> = ["survival".to_string()].into_iter().collect();
+        let base: HashSet<String> = ["survey".to_string()].into_iter().collect();
         let scope = scope_with_data_provider(&uri, &Arc::new(arts), &base);
         assert!(
-            scope.symbols.contains_key("lung"),
-            "data(lung) must expand via base-attached survival"
+            scope.symbols.contains_key("apiclus1"),
+            "data(api) must expand via base-attached survey: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("apistrat"),
+            "data(api) must bind every object survey's `api` stem provides"
         );
     }
 
@@ -21328,6 +21365,71 @@ y <- filter(df)"#;
         assert!(
             extract_top_level_data_loads(&arts.timeline).is_empty(),
             "function-scoped data() must not appear in top-level data loads"
+        );
+    }
+
+    #[test]
+    fn data_load_function_scoped_expands_inside_function_streaming() {
+        // Streaming-resolver coverage for the strict-arm `pick_frame_mut(Some(..))`
+        // path: a `data()` call INSIDE a function body must bind its expanded
+        // objects into that function's frame (visible when the cursor is inside
+        // the body). Complements the recursive-resolver test above and the
+        // late-arm (global-hoist) test. R-free via the synthetic provider.
+        let uri = test_uri();
+        let code =
+            "f <- function() {\n  data(api, package = \"survey\")\n  apiclus1\n  notathing\n}\n";
+        let arts = Arc::new(compute_artifacts(&uri, &parse_r(code), code));
+
+        let uri_for_artifacts = uri.clone();
+        let arts_for_closure = arts.clone();
+        let get_artifacts = move |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            (u == &uri_for_artifacts).then(|| arts_for_closure.clone())
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports: HashSet<String> = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let is_cancelled = || false;
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_exports,
+        };
+
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .expect("stream construction must succeed");
+
+        // (2, 2) — inside f's body at the `apiclus1` reference, after the
+        // function-scoped data() call on line 1.
+        stream.advance_to(2, 2);
+        let scope = stream.snapshot();
+        assert!(
+            scope.symbols.contains_key("apiclus1"),
+            "function-scoped data() must bind apiclus1 into f's frame: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.symbols.contains_key("apistrat"),
+            "function-scoped expansion must also bind apistrat"
+        );
+        assert!(
+            !scope.symbols.contains_key("notathing"),
+            "an unrelated name must remain unresolved"
         );
     }
 

@@ -237,6 +237,23 @@ fn apply_enumeration_from(
     }
 }
 
+/// De-duplicate `names` keeping first-seen order.
+///
+/// Used by [`PackageLibrary::prefetch_packages`] on the requested set. A
+/// duplicated package name must be loaded exactly once: `prefetch_uncached_level`
+/// applies each package's `data()` enumeration via [`apply_enumeration_from`],
+/// which *consumes* the enumeration entry, so a second pass over the same name
+/// would re-`insert_package` an un-enumerated `PackageInfo` and silently drop
+/// the enumerated `data_aliases`/`lazy_data` (issue #429). First-seen order is
+/// preserved so the dependency-closure BFS frontier stays deterministic.
+fn dedup_preserving_order(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
+}
+
 /// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
 ///
 /// This struct separates explicit exports (from `export()` and `S3method()` directives)
@@ -932,15 +949,25 @@ impl PackageLibrary {
             return;
         }
 
-        // Filter out packages we've already cached
+        // Filter out packages we've already cached, and de-duplicate the
+        // request. De-duplication is REQUIRED for correctness, not just
+        // efficiency: a package appearing twice (e.g. two `library(dplyr)`
+        // lines, which the warm-set builders pass through un-deduped) would be
+        // processed twice by `prefetch_uncached_level`, and because
+        // `apply_enumeration_from` *consumes* its `data()` enumeration entry
+        // (`datasets_map.remove`), the second `insert_package` would overwrite
+        // the first with an un-enumerated `PackageInfo` — silently dropping the
+        // enumerated `data_aliases`/`lazy_data` (issue #429 regression). Keep
+        // first-seen order so the dependency-closure BFS stays deterministic.
         let uncached_packages: Vec<String> = {
             let combined_cache = self.combined_entries.load();
             let packages_cache = self.packages.load();
-            packages
+            let filtered: Vec<String> = packages
                 .iter()
                 .filter(|p| !combined_cache.contains_key(*p) && !packages_cache.contains_key(*p))
                 .cloned()
-                .collect()
+                .collect();
+            dedup_preserving_order(filtered)
         };
 
         if uncached_packages.is_empty() {
@@ -948,11 +975,62 @@ impl PackageLibrary {
             return;
         }
 
+        // Issue #429: warm not just the requested packages but the transitive
+        // dependency closure that `warm_all_exports` traverses, loading it one
+        // dependency level at a time so each level enumerates datasets in a
+        // SINGLE batched R call. Loading transitive deps lazily via
+        // `get_package` during the recursion would otherwise spawn one `data()`
+        // subprocess per data-bearing dependency (75-350ms each, serially) on
+        // this synchronous did_open path. Discovery reads the just-cached
+        // packages' `depends` (plus meta-package `attached_packages`), mirroring
+        // `collect_exports_recursive`'s traversal, and skips anything already
+        // scheduled or cached so cycles terminate.
+        let mut scheduled: HashSet<String> = uncached_packages.iter().cloned().collect();
+        let mut frontier: Vec<String> = uncached_packages.clone();
+        while !frontier.is_empty() {
+            self.prefetch_uncached_level(&frontier).await;
+
+            let mut next: Vec<String> = Vec::new();
+            {
+                let cache = self.packages.load();
+                for pkg_name in &frontier {
+                    if let Some(info) = cache.get(pkg_name) {
+                        let mut deps: Vec<String> = info.depends.clone();
+                        if info.is_meta_package {
+                            deps.extend(info.attached_packages.iter().cloned());
+                        }
+                        for dep in deps {
+                            if !scheduled.contains(&dep) && !cache.contains_key(&dep) {
+                                scheduled.insert(dep.clone());
+                                next.push(dep);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // Finally, populate the combined_entries cache for the requested
+        // packages. Everything the recursive warm touches is already cached by
+        // the level loop above, so this performs no further R subprocess spawns.
+        for pkg_name in &uncached_packages {
+            let _ = self.warm_all_exports(pkg_name).await;
+        }
+    }
+
+    /// Load one level of uncached packages into the per-package cache: parse the
+    /// static (no-`exportPattern`) packages, batch the `exportPattern` packages
+    /// into a single R export call, and enumerate every data-bearing package's
+    /// `data()` objects in one batched R call (issue #429). Does NOT recurse
+    /// into dependencies or populate `combined_entries` — [`prefetch_packages`]
+    /// drives the transitive closure and the combined warm-up.
+    async fn prefetch_uncached_level(&self, uncached_packages: &[String]) {
         // Categorize packages: static (no exportPattern) vs pattern (needs R)
         let mut static_packages: Vec<(String, PathBuf, NamespaceParseResult)> = Vec::new();
         let mut pattern_packages: Vec<String> = Vec::new();
 
-        for pkg_name in &uncached_packages {
+        for pkg_name in uncached_packages {
             if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
                 if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
                     if parse_result.has_export_pattern {
@@ -1133,12 +1211,6 @@ impl PackageLibrary {
                 self.prefetch_pattern_packages_via_index(&pattern_packages, &mut datasets_map)
                     .await;
             }
-        }
-
-        // Step 3: Populate combined_entries cache without materializing owned
-        // aggregate sets that this warm-up path immediately discards.
-        for pkg_name in &uncached_packages {
-            let _ = self.warm_all_exports(pkg_name).await;
         }
     }
 
@@ -3989,6 +4061,98 @@ mod tests {
     // ============================================================================
     // Tests for package-dataset (lazy_data) resolution - issue #350
     // ============================================================================
+
+    #[test]
+    fn dedup_preserving_order_keeps_first_occurrence() {
+        // Guards the issue #429 fix: prefetch_packages must collapse a
+        // duplicated package name (e.g. two `library(dplyr)` lines) to a single
+        // entry in first-seen order, so its consumed `data()` enumeration is
+        // applied exactly once rather than overwritten by an un-enumerated
+        // second insert. The input's first-seen order ("tibble", "dplyr",
+        // "survey") is deliberately NOT lexicographically sorted, so this
+        // assertion fails for a no-op (keeps all 5 entries) AND for a sort-based
+        // dedup (would yield ["dplyr","survey","tibble"]).
+        let out = dedup_preserving_order(vec![
+            "tibble".into(),
+            "dplyr".into(),
+            "tibble".into(),
+            "survey".into(),
+            "dplyr".into(),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                "tibble".to_string(),
+                "dplyr".to_string(),
+                "survey".to_string(),
+            ]
+        );
+    }
+
+    /// Write a static (no-`exportPattern`) package on disk under `lib_root`:
+    /// one `export(<export>)` in NAMESPACE and an optional `Depends:` line in
+    /// DESCRIPTION. No `data/` dir, so it loads with no R subprocess.
+    fn write_static_pkg(lib_root: &std::path::Path, name: &str, export: &str, depends: &[&str]) {
+        let pkg_dir = lib_root.join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let depends_line = if depends.is_empty() {
+            String::new()
+        } else {
+            format!("Depends: {}\n", depends.join(", "))
+        };
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            format!("Package: {name}\nVersion: 1.0.0\n{depends_line}"),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), format!("export({export})\n")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefetch_loads_transitive_closure_without_r_and_terminates_on_cycle() {
+        // Covers the BFS added by the issue #429 N+1 fix
+        // (`prefetch_packages` → `prefetch_uncached_level`):
+        //   1. Termination on dependency cycles — the `scheduled` + cache guards
+        //      are what stop the level loop from re-queuing `pkgA`/`pkgB`
+        //      forever; remove them and this test hangs (verified by mutation).
+        //   2. The full transitive `Depends` closure is loaded and its combined
+        //      exports resolve through every level.
+        // R-free: static (no-`exportPattern`) packages load via
+        // NAMESPACE/DESCRIPTION parsing with no subprocess. (The batched-vs-
+        // per-package enumeration distinction is a subprocess-count property,
+        // not observable without R, so it is not asserted here.)
+        let lib_root = tempfile::tempdir().unwrap();
+        let root = lib_root.path();
+        write_static_pkg(root, "pkgA", "funcA", &["pkgB"]);
+        write_static_pkg(root, "pkgB", "funcB", &["pkgC", "pkgA"]); // pkgA back-edge → cycle
+        write_static_pkg(root, "pkgC", "funcC", &[]);
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![root.to_path_buf()]);
+
+        // Must return (terminate) despite the pkgA<->pkgB dependency cycle.
+        lib.prefetch_packages(&["pkgA".to_string()]).await;
+
+        // The entire transitive closure is in the per-package cache.
+        assert!(
+            lib.get_cached_package("pkgA").await.is_some(),
+            "requested package pkgA must be cached"
+        );
+        assert!(
+            lib.get_cached_package("pkgB").await.is_some(),
+            "first-level transitive dependency pkgB must be cached"
+        );
+        assert!(
+            lib.get_cached_package("pkgC").await.is_some(),
+            "second-level transitive dependency pkgC must be cached"
+        );
+
+        // The combined (transitive) export set resolves through the closure.
+        let exports = lib.get_all_exports("pkgA").await;
+        assert!(exports.contains("funcA"), "own export");
+        assert!(exports.contains("funcB"), "Depends export (level 1)");
+        assert!(exports.contains("funcC"), "transitive export (level 2)");
+    }
 
     /// Build a fake installed package on disk and return `(lib_root, lib)` with
     /// `lib`'s search path pointing at it. `namespace` is the NAMESPACE body and

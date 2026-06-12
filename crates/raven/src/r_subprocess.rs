@@ -515,22 +515,9 @@ impl RSubprocess {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Validate all package names
-        for pkg in packages {
-            if !is_valid_package_name(pkg) {
-                return Err(anyhow!(
-                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
-                    pkg
-                ));
-            }
-        }
-
-        // Build R code that queries all packages
-        let packages_vector = packages
-            .iter()
-            .map(|p| format!("\"{}\"", p))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Validate every name and build the quoted `c(...)` body (single-sources
+        // the R code-injection guard this module's safety contract requires).
+        let packages_vector = validate_and_join_package_names(packages)?;
 
         let r_code = format!(
             r#"
@@ -567,19 +554,7 @@ cat("__RAVEN_END__\n")
         if packages.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        for pkg in packages {
-            if !is_valid_package_name(pkg) {
-                return Err(anyhow!(
-                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
-                    pkg
-                ));
-            }
-        }
-        let packages_vector = packages
-            .iter()
-            .map(|p| format!("\"{}\"", p))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let packages_vector = validate_and_join_package_names(packages)?;
         let r_code = format!(
             r#"
 pkgs <- c({})
@@ -708,55 +683,88 @@ cat("__RAVEN_END__\n")
     }
 }
 
-/// Parse the output of `get_multiple_package_exports()` into a HashMap
-fn parse_multi_exports_output(
+/// Validate every package name against the R code-injection guard
+/// ([`is_valid_package_name`]) and build the quoted, comma-joined body for an
+/// R `c(...)` vector. Single source for the validate-then-interpolate idiom the
+/// `r_subprocess` module doc requires of every caller that names packages.
+fn validate_and_join_package_names(packages: &[String]) -> Result<String> {
+    for pkg in packages {
+        if !is_valid_package_name(pkg) {
+            return Err(anyhow!(
+                "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                pkg
+            ));
+        }
+    }
+    Ok(packages
+        .iter()
+        .map(|p| format!("\"{}\"", p))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Parse marker-framed multi-package R output into a per-package map.
+///
+/// The framing is shared by every batched query: a `header` line, then one
+/// `__PKG:name__` line per package followed by that package's item lines, and a
+/// final `__RAVEN_END__` terminator (tolerated absent). Each item line is fed
+/// through `transform`; lines mapping to `None` are skipped. Returns an error
+/// only if `header` is missing from `output`.
+fn parse_multi_package_output<T>(
     output: &str,
-) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    header: &str,
+    transform: impl Fn(&str) -> Option<T>,
+) -> Result<std::collections::HashMap<String, Vec<T>>> {
     let mut result = std::collections::HashMap::new();
 
-    // Find the start marker
-    let exports_start = output
-        .find("__RAVEN_MULTI_EXPORTS__")
-        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_EXPORTS__ marker in R output"))?;
+    let start = output
+        .find(header)
+        .ok_or_else(|| anyhow!("Missing {header} marker in R output"))?;
+    let section = &output[start + header.len()..];
 
-    // Parse exports section - each package is marked with __PKG:name__
-    let exports_section = &output[exports_start + "__RAVEN_MULTI_EXPORTS__".len()..];
     let mut current_package: Option<String> = None;
-    let mut current_exports: Vec<String> = Vec::new();
+    let mut current_items: Vec<T> = Vec::new();
 
-    for line in exports_section.lines() {
+    for line in section.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
         if line.starts_with("__PKG:") && line.ends_with("__") {
-            // Save previous package exports
+            // Save previous package's items, start a new package.
             if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_exports));
+                result.insert(pkg, std::mem::take(&mut current_items));
             }
-            // Start new package
-            let pkg_name = &line[6..line.len() - 2]; // Strip __PKG: and __
-            current_package = Some(pkg_name.to_string());
+            current_package = Some(line[6..line.len() - 2].to_string()); // strip __PKG: and __
         } else if line == "__RAVEN_END__" {
-            // End marker - save final package
             if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_exports));
+                result.insert(pkg, std::mem::take(&mut current_items));
             }
             break;
-        } else if current_package.is_some() {
-            // Export name
-            current_exports.push(line.to_string());
+        } else if current_package.is_some()
+            && let Some(item) = transform(line)
+        {
+            current_items.push(item);
         }
     }
 
-    // Handle case where __RAVEN_END__ was missing
+    // Handle a missing __RAVEN_END__ terminator.
     if let Some(pkg) = current_package {
-        result.insert(pkg, std::mem::take(&mut current_exports));
+        result.insert(pkg, std::mem::take(&mut current_items));
     }
 
-    log::trace!("Multi-export query: {} packages with exports", result.len());
+    Ok(result)
+}
 
+/// Parse the output of `get_multiple_package_exports()` into a HashMap.
+fn parse_multi_exports_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let result = parse_multi_package_output(output, "__RAVEN_MULTI_EXPORTS__", |line| {
+        Some(line.to_string())
+    })?;
+    log::trace!("Multi-export query: {} packages with exports", result.len());
     Ok(result)
 }
 
@@ -800,43 +808,12 @@ fn parse_data_item(line: &str) -> Option<DataObject> {
 /// Parse the marker-structured output of `get_multiple_package_datasets()`.
 /// Same framing as [`parse_multi_exports_output`]: a `__RAVEN_MULTI_DATASETS__`
 /// header, one `__PKG:name__` line per package, `__RAVEN_END__` terminator.
+/// Item lines are parsed via [`parse_data_item`].
 fn parse_multi_datasets_output(
     output: &str,
 ) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
-    let mut result = std::collections::HashMap::new();
-    let start = output
-        .find("__RAVEN_MULTI_DATASETS__")
-        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_DATASETS__ marker in R output"))?;
-    let section = &output[start + "__RAVEN_MULTI_DATASETS__".len()..];
-    let mut current_package: Option<String> = None;
-    let mut current_items: Vec<DataObject> = Vec::new();
-    for line in section.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("__PKG:") && line.ends_with("__") {
-            if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_items));
-            }
-            current_package = Some(line[6..line.len() - 2].to_string());
-        } else if line == "__RAVEN_END__" {
-            if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_items));
-            }
-            break;
-        } else if current_package.is_some()
-            && let Some(obj) = parse_data_item(line)
-        {
-            current_items.push(obj);
-        }
-    }
-    if let Some(pkg) = current_package {
-        result.insert(pkg, std::mem::take(&mut current_items));
-    }
-
+    let result = parse_multi_package_output(output, "__RAVEN_MULTI_DATASETS__", parse_data_item)?;
     log::trace!("Multi-datasets query: {} packages", result.len());
-
     Ok(result)
 }
 
@@ -2144,6 +2121,34 @@ __RAVEN_END__
     #[test]
     fn test_parse_multi_datasets_output_missing_marker() {
         assert!(parse_multi_datasets_output("no marker here").is_err());
+    }
+
+    #[test]
+    fn test_validate_and_join_package_names_quotes_and_rejects() {
+        // R-free coverage of the helper that single-sources the injection guard
+        // AND builds the quoted `c(...)` body interpolated into R code (issue
+        // #429). The R-gated batch tests skip without R, so this pins the
+        // output contract and the reject path in CI.
+        assert_eq!(
+            validate_and_join_package_names(&["dplyr".to_string(), "ggplot2".to_string()]).unwrap(),
+            "\"dplyr\", \"ggplot2\"",
+            "valid names must be quoted and comma-joined for the R vector body"
+        );
+        assert_eq!(
+            validate_and_join_package_names(&["survey".to_string()]).unwrap(),
+            "\"survey\"",
+            "single valid name must be quoted"
+        );
+        // An injection attempt is rejected before any interpolation.
+        assert!(
+            validate_and_join_package_names(&["bad; system('x')".to_string()]).is_err(),
+            "names with shell/R metacharacters must be rejected"
+        );
+        // One invalid name among valid ones rejects the whole batch (fail-closed).
+        assert!(
+            validate_and_join_package_names(&["dplyr".to_string(), "a\"b".to_string()]).is_err(),
+            "a quote-bearing name must reject the batch so it cannot break out of the R string"
+        );
     }
 
     #[tokio::test]
