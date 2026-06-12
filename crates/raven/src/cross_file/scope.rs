@@ -4172,10 +4172,17 @@ pub struct DataAliasProvider<'a> {
 /// - `package = Some(pkg)`: for each stem, bind every name in `pkg`'s
 ///   `data_aliases[stem]`. The package need not be attached — `data(api,
 ///   package = "survey")` works without `library(survey)`.
-/// - `package = None`: for each stem, search every package in
+/// - `package = None`: for each stem, search the packages in
 ///   `attached_packages` (the packages attached at-or-before the call, which
-///   the caller supplies) PLUS the default-attached `base_packages`, binding
-///   all matches from each.
+///   the caller supplies) and then the default-attached `base_packages`,
+///   binding the objects from the **first** package that provides any —
+///   mirroring R's `data()`, which loads a bare dataset from the first
+///   search-path entry that has it (attached packages sit ahead of base
+///   packages on the search path). The scope engine tracks attached packages
+///   as unordered sets, so within each set packages are visited in sorted
+///   name order — a deterministic approximation of true attachment order
+///   (issue #445); ties across attached packages resolve alphabetically
+///   rather than by recency.
 /// - Unknown package / empty aliases / no provider contribute nothing; the
 ///   literal-stem `Def` fallback (recorded at artifact time) is unaffected.
 ///
@@ -4215,11 +4222,18 @@ fn expand_data_load(
         match package {
             Some(pkg) => push_objects(pkg, stem, &mut out),
             None => {
-                for pkg in attached_packages
-                    .iter()
-                    .chain(provider.base_packages.iter())
-                {
+                // Sorted attached packages first, then sorted base packages;
+                // first package providing the stem wins (see doc comment).
+                let mut attached: Vec<&String> = attached_packages.iter().collect();
+                attached.sort_unstable();
+                let mut base: Vec<&String> = provider.base_packages.iter().collect();
+                base.sort_unstable();
+                for pkg in attached.into_iter().chain(base) {
+                    let before = out.len();
                     push_objects(pkg, stem, &mut out);
+                    if out.len() > before {
+                        break;
+                    }
                 }
             }
         }
@@ -21088,6 +21102,9 @@ y <- filter(df)"#;
     fn fake_alias_lookup(pkg: &str, stem: &str) -> Vec<String> {
         match (pkg, stem) {
             ("survey", "api") => vec!["apiclus1".into(), "apistrat".into()],
+            // Two packages providing the same object for the same stem
+            // (issue #445 determinism tests).
+            ("pkga", "shared") | ("pkgb", "shared") => vec!["shared_obj".into()],
             _ => Vec::new(),
         }
     }
@@ -21273,6 +21290,51 @@ y <- filter(df)"#;
         assert!(
             scope.symbols.contains_key("apistrat"),
             "data(api) must bind every object survey's `api` stem provides"
+        );
+    }
+
+    #[test]
+    fn data_load_bare_form_duplicate_providers_is_deterministic() {
+        // Issue #445: two attached packages provide the same object for the
+        // same stem. Attribution must not depend on HashSet iteration order:
+        // attached packages are searched in sorted name order and the first
+        // provider wins, so `pkga` wins regardless of library() order.
+        let uri = test_uri();
+        let code = "library(pkgb)\nlibrary(pkga)\ndata(shared)\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let arts = Arc::new(arts);
+        for _ in 0..16 {
+            let scope = scope_with_data_provider(&uri, &arts, &HashSet::new());
+            let symbol = scope
+                .symbols
+                .get("shared_obj")
+                .expect("shared_obj must be bound by bare data(shared)");
+            assert_eq!(
+                symbol.source_uri.as_str(),
+                "package:pkga",
+                "duplicate-provider winner must be deterministic (sorted-first attached package)"
+            );
+        }
+    }
+
+    #[test]
+    fn data_load_bare_form_attached_beats_base() {
+        // Issue #445: R's search path puts attached packages ahead of base
+        // packages, so an attached provider must win over a base provider even
+        // when the base package sorts first alphabetically.
+        let uri = test_uri();
+        let code = "library(pkgb)\ndata(shared)\n";
+        let arts = compute_artifacts(&uri, &parse_r(code), code);
+        let base: HashSet<String> = ["pkga".to_string()].into_iter().collect();
+        let scope = scope_with_data_provider(&uri, &Arc::new(arts), &base);
+        let symbol = scope
+            .symbols
+            .get("shared_obj")
+            .expect("shared_obj must be bound");
+        assert_eq!(
+            symbol.source_uri.as_str(),
+            "package:pkgb",
+            "attached package must beat base package for the bare data() form"
         );
     }
 
