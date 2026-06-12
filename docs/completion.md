@@ -71,6 +71,14 @@ Members are discovered from:
 - Assignments: `foo$bar <- …`, `foo[["bar"]] <- …`
 - Constructor literals: named arguments in `list()`, `data.frame()`, `tibble()`, etc.
 
+Non-syntactic member names are shown without quoting in the completion popup,
+but inserted with backticks so the resulting R code parses correctly:
+
+```r
+df <- list(`alpha beta` = 1)
+df$  # Offers: alpha beta; accepting inserts df$`alpha beta`
+```
+
 Member completion follows nested access at any depth, and `$`, `@`, and
 `[["lit"]]` segments are interchangeable in the chain:
 
