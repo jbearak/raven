@@ -151,6 +151,63 @@ Installing the R `magick` package (against system ImageMagick) pruned the last
 3 of those entries — ragg's `image_read`/`image_crop`/`image_sample` in
 `vignettes/ragg_quality.Rmd` now resolve.
 
+## Lazy-data ledger prune (#429) — 2026-06-11
+
+This branch's lazy-data enumeration plus `data()` alias expansion lets Raven
+resolve a large class of dataset symbols it previously flagged. A full
+four-group strict run reported **677 stale false-positive entries** — symbols
+Raven no longer emits — which were pruned in a single sweep keyed on the
+runner's `stale-fp:` report (package + path + start position + message):
+survival 540, broom 81, lattice 15, forcats 12, MASS 6, googlesheets4 5,
+reprex 4, dplyr 4, stats 3, KernSmooth 3, rpart 2, readr 1, ragg 1.
+
+Sysdata triage: all 25 remaining `R/sysdata.rda` entries (cli's `emojis`,
+`spinners`, `rstudio_themes`, `gfycat_*`, `wide_chars`; readr's `date_symbols`)
+are referenced from within their owning package's own `R/` sources, where the
+objects are namespace-internal but in-scope under package/`load_all` semantics.
+None is a user-level reference, so none was reclassified to `AcceptedReal`;
+they remain false positives and a known package-mode machinery gap (Raven does
+not yet treat a package's own `sysdata.rda` objects as in-scope for its `R/`
+code).
+
+Ledger size: `known_false_positives.toml` 2151 → 1474 entries (677 pruned, 0
+reclassified). `accepted_real_diagnostics.toml` unchanged (0 stale
+acceptances). The re-run is clean: 0 unclassified, 0 stale acceptances, 0 stale
+FPs.
+
+## Sysdata ledger prune (#429) — 2026-06-11
+
+The sysdata gap flagged in the triage above is closed. Two fixes, each keyed
+to why the package-mode sysdata machinery missed the fetched sources:
+
+1. **`devtools::use_data` in the AST scan** (`package_state/sysdata.rs`) —
+   readr's `data-raw/date-symbols.R` writes sysdata via the historic
+   `devtools::use_data(date_symbols, internal = TRUE)` re-export, which the
+   scanner only matched as `use_data` / `usethis::use_data`.
+2. **R-subprocess sysdata fallback in `raven check`**
+   (`cli/check.rs::maybe_load_sysdata_fallback`) — r-lib/cli commits the
+   binary `R/sysdata.rda` with no `data-raw/` generating script at all, so
+   only the load-the-`.rda` fallback can enumerate its objects. That fallback
+   previously ran only in the LSP startup path; the corpus drives the CLI,
+   which never invoked it. The trigger predicate is now single-sourced
+   (`backend::sysdata_r_fallback_needed`) and both paths run it.
+
+The negative invariant holds: sysdata names feed only package-mode scope, so
+`library(cli); emojis` in a user script still flags
+(`data_alias_acceptance_with_real_r` pins this).
+
+A full four-group strict run reported **33 stale false-positive entries**, all
+pruned keyed on the `stale-fp:` report: the 25 ledgered sysdata entries (cli
+23 — `emojis`, `spinners`, `rstudio_themes`, `gfycat_*`, `wide_chars`; readr
+2 — `date_symbols`) plus 8 base-group entries the fallback also fixed —
+`tools` (`IANA_URI_scheme_db`, `table_of_HTTP_status_codes`) and `utils`
+(`MARC_relator_db`), previously ledgered as "lazily loaded dataset in tools
+package" but actually `R/sysdata.rda` objects in the R sources.
+
+Ledger size: `known_false_positives.toml` 1474 → 1441 entries (33 pruned, 0
+reclassified). `accepted_real_diagnostics.toml` unchanged (0 stale
+acceptances). The run is otherwise clean: 0 unclassified, 0 stale acceptances.
+
 ## Validation
 
 - `cargo fmt --all --check` ✓

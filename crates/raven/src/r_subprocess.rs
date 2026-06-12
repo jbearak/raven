@@ -6,14 +6,26 @@
 //
 // # Safety invariants for callers
 //
-// Any code that spawns an R subprocess (here or in sibling modules like
-// `package_library`) MUST observe:
+// Any code that spawns an R subprocess to evaluate code or query R state (here
+// or in sibling modules like `package_library`) MUST observe:
 //
 // 1. **Validate user-controlled inputs** (e.g. package names) before they
 //    reach the spawn. Package-name validation is the canonical example.
-// 2. **Wrap every R subprocess call in `tokio::time::timeout()`.** A hung
-//    R process must not block the LSP indefinitely.
-// 3. **Never interpolate user-controlled strings into R code.** Pass values
+// 2. **Wrap every R subprocess query in `tokio::time::timeout()`.** A hung
+//    R process must not block the LSP indefinitely. Routing through
+//    `execute_r_code{,_with_timeout}` satisfies both this and the global
+//    concurrency bound below; do not spawn `R` directly past those helpers.
+// 3. **Go through `execute_r_code`/`execute_r_code_with_timeout`** rather than
+//    spawning `R` by hand. They hold a global semaphore (see
+//    `r_subprocess_semaphore`) that caps how many R processes run at once.
+//    Each spawn is CPU-heavy (base-package loading alone is 6–11s and pins a
+//    core); without the cap a burst of callers oversubscribes every core and
+//    starves the latency-sensitive 5s `formals()` queries past their timeout.
+// 4. `RSubprocess::new` is the one direct-spawn carve-out: it may probe
+//    candidate executables with `R --version` before an `RSubprocess` exists.
+//    Keep that path side-effect-free: no `-e`, no package loading, and no
+//    user-controlled R code.
+// 5. **Never interpolate user-controlled strings into R code.** Pass values
 //    as `Command` args instead. `help()` uses NSE for `package`, so any
 //    variable argument MUST be wrapped in parens to force evaluation:
 //    `help(topic, package = (pkg))`. Without the parens R reads the symbol
@@ -21,9 +33,46 @@
 
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 use crate::parameter_resolver::ParameterInfo;
+
+/// Global bound on the number of R subprocesses running concurrently.
+///
+/// Every R spawn is CPU-heavy (loading the base packages alone takes
+/// 6–11s of wall time and pins a core). Nothing previously limited how many
+/// ran at once, so under high task concurrency (e.g. a 16-way test run, or a
+/// burst of LSP requests each warming packages) dozens of R processes would
+/// saturate every core simultaneously. That CPU starvation made short,
+/// latency-sensitive queries — the 5s-budget `formals()` completion lookups —
+/// blow past their own timeout, and starved unrelated CPU-bound work on the
+/// same machine. Bounding concurrency to roughly the core count keeps each R
+/// process making progress instead of thrashing, which both stabilises the
+/// 5s timeout and protects co-scheduled CPU work.
+///
+/// The permit is acquired *outside* the per-call `tokio::time::timeout`, so
+/// queue-wait never counts against a query's timeout — the timeout continues
+/// to bound only the actual spawn-and-wait, preserving the "a hung R process
+/// must not block the LSP indefinitely" invariant.
+fn r_subprocess_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = semaphore_permits(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        );
+        Semaphore::new(permits)
+    })
+}
+
+/// Permit count for the global R-subprocess semaphore: the machine's
+/// available parallelism (fallback 4 when unknown), clamped to [2, 8].
+fn semaphore_permits(parallelism: usize) -> usize {
+    parallelism.clamp(2, 8)
+}
 
 /// R subprocess interface for package queries
 pub struct RSubprocess {
@@ -246,6 +295,15 @@ impl RSubprocess {
         r_code: &str,
         timeout: std::time::Duration,
     ) -> Result<String> {
+        // Bound the number of R processes running at once (see
+        // `r_subprocess_semaphore`). Acquired before — and held across — the
+        // timeout below so queue-wait is excluded from the per-call timeout
+        // budget. The semaphore is never closed, so `acquire` cannot error.
+        let _permit = r_subprocess_semaphore()
+            .acquire()
+            .await
+            .expect("R subprocess semaphore is never closed");
+
         let start = std::time::Instant::now();
         crate::perf::increment_r_subprocess_calls();
 
@@ -461,22 +519,9 @@ impl RSubprocess {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Validate all package names
-        for pkg in packages {
-            if !is_valid_package_name(pkg) {
-                return Err(anyhow!(
-                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
-                    pkg
-                ));
-            }
-        }
-
-        // Build R code that queries all packages
-        let packages_vector = packages
-            .iter()
-            .map(|p| format!("\"{}\"", p))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Validate every name and build the quoted `c(...)` body (single-sources
+        // the R code-injection guard this module's safety contract requires).
+        let packages_vector = validate_and_join_package_names(packages)?;
 
         let r_code = format!(
             r#"
@@ -498,6 +543,39 @@ cat("__RAVEN_END__\n")
 
         // Parse the structured output
         parse_multi_exports_output(&output)
+    }
+
+    /// Enumerate dataset objects for multiple packages in one R call via
+    /// `data(package = "pkg")$results[, "Item"]` (issue #429).
+    ///
+    /// Items are `name` or `name (stem)`; both halves are preserved in
+    /// [`DataObject`] so callers can map file stems to bound object names.
+    /// Packages that error (not installed, no data) yield empty lists.
+    pub async fn get_multiple_package_datasets(
+        &self,
+        packages: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
+        if packages.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let packages_vector = validate_and_join_package_names(packages)?;
+        let r_code = format!(
+            r#"
+pkgs <- c({})
+cat("__RAVEN_MULTI_DATASETS__\n")
+for (pkg in pkgs) {{
+    cat(paste0("__PKG:", pkg, "__\n"))
+    tryCatch({{
+        items <- suppressWarnings(data(package = pkg)$results)
+        if (length(items)) writeLines(items[, "Item"])
+    }}, error = function(e) {{}})
+}}
+cat("__RAVEN_END__\n")
+"#,
+            packages_vector
+        );
+        let output = self.execute_r_code(&r_code).await?;
+        parse_multi_datasets_output(&output)
     }
 
     /// Query function parameters using `formals()`.
@@ -609,55 +687,137 @@ cat("__RAVEN_END__\n")
     }
 }
 
-/// Parse the output of `get_multiple_package_exports()` into a HashMap
-fn parse_multi_exports_output(
+/// Validate every package name against the R code-injection guard
+/// ([`is_valid_package_name`]) and build the quoted, comma-joined body for an
+/// R `c(...)` vector. Single source for the validate-then-interpolate idiom the
+/// `r_subprocess` module doc requires of every caller that names packages.
+fn validate_and_join_package_names(packages: &[String]) -> Result<String> {
+    for pkg in packages {
+        if !is_valid_package_name(pkg) {
+            return Err(anyhow!(
+                "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                pkg
+            ));
+        }
+    }
+    Ok(packages
+        .iter()
+        .map(|p| format!("\"{}\"", p))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Parse marker-framed multi-package R output into a per-package map.
+///
+/// The framing is shared by every batched query: a `header` line, then one
+/// `__PKG:name__` line per package followed by that package's item lines, and a
+/// final `__RAVEN_END__` terminator (tolerated absent). Each item line is fed
+/// through `transform`; lines mapping to `None` are skipped. Returns an error
+/// only if `header` is missing from `output`.
+fn parse_multi_package_output<T>(
     output: &str,
-) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    header: &str,
+    transform: impl Fn(&str) -> Option<T>,
+) -> Result<std::collections::HashMap<String, Vec<T>>> {
     let mut result = std::collections::HashMap::new();
 
-    // Find the start marker
-    let exports_start = output
-        .find("__RAVEN_MULTI_EXPORTS__")
-        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_EXPORTS__ marker in R output"))?;
+    let start = output
+        .find(header)
+        .ok_or_else(|| anyhow!("Missing {header} marker in R output"))?;
+    let section = &output[start + header.len()..];
 
-    // Parse exports section - each package is marked with __PKG:name__
-    let exports_section = &output[exports_start + "__RAVEN_MULTI_EXPORTS__".len()..];
     let mut current_package: Option<String> = None;
-    let mut current_exports: Vec<String> = Vec::new();
+    let mut current_items: Vec<T> = Vec::new();
 
-    for line in exports_section.lines() {
+    for line in section.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
         if line.starts_with("__PKG:") && line.ends_with("__") {
-            // Save previous package exports
+            // Save previous package's items, start a new package.
             if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_exports));
+                result.insert(pkg, std::mem::take(&mut current_items));
             }
-            // Start new package
-            let pkg_name = &line[6..line.len() - 2]; // Strip __PKG: and __
-            current_package = Some(pkg_name.to_string());
+            current_package = Some(line[6..line.len() - 2].to_string()); // strip __PKG: and __
         } else if line == "__RAVEN_END__" {
-            // End marker - save final package
             if let Some(pkg) = current_package.take() {
-                result.insert(pkg, std::mem::take(&mut current_exports));
+                result.insert(pkg, std::mem::take(&mut current_items));
             }
             break;
-        } else if current_package.is_some() {
-            // Export name
-            current_exports.push(line.to_string());
+        } else if current_package.is_some()
+            && let Some(item) = transform(line)
+        {
+            current_items.push(item);
         }
     }
 
-    // Handle case where __RAVEN_END__ was missing
+    // Handle a missing __RAVEN_END__ terminator.
     if let Some(pkg) = current_package {
-        result.insert(pkg, std::mem::take(&mut current_exports));
+        result.insert(pkg, std::mem::take(&mut current_items));
     }
 
-    log::trace!("Multi-export query: {} packages with exports", result.len());
+    Ok(result)
+}
 
+/// Parse the output of `get_multiple_package_exports()` into a HashMap.
+fn parse_multi_exports_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let result = parse_multi_package_output(output, "__RAVEN_MULTI_EXPORTS__", |line| {
+        Some(line.to_string())
+    })?;
+    log::trace!("Multi-export query: {} packages with exports", result.len());
+    Ok(result)
+}
+
+/// One dataset object enumerated by `data(package = ...)`.
+///
+/// R's `Item` column is `name` for a dataset whose object name matches its
+/// data-file stem, or `name (stem)` when a multi-object data file binds
+/// differently-named objects (e.g. survey's `data/api.rda` → `apiclus1 (api)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataObject {
+    /// The R object name bound by `data()` / lazy-loading (e.g. `apiclus1`).
+    pub name: String,
+    /// The data-file stem the object loads from (e.g. `api`); equals `name`
+    /// when the Item carried no parenthesized topic.
+    pub file_stem: String,
+}
+
+/// Parse one `Item` line from `data(package=)$results` into a [`DataObject`].
+fn parse_data_item(line: &str) -> Option<DataObject> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if let Some((name, rest)) = line.split_once(" (")
+        && let Some(stem) = rest.strip_suffix(')')
+    {
+        let (name, stem) = (name.trim(), stem.trim());
+        if !name.is_empty() && !stem.is_empty() {
+            return Some(DataObject {
+                name: name.to_string(),
+                file_stem: stem.to_string(),
+            });
+        }
+    }
+    Some(DataObject {
+        name: line.to_string(),
+        file_stem: line.to_string(),
+    })
+}
+
+/// Parse the marker-structured output of `get_multiple_package_datasets()`.
+/// Same framing as [`parse_multi_exports_output`]: a `__RAVEN_MULTI_DATASETS__`
+/// header, one `__PKG:name__` line per package, `__RAVEN_END__` terminator.
+/// Item lines are parsed via [`parse_data_item`].
+fn parse_multi_datasets_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<DataObject>>> {
+    let result = parse_multi_package_output(output, "__RAVEN_MULTI_DATASETS__", parse_data_item)?;
+    log::trace!("Multi-datasets query: {} packages", result.len());
     Ok(result)
 }
 
@@ -958,6 +1118,18 @@ pub fn get_fallback_lib_paths() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_semaphore_permits_clamps_to_range() {
+        // Below the floor clamps up to 2.
+        assert_eq!(semaphore_permits(1), 2);
+        assert_eq!(semaphore_permits(2), 2);
+        // Within range passes through unchanged.
+        assert_eq!(semaphore_permits(4), 4);
+        assert_eq!(semaphore_permits(8), 8);
+        // Above the ceiling clamps down to 8.
+        assert_eq!(semaphore_permits(16), 8);
+    }
 
     #[test]
     fn test_new_with_none_discovers_r() {
@@ -1887,6 +2059,139 @@ mod tests {
         assert!(
             params.iter().any(|p| p.is_dots),
             "sum should have a ... parameter"
+        );
+    }
+
+    #[test]
+    fn test_parse_data_item_plain() {
+        assert_eq!(
+            parse_data_item("lung"),
+            Some(DataObject {
+                name: "lung".to_string(),
+                file_stem: "lung".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_data_item_aliased() {
+        assert_eq!(
+            parse_data_item("apiclus1 (api)"),
+            Some(DataObject {
+                name: "apiclus1".to_string(),
+                file_stem: "api".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_data_item_empty_and_whitespace() {
+        assert_eq!(parse_data_item(""), None);
+        assert_eq!(parse_data_item("   "), None);
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_two_packages() {
+        let output = "\
+__RAVEN_MULTI_DATASETS__
+__PKG:survival__
+lung
+ovarian
+__PKG:survey__
+apiclus1 (api)
+apistrat (api)
+__RAVEN_END__
+";
+        let result = parse_multi_datasets_output(output).unwrap();
+        assert_eq!(result["survival"].len(), 2);
+        assert_eq!(result["survival"][0].name, "lung");
+        assert_eq!(
+            result["survey"][0],
+            DataObject {
+                name: "apiclus1".into(),
+                file_stem: "api".into()
+            }
+        );
+        assert_eq!(result["survey"][1].file_stem, "api");
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_empty_package() {
+        let output = "__RAVEN_MULTI_DATASETS__\n__PKG:cli__\n__RAVEN_END__\n";
+        let result = parse_multi_datasets_output(output).unwrap();
+        assert!(result["cli"].is_empty());
+    }
+
+    #[test]
+    fn test_parse_multi_datasets_output_missing_marker() {
+        assert!(parse_multi_datasets_output("no marker here").is_err());
+    }
+
+    #[test]
+    fn test_validate_and_join_package_names_quotes_and_rejects() {
+        // R-free coverage of the helper that single-sources the injection guard
+        // AND builds the quoted `c(...)` body interpolated into R code (issue
+        // #429). The R-gated batch tests skip without R, so this pins the
+        // output contract and the reject path in CI.
+        assert_eq!(
+            validate_and_join_package_names(&["dplyr".to_string(), "ggplot2".to_string()]).unwrap(),
+            "\"dplyr\", \"ggplot2\"",
+            "valid names must be quoted and comma-joined for the R vector body"
+        );
+        assert_eq!(
+            validate_and_join_package_names(&["survey".to_string()]).unwrap(),
+            "\"survey\"",
+            "single valid name must be quoted"
+        );
+        // An injection attempt is rejected before any interpolation.
+        assert!(
+            validate_and_join_package_names(&["bad; system('x')".to_string()]).is_err(),
+            "names with shell/R metacharacters must be rejected"
+        );
+        // One invalid name among valid ones rejects the whole batch (fail-closed).
+        assert!(
+            validate_and_join_package_names(&["dplyr".to_string(), "a\"b".to_string()]).is_err(),
+            "a quote-bearing name must reject the batch so it cannot break out of the R string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_multiple_package_datasets_base_datasets() {
+        // `datasets` ships with every R install; `state.abb (state)` exercises aliases.
+        let Some(sub) = RSubprocess::new(None) else {
+            eprintln!("R not available, skipping");
+            return;
+        };
+        let result = sub
+            .get_multiple_package_datasets(&["datasets".to_string()])
+            .await
+            .expect("query should succeed");
+        let items = &result["datasets"];
+        assert!(
+            items
+                .iter()
+                .any(|d| d.name == "mtcars" && d.file_stem == "mtcars")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|d| d.name == "state.abb" && d.file_stem == "state")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_multiple_package_datasets_rejects_invalid_name() {
+        // Validation fires before any subprocess is spawned, but constructing
+        // `RSubprocess` still requires R on PATH, so the test is skipped
+        // (like its neighbors) when R is absent.
+        let Some(sub) = RSubprocess::new(None) else {
+            eprintln!("R not available, skipping");
+            return;
+        };
+        assert!(
+            sub.get_multiple_package_datasets(&["bad; system('x')".to_string()])
+                .await
+                .is_err()
         );
     }
 }

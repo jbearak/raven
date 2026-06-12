@@ -101,6 +101,7 @@ Items here have no natural code home — they span multiple systems, depend on e
 
 ### Environment / tooling
 
+- **Searching the repo**: `target/` is huge (200+ GB of `debug/deps`), so plain `grep -r` is very slow because it doesn't honor `.gitignore`. Use `rg` (respects `.gitignore`, skips `target/`) or `grep -r --exclude-dir=target`.
 - **VS Code test races**: `showTextDocument(doc)`'s promise resolves before VS Code finishes promoting the editor to active, and a focused webview can leave `activeTextEditor` `undefined`. Tests whose command handlers read `activeTextEditor` must call `awaitActive(editor)` (see `editors/vscode/src/test/helper.ts`) after `showTextDocument` and before each `executeCommand`.
 - **Linux inotify**: libpath watching is recursive (one watch per descendant directory, ~10–20 per installed package). On old distros capped at the legacy 8192 default, warn users to raise `fs.inotify.max_user_watches`.
 - **DOMPurify pin**: `dompurify` lives in `editors/vscode/package.json` (NOT the root) and is exact-pinned (no `^`). A version bump must re-pass `tests/bun/plot-webview-sanitize.test.ts`. Do NOT add `@types/dompurify` — the package ships its own types.

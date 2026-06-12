@@ -130,6 +130,14 @@ pub struct PackageInfo {
     /// separate route: `initialize` merges them into `base_exports`, so their
     /// `PackageInfo.lazy_data` is left empty by design.
     pub lazy_data: Vec<String>,
+    /// Map from data-file stem to the object names that file binds, from R's
+    /// `data(package=)` enumeration (issue #429). Covers multi-object files
+    /// (survey: `api` → `apiclus1`, `apistrat`, ...). Populated for any
+    /// package with a `data/` dir when the R subprocess is available; empty
+    /// otherwise. Consumed only by `data()` call alias expansion in
+    /// cross-file scope — never injected after bare `library()` for
+    /// non-LazyData packages.
+    pub data_aliases: HashMap<String, Vec<String>>,
 }
 
 impl PackageInfo {
@@ -144,6 +152,7 @@ impl PackageInfo {
             is_meta_package,
             attached_packages,
             lazy_data: Vec::new(),
+            data_aliases: HashMap::new(),
         }
     }
 
@@ -163,6 +172,7 @@ impl PackageInfo {
             is_meta_package,
             attached_packages,
             lazy_data,
+            data_aliases: HashMap::new(),
         }
     }
 }
@@ -183,6 +193,65 @@ async fn package_info_from_dir(
 ) -> PackageInfo {
     let lazy_data = parse_data_symbols(pkg_dir).await;
     PackageInfo::with_details(name, exports, depends, lazy_data)
+}
+
+/// Fold R's `data(package=)` enumeration into a freshly-built `PackageInfo`.
+///
+/// `has_lazy_data_db` is the `data/Rdata.rdb` check: that DB exists iff
+/// DESCRIPTION sets LazyData, and only then does `library(pkg)` attach the
+/// datasets — so enumerated names replace `lazy_data` only in that case.
+/// Non-LazyData packages keep their static file-stem `lazy_data` (deliberately
+/// permissive; see issue #429 scope decisions). `data_aliases` is filled for
+/// both, feeding `data()` call alias expansion.
+fn apply_enumerated_data(
+    info: &mut PackageInfo,
+    enumerated: &[crate::r_subprocess::DataObject],
+    has_lazy_data_db: bool,
+) {
+    if enumerated.is_empty() {
+        return;
+    }
+    if has_lazy_data_db {
+        info.lazy_data = enumerated.iter().map(|d| d.name.clone()).collect();
+    }
+    for d in enumerated {
+        info.data_aliases
+            .entry(d.file_stem.clone())
+            .or_default()
+            .push(d.name.clone());
+    }
+}
+
+/// Removes the dataset entry for `name` from `map` (if any) and applies it to
+/// `info` via [`apply_enumerated_data`].  The `has_db` flag is derived from the
+/// package directory here so callers don't repeat that derivation.
+fn apply_enumeration_from(
+    map: &mut HashMap<String, Vec<crate::r_subprocess::DataObject>>,
+    name: &str,
+    pkg_dir: &std::path::Path,
+    info: &mut PackageInfo,
+) {
+    if let Some(enumerated) = map.remove(name) {
+        let has_db = pkg_dir.join("data").join("Rdata.rdb").is_file();
+        apply_enumerated_data(info, &enumerated, has_db);
+    }
+}
+
+/// De-duplicate `names` keeping first-seen order.
+///
+/// Used by [`PackageLibrary::prefetch_packages`] on the requested set. A
+/// duplicated package name must be loaded exactly once: `prefetch_uncached_level`
+/// applies each package's `data()` enumeration via [`apply_enumeration_from`],
+/// which *consumes* the enumeration entry, so a second pass over the same name
+/// would re-`insert_package` an un-enumerated `PackageInfo` and silently drop
+/// the enumerated `data_aliases`/`lazy_data` (issue #429). First-seen order is
+/// preserved so the dependency-closure BFS frontier stays deterministic.
+fn dedup_preserving_order(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
 }
 
 /// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
@@ -675,6 +744,24 @@ impl PackageLibrary {
         self.packages.load().contains_key(name)
     }
 
+    /// Synchronous lookup of the object names a `data()` file-stem binds in a
+    /// package, for `data()` alias expansion in cross-file scope (issue #429).
+    ///
+    /// Returns the names in `package`'s `data_aliases[stem]` (e.g. survey's
+    /// `api` → `["apiclus1", "apistrat", ...]`), or an empty `Vec` when the
+    /// package is not cached, has no `data/` enumeration, or the stem is
+    /// unknown. Reads the current immutable `packages` snapshot via ArcSwap
+    /// `load()` (no promotion, no locking), matching the hot-path discipline of
+    /// [`is_cached_sync`] / [`is_symbol_from_loaded_packages`].
+    pub fn data_objects_for_stem_sync(&self, package: &str, stem: &str) -> Vec<String> {
+        let cache = self.packages.load();
+        cache
+            .get(package)
+            .and_then(|info| info.data_aliases.get(stem))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Get the number of cached packages
     pub async fn cached_count(&self) -> usize {
         let cache = self.packages.load();
@@ -809,19 +896,33 @@ impl PackageLibrary {
     /// cache them. Shared by the two `prefetch_packages` branches that need it
     /// — no R subprocess available, and a batched R query that failed — which
     /// otherwise do byte-identical per-package work.
-    async fn prefetch_pattern_packages_via_index(&self, pattern_packages: &[String]) {
+    ///
+    /// `datasets_map` carries any dataset enumeration already fetched up front
+    /// (issue #429). When the batched export query fails *after* a successful
+    /// `get_multiple_package_datasets`, those results would otherwise be
+    /// discarded; applying them here preserves each package's enumerated
+    /// `lazy_data`/`data_aliases`. Entries are consumed via
+    /// [`apply_enumeration_from`] (which `remove`s the matching key), so the
+    /// `&mut` borrow is required. The no-R branch passes an empty map.
+    async fn prefetch_pattern_packages_via_index(
+        &self,
+        pattern_packages: &[String],
+        datasets_map: &mut HashMap<String, Vec<crate::r_subprocess::DataObject>>,
+    ) {
         for pkg_name in pattern_packages {
             if let Some(pkg_dir) = self.find_package_directory(pkg_name)
                 && let Some(parse_result) = self.parse_package_static(&pkg_dir)
             {
                 let exports = self.load_with_index_fallback(&pkg_dir, &parse_result).await;
-                let info = package_info_from_dir(
+                let mut info = package_info_from_dir(
                     pkg_name.clone(),
                     &pkg_dir,
                     exports,
                     parse_result.depends,
                 )
                 .await;
+                // Preserve any pre-fetched dataset enumeration for this package.
+                apply_enumeration_from(datasets_map, pkg_name, &pkg_dir, &mut info);
                 self.insert_package(info).await;
             }
         }
@@ -848,15 +949,25 @@ impl PackageLibrary {
             return;
         }
 
-        // Filter out packages we've already cached
+        // Filter out packages we've already cached, and de-duplicate the
+        // request. De-duplication is REQUIRED for correctness, not just
+        // efficiency: a package appearing twice (e.g. two `library(dplyr)`
+        // lines, which the warm-set builders pass through un-deduped) would be
+        // processed twice by `prefetch_uncached_level`, and because
+        // `apply_enumeration_from` *consumes* its `data()` enumeration entry
+        // (`datasets_map.remove`), the second `insert_package` would overwrite
+        // the first with an un-enumerated `PackageInfo` — silently dropping the
+        // enumerated `data_aliases`/`lazy_data` (issue #429 regression). Keep
+        // first-seen order so the dependency-closure BFS stays deterministic.
         let uncached_packages: Vec<String> = {
             let combined_cache = self.combined_entries.load();
             let packages_cache = self.packages.load();
-            packages
+            let filtered: Vec<String> = packages
                 .iter()
                 .filter(|p| !combined_cache.contains_key(*p) && !packages_cache.contains_key(*p))
                 .cloned()
-                .collect()
+                .collect();
+            dedup_preserving_order(filtered)
         };
 
         if uncached_packages.is_empty() {
@@ -864,11 +975,62 @@ impl PackageLibrary {
             return;
         }
 
+        // Issue #429: warm not just the requested packages but the transitive
+        // dependency closure that `warm_all_exports` traverses, loading it one
+        // dependency level at a time so each level enumerates datasets in a
+        // SINGLE batched R call. Loading transitive deps lazily via
+        // `get_package` during the recursion would otherwise spawn one `data()`
+        // subprocess per data-bearing dependency (75-350ms each, serially) on
+        // this synchronous did_open path. Discovery reads the just-cached
+        // packages' `depends` (plus meta-package `attached_packages`), mirroring
+        // `collect_exports_recursive`'s traversal, and skips anything already
+        // scheduled or cached so cycles terminate.
+        let mut scheduled: HashSet<String> = uncached_packages.iter().cloned().collect();
+        let mut frontier: Vec<String> = uncached_packages.clone();
+        while !frontier.is_empty() {
+            self.prefetch_uncached_level(&frontier).await;
+
+            let mut next: Vec<String> = Vec::new();
+            {
+                let cache = self.packages.load();
+                for pkg_name in &frontier {
+                    if let Some(info) = cache.get(pkg_name) {
+                        let mut deps: Vec<String> = info.depends.clone();
+                        if info.is_meta_package {
+                            deps.extend(info.attached_packages.iter().cloned());
+                        }
+                        for dep in deps {
+                            if !scheduled.contains(&dep) && !cache.contains_key(&dep) {
+                                scheduled.insert(dep.clone());
+                                next.push(dep);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // Finally, populate the combined_entries cache for the requested
+        // packages. Everything the recursive warm touches is already cached by
+        // the level loop above, so this performs no further R subprocess spawns.
+        for pkg_name in &uncached_packages {
+            let _ = self.warm_all_exports(pkg_name).await;
+        }
+    }
+
+    /// Load one level of uncached packages into the per-package cache: parse the
+    /// static (no-`exportPattern`) packages, batch the `exportPattern` packages
+    /// into a single R export call, and enumerate every data-bearing package's
+    /// `data()` objects in one batched R call (issue #429). Does NOT recurse
+    /// into dependencies or populate `combined_entries` — [`prefetch_packages`]
+    /// drives the transitive closure and the combined warm-up.
+    async fn prefetch_uncached_level(&self, uncached_packages: &[String]) {
         // Categorize packages: static (no exportPattern) vs pattern (needs R)
         let mut static_packages: Vec<(String, PathBuf, NamespaceParseResult)> = Vec::new();
         let mut pattern_packages: Vec<String> = Vec::new();
 
-        for pkg_name in &uncached_packages {
+        for pkg_name in uncached_packages {
             if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
                 if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
                     if parse_result.has_export_pattern {
@@ -891,11 +1053,54 @@ impl PackageLibrary {
             pattern_packages.len()
         );
 
+        // Issue #429: one batched dataset enumeration call for all packages
+        // that have a `data/` dir (both static and pattern paths below use it).
+        // Each R spawn is 75-350ms, so we batch once up front.
+        let mut datasets_map: HashMap<String, Vec<crate::r_subprocess::DataObject>> =
+            HashMap::new();
+        if let Some(ref r_subprocess) = self.r_subprocess {
+            // Collect names of packages with a data/ dir from both categories.
+            let mut data_pkgs: Vec<String> = Vec::new();
+            for (name, pkg_dir, _) in &static_packages {
+                if pkg_dir.join("data").is_dir() {
+                    data_pkgs.push(name.clone());
+                }
+            }
+            for pkg_name in &pattern_packages {
+                if let Some(pkg_dir) = self.find_package_directory(pkg_name)
+                    && pkg_dir.join("data").is_dir()
+                {
+                    data_pkgs.push(pkg_name.clone());
+                }
+            }
+            if !data_pkgs.is_empty() {
+                match r_subprocess.get_multiple_package_datasets(&data_pkgs).await {
+                    Ok(map) => {
+                        log::trace!(
+                            "Batched dataset enumeration returned {} entries for {} packages",
+                            map.values().map(|v| v.len()).sum::<usize>(),
+                            map.len()
+                        );
+                        datasets_map = map;
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "Batched dataset() enumeration failed: {} (static fallback for all)",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Step 1: Load static packages immediately (no R subprocess needed)
         for (name, pkg_dir, parse_result) in static_packages {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
-            let info =
+            let mut info =
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
+
+            // Apply dataset enumeration if available for this package.
+            apply_enumeration_from(&mut datasets_map, &name, &pkg_dir, &mut info);
 
             log::trace!(
                 "Loaded {} exports + {} datasets for package '{}' statically",
@@ -931,13 +1136,21 @@ impl PackageLibrary {
                                     let depends =
                                         parse_description_depends(&pkg_dir.join("DESCRIPTION"))
                                             .unwrap_or_default();
-                                    package_info_from_dir(
+                                    let mut i = package_info_from_dir(
                                         pkg_name.clone(),
                                         &pkg_dir,
                                         exports_set,
                                         depends,
                                     )
-                                    .await
+                                    .await;
+                                    // Apply dataset enumeration if available.
+                                    apply_enumeration_from(
+                                        &mut datasets_map,
+                                        &pkg_name,
+                                        &pkg_dir,
+                                        &mut i,
+                                    );
+                                    i
                                 }
                                 None => {
                                     // No on-disk directory for this package. When R
@@ -978,9 +1191,14 @@ impl PackageLibrary {
                             e
                         );
 
-                        // Fall back to INDEX + explicit exports for pattern packages
-                        self.prefetch_pattern_packages_via_index(&pattern_packages)
-                            .await;
+                        // Fall back to INDEX + explicit exports for pattern
+                        // packages, preserving any dataset enumeration already
+                        // fetched into `datasets_map` (issue #429).
+                        self.prefetch_pattern_packages_via_index(
+                            &pattern_packages,
+                            &mut datasets_map,
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -990,15 +1208,9 @@ impl PackageLibrary {
                     pattern_packages.len()
                 );
 
-                self.prefetch_pattern_packages_via_index(&pattern_packages)
+                self.prefetch_pattern_packages_via_index(&pattern_packages, &mut datasets_map)
                     .await;
             }
-        }
-
-        // Step 3: Populate combined_entries cache without materializing owned
-        // aggregate sets that this warm-up path immediately discards.
-        for pkg_name in &uncached_packages {
-            let _ = self.warm_all_exports(pkg_name).await;
         }
     }
 
@@ -1627,8 +1839,28 @@ impl PackageLibrary {
         };
 
         // Step 5: Create PackageInfo (incl. datasets from `data/`) and cache it.
-        let info =
+        let mut info =
             package_info_from_dir(name.to_string(), &pkg_dir, exports, parse_result.depends).await;
+
+        // Issue #429: enumerate lazy-data objects via R when the package ships data/.
+        let data_dir = pkg_dir.join("data");
+        if data_dir.is_dir()
+            && let Some(ref r_subprocess) = self.r_subprocess
+        {
+            let pkgs = vec![name.to_string()];
+            match r_subprocess.get_multiple_package_datasets(&pkgs).await {
+                Ok(mut map) => {
+                    apply_enumeration_from(&mut map, name, &pkg_dir, &mut info);
+                }
+                Err(e) => {
+                    log::trace!(
+                        "data() enumeration failed for '{}': {} (static fallback)",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
 
         log::trace!(
             "Created PackageInfo for '{}': {} exports, {} depends, is_meta_package={}",
@@ -3830,6 +4062,98 @@ mod tests {
     // Tests for package-dataset (lazy_data) resolution - issue #350
     // ============================================================================
 
+    #[test]
+    fn dedup_preserving_order_keeps_first_occurrence() {
+        // Guards the issue #429 fix: prefetch_packages must collapse a
+        // duplicated package name (e.g. two `library(dplyr)` lines) to a single
+        // entry in first-seen order, so its consumed `data()` enumeration is
+        // applied exactly once rather than overwritten by an un-enumerated
+        // second insert. The input's first-seen order ("tibble", "dplyr",
+        // "survey") is deliberately NOT lexicographically sorted, so this
+        // assertion fails for a no-op (keeps all 5 entries) AND for a sort-based
+        // dedup (would yield ["dplyr","survey","tibble"]).
+        let out = dedup_preserving_order(vec![
+            "tibble".into(),
+            "dplyr".into(),
+            "tibble".into(),
+            "survey".into(),
+            "dplyr".into(),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                "tibble".to_string(),
+                "dplyr".to_string(),
+                "survey".to_string(),
+            ]
+        );
+    }
+
+    /// Write a static (no-`exportPattern`) package on disk under `lib_root`:
+    /// one `export(<export>)` in NAMESPACE and an optional `Depends:` line in
+    /// DESCRIPTION. No `data/` dir, so it loads with no R subprocess.
+    fn write_static_pkg(lib_root: &std::path::Path, name: &str, export: &str, depends: &[&str]) {
+        let pkg_dir = lib_root.join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let depends_line = if depends.is_empty() {
+            String::new()
+        } else {
+            format!("Depends: {}\n", depends.join(", "))
+        };
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            format!("Package: {name}\nVersion: 1.0.0\n{depends_line}"),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), format!("export({export})\n")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefetch_loads_transitive_closure_without_r_and_terminates_on_cycle() {
+        // Covers the BFS added by the issue #429 N+1 fix
+        // (`prefetch_packages` → `prefetch_uncached_level`):
+        //   1. Termination on dependency cycles — the `scheduled` + cache guards
+        //      are what stop the level loop from re-queuing `pkgA`/`pkgB`
+        //      forever; remove them and this test hangs (verified by mutation).
+        //   2. The full transitive `Depends` closure is loaded and its combined
+        //      exports resolve through every level.
+        // R-free: static (no-`exportPattern`) packages load via
+        // NAMESPACE/DESCRIPTION parsing with no subprocess. (The batched-vs-
+        // per-package enumeration distinction is a subprocess-count property,
+        // not observable without R, so it is not asserted here.)
+        let lib_root = tempfile::tempdir().unwrap();
+        let root = lib_root.path();
+        write_static_pkg(root, "pkgA", "funcA", &["pkgB"]);
+        write_static_pkg(root, "pkgB", "funcB", &["pkgC", "pkgA"]); // pkgA back-edge → cycle
+        write_static_pkg(root, "pkgC", "funcC", &[]);
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![root.to_path_buf()]);
+
+        // Must return (terminate) despite the pkgA<->pkgB dependency cycle.
+        lib.prefetch_packages(&["pkgA".to_string()]).await;
+
+        // The entire transitive closure is in the per-package cache.
+        assert!(
+            lib.get_cached_package("pkgA").await.is_some(),
+            "requested package pkgA must be cached"
+        );
+        assert!(
+            lib.get_cached_package("pkgB").await.is_some(),
+            "first-level transitive dependency pkgB must be cached"
+        );
+        assert!(
+            lib.get_cached_package("pkgC").await.is_some(),
+            "second-level transitive dependency pkgC must be cached"
+        );
+
+        // The combined (transitive) export set resolves through the closure.
+        let exports = lib.get_all_exports("pkgA").await;
+        assert!(exports.contains("funcA"), "own export");
+        assert!(exports.contains("funcB"), "Depends export (level 1)");
+        assert!(exports.contains("funcC"), "transitive export (level 2)");
+    }
+
     /// Build a fake installed package on disk and return `(lib_root, lib)` with
     /// `lib`'s search path pointing at it. `namespace` is the NAMESPACE body and
     /// `datasets` are written one-per-line to `data/datalist`. The returned
@@ -4177,6 +4501,77 @@ mod tests {
         assert!(
             info.lazy_data.contains(&"planes".to_string()),
             "lazy_data should contain `planes`, got {:?}",
+            info.lazy_data
+        );
+    }
+
+    // ============================================================================
+    // Tests for apply_enumerated_data and data_aliases (issue #429)
+    // ============================================================================
+
+    #[test]
+    fn test_package_info_data_aliases_default_empty() {
+        let info = PackageInfo::new("pkg".to_string(), HashSet::new());
+        assert!(info.data_aliases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apply_enumerated_data_lazydata_package() {
+        // Rdata.rdb present → lazy_data replaced by enumerated names; aliases mapped.
+        let enumerated = vec![
+            crate::r_subprocess::DataObject {
+                name: "apiclus1".into(),
+                file_stem: "api".into(),
+            },
+            crate::r_subprocess::DataObject {
+                name: "apistrat".into(),
+                file_stem: "api".into(),
+            },
+            crate::r_subprocess::DataObject {
+                name: "lung".into(),
+                file_stem: "lung".into(),
+            },
+        ];
+        let mut info = PackageInfo::new("survey".to_string(), HashSet::new());
+        info.lazy_data = vec!["api".to_string()]; // static stem discovery result
+        apply_enumerated_data(&mut info, &enumerated, /* has_lazy_data_db */ true);
+        assert_eq!(info.lazy_data, vec!["apiclus1", "apistrat", "lung"]);
+        assert_eq!(info.data_aliases["api"], vec!["apiclus1", "apistrat"]);
+        assert_eq!(info.data_aliases["lung"], vec!["lung"]);
+    }
+
+    #[tokio::test]
+    async fn test_apply_enumerated_data_non_lazydata_package() {
+        // No Rdata.rdb → lazy_data untouched (permissive static stems stay); aliases still mapped.
+        let enumerated = vec![crate::r_subprocess::DataObject {
+            name: "apiclus1".into(),
+            file_stem: "api".into(),
+        }];
+        let mut info = PackageInfo::new("survey".to_string(), HashSet::new());
+        info.lazy_data = vec!["api".to_string()];
+        apply_enumerated_data(&mut info, &enumerated, false);
+        assert_eq!(info.lazy_data, vec!["api"]);
+        assert_eq!(info.data_aliases["api"], vec!["apiclus1"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_package_enumerates_datasets_with_r() {
+        // survival ships an Rdata.rdb with no datalist; its `lung` dataset is
+        // invisible to static stem discovery, so this exercises enumeration.
+        let r_subprocess = match RSubprocess::new(None) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let lib = PackageLibrary::new(Some(r_subprocess)).await;
+
+        let Some(info) = lib.get_package("survival").await else {
+            eprintln!("survival not installed, skipping");
+            return;
+        };
+        assert!(
+            info.lazy_data.contains(&"lung".to_string()),
+            "lazy_data should contain `lung`, got {:?}",
             info.lazy_data
         );
     }

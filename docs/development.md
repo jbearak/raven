@@ -312,6 +312,9 @@ Lookups:
 All R subprocess calls must:
 - validate user-controlled inputs (package names, paths)
 - use timeouts to avoid hangs
+- route through `RSubprocess::execute_r_code{,_with_timeout}` rather than spawning `R` directly
+
+Each `R` spawn is CPU-heavy — loading the base packages alone is 6–11s and pins a core. A global semaphore (`r_subprocess_semaphore` in `r_subprocess.rs`, sized to the available parallelism clamped to the range 2–8) caps how many R processes run at once, so a burst of callers (a 16-way test run, or many documents warming packages at once) cannot oversubscribe every core and starve the latency-sensitive 5s `formals()` queries past their timeout. The permit is taken outside the per-call timeout, so queue-wait never counts against a query's budget. If you see R-gated tests time out only under heavy machine load, suspect spawn volume, not the timeout value.
 
 See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`.
 
@@ -550,9 +553,9 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 
 `crates/raven/src/package_state/sysdata.rs` extracts the symbols written to `R/sysdata.rda` (package-internal data) and the names bound by `.onLoad`/`.onAttach`. The strategy is AST-first:
 
-1. **AST scan** — walks `data-raw/**/*.R` (recursively) looking for `usethis::use_data(..., internal = TRUE)` and `save(..., file = "...sysdata.rda")` calls. Also scans `R/*.R` files for `.onLoad`/`.onAttach` definitions and collects `assign("x", ..., envir = <ns>)` and `<ns>$x <- ...` bindings where the receiver is provably namespace-like (`topenv(environment())`, `asNamespace(...)`, `getNamespace(...)`, `parent.env(environment())`).
+1. **AST scan** — walks `data-raw/**/*.R` (recursively) looking for `usethis::use_data(..., internal = TRUE)` (also the `devtools::use_data` re-export and bare `use_data`) and `save(..., file = "...sysdata.rda")` calls. Also scans `R/*.R` files for `.onLoad`/`.onAttach` definitions and collects `assign("x", ..., envir = <ns>)` and `<ns>$x <- ...` bindings where the receiver is provably namespace-like (`topenv(environment())`, `asNamespace(...)`, `getNamespace(...)`, `parent.env(environment())`).
 
-2. **R-subprocess fallback** — only when the AST scan finds nothing *and* `R/sysdata.rda` actually exists. Loads the file via a one-shot R subprocess (`load()` into an empty env, then `ls()`), subject to a 10-second `tokio::time::timeout`. Results are cached by file digest so the subprocess is called at most once per `.rda` version. Any failure is fail-soft (returns empty).
+2. **R-subprocess fallback** — only when the AST scan finds nothing *and* `R/sysdata.rda` actually exists (e.g. sources that commit the binary `.rda` with no `data-raw/` generating script, like r-lib/cli). Loads the file via a one-shot R subprocess (`load()` into an empty env, then `ls()`), subject to a 10-second `tokio::time::timeout`. Results are cached by file digest so the subprocess is called at most once per `.rda` version. Any failure is fail-soft (returns empty). The trigger predicate is single-sourced in `backend::sysdata_r_fallback_needed` and the fallback runs in **both** the LSP startup path (`backend.rs`) and `raven check` (`cli/check.rs::maybe_load_sysdata_fallback`), so editor and CLI agree that a package's own `R/` code can reference its sysdata objects. The names feed only package-mode scope — a user script doing `library(cli); emojis` still flags.
 
 ### `system.file()` source resolution
 

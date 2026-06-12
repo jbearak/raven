@@ -4770,6 +4770,7 @@ child_var <- 100
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -4798,6 +4799,7 @@ child_var <- 100
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -4824,6 +4826,7 @@ child_var <- 100
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -4959,6 +4962,7 @@ x <- 1
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -4982,6 +4986,7 @@ x <- 1
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -5106,6 +5111,7 @@ x <- 1
                 false,
                 crate::cross_file::config::BackwardDependencyMode::Explicit,
                 &|| false,
+                None,
                 None,
             );
 
@@ -5601,6 +5607,7 @@ x <- 1
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -5679,6 +5686,7 @@ x <- 1
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -5784,6 +5792,7 @@ x <- 1
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
             None,
+            None,
         );
 
         assert!(
@@ -5862,6 +5871,7 @@ x <- 1
             false,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 
@@ -6068,6 +6078,7 @@ mod cross_directory_hoisting_tests {
             true,
             crate::cross_file::config::BackwardDependencyMode::Explicit,
             &|| false,
+            None,
             None,
         );
 

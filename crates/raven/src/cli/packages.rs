@@ -857,9 +857,9 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
         // `capture_reference = false` to stay deterministic / R-free.)
         let outcome =
             crate::package_library::build_package_library_tier1_only(None, &[], None).await;
-        // `--capture-reference` is an explicit opt-in to snapshot the build
-        // machine's installed library; a non-ready build or an empty library
-        // would silently ship a names.db with no reference capture, so refuse.
+        // Reference capture is always on for this maintainer command. A
+        // non-ready build or an empty library would silently ship a names.db
+        // with no reference capture, so refuse.
         if !outcome.status.is_ready() {
             use crate::package_library::PackageLibraryStatus::*;
             let reason = match &outcome.status {
@@ -870,8 +870,8 @@ pub async fn run_build_shipped_db(args: BuildShippedDbArgs) -> Result<(), String
                 Ready => unreachable!("guarded by is_ready()"),
             };
             return Err(format!(
-                "cannot capture reference R library: {reason}. --capture-reference needs R \
-                 and an installed library"
+                "cannot capture reference R library: {reason}. build-shipped-db needs R \
+                 and an installed library for its always-on reference capture"
             ));
         }
         let installed = outcome.library.enumerate_installed_packages();

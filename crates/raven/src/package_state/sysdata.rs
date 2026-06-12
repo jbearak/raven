@@ -74,13 +74,20 @@ fn visit_for_sysdata(node: Node, content: &str, symbols: &mut BTreeSet<String>) 
     }
 }
 
-/// Match `usethis::use_data(a, b, internal = TRUE)` or `use_data(a, b, internal = TRUE)`.
+/// Match `usethis::use_data(a, b, internal = TRUE)`, `devtools::use_data(...)`,
+/// or bare `use_data(a, b, internal = TRUE)`.
 fn try_extract_use_data_internal(node: Node, content: &str, symbols: &mut BTreeSet<String>) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
     let func_text = node_text(func_node, content);
-    if func_text != "use_data" && func_text != "usethis::use_data" {
+    // `devtools::use_data` is the historic re-export of `usethis::use_data`
+    // (e.g. readr's data-raw/date-symbols.R); all three spellings write the
+    // same R/sysdata.rda.
+    if func_text != "use_data"
+        && func_text != "usethis::use_data"
+        && func_text != "devtools::use_data"
+    {
         return;
     }
     let Some(args_node) = node.child_by_field_name("arguments") else {
@@ -739,7 +746,9 @@ static SYSDATA_R_CACHE: std::sync::LazyLock<SysdataCache> =
 ///
 /// # Safety invariants (per `r_subprocess` module doc)
 /// - No user-controlled input is interpolated into the R code.
-/// - The call is wrapped in `tokio::time::timeout()` by the caller.
+/// - Runs through `execute_r_code_with_timeout` (10s), so the R-subprocess
+///   concurrency-semaphore permit is acquired outside the timeout and the call
+///   is bounded against hung processes.
 pub async fn load_sysdata_via_r(
     r_subprocess: &crate::r_subprocess::RSubprocess,
     workspace_root: &Path,
@@ -783,14 +792,18 @@ pub async fn load_sysdata_via_r(
         escaped_path
     );
 
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        r_subprocess.execute_r_code(&r_code),
-    )
-    .await
+    // Use `execute_r_code_with_timeout` (not an outer `tokio::time::timeout`
+    // around `execute_r_code`) so the global R-subprocess semaphore permit is
+    // acquired OUTSIDE the timeout: queue-wait under R-subprocess contention
+    // must not count against this 10s budget, otherwise a busy session could
+    // time out here and fail-soft to an empty set, reintroducing the very
+    // package-internal-sysdata false positives this fallback exists to prevent.
+    let result = match r_subprocess
+        .execute_r_code_with_timeout(&r_code, std::time::Duration::from_secs(10))
+        .await
     {
-        Ok(Ok(stdout)) => stdout,
-        _ => return BTreeSet::new(),
+        Ok(stdout) => stdout,
+        Err(_) => return BTreeSet::new(),
     };
 
     let symbols: BTreeSet<String> = result
@@ -820,6 +833,16 @@ mod tests {
         extract_sysdata_names_from_source(code, &mut syms);
         assert!(syms.contains("x"), "got: {:?}", syms);
         assert!(syms.contains("y"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn devtools_use_data_internal_true_extracts_symbols() {
+        // readr's data-raw/date-symbols.R idiom: the historic devtools::use_data
+        // re-export must be recognized like usethis::use_data.
+        let code = r#"devtools::use_data(date_symbols, internal = TRUE, overwrite = TRUE)"#;
+        let mut syms = BTreeSet::new();
+        extract_sysdata_names_from_source(code, &mut syms);
+        assert!(syms.contains("date_symbols"), "got: {:?}", syms);
     }
 
     #[test]
