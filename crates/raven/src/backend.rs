@@ -5707,21 +5707,17 @@ impl LanguageServer for Backend {
         // mirroring `nse_hint_for_usage`'s suppression so the message hint and
         // the lightbulb action stay in lockstep. Only parsed when an undefined
         // diagnostic is actually present.
-        let has_undef = params.context.diagnostics.iter().any(|d| {
+        let is_undefined = |d: &Diagnostic| {
             matches!(&d.code, Some(NumberOrString::String(c))
                 if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
-        });
-        let nse_decls = if has_undef {
+        };
+        let nse_decls = if params.context.diagnostics.iter().any(&is_undefined) {
             crate::cross_file::directive::parse_directives(&text).nse_declarations
         } else {
             Vec::new()
         };
         for diag in &params.context.diagnostics {
-            let is_undef = matches!(
-                &diag.code,
-                Some(NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE
-            );
-            if !is_undef {
+            if !is_undefined(diag) {
                 continue;
             }
             // Resolve the exact node the diagnostic points at, so the quick-fix
@@ -5735,10 +5731,7 @@ impl LanguageServer for Backend {
                 // Skip when a directive already governs this call: the user has
                 // declared NSE for the callee, so offering to (re)declare it
                 // would insert a conflicting directive.
-                let (call_pkg, bare) = match fix.callee.split_once("::") {
-                    Some((p, n)) => (Some(p), n),
-                    None => (None, fix.callee.as_str()),
-                };
+                let (call_pkg, bare) = handlers::split_callee_qualifier(&fix.callee);
                 if handlers::nse_directive_governs(
                     nse_decls
                         .iter()

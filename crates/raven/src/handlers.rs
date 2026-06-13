@@ -14261,13 +14261,18 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
 /// the given bare name + optional `call_pkg` qualifier at `call_line`.
 /// `entries` are the `(package, declaration-line)` pairs of every directive for
 /// that bare name. A directive governs the call when it is declared before the
-/// call line and its qualifier matches the call's: a bare directive matches a
-/// bare call, and a `pkg::name` directive matches a `pkg::name` call. This
-/// mirrors the package/position gating of [`NseAnalysis::directive_nse_policy`]
-/// and is shared by the discoverability hint and the quick-fix so neither
-/// nags the user to declare NSE they have already declared, and neither
-/// over-suppresses (a bare directive does not silence a `pkg::name` call, and a
-/// directive written after the call does not silence an earlier call).
+/// call line and its qualifier matches the call's exactly: a bare directive
+/// matches a bare call, and a `pkg::name` directive matches a `pkg::name` call.
+///
+/// Shared by the discoverability hint and the quick-fix so they agree on when
+/// to step aside for a user who has already declared NSE. It deliberately does
+/// NOT model [`NseAnalysis::directive_nse_policy`]'s `BareInPlayQualified` pass
+/// (a `pkg::name` directive governing a *bare* call when `pkg` is in play):
+/// covering that would require the in-play package set here and in the
+/// code-action layer. The omission only ever errs toward *showing* the hint /
+/// offering the quick-fix for such a call — never toward hiding a diagnostic —
+/// which is the safe direction (the suggestion to extend coverage is harmless
+/// guidance, whereas a wrongly-hidden hint loses discoverability).
 pub(crate) fn nse_directive_governs<'a>(
     entries: impl IntoIterator<Item = (Option<&'a str>, u32)>,
     call_pkg: Option<&str>,
@@ -14279,7 +14284,9 @@ pub(crate) fn nse_directive_governs<'a>(
 }
 
 /// Split a callee name (`name` or `pkg::name`) into `(package, bare name)`.
-fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
+/// Shared by the hint and the code-action quick-fix so both assemble the
+/// qualifier the same way before consulting [`nse_directive_governs`].
+pub(crate) fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
     match callee.split_once("::") {
         Some((p, n)) => (Some(p), n),
         None => (None, callee),

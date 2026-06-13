@@ -206,18 +206,21 @@ fn is_formal_name(s: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '.' || c == '_')
 }
 
-/// Whether a declared callee name is a bare name or a single well-formed
-/// `pkg::name` qualifier — both halves non-empty, no stray colons. Mirrors the
-/// `nse` directive's `::` validation so a malformed `pkg:::name` / `a:b` (which
-/// the quoted forms `"..."`/`'...'` would otherwise accept verbatim) is not
-/// stored as a symbol that [`declared_name_matches`]'s `rsplit_once("::")`
-/// would later mis-pair.
+/// Whether a declared callee name has a well-formed namespace qualifier. A
+/// `pkg::name` qualifier must have both halves non-empty and neither half may
+/// itself contain a colon — so a malformed `pkg:::name` / `pkg::a::b` (which the
+/// quoted forms `"..."`/`'...'` would otherwise accept verbatim) is rejected
+/// before it can be stored as a symbol that [`declared_name_matches`]'s
+/// `rsplit_once("::")` would mis-split and mis-pair. A name with NO `::` is
+/// always accepted: a lone `:` (e.g. a backtick-quoted R symbol `` `a:b` ``,
+/// declared via the quoted form) is not a namespace qualifier and `rsplit_once`
+/// leaves it intact, so it cannot mis-pair.
 fn is_well_formed_callee_name(name: &str) -> bool {
     match name.split_once("::") {
         Some((pkg, bare)) => {
             !pkg.is_empty() && !bare.is_empty() && !pkg.contains(':') && !bare.contains(':')
         }
-        None => !name.contains(':'),
+        None => true,
     }
 }
 
@@ -718,12 +721,17 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         if let Some(caps) = patterns.declare_func.captures(line) {
             if let Some(name) = capture_symbol_name(&caps, 1) {
                 // Reject malformed namespace qualifiers. The quoted forms accept
-                // any content, so `"pkg:::my_func"` / `"a:b"` are caught here;
-                // and for the unquoted form the regex stops at the first bad
-                // boundary, so a trailing `:` in the source means it truncated a
-                // bad qualifier (`pkg:::name` -> `pkg`) — drop it rather than
-                // store the misleading prefix. Both keep stored names well-formed
-                // for `declared_name_matches`'s `rsplit_once("::")`.
+                // any content, so a malformed `"pkg:::my_func"` is caught by
+                // `is_well_formed_callee_name`. For the unquoted form the regex
+                // stops at the first non-name byte, so a colon *immediately*
+                // after the captured name means the name itself was meant to
+                // carry a (malformed) qualifier — `pkg:::name` captures `pkg`,
+                // `a:b` captures `a` — and we drop it rather than store the
+                // misleading truncated prefix. A colon after a SEPARATOR (e.g.
+                // `func helper :note`) is ordinary trailing text the prefix-
+                // tolerant `func` regex ignores, so only an adjacent colon
+                // (group 3's `m.end()`) counts. Both checks keep every stored
+                // name well-formed for `declared_name_matches`'s `rsplit_once`.
                 let unquoted_truncated = caps
                     .get(3)
                     .is_some_and(|m| line[m.end()..].starts_with(':'));
@@ -754,6 +762,10 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     Some((p, n)) if !p.is_empty() && !n.is_empty() => {
                         (Some(p.to_string()), n.to_string())
                     }
+                    // Defense-in-depth: the capture group `[A-Za-z0-9._]+(?:::…)?`
+                    // cannot actually produce an empty half, so this arm is
+                    // unreachable for a matched `raw` — it documents that a
+                    // malformed qualifier is dropped, not coerced into a name.
                     Some(_) => {
                         continue;
                     }
@@ -2424,11 +2436,11 @@ x <- undefined"#;
         // against a well-formed `# raven: nse pkg::name`. This holds for both
         // the unquoted truncation path and the quoted (verbatim) path.
         for line in [
-            "# raven: func pkg:::my_func(x)", // unquoted -> regex truncates to `pkg`
+            "# raven: func pkg:::my_func(x)", // unquoted -> regex truncates to `pkg`, trailing `:`
             "# raven: func ::my_func(x)",     // leading `::`, no bare name
-            "# raven: func a:b",              // single stray colon
-            "# raven: func \"pkg:::my_func\"(x)", // quoted, verbatim
-            "# raven: func \"a:b\"",          // quoted single colon
+            "# raven: func a:b",              // unquoted single colon (not a bare R name)
+            "# raven: func \"pkg:::my_func\"(x)", // quoted malformed qualifier
+            "# raven: func \"pkg::a::b\"",    // quoted multi-`::` qualifier
         ] {
             let meta = parse_directives(&format!("{line}\n"));
             assert!(
@@ -2445,10 +2457,17 @@ x <- undefined"#;
             meta.declared_functions[0].formals,
             Some(vec!["a".to_string(), "b".to_string()])
         );
-        // A non-colon special character is still accepted via the quoted form.
-        let meta = parse_directives("# raven: func \"my-helper\"\n");
-        assert_eq!(meta.declared_functions.len(), 1);
-        assert_eq!(meta.declared_functions[0].name, "my-helper");
+        // Non-`::` special characters are still accepted via the quoted form,
+        // including a lone `:` (a valid backtick-quoted R symbol `` `a:b` ``):
+        // it has no `::` qualifier, so it cannot mis-pair.
+        for (line, expected) in [
+            ("# raven: func \"my-helper\"\n", "my-helper"),
+            ("# raven: func \"a:b\"\n", "a:b"),
+        ] {
+            let meta = parse_directives(line);
+            assert_eq!(meta.declared_functions.len(), 1, "case: {line}");
+            assert_eq!(meta.declared_functions[0].name, expected, "case: {line}");
+        }
     }
 
     #[test]
