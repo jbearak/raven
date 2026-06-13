@@ -12319,6 +12319,114 @@ lineLength = 200
         );
     }
 
+    #[tokio::test]
+    async fn code_action_offers_quick_fix_when_directive_is_after_call() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Call on line 1, directive on line 2 (AFTER the call). The backend
+        // governs-check is position-gated (`line < call_line`), so the later
+        // directive must NOT suppress the quick-fix for the earlier call — the
+        // code-action counterpart of `nse_hint_fires_when_directive_is_after_the_call`.
+        // `masked` (the would-be-captured arg) is at cols 12-18 of line 1.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n# raven: nse my_func(y)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_masked = Diagnostic {
+            range: Range {
+                start: Position::new(1, 12),
+                end: Position::new(1, 18),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_masked],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert!(
+            nse_actions >= 1,
+            "a directive after the call must not suppress the quick-fix: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_skips_non_undefined_diagnostic() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // The `is_undefined` filter: a diagnostic whose code is NOT
+        // UNDEFINED_VARIABLE must yield no NSE quick-fix even when it sits on an
+        // eligible call argument.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let not_undef = Diagnostic {
+            range: Range {
+                start: Position::new(1, 8),
+                end: Position::new(1, 10),
+            },
+            code: Some(NumberOrString::String("some-other-lint".to_string())),
+            message: "Something else".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![not_undef],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "no NSE quick-fix for a non-undefined diagnostic: {actions:?}"
+        );
+    }
+
     // ====================================================================
     // Issue #343 Task 5: outgoing-only chunk-aware cross-file metadata.
     //

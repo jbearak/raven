@@ -177,7 +177,9 @@ As with `# raven: func`, the callee name accepts a bare `name` or a single
 `pkg::name` qualifier unquoted; a name with characters outside `[A-Za-z0-9._]`
 (e.g. spaces) must use the quoted form. The NSE policy is consulted only for
 ordinary `callee(args)` calls, so it cannot apply to operators (`a %+% b` is not
-a call) — an `# raven: nse` for an operator parses but is inert.
+a call). An operator name contains characters outside `[A-Za-z0-9._]`, so it
+would have to use the quoted form (`# raven: nse "%+%"`) to parse at all — and
+even then it is inert, because operator calls are not `callee(args)` calls.
 
 A literal `...` in the captured list declares that the arguments a call passes
 through the function's `...` are captured (checked formals before `...` are

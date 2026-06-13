@@ -13748,6 +13748,12 @@ fn declared_function_formals(
 /// side stays lenient (a bare `# raven: func foo` still serves a qualified nse,
 /// and vice versa).
 fn declared_name_matches(declared: &str, name: &str, package: Option<&str>) -> bool {
+    // `declared` is stored only after `is_well_formed_callee_name` (directive.rs)
+    // guarantees at most one `::` with colon-free halves, so this `rsplit_once`
+    // and the `split_once("::")` the parser/`split_callee_qualifier` use to STORE
+    // and look up the same name coincide on the single boundary. The split
+    // directions differ only as defence-in-depth; do not relax the well-formed
+    // screen without aligning all three on one direction.
     let (decl_pkg, decl_name) = match declared.rsplit_once("::") {
         Some((p, n)) => (Some(p), n),
         None => (None, declared),
@@ -14335,7 +14341,7 @@ pub(crate) fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
 /// suggestions are converted.
 fn callee_directive_form(callee: &str) -> String {
     let (pkg, bare) = split_callee_qualifier(callee);
-    let bare = match bare.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+    let bare = match unquote_backtick_name(bare) {
         Some(inner) => format!("\"{inner}\""),
         None => bare.to_string(),
     };
@@ -57476,6 +57482,30 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_hint_suggestion_quotes_nonsyntactic_callee() {
+        // The suggested directive for a NON-SYNTACTIC callee must use the quoted
+        // form (`"my data fn"`) so it parses — not the raw backtick spelling,
+        // which the directive grammar rejects (the suggestion would then silently
+        // never govern). Guards `callee_directive_form` through the emit path;
+        // other backtick-callee tests only hand-write quoted directives.
+        let diags = collect_undefined_messages(
+            "`my data fn` <- function(df, cond) df\n`my data fn`(real_df, undef_arg)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg reported");
+        assert!(
+            d.contains("# raven: func \"my data fn\""),
+            "suggestion must quote the non-syntactic callee: {d}"
+        );
+        assert!(
+            !d.contains("# raven: func `my data fn`"),
+            "suggestion must not emit the raw backtick callee form: {d}"
+        );
+    }
+
+    #[test]
     fn nse_directive_does_not_borrow_ambiguous_reordered_formals() {
         // `f` is redefined with PERMUTED formals, so its positional order is
         // ambiguous. The bare `# raven: nse f(x)` must NOT borrow a formal order
@@ -57524,14 +57554,18 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn top_level_undefined_has_no_hint() {
-        // Not inside a call argument -> no hint.
+        // Not inside a call argument -> no hint. `.expect` (not `if let`) so a
+        // regression that stopped flagging top-level `x` fails here loudly
+        // instead of passing vacuously without ever checking the no-hint rule.
         let diags = collect_undefined_messages("x + 1\n");
-        if let Some(d) = diags.iter().find(|m| m.contains("Undefined variable: x")) {
-            assert!(
-                !d.contains("# raven: nse"),
-                "no hint for non-call usage: {d}"
-            );
-        }
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: x"))
+            .expect("top-level x flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "no hint for non-call usage: {d}"
+        );
     }
 
     #[test]

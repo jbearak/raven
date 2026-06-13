@@ -734,6 +734,16 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Requirements: 1.1, 1.2, 1.3, 1.4, 1.5
         if let Some(caps) = patterns.declare_var.captures(line) {
             if let Some(name) = capture_symbol_name(&caps, 1) {
+                // Store the name in call-site form (backtick-wrapped if
+                // non-syntactic), mirroring `declare_func`/`nse`, so a declared
+                // non-syntactic variable (`# raven: var "my fn"`) aligns with the
+                // backticked usage text `` `my fn` `` at BOTH the
+                // undefined-variable check and go-to-definition. (The
+                // undefined-variable path also has an unquote fallback, but
+                // go-to-definition compares the stored name exactly, so without
+                // the wrap it would miss a non-syntactic declared variable.)
+                // Variables are not package-qualified, so there is no `::` split.
+                let name = callee_name_for_match(&name);
                 log::trace!(
                     "  Parsed variable declaration directive at line {}: name='{}'",
                     line_num,
@@ -1918,6 +1928,20 @@ x <- undefined"#;
         let content = "# @lsp-var 'my.var'";
         let meta = parse_directives(content);
         assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "my.var");
+    }
+
+    #[test]
+    fn declare_var_wraps_nonsyntactic_name() {
+        // A non-syntactic variable name is stored backtick-wrapped (call-site
+        // form), mirroring `declare_func`/`nse`, so go-to-definition (which
+        // compares the stored name exactly to the usage `node_text`) locates a
+        // `# raven: var "my fn"` declaration from a `` `my fn` `` usage. A
+        // syntactic name is still stored bare.
+        let meta = parse_directives("# raven: var \"my fn\"\n");
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "`my fn`");
+        let meta = parse_directives("# raven: var \"my.var\"\n");
         assert_eq!(meta.declared_variables[0].name, "my.var");
     }
 
