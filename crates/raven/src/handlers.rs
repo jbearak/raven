@@ -12848,9 +12848,12 @@ pub(crate) struct NseAnalysis<'a> {
     /// governs every call of the name in the file, including nested rebindings),
     /// NOT `library()`-position-aware (a `pkg::` qualifier's in-scope test is
     /// file-wide), and NOT arity/signature-aware (it does not validate captured
-    /// formals against the callee's real definition). Its only effect is to
-    /// suppress diagnostics, so an inaccurate directive over-suppresses rather
-    /// than mis-reporting — never a false positive.
+    /// formals against the callee's real definition). It REPLACES Raven's own
+    /// inference for the callee (consulted in `resolve_call_arg_policy` before the
+    /// built-in/verb policy tables), so an inaccurate directive cuts both ways: a
+    /// directive broader than the real NSE behavior hides diagnostics, while one
+    /// narrower than Raven's own inference can re-surface diagnostics the verb
+    /// tables would otherwise have suppressed. The user owns the accuracy.
     directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
 }
 
@@ -57785,11 +57788,18 @@ my_func <- function(a = default_value) {
         // `nse_directive_governs` intentionally omits the BareInPlayQualified
         // pass (it errs toward SHOWING the hint). So a bare call whose only
         // governing directive is an in-play `pkg::` one still gets the
-        // discoverability hint on a surviving non-captured argument. Guards that
-        // documented asymmetry — a regression that started suppressing the hint
-        // here would otherwise ship silently.
-        let diags =
-            collect_undefined_messages("library(pkg)\n# raven: nse pkg::foo(x)\nfoo(real_undef)\n");
+        // discoverability hint on a surviving non-captured argument. The captured
+        // named arg `x = masked` IS suppressed (proving the directive genuinely
+        // governs the bare call via BareInPlayQualified, so the test isn't
+        // vacuous), while the non-captured positional `real_undef` is still
+        // flagged AND carries the hint.
+        let diags = collect_undefined_messages(
+            "library(pkg)\n# raven: nse pkg::foo(x)\nfoo(real_undef, x = masked)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked")),
+            "captured `x` must be suppressed (directive governs the bare call); got {diags:?}"
+        );
         let d = diags
             .iter()
             .find(|m| m.contains("Undefined variable: real_undef"))

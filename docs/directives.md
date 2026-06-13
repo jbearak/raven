@@ -215,9 +215,13 @@ it), it is intentionally **not**:
   `...` formal.
 
 This is by design: the directive is an opt-in escape hatch where you take
-responsibility for declaring an accurate policy. Its only effect is to *suppress*
-diagnostics, so an inaccurate or stale directive over-suppresses (it may hide a
-diagnostic you wanted) rather than producing a false positive.
+responsibility for declaring an accurate policy. It **replaces** Raven's own
+inference for the named callee rather than merely adding to it, so an inaccurate
+or stale directive cuts both ways — one *broader* than the real NSE behavior
+hides diagnostics you may have wanted, while one *narrower* than Raven's own
+inference (for example declaring a partial capture on a function Raven already
+recognizes as data-masking) can re-surface diagnostics it would otherwise have
+suppressed.
 
 Named arguments are matched by formal name regardless of order. For
 **positional** arguments Raven needs the formal order, which it reads from a

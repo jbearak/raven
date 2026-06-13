@@ -1173,8 +1173,10 @@ fn per_formal_mask(
     // when the user declared dots-capture (`captured_dots`) a trailing argument
     // beyond the resolved formal list is suppressed even if the callee does not
     // actually have a `...` formal. With no dots-capture declared, `captured_dots`
-    // is false and the overflow argument stays checked — so the coarse,
-    // user-authoritative behavior only ever errs toward suppression.
+    // is false and the overflow argument stays checked. (This overflow rule only
+    // chooses whether to suppress; whether the directive's policy is itself
+    // broader or narrower than Raven's inference is decided earlier, in
+    // `resolve_call_arg_policy`.)
     let mut cursor = 0usize;
     for (i, label) in arg_labels.iter().enumerate() {
         if label.is_some() {

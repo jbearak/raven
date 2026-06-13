@@ -5683,11 +5683,14 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         // Honor the client's code-action kind filter. This handler only produces
         // `QUICKFIX` actions (the `# raven: nse` quick-fix), so a request that
-        // restricts kinds to a set QUICKFIX does not satisfy (e.g. a refactor- or
-        // source-only request) gets no work done. A filter kind matches when it
-        // is empty (the root), equals `quickfix`, or is a parent of it.
+        // restricts kinds to a non-empty set QUICKFIX does not satisfy (e.g. a
+        // refactor- or source-only request) gets no work done. A filter kind
+        // matches when it equals `quickfix` or is a parent of it; an EMPTY filter
+        // list is treated as "no restriction" (offer the quick-fix) so a
+        // degenerate request never silently hides a fix the client wanted.
         let quickfix = CodeActionKind::QUICKFIX;
         if let Some(only) = &params.context.only
+            && !only.is_empty()
             && !only.iter().any(|k| {
                 let (k, qf) = (k.as_str(), quickfix.as_str());
                 k.is_empty() || qf == k || qf.starts_with(&format!("{k}."))
@@ -12449,6 +12452,9 @@ lineLength = 200
         };
         // A request restricted to REFACTOR must not return the QUICKFIX NSE
         // action even when an eligible undefined-variable diagnostic is present.
+        // The same diagnostic with no filter DOES yield the quick-fix, so the
+        // zero-count below is the filter at work, not a setup that produced
+        // nothing to filter.
         let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
@@ -12465,32 +12471,43 @@ lineLength = 200
             message: "Undefined variable".to_string(),
             ..Default::default()
         };
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: Range::default(),
-            context: CodeActionContext {
-                diagnostics: vec![undef],
-                only: Some(vec![CodeActionKind::REFACTOR]),
-                trigger_kind: None,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
+        let nse_action_count = |only: Option<Vec<CodeActionKind>>| {
+            let svc = &svc;
+            let uri = uri.clone();
+            let undef = undef.clone();
+            async move {
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    range: Range::default(),
+                    context: CodeActionContext {
+                        diagnostics: vec![undef],
+                        only,
+                        trigger_kind: None,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                svc.inner()
+                    .code_action(params)
+                    .await
+                    .expect("code_action ok")
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|a| {
+                        matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+                    })
+                    .count()
+            }
         };
-        let actions = svc
-            .inner()
-            .code_action(params)
-            .await
-            .expect("code_action ok")
-            .unwrap_or_default();
-        let nse_actions = actions
-            .iter()
-            .filter(|a| {
-                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
-            })
-            .count();
+
+        assert!(
+            nse_action_count(None).await >= 1,
+            "without a kind filter the diagnostic yields the NSE quick-fix"
+        );
         assert_eq!(
-            nse_actions, 0,
-            "a refactor-only request must not return the QUICKFIX NSE action: {actions:?}"
+            nse_action_count(Some(vec![CodeActionKind::REFACTOR])).await,
+            0,
+            "a refactor-only request must not return the QUICKFIX NSE action"
         );
     }
 
