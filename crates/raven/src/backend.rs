@@ -39,7 +39,7 @@ tokio::task_local! {
 enum IndexCategory {
     /// Files directly sourced by open documents
     Sourced,
-    /// Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
+    /// Files referenced by backward directives (`# raven: run-by`, `# raven: sourced-by`)
     BackwardDirective,
 }
 const DIAGNOSTIC_FANOUT_CONCURRENCY: usize = 8;
@@ -3189,7 +3189,7 @@ impl LanguageServer for Backend {
 
             // Pre-collect content for potential parent files to avoid borrow conflicts
             // The content provider needs to access documents/cache while graph is mutably borrowed
-            // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+            // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
             // Backward directives should always be resolved relative to the file's directory
             let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
                 &uri_clone,
@@ -3991,7 +3991,7 @@ impl LanguageServer for Backend {
                 };
 
                 // Pre-collect content for potential parent files to avoid borrow conflicts
-                // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
                 // Backward directives should always be resolved relative to the file's directory
                 let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
                     &uri_clone,
@@ -5193,7 +5193,7 @@ impl LanguageServer for Backend {
                         let workspace_root = state.workspace_folders.first().cloned();
 
                         // Pre-collect content for potential parent files to avoid borrow conflicts
-                        // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
+                        // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
                         // Backward directives should always be resolved relative to the file's directory
                         let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
                             &uri_clone,

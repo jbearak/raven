@@ -8,7 +8,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 |---|---|
 | Variable or function identifier | The most recent in-scope assignment (same file or sourced file) |
 | RHS of `$` or `@` (`foo$bar`) | The member assignment or constructor-literal field — see [$ and @ Member Resolution](#-and--member-resolution) |
-| Symbol declared via `@lsp-var` / `@lsp-func` | The directive line itself — see [Declared Symbols](#declared-symbols) |
+| Symbol declared via `# raven: var` / `# raven: func` | The directive line itself — see [Declared Symbols](#declared-symbols) |
 | File path inside `source()` or a path directive | The referenced file, opened at line 0 |
 | Identifier in `.stan`, `.jags`, or `.bugs` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
 
@@ -39,7 +39,7 @@ result <- helper_function(42)  # cmd-click jumps into utils.R
 helper_function <- function(x) { x * 2 }  # ← jump target
 ```
 
-Raven follows both `source()` calls and [forward directives](directives.md#forward-directives) (`@lsp-source`, `@lsp-run`, `@lsp-include`). Backward directives (`@lsp-sourced-by`) bring the parent file's symbols into scope, so cmd-clicking a parent-defined symbol in a child file works too.
+Raven follows both `source()` calls and [forward directives](directives.md#forward-directives) (`# raven: source`, `# raven: run`, `# raven: include`). Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) bring the parent file's symbols into scope, so cmd-clicking a parent-defined symbol in a child file works too.
 
 If no definition is found in the dependency graph, Raven falls back to other open documents and the workspace index so you can still navigate to reasonable candidates during project-wide exploration.
 
@@ -58,12 +58,12 @@ For the full scope rules, see [$ and @ Member Resolution](cross-file.md#-and--me
 
 ## Declared Symbols
 
-Symbols declared via [`@lsp-var` or `@lsp-func`](directives.md#declaration-directives) are navigable. Cmd-click jumps to the directive line at column 0. If the same name is declared more than once in the providing file, Raven jumps to the **first declaration by line number**:
+Symbols declared via [`# raven: var` or `# raven: func`](directives.md#declaration-directives) are navigable. Cmd-click jumps to the directive line at column 0. If the same name is declared more than once in the providing file, Raven jumps to the **first declaration by line number**:
 
 ```r
-# @lsp-var config   ← jump target (first declaration)
+# raven: var config   ← jump target (first declaration)
 load("config.RData")
-# @lsp-var config   ← later duplicate, not used
+# raven: var config   ← later duplicate, not used
 use(config)
 ```
 
@@ -73,9 +73,9 @@ This is the same rule the [diagnostics](diagnostics.md) and [completion](complet
 
 Inside `source()` strings and path-taking directives, cmd-click navigates to the referenced file. Path resolution follows the standard Raven rules:
 
-- `source()` calls and forward directives respect `@lsp-cd`.
-- Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's own directory and ignore `@lsp-cd`.
-- Workspace-root fallback applies to AST-detected `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no working directory is in effect.
+- `source()` calls and forward directives respect `# raven: cd`.
+- Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's own directory and ignore `# raven: cd`.
+- Workspace-root fallback applies to AST-detected `source()` calls and forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no working directory is in effect.
 
 See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Directives](directives.md#working-directory-directives) for details.
 
@@ -94,11 +94,11 @@ For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-defini
 - **Stan** — jumps to the most recent declaration of a variable or function at or before the cursor (or the first declaration if none precede it).
 - **JAGS** — jumps to the most recent assignment at or before the cursor (or the first assignment if none precede it), or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Built-in keywords, distributions, and functions are excluded from the fallback.
 
-Identifier resolution is file-local — Raven doesn't build a cross-file scope graph for these languages. File-path navigation (e.g. cmd-click on a path in `@lsp-sourced-by`) still works normally. See also [Find References — JAGS and Stan](find-references.md#jags-and-stan).
+Identifier resolution is file-local — Raven doesn't build a cross-file scope graph for these languages. File-path navigation (e.g. cmd-click on a path in `# raven: sourced-by`) still works normally. See also [Find References — JAGS and Stan](find-references.md#jags-and-stan).
 
 ## Related
 
 - [Find References](find-references.md) — the reverse operation: list every usage of a symbol
 - [Cross-File & Package Awareness](cross-file.md) — how the dependency graph and scope model work
-- [Directives](directives.md) — `@lsp-source`, `@lsp-sourced-by`, `@lsp-var`, `@lsp-func`, and friends
+- [Directives](directives.md) — `# raven: source`, `# raven: sourced-by`, `# raven: var`, `# raven: func`, and friends
 - [Completions](completion.md) — position-aware scope used for `$` member and symbol completions

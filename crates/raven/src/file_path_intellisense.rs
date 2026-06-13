@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Url};
 use tree_sitter::{Node, Tree};
 
-use crate::cross_file::directive::{BACKWARD_DIRECTIVE_KEYWORDS, FORWARD_DIRECTIVE_KEYWORDS};
+use crate::cross_file::directive::{
+    BACKWARD_DIRECTIVE_KEYWORDS, DIRECTIVE_PREFIX, FORWARD_DIRECTIVE_KEYWORDS,
+};
 use crate::cross_file::path_resolve::PathContext;
 use crate::cross_file::types::{CrossFileMetadata, byte_offset_to_utf16_column};
 use crate::utf16::utf16_column_to_byte_offset;
@@ -56,10 +58,11 @@ pub enum FilePathContext {
 /// Type of LSP directive for path context
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveType {
-    /// Backward directives: @lsp-sourced-by, @lsp-run-by, @lsp-included-by
-    /// These declare that the current file is sourced BY another file
+    /// Backward directives: `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`
+    /// These declare that the current file is sourced BY another file.
+    /// (The `@lsp-` forms — e.g. `@lsp-sourced-by` — are permanent aliases that parse identically.)
     SourcedBy,
-    /// Forward directive: @lsp-source
+    /// Forward directive: `# raven: source`
     /// This declares that the current file sources another file
     Source,
 }
@@ -346,8 +349,8 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// Check if cursor is after an LSP directive where a path is expected
 ///
 /// Uses regex patterns consistent with cross_file/directive.rs to detect
-/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and forward source directives
-/// (`@lsp-source`, `@lsp-run`, `@lsp-include`).
+/// `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`, and forward source directives
+/// (`# raven: source`, `# raven: run`, `# raven: include`).
 /// Handles optional colon and quotes syntax variations.
 ///
 /// # Arguments
@@ -572,9 +575,14 @@ fn unescape_string(s: &str) -> String {
 
 /// Generate file path completions for the given context
 ///
-/// Determines the base directory based on context type:
-/// - SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// Determines the base directory based on context type and directive variant
+/// (see [`resolve_base_directory`]):
+/// - `SourceCall` (AST `source()`) and forward directives
+///   (`Directive` with `DirectiveType::Source`): use `PathContext::from_metadata()`
+///   — respect `# raven: cd` (explicit or inherited), with workspace-root fallback.
+/// - Backward directives (`Directive` with `DirectiveType::SourcedBy`): use
+///   `PathContext::new()` — ignore `# raven: cd` and resolve relative to the
+///   file's directory.
 ///
 /// # Arguments
 /// * `context` - The detected file path context
@@ -876,8 +884,8 @@ fn create_path_completion_item(
 /// Get definition location for a file path at the given position
 ///
 /// Detects context type and resolves path using appropriate PathContext:
-/// - SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// - SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
+/// - Directive: Uses PathContext::new() (ignores `# raven: cd`)
 ///
 /// If workspace_root is provided, enforces workspace boundary: paths resolving
 /// outside the workspace return None.
@@ -928,7 +936,7 @@ pub fn file_path_definition(
         }
         FilePathContext::Directive { directive_type, .. } => match directive_type {
             DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                // Backward directives: relative to file's directory (ignore `# raven: cd`)
                 let path_context = PathContext::new(file_uri, workspace_root)?;
                 resolve_path(&normalized_path, &path_context)?
             }
@@ -1302,8 +1310,8 @@ fn try_extract_full_directive_path(
 /// Resolve the base directory for file path completions
 ///
 /// Determines the base directory based on context type and partial path:
-/// - For SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - For Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// - For SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
+/// - For Directive: Uses PathContext::new() (ignores `# raven: cd`)
 /// - For paths starting with `/`: Resolves relative to workspace root (both contexts)
 ///
 /// The partial path's directory component (e.g., `../`, `subdir/`) is joined
@@ -1385,7 +1393,7 @@ pub fn resolve_base_directory(
         }
         FilePathContext::Directive { directive_type, .. } => match directive_type {
             DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                // Backward directives: relative to file's directory (ignore `# raven: cd`)
                 let path_context = PathContext::new(file_uri, workspace_root)?;
                 if partial_dir.is_empty() {
                     Some(path_context.effective_working_directory())
@@ -1506,11 +1514,13 @@ fn normalize_path_separators(path: &str) -> String {
 /// These patterns match the directive prefix only (not the path itself),
 /// allowing us to determine where the path portion begins.
 struct DirectivePathPatterns {
-    /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
-    /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
+    /// Pattern for backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`)
+    /// Matches the canonical `# raven:` forms and the equivalent `@lsp-` aliases, e.g.
+    /// `# @lsp-sourced-by:` or `# @lsp-run-by` (with optional leading whitespace).
     backward: Regex,
-    /// Pattern for forward directives (@lsp-source, @lsp-run, @lsp-include)
-    /// Matches: `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
+    /// Pattern for forward directives (`# raven: source`, `# raven: run`, `# raven: include`)
+    /// Matches the canonical `# raven:` forms and the equivalent `@lsp-` aliases, e.g.
+    /// `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
     /// (with optional leading whitespace)
     forward: Regex,
 }
@@ -1523,11 +1533,14 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
     static PATTERNS: OnceLock<DirectivePathPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         // Patterns match the directive keyword and trailing whitespace/colon.
-        // The keyword alternations are shared verbatim with
-        // cross_file/directive.rs via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS so
-        // the recognized keyword set cannot drift between the two regex sets;
-        // they are plugged into the middle of each pattern by concatenation.
-        // The @ is required, colon is optional, leading whitespace is allowed.
+        // Both the keyword alternations ({FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS)
+        // and the prefix alternation (DIRECTIVE_PREFIX) are shared verbatim with
+        // cross_file/directive.rs so neither the recognized keyword set nor the
+        // accepted prefixes can drift between the two regex sets; they are
+        // plugged into the middle of each pattern by concatenation. Either
+        // prefix is accepted: `@lsp-` (the `@` is required) or the canonical
+        // `# raven:` form (#421). Colon after the keyword is optional, leading
+        // whitespace is allowed.
         // `\u{feff}` in the leading class tolerates a raw BOM on a first-line
         // directive (in-memory text keeps it verbatim); matching against the
         // BOM-bearing line keeps the reported path column client-aligned. #346.
@@ -1537,18 +1550,22 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         DirectivePathPatterns {
             backward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    r"^[\s\u{feff}]*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     BACKWARD_DIRECTIVE_KEYWORDS,
-                    r#")(?:\s+:?\s*|:\s*)"#,
+                    r")(?:\s+:?\s*|:\s*)",
                 ]
                 .concat(),
             )
             .unwrap(),
             forward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    r"^[\s\u{feff}]*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     FORWARD_DIRECTIVE_KEYWORDS,
-                    r#")(?:\s+:?\s*|:\s*)"#,
+                    r")(?:\s+:?\s*|:\s*)",
                 ]
                 .concat(),
             )
@@ -2197,45 +2214,87 @@ mod tests {
     fn test_shared_directive_keywords_recognized_by_both_regex_sets() {
         use crate::cross_file::directive::parse_directives;
 
-        for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
-            let content = format!("# @lsp-{kw} utils.R");
-            let eol = Position::new(0, content.chars().count() as u32);
+        // Both prefixes must round-trip identically: `# raven:` is the canonical
+        // user-facing form and `@lsp-` a permanent alias (#421).
+        for prefix in ["@lsp-", "raven: "] {
+            for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
+                let content = format!("# {prefix}{kw} utils.R");
+                let eol = Position::new(0, content.chars().count() as u32);
 
-            // file_path_intellisense seam (column-aligned, BOM-tolerant).
-            assert!(
-                matches!(
-                    is_directive_path_context(&content, eol),
-                    Some((DirectiveType::Source, _, _))
-                ),
-                "path-context matcher did not recognize forward keyword `{kw}`",
-            );
+                // file_path_intellisense seam (column-aligned, BOM-tolerant).
+                assert!(
+                    matches!(
+                        is_directive_path_context(&content, eol),
+                        Some((DirectiveType::Source, _, _))
+                    ),
+                    "path-context matcher did not recognize forward keyword `{kw}` with prefix `{prefix}`",
+                );
 
-            // cross_file::directive seam (full parser, capture groups).
-            assert_eq!(
-                parse_directives(&content).sources.len(),
-                1,
-                "directive parser did not recognize forward keyword `{kw}`",
-            );
+                // cross_file::directive seam (full parser, capture groups).
+                assert_eq!(
+                    parse_directives(&content).sources.len(),
+                    1,
+                    "directive parser did not recognize forward keyword `{kw}` with prefix `{prefix}`",
+                );
+            }
+
+            for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
+                let content = format!("# {prefix}{kw} ../main.R");
+                let eol = Position::new(0, content.chars().count() as u32);
+
+                assert!(
+                    matches!(
+                        is_directive_path_context(&content, eol),
+                        Some((DirectiveType::SourcedBy, _, _))
+                    ),
+                    "path-context matcher did not recognize backward keyword `{kw}` with prefix `{prefix}`",
+                );
+
+                assert_eq!(
+                    parse_directives(&content).sourced_by.len(),
+                    1,
+                    "directive parser did not recognize backward keyword `{kw}` with prefix `{prefix}`",
+                );
+            }
         }
+    }
 
-        for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
-            let content = format!("# @lsp-{kw} ../main.R");
-            let eol = Position::new(0, content.chars().count() as u32);
+    #[test]
+    fn test_directive_raven_source_forward_path_column() {
+        // # raven: source utils.R
+        // 0         1         2
+        // 0123456789012345678901234
+        // Keyword+separator ends at 16, path starts at 16.
+        let content = "# raven: source utils.R";
+        let position = Position {
+            line: 0,
+            character: 19,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "uti");
+        assert_eq!(path_start.character, 16);
+    }
 
-            assert!(
-                matches!(
-                    is_directive_path_context(&content, eol),
-                    Some((DirectiveType::SourcedBy, _, _))
-                ),
-                "path-context matcher did not recognize backward keyword `{kw}`",
-            );
-
-            assert_eq!(
-                parse_directives(&content).sourced_by.len(),
-                1,
-                "directive parser did not recognize backward keyword `{kw}`",
-            );
-        }
+    #[test]
+    fn test_directive_raven_sourced_by_path_column() {
+        // # raven: sourced-by ../main.R
+        // 0         1         2
+        // 0123456789012345678901234567890
+        // Keyword+separator ends at 20, path starts at 20.
+        let content = "# raven: sourced-by ../main.R";
+        let position = Position {
+            line: 0,
+            character: 23,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::SourcedBy);
+        assert_eq!(partial, "../");
+        assert_eq!(path_start.character, 20);
     }
 
     #[test]

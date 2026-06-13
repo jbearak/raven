@@ -24,8 +24,9 @@
 //!   followed by `:`, `(`, or `-`). `TODO` happens to be a valid identifier,
 //!   so without this gate `# TODO: rewrite parse_args` would parse as code.
 //! * **Suppression / directive markers** — `# nolint`, `# nolint start`,
-//!   `# nolint end`, `# nolint: rule`, `# @lsp-ignore`, `# @lsp-ignore-next`,
-//!   and any other `# @lsp-…` directive. These wouldn't pass the code-like
+//!   `# nolint end`, `# nolint: rule`, `# raven: ignore`, `# raven: ignore-next`,
+//!   and any other `# raven:` directive (the `# @lsp-…` forms are permanent
+//!   aliases that parse identically). These wouldn't pass the code-like
 //!   heuristic anyway, but skipping them up front keeps the rule from
 //!   competing with the suppression infrastructure.
 
@@ -66,7 +67,7 @@ pub(crate) fn collect(
     // or that the suppression infrastructure has marked. Splitting (rather
     // than discarding the whole group) keeps unrelated commented-out code on
     // adjacent lines from being silently swallowed by a single nearby
-    // directive — e.g. `# @lsp-ignore-next\n# x <- 1\n# y <- 2` must still
+    // directive — e.g. `# raven: ignore-next\n# x <- 1\n# y <- 2` must still
     // flag line 2.
     let groups = group_contiguous(&standalone);
 
@@ -194,7 +195,7 @@ fn group_contiguous(comments: &[StandaloneComment]) -> Vec<Vec<StandaloneComment
 /// Decide whether a single comment line should be excluded from try-parsing.
 ///
 /// Used by [`split_on_skip_lines`] to break a contiguous group at each
-/// skip-line boundary, so that one stray `# TODO:` or `# @lsp-source ...`
+/// skip-line boundary, so that one stray `# TODO:` or `# raven: source ...`
 /// doesn't silently swallow neighbouring commented-out code.
 fn is_skip_line(line: &str, is_first_line_of_file: bool) -> bool {
     // Skip a raw leading U+FEFF so a BOM-prefixed first line is classified the
@@ -216,7 +217,9 @@ fn is_skip_line(line: &str, is_first_line_of_file: bool) -> bool {
 }
 
 /// `# nolint`, `# nolint start`, `# nolint end`, `# nolint: rule`, and any
-/// `# @lsp-…` directive (`@lsp-ignore`, `@lsp-source`, `@lsp-var`, etc.).
+/// `# raven:` directive (`# raven: ignore`, `# raven: source`, `# raven: var`,
+/// etc.) — including the permanent `@lsp-` aliases the matcher still accepts
+/// (`@lsp-ignore`, `@lsp-source`, `@lsp-var`, etc.).
 fn is_directive_marker(trimmed_line: &str) -> bool {
     let body = match strip_hash_prefix(trimmed_line) {
         Some(b) => b,
@@ -371,6 +374,16 @@ mod tests {
         // not commented-out code.
         assert!(is_directive_marker("# raven: ignore-next"));
         assert!(is_directive_marker("# raven: expect-next"));
+        // The structural families also live under `# raven:` (#421) and must be
+        // treated as directive markers, not parsed as commented-out code. These
+        // all exercise the one keyword-agnostic `raven:` branch above; they are
+        // enumerated as documentation of the families that now apply, not as
+        // independent code paths.
+        assert!(is_directive_marker("# raven: source ../helpers.R"));
+        assert!(is_directive_marker("# raven: sourced-by ../main.R"));
+        assert!(is_directive_marker("# raven: cd /data"));
+        assert!(is_directive_marker("# raven: var myvar"));
+        assert!(is_directive_marker("# raven: func myfunc"));
         // Near-misses must NOT be treated as markers.
         assert!(!is_directive_marker("# raven-ignore-next"));
         assert!(!is_directive_marker("# ravene: ignore-next"));

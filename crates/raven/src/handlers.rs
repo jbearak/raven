@@ -185,7 +185,7 @@ impl DiagnosticsSnapshot {
         // `get_enriched_metadata` is masked-correct for open Rmd/Quarto docs:
         // the DocumentStore arm now stores metadata derived from the masked
         // analysis text at did_open/did_change time (#343 Task 5), and the
-        // remaining tiers mask too. So a `# @lsp-cd` in prose is ignored while
+        // remaining tiers mask too. So a `# raven: cd` in prose is ignored while
         // chunk `source()`/`library()` calls are captured — no Rmd special case
         // needed here. The fallback re-extracts from the masked `(text, tree)`
         // for the rare case where no enriched entry exists yet.
@@ -4340,9 +4340,9 @@ fn collect_legacy_ast_symbols(
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
 /// restricts results to the file's **top-level** live exports (function-locals are excluded — see
 /// the [`ScopeArtifacts::exported_interface`] footgun), skips declared (virtual) symbols such as
-/// `@lsp-var`/`@lsp-func`, and maps internal symbol kinds to LSP `SymbolKind` values. Each matched
-/// symbol is appended as a `SymbolInformation` with the provided `file_uri` and the symbol's
-/// definition position.
+/// `# raven: var`/`# raven: func` (aliases `@lsp-var`/`@lsp-func`), and maps internal symbol
+/// kinds to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation`
+/// with the provided `file_uri` and the symbol's definition position.
 ///
 /// - `file_uri`: URI to assign to each returned `SymbolInformation`.
 /// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
@@ -4372,7 +4372,7 @@ fn collect_workspace_symbols_from_artifacts(
             continue;
         }
 
-        // Skip declared symbols (@lsp-var, @lsp-func) — they are virtual
+        // Skip declared symbols (`# raven: var`, `# raven: func`) — they are virtual
         if scoped_symbol.is_declared {
             continue;
         }
@@ -4573,16 +4573,16 @@ pub async fn diagnostics_async_standalone(
     let mut diagnostics = sync_diagnostics;
 
     // Replace sync missing-file diagnostics with async disk-checked results.
-    // Include both source() call messages and @lsp-source directive messages.
+    // Include both source() call messages and `# raven: source` directive messages.
     diagnostics.retain(|d| {
         !d.message.starts_with("File not found:")
             && !d.message.starts_with("Parent file not found:")
             && !d.message.starts_with("Cannot resolve path:")
             && !d.message.starts_with("Cannot resolve parent path:")
             && !d.message.starts_with("Path is outside workspace:")
-            // @lsp-source directive specific messages
-            && !d.message.contains("referenced by @lsp-source directive")
-            && !d.message.contains("in @lsp-source directive")
+            // `# raven: source` directive specific messages
+            && !d.message.contains("referenced by source directive")
+            && !d.message.contains("in source directive")
     });
 
     // Collect URIs to check (skip if severity is disabled)
@@ -4610,15 +4610,15 @@ async fn collect_missing_file_diagnostics_standalone(
     let mut diagnostics = Vec::new();
     let workspace_root = workspace_folders.and_then(|w| w.to_file_path().ok());
 
-    // Forward sources use @lsp-cd for path resolution
+    // Forward sources use `# raven: cd` for path resolution
     let forward_ctx =
         crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_folders);
-    // Backward directives IGNORE @lsp-cd - always resolve relative to file's directory
+    // Backward directives IGNORE `# raven: cd` - always resolve relative to file's directory
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders);
 
     // Collect all paths to check: (path, path_str, line, col, is_backward, is_directive)
-    // is_directive is true for @lsp-source directives, false for source() calls
-    // _Requirements: 6.1, 6.3_ (for @lsp-source directive missing file diagnostics)
+    // is_directive is true for `# raven: source` directives, false for source() calls
+    // _Requirements: 6.1, 6.3_ (for `# raven: source` directive missing file diagnostics)
     let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
 
     for source in &meta.sources {
@@ -4636,7 +4636,7 @@ async fn collect_missing_file_diagnostics_standalone(
             {
                 let message = if source.is_directive {
                     format!(
-                        "File '{}' referenced by @lsp-source directive is outside workspace",
+                        "File '{}' referenced by source directive is outside workspace",
                         source.path
                     )
                 } else {
@@ -4669,10 +4669,7 @@ async fn collect_missing_file_diagnostics_standalone(
             ));
         } else {
             let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
+                format!("Cannot resolve path '{}' in source directive", source.path)
             } else {
                 format!("Cannot resolve path: '{}'", source.path)
             };
@@ -4763,7 +4760,7 @@ async fn collect_missing_file_diagnostics_standalone(
     };
 
     // Generate diagnostics for missing files
-    // _Requirements: 6.1_ (for @lsp-source directive missing file diagnostics)
+    // _Requirements: 6.1_ (for `# raven: source` directive missing file diagnostics)
     for (i, (_, path_str, line, col, is_backward, is_directive)) in
         paths_to_check.into_iter().enumerate()
     {
@@ -4782,10 +4779,10 @@ async fn collect_missing_file_diagnostics_standalone(
                     ..Default::default()
                 });
             } else {
-                // Use specific message for @lsp-source directives (Requirement 6.1)
+                // Use specific message for `# raven: source` directives (Requirement 6.1)
                 let message = if is_directive {
                     format!(
-                        "File '{}' referenced by @lsp-source directive not found",
+                        "File '{}' referenced by source directive not found",
                         path_str
                     )
                 } else {
@@ -4855,7 +4852,7 @@ fn collect_invalid_line_param_diagnostics(
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!(
-                    "Invalid line=0 in @lsp-source directive for '{}': line numbers are 1-based. Using line 1 instead.",
+                    "Invalid line=0 in source directive for '{}': line numbers are 1-based. Using line 1 instead.",
                     source.path
                 ),
                 ..Default::default()
@@ -4953,10 +4950,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
         });
         if resolved.is_none() {
             let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
+                format!("Cannot resolve path '{}' in source directive", source.path)
             } else {
                 format!("Cannot resolve path: '{}'", source.path)
             };
@@ -5152,7 +5146,7 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message: format!(
-                    "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
+                    "Redundant source directive: '{}' is already sourced by a source() call",
                     target_name
                 ),
                 ..Default::default()
@@ -5696,7 +5690,7 @@ fn collect_undefined_variables_from_snapshot(
     use crate::cross_file::config::BackwardDependencyMode;
     use crate::cross_file::types::byte_offset_to_utf16_column;
 
-    // Auto + no @lsp-sourced-by + scan-in-progress: backward-dependency edges
+    // Auto + no `# raven: sourced-by` + scan-in-progress: backward-dependency edges
     // may not be visible yet, so any symbol could be inherited from a parent
     // file we haven't indexed. Defer all undefined-variable diagnostics until
     // the workspace scan completes; the post-scan force-republish will then
@@ -5780,7 +5774,7 @@ fn collect_undefined_variables_from_snapshot(
     // emit site to annotate forward references with the line of the first
     // later definition without re-walking the timeline per usage. Function-
     // local definitions are excluded because they cannot satisfy a top-level
-    // use. `@lsp-var` / `@lsp-func` directives produce `Declaration` events
+    // use. `# raven: var` / `# raven: func` directives produce `Declaration` events
     // (not `Def`) and are naturally excluded.
     let top_level_defs_by_name: HashMap<String, Vec<(u32, u32)>> = snapshot
         .artifacts_map
@@ -11933,8 +11927,8 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
 /// **WARNING** — R accepts, but the binding is almost certainly unintended:
 /// `"foo" <- 1` (R coerces the string to a name and binds the value to
 /// `foo`), `... <- 1`, `..1 <- 1` (R creates a binding that the standard
-/// `...` / `..N` accessors can't reach). Suppressible via `# @lsp-ignore`
-/// when the binding really is intentional.
+/// `...` / `..N` accessors can't reach). Suppressible via `# raven: ignore`
+/// (alias `# @lsp-ignore`) when the binding really is intentional.
 ///
 /// Two idiomatic string-target forms are exempt from the WARNING tier:
 /// a quoted-string target whose assigned value is a function definition
@@ -12025,9 +12019,10 @@ fn collect_invalid_assignment_targets_inner(
     }
 }
 
-/// Lines suppressed by `# @lsp-ignore` (on the same line) or
-/// `# @lsp-ignore-next` (on the preceding line), discovered by walking the
-/// tree-sitter AST for `comment` nodes.
+/// Lines suppressed by `# raven: ignore` (on the same line) or
+/// `# raven: ignore-next` (on the preceding line), discovered by walking the
+/// tree-sitter AST for `comment` nodes. The `@lsp-` forms (`# @lsp-ignore` /
+/// `# @lsp-ignore-next`) are permanent aliases that parse identically.
 ///
 /// Driving this off the AST rather than line-scanning the raw text means
 /// we automatically respect every nuance of where `#` characters open
@@ -12040,7 +12035,7 @@ fn collect_invalid_assignment_targets_inner(
 /// belong to the opt-in lint pipeline. Silencing an ERROR-tier diagnostic
 /// for code R itself rejects (e.g. `TRUE <- 1`) because the user wrote
 /// `# nolint: line_length` for an unrelated style lint would be a
-/// surprise; restricting to `@lsp-ignore` keeps the suppression channel
+/// surprise; restricting to `# raven: ignore` keeps the suppression channel
 /// the same one the rest of `handlers.rs` uses.
 fn lsp_ignored_lines_from_tree(
     root: Node<'_>,
@@ -12119,19 +12114,19 @@ fn classify_comment_for_ignore(
     #[allow(clippy::collapsible_match)]
     match classify_lsp_ignore_marker(body) {
         Some((LspIgnoreKind::SameLine, what)) => {
-            // Inline `# @lsp-ignore` suppresses *this* line — but only
+            // Inline `# raven: ignore` suppresses *this* line — but only
             // when there's code before the marker. A standalone
-            // `# @lsp-ignore` on its own line has nothing to suppress
-            // (use `# @lsp-ignore-next` instead).
+            // `# raven: ignore` on its own line has nothing to suppress
+            // (use `# raven: ignore-next` instead).
             if !standalone {
                 insert(out, row, what);
             }
         }
         Some((LspIgnoreKind::NextLine, what)) => {
-            // `@lsp-ignore-next` only applies when the comment is on its
+            // `# raven: ignore-next` only applies when the comment is on its
             // own line, matching the directive parser in
             // `cross_file/directive.rs`. A trailing
-            // `x <- 1 # @lsp-ignore-next` does NOT suppress the next
+            // `x <- 1 # raven: ignore-next` does NOT suppress the next
             // line.
             if standalone {
                 insert(out, row.saturating_add(1), what);
@@ -12148,7 +12143,7 @@ enum LspIgnoreKind {
 }
 
 /// Classify the text after a `#` that opens a comment. Returns the ignore kind
-/// (`SameLine` for `@lsp-ignore` / `# raven: ignore`, `NextLine` for the
+/// (`SameLine` for `# raven: ignore` / `@lsp-ignore`, `NextLine` for the
 /// `-next` forms) paired with what it suppresses (a blanket
 /// [`LineSuppression::All`] or a code-scoped set parsed from the `[code]`
 /// selector). Returns `None` otherwise. Matches word-boundary so
@@ -16380,7 +16375,7 @@ pub fn completion(
         crate::file_path_intellisense::FilePathContext::None
     ) {
         // Get enriched metadata from state for source() calls (includes inherited_working_directory)
-        // Directive contexts don't use @lsp-cd, so we use default metadata
+        // Directive contexts don't use `# raven: cd`, so we use default metadata
         let metadata = match file_path_context {
             crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
                 // Use get_enriched_metadata to get metadata with inherited_working_directory
@@ -17864,7 +17859,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             symbol.is_declared
         );
 
-        // Handle declared symbols (from @lsp-var or @lsp-func directives)
+        // Handle declared symbols (from `# raven: var` or `# raven: func` directives)
         // Validates: Requirements 7.1, 7.2, 7.3
         if symbol.is_declared {
             let kind_str = match symbol.kind {
@@ -17872,9 +17867,13 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 crate::cross_file::SymbolKind::Variable => "declared variable",
                 _ => "declared symbol",
             };
+            // Always render the canonical `# raven:` directive form here. The
+            // parser accepts both `# raven: func`/`var` and the `@lsp-` alias but
+            // does not retain which prefix the user typed, so we surface the
+            // canonical spelling regardless of input prefix.
             let directive_type = match symbol.kind {
-                crate::cross_file::SymbolKind::Function => "@lsp-func",
-                _ => "@lsp-var",
+                crate::cross_file::SymbolKind::Function => "# raven: func",
+                _ => "# raven: var",
             };
             // Convert 0-based line to 1-based for display
             let display_line = symbol.defined_line + 1;
@@ -18770,7 +18769,7 @@ pub fn goto_definition_with_cancel(
         crate::file_path_intellisense::FilePathContext::None
     ) {
         // Get enriched metadata from state for source() calls (includes inherited_working_directory)
-        // Directive contexts don't use @lsp-cd, so we use default metadata
+        // Directive contexts don't use `# raven: cd`, so we use default metadata
         let metadata = match file_path_context {
             crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
                 // Use get_enriched_metadata to get metadata with inherited_working_directory
@@ -18907,7 +18906,7 @@ pub fn goto_definition_with_cancel(
             return None;
         }
 
-        // Handle declared symbols (from @lsp-var or @lsp-func directives)
+        // Handle declared symbols (from `# raven: var` or `# raven: func` directives)
         // For declared symbols, navigate to the directive line (column 0)
         // If symbol is declared multiple times, use the first declaration by line number
         // Validates: Requirements 8.1, 8.2
@@ -46438,8 +46437,8 @@ mod integration_tests {
             _ => "declared symbol",
         };
         let directive_type = match symbol.kind {
-            SymbolKind::Function => "@lsp-func",
-            _ => "@lsp-var",
+            SymbolKind::Function => "# raven: func",
+            _ => "# raven: var",
         };
         let display_line = symbol.defined_line + 1;
 
@@ -46453,7 +46452,7 @@ mod integration_tests {
             "Should show symbol name with kind"
         );
         assert!(
-            value.contains("Declared via @lsp-var directive at line 5"),
+            value.contains("Declared via # raven: var directive at line 5"),
             "Should show directive info with 1-based line"
         );
     }
@@ -46485,8 +46484,8 @@ mod integration_tests {
             _ => "declared symbol",
         };
         let directive_type = match symbol.kind {
-            SymbolKind::Function => "@lsp-func",
-            _ => "@lsp-var",
+            SymbolKind::Function => "# raven: func",
+            _ => "# raven: var",
         };
         let display_line = symbol.defined_line + 1;
 
@@ -46500,7 +46499,7 @@ mod integration_tests {
             "Should show symbol name with kind"
         );
         assert!(
-            value.contains("Declared via @lsp-func directive at line 10"),
+            value.contains("Declared via # raven: func directive at line 10"),
             "Should show directive info with 1-based line"
         );
     }
@@ -48911,7 +48910,7 @@ result <- helper_with_spaces(42)"#;
             "Should emit one diagnostic for redundant directive: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        // Snapshot path message: "Redundant @lsp-source directive: 'utils.R' is already sourced by a source() call"
+        // Snapshot path message: "Redundant source directive: 'utils.R' is already sourced by a source() call"
         // Use path-agnostic substring matching to stay robust to message rewording.
         assert!(diagnostics[0].message.to_lowercase().contains("redundant"));
         assert!(diagnostics[0].message.contains("utils.R"));
@@ -49530,7 +49529,7 @@ result <- helper_with_spaces(42)"#;
         // did_open/did_change path with disk-existence checks). Camp B
         // regressed here: plain `resolve_path` returned <scripts>/helpers.R
         // which fails the existence check, emitting "File 'helpers.R'
-        // referenced by @lsp-source directive not found" even though the
+        // referenced by source directive not found" even though the
         // graph edge was fine. With the fix, resolution returns
         // <workspace>/helpers.R which exists and no diagnostic fires.
         let directive_meta = crate::cross_file::extract_metadata(main_code);

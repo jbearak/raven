@@ -34,8 +34,9 @@
 //!   expectation deeper (lintr's "tidy" default).
 //!
 //! Lines skipped without checks:
-//! * Suppressed lines (`# nolint`, `# nolint start/end`, `# @lsp-ignore`,
-//!   `# @lsp-ignore-next`).
+//! * Suppressed lines (`# nolint`, `# nolint start/end`, `# raven: ignore`,
+//!   `# raven: ignore-next`; the `# @lsp-ignore` / `# @lsp-ignore-next` forms
+//!   are permanent aliases that parse identically).
 //! * Blank lines.
 //! * Lines whose leading whitespace contains any tab — those belong to the
 //!   `no_tab` rule.

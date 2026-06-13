@@ -42,7 +42,7 @@ For dynamic or conditional paths that Raven can't detect, use [directives](direc
 
 ### R Markdown / Quarto chunks
 
-Inside `.Rmd` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# @lsp-sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).
+Inside `.Rmd` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# raven: sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).
 
 ## Package Awareness
 
@@ -92,7 +92,7 @@ Base-package datasets are always available (auto-attached at startup); a non-bas
 
 `data()` calls bind a dataset's objects from the call onward, mirroring R. `data(api, package = "survey")` puts every object that the package's `api` data file binds — `apiclus1`, `apistrat`, … — in scope, even when a single data file ships several differently-named objects (the file stem and the object names differ). Because R loads those objects into the calling environment, a `data()` call overwrites earlier same-named bindings in that environment; later assignments can overwrite the data objects again. The bare form `data(api)` (no `package =`) searches the packages attached at-or-before the call and then the default-attached base packages, binding the objects from the first package that provides the dataset — mirroring R, where the first search-path hit wins and attached packages sit ahead of base packages. (Raven doesn't track attachment order, so when several attached packages provide the same dataset the alphabetically-first one is attributed.) The literal argument (`api`) is always bound too, so the behavior degrades gracefully when R is unavailable. Resolving the *object* names (beyond the file stem) requires a `data/` enumeration, captured when the package is loaded; `raven check` warms the packages named in `data(package = …)` for this. A package's namespace-internal `sysdata.rda` objects (e.g. `cli`'s internal `emojis` table) are never exposed this way — `library(cli)` followed by `emojis` is still a real R error and Raven flags it correctly.
 
-> **Parent-file `data()` scope limit.** When a child file inherits its parent's scope via `@lsp-sourced-by` (or auto-inferred backward dependency), `data()` alias expansion — the mapping from file stem to the individual object names — is not propagated through the backward parent-prefix walk. The literal stem bound by the `data()` call in the parent *does* flow to the child, so the most commonly used name resolves. Only the expanded aliases (e.g. `apiclus1` / `apistrat` from `data(api)`) may be missing in the child's scope view. Forward `source()` children receive full expansion. To work around this in a child file, repeat the `data()` call there, or use an [`@lsp-var` directive](directives.md#declaration-directives) to declare the alias names explicitly.
+> **Parent-file `data()` scope limit.** When a child file inherits its parent's scope via `# raven: sourced-by` (or auto-inferred backward dependency), `data()` alias expansion — the mapping from file stem to the individual object names — is not propagated through the backward parent-prefix walk. The literal stem bound by the `data()` call in the parent *does* flow to the child, so the most commonly used name resolves. Only the expanded aliases (e.g. `apiclus1` / `apistrat` from `data(api)`) may be missing in the child's scope view. Forward `source()` children receive full expansion. To work around this in a child file, repeat the `data()` call there, or use a [`# raven: var` directive](directives.md#declaration-directives) to declare the alias names explicitly.
 
 ### Position-Aware Loading
 
@@ -234,11 +234,11 @@ The dependency graph and scope model power several features:
 
 The `raven.crossFile.backwardDependencies` setting controls how Raven discovers which files source the current file.
 
-**`"auto"` (default):** Raven scans the workspace for `source()` calls and infers backward relationships automatically. No `@lsp-sourced-by` directives needed. Diagnostics are deferred until the workspace scan completes to avoid false positives.
+**`"auto"` (default):** Raven scans the workspace for `source()` calls and infers backward relationships automatically. No `# raven: sourced-by` directives needed. Diagnostics are deferred until the workspace scan completes to avoid false positives.
 
-**`"explicit"`:** Only relationships declared via `@lsp-sourced-by` directives are used. Use this if auto-inference produces unwanted results (e.g., a file sourced by multiple parents with conflicting scopes).
+**`"explicit"`:** Only relationships declared via `# raven: sourced-by` directives are used. Use this if auto-inference produces unwanted results (e.g., a file sourced by multiple parents with conflicting scopes).
 
-**Per-file opt-out:** Adding an explicit `@lsp-sourced-by` directive to a file disables auto-inference for that file.
+**Per-file opt-out:** Adding an explicit `# raven: sourced-by` directive to a file disables auto-inference for that file.
 
 See [Configuration](configuration.md) for the setting.
 
@@ -246,9 +246,9 @@ See [Configuration](configuration.md) for the setting.
 
 When Raven resolves a relative path to another file, the base directory depends on where the path came from:
 
-- **Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`@lsp-cd`](directives.md) working directory.
-- **Backward directives** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's own directory and **ignore `@lsp-cd`**.
-- **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no working directory (an explicit `@lsp-cd` or one inherited from a parent file) is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
+- **Forward directives** (`# raven: source`, `# raven: run`, `# raven: include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`# raven: cd`](directives.md) working directory.
+- **Backward directives** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's own directory and **ignore `# raven: cd`**.
+- **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no working directory (an explicit `# raven: cd` or one inherited from a parent file) is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
 
 ### Global Symbol Hoisting
 

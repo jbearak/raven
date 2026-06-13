@@ -904,7 +904,7 @@ impl WorldState {
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         if let Some(doc) = self.documents.get(uri) {
             // Parse from `analysis_text()`: masked for Rmd/Quarto (so a
-            // `# @lsp-cd` in prose is ignored while one inside a chunk is a
+            // `# raven: cd` in prose is ignored while one inside a chunk is a
             // real directive), raw for everything else (behavior-neutral).
             return Some(Arc::new(crate::cross_file::directive::parse_directives(
                 &doc.analysis_text(),

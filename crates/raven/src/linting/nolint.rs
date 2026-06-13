@@ -10,9 +10,9 @@
 //!   suppression on the same source line.
 //! * `# nolint start` / `# nolint end` — lintr-style block suppression,
 //!   inclusive of the start and end lines.
-//! * `# @lsp-ignore` — Raven's own line marker; behaves like `# nolint`.
-//! * `# @lsp-ignore-next` — Raven's own marker that suppresses the *following*
-//!   source line.
+//! * `# @lsp-ignore` / `# @lsp-ignore-next` — permanent `@lsp-` aliases for
+//!   `# raven: ignore` / `# raven: ignore-next`; they parse and behave
+//!   identically (the `-next` form suppresses the *following* source line).
 //!
 //! Same-line markers nested inside a commented-code line — `# x <- 1 # nolint`
 //! — are also honoured via a parse-gated fallback (issue #242). The fallback
@@ -143,7 +143,8 @@ enum NolintMarker {
     Line(LineSuppression),
     Start(LineSuppression),
     End,
-    /// `# @lsp-ignore-next` — suppresses the line *after* the marker.
+    /// `# raven: ignore-next` (alias `# @lsp-ignore-next`) — suppresses the
+    /// line *after* the marker.
     NextLine(LineSuppression),
     /// `# raven: ignore-file` — suppresses every line in the file.
     File(LineSuppression),

@@ -43,7 +43,8 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 /// # Transitive Inheritance
 /// When the parent has an inherited_working_directory in its metadata (from its own parent),
 /// that value is used through PathContext::from_metadata. This enables transitive inheritance:
-/// A → B → C where A has @lsp-cd, B inherits from A, and C inherits from B (getting A's WD).
+/// A → B → C where A has `# raven: cd` (the `@lsp-cd` form is a permanent alias that
+/// parses identically), B inherits from A, and C inherits from B (getting A's WD).
 ///
 /// _Requirements: 5.1, 5.3, 9.1, 9.2, 9.3_
 pub fn resolve_parent_working_directory_with_visited<F>(
@@ -161,9 +162,9 @@ pub const DEFAULT_MAX_INHERITANCE_DEPTH: usize = 10;
 /// * `None` - If inheritance should not occur (explicit WD, no backward directives, etc.)
 ///
 /// # Behavior
-/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Skips inheritance if the child file has an explicit `# raven: cd` directive
 /// - Uses the first backward directive (document order) to determine the parent
-/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Resolves the parent path using file-relative resolution (not affected by `# raven: cd`)
 /// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
 /// - Uses default max depth of 10 to prevent infinite chains
 ///
@@ -207,9 +208,9 @@ where
 /// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, or the parent path cannot be resolved)
 ///
 /// # Behavior
-/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Skips inheritance if the child file has an explicit `# raven: cd` directive
 /// - Uses the first backward directive (document order) to determine the parent
-/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Resolves the parent path using file-relative resolution (not affected by `# raven: cd`)
 /// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
 /// - Stops inheritance if max_depth is 0 (depth limit reached)
 /// - Detects cycles and stops inheritance when a cycle is detected
@@ -267,9 +268,9 @@ where
 /// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, or the parent path cannot be resolved)
 ///
 /// # Behavior
-/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Skips inheritance if the child file has an explicit `# raven: cd` directive
 /// - Uses the first backward directive (document order) to determine the parent
-/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Resolves the parent path using file-relative resolution (not affected by `# raven: cd`)
 /// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
 /// - Stops inheritance if max_depth is 0 (depth limit reached)
 /// - Detects cycles and stops inheritance when a cycle is detected (Requirement 9.3)
@@ -343,7 +344,7 @@ where
     );
 
     // Resolve parent URI using file-relative resolution only
-    // IMPORTANT: Backward directive paths ignore both explicit @lsp-cd and inherited
+    // IMPORTANT: Backward directive paths ignore both explicit `# raven: cd` and inherited
     // working directories - they always resolve relative to the file's directory
     // (Requirements 4.1, 4.2, 4.3)
     let backward_ctx = PathContext::new(uri, workspace_root)?;
@@ -426,10 +427,15 @@ pub struct DependencyEdge {
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
-    /// True if the edge was created from an LSP directive (@lsp-source or @lsp-sourced-by)
+    /// True if the edge was created from any Raven directive — forward-family
+    /// (`# raven: source`/`run`/`include`) or backward-family
+    /// (`# raven: sourced-by`/`run-by`/`included-by`) — rather than an
+    /// AST-detected `source()` call.
     pub is_directive: bool,
-    /// True if the directive origin is a backward directive (@lsp-sourced-by / @lsp-run-by).
-    /// False for forward directives (@lsp-source) and AST-detected edges.
+    /// True if the edge originates from a backward-family directive
+    /// (e.g. `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`).
+    /// False for forward-family directives (e.g. `# raven: source`, `# raven: run`,
+    /// `# raven: include`) and AST-detected edges.
     pub is_backward_directive: bool,
 }
 
@@ -642,12 +648,13 @@ impl DependencyGraph {
     {
         let mut result = UpdateResult::default();
 
-        // Build PathContext for forward sources (includes working_directory from @lsp-cd)
-        // IMPORTANT: Forward directives (@lsp-source, @lsp-run, @lsp-include) and AST-detected
-        // source() calls should use the working directory from @lsp-cd for path resolution.
+        // Build PathContext for forward sources (includes working_directory from `# raven: cd`)
+        // IMPORTANT: Forward directives (`# raven: source`, `# raven: run`, `# raven: include`)
+        // and AST-detected source() calls should use the working directory from `# raven: cd`
+        // for path resolution.
         // This is because forward directives are semantically equivalent to source() calls
         // and describe runtime execution behavior where the working directory matters.
-        // Using PathContext::from_metadata() includes both explicit @lsp-cd and inherited
+        // Using PathContext::from_metadata() includes both explicit `# raven: cd` and inherited
         // working directories in the path resolution context.
         // (Requirements 3.1, 3.2, 3.4)
         let path_ctx = match PathContext::from_metadata(uri, meta, workspace_root) {
@@ -656,9 +663,9 @@ impl DependencyGraph {
         };
 
         // Build separate PathContext for backward directives (without any working_directory)
-        // IMPORTANT: Backward directive paths (e.g., @lsp-sourced-by: ../parent.R) should
+        // IMPORTANT: Backward directive paths (e.g., `# raven: sourced-by ../parent.R`) should
         // ALWAYS resolve relative to the child file's directory, regardless of:
-        //   - Explicit @lsp-cd directives in the child file
+        //   - Explicit `# raven: cd` directives in the child file
         //   - Inherited working directory from parent files
         // This is intentional behavior per Requirements 4.1, 4.2, 4.3.
         // Using PathContext::new() ensures neither working_directory nor
@@ -668,11 +675,11 @@ impl DependencyGraph {
             None => return result,
         };
 
-        // Helper to resolve paths for forward sources (@lsp-source directives and source() calls)
-        // Uses PathContext with working_directory from @lsp-cd, enabling paths to resolve
+        // Helper to resolve paths for forward sources (`# raven: source` directives and source() calls)
+        // Uses PathContext with working_directory from `# raven: cd`, enabling paths to resolve
         // relative to the configured working directory rather than the file's directory.
         // Also uses workspace-root fallback for AST source() calls AND forward directives
-        // in files without @lsp-cd — forward directives are semantically equivalent to
+        // in files without `# raven: cd` — forward directives are semantically equivalent to
         // source() calls (see .kiro/specs/lsp-source-directive/) and must resolve identically.
         // Returns Option<Url> - existence is checked later during file read operations.
         let do_resolve = |path: &str| -> Option<Url> {
@@ -700,7 +707,7 @@ impl DependencyGraph {
             .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
         // Snapshot backward edges (incoming `is_backward_directive` edges)
-        // before removal: a `@lsp-sourced-by` directive change rewires the
+        // before removal: a `# raven: sourced-by` directive change rewires the
         // backward map for `uri` and the forward map for each parent, but
         // leaves `forward[uri]` (this file's outgoing edges) untouched.
         // Same full-edge equality applies here.
@@ -729,9 +736,9 @@ impl DependencyGraph {
         let mut directive_edges: Vec<DependencyEdge> = Vec::new();
         let mut directive_from_to: HashSet<FromToPair> = HashSet::new();
 
-        // Process forward directive sources (@lsp-source, @lsp-run, @lsp-include)
-        // Uses do_resolve which includes @lsp-cd working directory in path resolution.
-        // This differs from backward directives which ignore @lsp-cd.
+        // Process forward directive sources (`# raven: source`, `# raven: run`, `# raven: include`)
+        // Uses do_resolve which includes `# raven: cd` working directory in path resolution.
+        // This differs from backward directives which ignore `# raven: cd`.
         // Creates edges optimistically; file existence is validated during file operations.
         // (Requirements 3.1, 3.2, 3.4)
         for source in &meta.sources {
@@ -768,9 +775,9 @@ impl DependencyGraph {
             }
         }
 
-        // Process backward directives (@lsp-sourced-by) - create forward edges from parent to this file
+        // Process backward directives (`# raven: sourced-by`) - create forward edges from parent to this file
         // Uses do_resolve_backward which resolves paths relative to the file's directory,
-        // ignoring both explicit @lsp-cd and inherited working directories (Requirements 4.1-4.3)
+        // ignoring both explicit `# raven: cd` and inherited working directories (Requirements 4.1-4.3)
         for directive in &meta.sourced_by {
             if let Some(parent_uri) = do_resolve_backward(&directive.path) {
                 // Extract child filename for inference
@@ -934,7 +941,7 @@ impl DependencyGraph {
         }
 
         // Detect whether forward OR backward edges changed for this file.
-        // Backward changes (added/removed `@lsp-sourced-by`) don't touch
+        // Backward changes (added/removed `# raven: sourced-by`) don't touch
         // `forward[uri]`, but they DO change the dependency graph that
         // `collect_neighborhood` and `detect_cycle` traverse — so the caches
         // keyed on `edge_revision` must be invalidated for those too. We
@@ -1388,9 +1395,9 @@ impl DependencyGraph {
         for edge in edges_to_check {
             // Use the is_backward_directive flag to distinguish between:
             // - Forward directive edges (is_directive=true, is_backward_directive=false):
-            //   Created by @lsp-source in THIS file - should be removed
+            //   Created by `# raven: source` in THIS file - should be removed
             // - Backward directive edges (is_directive=true, is_backward_directive=true):
-            //   Created by @lsp-sourced-by in OTHER files - should be kept
+            //   Created by `# raven: sourced-by` in OTHER files - should be kept
             // - AST edges (is_directive=false):
             //   Created by source() calls in THIS file - should be removed
 

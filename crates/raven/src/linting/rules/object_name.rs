@@ -314,7 +314,7 @@ fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
 /// Base R S3 generics whose `<generic>.<class>` methods are conventionally
 /// exempt from naming-style enforcement. The list is intentionally finite — if
 /// users define their own generic and want methods exempt, they can suppress
-/// the line with `# nolint` or `# @lsp-ignore`.
+/// the line with `# nolint` or `# raven: ignore` (alias `# @lsp-ignore`).
 ///
 /// Sourced from base R's documented generics across `methods("...")` output
 /// for typical interactive sessions: print/format/summary family,

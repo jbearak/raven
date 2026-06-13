@@ -47,7 +47,7 @@ Maintainer/internal:
 Code (authoritative for behavior):
 - Cross-file: `crates/raven/src/cross_file/` — module docs in `scope.rs`, `revalidation.rs`, `dependency.rs`, `path_resolve.rs`.
 - Indentation: `crates/raven/src/indentation/`
-- Linting: `crates/raven/src/linting/` — opt-in lintr-equivalent rules in Rust, gated by `state.lint_config`. Honors `# nolint` / `# nolint start/end` and `# @lsp-ignore` / `# @lsp-ignore-next`.
+- Linting: `crates/raven/src/linting/` — opt-in lintr-equivalent rules in Rust, gated by `state.lint_config`. Honors `# nolint` / `# nolint start/end` and `# raven: ignore` / `# raven: ignore-next` (and their `@lsp-` aliases).
 - Packages / R subprocess: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs` — the `r_subprocess` module doc spells out the safety invariants every R-subprocess caller must follow.
 - Diagnostic collectors: `crates/raven/src/handlers.rs` — `is_structural_non_reference` is the single source of truth for "structural identifier; not a reference".
 - Config layering: `crates/raven/src/config_file/mod.rs` — `recompute_parsed_configs` is the only writer of the parsed config fields; callers mutate the raw layers and then call it.
@@ -67,12 +67,12 @@ When making significant changes:
 Each item below either spans multiple systems or is a discipline that applies in many places. Per-function invariants live in doc comments next to the function, not in this list.
 
 - **Path resolution**
-  - Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) resolve relative to the file's directory and **ignore `@lsp-cd`** (`PathContext::new`).
-  - Forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`) and AST-detected `source()` calls **respect `@lsp-cd`** when present (`PathContext::from_metadata`).
+  - Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's directory and **ignore `# raven: cd`** (`PathContext::new`).
+  - Forward directives (`# raven: source`, `# raven: run`, `# raven: include`) and AST-detected `source()` calls **respect `# raven: cd`** when present (`PathContext::from_metadata`).
   - See `crates/raven/src/cross_file/path_resolve.rs` and `docs/cross-file.md`.
 
 - **Workspace-root fallback**
-  - For AST-detected `source()` calls AND forward directives (`@lsp-source`, `@lsp-run`, `@lsp-include`), and only when no `@lsp-cd` is explicitly or inheritedly in effect. Forward directives are semantically equivalent to `source()` calls and must resolve identically.
+  - For AST-detected `source()` calls AND forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no `# raven: cd` is explicitly or inheritedly in effect. Forward directives are path-resolution equivalent to `source()` calls and must resolve identically (path resolution only — `# raven: run`/`# raven: include` are not execution-time equivalents of `source()`).
   - Must hold uniformly across dependency-graph resolution, scope resolution, missing-file diagnostics, file-path go-to-definition, and path completion. Never apply to backward directives.
 
 - **Diagnostics publishing monotonicity**

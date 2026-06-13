@@ -172,7 +172,7 @@ Key files under `crates/raven/src/cross_file/`:
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
-- `directive.rs` — Parsing of `@lsp-*` directive comments
+- `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
 - `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)
 - `parent_resolve.rs` — Parent-prefix scope resolution (backward-edge traversal)
@@ -185,8 +185,8 @@ Key files under `crates/raven/src/cross_file/`:
 ### Path resolution invariant (forward vs backward)
 
 There is a deliberate distinction in how relative paths are resolved:
-- **Backward directives** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) are resolved **relative to the child file’s directory**, ignoring `@lsp-cd`.
-- **Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) and AST-detected **`source()` calls** resolve using `@lsp-cd` when present (otherwise file-relative).
+- **Backward directives** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) are resolved **relative to the child file’s directory**, ignoring `# raven: cd`.
+- **Forward directives** (`# raven: source`, `# raven: run`, `# raven: include`) and AST-detected **`source()` calls** resolve using `# raven: cd` when present (otherwise file-relative).
 
 Implementation:
 - Backward directives must use `PathContext::new()`.
@@ -196,9 +196,9 @@ User-facing explanation/examples live in `docs/cross-file.md`.
 
 ### Workspace-root fallback for unannotated codebases
 
-For codebases without `@lsp-cd`, `source()` paths are often written relative to the workspace root.
+For codebases without `# raven: cd`, `source()` paths are often written relative to the workspace root.
 
-For **AST-detected `source()` calls and forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`), Raven attempts:
+For **AST-detected `source()` calls and forward directives** (`# raven: source`, `# raven: run`, `# raven: include`), Raven attempts:
 1. File-relative resolution
 2. If the file does not exist *and* there is no explicit/inherited working directory: try workspace-root-relative resolution
 
@@ -219,7 +219,7 @@ The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX,
 The hash is deterministic and includes:
 - Exported symbols
 - Loaded packages (from `library()` / `require()` / `loadNamespace()`)
-- Declared symbols (from `@lsp-var` / `@lsp-func` directives)
+- Declared symbols (from `# raven: var` / `# raven: func` directives)
 
 The backend uses `old_interface_hash` vs `new_interface_hash` to decide whether to revalidate dependents.
 
@@ -282,7 +282,7 @@ For `.Rmd` / `.qmd` documents, everywhere we store or extract cross-file data we
 - **Raw content** — `DocumentStore::DocumentState.contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.
 - **Masked analysis** — the `tree`, `metadata`, `artifacts`, and `loaded_packages` on those same entries are derived from `chunks::mask_to_r` (chunk bodies only). Byte offsets in the stored `tree` index into the masked text, exposed by `DocumentState::analysis_text()`; pairing the tree with raw content mis-slices.
 
-The single chokepoint helpers live in `cross_file/mod.rs`: `analysis_text_for_path(path, content)` (masks for Rmd, borrows raw otherwise) and `extract_metadata_for_path(path, content)`. Every metadata-extraction site that starts from a path-identified file's raw content (did_open, on-demand indexing, file-cache fallbacks in `state.rs`, the legacy-document arms in `content_provider.rs`) routes through these so `.Rmd` files contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd`/`.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd or a `.R` file's `@lsp-sourced-by` backward directive.
+The single chokepoint helpers live in `cross_file/mod.rs`: `analysis_text_for_path(path, content)` (masks for Rmd, borrows raw otherwise) and `extract_metadata_for_path(path, content)`. Every metadata-extraction site that starts from a path-identified file's raw content (did_open, on-demand indexing, file-cache fallbacks in `state.rs`, the legacy-document arms in `content_provider.rs`) routes through these so `.Rmd` files contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd`/`.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd or a `.R` file's `# raven: sourced-by` backward directive.
 
 ## Package library internals
 

@@ -7,7 +7,7 @@ Raven offers context-aware completions for R symbols, package exports, function 
 | Symbol source | Behavior |
 |---|---|
 | **Local definitions** | Symbols defined in the current file, above the cursor |
-| **Cross-file symbols** | Symbols from sourced files, available after the `source()` call / `@lsp-source` directive |
+| **Cross-file symbols** | Symbols from sourced files, available after the `source()` call / `# raven: source` directive |
 | **Package exports** | Functions and variables from loaded packages, with `{pkg}` attribution |
 | **Function parameters** | Parameter names when inside a function call |
 | **File paths** | `.R`/`.r` files and directories inside `source()` strings and path directives |
@@ -56,7 +56,7 @@ Inside `source()` strings and path-taking directives, Raven completes file paths
 source("utils/  # Offers: utils/helpers.R, utils/config.R, ...
 ```
 
-Path completion respects `@lsp-cd` and workspace-root fallback rules.
+Path completion respects `# raven: cd` and workspace-root fallback rules for forward directives (`# raven: source`, `# raven: run`, `# raven: include`) and `source()` calls. Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) still resolve relative to the file's directory.
 
 ## $ Member Completions
 
@@ -128,7 +128,7 @@ File-local symbols are discovered by scanning the current file for variable decl
 ## Scope Rules Summary
 
 1. Local definitions: available after their definition line
-2. Cross-file symbols: available after the `source()` call / `@lsp-source` directive
+2. Cross-file symbols: available after the `source()` call / `# raven: source` directive
 3. Package exports: available after the `library()` call
 4. Inside function bodies: global definitions are hoisted (all visible regardless of position)
 5. `rm()` / `remove()` calls: removed symbols are excluded from completions

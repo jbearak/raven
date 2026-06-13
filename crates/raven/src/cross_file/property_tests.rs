@@ -19351,8 +19351,9 @@ proptest! {
 
     /// Feature: lsp-source-directive, Property 11 Extended: Diagnostic message format
     ///
-    /// The diagnostic message for a missing file referenced by @lsp-source should
-    /// specifically mention "@lsp-source directive" to distinguish from source() calls.
+    /// The diagnostic message for a missing file referenced by a forward source
+    /// directive should specifically mention "source directive" to distinguish it
+    /// from a bare source() call (prefix-agnostic: `# raven: source` / `@lsp-source`).
     ///
     /// **Validates: Requirements 6.1**
     #[test]
@@ -19418,13 +19419,15 @@ proptest! {
             "Should emit diagnostic for missing file"
         );
 
-        // Property: Diagnostic message should mention "@lsp-source directive"
+        // Property: Diagnostic message should mention "source directive" to
+        // distinguish it from a bare source() call (prefix-agnostic since #421:
+        // `# raven: source` and `@lsp-source` share this wording).
         let has_directive_mention = diagnostics.iter().any(|d| {
-            d.message.contains("@lsp-source directive")
+            d.message.contains("source directive")
         });
         prop_assert!(
             has_directive_mention,
-            "Diagnostic message should mention '@lsp-source directive', got messages: {:?}",
+            "Diagnostic message should mention 'source directive', got messages: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 

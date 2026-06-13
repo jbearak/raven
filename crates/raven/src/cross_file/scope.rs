@@ -578,8 +578,8 @@ pub struct ScopedSymbol {
     /// 0-based UTF-16 column of definition
     pub defined_column: u32,
     pub signature: Option<String>,
-    /// Whether this symbol was declared via @lsp-var or @lsp-func directive
-    /// (as opposed to being statically detected from code)
+    /// Whether this symbol was declared via `# raven: var` or `# raven: func`
+    /// directive (as opposed to being statically detected from code)
     pub is_declared: bool,
 }
 
@@ -612,7 +612,7 @@ pub enum ScopeEvent {
     /// key the timeline is sorted by** (see `event_effect_position`).
     ///
     /// For most definitions the two positions are identical (e.g. `for`
-    /// iterators, function parameters, `@lsp-var` declarations). For
+    /// iterators, function parameters, `# raven: var` declarations). For
     /// `<-`/`=`/`<<-` (and `->`/`->>`) assignments whose value side is
     /// **not** a function definition (after stripping `parenthesized_expression`
     /// wrappers via `unwrap_function_definition`) and for `assign()` calls,
@@ -682,7 +682,7 @@ pub enum ScopeEvent {
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
     },
-    /// A symbol declared via @lsp-var or @lsp-func directive.
+    /// A symbol declared via `# raven: var` or `# raven: func` directive.
     /// These directives allow users to declare symbols that cannot be statically
     /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
     /// The column is set to u32::MAX (end-of-line sentinel) so the symbol is
@@ -1314,8 +1314,9 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
 ///
 /// This is an extended version of `compute_artifacts` that also includes forward directive sources
-/// (`@lsp-source`, `@lsp-run`, `@lsp-include`) from the metadata in the timeline. This ensures that
-/// symbols from files referenced by forward directives are available in scope resolution.
+/// (`# raven: source`, `# raven: run`, `# raven: include`) from the metadata in the timeline. This
+/// ensures that symbols from files referenced by forward directives are available in scope resolution.
+/// (The `@lsp-` forms — e.g. `@lsp-source` — are permanent aliases that parse identically.)
 ///
 /// The function:
 /// - collects symbol and function-scope definitions from the AST,
@@ -1379,7 +1380,7 @@ pub fn compute_artifacts_with_metadata(
     }
 
     // Add directive sources from metadata (if provided) that don't overlap with AST sources
-    // This ensures @lsp-source directives are included in scope resolution
+    // This ensures `# raven: source` directives are included in scope resolution
     if let Some(meta) = metadata {
         for source in &meta.sources {
             if source.is_directive {
@@ -1398,7 +1399,7 @@ pub fn compute_artifacts_with_metadata(
             }
         }
 
-        // Add Declaration events from @lsp-var directives
+        // Add Declaration events from `# raven: var` directives
         // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
         // Also add to exported_interface (later declarations will overwrite earlier ones)
         for decl in &meta.declared_variables {
@@ -1420,7 +1421,7 @@ pub fn compute_artifacts_with_metadata(
             // This is handled by processing declarations in timeline order after sorting
         }
 
-        // Add Declaration events from @lsp-func directives
+        // Add Declaration events from `# raven: func` directives
         // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
         // Also add to exported_interface (later declarations will overwrite earlier ones)
         for decl in &meta.declared_functions {
@@ -4586,7 +4587,7 @@ where
     // Filter backward edges based on the backward dependency mode.
     //
     // - Explicit: Only use backward-directive edges (edges created from
-    //   @lsp-sourced-by directives). Forward-created backward entries from
+    //   `# raven: sourced-by` directives). Forward-created backward entries from
     //   the workspace scan are ignored.
     // - Auto: Use all backward edges, UNLESS the file has explicit backward
     //   directives — then only use those (per-file opt-out).
@@ -6486,7 +6487,7 @@ where
                 column: _,
                 symbol,
             } => {
-                // `@lsp-var`/`@lsp-func` declarations are always global.
+                // `# raven: var`/`# raven: func` declarations are always global.
                 let frame = &mut self.global_strict_frame;
                 // Mirror the recursive resolver's
                 // `entry().and_modify().or_insert_with()` semantics:

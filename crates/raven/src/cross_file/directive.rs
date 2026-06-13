@@ -160,9 +160,10 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 }
 
 /// Keyword alternation for forward source directives: `@lsp-source`, `@lsp-run`,
-/// `@lsp-include`. This is the inner body of the `@lsp-(?:…)` group only — the
-/// surrounding regex (anchoring, separator, capture groups) is supplied by each
-/// call site.
+/// `@lsp-include` (and their `# raven: source` / `run` / `include` aliases).
+/// This is the inner body of the `(?:@lsp-|raven:\s*)(?:…)` group only — the
+/// surrounding regex (prefix, anchoring, separator, capture groups) is supplied
+/// by each call site.
 ///
 /// Single source of truth: the directive vocabulary is recognized by two
 /// independent regex sets — the full parser in [`patterns`] (capture groups,
@@ -170,13 +171,30 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 /// `file_path_intellisense::directive_path_patterns`. Those sets differ
 /// deliberately in everything *except* the keyword vocabulary, so only the
 /// alternation bodies are shared here to keep the recognized keywords from
-/// drifting between them.
+/// drifting between them. Both prefixes (`@lsp-` and `# raven:`) are likewise
+/// accepted by both sets; `@lsp-` is a permanent alias of the canonical
+/// `# raven:` form (#421).
 pub(crate) const FORWARD_DIRECTIVE_KEYWORDS: &str = "source|run|include";
 
 /// Keyword alternation for backward provenance directives: `@lsp-sourced-by`,
 /// `@lsp-run-by`, `@lsp-included-by`. See [`FORWARD_DIRECTIVE_KEYWORDS`] for why
 /// this is factored out.
 pub(crate) const BACKWARD_DIRECTIVE_KEYWORDS: &str = "sourced-by|run-by|included-by";
+
+/// Prefix alternation accepted by every structural directive family: the
+/// canonical `# raven:` form and the permanent `@lsp-` alias (#421). It is the
+/// regex slice that sits between the `#\s*` comment opener and the keyword
+/// group, e.g. `^\s*#\s*` + `DIRECTIVE_PREFIX` + `(?:source|run|include)`.
+///
+/// Shared — for the same no-drift reason as [`FORWARD_DIRECTIVE_KEYWORDS`] —
+/// across both directive regex sets (the full parser in [`patterns`] and the
+/// path-context matcher in `file_path_intellisense::directive_path_patterns`),
+/// so the two seams cannot disagree about which prefixes are accepted. The
+/// suppression patterns are deliberately *not* built from this const: they keep
+/// separate `@lsp-`/`raven:` regexes because their shapes diverge (e.g.
+/// `@lsp-ignore` permits a trailing `:?`, and the block/file forms exist only
+/// under `raven:`).
+pub(crate) const DIRECTIVE_PREFIX: &str = r"(?:@lsp-|raven:\s*)";
 
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
@@ -188,10 +206,18 @@ fn patterns() -> &'static DirectivePatterns {
         // The forward/backward keyword alternations are shared with
         // file_path_intellisense via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS,
         // plugged into the middle of each pattern by concatenation.
+        // Every structural family accepts either prefix via the shared
+        // [`DIRECTIVE_PREFIX`] alternation: `# raven:` is the canonical
+        // user-facing form and `@lsp-` a permanent alias (#421). The keyword
+        // groups are disjoint from the suppression verbs (`ignore`/`expect`),
+        // so `# raven: ignore` still routes to the suppression patterns below
+        // and `# raven: source` to `forward`.
         DirectivePatterns {
             backward: Regex::new(
                 &[
-                    r#"^\s*#\s*@lsp-(?:"#,
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     BACKWARD_DIRECTIVE_KEYWORDS,
                     r#")\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#,
                 ]
@@ -200,7 +226,9 @@ fn patterns() -> &'static DirectivePatterns {
             .unwrap(),
             forward: Regex::new(
                 &[
-                    r#"^\s*#\s*@lsp-(?:"#,
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     FORWARD_DIRECTIVE_KEYWORDS,
                     r#")(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?"#,
                 ]
@@ -208,8 +236,14 @@ fn patterns() -> &'static DirectivePatterns {
             )
             .unwrap(),
             working_dir: Regex::new(
-                r#"^\s*#\s*@lsp-(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
-            ).unwrap(),
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
+            )
+            .unwrap(),
             ignore: Regex::new(
                 r"#\s*@lsp-(ignore|expect)(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
@@ -247,14 +281,24 @@ fn patterns() -> &'static DirectivePatterns {
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 1.1, 1.2, 1.3
             declare_var: Regex::new(
-                r#"^\s*#\s*@lsp-(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
             ).unwrap(),
             // Declaration directives for functions
             // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 2.1, 2.2, 2.3
             declare_func: Regex::new(
-                r#"^\s*#\s*@lsp-(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
             ).unwrap(),
         }
     })
@@ -1946,5 +1990,157 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.sourced_by.len(), 1);
         assert_eq!(meta.sourced_by[0].path, "../main.R");
+    }
+
+    // ---- #421: `# raven:` aliases for all structural directive families ----
+    //
+    // `# raven:` is the canonical user-facing prefix; `@lsp-` remains a
+    // permanent alias. The structural families share their keyword vocabulary
+    // and grammar with the `@lsp-` forms, so these tests assert parity (same
+    // parse result for both prefixes) plus a near-miss matrix.
+
+    #[test]
+    fn raven_forward_directive_parity() {
+        let lsp = parse_directives("# @lsp-source utils.R");
+        let raven = parse_directives("# raven: source utils.R");
+        assert_eq!(raven.sources.len(), 1);
+        assert_eq!(raven.sources[0].path, "utils.R");
+        assert!(raven.sources[0].is_directive);
+        assert_eq!(raven.sources[0].path, lsp.sources[0].path);
+    }
+
+    #[test]
+    fn raven_forward_directive_colon_quotes_line() {
+        let meta = parse_directives(r#"# raven: source: "utils/helpers.R" line=20"#);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils/helpers.R");
+        assert_eq!(meta.sources[0].line, 19); // 1-based 20 -> 0-based 19
+    }
+
+    #[test]
+    fn raven_forward_directive_no_space_after_colon() {
+        // `raven:\s*` permits zero spaces, mirroring the suppression grammar.
+        let meta = parse_directives("# raven:source utils.R");
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+    }
+
+    #[test]
+    fn raven_forward_synonyms_all() {
+        for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
+            let meta = parse_directives(&format!("# raven: {kw} utils.R"));
+            assert_eq!(meta.sources.len(), 1, "raven: {kw} failed");
+            assert_eq!(meta.sources[0].path, "utils.R", "raven: {kw} path");
+        }
+    }
+
+    #[test]
+    fn raven_backward_directive_parity() {
+        let lsp = parse_directives("# @lsp-sourced-by ../main.R line=15");
+        let raven = parse_directives("# raven: sourced-by ../main.R line=15");
+        assert_eq!(raven.sourced_by.len(), 1);
+        assert_eq!(raven.sourced_by[0].path, "../main.R");
+        assert_eq!(raven.sourced_by[0].call_site, CallSiteSpec::Line(14));
+        assert_eq!(raven.sourced_by[0].call_site, lsp.sourced_by[0].call_site);
+    }
+
+    #[test]
+    fn raven_backward_synonyms_and_match() {
+        for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
+            let meta = parse_directives(&format!(r#"# raven: {kw} ../main.R match="source(""#));
+            assert_eq!(meta.sourced_by.len(), 1, "raven: {kw} failed");
+            assert_eq!(
+                meta.sourced_by[0].call_site,
+                CallSiteSpec::Match("source(".to_string()),
+                "raven: {kw} match"
+            );
+        }
+    }
+
+    #[test]
+    fn raven_working_directory_parity_and_synonyms() {
+        for kw in [
+            "working-directory",
+            "working-dir",
+            "current-directory",
+            "current-dir",
+            "cd",
+            "wd",
+        ] {
+            let meta = parse_directives(&format!("# raven: {kw} /data/scripts"));
+            assert_eq!(
+                meta.working_directory,
+                Some("/data/scripts".to_string()),
+                "raven: {kw} failed"
+            );
+        }
+    }
+
+    #[test]
+    fn raven_declaration_directives_parity_and_synonyms() {
+        for kw in ["var", "variable", "declare-var", "declare-variable"] {
+            let meta = parse_directives(&format!("# raven: {kw} myvar"));
+            assert_eq!(meta.declared_variables.len(), 1, "raven: {kw} failed");
+            assert_eq!(meta.declared_variables[0].name, "myvar");
+            assert!(!meta.declared_variables[0].is_function);
+        }
+        for kw in ["func", "function", "declare-func", "declare-function"] {
+            let meta = parse_directives(&format!("# raven: {kw} myfunc"));
+            assert_eq!(meta.declared_functions.len(), 1, "raven: {kw} failed");
+            assert_eq!(meta.declared_functions[0].name, "myfunc");
+            assert!(meta.declared_functions[0].is_function);
+        }
+    }
+
+    /// `# raven: ignore` must still route to suppression, not the structural
+    /// branches — the structural keyword groups are disjoint from ignore/expect.
+    #[test]
+    fn raven_ignore_still_routes_to_suppression_not_structural() {
+        let meta = parse_directives("x <- undefined # raven: ignore");
+        assert!(is_line_ignored(&meta, 0));
+        assert_eq!(meta.sources.len(), 0);
+        assert_eq!(meta.declared_variables.len(), 0);
+        assert_eq!(meta.declared_functions.len(), 0);
+    }
+
+    /// Header-only parity: `# raven: sourced-by` / `# raven: cd` after code are
+    /// ignored, exactly like their `@lsp-` forms.
+    #[test]
+    fn raven_backward_and_cd_are_header_only() {
+        let meta = parse_directives("x <- 1\n# raven: sourced-by ../main.R\n# raven: cd /data");
+        assert_eq!(meta.sourced_by.len(), 0);
+        assert_eq!(meta.working_directory, None);
+    }
+
+    /// Forward directives are not header-only: `# raven: source` is recognised
+    /// mid-file, matching `@lsp-source`.
+    #[test]
+    fn raven_forward_recognised_after_code() {
+        let meta = parse_directives("x <- 1\n# raven: source utils.R");
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].path, "utils.R");
+    }
+
+    /// Near-miss matrix: lookalikes that must NOT parse as raven directives.
+    #[test]
+    fn raven_structural_near_misses_do_not_match() {
+        let cases = [
+            "# raven source utils.R",   // missing colon
+            "# ravens: source utils.R", // wrong namespace
+            "# ravenx: cd /data",       // wrong namespace
+            "# raven :source utils.R",  // space before colon
+            "# raven: sourc utils.R",   // not a keyword
+        ];
+        for c in cases {
+            let meta = parse_directives(c);
+            assert_eq!(meta.sources.len(), 0, "should not match forward: {c:?}");
+            assert_eq!(meta.working_directory, None, "should not set wd: {c:?}");
+            assert_eq!(meta.sourced_by.len(), 0, "should not match backward: {c:?}");
+            assert_eq!(
+                meta.declared_variables.len(),
+                0,
+                "should not declare var: {c:?}"
+            );
+        }
     }
 }
