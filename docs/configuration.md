@@ -62,7 +62,7 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`
 | Setting | Default | Description |
 |---|---|---|
 | `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
-| `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require `@lsp-sourced-by` directives. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
+| `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require `# raven: sourced-by` directives. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
 | `raven.crossFile.hoistGlobalsInFunctions` | `true` | Hoist global definitions inside function bodies (late-binding semantics). See [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting). *LSP init-only — not exposed in the VS Code Settings UI.* |
 | `raven.crossFile.assumeCallSite` | `"end"` | Default call site when not specified by directive (`"end"` or `"start"`) |
 | `raven.crossFile.maxBackwardDepth` | `10` | Maximum depth for backward directive traversal |
@@ -101,7 +101,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
 | `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
 | `raven.crossFile.outOfScopeSeverity` | `"warning"` | Symbol used before it's in scope |
-| `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `@lsp-source` directive |
+| `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `# raven: source` directive |
 | `raven.diagnostics.mixedLogicalSeverity` | `"warning"` | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (not wrapped in parentheses). Since `&` binds tighter than `\|` in R, the grouping is silent — the rule asks for explicit parentheses. Applies everywhere, not just inside `if` / `while` conditions. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | Binary `=` used directly inside an `if` / `while` condition (likely `==` intended). |
 | `raven.diagnostics.reportUnusedSuppressions` | `false` | Report **every** suppression directive that suppressed nothing as an `unused-suppression` hint, not just `# raven: expect[...]` directives. With the default `false`, only `expect` directives are checked; a plain `# raven: ignore` / `# @lsp-ignore` / `# nolint` stays silent even when it matched no diagnostic. Pyright-style; the hint is HINT severity, so it never gates `raven check --max-severity error` by default. Available in `raven.toml` (`[diagnostics] reportUnusedSuppressions = true`) and honored by `raven check`. See [Directives → Ignore Directives](directives.md#ignore-directives). |

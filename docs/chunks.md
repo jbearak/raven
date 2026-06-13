@@ -30,9 +30,9 @@ These features apply only inside R chunk bodies. On prose, YAML front matter, or
 
 ### Cross-file resolution from chunks
 
-Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk bodies, never prose. A `source("helpers.R")` written inside an R chunk creates a real dependency edge — symbols defined in the sourced file resolve in later chunks, and a missing target is flagged — while the same text in prose or a comment outside a chunk is ignored. `library()` calls and `# @lsp-cd` / `@lsp-sourced-by`-style directives are likewise honored only inside chunks.
+Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk bodies, never prose. A `source("helpers.R")` written inside an R chunk creates a real dependency edge — symbols defined in the sourced file resolve in later chunks, and a missing target is flagged — while the same text in prose or a comment outside a chunk is ignored. `library()` calls and `# raven: cd` / `# raven: sourced-by`-style directives are likewise honored only inside chunks.
 
-The relationship also works in the other direction: a plain `.R` file can declare `# @lsp-sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
+The relationship also works in the other direction: a plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
 
 ### Suppressing diagnostics in a chunk
 

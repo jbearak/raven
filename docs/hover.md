@@ -12,7 +12,7 @@ Hovering over an identifier shows what the symbol is, where it's defined, and �
 | Named-argument label resolving to a user-defined function's formal (`param` in `f(param = …)`) | A code block with the formal (and its default), *parameter of* `f`, and the formal's `@param` doc when documented |
 | Function-parameter name at a definition site (`x` in `f <- function(x)`) | The parameter's `@param` roxygen — when the enclosing *named* function is documented |
 | `obj$name` / `obj@slot` member with a *local* member definition | A code block with that member's definition statement and a file-location line (parity with go-to-definition) |
-| Symbol declared via `@lsp-var` / `@lsp-func` | `name (declared function\|variable)` + the directive and line where it's declared |
+| Symbol declared via `# raven: var` / `# raven: func` | `name (declared function\|variable)` + the directive and line where it's declared |
 | Package export in scope (via `library()` / `require()` / `loadNamespace()` / directives) | Bold `pkg::name` help-panel link + R help text |
 | Built-in or otherwise unresolved symbol | R help text, if R has a topic for it |
 
@@ -47,7 +47,7 @@ The relative path is computed against the workspace root when one is available, 
 
 ## Declared Symbols
 
-Symbols declared via [`@lsp-var` or `@lsp-func`](directives.md#declaration-directives) hover as an R code block with the declaration, followed by the directive line and (for cross-file declarations) a file attribution. For a function declared in another file, the hover renders the code block:
+Symbols declared via [`# raven: var` or `# raven: func`](directives.md#declaration-directives) hover as an R code block with the declaration, followed by the directive line and (for cross-file declarations) a file attribution. For a function declared in another file, the hover renders the code block:
 
 ```r
 name (declared function)
@@ -98,7 +98,7 @@ This isn't a Raven bug. Both extensions are answering the hover request independ
 - [Cross-File & Package Awareness](cross-file.md) — the scope and dependency model hover uses
 - [Go-to-Definition](go-to-definition.md) — follows the same file-location link hover displays
 - [Help Viewer](help-viewer.md) — the panel opened by the bold `pkg::name` link at the top of a hover
-- [Directives](directives.md) — `@lsp-var` / `@lsp-func` declaration format
+- [Directives](directives.md) — `# raven: var` / `# raven: func` declaration format
 - [Completions](completion.md) — shares the position-aware scope model with hover
 - [Diagnostics](diagnostics.md) — if hover resolves a symbol, the diagnostics pass won't flag it as undefined
 - [Comparison: Hover help](comparison.md#hover-help) — how Raven's scope-aware attribution differs from REditorSupport's

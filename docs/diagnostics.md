@@ -9,8 +9,8 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 ## Quick Reference
 
 - **Silence one site** — add `# raven: ignore` on the line (or `# raven: ignore-next` on the line above). `# @lsp-ignore` is a permanent alias. See [Suppressing diagnostics](#suppressing-diagnostics)
-- **Declare a symbol the analyzer can't see** — use [`@lsp-var`, `@lsp-func`](directives.md#declaration-directives)
-- **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `@lsp-sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
+- **Declare a symbol the analyzer can't see** — use [`# raven: var`, `# raven: func`](directives.md#declaration-directives)
+- **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `# raven: sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
 - **Turn a category off globally** — set the matching severity to `"off"` (see [Configuration](configuration.md))
 - **Disable everything** — set `raven.diagnostics.enabled` to `false`
 
@@ -28,7 +28,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 |---|---|---|
 | `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
 | `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
-| `unresolved-source-path` | A `source()` / `@lsp-source` path that does not resolve to a file | No |
+| `unresolved-source-path` | A `source()` / `# raven: source` path that does not resolve to a file | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
 | `package-not-installed` | `library()` / `require()` of a package that is not installed | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
@@ -92,8 +92,8 @@ If the symbol is defined later in the same file at top level, the message also r
 - A definition above the usage in the same file
 - A definition in a sourced file (via `source()` or directives)
 - A package export from a loaded `library()`
-- A declaration directive (`@lsp-var`, `@lsp-func`)
-- An `@lsp-ignore` on the line
+- A declaration directive (`# raven: var`, `# raven: func`)
+- A `# raven: ignore` on the line
 
 Raven also recognizes a few call forms that bind a name at runtime, so the bound name resolves without a directive:
 - `assign("x", ...)` and write/append-mode `textConnection("x", "w")` bind `x`.
@@ -160,7 +160,7 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 - `raven.diagnostics.undefinedVariableInCallArguments` (default `true`)
 - `raven.diagnostics.undefinedVariableInBracketIndices` (default `true`)
 
-**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`), `tidyr::gather` key/value outputs, `tidytext` (`unnest_tokens`/`bind_tf_idf`), `modelr::data_grid`, `drake::readd`, rlang capture helpers, `survival::tmerge` time-dependent terms, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. Use `# nolint`, `@lsp-ignore`, or the opt-out settings as escape hatches.
+**Limitations:** The NSE policy table covers the common, slow-moving surface (base/utils metaprogramming and object-name helpers, default-attached `stats` model-fitting `subset`/`weights` data-masking, `dplyr`/`tidyr` data-masking and tidy-select verbs including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`, `tibble`/`targets` constructors and target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes` step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`), `tidyr::gather` key/value outputs, `tidytext` (`unnest_tokens`/`bind_tf_idf`), `modelr::data_grid`, `drake::readd`, rlang capture helpers, `survival::tmerge` time-dependent terms, a few DSLs) but is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive. In data.table projects, an unresolved non-data.table object such as `df[typo, ]` may be silently skipped. Use `# nolint`, `# raven: ignore`, or the opt-out settings as escape hatches.
 
 ### Package Diagnostics
 
@@ -196,13 +196,13 @@ With missing-package off by default in `raven check`, a genuine typo such as `li
 | Circular dependency | error | Two files source each other (directly or transitively) |
 | Max chain depth exceeded | warning | Source chain exceeds configured maximum depth |
 | Out-of-scope symbol | warning | Symbol from a sourced file used before the `source()` call |
-| Redundant directive | hint | `@lsp-source` directive for a file already brought in by an earlier `source()` call |
+| Redundant directive | hint | `# raven: source` directive for a file already brought in by an earlier `source()` call |
 
-These dependency-graph diagnostics are **not** suppressible with `# @lsp-ignore`; turn each off via its severity setting (see [Configuration](configuration.md)). The out-of-scope-symbol diagnostic is the exception — it honors `# @lsp-ignore` / `# @lsp-ignore-next` on the offending usage line.
+These dependency-graph diagnostics are **not** suppressible with `# raven: ignore`; turn each off via its severity setting (see [Configuration](configuration.md)). The out-of-scope-symbol diagnostic is the exception — it honors `# raven: ignore` / `# raven: ignore-next` on the offending usage line.
 
 ### Assignment Targets
 
-Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side. Both tiers honor `# @lsp-ignore` / `# @lsp-ignore-next` on the affected line.
+Always on whenever diagnostics are enabled; not configurable per rule. Applies to every assignment operator: `<-`, `<<-`, `=`, `->`, `->>`. For right-arrow operators the target is the right-hand side; for the others it's the left-hand side. Both tiers honor `# raven: ignore` / `# raven: ignore-next` on the affected line.
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
@@ -219,14 +219,14 @@ Always on whenever diagnostics are enabled; not configurable per rule. Applies t
 
 ### Semantic Warnings
 
-Always-on diagnostics that flag likely-wrong code — not style preferences. Active as long as `raven.diagnostics.enabled` is true. Configurable severity via `raven.diagnostics.*`; honor `# @lsp-ignore` / `# @lsp-ignore-next` and `# nolint`.
+Always-on diagnostics that flag likely-wrong code — not style preferences. Active as long as `raven.diagnostics.enabled` is true. Configurable severity via `raven.diagnostics.*`; honor `# raven: ignore` / `# raven: ignore-next` and `# nolint`.
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
 | Mixed logical operators | warning | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (no parentheses), e.g. `a & b \| c`. `&` binds more tightly than `\|` in R, making the grouping easy to mis-read. Stops at call/subset boundaries |
 | Condition assignment | warning | `=` used as a binary operator directly inside an `if` / `while` condition (`if (x = 1)`). R rejects this as a syntax error at runtime; tree-sitter-r accepts it silently. Stops at call, parenthesized-expression, and braced-expression boundaries |
 
-**Suppression:** `# @lsp-ignore` on the line, `# @lsp-ignore-next` on the line above, or `# nolint` (with optional rule names `mixed_logical`, `condition_assignment`).
+**Suppression:** `# raven: ignore` on the line, `# raven: ignore-next` on the line above, or `# nolint` (with optional rule names `mixed_logical`, `condition_assignment`).
 
 **Settings:** `raven.diagnostics.mixedLogicalSeverity` (default `"warning"`), `raven.diagnostics.conditionAssignmentSeverity` (default `"warning"`).
 
@@ -259,32 +259,32 @@ Lint diagnostics carry the `source` field `raven (lint)` so they're easy to dist
 
 The infix-spaces lint flags two opposing cases. **Spaces required** on both sides: arithmetic (`+`, `-`, `*`, `/`, `^`), comparison (`<`, `<=`, `==`, `!=`, ...), logical (`&`, `&&`, `|`, `||`), assignment (`<-`, `<<-`, `->`, `->>`, `=`), pipe (`|>`, `%>%`, any `%...%`), and binary formula (`y ~ x`). **No spaces** on either side: sequence (`:`), namespace (`::`, `:::`), member access (`$`, `@`), and unary `-`, `+`, `!`, `?`. The rule is conservative — alignment whitespace (`x   <- 1`) is not flagged, and line-continuation cases (operator at end of line, RHS on the next line) are skipped since the line break supplies the separation.
 
-The commented-code lint groups consecutive standalone comment lines and try-parses their bodies as R. A block is reported when it parses without errors **and** contains at least one call, assignment, binary/unary operator, function definition, or control-flow construct — bare identifiers and literals are treated as prose. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged. Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines (`# -*- ... -*-`), and `# nolint` / `# @lsp-…` directives are skipped up front.
+The commented-code lint groups consecutive standalone comment lines and try-parses their bodies as R. A block is reported when it parses without errors **and** contains at least one call, assignment, binary/unary operator, function definition, or control-flow construct — bare identifiers and literals are treated as prose. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged. Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines (`# -*- ... -*-`), and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped up front.
 
 The object-name lint has independent style settings for **functions** (`objectNameStyleFunction`), **variables** (`objectNameStyleVariable`), and **arguments** (`objectNameStyleArgument`). Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Using `any` accepts all names for that kind — since the three are checked independently, you can enforce a style on two while opting out of the third.
 
 > [!NOTE]
 > Some names are always accepted regardless of the configured style:
 > - An optional leading `.` is always valid; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not).
-> - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# @lsp-ignore`.
+> - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# raven: ignore`.
 > - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) and non-ASCII identifiers are skipped entirely.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 
 - `# nolint` on a line suppresses lints on that line (rule-name filters like `# nolint: line_length` narrow suppression to the named rules).
 - `# nolint start` / `# nolint end` brackets a region.
-- The standard `# @lsp-ignore` and `# @lsp-ignore-next` markers also apply to lint diagnostics.
+- The standard `# raven: ignore` and `# raven: ignore-next` markers also apply to lint diagnostics.
 
 ## Suppression
 
-### Per-Line: @lsp-ignore
+### Per-Line: `# raven: ignore`
 
 ```r
-x <- unknown_var # @lsp-ignore
+x <- unknown_var # raven: ignore
 ```
 
 ```r
-# @lsp-ignore-next
+# raven: ignore-next
 x <- unknown_var
 ```
 
@@ -292,8 +292,8 @@ x <- unknown_var
 
 ```r
 load("data.RData")
-# @lsp-var model_fit
-# @lsp-var training_data
+# raven: var model_fit
+# raven: var training_data
 x <- model_fit  # No warning
 ```
 
@@ -340,7 +340,7 @@ In R Markdown (`.Rmd`) and Quarto (`.qmd`) documents, the R code inside chunks i
 - Prose, YAML, markdown links, and non-R chunks never produce diagnostics.
 - Symbols defined in one R chunk are in scope in later R chunks (the chunks share a single analysis), so a variable assigned in an early chunk and used in a later one is not flagged as undefined.
 - Chunk options that only affect knitr execution (such as `eval=FALSE`) suppress diagnostics for that chunk body — it may hold intentionally incomplete snippets — but language intelligence (completions, semantic tokens, indentation) still works inside it.
-- `# nolint` markers and `# @lsp-ignore` directives work inside chunks just as in plain R.
+- `# nolint` markers and `# raven: ignore` directives work inside chunks just as in plain R.
 
 ### Parameterized reports (`params`)
 
