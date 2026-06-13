@@ -85,11 +85,11 @@ pub struct DeclaredSymbol {
 /// names the captured/data-masked formals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NseScope {
-    /// `# raven: nse my_func` — suppress undefined-variable in every argument.
+    /// `# raven: nse my_func` (or empty parens `my_func()`) — suppress
+    /// undefined-variable in every argument.
     WholeCall,
     /// `# raven: nse my_func(x, y)` — suppress only arguments bound to these
-    /// formals. Never empty (an empty parameter list is malformed and dropped
-    /// during parsing).
+    /// formals. Never empty: empty parens parse as [`NseScope::WholeCall`].
     Formals(Vec<String>),
 }
 

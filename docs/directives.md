@@ -190,9 +190,6 @@ Installed-package functions expose only export names (not formals) to the
 synchronous diagnostic pass, so positional matching for an installed-package
 callee also requires a paired `# raven: func` with formals.
 
-Malformed forms — `# raven: nse my_func()` with empty parentheses, or the
-bracket form `# raven: nse[...]` — are ignored rather than blanket-suppressing.
-
 ### Position-Aware Behavior
 
 Declared symbols are available starting from the next line (line N+1):

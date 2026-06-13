@@ -682,11 +682,12 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     }
                     None => (None, raw.to_string()),
                 };
-                let scope = match caps.get(2) {
-                    Some(body) => match split_formal_list(body.as_str()) {
-                        Some(formals) => NseScope::Formals(formals),
-                        None => continue,
-                    },
+                // No parentheses (`nse f`) and empty parentheses (`nse f()`)
+                // both mean whole-call NSE — `f()` lists zero captured formals,
+                // which is most naturally read as "same as no parens" rather
+                // than a silent no-op. A non-empty list is per-formal.
+                let scope = match caps.get(2).and_then(|b| split_formal_list(b.as_str())) {
+                    Some(formals) => NseScope::Formals(formals),
                     None => NseScope::WholeCall,
                 };
                 meta.nse_declarations.push(NseDeclaration {
@@ -2256,12 +2257,24 @@ x <- undefined"#;
         for line in [
             "# raven: nse",
             "# raven: nse ()",
-            "# raven: nse my_func()",
             "# raven: nse[my_func(x)]",
         ] {
             let meta = parse_directives(&format!("{line}\n"));
             assert!(meta.nse_declarations.is_empty(), "case: {line}");
         }
+    }
+
+    #[test]
+    fn nse_empty_parens_is_whole_call() {
+        // `nse f()` lists zero captured formals — treated as whole-call, the
+        // same as the parenless `nse f` form.
+        let meta = parse_directives("# raven: nse my_func()\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(meta.nse_declarations[0].name, "my_func");
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            crate::cross_file::types::NseScope::WholeCall
+        );
     }
 
     #[test]
