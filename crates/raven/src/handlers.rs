@@ -12670,39 +12670,52 @@ enum LocalCalleeAlias {
     Unknown,
 }
 
-/// Classify the RHS of a top-level identifier assignment as a callee binding
-/// for the direct-call NSE policy (issue #450). Mirrors
-/// [`value_may_bind_function`]'s callable/non-callable split, but additionally
-/// distinguishes a qualified alias (`pkg::name`) from any other computed
-/// callable so the resolver can preserve simple aliases' policies.
-enum CalleeBinding {
-    /// `name <- function(...) ...` — tracked via `local_function_defs`.
-    Definition,
-    /// `name <- pkg::target` / `pkg:::target`.
-    Qualified { package: String, name: String },
-    /// Any other value that may be callable (`get_filter()`, `some_fn`, …).
-    UnknownCallable,
-    /// An obvious non-function literal (`1`, `"x"`, `TRUE`, `NULL`, …) — does
-    /// not shadow R's function lookup.
-    NonCallable,
+/// How a top-level identifier's last binding presents in call position, for the
+/// direct-call NSE policy (issue #450). A literal definition keeps its own
+/// inferred policy; any other callable value is an alias/rebinding tracked in
+/// `local_callee_aliases`. A non-callable literal yields `None` — it does not
+/// shadow R's function lookup, which skips non-functions in call position.
+enum LocalCalleeBinding<'t> {
+    /// `name <- function(...) ...` — recorded in `local_function_defs`; the
+    /// node is carried so the caller stores exactly what was classified.
+    Definition(Node<'t>),
+    /// A non-literal callable value (`stats::filter`, `get_filter()`, …).
+    Alias(LocalCalleeAlias),
 }
 
-/// Determine the [`CalleeBinding`] kind of an assignment's value node.
-fn classify_callee_binding(value: Node, text: &str) -> CalleeBinding {
-    let value = unwrap_parenthesized(value);
+/// Classify an assignment's value node as a [`LocalCalleeBinding`], or `None`
+/// for an obvious non-function literal. `value` must already be
+/// parenthesis-unwrapped (the caller does this once). Mirrors
+/// [`value_may_bind_function`]'s callable/non-callable split, but additionally
+/// distinguishes a qualified alias (`pkg::name`) — whose target policy is
+/// preserved — from any other computed callable.
+fn classify_callee_binding<'t>(value: Node<'t>, text: &str) -> Option<LocalCalleeBinding<'t>> {
     match value.kind() {
-        "function_definition" => CalleeBinding::Definition,
-        "namespace_operator" => value
-            .child_by_field_name("lhs")
-            .zip(value.child_by_field_name("rhs"))
-            .map(|(pkg, target)| CalleeBinding::Qualified {
-                package: node_text(pkg, text).to_string(),
-                name: node_text(target, text).to_string(),
-            })
-            .unwrap_or(CalleeBinding::UnknownCallable),
-        _ if value_may_bind_function(value, text) => CalleeBinding::UnknownCallable,
-        _ => CalleeBinding::NonCallable,
+        "function_definition" => Some(LocalCalleeBinding::Definition(value)),
+        "namespace_operator" => Some(LocalCalleeBinding::Alias(
+            match namespace_parts(value, text) {
+                Some((package, target)) => LocalCalleeAlias::Qualified {
+                    package: package.to_string(),
+                    name: target.to_string(),
+                },
+                None => LocalCalleeAlias::Unknown,
+            },
+        )),
+        _ if value_may_bind_function(value, text) => {
+            Some(LocalCalleeBinding::Alias(LocalCalleeAlias::Unknown))
+        }
+        _ => None,
     }
+}
+
+/// The `(package, name)` text of a `namespace_operator` node (`pkg::name` /
+/// `pkg:::name`), or `None` if either side is missing. Shared by the NSE
+/// callee-classification and policy-resolution paths so the grammar's `lhs` /
+/// `rhs` field names are named in exactly one place.
+fn namespace_parts<'t>(node: Node<'t>, text: &'t str) -> Option<(&'t str, &'t str)> {
+    let lhs = node.child_by_field_name("lhs")?;
+    let rhs = node.child_by_field_name("rhs")?;
+    Some((node_text(lhs, text), node_text(rhs, text)))
 }
 
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
@@ -13050,38 +13063,28 @@ fn collect_nse_facts<'t>(
         let value = unwrap_parenthesized(value);
         // Callee-binding bookkeeping for the NSE policy resolver (issue #450).
         // `local_function_defs`, `local_callee_aliases`, and the shadow set are
-        // kept consistent under last-binding-wins: every top-level rebinding of
-        // a name clears its stale entry in the maps it no longer belongs to, so
-        // the three structures never disagree about what `name` currently is.
+        // kept consistent under last-binding-wins: a name is in the shadow set
+        // iff its last binding is callable, lives in exactly one of the
+        // definition / alias maps, and a rebinding clears the map it no longer
+        // belongs to — so the structures never disagree about what `name` is.
         match classify_callee_binding(value, text) {
-            CalleeBinding::Definition => {
-                local_function_defs.insert(name.to_string(), value);
-                local_callee_aliases.remove(name);
+            Some(binding) => {
                 local_callee_shadows.insert(name.to_string());
+                match binding {
+                    LocalCalleeBinding::Definition(def) => {
+                        local_function_defs.insert(name.to_string(), def);
+                        local_callee_aliases.remove(name);
+                    }
+                    LocalCalleeBinding::Alias(alias) => {
+                        local_callee_aliases.insert(name.to_string(), alias);
+                        local_function_defs.remove(name);
+                    }
+                }
             }
-            CalleeBinding::Qualified {
-                package,
-                name: target,
-            } => {
-                local_callee_aliases.insert(
-                    name.to_string(),
-                    LocalCalleeAlias::Qualified {
-                        package,
-                        name: target,
-                    },
-                );
-                local_function_defs.remove(name);
-                local_callee_shadows.insert(name.to_string());
-            }
-            CalleeBinding::UnknownCallable => {
-                local_callee_aliases.insert(name.to_string(), LocalCalleeAlias::Unknown);
-                local_function_defs.remove(name);
-                local_callee_shadows.insert(name.to_string());
-            }
-            CalleeBinding::NonCallable => {
-                local_function_defs.remove(name);
-                local_callee_aliases.remove(name);
+            None => {
                 local_callee_shadows.remove(name);
+                local_function_defs.remove(name);
+                local_callee_aliases.remove(name);
             }
         }
         // Reference-class generators and data.table object classification are
@@ -13811,12 +13814,8 @@ fn table_verb_policy(
     analysis: &NseAnalysis,
 ) -> Option<crate::nse::ArgPolicy> {
     if func.kind() == "namespace_operator" {
-        return func
-            .child_by_field_name("lhs")
-            .zip(func.child_by_field_name("rhs"))
-            .and_then(|(pkg, name)| {
-                crate::nse::package_policy(node_text(pkg, text), node_text(name, text))
-            });
+        return namespace_parts(func, text)
+            .and_then(|(pkg, name)| crate::nse::package_policy(pkg, name));
     }
     if func.kind() != "identifier" {
         return None;
