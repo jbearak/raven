@@ -226,14 +226,21 @@ fn is_well_formed_callee_name(name: &str) -> bool {
 
 /// Store a declared callee `name` (the bare part, never the `pkg::` qualifier)
 /// in the form it appears at a call site. A non-syntactic R name (spaces,
-/// operators, a leading digit, …) must be backtick-quoted in source, so its
-/// tree-sitter `node_text` carries the backticks; a directive captures the name
-/// WITHOUT its quoting delimiters, so we re-add backticks for a non-syntactic
-/// name to keep the stored key aligned with the callee text matched at use
-/// sites (`# raven: nse "my fn"(x)` must govern a `` `my fn`(x) `` call).
-/// Syntactic names are stored bare — they appear without backticks in source.
+/// operators, a leading digit, a leading-dot digit like `.2way`, a reserved word
+/// like `if`, …) must be backtick-quoted in source, so its tree-sitter
+/// `node_text` carries the backticks; a directive captures the name WITHOUT its
+/// quoting delimiters, so we re-add backticks for a non-syntactic name to keep
+/// the stored key aligned with the callee text matched at use sites
+/// (`# raven: nse "my fn"(x)` must govern a `` `my fn`(x) `` call). Syntactic
+/// names — including non-ASCII identifiers in a UTF-8 locale — are stored bare,
+/// matching their unquoted source spelling.
+///
+/// The syntactic-name test is [`crate::r_names::is_syntactic_r_name`], the same
+/// rule the completion path uses to decide member-insert quoting, NOT the
+/// laxer [`is_formal_name`] (which accepts `...` and leading-dot digits because
+/// it only filters bogus tokens out of a mis-segmented default list).
 fn callee_name_for_match(name: &str) -> String {
-    if is_formal_name(name) {
+    if crate::r_names::is_syntactic_r_name(name) {
         name.to_string()
     } else {
         format!("`{name}`")
@@ -2496,6 +2503,33 @@ x <- undefined"#;
         // A malformed `::` qualifier is still rejected even when quoted.
         let meta = parse_directives("# raven: nse \"pkg:::x\"(a)\n");
         assert!(meta.nse_declarations.is_empty());
+    }
+
+    #[test]
+    fn nse_wraps_dot_digit_and_reserved_callee() {
+        use crate::cross_file::types::NseScope;
+        // A leading-dot digit name (`.2way`) is NOT a syntactic R name, so the
+        // call site is `` `.2way`(x) `` (node_text carries backticks). The stored
+        // key must be wrapped to match — `is_formal_name` used to accept it bare
+        // and the directive silently never governed the call.
+        let meta = parse_directives("# raven: nse \".2way\"(x)\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(meta.nse_declarations[0].name, "`.2way`");
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["x".to_string()])
+        );
+        // A reserved word used as a callee (`` `if`(...) ``) is likewise
+        // non-syntactic and must be wrapped.
+        let meta = parse_directives("# raven: nse \"if\"(cond)\n");
+        assert_eq!(meta.nse_declarations[0].name, "`if`");
+        // A non-ASCII but syntactic identifier is stored bare — it appears
+        // without backticks in a UTF-8 source file.
+        let meta = parse_directives("# raven: nse \"données\"(x)\n");
+        assert_eq!(meta.nse_declarations[0].name, "données");
+        // Same rule on the `func` directive's stored callee name.
+        let meta = parse_directives("# raven: func \".2way\"(a)\n");
+        assert_eq!(meta.declared_functions[0].name, "`.2way`");
     }
 
     #[test]

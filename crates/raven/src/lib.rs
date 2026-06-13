@@ -44,6 +44,7 @@ pub mod package_state;
 pub mod parameter_resolver;
 pub mod perf;
 pub mod qualified_resolve;
+pub mod r_names;
 pub mod r_subprocess;
 pub mod roxygen;
 pub mod stan_builtins;

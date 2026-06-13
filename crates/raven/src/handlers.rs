@@ -16643,26 +16643,8 @@ fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
-fn is_syntactic_r_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '.' {
-        return false;
-    }
-    if first == '.'
-        && let Some(second) = chars.clone().next()
-        && second.is_ascii_digit()
-    {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
-        && !crate::reserved_words::is_reserved_word(name)
-}
-
 fn accessor_member_insert_text(name: &str) -> String {
-    if is_syntactic_r_name(name) || name.contains('`') {
+    if crate::r_names::is_syntactic_r_name(name) || name.contains('`') {
         name.to_string()
     } else {
         format!("`{name}`")
@@ -57538,6 +57520,27 @@ my_func <- function(a = default_value) {
         assert!(
             !diags.iter().any(|m| m.contains("masked_x")),
             "captured formal `x` must be suppressed by the quoted-name directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dot_digit_callee_governs_backtick_call() {
+        // A leading-dot digit callee (`.2way`) is non-syntactic, so the call is
+        // written `` `.2way`(...) `` and its callee node_text carries backticks.
+        // The directive must store the name wrapped to match; before the fix
+        // `is_formal_name` accepted `.2way` bare and the directive silently never
+        // governed the call (a safe-direction miss — `masked_x` would stay
+        // flagged). `real_a` (non-captured) is still flagged.
+        let diags = collect_undefined_messages(
+            "`.2way` <- function(a, x) a\n# raven: nse \".2way\"(x)\n`.2way`(real_a, masked_x)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_a")),
+            "non-captured formal `a` must still be flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured formal `x` must be suppressed by the dot-digit directive; got {diags:?}"
         );
     }
 
