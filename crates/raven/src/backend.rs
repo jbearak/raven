@@ -5699,20 +5699,14 @@ impl LanguageServer for Backend {
             if !is_undef {
                 continue;
             }
-            let line = diag.range.start.line;
-            let ident: String = text
-                .lines()
-                .nth(line as usize)
-                .map(|l| {
-                    let s = diag.range.start.character as usize;
-                    let e = diag.range.end.character as usize;
-                    l.chars().skip(s).take(e.saturating_sub(s)).collect()
-                })
-                .unwrap_or_default();
-            if ident.is_empty() {
+            // Resolve the exact node the diagnostic points at, so the quick-fix
+            // targets the right call even when the same name recurs on a line
+            // (and so multi-byte characters before it don't skew the column).
+            let point = handlers::lsp_position_to_ts_point(&text, diag.range.start);
+            let Some(usage_node) = root.descendant_for_point_range(point, point) else {
                 continue;
-            }
-            if let Some(fix) = handlers::nse_quick_fix_edit(root, &text, line, &ident) {
+            };
+            if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text) {
                 let edit = TextEdit {
                     range: Range {
                         start: Position::new(fix.insert_line, 0),

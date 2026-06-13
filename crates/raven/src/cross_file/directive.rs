@@ -317,11 +317,14 @@ fn patterns() -> &'static DirectivePatterns {
             // NSE contract directive: `# raven: nse [pkg::]name[(formals…)]`
             // Group 1: qualified or bare name (e.g. "my_func" or "pkg::my_func")
             // Group 2: optional formal list body (text between `(` and `)`)
+            // A trailing `# comment` is tolerated (parity with func/var, which
+            // are not end-anchored), but an unclosed `(` still fails to match so
+            // a malformed payload is ignored rather than blanket-suppressing.
             nse: Regex::new(
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"nse\s*:?\s*([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*$"#,
+                    r#"nse\s*:?\s*([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
                 ]
                 .concat(),
             ).unwrap(),
@@ -2271,6 +2274,25 @@ x <- undefined"#;
             f.formals,
             Some(vec!["data".to_string(), "x".to_string(), "y".to_string()])
         );
+    }
+
+    #[test]
+    fn nse_tolerates_trailing_comment() {
+        use crate::cross_file::types::NseScope;
+        let meta = parse_directives("# raven: nse my_func(x)   # why this is captured\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["x".to_string()])
+        );
+    }
+
+    #[test]
+    fn nse_unclosed_paren_is_ignored() {
+        // A trailing comment is allowed, but a malformed (unclosed) payload must
+        // not silently become a whole-call declaration.
+        let meta = parse_directives("# raven: nse my_func(x\n");
+        assert!(meta.nse_declarations.is_empty());
     }
 
     #[test]

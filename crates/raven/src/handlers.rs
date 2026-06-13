@@ -6216,6 +6216,18 @@ fn collect_undefined_variables_from_snapshot(
             })
             .map(|&(line, _col)| line);
 
+        // A suppressed diagnostic is discarded below, so compute the (cheap but
+        // non-trivial) NSE discoverability hint only after the suppression check.
+        if suppressed_line {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    usage_line,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                ));
+            }
+            continue;
+        }
+
         let mut message = match forward_ref_defined_line {
             Some(line) => format!(
                 "Undefined variable: {} (defined later on line {})",
@@ -6233,16 +6245,6 @@ fn collect_undefined_variables_from_snapshot(
                     ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: func {callee}(<formals>)` and `# raven: nse {callee}(<nse-formals>)`"
                 )),
             }
-        }
-
-        if suppressed_line {
-            if let Some(out) = suppressed_out.as_deref_mut() {
-                out.push((
-                    usage_line,
-                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
-                ));
-            }
-            continue;
         }
 
         diagnostics.push(Diagnostic {
@@ -12900,65 +12902,6 @@ impl<'a> NseAnalysis<'a> {
             base_exports,
             directive_nse: HashMap::new(),
         };
-        // Translate `# raven: nse` declarations into per-callee policies,
-        // resolving formal order (for positional matching) from `# raven: func`
-        // declarations first, then visible local function definitions. When no
-        // order is available, fall back to named-only matching by placing
-        // "..." first so the positional pass suppresses nothing. Assigned before
-        // the `!call_args_enabled` early return so directive policies are present
-        // regardless of the dots-forwarding pass.
-        let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
-        for decl in nse_declarations {
-            use crate::cross_file::types::NseScope;
-            let policy = match &decl.scope {
-                NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
-                NseScope::Formals(captured) => {
-                    let order =
-                        declared_function_formals(declared_functions, &decl.name, decl.line)
-                            .or_else(|| {
-                                local_function_defs
-                                    .get(&decl.name)
-                                    .map(|def| function_formal_names(*def, text))
-                                    .filter(|f| !f.is_empty())
-                            });
-                    match order {
-                        Some(mut formals) => {
-                            for c in captured {
-                                if !formals.contains(c) {
-                                    formals.push(c.clone());
-                                }
-                            }
-                            crate::nse::ArgPolicy::PerFormal {
-                                formals,
-                                captured: captured.clone(),
-                                captured_dots: false,
-                            }
-                        }
-                        None => {
-                            let mut formals = vec!["...".to_string()];
-                            formals.extend(captured.iter().cloned());
-                            crate::nse::ArgPolicy::PerFormal {
-                                formals,
-                                captured: captured.clone(),
-                                captured_dots: false,
-                            }
-                        }
-                    }
-                }
-            };
-            directive_nse
-                .entry(decl.name.clone())
-                .or_default()
-                .push(DirectiveNsePolicy {
-                    line: decl.line,
-                    package: decl.package.clone(),
-                    policy,
-                });
-        }
-        for entries in directive_nse.values_mut() {
-            entries.sort_by_key(|e| e.line);
-        }
-        analysis.directive_nse = directive_nse;
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
         // position is itself data-masking through its dots. Runs against the
@@ -13019,6 +12962,67 @@ impl<'a> NseAnalysis<'a> {
             }
         }
         analysis.local_function_policies.extend(dots_upgrades);
+
+        // Translate `# raven: nse` declarations into per-callee policies,
+        // resolving formal order (for positional matching) from `# raven: func`
+        // declarations first, then visible local function definitions. When no
+        // order is available, fall back to named-only matching by placing "..."
+        // first so the positional pass suppresses nothing. Built only here, in
+        // the call-args-enabled path: when call arguments are blanket-suppressed
+        // the policies are never consulted, so the work is skipped via the
+        // `!call_args_enabled` early return above.
+        let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
+        for decl in nse_declarations {
+            use crate::cross_file::types::NseScope;
+            let policy = match &decl.scope {
+                NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
+                NseScope::Formals(captured) => {
+                    let order =
+                        declared_function_formals(declared_functions, &decl.name).or_else(|| {
+                            local_function_defs
+                                .get(&decl.name)
+                                .map(|def| function_formal_names(*def, text))
+                                .filter(|f| !f.is_empty())
+                        });
+                    match order {
+                        Some(mut formals) => {
+                            for c in captured {
+                                if !formals.contains(c) {
+                                    formals.push(c.clone());
+                                }
+                            }
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured: captured.clone(),
+                                captured_dots: false,
+                            }
+                        }
+                        None => {
+                            let mut formals = vec!["...".to_string()];
+                            formals.extend(captured.iter().cloned());
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured: captured.clone(),
+                                captured_dots: false,
+                            }
+                        }
+                    }
+                }
+            };
+            directive_nse
+                .entry(decl.name.clone())
+                .or_default()
+                .push(DirectiveNsePolicy {
+                    line: decl.line,
+                    package: decl.package.clone(),
+                    policy,
+                });
+        }
+        for entries in directive_nse.values_mut() {
+            entries.sort_by_key(|e| e.line);
+        }
+        analysis.directive_nse = directive_nse;
+
         analysis
     }
 
@@ -13610,18 +13614,28 @@ fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
     names
 }
 
-/// The declared formal order for `name` from the most recent `# raven: func
-/// name(formals…)` directive on a line strictly before `before_line`, if any.
+/// The declared formal order for callee `name` from the most recent
+/// `# raven: func …(formals…)` directive, if any. Formal order is a
+/// position-independent signature fact, so this is NOT gated on the directive's
+/// line relative to the `# raven: nse` it serves — a `# raven: func` works
+/// whether it precedes or follows the `# raven: nse`. A qualified
+/// `# raven: func pkg::name(...)` is stored under its full `pkg::name`, so the
+/// bare suffix is compared too (the `# raven: nse` form splits the qualifier off).
 fn declared_function_formals(
     declared_functions: &[crate::cross_file::types::DeclaredSymbol],
     name: &str,
-    before_line: u32,
 ) -> Option<Vec<String>> {
     declared_functions
         .iter()
-        .filter(|d| d.name == name && d.line < before_line && d.formals.is_some())
+        .filter(|d| d.formals.is_some() && declared_name_matches(&d.name, name))
         .max_by_key(|d| d.line)
         .and_then(|d| d.formals.clone())
+}
+
+/// Whether a declared-function name (possibly written `pkg::name`) refers to the
+/// bare callee `name`: exact match, or the suffix after the last `::`.
+fn declared_name_matches(declared: &str, name: &str) -> bool {
+    declared == name || declared.rsplit("::").next() == Some(name)
 }
 
 /// True when the function declares a `...` formal — the allocation-free
@@ -14221,46 +14235,14 @@ pub(crate) struct NseQuickFix {
     pub title: String,
 }
 
-/// Find the first `identifier` node on 0-based `line` whose text equals `ident`
-/// and that sits inside a call argument with a simple callee. Returns `None`
-/// when no such node exists. Does NOT apply any builtin filtering — that is the
-/// caller's responsibility.
-fn find_identifier_in_call_arg<'t>(
-    root: Node<'t>,
-    text: &'t str,
-    line: u32,
-    ident: &str,
-) -> Option<Node<'t>> {
-    let mut cursor = root.walk();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier"
-            && node.start_position().row as u32 == line
-            && node_text(node, text) == ident
-            && enclosing_call_arg_context(node, text).is_some()
-        {
-            return Some(node);
-        }
-        let children: Vec<Node> = node.children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push(child);
-        }
-    }
-    None
-}
-
-/// Build a `# raven: nse` quick-fix for the undefined identifier `ident` on
-/// 0-based `line`, if it sits inside a call argument with a non-builtin callee.
-/// Operates on `text` (the analysis text the `root` tree was parsed from).
-pub(crate) fn nse_quick_fix_edit(
-    root: Node,
-    text: &str,
-    line: u32,
-    ident: &str,
-) -> Option<NseQuickFix> {
-    // Find the matching identifier node on `line` that is inside a call arg.
-    let target = find_identifier_in_call_arg(root, text, line, ident)?;
-    let (call, callee, formal) = enclosing_call_arg_context(target, text)?;
+/// Build a `# raven: nse` quick-fix for the undefined identifier at
+/// `usage_node`, if it sits inside a call argument with a non-builtin callee.
+/// `usage_node` is the exact node the diagnostic range resolves to (via
+/// `descendant_for_point_range`), so the call and formal are unambiguous even
+/// when the same name appears more than once on a line. `text` is the analysis
+/// text the node's tree was parsed from.
+pub(crate) fn nse_quick_fix_edit(usage_node: Node, text: &str) -> Option<NseQuickFix> {
+    let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
     if is_builtin(&callee) {
         return None;
     }
@@ -16289,7 +16271,7 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
 /// `Position.character` and `Point.column` use different units, so passing
 /// the LSP column as-is misplaces the cursor on lines containing multi-byte
 /// UTF-8 characters before the cursor.
-fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
+pub(crate) fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     Point::new(position.line as usize, byte_col)
@@ -56504,6 +56486,17 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_func_after_nse_also_enables_positional() {
+        // Formal order is position-independent: a `# raven: func` works whether
+        // it precedes or follows the `# raven: nse` it serves.
+        let src = "# raven: nse my_func(x, y)\n# raven: func my_func(data, x, y)\nmy_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
     fn nse_paired_func_enables_positional() {
         let src = "# raven: func my_func(data, x, y)\n# raven: nse my_func(x, y)\nmy_func(real_df, m1, m2)\n";
         let diags = collect_undefined_messages(src);
@@ -57046,11 +57039,31 @@ my_func <- function(a = default_value) {
         }
     }
 
+    /// Find the first `identifier` node named `name` anywhere in the tree, so the
+    /// quick-fix tests can pass the exact node the production handler resolves
+    /// from the diagnostic range via `descendant_for_point_range`.
+    fn first_ident<'t>(root: super::Node<'t>, text: &'t str, name: &str) -> super::Node<'t> {
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return node;
+            }
+            let children: Vec<super::Node> = node.children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        panic!("identifier `{name}` not found");
+    }
+
     #[test]
     fn nse_quick_fix_inserts_directive_above_call() {
         let src = "my_filter <- function(df, cond) df\n  my_filter(real_df, x)\n";
         let tree = parse_r_code(src);
-        let fix = super::nse_quick_fix_edit(tree.root_node(), src, 1, "x").expect("edit");
+        // Use the second `x` (the call argument), not the formal in the def.
+        let node = first_ident(tree.root_node(), src, "x");
+        let fix = super::nse_quick_fix_edit(node, src).expect("edit");
         assert_eq!(fix.insert_line, 1);
         assert_eq!(fix.text, "  # raven: nse my_filter(<formal>)\n");
         assert!(fix.title.contains("# raven: nse"));
@@ -57060,7 +57073,8 @@ my_func <- function(a = default_value) {
     fn nse_quick_fix_named_arg_uses_formal_name() {
         let src = "my_filter <- function(df, cond) df\nmy_filter(df = real_df, cond = x)\n";
         let tree = parse_r_code(src);
-        let fix = super::nse_quick_fix_edit(tree.root_node(), src, 1, "x").expect("edit");
+        let node = first_ident(tree.root_node(), src, "x");
+        let fix = super::nse_quick_fix_edit(node, src).expect("edit");
         assert_eq!(fix.text, "# raven: nse my_filter(cond)\n");
     }
 
@@ -57068,14 +57082,16 @@ my_func <- function(a = default_value) {
     fn nse_quick_fix_none_for_builtin() {
         let src = "paste(undefined_x)\n";
         let tree = parse_r_code(src);
-        assert!(super::nse_quick_fix_edit(tree.root_node(), src, 0, "undefined_x").is_none());
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        assert!(super::nse_quick_fix_edit(node, src).is_none());
     }
 
     #[test]
     fn nse_quick_fix_none_when_not_in_call_arg() {
         let src = "x + 1\n";
         let tree = parse_r_code(src);
-        assert!(super::nse_quick_fix_edit(tree.root_node(), src, 0, "x").is_none());
+        let node = first_ident(tree.root_node(), src, "x");
+        assert!(super::nse_quick_fix_edit(node, src).is_none());
     }
 }
 
