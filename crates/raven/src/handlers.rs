@@ -12996,7 +12996,18 @@ impl<'a> NseAnalysis<'a> {
             use crate::cross_file::types::NseScope;
             let policy = match &decl.scope {
                 NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
-                NseScope::Formals(captured) => {
+                NseScope::Formals(listed) => {
+                    // A literal `...` in the list (`# raven: nse f(...)`) declares
+                    // that arguments absorbed by `...` are captured, rather than
+                    // naming a formal called "...". Split it out so it sets
+                    // `captured_dots` instead of being matched as a formal name
+                    // (which never suppresses anything).
+                    let captured_dots = listed.iter().any(|c| c == "...");
+                    let captured: Vec<String> = listed
+                        .iter()
+                        .filter(|c| c.as_str() != "...")
+                        .cloned()
+                        .collect();
                     let order = declared_function_formals(
                         declared_functions,
                         &decl.name,
@@ -13010,15 +13021,15 @@ impl<'a> NseAnalysis<'a> {
                     });
                     match order {
                         Some(mut formals) => {
-                            for c in captured {
+                            for c in &captured {
                                 if !formals.contains(c) {
                                     formals.push(c.clone());
                                 }
                             }
                             crate::nse::ArgPolicy::PerFormal {
                                 formals,
-                                captured: captured.clone(),
-                                captured_dots: false,
+                                captured,
+                                captured_dots,
                             }
                         }
                         None => {
@@ -13026,8 +13037,8 @@ impl<'a> NseAnalysis<'a> {
                             formals.extend(captured.iter().cloned());
                             crate::nse::ArgPolicy::PerFormal {
                                 formals,
-                                captured: captured.clone(),
-                                captured_dots: false,
+                                captured,
+                                captured_dots,
                             }
                         }
                     }
@@ -14233,12 +14244,11 @@ fn nse_hint_for_usage<'t>(
 ) -> Option<(String, Option<String>)> {
     let (_call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
     // Suppress the hint for high-confidence standard-eval builtins and base
-    // exports (paste, c, print, …).
-    if is_builtin(&callee)
-        || analysis
-            .base_exports
-            .is_some_and(|e| e.contains(callee.as_str()))
-    {
+    // exports (paste, c, print, …). Filter on the bare suffix so a qualified
+    // `base::paste(...)` is recognized too, while the returned `callee` keeps
+    // the qualifier for the suggested directive.
+    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
+    if is_builtin(bare) || analysis.base_exports.is_some_and(|e| e.contains(bare)) {
         return None;
     }
     Some((callee, formal))
@@ -14246,9 +14256,15 @@ fn nse_hint_for_usage<'t>(
 
 /// The enclosing call-argument context of `usage_node`: walks up to the
 /// `argument` that is a direct child of a `call`'s `arguments`, returning the
-/// `call` node, the callee name (identifier text, or the RHS of a
-/// `package::name`), and the matched formal name when the argument is named.
-/// `None` when `usage_node` is not inside a call argument with a simple callee.
+/// `call` node, the callee name, and the matched formal name when the argument
+/// is named. `None` when `usage_node` is not inside a call argument with a
+/// simple callee.
+///
+/// For a `package::name` call the callee is the **full qualified** `pkg::name`,
+/// not the bare suffix: the suggested `# raven: nse` directive must carry the
+/// qualifier so it actually matches the qualified call (an unqualified
+/// directive does not — see [`NseAnalysis::directive_nse_policy`]). Callers that
+/// filter against builtin/base names use the bare suffix.
 fn enclosing_call_arg_context<'t>(
     usage_node: Node<'t>,
     text: &'t str,
@@ -14266,7 +14282,10 @@ fn enclosing_call_arg_context<'t>(
     let func = call.child_by_field_name("function")?;
     let callee = match func.kind() {
         "identifier" => node_text(func, text).to_string(),
-        "namespace_operator" => namespace_parts(func, text)?.1.to_string(),
+        "namespace_operator" => {
+            let (pkg, n) = namespace_parts(func, text)?;
+            format!("{pkg}::{n}")
+        }
         _ => return None,
     };
     // The matched formal: a named argument's name, else None (positional/unknown).
@@ -14299,7 +14318,10 @@ pub(crate) fn nse_quick_fix_edit(
     base_exports: Option<&HashSet<String>>,
 ) -> Option<NseQuickFix> {
     let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    if is_builtin(&callee) || base_exports.is_some_and(|e| e.contains(callee.as_str())) {
+    // Filter on the bare suffix (so a qualified `base::paste(...)` is caught),
+    // while the suggested directive below keeps the qualifier from `callee`.
+    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
+    if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
         return None;
     }
     let insert_line = call.start_position().row as u32;
@@ -56543,6 +56565,59 @@ my_func <- function(a = default_value) {
         );
     }
 
+    /// Issue #455 manual-report regression: the exact shape a user hit — a
+    /// `library(arm)` with an installed/resolved `lmer` export, a `# raven: func`
+    /// supplying the formal order, and a `# raven: nse` declaring the captured
+    /// formals — using the **colon-after-keyword** form (`func:` / `nse:`). The
+    /// positional call `lmer(x, y)` must be fully suppressed: the paired `func`
+    /// gives the order so both positionals bind captured formals. A resolved
+    /// package export must NOT bypass the authoritative directive.
+    #[test]
+    fn nse_paired_func_colon_form_suppresses_with_resolved_package_export() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let pkg_dir = tmp.path().join("arm");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), "export(lmer)\n").unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: arm\nTitle: ARM\nDescription: x\n",
+        )
+        .unwrap();
+
+        let mut state = create_test_state();
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state.package_library_ready = true;
+
+        let code = "library(arm)\n# raven: func: lmer(formula, data)\n# raven: nse: lmer(formula, data)\nlmer(x, y)\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let msgs: Vec<String> = diagnostics.into_iter().map(|d| d.message).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("Undefined variable: x")),
+            "first positional binds captured formal `formula`; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("Undefined variable: y")),
+            "second positional binds captured formal `data`; got {msgs:?}"
+        );
+    }
+
     #[test]
     fn nse_qualified_matches_qualified_call() {
         let src = "# raven: nse pkg::my_func(x)\npkg::my_func(x = masked_col)\n";
@@ -56615,6 +56690,44 @@ my_func <- function(a = default_value) {
         );
         assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
         assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
+    fn nse_func_formals_with_defaults_strip_to_names() {
+        // A `# raven: func` that pastes a real signature with defaults
+        // (`x = NULL`) must still yield the formal *name* `x` for positional
+        // matching — not the literal `"x = NULL"`.
+        let src = "# raven: func my_func(data, x = NULL)\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg (default stripped) suppressed positionally; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dots_capture_suppresses_dots_absorbed_args() {
+        // `# raven: nse f(...)` declares that arguments absorbed by `...` are
+        // captured. With a local def `function(a, ...)`, the fixed `a` arg is
+        // checked while the trailing dots-absorbed args are suppressed.
+        let src = "my_func <- function(a, ...) a\n# raven: nse my_func(...)\nmy_func(real_arg, masked_1, masked_2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_arg")),
+            "fixed formal `a` is checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_1")),
+            "dots-absorbed arg suppressed; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_2")),
+            "dots-absorbed arg suppressed; got {diags:?}"
+        );
     }
 
     #[test]
@@ -57252,6 +57365,30 @@ my_func <- function(a = default_value) {
         // With `some_base_fn` known as a base export, it is suppressed.
         let base: std::collections::HashSet<String> =
             std::iter::once("some_base_fn".to_string()).collect();
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_qualified_callee_keeps_package() {
+        // For a `pkg::verb(...)` call the suggested directive must carry the
+        // qualifier — an unqualified `# raven: nse verb` would not match the
+        // qualified call, so the fix would be a no-op.
+        let src = "mypkg::my_verb(masked)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "masked");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        assert_eq!(fix.text, "# raven: nse mypkg::my_verb(<formal>)\n");
+    }
+
+    #[test]
+    fn nse_quick_fix_qualified_base_export_filtered_by_bare_suffix() {
+        // A qualified `base::paste(...)` is filtered via the bare suffix, just
+        // like the bare `paste(...)` builtin.
+        let src = "base::paste(undefined_x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        let base: std::collections::HashSet<String> =
+            std::iter::once("paste".to_string()).collect();
         assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
     }
 }

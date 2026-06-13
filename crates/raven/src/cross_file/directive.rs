@@ -164,10 +164,23 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 /// Split a directive parameter list body (the text between `(` and `)`) into
 /// trimmed, non-empty formal names. Returns `None` when the body has no usable
 /// names (so an empty `()` is treated as malformed by callers).
+///
+/// Each comma-separated entry is reduced to its formal *name* by dropping any
+/// `= default` suffix, so a user can paste a real signature
+/// (`# raven: func f(data, x = NULL)`) and still get `["data", "x"]` for
+/// positional matching. Defaults containing commas or `)` (e.g. `x = c(1, 2)`)
+/// are out of scope — the surrounding regex captures only up to the first `)`,
+/// and the comma split would mis-segment them — but simple literal defaults
+/// (`= NULL`, `= TRUE`, `= 10`) are handled.
 fn split_formal_list(body: &str) -> Option<Vec<String>> {
     let names: Vec<String> = body
         .split(',')
-        .map(|s| s.trim().to_string())
+        .map(|s| {
+            s.split_once('=')
+                .map_or(s, |(name, _)| name)
+                .trim()
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect();
     if names.is_empty() { None } else { Some(names) }
@@ -2312,5 +2325,15 @@ x <- undefined"#;
     fn func_directive_without_formals_keeps_none() {
         let meta = parse_directives("# raven: func my_func\n");
         assert_eq!(meta.declared_functions[0].formals, None);
+    }
+
+    #[test]
+    fn func_directive_strips_default_values_from_formals() {
+        // A pasted signature with defaults keeps only the formal names.
+        let meta = parse_directives("# raven: func my_func(data, x = NULL, n = 10)\n");
+        assert_eq!(
+            meta.declared_functions[0].formals,
+            Some(vec!["data".to_string(), "x".to_string(), "n".to_string()])
+        );
     }
 }

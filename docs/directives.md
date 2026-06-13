@@ -147,10 +147,11 @@ Declaration directives work in any R file, whether or not it participates in cro
 # @lsp-func myfunc                # alias (every synonym also has an @lsp- form)
 ```
 
-`# raven: func` can also declare a formal list alongside the symbol, which records the order of parameters for use by `# raven: nse` positional matching (see below):
+`# raven: func` can also declare a formal list alongside the symbol, which records the order of parameters for use by `# raven: nse` positional matching (see below). You can paste a real signature — `= default` suffixes are dropped, keeping just the formal names:
 
 ```r
-# raven: func my_func(data, x, y)   # declares existence + formal order
+# raven: func my_func(data, x, y)        # declares existence + formal order
+# raven: func my_func(data, x = NULL)    # defaults are stripped → data, x
 ```
 
 ### NSE Declarations
@@ -162,9 +163,14 @@ identifiers in its captured arguments are not flagged as undefined variables.
 # raven: nse my_func              # whole-call: every argument is NSE
 # raven: nse my_func(x)           # only the `x` formal is captured
 # raven: nse my_func(x, y)        # `x` and `y` are captured
+# raven: nse my_func(...)         # arguments absorbed by `...` are captured
 # raven: nse pkg::my_func(x, y)   # qualified form
 # @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
 ```
+
+A literal `...` in the captured list declares that the arguments a call passes
+through the function's `...` are captured (checked formals before `...` are
+still verified). Combine it with named formals, e.g. `# raven: nse my_func(x, ...)`.
 
 `# raven: nse` is position-aware: it applies to calls **after** the directive
 line, and the most recent declaration for a function wins. It is an
