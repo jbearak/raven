@@ -56248,6 +56248,34 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_directive_overrides_local_inference() {
+        // The local def has no captures (standard eval), but the explicit
+        // `# raven: nse` declaration is authoritative and declares `x` NSE.
+        let src = "my_func <- function(data, x) NULL\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg suppressed by directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn no_nse_directive_keeps_standard_checking() {
+        // Sanity: without a directive, a plain local call checks its args, so
+        // the directive tests above are not vacuously suppressing everything.
+        let src = "my_func <- function(data, x) NULL\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("masked_col")),
+            "without a directive the arg is checked; got {diags:?}"
+        );
+    }
+
+    #[test]
     fn nse_per_formal_with_local_def_positional() {
         let src = "my_func <- function(data, x) data\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
         let diags = collect_undefined_messages(src);
