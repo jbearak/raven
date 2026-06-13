@@ -1527,7 +1527,9 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         // cross_file/directive.rs via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS so
         // the recognized keyword set cannot drift between the two regex sets;
         // they are plugged into the middle of each pattern by concatenation.
-        // The @ is required, colon is optional, leading whitespace is allowed.
+        // Either prefix is accepted: `@lsp-` (the `@` is required) or the
+        // canonical `# raven:` form (#421). Colon after the keyword is optional,
+        // leading whitespace is allowed.
         // `\u{feff}` in the leading class tolerates a raw BOM on a first-line
         // directive (in-memory text keeps it verbatim); matching against the
         // BOM-bearing line keeps the reported path column client-aligned. #346.
@@ -1537,7 +1539,7 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         DirectivePathPatterns {
             backward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    r#"^[\s\u{feff}]*#\s*(?:@lsp-|raven:\s*)(?:"#,
                     BACKWARD_DIRECTIVE_KEYWORDS,
                     r#")(?:\s+:?\s*|:\s*)"#,
                 ]
@@ -1546,7 +1548,7 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
             .unwrap(),
             forward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*@lsp-(?:"#,
+                    r#"^[\s\u{feff}]*#\s*(?:@lsp-|raven:\s*)(?:"#,
                     FORWARD_DIRECTIVE_KEYWORDS,
                     r#")(?:\s+:?\s*|:\s*)"#,
                 ]
@@ -2197,45 +2199,87 @@ mod tests {
     fn test_shared_directive_keywords_recognized_by_both_regex_sets() {
         use crate::cross_file::directive::parse_directives;
 
-        for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
-            let content = format!("# @lsp-{kw} utils.R");
-            let eol = Position::new(0, content.chars().count() as u32);
+        // Both prefixes must round-trip identically: `# raven:` is the canonical
+        // user-facing form and `@lsp-` a permanent alias (#421).
+        for prefix in ["@lsp-", "raven: "] {
+            for kw in FORWARD_DIRECTIVE_KEYWORDS.split('|') {
+                let content = format!("# {prefix}{kw} utils.R");
+                let eol = Position::new(0, content.chars().count() as u32);
 
-            // file_path_intellisense seam (column-aligned, BOM-tolerant).
-            assert!(
-                matches!(
-                    is_directive_path_context(&content, eol),
-                    Some((DirectiveType::Source, _, _))
-                ),
-                "path-context matcher did not recognize forward keyword `{kw}`",
-            );
+                // file_path_intellisense seam (column-aligned, BOM-tolerant).
+                assert!(
+                    matches!(
+                        is_directive_path_context(&content, eol),
+                        Some((DirectiveType::Source, _, _))
+                    ),
+                    "path-context matcher did not recognize forward keyword `{kw}` with prefix `{prefix}`",
+                );
 
-            // cross_file::directive seam (full parser, capture groups).
-            assert_eq!(
-                parse_directives(&content).sources.len(),
-                1,
-                "directive parser did not recognize forward keyword `{kw}`",
-            );
+                // cross_file::directive seam (full parser, capture groups).
+                assert_eq!(
+                    parse_directives(&content).sources.len(),
+                    1,
+                    "directive parser did not recognize forward keyword `{kw}` with prefix `{prefix}`",
+                );
+            }
+
+            for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
+                let content = format!("# {prefix}{kw} ../main.R");
+                let eol = Position::new(0, content.chars().count() as u32);
+
+                assert!(
+                    matches!(
+                        is_directive_path_context(&content, eol),
+                        Some((DirectiveType::SourcedBy, _, _))
+                    ),
+                    "path-context matcher did not recognize backward keyword `{kw}` with prefix `{prefix}`",
+                );
+
+                assert_eq!(
+                    parse_directives(&content).sourced_by.len(),
+                    1,
+                    "directive parser did not recognize backward keyword `{kw}` with prefix `{prefix}`",
+                );
+            }
         }
+    }
 
-        for kw in BACKWARD_DIRECTIVE_KEYWORDS.split('|') {
-            let content = format!("# @lsp-{kw} ../main.R");
-            let eol = Position::new(0, content.chars().count() as u32);
+    #[test]
+    fn test_directive_raven_source_forward_path_column() {
+        // # raven: source utils.R
+        // 0         1         2
+        // 0123456789012345678901234
+        // Keyword+separator ends at 16, path starts at 16.
+        let content = "# raven: source utils.R";
+        let position = Position {
+            line: 0,
+            character: 19,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::Source);
+        assert_eq!(partial, "uti");
+        assert_eq!(path_start.character, 16);
+    }
 
-            assert!(
-                matches!(
-                    is_directive_path_context(&content, eol),
-                    Some((DirectiveType::SourcedBy, _, _))
-                ),
-                "path-context matcher did not recognize backward keyword `{kw}`",
-            );
-
-            assert_eq!(
-                parse_directives(&content).sourced_by.len(),
-                1,
-                "directive parser did not recognize backward keyword `{kw}`",
-            );
-        }
+    #[test]
+    fn test_directive_raven_sourced_by_path_column() {
+        // # raven: sourced-by ../main.R
+        // 0         1         2
+        // 0123456789012345678901234567890
+        // Keyword+separator ends at 20, path starts at 20.
+        let content = "# raven: sourced-by ../main.R";
+        let position = Position {
+            line: 0,
+            character: 23,
+        };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some());
+        let (directive_type, partial, path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::SourcedBy);
+        assert_eq!(partial, "../");
+        assert_eq!(path_start.character, 20);
     }
 
     #[test]

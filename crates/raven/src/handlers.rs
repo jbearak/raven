@@ -4581,8 +4581,8 @@ pub async fn diagnostics_async_standalone(
             && !d.message.starts_with("Cannot resolve parent path:")
             && !d.message.starts_with("Path is outside workspace:")
             // @lsp-source directive specific messages
-            && !d.message.contains("referenced by @lsp-source directive")
-            && !d.message.contains("in @lsp-source directive")
+            && !d.message.contains("referenced by source directive")
+            && !d.message.contains("in source directive")
     });
 
     // Collect URIs to check (skip if severity is disabled)
@@ -4636,7 +4636,7 @@ async fn collect_missing_file_diagnostics_standalone(
             {
                 let message = if source.is_directive {
                     format!(
-                        "File '{}' referenced by @lsp-source directive is outside workspace",
+                        "File '{}' referenced by source directive is outside workspace",
                         source.path
                     )
                 } else {
@@ -4669,10 +4669,7 @@ async fn collect_missing_file_diagnostics_standalone(
             ));
         } else {
             let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
+                format!("Cannot resolve path '{}' in source directive", source.path)
             } else {
                 format!("Cannot resolve path: '{}'", source.path)
             };
@@ -4785,7 +4782,7 @@ async fn collect_missing_file_diagnostics_standalone(
                 // Use specific message for @lsp-source directives (Requirement 6.1)
                 let message = if is_directive {
                     format!(
-                        "File '{}' referenced by @lsp-source directive not found",
+                        "File '{}' referenced by source directive not found",
                         path_str
                     )
                 } else {
@@ -4855,7 +4852,7 @@ fn collect_invalid_line_param_diagnostics(
                 },
                 severity: Some(DiagnosticSeverity::WARNING),
                 message: format!(
-                    "Invalid line=0 in @lsp-source directive for '{}': line numbers are 1-based. Using line 1 instead.",
+                    "Invalid line=0 in source directive for '{}': line numbers are 1-based. Using line 1 instead.",
                     source.path
                 ),
                 ..Default::default()
@@ -4953,10 +4950,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
         });
         if resolved.is_none() {
             let message = if source.is_directive {
-                format!(
-                    "Cannot resolve path '{}' in @lsp-source directive",
-                    source.path
-                )
+                format!("Cannot resolve path '{}' in source directive", source.path)
             } else {
                 format!("Cannot resolve path: '{}'", source.path)
             };
@@ -5152,7 +5146,7 @@ fn collect_redundant_directive_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message: format!(
-                    "Redundant @lsp-source directive: '{}' is already sourced by a source() call",
+                    "Redundant source directive: '{}' is already sourced by a source() call",
                     target_name
                 ),
                 ..Default::default()
@@ -48911,7 +48905,7 @@ result <- helper_with_spaces(42)"#;
             "Should emit one diagnostic for redundant directive: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        // Snapshot path message: "Redundant @lsp-source directive: 'utils.R' is already sourced by a source() call"
+        // Snapshot path message: "Redundant source directive: 'utils.R' is already sourced by a source() call"
         // Use path-agnostic substring matching to stay robust to message rewording.
         assert!(diagnostics[0].message.to_lowercase().contains("redundant"));
         assert!(diagnostics[0].message.contains("utils.R"));
@@ -49530,7 +49524,7 @@ result <- helper_with_spaces(42)"#;
         // did_open/did_change path with disk-existence checks). Camp B
         // regressed here: plain `resolve_path` returned <scripts>/helpers.R
         // which fails the existence check, emitting "File 'helpers.R'
-        // referenced by @lsp-source directive not found" even though the
+        // referenced by source directive not found" even though the
         // graph edge was fine. With the fix, resolution returns
         // <workspace>/helpers.R which exists and no diagnostic fires.
         let directive_meta = crate::cross_file::extract_metadata(main_code);

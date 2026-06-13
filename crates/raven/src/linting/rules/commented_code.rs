@@ -371,6 +371,13 @@ mod tests {
         // not commented-out code.
         assert!(is_directive_marker("# raven: ignore-next"));
         assert!(is_directive_marker("# raven: expect-next"));
+        // The structural families also live under `# raven:` (#421) and must be
+        // treated as directive markers, not parsed as commented-out code.
+        assert!(is_directive_marker("# raven: source ../helpers.R"));
+        assert!(is_directive_marker("# raven: sourced-by ../main.R"));
+        assert!(is_directive_marker("# raven: cd /data"));
+        assert!(is_directive_marker("# raven: var myvar"));
+        assert!(is_directive_marker("# raven: func myfunc"));
         // Near-misses must NOT be treated as markers.
         assert!(!is_directive_marker("# raven-ignore-next"));
         assert!(!is_directive_marker("# ravene: ignore-next"));
