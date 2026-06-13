@@ -6216,7 +6216,7 @@ fn collect_undefined_variables_from_snapshot(
             })
             .map(|&(line, _col)| line);
 
-        let message = match forward_ref_defined_line {
+        let mut message = match forward_ref_defined_line {
             Some(line) => format!(
                 "Undefined variable: {} (defined later on line {})",
                 name,
@@ -6224,6 +6224,16 @@ fn collect_undefined_variables_from_snapshot(
             ),
             None => format!("Undefined variable: {}", name),
         };
+        if let Some((callee, formal)) = nse_hint_for_usage(usage_node, text, &nse_analysis) {
+            match formal {
+                Some(f) => message.push_str(&format!(
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: nse {callee}({f})`"
+                )),
+                None => message.push_str(&format!(
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: func {callee}(<formals>)` and `# raven: nse {callee}(<nse-formals>)`"
+                )),
+            }
+        }
 
         if suppressed_line {
             if let Some(out) = suppressed_out.as_deref_mut() {
@@ -14144,6 +14154,51 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
         return true;
     }
     value_may_bind_function(children[1], text)
+}
+
+/// If `usage_node` (an undefined identifier) sits inside a call argument whose
+/// callee is a *plausible* NSE boundary (not a high-confidence standard-eval
+/// builtin or base export), return the callee name and the matched formal name
+/// (when the argument is named) so the diagnostic can suggest `# raven: nse`.
+/// Returns `None` when no hint should be shown (top-level usage, builtin
+/// callee, base-export callee, etc.).
+fn nse_hint_for_usage<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+    analysis: &NseAnalysis<'_>,
+) -> Option<(String, Option<String>)> {
+    // Walk up to the enclosing `argument` that is a direct child of an
+    // `arguments` node.
+    let mut cur = usage_node;
+    let arg = loop {
+        let parent = cur.parent()?;
+        if parent.kind() == "arguments" && cur.kind() == "argument" {
+            break cur;
+        }
+        cur = parent;
+    };
+    let args = arg.parent()?; // "arguments"
+    let call = args.parent().filter(|n| n.kind() == "call")?;
+    let func = call.child_by_field_name("function")?;
+    let callee = match func.kind() {
+        "identifier" => node_text(func, text).to_string(),
+        "namespace_operator" => namespace_parts(func, text)?.1.to_string(),
+        _ => return None,
+    };
+    // Suppress the hint for high-confidence standard-eval builtins and base
+    // exports (paste, c, print, …).
+    if is_builtin(&callee)
+        || analysis
+            .base_exports
+            .is_some_and(|e| e.contains(callee.as_str()))
+    {
+        return None;
+    }
+    // The matched formal: a named argument's name, else None (positional/unknown).
+    let formal = arg
+        .child_by_field_name("name")
+        .map(|n| node_text(n, text).to_string());
+    Some((callee, formal))
 }
 
 /// Resolve a `call` node's argument policy by classifying its callee against
@@ -24391,15 +24446,23 @@ clean_data <- function(x) {
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
         // Resolved export, no policy -> standard-eval -> argument checked.
+        // Use `contains` rather than `==` because the message may have a
+        // trailing NSE-hint suffix (the callee `my_fn` is not a builtin or
+        // base export, so the hint fires — that is correct behavior per #455).
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: undefined_var"),
+                .any(|m| m.contains("Undefined variable: undefined_var")),
             "argument of a resolved no-policy export must be checked; messages: {messages:?}"
         );
-        // The resolved export itself must not be flagged.
+        // The resolved export itself must not be flagged. Use
+        // `contains("Undefined variable: my_fn")` rather than `contains("my_fn")`
+        // because the NSE hint for `undefined_var`'s diagnostic legitimately
+        // mentions `my_fn` as the callee (correct behavior per #455).
         assert!(
-            !messages.iter().any(|m| m.contains("my_fn")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: my_fn")),
             "resolved package export `my_fn` must not be flagged; messages: {messages:?}"
         );
         // Contrast: an unresolved callee falls back to WholeCall, suppressing
@@ -24574,12 +24637,19 @@ clean_data <- function(x) {
                 .any(|m| m == "Undefined variable: totally_undefined_baseline"),
             "baseline undefined must fire; messages: {messages:?}"
         );
+        // Use `contains("Undefined variable: is_true")` rather than
+        // `contains("is_true")` because `# raven: nse` hint messages for
+        // other diagnostics may legitimately mention `is_true` as the callee.
         assert!(
-            !messages.iter().any(|m| m.contains("is_true")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: is_true")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages.iter().any(|m| m.contains("deferred_run")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: deferred_run")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
     }
@@ -54477,6 +54547,9 @@ mod function_parameter_tests {
     }
 
     /// Collect the names reported as "Undefined variable: <name>" for `code`.
+    /// Extracts only the bare identifier (text up to the first space, period,
+    /// or end of string), so the result is stable even when the message has a
+    /// trailing hint (e.g. ". If `f()` captures …").
     fn undefined_variable_names(code: &str) -> Vec<String> {
         let mut state = create_test_state();
         let uri = add_document(&mut state, "file:///test.R", code);
@@ -54500,9 +54573,11 @@ mod function_parameter_tests {
         diagnostics
             .iter()
             .filter_map(|d| {
-                d.message
-                    .strip_prefix("Undefined variable: ")
-                    .map(str::to_string)
+                d.message.strip_prefix("Undefined variable: ").map(|rest| {
+                    // Take only the identifier: stop at space, period, or
+                    // the parenthesized forward-reference note.
+                    rest.split([' ', '.']).next().unwrap_or(rest).to_string()
+                })
             })
             .collect()
     }
@@ -56837,6 +56912,48 @@ my_func <- function(a = default_value) {
                 .any(|m| m.contains("Undefined variable: undefined_pkg")),
             "citation is standard-eval; its argument should be flagged; got {citation:?}"
         );
+    }
+
+    // Issue #455: when an `undefined-variable` diagnostic fires for an
+    // identifier inside a non-builtin call argument, the message should
+    // suggest `# raven: nse` to aid discoverability.
+    #[test]
+    fn undefined_in_user_call_arg_gets_nse_hint() {
+        // Local user function, no NSE declared: undefined `x` in its arg gets a hint.
+        let diags = collect_undefined_messages(
+            "my_filter <- function(df, cond) df\nmy_filter(real_df, x)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: x"))
+            .expect("x reported");
+        assert!(
+            d.contains("# raven: nse"),
+            "message should suggest the directive: {d}"
+        );
+    }
+
+    #[test]
+    fn undefined_in_builtin_call_arg_has_no_hint() {
+        // paste() is a high-confidence standard-eval builtin -> no NSE hint noise.
+        let diags = collect_undefined_messages("paste(undefined_x)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undefined_x"))
+            .expect("reported");
+        assert!(!d.contains("# raven: nse"), "no hint for builtins: {d}");
+    }
+
+    #[test]
+    fn top_level_undefined_has_no_hint() {
+        // Not inside a call argument -> no hint.
+        let diags = collect_undefined_messages("x + 1\n");
+        if let Some(d) = diags.iter().find(|m| m.contains("Undefined variable: x")) {
+            assert!(
+                !d.contains("# raven: nse"),
+                "no hint for non-call usage: {d}"
+            );
+        }
     }
 }
 
