@@ -362,11 +362,14 @@ fn patterns() -> &'static DirectivePatterns {
             // qualifier only — the same shape as the `nse` directive below. A
             // name with characters outside `[A-Za-z0-9._]` (operators,
             // replacement functions, spaces) must use the quoted form. Quoted
-            // forms accept any content, so malformed qualifiers (`"pkg:::x"`,
-            // `"a:b"`) and unquoted truncations (`pkg:::x` -> `pkg`) are rejected
-            // at parse time via `is_well_formed_callee_name` + a trailing-colon
-            // check, keeping every stored name well-formed for
-            // `declared_name_matches`'s `rsplit_once("::")`.
+            // forms accept any content, so malformed `::` qualifiers (`"pkg:::x"`,
+            // `"pkg::a::b"`) and unquoted truncations (`pkg:::x` -> `pkg`,
+            // `some-func` -> `some`) are rejected at parse time via
+            // `is_well_formed_callee_name` + the adjacent-non-separator check,
+            // keeping every stored name well-formed for `declared_name_matches`'s
+            // `rsplit_once("::")`. (A lone `:` with no `::`, e.g. a backtick
+            // symbol `` `a:b` `` declared as `"a:b"`, is accepted — it cannot
+            // mis-pair.)
             declare_func: Regex::new(
                 &[
                     r"^\s*#\s*",
@@ -720,21 +723,27 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
         if let Some(caps) = patterns.declare_func.captures(line) {
             if let Some(name) = capture_symbol_name(&caps, 1) {
-                // Reject malformed namespace qualifiers. The quoted forms accept
-                // any content, so a malformed `"pkg:::my_func"` is caught by
+                // Reject malformed names. The quoted forms accept any content,
+                // so a malformed `"pkg:::my_func"` is caught by
                 // `is_well_formed_callee_name`. For the unquoted form the regex
-                // stops at the first non-name byte, so a colon *immediately*
-                // after the captured name means the name itself was meant to
-                // carry a (malformed) qualifier — `pkg:::name` captures `pkg`,
-                // `a:b` captures `a` — and we drop it rather than store the
-                // misleading truncated prefix. A colon after a SEPARATOR (e.g.
-                // `func helper :note`) is ordinary trailing text the prefix-
-                // tolerant `func` regex ignores, so only an adjacent colon
-                // (group 3's `m.end()`) counts. Both checks keep every stored
-                // name well-formed for `declared_name_matches`'s `rsplit_once`.
-                let unquoted_truncated = caps
-                    .get(3)
-                    .is_some_and(|m| line[m.end()..].starts_with(':'));
+                // stops at the first byte outside its name class, so a
+                // NON-SEPARATOR character immediately after the captured name
+                // means the regex truncated a longer (non-syntactic) name:
+                // `some-func` -> `some`, `obj$method` -> `obj`, `pkg:::name` ->
+                // `pkg`. Storing that truncated prefix would silently declare the
+                // WRONG symbol, so drop it — a non-syntactic name must use the
+                // quoted form. Only an *adjacent* offending byte counts: a
+                // separator (whitespace, the `(` formals opener, or a `#`
+                // comment) is ordinary trailing text the prefix-tolerant `func`
+                // regex legitimately ignores. Together with
+                // `is_well_formed_callee_name` this keeps every stored name
+                // well-formed for `declared_name_matches`'s `rsplit_once`.
+                let unquoted_truncated = caps.get(3).is_some_and(|m| {
+                    line[m.end()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| !c.is_whitespace() && c != '(' && c != '#')
+                });
                 if !is_well_formed_callee_name(&name) || unquoted_truncated {
                     continue;
                 }
@@ -2468,6 +2477,29 @@ x <- undefined"#;
             assert_eq!(meta.declared_functions.len(), 1, "case: {line}");
             assert_eq!(meta.declared_functions[0].name, expected, "case: {line}");
         }
+    }
+
+    #[test]
+    fn func_rejects_unquoted_nonsyntactic_truncation() {
+        // An unquoted name with a non-`[A-Za-z0-9._]` character (which the regex
+        // would silently truncate) must be dropped, not stored as the wrong
+        // truncated prefix. Non-syntactic names belong in the quoted form.
+        for line in [
+            "# raven: func some-func",  // would truncate to `some`
+            "# raven: func obj$method", // would truncate to `obj`
+            "# raven: func a%b",        // would truncate to `a`
+        ] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert!(
+                meta.declared_functions.is_empty(),
+                "truncated name stored for `{line}`: {:?}",
+                meta.declared_functions
+            );
+        }
+        // But a separator after the name is ordinary ignored trailing text.
+        let meta = parse_directives("# raven: func my_func   trailing note\n");
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "my_func");
     }
 
     #[test]

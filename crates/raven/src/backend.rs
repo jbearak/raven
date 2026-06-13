@@ -5702,17 +5702,23 @@ impl LanguageServer for Backend {
         // lightbulb entries. Two calls on different lines keep distinct insert
         // lines and so are not collapsed.
         let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
-        // The `# raven: nse` declarations in this document, parsed once, so the
+        // The `# raven: nse` declarations governing this document, so the
         // quick-fix can be skipped when a directive already governs the call —
         // mirroring `nse_hint_for_usage`'s suppression so the message hint and
-        // the lightbulb action stay in lockstep. Only parsed when an undefined
-        // diagnostic is actually present.
+        // the lightbulb action stay in lockstep. Read from the SAME cached,
+        // masked-correct metadata the diagnostic path used (`get_enriched_metadata`
+        // — the `directive_nse` map feeding the hint is built from it), rather
+        // than re-parsing, so the two cannot diverge. Only fetched when an
+        // undefined diagnostic is actually present.
         let is_undefined = |d: &Diagnostic| {
             matches!(&d.code, Some(NumberOrString::String(c))
                 if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
         };
         let nse_decls = if params.context.diagnostics.iter().any(&is_undefined) {
-            crate::cross_file::directive::parse_directives(&text).nse_declarations
+            state
+                .get_enriched_metadata(&uri)
+                .map(|m| m.nse_declarations.clone())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -5723,8 +5729,11 @@ impl LanguageServer for Backend {
             // Resolve the exact node the diagnostic points at, so the quick-fix
             // targets the right call even when the same name recurs on a line
             // (and so multi-byte characters before it don't skew the column).
-            let point = handlers::lsp_position_to_ts_point(&text, diag.range.start);
-            let Some(usage_node) = root.descendant_for_point_range(point, point) else {
+            // Use the full diagnostic span (start..end), not a zero-length point,
+            // so resolution is robust at node boundaries.
+            let start = handlers::lsp_position_to_ts_point(&text, diag.range.start);
+            let end = handlers::lsp_position_to_ts_point(&text, diag.range.end);
+            let Some(usage_node) = root.descendant_for_point_range(start, end) else {
                 continue;
             };
             if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {

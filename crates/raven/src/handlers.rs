@@ -56752,11 +56752,20 @@ my_func <- function(a = default_value) {
     fn nse_qualified_directive_still_applies_to_bare_call_without_local() {
         // The legitimate qualified→bare case: `pkg` is in play and nothing
         // shadows `my_func`, so the qualified directive governs the bare call.
-        let src = "library(pkg)\n# raven: nse pkg::my_func(x)\nmy_func(x = masked_col)\n";
+        // The second, non-captured arg (`y`) is the load-bearing assertion: it
+        // must still be flagged, proving the directive's PerFormal policy is in
+        // effect rather than the blanket `WholeCall` fallback an unresolved
+        // callee would otherwise get (which would suppress `real_undef` too).
+        let src =
+            "library(pkg)\n# raven: nse pkg::my_func(x)\nmy_func(x = masked_col, y = real_undef)\n";
         let diags = collect_undefined_messages(src);
         assert!(
             !diags.iter().any(|m| m.contains("masked_col")),
-            "qualified directive should still reach an unshadowed bare call; got {diags:?}"
+            "captured `x` must be suppressed via the in-play qualified directive; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "non-captured `y` must still be checked (PerFormal, not WholeCall); got {diags:?}"
         );
     }
 
