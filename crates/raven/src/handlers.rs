@@ -12648,6 +12648,72 @@ struct ReferenceClassInfo {
     methods: HashSet<String>,
 }
 
+/// The payload of an [`LocalCalleeBinding::Alias`]: how a name's non-literal
+/// callable rebinding resolves in call position, so the direct-call NSE
+/// resolver can honor R's "the local binding is what's called" rule for aliases
+/// and factory results (issue #450). Stored per-name in `local_callee_aliases`.
+enum LocalCalleeAlias {
+    /// `filter <- pkg::target` / `pkg:::target`. The policy is resolved through
+    /// the qualified target, so `filter <- stats::filter` checks arguments
+    /// (standard-eval target) while `filter <- dplyr::filter` keeps dplyr's
+    /// data-mask policy. Both names are owned because [`NseAnalysis`] outlives
+    /// the parse tree the binding was read from.
+    Qualified { package: String, name: String },
+    /// `filter <- get_filter()` / `filter <- some_fn`: a computed or aliased
+    /// value that may be callable but whose policy cannot be determined
+    /// statically. Resolved conservatively to `WholeCall` (suppress every
+    /// argument) rather than inheriting any package verb's policy.
+    Unknown,
+}
+
+/// How a top-level identifier's last binding presents in call position, for the
+/// direct-call NSE policy (issue #450). A literal definition keeps its own
+/// inferred policy; any other callable value is an alias/rebinding tracked in
+/// `local_callee_aliases`. A non-callable literal yields `None` — it does not
+/// shadow R's function lookup, which skips non-functions in call position.
+enum LocalCalleeBinding<'t> {
+    /// `name <- function(...) ...` — recorded in `local_function_defs`; the
+    /// node is carried so the caller stores exactly what was classified.
+    Definition(Node<'t>),
+    /// A non-literal callable value (`stats::filter`, `get_filter()`, …).
+    Alias(LocalCalleeAlias),
+}
+
+/// Classify an assignment's value node as a [`LocalCalleeBinding`], or `None`
+/// for an obvious non-function literal. `value` must already be
+/// parenthesis-unwrapped (the caller does this once). Mirrors
+/// [`value_may_bind_function`]'s callable/non-callable split, but additionally
+/// distinguishes a qualified alias (`pkg::name`) — whose target policy is
+/// preserved — from any other computed callable.
+fn classify_callee_binding<'t>(value: Node<'t>, text: &str) -> Option<LocalCalleeBinding<'t>> {
+    match value.kind() {
+        "function_definition" => Some(LocalCalleeBinding::Definition(value)),
+        "namespace_operator" => Some(LocalCalleeBinding::Alias(
+            match namespace_parts(value, text) {
+                Some((package, target)) => LocalCalleeAlias::Qualified {
+                    package: package.to_string(),
+                    name: target.to_string(),
+                },
+                None => LocalCalleeAlias::Unknown,
+            },
+        )),
+        _ if value_may_bind_function(value, text) => {
+            Some(LocalCalleeBinding::Alias(LocalCalleeAlias::Unknown))
+        }
+        _ => None,
+    }
+}
+
+/// The `(package, name)` text of a `namespace_operator` node (`pkg::name` /
+/// `pkg:::name`), or `None` if either side is missing. Shared by the NSE
+/// callee-classification and policy-resolution paths so the grammar's `lhs` /
+/// `rhs` field names are named in exactly one place.
+fn namespace_parts<'t>(node: Node<'t>, text: &'t str) -> Option<(&'t str, &'t str)> {
+    let lhs = node.child_by_field_name("lhs")?;
+    let rhs = node.child_by_field_name("rhs")?;
+    Some((node_text(lhs, text), node_text(rhs, text)))
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -12677,6 +12743,14 @@ pub(crate) struct NseAnalysis<'a> {
     /// dots-forwarding inference uses it as a conservative veto before treating
     /// a bare covered-verb call as a package verb.
     local_callee_shadows: HashSet<String>,
+    /// Non-literal local callee aliases/rebindings (issue #450): a name's last
+    /// top-level binding to a qualified alias (`filter <- stats::filter`) or an
+    /// opaque callable (`filter <- get_filter()`). The direct-call resolver
+    /// consults this so such a rebinding shadows the package/base verb just like
+    /// a literal `name <- function(...)` definition does. Kept disjoint from
+    /// `local_function_defs` / `local_function_policies` by last-binding-wins
+    /// bookkeeping in [`collect_nse_facts`].
+    local_callee_aliases: HashMap<String, LocalCalleeAlias>,
     /// Packages detectably in play across the file/workspace: `library()` /
     /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
     /// packages. A loaded package shadows base when classifying a bare callee.
@@ -12745,6 +12819,7 @@ impl<'a> NseAnalysis<'a> {
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
+        let mut local_callee_aliases: HashMap<String, LocalCalleeAlias> = HashMap::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
         let mut class_transitions: HashMap<String, Vec<(usize, DataTableClass)>> = HashMap::new();
@@ -12757,6 +12832,7 @@ impl<'a> NseAnalysis<'a> {
             text,
             &mut local_function_defs,
             &mut local_callee_shadows,
+            &mut local_callee_aliases,
             &mut data_table_objects,
             &mut non_data_table_objects,
             &mut class_transitions,
@@ -12787,6 +12863,7 @@ impl<'a> NseAnalysis<'a> {
             bracket_indices_enabled,
             local_function_policies,
             local_callee_shadows,
+            local_callee_aliases,
             in_play_packages,
             self_nse_package,
             data_table_in_play,
@@ -12919,8 +12996,9 @@ impl<'a> NseAnalysis<'a> {
 
 /// Walk the tree gathering the facts [`NseAnalysis`] needs: top-level function
 /// definitions (their capture policies are inferred afterwards in
-/// [`NseAnalysis::build`]), top-level data.table-like object bindings, and
-/// whether `data.table::` is used anywhere in the file.
+/// [`NseAnalysis::build`]), top-level non-literal callee aliases/rebindings
+/// (`filter <- stats::filter`; issue #450), top-level data.table-like object
+/// bindings, and whether `data.table::` is used anywhere in the file.
 ///
 /// Only **top-level** bindings are recorded (`in_function` is false): with
 /// global hoisting, top-level functions are visible everywhere, whereas a
@@ -12929,13 +13007,16 @@ impl<'a> NseAnalysis<'a> {
 /// simply falls to the conservative unresolved-callee path. The `data.table::`
 /// qualifier scan stays file-wide because data.table-in-play is a file fact.
 /// `HashMap::insert` makes the last definition of a name win, matching R's
-/// runtime where the latest top-level assignment is the one in effect.
+/// runtime where the latest top-level assignment is the one in effect; the
+/// definition map and the alias map clear each other on rebinding so they stay
+/// disjoint and the surviving entry reflects the last assignment's kind.
 #[allow(clippy::too_many_arguments)] // collector pattern: accumulates into multiple pre-existing sets
 fn collect_nse_facts<'t>(
     node: Node<'t>,
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
     local_callee_shadows: &mut HashSet<String>,
+    local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
     class_transitions: &mut HashMap<String, Vec<(usize, DataTableClass)>>,
@@ -12976,20 +13057,42 @@ fn collect_nse_facts<'t>(
     {
         let name = node_text(target, text);
         let value = unwrap_parenthesized(value);
-        if value_may_bind_function(value, text) {
-            local_callee_shadows.insert(name.to_string());
-        } else {
-            local_callee_shadows.remove(name);
+        // Callee-binding bookkeeping for the NSE policy resolver (issue #450).
+        // `local_function_defs`, `local_callee_aliases`, and the shadow set are
+        // kept consistent under last-binding-wins: a name is in the shadow set
+        // iff its last binding is callable, lives in exactly one of the
+        // definition / alias maps, and a rebinding clears the map it no longer
+        // belongs to — so the structures never disagree about what `name` is.
+        match classify_callee_binding(value, text) {
+            Some(binding) => {
+                local_callee_shadows.insert(name.to_string());
+                match binding {
+                    LocalCalleeBinding::Definition(def) => {
+                        local_function_defs.insert(name.to_string(), def);
+                        local_callee_aliases.remove(name);
+                    }
+                    LocalCalleeBinding::Alias(alias) => {
+                        local_callee_aliases.insert(name.to_string(), alias);
+                        local_function_defs.remove(name);
+                    }
+                }
+            }
+            None => {
+                local_callee_shadows.remove(name);
+                local_function_defs.remove(name);
+                local_callee_aliases.remove(name);
+            }
         }
+        // Reference-class generators and data.table object classification are
+        // independent facts about the same binding; a function definition is
+        // neither, matching the original mutually-exclusive chain.
         if let Some(info) = reference_class_info_from_set_ref_class(value, text) {
             let generator = name.to_string();
             if let Some(class_name) = info.class_name.clone() {
                 reference_class_by_class.insert(class_name, generator.clone());
             }
             reference_class_generators.insert(generator, info);
-        } else if value.kind() == "function_definition" {
-            local_function_defs.insert(name.to_string(), value);
-        } else {
+        } else if value.kind() != "function_definition" {
             match constructor_data_table_class(value, text) {
                 DataTableClass::DataTable => {
                     non_data_table_objects.remove(name);
@@ -13012,6 +13115,7 @@ fn collect_nse_facts<'t>(
             text,
             local_function_defs,
             local_callee_shadows,
+            local_callee_aliases,
             data_table_objects,
             non_data_table_objects,
             class_transitions,
@@ -13706,12 +13810,8 @@ fn table_verb_policy(
     analysis: &NseAnalysis,
 ) -> Option<crate::nse::ArgPolicy> {
     if func.kind() == "namespace_operator" {
-        return func
-            .child_by_field_name("lhs")
-            .zip(func.child_by_field_name("rhs"))
-            .and_then(|(pkg, name)| {
-                crate::nse::package_policy(node_text(pkg, text), node_text(name, text))
-            });
+        return namespace_parts(func, text)
+            .and_then(|(pkg, name)| crate::nse::package_policy(pkg, name));
     }
     if func.kind() != "identifier" {
         return None;
@@ -13962,6 +14062,26 @@ fn resolve_call_arg_policy(
     // 1. A local definition shadows any package / base policy.
     if let Some(policy) = analysis.local_function_policies.get(name) {
         return policy.clone();
+    }
+    // 1b (issue #450). A non-literal local callee alias/rebinding also shadows
+    //     the package / base verb, just like a literal definition: R calls the
+    //     locally bound value, not the package export. Disjoint from
+    //     `local_function_policies` by last-binding-wins bookkeeping in
+    //     `collect_nse_facts`.
+    if let Some(alias) = analysis.local_callee_aliases.get(name) {
+        return match alias {
+            // Resolve the qualified target's verb policy: a target with no
+            // table policy (e.g. `stats::filter`) is standard-eval, so its
+            // arguments are checked, while `dplyr::filter` keeps its data-mask
+            // policy.
+            LocalCalleeAlias::Qualified {
+                package,
+                name: target,
+            } => crate::nse::package_policy(package, target).unwrap_or(ArgPolicy::Standard),
+            // An opaque callable whose policy we cannot prove: suppress
+            // conservatively rather than inherit any package verb's policy.
+            LocalCalleeAlias::Unknown => ArgPolicy::WholeCall,
+        };
     }
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
     // owner resolution).
@@ -21851,6 +21971,147 @@ mod tests {
             was_collected(&used, "typo_arg"),
             "outer formal is not embraced; its argument stays checked"
         );
+    }
+
+    // ---- Issue #450: direct-call policy for non-literal local callee aliases ----
+
+    /// A simple qualified alias of a covered verb to a standard-eval target
+    /// preserves the target's policy: `filter <- stats::filter` makes bare
+    /// `filter(df, typo)` a standard-eval call, so its arguments are checked
+    /// even with dplyr in play.
+    #[test]
+    fn nse_alias_qualified_standard_target_checks_args() {
+        let code = "filter <- stats::filter\nfilter(df, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "df"), "data argument stays checked");
+        assert!(
+            was_collected(&used, "typo"),
+            "stats::filter is standard-eval; its argument must be checked"
+        );
+    }
+
+    /// A qualified alias to a data-masking verb keeps that verb's policy:
+    /// `filter <- dplyr::filter` leaves bare `filter(df, col)`'s masked column
+    /// suppressed while the data argument stays checked.
+    #[test]
+    fn nse_alias_qualified_masking_target_suppresses_column() {
+        let code = "filter <- dplyr::filter\nfilter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(was_collected(&used, "df"), "data argument stays checked");
+        assert!(
+            !was_collected(&used, "col"),
+            "dplyr::filter's masked column must stay suppressed through the alias"
+        );
+    }
+
+    /// An unknown callable-producing expression (`filter <- get_filter()`) has
+    /// no statically known policy, so the call is conservatively whole-call
+    /// suppressed rather than resolved as dplyr's `filter` — the alias must not
+    /// inherit the package verb's policy.
+    #[test]
+    fn nse_alias_unknown_callable_suppresses_conservatively() {
+        let code = "filter <- get_filter()\nfilter(df, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            !was_collected(&used, "df"),
+            "unknown callable alias suppresses conservatively"
+        );
+        assert!(
+            !was_collected(&used, "typo"),
+            "unknown callable alias suppresses conservatively"
+        );
+    }
+
+    /// An obvious non-function literal (`filter <- 1`) does not shadow R's
+    /// function lookup, which skips non-functions in call position. Bare
+    /// `filter(df, col)` therefore still resolves to dplyr's `filter`: the
+    /// masked column is suppressed but the data argument stays checked. (If the
+    /// literal were wrongly treated as an opaque callable, `df` would be
+    /// whole-call suppressed too.)
+    #[test]
+    fn nse_alias_non_function_literal_not_a_shadow() {
+        let code = "filter <- 1\nfilter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "non-function literal is not a callable shadow; dplyr policy keeps data checked"
+        );
+        assert!(
+            !was_collected(&used, "col"),
+            "function lookup falls through to dplyr::filter, which masks the column"
+        );
+    }
+
+    /// A bare-identifier alias is an opaque callable: `filter <- some_fn`
+    /// cannot be proven data-masking, so the call is conservatively whole-call
+    /// suppressed rather than resolved as the package verb.
+    #[test]
+    fn nse_alias_identifier_callable_suppresses_conservatively() {
+        let code = "filter <- some_fn\nfilter(df, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(!was_collected(&used, "df"));
+        assert!(!was_collected(&used, "typo"));
+    }
+
+    /// Last top-level binding wins for the alias policy, in both directions: a
+    /// later non-function literal re-enables the package verb's policy, and a
+    /// later standard-eval alias re-enables argument checking over an earlier
+    /// data-masking alias.
+    #[test]
+    fn nse_alias_last_binding_wins() {
+        // dplyr alias, then overwritten by a non-function literal: the literal
+        // is not a shadow, so dplyr's policy applies and `col` is masked.
+        let masking_then_literal = "filter <- dplyr::filter\nfilter <- 1\nfilter(df, col)";
+        let tree = parse_r_code(masking_then_literal);
+        let mut used = Vec::new();
+        collect_with_packages(
+            tree.root_node(),
+            masking_then_literal,
+            &["dplyr"],
+            &mut used,
+        );
+        assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+
+        // dplyr alias, then overwritten by a standard-eval qualified alias: the
+        // last binding wins, so the argument is checked.
+        let masking_then_standard =
+            "filter <- dplyr::filter\nfilter <- stats::filter\nfilter(df, typo)";
+        let tree = parse_r_code(masking_then_standard);
+        let mut used = Vec::new();
+        collect_with_packages(
+            tree.root_node(),
+            masking_then_standard,
+            &["dplyr"],
+            &mut used,
+        );
+        assert!(was_collected(&used, "typo"));
+    }
+
+    /// A literal function definition rebound to a non-function literal no longer
+    /// shadows the package verb (last-binding-wins across the definition and
+    /// alias maps).
+    #[test]
+    fn nse_alias_definition_then_literal_clears_shadow() {
+        let code = "filter <- function(x, ...) x\nfilter <- 1\nfilter(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "rebinding to a literal clears the local definition; dplyr keeps data checked"
+        );
+        assert!(!was_collected(&used, "col"));
     }
 
     // ---- Phase 3: conditional bracket suppression ----
