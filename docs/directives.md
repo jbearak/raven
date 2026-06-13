@@ -147,6 +147,52 @@ Declaration directives work in any R file, whether or not it participates in cro
 # @lsp-func myfunc                # alias (every synonym also has an @lsp- form)
 ```
 
+`# raven: func` can also declare a formal list alongside the symbol, which records the order of parameters for use by `# raven: nse` positional matching (see below):
+
+```r
+# raven: func my_func(data, x, y)   # declares existence + formal order
+```
+
+### NSE Declarations
+
+Teach Raven that a function uses non-standard evaluation (NSE), so bare
+identifiers in its captured arguments are not flagged as undefined variables.
+
+```r
+# raven: nse my_func              # whole-call: every argument is NSE
+# raven: nse my_func(x)           # only the `x` formal is captured
+# raven: nse my_func(x, y)        # `x` and `y` are captured
+# raven: nse pkg::my_func(x, y)   # qualified form
+# @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
+```
+
+`# raven: nse` is position-aware: it applies to calls **after** the directive
+line, and the most recent declaration for a function wins. It is an
+authoritative declaration that overrides Raven's own inference for that callee —
+but it is **not** a blanket diagnostic ignore: it declares a reusable
+argument-evaluation policy for the named function.
+
+A qualified declaration (`pkg::my_func`) matches both `pkg::my_func(...)` calls
+and unqualified `my_func(...)` calls when `pkg` is in scope (loaded via
+`library()` or package imports).
+
+Named arguments are matched by formal name regardless of order. For
+**positional** arguments Raven needs the formal order, which it reads from a
+visible local definition or from a paired `# raven: func` declaration:
+
+```r
+# raven: func my_func(data, x, y)   # declares existence + formal order
+# raven: nse my_func(x, y)          # declares which formals are captured
+my_func(df, col_a, col_b)           # col_a, col_b suppressed; df checked
+```
+
+Installed-package functions expose only export names (not formals) to the
+synchronous diagnostic pass, so positional matching for an installed-package
+callee also requires a paired `# raven: func` with formals.
+
+Malformed forms — `# raven: nse my_func()` with empty parentheses, or the
+bracket form `# raven: nse[...]` — are ignored rather than blanket-suppressing.
+
 ### Position-Aware Behavior
 
 Declared symbols are available starting from the next line (line N+1):
