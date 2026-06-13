@@ -427,10 +427,15 @@ pub struct DependencyEdge {
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
-    /// True if the edge was created from an LSP directive (`# raven: source` or `# raven: sourced-by`)
+    /// True if the edge was created from any Raven directive — forward-family
+    /// (`# raven: source`/`run`/`include`) or backward-family
+    /// (`# raven: sourced-by`/`run-by`/`included-by`) — rather than an
+    /// AST-detected `source()` call.
     pub is_directive: bool,
-    /// True if the directive origin is a backward directive (`# raven: sourced-by` / `# raven: run-by`).
-    /// False for forward directives (`# raven: source`) and AST-detected edges.
+    /// True if the edge originates from a backward-family directive
+    /// (e.g. `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`).
+    /// False for forward-family directives (e.g. `# raven: source`, `# raven: run`,
+    /// `# raven: include`) and AST-detected edges.
     pub is_backward_directive: bool,
 }
 

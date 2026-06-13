@@ -28,7 +28,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 |---|---|---|
 | `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
 | `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
-| `unresolved-source-path` | A `source()` / `# raven: source` path that does not resolve to a file | No |
+| `unresolved-source-path` | A forward-directive path (`source()`, `# raven: source` / `# raven: run` / `# raven: include`) that does not resolve to a file | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
 | `package-not-installed` | `library()` / `require()` of a package that is not installed | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |

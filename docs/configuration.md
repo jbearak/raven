@@ -62,7 +62,7 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rPath`
 | Setting | Default | Description |
 |---|---|---|
 | `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
-| `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require `# raven: sourced-by` directives. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
+| `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require backward directives (e.g. `# raven: sourced-by`) to declare backward dependencies. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
 | `raven.crossFile.hoistGlobalsInFunctions` | `true` | Hoist global definitions inside function bodies (late-binding semantics). See [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting). *LSP init-only — not exposed in the VS Code Settings UI.* |
 | `raven.crossFile.assumeCallSite` | `"end"` | Default call site when not specified by directive (`"end"` or `"start"`) |
 | `raven.crossFile.maxBackwardDepth` | `10` | Maximum depth for backward directive traversal |

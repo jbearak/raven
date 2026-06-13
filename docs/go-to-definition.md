@@ -39,7 +39,7 @@ result <- helper_function(42)  # cmd-click jumps into utils.R
 helper_function <- function(x) { x * 2 }  # ← jump target
 ```
 
-Raven follows both `source()` calls and [forward directives](directives.md#forward-directives) (`# raven: source`, `# raven: run`, `# raven: include`). Backward directives (`# raven: sourced-by`) bring the parent file's symbols into scope, so cmd-clicking a parent-defined symbol in a child file works too.
+Raven follows both `source()` calls and [forward directives](directives.md#forward-directives) (`# raven: source`, `# raven: run`, `# raven: include`). Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) bring the parent file's symbols into scope, so cmd-clicking a parent-defined symbol in a child file works too.
 
 If no definition is found in the dependency graph, Raven falls back to other open documents and the workspace index so you can still navigate to reasonable candidates during project-wide exploration.
 

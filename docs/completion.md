@@ -56,7 +56,7 @@ Inside `source()` strings and path-taking directives, Raven completes file paths
 source("utils/  # Offers: utils/helpers.R, utils/config.R, ...
 ```
 
-Path completion respects `# raven: cd` and workspace-root fallback rules.
+Path completion respects `# raven: cd` and workspace-root fallback rules for forward directives (`# raven: source`, `# raven: run`, `# raven: include`) and `source()` calls. Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) still resolve relative to the file's directory.
 
 ## $ Member Completions
 

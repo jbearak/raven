@@ -575,9 +575,14 @@ fn unescape_string(s: &str) -> String {
 
 /// Generate file path completions for the given context
 ///
-/// Determines the base directory based on context type:
-/// - SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
-/// - Directive: Uses PathContext::new() (ignores `# raven: cd`)
+/// Determines the base directory based on context type and directive variant
+/// (see [`resolve_base_directory`]):
+/// - `SourceCall` (AST `source()`) and forward directives
+///   (`Directive` with `DirectiveType::Source`): use `PathContext::from_metadata()`
+///   — respect `# raven: cd` (explicit or inherited), with workspace-root fallback.
+/// - Backward directives (`Directive` with `DirectiveType::SourcedBy`): use
+///   `PathContext::new()` — ignore `# raven: cd` and resolve relative to the
+///   file's directory.
 ///
 /// # Arguments
 /// * `context` - The detected file path context

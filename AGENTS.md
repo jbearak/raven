@@ -72,7 +72,7 @@ Each item below either spans multiple systems or is a discipline that applies in
   - See `crates/raven/src/cross_file/path_resolve.rs` and `docs/cross-file.md`.
 
 - **Workspace-root fallback**
-  - For AST-detected `source()` calls AND forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no `# raven: cd` is explicitly or inheritedly in effect. Forward directives are semantically equivalent to `source()` calls and must resolve identically.
+  - For AST-detected `source()` calls AND forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no `# raven: cd` is explicitly or inheritedly in effect. Forward directives are path-resolution equivalent to `source()` calls and must resolve identically (path resolution only — `# raven: run`/`# raven: include` are not execution-time equivalents of `source()`).
   - Must hold uniformly across dependency-graph resolution, scope resolution, missing-file diagnostics, file-path go-to-definition, and path completion. Never apply to backward directives.
 
 - **Diagnostics publishing monotonicity**

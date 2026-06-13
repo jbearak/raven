@@ -1011,10 +1011,10 @@
           ],
           "enumDescriptions": [
             "Infer parent files by scanning the workspace for source() calls and forward directives. Diagnostics are deferred until the workspace scan completes.",
-            "Only use explicit # raven: sourced-by directives to resolve parent files. Diagnostics are shown immediately without waiting for a workspace scan."
+            "Only use explicit # raven: sourced-by directives (or the permanent @lsp-sourced-by alias) to resolve parent files. Diagnostics are shown immediately without waiting for a workspace scan."
           ],
           "default": "auto",
-          "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, and 'explicit' requires # raven: sourced-by directives."
+          "description": "Controls how Raven discovers files that source the current file. 'auto' scans the workspace, and 'explicit' requires # raven: sourced-by directives (the @lsp-sourced-by alias also works)."
         },
         "raven.crossFile.indexWorkspace": {
           "type": "boolean",
@@ -1126,7 +1126,7 @@
             "Disable redundant directive diagnostics"
           ],
           "default": "hint",
-          "description": "Severity level for diagnostics when a # raven: source directive (without line=) targets the same file as an earlier source() call. The directive is redundant since the source() call already makes the symbols available."
+          "description": "Severity level for diagnostics when a # raven: source directive (or its permanent @lsp-source alias), without line=, targets the same file as an earlier source() call. The directive is redundant since the source() call already makes the symbols available."
         },
         "raven.crossFile.onDemandIndexing.enabled": {
           "type": "boolean",
