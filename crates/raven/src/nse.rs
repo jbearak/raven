@@ -1167,6 +1167,14 @@ fn per_formal_mask(
     // Pass 2: positional arguments fill remaining formals in order, stopping at
     // `...`. A cursor that has reached `...` (or run off the end) routes every
     // further positional argument through the dots policy.
+    //
+    // Running off the end is treated like reaching `...` ON PURPOSE: the
+    // `# raven: nse` directive is not arity-aware (see `docs/directives.md`), so
+    // when the user declared dots-capture (`captured_dots`) a trailing argument
+    // beyond the resolved formal list is suppressed even if the callee does not
+    // actually have a `...` formal. With no dots-capture declared, `captured_dots`
+    // is false and the overflow argument stays checked — so the coarse,
+    // user-authoritative behavior only ever errs toward suppression.
     let mut cursor = 0usize;
     for (i, label) in arg_labels.iter().enumerate() {
         if label.is_some() {

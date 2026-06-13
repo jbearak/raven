@@ -5681,6 +5681,20 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
+        // Honor the client's code-action kind filter. This handler only produces
+        // `QUICKFIX` actions (the `# raven: nse` quick-fix), so a request that
+        // restricts kinds to a set QUICKFIX does not satisfy (e.g. a refactor- or
+        // source-only request) gets no work done. A filter kind matches when it
+        // is empty (the root), equals `quickfix`, or is a parent of it.
+        let quickfix = CodeActionKind::QUICKFIX;
+        if let Some(only) = &params.context.only
+            && !only.iter().any(|k| {
+                let (k, qf) = (k.as_str(), quickfix.as_str());
+                k.is_empty() || qf == k || qf.starts_with(&format!("{k}."))
+            })
+        {
+            return Ok(None);
+        }
         let state = self.state.read().await;
         let Some(doc) = state.get_document(&uri) else {
             return Ok(None);
@@ -12424,6 +12438,59 @@ lineLength = 200
         assert_eq!(
             nse_actions, 0,
             "no NSE quick-fix for a non-undefined diagnostic: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_respects_only_kind_filter() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionKind, CodeActionParams, Diagnostic, PartialResultParams,
+            Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // A request restricted to REFACTOR must not return the QUICKFIX NSE
+        // action even when an eligible undefined-variable diagnostic is present.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = Diagnostic {
+            range: Range {
+                start: Position::new(1, 8),
+                end: Position::new(1, 10),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef],
+                only: Some(vec![CodeActionKind::REFACTOR]),
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "a refactor-only request must not return the QUICKFIX NSE action: {actions:?}"
         );
     }
 

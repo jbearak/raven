@@ -193,7 +193,31 @@ argument-evaluation policy for the named function.
 
 A qualified declaration (`pkg::my_func`) matches both `pkg::my_func(...)` calls
 and unqualified `my_func(...)` calls when `pkg` is in scope (loaded via
-`library()` or package imports).
+`library()` or package imports) — except when a local binding shadows the bare
+name, since R would then invoke the local value rather than `pkg::my_func`.
+
+#### `# raven: nse` is deliberately coarse
+
+`# raven: nse` is a file-level, name-keyed, authoritative override. Apart from
+the position-awareness of the directive line itself (it governs calls *after*
+it), it is intentionally **not**:
+
+- **Scope-aware.** It applies to every call of the named function in the file,
+  including calls inside nested function bodies that locally rebind the name — a
+  nested helper sharing a top-level name is still governed by the file-level
+  directive, not its inner definition.
+- **`library()`-position-aware.** Whether a `pkg::` qualifier's package is "in
+  scope" is judged file-wide, so a qualified declaration can govern a bare call
+  even if the matching `library(pkg)` appears later in the file.
+- **Arity- or signature-aware.** It does not validate the captured formals
+  against the callee's real definition. In particular, `# raven: nse f(...)`
+  captures a call's trailing arguments even if `f` does not actually declare a
+  `...` formal.
+
+This is by design: the directive is an opt-in escape hatch where you take
+responsibility for declaring an accurate policy. Its only effect is to *suppress*
+diagnostics, so an inaccurate or stale directive over-suppresses (it may hide a
+diagnostic you wanted) rather than producing a false positive.
 
 Named arguments are matched by formal name regardless of order. For
 **positional** arguments Raven needs the formal order, which it reads from a

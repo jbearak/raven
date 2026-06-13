@@ -12840,6 +12840,17 @@ pub(crate) struct NseAnalysis<'a> {
     /// translated to policies and resolved against available formal-order
     /// sources (`# raven: func`, local definitions). Keyed by bare callee name;
     /// each vec sorted ascending by directive line for position-gated lookup.
+    ///
+    /// `# raven: nse` is intentionally a coarse, file-level, name-keyed
+    /// authoritative override (see `docs/directives.md`). Apart from the
+    /// position-gating of the directive LINE (`directive_nse_policy` only matches
+    /// declarations before the call line), it is deliberately NOT scope-aware (it
+    /// governs every call of the name in the file, including nested rebindings),
+    /// NOT `library()`-position-aware (a `pkg::` qualifier's in-scope test is
+    /// file-wide), and NOT arity/signature-aware (it does not validate captured
+    /// formals against the callee's real definition). Its only effect is to
+    /// suppress diagnostics, so an inaccurate directive over-suppresses rather
+    /// than mis-reporting — never a false positive.
     directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
 }
 
@@ -57745,6 +57756,47 @@ my_func <- function(a = default_value) {
         assert!(
             !diags.iter().any(|m| m.contains("masked_x")),
             "captured formal `x` must be suppressed by the dot-digit directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dots_capture_is_not_arity_aware() {
+        // `# raven: nse f(...)` declares dots-capture. Per the directive's
+        // intentional arity-non-awareness (docs/directives.md "deliberately
+        // coarse"), a trailing positional beyond the callee's real arity is
+        // captured even though `f` has no `...` formal. Pins that documented
+        // behavior: `third_undef` is suppressed while the in-arity positionals
+        // stay checked. (Errs only toward suppression, never a false positive.)
+        let diags = collect_undefined_messages(
+            "f <- function(a, b) a\n# raven: nse f(...)\nf(p_a, p_b, third_undef)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("p_a")),
+            "in-arity non-captured positional stays checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("third_undef")),
+            "dots-capture suppresses the overflow positional (not arity-aware); got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_shows_for_bare_call_governed_only_by_in_play_qualified_directive() {
+        // `nse_directive_governs` intentionally omits the BareInPlayQualified
+        // pass (it errs toward SHOWING the hint). So a bare call whose only
+        // governing directive is an in-play `pkg::` one still gets the
+        // discoverability hint on a surviving non-captured argument. Guards that
+        // documented asymmetry — a regression that started suppressing the hint
+        // here would otherwise ship silently.
+        let diags =
+            collect_undefined_messages("library(pkg)\n# raven: nse pkg::foo(x)\nfoo(real_undef)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: real_undef"))
+            .expect("real_undef flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "hint should still show for an in-play-qualified-only directive: {d}"
         );
     }
 
