@@ -1966,11 +1966,13 @@ mod integration_tests {
                 name: "declared_var".to_string(),
                 line: 0,
                 is_function: false,
+                formals: None,
             }],
             declared_functions: vec![DeclaredSymbol {
                 name: "declared_func".to_string(),
                 line: 1,
                 is_function: true,
+                formals: None,
             }],
             ..Default::default()
         };
@@ -2081,6 +2083,7 @@ mod integration_tests {
                 name: "old_declared".to_string(),
                 line: 0,
                 is_function: false,
+                formals: None,
             }],
             ..Default::default()
         };
@@ -2203,6 +2206,7 @@ mod integration_tests {
                 name: "child_declared".to_string(),
                 line: 0,
                 is_function: true,
+                formals: None,
             }],
             ..Default::default()
         };

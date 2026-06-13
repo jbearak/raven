@@ -9003,6 +9003,7 @@ outside_var <- 2"#;
                 name: "declared_var".to_string(),
                 line: 0,
                 is_function: false,
+                formals: None,
             }],
             ..Default::default()
         };
@@ -9142,11 +9143,13 @@ outside_var <- 2"#;
                     name: "before_var".to_string(),
                     line: 0,
                     is_function: false,
+                    formals: None,
                 },
                 DeclaredSymbol {
                     name: "after_var".to_string(),
                     line: 2,
                     is_function: false,
+                    formals: None,
                 },
             ],
             ..Default::default()

@@ -615,6 +615,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     name,
                     line: line_num,
                     is_function: false,
+                    formals: None,
                 });
             }
             continue;
@@ -633,6 +634,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     name,
                     line: line_num,
                     is_function: true,
+                    formals: None,
                 });
             }
             continue;
