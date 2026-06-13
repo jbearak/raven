@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 use super::types::{
     BackwardDirective, CallSiteSpec, CrossFileMetadata, DeclaredSymbol, ForwardSource,
-    LineSuppression, SuppressionDirective, SuppressionFlavor, SuppressionRange,
+    LineSuppression, NseDeclaration, NseScope, SuppressionDirective, SuppressionFlavor,
+    SuppressionRange,
 };
 
 /// Compiled regex patterns for directive parsing
@@ -26,6 +27,7 @@ struct DirectivePatterns {
     raven_ignore_file: Regex,
     declare_var: Regex,
     declare_func: Regex,
+    nse: Regex,
 }
 
 /// Convert an optional `[code]` selector capture into a [`LineSuppression`].
@@ -159,6 +161,18 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
     Some(name)
 }
 
+/// Split a directive parameter list body (the text between `(` and `)`) into
+/// trimmed, non-empty formal names. Returns `None` when the body has no usable
+/// names (so an empty `()` is treated as malformed by callers).
+fn split_formal_list(body: &str) -> Option<Vec<String>> {
+    let names: Vec<String> = body
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
+}
+
 /// Keyword alternation for forward source directives: `@lsp-source`, `@lsp-run`,
 /// `@lsp-include` (and their `# raven: source` / `run` / `include` aliases).
 /// This is the inner body of the `(?:@lsp-|raven:\s*)(?:…)` group only — the
@@ -290,13 +304,24 @@ fn patterns() -> &'static DirectivePatterns {
             ).unwrap(),
             // Declaration directives for functions
             // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
-            // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
+            // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted, 4=optional formal list body
             // Requirements: 2.1, 2.2, 2.3
             declare_func: Regex::new(
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:]+))(?:\s*\(([^)]*)\))?"#,
+                ]
+                .concat(),
+            ).unwrap(),
+            // NSE contract directive: `# raven: nse [pkg::]name[(formals…)]`
+            // Group 1: qualified or bare name (e.g. "my_func" or "pkg::my_func")
+            // Group 2: optional formal list body (text between `(` and `)`)
+            nse: Regex::new(
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"nse\s*:?\s*([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*$"#,
                 ]
                 .concat(),
             ).unwrap(),
@@ -630,11 +655,42 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     line_num,
                     name
                 );
+                let formals = caps.get(4).and_then(|m| split_formal_list(m.as_str()));
                 meta.declared_functions.push(DeclaredSymbol {
                     name,
                     line: line_num,
                     is_function: true,
-                    formals: None,
+                    formals,
+                });
+            }
+            continue;
+        }
+
+        // `# raven: nse [pkg::]name[(formals…)]` — NSE argument-policy
+        // declaration. Position-aware (applies to calls after this line).
+        if let Some(caps) = patterns.nse.captures(line) {
+            if let Some(raw) = caps.get(1).map(|m| m.as_str()) {
+                let (package, name) = match raw.split_once("::") {
+                    Some((p, n)) if !p.is_empty() && !n.is_empty() => {
+                        (Some(p.to_string()), n.to_string())
+                    }
+                    Some(_) => {
+                        continue;
+                    }
+                    None => (None, raw.to_string()),
+                };
+                let scope = match caps.get(2) {
+                    Some(body) => match split_formal_list(body.as_str()) {
+                        Some(formals) => NseScope::Formals(formals),
+                        None => continue,
+                    },
+                    None => NseScope::WholeCall,
+                };
+                meta.nse_declarations.push(NseDeclaration {
+                    name,
+                    package,
+                    scope,
+                    line: line_num,
                 });
             }
             continue;
@@ -2144,5 +2200,82 @@ x <- undefined"#;
                 "should not declare var: {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_nse_whole_call() {
+        let meta = parse_directives("# raven: nse my_func\nmy_func(x > 1)\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        let d = &meta.nse_declarations[0];
+        assert_eq!(d.name, "my_func");
+        assert_eq!(d.package, None);
+        assert_eq!(d.scope, crate::cross_file::types::NseScope::WholeCall);
+        assert_eq!(d.line, 0);
+    }
+
+    #[test]
+    fn parses_nse_per_formal_and_variants() {
+        use crate::cross_file::types::NseScope;
+        let cases = [
+            ("# raven: nse my_func(x)", "my_func", None, vec!["x"]),
+            (
+                "# raven: nse my_func(x, y)",
+                "my_func",
+                None,
+                vec!["x", "y"],
+            ),
+            ("# raven:nse my_func(x)", "my_func", None, vec!["x"]),
+            ("# raven: nse: my_func(x)", "my_func", None, vec!["x"]),
+            ("# @lsp-nse my_func(x)", "my_func", None, vec!["x"]),
+            (
+                "# raven: nse pkg::my_func(x, y)",
+                "my_func",
+                Some("pkg"),
+                vec!["x", "y"],
+            ),
+        ];
+        for (line, name, pkg, formals) in cases {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert_eq!(meta.nse_declarations.len(), 1, "case: {line}");
+            let d = &meta.nse_declarations[0];
+            assert_eq!(d.name, name, "case: {line}");
+            assert_eq!(d.package.as_deref(), pkg, "case: {line}");
+            assert_eq!(
+                d.scope,
+                NseScope::Formals(formals.iter().map(|s| s.to_string()).collect()),
+                "case: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_nse_is_ignored() {
+        for line in [
+            "# raven: nse",
+            "# raven: nse ()",
+            "# raven: nse my_func()",
+            "# raven: nse[my_func(x)]",
+        ] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert!(meta.nse_declarations.is_empty(), "case: {line}");
+        }
+    }
+
+    #[test]
+    fn func_directive_captures_formals() {
+        let meta = parse_directives("# raven: func my_func(data, x, y)\n");
+        assert_eq!(meta.declared_functions.len(), 1);
+        let f = &meta.declared_functions[0];
+        assert_eq!(f.name, "my_func");
+        assert_eq!(
+            f.formals,
+            Some(vec!["data".to_string(), "x".to_string(), "y".to_string()])
+        );
+    }
+
+    #[test]
+    fn func_directive_without_formals_keeps_none() {
+        let meta = parse_directives("# raven: func my_func\n");
+        assert_eq!(meta.declared_functions[0].formals, None);
     }
 }
