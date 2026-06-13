@@ -57495,6 +57495,30 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_named_formal_and_dots_capture_together() {
+        // The documented combined form `# raven: nse f(x, ...)` must capture
+        // BOTH the named formal `x` AND the `...`-absorbed trailing args, while
+        // a non-captured formal (`y`) stays checked — exercising captured names
+        // and `captured_dots` simultaneously (a regression clobbering either
+        // would surface here).
+        let diags = collect_undefined_messages(
+            "my_func <- function(x, y, ...) x\n# raven: nse my_func(x, ...)\nmy_func(masked_x, real_y, dots_undef)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured named formal `x` must be suppressed; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_y")),
+            "non-captured formal `y` must still be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("dots_undef")),
+            "arg absorbed by captured `...` must be suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
     fn nse_captured_name_absent_from_formals_keeps_extra_positional_checked() {
         // `# raven: nse my_func(x)` names `x`, not a formal of `function(a, b)`.
         // A third positional beyond the real arity must still be checked, not

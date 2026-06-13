@@ -169,8 +169,13 @@ identifiers in its captured arguments are not flagged as undefined variables.
 # raven: nse my_func(x, y)        # `x` and `y` are captured
 # raven: nse my_func(...)         # arguments absorbed by `...` are captured
 # raven: nse pkg::my_func(x, y)   # qualified form
+# raven: nse "%+%"(lhs)           # quote non-syntactic names (operators, etc.)
 # @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
 ```
+
+As with `# raven: func`, the callee name accepts a bare `name` or a single
+`pkg::name` qualifier unquoted; a name with characters outside `[A-Za-z0-9._]`
+(operators like `%+%`, names with spaces) must use the quoted form.
 
 A literal `...` in the captured list declares that the arguments a call passes
 through the function's `...` are captured (checked formals before `...` are

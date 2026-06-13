@@ -379,22 +379,24 @@ fn patterns() -> &'static DirectivePatterns {
                 .concat(),
             ).unwrap(),
             // NSE contract directive: `# raven: nse [pkg::]name[(formals…)]`
-            // Group 1: qualified or bare name (e.g. "my_func" or "pkg::my_func")
-            // Group 2: optional formal list body (text between `(` and `)`)
+            // Groups: 1=double-quoted name, 2=single-quoted name, 3=unquoted
+            // (bare or `pkg::name`) name, 4=optional formal list body.
             //
             // A separator (whitespace or `:`) is REQUIRED after the `nse`
             // keyword, so a run-together `nseg(col)` is not misread as a
-            // declaration for callee `g`. The pattern is end-anchored (only an
-            // optional trailing `# comment` may follow): an unclosed `(` or any
-            // unexpected trailing text fails to match, so a malformed payload is
-            // ignored rather than producing a partial/blanket suppression. This
-            // is intentionally stricter than the `func`/`var` directives, which
-            // match a prefix and silently ignore trailing tokens.
+            // declaration for callee `g`. As with `func`, a callee whose name
+            // has characters outside `[A-Za-z0-9._]` (operators like `%+%`,
+            // names with spaces) uses the quoted form. The pattern is
+            // end-anchored (only an optional trailing `# comment` may follow):
+            // an unclosed `(` or any unexpected trailing text fails to match, so
+            // a malformed payload is ignored rather than producing a
+            // partial/blanket suppression — intentionally stricter than the
+            // prefix-tolerant `func`/`var` directives.
             nse: Regex::new(
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"nse(?:\s+|\s*:\s*)([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
+                    r#"nse(?:\s+|\s*:\s*)(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
                 ]
                 .concat(),
             ).unwrap(),
@@ -766,25 +768,25 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // `# raven: nse [pkg::]name[(formals…)]` — NSE argument-policy
         // declaration. Position-aware (applies to calls after this line).
         if let Some(caps) = patterns.nse.captures(line) {
-            if let Some(raw) = caps.get(1).map(|m| m.as_str()) {
+            // Name from the double-quoted / single-quoted / unquoted groups
+            // (1/2/3), then reject a malformed `::` qualifier the same way the
+            // `func` directive does — the quoted forms accept any content, so a
+            // `"pkg:::x"` must be screened out before it could mis-pair.
+            if let Some(raw) =
+                capture_symbol_name(&caps, 1).filter(|n| is_well_formed_callee_name(n))
+            {
                 let (package, name) = match raw.split_once("::") {
-                    Some((p, n)) if !p.is_empty() && !n.is_empty() => {
-                        (Some(p.to_string()), n.to_string())
-                    }
-                    // Defense-in-depth: the capture group `[A-Za-z0-9._]+(?:::…)?`
-                    // cannot actually produce an empty half, so this arm is
-                    // unreachable for a matched `raw` — it documents that a
-                    // malformed qualifier is dropped, not coerced into a name.
-                    Some(_) => {
-                        continue;
-                    }
-                    None => (None, raw.to_string()),
+                    // `is_well_formed_callee_name` guarantees both halves are
+                    // non-empty and colon-free, so any `::` split is a valid
+                    // qualifier.
+                    Some((p, n)) => (Some(p.to_string()), n.to_string()),
+                    None => (None, raw),
                 };
                 // No parentheses (`nse f`) and empty parentheses (`nse f()`)
                 // both mean whole-call NSE — `f()` lists zero captured formals,
                 // which is most naturally read as "same as no parens" rather
                 // than a silent no-op. A non-empty list is per-formal.
-                let scope = match caps.get(2).and_then(|b| split_formal_list(b.as_str())) {
+                let scope = match caps.get(4).and_then(|b| split_formal_list(b.as_str())) {
                     Some(formals) => NseScope::Formals(formals),
                     None => NseScope::WholeCall,
                 };
@@ -2436,6 +2438,29 @@ x <- undefined"#;
             assert_eq!(meta.nse_declarations.len(), 1, "case: {line}");
             assert_eq!(meta.nse_declarations[0].name, "my_func", "case: {line}");
         }
+    }
+
+    #[test]
+    fn nse_accepts_quoted_nonsyntactic_name() {
+        use crate::cross_file::types::NseScope;
+        // Operators / names with characters outside `[A-Za-z0-9._]` use the
+        // quoted form, mirroring `func`.
+        let meta = parse_directives("# raven: nse \"%+%\"(x)\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(meta.nse_declarations[0].name, "%+%");
+        assert_eq!(meta.nse_declarations[0].package, None);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["x".to_string()])
+        );
+        // A quoted name with no formals is whole-call.
+        let meta = parse_directives("# raven: nse 'my odd fn'\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(meta.nse_declarations[0].name, "my odd fn");
+        assert_eq!(meta.nse_declarations[0].scope, NseScope::WholeCall);
+        // A malformed `::` qualifier is still rejected even when quoted.
+        let meta = parse_directives("# raven: nse \"pkg:::x\"(a)\n");
+        assert!(meta.nse_declarations.is_empty());
     }
 
     #[test]
