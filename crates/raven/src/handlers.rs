@@ -14167,8 +14167,28 @@ fn nse_hint_for_usage<'t>(
     text: &'t str,
     analysis: &NseAnalysis<'_>,
 ) -> Option<(String, Option<String>)> {
-    // Walk up to the enclosing `argument` that is a direct child of an
-    // `arguments` node.
+    let (_call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
+    // Suppress the hint for high-confidence standard-eval builtins and base
+    // exports (paste, c, print, …).
+    if is_builtin(&callee)
+        || analysis
+            .base_exports
+            .is_some_and(|e| e.contains(callee.as_str()))
+    {
+        return None;
+    }
+    Some((callee, formal))
+}
+
+/// The enclosing call-argument context of `usage_node`: walks up to the
+/// `argument` that is a direct child of a `call`'s `arguments`, returning the
+/// `call` node, the callee name (identifier text, or the RHS of a
+/// `package::name`), and the matched formal name when the argument is named.
+/// `None` when `usage_node` is not inside a call argument with a simple callee.
+fn enclosing_call_arg_context<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+) -> Option<(Node<'t>, String, Option<String>)> {
     let mut cur = usage_node;
     let arg = loop {
         let parent = cur.parent()?;
@@ -14185,20 +14205,90 @@ fn nse_hint_for_usage<'t>(
         "namespace_operator" => namespace_parts(func, text)?.1.to_string(),
         _ => return None,
     };
-    // Suppress the hint for high-confidence standard-eval builtins and base
-    // exports (paste, c, print, …).
-    if is_builtin(&callee)
-        || analysis
-            .base_exports
-            .is_some_and(|e| e.contains(callee.as_str()))
-    {
-        return None;
-    }
     // The matched formal: a named argument's name, else None (positional/unknown).
     let formal = arg
         .child_by_field_name("name")
         .map(|n| node_text(n, text).to_string());
-    Some((callee, formal))
+    Some((call, callee, formal))
+}
+
+/// A quick-fix edit that declares an NSE contract for the call surrounding an
+/// undefined identifier. `insert_line` is the 0-based line to insert before;
+/// `text` is the directive line (with trailing newline and matching indent).
+pub(crate) struct NseQuickFix {
+    pub insert_line: u32,
+    pub text: String,
+    pub title: String,
+}
+
+/// Find the first `identifier` node on 0-based `line` whose text equals `ident`
+/// and that sits inside a call argument with a simple callee. Returns `None`
+/// when no such node exists. Does NOT apply any builtin filtering — that is the
+/// caller's responsibility.
+fn find_identifier_in_call_arg<'t>(
+    root: Node<'t>,
+    text: &'t str,
+    line: u32,
+    ident: &str,
+) -> Option<Node<'t>> {
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && node.start_position().row as u32 == line
+            && node_text(node, text) == ident
+            && enclosing_call_arg_context(node, text).is_some()
+        {
+            return Some(node);
+        }
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+/// Build a `# raven: nse` quick-fix for the undefined identifier `ident` on
+/// 0-based `line`, if it sits inside a call argument with a non-builtin callee.
+/// Operates on `text` (the analysis text the `root` tree was parsed from).
+pub(crate) fn nse_quick_fix_edit(
+    root: Node,
+    text: &str,
+    line: u32,
+    ident: &str,
+) -> Option<NseQuickFix> {
+    // Find the matching identifier node on `line` that is inside a call arg.
+    let target = find_identifier_in_call_arg(root, text, line, ident)?;
+    let (call, callee, formal) = enclosing_call_arg_context(target, text)?;
+    if is_builtin(&callee) {
+        return None;
+    }
+    let insert_line = call.start_position().row as u32;
+    let indent: String = text
+        .lines()
+        .nth(insert_line as usize)
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let (payload, title) = match &formal {
+        Some(f) => (
+            format!("{callee}({f})"),
+            format!("Declare NSE: # raven: nse {callee}({f})"),
+        ),
+        None => (
+            format!("{callee}(<formal>)"),
+            format!(
+                "Declare NSE: # raven: nse {callee}(<formal>) (replace <formal> with the captured parameter; pair with `# raven: func` for positional matching)"
+            ),
+        ),
+    };
+    Some(NseQuickFix {
+        insert_line,
+        text: format!("{indent}# raven: nse {payload}\n"),
+        title,
+    })
 }
 
 /// Resolve a `call` node's argument policy by classifying its callee against
@@ -56954,6 +57044,38 @@ my_func <- function(a = default_value) {
                 "no hint for non-call usage: {d}"
             );
         }
+    }
+
+    #[test]
+    fn nse_quick_fix_inserts_directive_above_call() {
+        let src = "my_filter <- function(df, cond) df\n  my_filter(real_df, x)\n";
+        let tree = parse_r_code(src);
+        let fix = super::nse_quick_fix_edit(tree.root_node(), src, 1, "x").expect("edit");
+        assert_eq!(fix.insert_line, 1);
+        assert_eq!(fix.text, "  # raven: nse my_filter(<formal>)\n");
+        assert!(fix.title.contains("# raven: nse"));
+    }
+
+    #[test]
+    fn nse_quick_fix_named_arg_uses_formal_name() {
+        let src = "my_filter <- function(df, cond) df\nmy_filter(df = real_df, cond = x)\n";
+        let tree = parse_r_code(src);
+        let fix = super::nse_quick_fix_edit(tree.root_node(), src, 1, "x").expect("edit");
+        assert_eq!(fix.text, "# raven: nse my_filter(cond)\n");
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_builtin() {
+        let src = "paste(undefined_x)\n";
+        let tree = parse_r_code(src);
+        assert!(super::nse_quick_fix_edit(tree.root_node(), src, 0, "undefined_x").is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_when_not_in_call_arg() {
+        let src = "x + 1\n";
+        let tree = parse_r_code(src);
+        assert!(super::nse_quick_fix_edit(tree.root_node(), src, 0, "x").is_none());
     }
 }
 

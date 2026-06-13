@@ -2297,6 +2297,7 @@ impl LanguageServer for Backend {
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
@@ -5676,6 +5677,64 @@ impl LanguageServer for Backend {
             &params.text_document_position.text_document.uri,
             params.text_document_position.position,
         ))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let state = self.state.read().await;
+        let Some(doc) = state.get_document(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = doc.tree.as_ref() else {
+            return Ok(None);
+        };
+        let text = doc.analysis_text();
+        let root = tree.root_node();
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        for diag in &params.context.diagnostics {
+            let is_undef = matches!(
+                &diag.code,
+                Some(NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE
+            );
+            if !is_undef {
+                continue;
+            }
+            let line = diag.range.start.line;
+            let ident: String = text
+                .lines()
+                .nth(line as usize)
+                .map(|l| {
+                    let s = diag.range.start.character as usize;
+                    let e = diag.range.end.character as usize;
+                    l.chars().skip(s).take(e.saturating_sub(s)).collect()
+                })
+                .unwrap_or_default();
+            if ident.is_empty() {
+                continue;
+            }
+            if let Some(fix) = handlers::nse_quick_fix_edit(root, &text, line, &ident) {
+                let edit = TextEdit {
+                    range: Range {
+                        start: Position::new(fix.insert_line, 0),
+                        end: Position::new(fix.insert_line, 0),
+                    },
+                    new_text: fix.text,
+                };
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: fix.title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+        Ok(Some(actions))
     }
 
     /// Handles on-type formatting requests triggered by newline characters.
