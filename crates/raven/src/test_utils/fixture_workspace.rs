@@ -124,6 +124,21 @@ pub fn create_fixture_workspace(config: &FixtureConfig) -> TempDir {
     temp_dir
 }
 
+/// Create a temporary single-file workspace containing exactly `file_0.R` with
+/// the given content.
+///
+/// For benchmarks/tests that need to exercise a specific code shape (e.g. an
+/// NSE-saturated document) rather than the synthetic [`FixtureConfig`] output.
+/// The returned `TempDir` cleans up on drop; the file is always named
+/// `file_0.R` so callers can reuse the existing `file_0_uri` helper.
+pub fn create_single_file_workspace(content: &str) -> TempDir {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory for fixture workspace");
+    let filepath = temp_dir.path().join("file_0.R");
+    std::fs::write(&filepath, content)
+        .unwrap_or_else(|e| panic!("Failed to write single-file fixture: {}", e));
+    temp_dir
+}
+
 /// Write fixture files into an existing directory.
 ///
 /// Useful when you need to control the directory path (e.g., for named temp dirs).

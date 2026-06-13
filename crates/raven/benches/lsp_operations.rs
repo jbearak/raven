@@ -13,7 +13,8 @@ use url::Url;
 
 use raven::state::{Document, WorldState, scan_workspace};
 use raven::test_utils::fixture_workspace::{
-    FixtureConfig, create_fanout_fixture_workspace, create_fixture_workspace, fanout_parent_uris,
+    FixtureConfig, create_fanout_fixture_workspace, create_fixture_workspace,
+    create_single_file_workspace, fanout_parent_uris,
 };
 
 // ---------------------------------------------------------------------------
@@ -323,6 +324,95 @@ fn bench_diagnostics_fanout(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: Diagnostics over NSE-saturated code
+//
+// `bench_diagnostics` above runs the full pipeline over the generic fixture,
+// where the NSE (non-standard-evaluation) policy resolver is a small slice of
+// total time and its argument-suppression branches are barely entered. This
+// bench instead saturates the document with the shapes that drive the NSE path
+// — bare data-masking verb calls (dplyr/data.table), local function defs that
+// shadow verbs, and non-literal local callee aliases (`f <- stats::filter`,
+// `f <- get_filter()`; issue #450) — so NSE work dominates and a regression in
+// `collect_nse_facts` / `resolve_call_arg_policy` actually moves the number.
+// Unlike a full-pipeline bench over a noisy workspace scan, this is a single
+// in-memory document, keeping run-to-run variance low.
+// ---------------------------------------------------------------------------
+
+/// Generate a deterministic, NSE-saturated R document of `blocks` repeated
+/// units. A preamble pulls dplyr/data.table into play and defines a local
+/// function over the covered verb `mutate`, which shadows the package export.
+/// Each unit binds qualified aliases (standard-eval `stats::filter` and masking
+/// `dplyr::filter`) and opaque callables (`get_filter()`, a bare identifier),
+/// then **calls** bare covered verbs, the shadowing local def, and every alias —
+/// so the resolver walks each branch of `resolve_call_arg_policy`: the
+/// local-definition shadow (`mutate(...)`), the qualified-target policy
+/// (`std_filter`/`masked_filter`), the opaque `Unknown` suppression (`opaque`,
+/// `ref`), and the built-in package policy (the bare verbs). Alias/def names are
+/// unique per block (no last-binding-wins collapse) so collection records many
+/// disjoint entries; the many undefined references are intentional — deciding
+/// which to suppress is exactly the NSE work being timed.
+fn generate_nse_dense_file(blocks: usize) -> String {
+    use std::fmt::Write;
+    // The shadowing def lives in the preamble: `mutate` is a single top-level
+    // binding (R semantics), but the per-block `mutate(...)` calls below drive
+    // the local-definition branch on every iteration.
+    let mut content = String::from(
+        "library(dplyr)\nlibrary(data.table)\nmutate <- function(data, expr) data\n\n",
+    );
+    for i in 0..blocks {
+        write!(
+            content,
+            "std_filter_{i} <- stats::filter\n\
+             masked_filter_{i} <- dplyr::filter\n\
+             opaque_{i} <- get_filter()\n\
+             ref_{i} <- some_fn\n\
+             res_a_{i} <- filter(df_{i}, value_{i} > threshold_{i})\n\
+             res_b_{i} <- mutate(df_{i}, z_{i} = x_{i} + y_{i})\n\
+             res_c_{i} <- select(df_{i}, col_a_{i}, col_b_{i})\n\
+             res_d_{i} <- summarise(group_by(df_{i}, grp_{i}), m_{i} = mean(x_{i}))\n\
+             res_e_{i} <- std_filter_{i}(df_{i}, typo_{i})\n\
+             res_f_{i} <- masked_filter_{i}(df_{i}, col_{i})\n\
+             res_g_{i} <- opaque_{i}(df_{i}, arg_{i})\n\
+             res_h_{i} <- ref_{i}(df_{i}, more_{i})\n\
+             dt_{i} <- data.table(a_{i} = 1, b_{i} = 2)\n\
+             dt_{i}[value_{i} > 1, sum(x_{i}), by = grp_{i}]\n\n",
+        )
+        .unwrap();
+    }
+    content
+}
+
+fn bench_diagnostics_nse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lsp_diagnostics_nse");
+    group.sample_size(20);
+
+    let sizes: &[(&str, usize)] = &[("nse_20", 20), ("nse_80", 80)];
+
+    for (label, blocks) in sizes {
+        let workspace = create_single_file_workspace(&generate_nse_dense_file(*blocks));
+        let state = build_state_from_fixture(workspace.path());
+        let uri = file_0_uri(workspace.path());
+        let cancel = raven::handlers::DiagCancelToken::never();
+
+        group.bench_with_input(
+            BenchmarkId::new("diagnostics_nse", *label),
+            &(&state, &uri, &cancel),
+            |b, &(state, uri, cancel)| {
+                b.iter(|| {
+                    black_box(raven::handlers::diagnostics(
+                        black_box(state),
+                        black_box(uri),
+                        black_box(cancel),
+                    ))
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_completion,
@@ -330,5 +420,6 @@ criterion_group!(
     bench_goto_definition,
     bench_diagnostics,
     bench_diagnostics_fanout,
+    bench_diagnostics_nse,
 );
 criterion_main!(benches);
