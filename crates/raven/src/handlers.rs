@@ -5722,6 +5722,8 @@ fn collect_undefined_variables_from_snapshot(
         self_nse_package_for_file(snapshot, uri),
         Some(snapshot.package_library.as_ref()),
         Some(snapshot.base_exports.as_ref()),
+        &snapshot.directive_meta.nse_declarations,
+        &snapshot.directive_meta.declared_functions,
     );
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
@@ -12709,6 +12711,15 @@ fn namespace_parts<'t>(node: Node<'t>, text: &'t str) -> Option<(&'t str, &'t st
     Some((node_text(lhs, text), node_text(rhs, text)))
 }
 
+/// A `# raven: nse` declaration resolved to an `ArgPolicy`, retaining the
+/// directive line (for position gating) and the optional package qualifier
+/// (for qualified/unqualified call matching).
+struct DirectiveNsePolicy {
+    line: u32,
+    package: Option<String>,
+    policy: crate::nse::ArgPolicy,
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -12788,6 +12799,11 @@ pub(crate) struct NseAnalysis<'a> {
     package_library: Option<&'a crate::package_library::PackageLibrary>,
     /// Live base/builtin exports, consulted alongside `is_builtin`.
     base_exports: Option<&'a HashSet<String>>,
+    /// Per-callee NSE contracts declared via `# raven: nse` directives, already
+    /// translated to policies and resolved against available formal-order
+    /// sources (`# raven: func`, local definitions). Keyed by bare callee name;
+    /// each vec sorted ascending by directive line for position-gated lookup.
+    directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -12811,6 +12827,8 @@ impl<'a> NseAnalysis<'a> {
         self_nse_package: Option<String>,
         package_library: Option<&'a crate::package_library::PackageLibrary>,
         base_exports: Option<&'a HashSet<String>>,
+        nse_declarations: &[crate::cross_file::types::NseDeclaration],
+        declared_functions: &[crate::cross_file::types::DeclaredSymbol],
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
@@ -12870,7 +12888,67 @@ impl<'a> NseAnalysis<'a> {
             reference_class_method_functions,
             package_library,
             base_exports,
+            directive_nse: HashMap::new(),
         };
+        // Translate `# raven: nse` declarations into per-callee policies,
+        // resolving formal order (for positional matching) from `# raven: func`
+        // declarations first, then visible local function definitions. When no
+        // order is available, fall back to named-only matching by placing
+        // "..." first so the positional pass suppresses nothing. Assigned before
+        // the `!call_args_enabled` early return so directive policies are present
+        // regardless of the dots-forwarding pass.
+        let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
+        for decl in nse_declarations {
+            use crate::cross_file::types::NseScope;
+            let policy = match &decl.scope {
+                NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
+                NseScope::Formals(captured) => {
+                    let order =
+                        declared_function_formals(declared_functions, &decl.name, decl.line)
+                            .or_else(|| {
+                                local_function_defs
+                                    .get(&decl.name)
+                                    .map(|def| function_formal_names(*def, text))
+                                    .filter(|f| !f.is_empty())
+                            });
+                    match order {
+                        Some(mut formals) => {
+                            for c in captured {
+                                if !formals.contains(c) {
+                                    formals.push(c.clone());
+                                }
+                            }
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured: captured.clone(),
+                                captured_dots: false,
+                            }
+                        }
+                        None => {
+                            let mut formals = vec!["...".to_string()];
+                            formals.extend(captured.iter().cloned());
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured: captured.clone(),
+                                captured_dots: false,
+                            }
+                        }
+                    }
+                }
+            };
+            directive_nse
+                .entry(decl.name.clone())
+                .or_default()
+                .push(DirectiveNsePolicy {
+                    line: decl.line,
+                    package: decl.package.clone(),
+                    policy,
+                });
+        }
+        for entries in directive_nse.values_mut() {
+            entries.sort_by_key(|e| e.line);
+        }
+        analysis.directive_nse = directive_nse;
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
         // position is itself data-masking through its dots. Runs against the
@@ -12932,6 +13010,32 @@ impl<'a> NseAnalysis<'a> {
         }
         analysis.local_function_policies.extend(dots_upgrades);
         analysis
+    }
+
+    /// The most recent `# raven: nse` policy applicable to a call to `name`
+    /// (optionally qualified `qualifier::name`) at `call_line`, per the
+    /// resolution model. Position-gated to declarations strictly before
+    /// `call_line`.
+    fn directive_nse_policy(
+        &self,
+        name: &str,
+        qualifier: Option<&str>,
+        call_line: u32,
+    ) -> Option<crate::nse::ArgPolicy> {
+        let entries = self.directive_nse.get(name)?;
+        entries
+            .iter()
+            .rev()
+            .find(|e| {
+                e.line < call_line
+                    && match (&e.package, qualifier) {
+                        (None, None) => true,
+                        (None, Some(_)) => false,
+                        (Some(p), Some(q)) => p == q,
+                        (Some(p), None) => self.in_play_packages.iter().any(|ip| ip == p),
+                    }
+            })
+            .map(|e| e.policy.clone())
     }
 
     /// The data.table class of `name` as of byte `pos`, per the latest
@@ -13496,6 +13600,20 @@ fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
     names
 }
 
+/// The declared formal order for `name` from the most recent `# raven: func
+/// name(formals…)` directive on a line strictly before `before_line`, if any.
+fn declared_function_formals(
+    declared_functions: &[crate::cross_file::types::DeclaredSymbol],
+    name: &str,
+    before_line: u32,
+) -> Option<Vec<String>> {
+    declared_functions
+        .iter()
+        .filter(|d| d.name == name && d.line < before_line && d.formals.is_some())
+        .max_by_key(|d| d.line)
+        .and_then(|d| d.formals.clone())
+}
+
 /// True when the function declares a `...` formal — the allocation-free
 /// yes/no twin of [`function_formal_names`] for the hot paths that only need
 /// this one fact.
@@ -14044,6 +14162,12 @@ fn resolve_call_arg_policy(
 
     // Namespace-qualified `pkg::name` resolves purely from syntax.
     if func.kind() == "namespace_operator" {
+        let call_line = call_node.start_position().row as u32;
+        if let Some((pkg, n)) = namespace_parts(func, text)
+            && let Some(p) = analysis.directive_nse_policy(n, Some(pkg), call_line)
+        {
+            return p;
+        }
         // A qualified call with no NSE policy is a resolved standard-eval call.
         return table_verb_policy(func, text, analysis).unwrap_or(ArgPolicy::Standard);
     }
@@ -14053,6 +14177,13 @@ fn resolve_call_arg_policy(
         return ArgPolicy::WholeCall;
     }
     let name = node_text(func, text);
+
+    // 0. An explicit `# raven: nse` declaration is an authoritative user
+    //    override, position-gated to calls after the directive line.
+    let call_line = call_node.start_position().row as u32;
+    if let Some(policy) = analysis.directive_nse_policy(name, None, call_line) {
+        return policy;
+    }
 
     // 1. A local definition shadows any package / base policy.
     if let Some(policy) = analysis.local_function_policies.get(name) {
@@ -14613,7 +14744,18 @@ fn collect_usages_with_context<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    let analysis = NseAnalysis::build(node, text, true, true, Vec::new(), None, None, None);
+    let analysis = NseAnalysis::build(
+        node,
+        text,
+        true,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+        &[],
+        &[],
+    );
     collect_usages_with_analysis(node, text, &analysis, context, used);
 }
 
@@ -20636,7 +20778,8 @@ mod tests {
         used: &mut Vec<(String, Node<'a>)>,
     ) {
         let in_play: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
-        let analysis = NseAnalysis::build(root, text, true, true, in_play, None, None, None);
+        let analysis =
+            NseAnalysis::build(root, text, true, true, in_play, None, None, None, &[], &[]);
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
 
@@ -20657,6 +20800,8 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            &[],
         );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
@@ -20842,6 +20987,8 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -20894,6 +21041,8 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21221,6 +21370,8 @@ mod tests {
             None,
             None,
             Some(&base_exports),
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -56071,6 +56222,101 @@ my_func <- function(a = default_value) {
             None,
         );
         diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    // Issue #455: `# raven: nse` declarations override the inferred NSE policy
+    // for a callee, position-gated to calls after the directive. These exercise
+    // the full snapshot path (`collect_undefined_messages` builds
+    // `directive_meta` via `DiagnosticsSnapshot::build`, so the `# raven: nse` /
+    // `# raven: func` lines are parsed and threaded into `NseAnalysis`).
+    #[test]
+    fn nse_whole_call_suppresses_all_args() {
+        // Local def infers `Standard` (args checked); only the `# raven: nse`
+        // whole-call override suppresses them. A bare undefined callee would be
+        // `WholeCall` already, making the assertions pass vacuously.
+        let diags = collect_undefined_messages(
+            "my_func <- function(a, b) a\n# raven: nse my_func\nmy_func(undefined_a, undefined_b > 1)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("undefined_a")),
+            "got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("undefined_b")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_per_formal_with_local_def_positional() {
+        let src = "my_func <- function(data, x) data\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_named_arg_matches_without_order() {
+        let src = "# raven: nse my_func(x)\nmy_func(data = real_df, x = masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_positional_without_order_does_not_suppress() {
+        let src = "# raven: nse my_func(x)\nmy_func(masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_is_position_aware() {
+        // A local definition with a standard-eval policy makes the pre-directive
+        // call's argument checked; only after the `# raven: nse` line does the
+        // whole-call override take effect. (A bare undefined callee would
+        // suppress its args unconditionally, masking the position gate.)
+        let src = "my_func <- function(x) x\nmy_func(before_col)\n# raven: nse my_func\nmy_func(after_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("before_col")),
+            "call before directive checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("after_col")),
+            "call after directive suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_qualified_matches_qualified_call() {
+        let src = "# raven: nse pkg::my_func(x)\npkg::my_func(x = masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_paired_func_enables_positional() {
+        let src = "# raven: func my_func(data, x, y)\n# raven: nse my_func(x, y)\nmy_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
     }
 
     /// Issue #398 end-to-end: a standard-eval call argument (`paste` is a
