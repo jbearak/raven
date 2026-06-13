@@ -12877,10 +12877,19 @@ impl<'a> NseAnalysis<'a> {
         let mut reference_class_by_class = HashMap::new();
         let mut reference_class_method_functions = HashMap::new();
         let mut data_table_qualifier_seen = false;
+        // Names redefined within the file under two or more DIFFERENT formal
+        // orders. `local_function_defs` is last-binding-wins, so a later
+        // redefinition with permuted parameters would otherwise lend its order
+        // to an earlier call's positional NSE matching and invert which slot is
+        // suppressed (hiding a real undefined variable). When a name is in this
+        // set its order is ambiguous, so the `# raven: nse` borrow below falls
+        // back to safe named-only matching instead.
+        let mut ambiguous_local_formal_order: HashSet<String> = HashSet::new();
         collect_nse_facts(
             root,
             text,
             &mut local_function_defs,
+            &mut ambiguous_local_formal_order,
             &mut local_callee_shadows,
             &mut local_callee_aliases,
             &mut data_table_objects,
@@ -13029,6 +13038,14 @@ impl<'a> NseAnalysis<'a> {
                         // qualified declaration falls through to the named-only
                         // `None` arm below.
                         if decl.package.is_some() {
+                            return None;
+                        }
+                        // A name redefined under conflicting formal orders has no
+                        // single authoritative order to borrow (last-binding-wins
+                        // would lend a later redefinition's permuted order to an
+                        // earlier call and hide a real undefined variable). Fall
+                        // through to the safe named-only `None` arm.
+                        if ambiguous_local_formal_order.contains(&decl.name) {
                             return None;
                         }
                         local_function_defs
@@ -13203,6 +13220,7 @@ fn collect_nse_facts<'t>(
     node: Node<'t>,
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
+    ambiguous_local_formal_order: &mut HashSet<String>,
     local_callee_shadows: &mut HashSet<String>,
     local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
     data_table_objects: &mut HashSet<String>,
@@ -13256,6 +13274,16 @@ fn collect_nse_facts<'t>(
                 local_callee_shadows.insert(name.to_string());
                 match binding {
                     LocalCalleeBinding::Definition(def) => {
+                        // A redefinition with a different formal order makes the
+                        // name's positional order ambiguous (see the set's doc in
+                        // `NseAnalysis::build`). Detect it here while the prior
+                        // definition is still in the map; the mark is monotonic.
+                        if let Some(prev) = local_function_defs.get(name)
+                            && function_formal_names(*prev, text)
+                                != function_formal_names(def, text)
+                        {
+                            ambiguous_local_formal_order.insert(name.to_string());
+                        }
                         local_function_defs.insert(name.to_string(), def);
                         local_callee_aliases.remove(name);
                     }
@@ -13302,6 +13330,7 @@ fn collect_nse_facts<'t>(
             child,
             text,
             local_function_defs,
+            ambiguous_local_formal_order,
             local_callee_shadows,
             local_callee_aliases,
             data_table_objects,
@@ -14419,6 +14448,15 @@ fn nse_eligible_call_arg<'t>(
     if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
         return None;
     }
+    // A non-syntactic named-argument label (e.g. `` `weird name` = x ``) cannot
+    // be expressed as a formal in the directive grammar — `split_formal_list`
+    // filters formals through `is_formal_name`, which rejects a backtick- or
+    // quote-delimited token. Emitting `# raven: nse callee(`weird name`)` would
+    // therefore re-parse to an empty formal list and silently degrade to a
+    // whole-call directive (suppressing EVERY argument). Drop such a label to
+    // `None` so both the hint and the quick-fix fall to the parseable
+    // formal-less suggestion instead of proposing a directive that misbehaves.
+    let formal = formal.filter(|f| crate::r_names::is_syntactic_r_name(f));
     Some((call, callee, formal))
 }
 
@@ -57410,6 +57448,66 @@ my_func <- function(a = default_value) {
         assert!(
             d.contains("# raven: nse"),
             "message should suggest the directive: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_drops_nonsyntactic_named_arg_formal() {
+        // A backtick-quoted (non-syntactic) named-argument label cannot be a
+        // formal in the directive grammar (`split_formal_list` rejects it), so a
+        // `# raven: nse my_fn(`weird name`)` suggestion would silently re-parse
+        // to whole-call. The hint must instead fall back to the parseable
+        // formal-less func+nse suggestion.
+        let diags = collect_undefined_messages(
+            "my_fn <- function(`weird name`) `weird name`\nmy_fn(`weird name` = undef)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef"))
+            .expect("undef reported");
+        assert!(
+            !d.contains("nse my_fn(`weird name`)"),
+            "must not propose an unparseable per-formal directive: {d}"
+        );
+        assert!(
+            d.contains("# raven: func") && d.contains("<formals>"),
+            "should fall back to the formal-less func+nse suggestion: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_directive_does_not_borrow_ambiguous_reordered_formals() {
+        // `f` is redefined with PERMUTED formals, so its positional order is
+        // ambiguous. The bare `# raven: nse f(x)` must NOT borrow a formal order
+        // (last-binding-wins would lend the later `(x, data)` order to the
+        // earlier call and suppress slot 1 — hiding the real undefined
+        // `real_undef`). It falls back to named-only matching, leaving the
+        // positional `real_undef` flagged.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_undef, masked_col)\nf <- function(x, data) data\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "ambiguous formal order must not suppress positional `real_undef`; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_directive_borrows_formals_when_redefinition_keeps_order() {
+        // Redefining `f` with the SAME formal order is not ambiguous, so
+        // positional borrowing still applies: the captured formal `x` (slot 2)
+        // is suppressed and the non-captured slot 1 stays flagged. Guards the
+        // ambiguity check against over-triggering on identical redefinitions.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_data, masked_x)\nf <- function(data, x) x\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_data")),
+            "non-captured slot 1 still flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured slot 2 `x` must still be suppressed when order is unchanged; got {diags:?}"
         );
     }
 
