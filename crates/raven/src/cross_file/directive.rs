@@ -382,15 +382,20 @@ fn patterns() -> &'static DirectivePatterns {
             // Groups: 1=double-quoted name, 2=single-quoted name, 3=unquoted
             // (bare or `pkg::name`) name, 4=optional formal list body.
             //
+            // As with `func`, a callee whose name has characters outside
+            // `[A-Za-z0-9._]` (e.g. a name with spaces, called `` `my fn`(x) ``)
+            // uses the quoted form. Note the NSE policy is consulted only for
+            // ordinary `callee(args)` calls, so it cannot apply to operators
+            // (`a %+% b` is not a call) — an `nse` policy for an operator parses
+            // but is inert.
+            //
             // A separator (whitespace or `:`) is REQUIRED after the `nse`
             // keyword, so a run-together `nseg(col)` is not misread as a
-            // declaration for callee `g`. As with `func`, a callee whose name
-            // has characters outside `[A-Za-z0-9._]` (operators like `%+%`,
-            // names with spaces) uses the quoted form. The pattern is
-            // end-anchored (only an optional trailing `# comment` may follow):
-            // an unclosed `(` or any unexpected trailing text fails to match, so
-            // a malformed payload is ignored rather than producing a
-            // partial/blanket suppression — intentionally stricter than the
+            // declaration for callee `g`. The pattern is end-anchored (only an
+            // optional trailing `# comment` may follow): an unclosed `(`, a
+            // truncated unquoted name (`nse some-func` leaves trailing `-func`),
+            // or any unexpected trailing text fails to match, so a malformed
+            // payload is ignored — intentionally stricter than the
             // prefix-tolerant `func`/`var` directives.
             nse: Regex::new(
                 &[
@@ -2443,24 +2448,40 @@ x <- undefined"#;
     #[test]
     fn nse_accepts_quoted_nonsyntactic_name() {
         use crate::cross_file::types::NseScope;
-        // Operators / names with characters outside `[A-Za-z0-9._]` use the
-        // quoted form, mirroring `func`.
-        let meta = parse_directives("# raven: nse \"%+%\"(x)\n");
+        // A callee whose name has characters outside `[A-Za-z0-9._]` (e.g. a
+        // name with spaces, called `` `my fn`(x) ``) uses the quoted form,
+        // mirroring `func`.
+        let meta = parse_directives("# raven: nse \"my data fn\"(x)\n");
         assert_eq!(meta.nse_declarations.len(), 1);
-        assert_eq!(meta.nse_declarations[0].name, "%+%");
+        assert_eq!(meta.nse_declarations[0].name, "my data fn");
         assert_eq!(meta.nse_declarations[0].package, None);
         assert_eq!(
             meta.nse_declarations[0].scope,
             NseScope::Formals(vec!["x".to_string()])
         );
         // A quoted name with no formals is whole-call.
-        let meta = parse_directives("# raven: nse 'my odd fn'\n");
+        let meta = parse_directives("# raven: nse 'my data fn'\n");
         assert_eq!(meta.nse_declarations.len(), 1);
-        assert_eq!(meta.nse_declarations[0].name, "my odd fn");
+        assert_eq!(meta.nse_declarations[0].name, "my data fn");
         assert_eq!(meta.nse_declarations[0].scope, NseScope::WholeCall);
         // A malformed `::` qualifier is still rejected even when quoted.
         let meta = parse_directives("# raven: nse \"pkg:::x\"(a)\n");
         assert!(meta.nse_declarations.is_empty());
+    }
+
+    #[test]
+    fn nse_rejects_unquoted_truncation() {
+        // An UNQUOTED non-syntactic callee leaves trailing text the end-anchored
+        // regex can't match, so the directive is dropped rather than stored as a
+        // truncated prefix; such names must use the quoted form instead.
+        for line in [
+            "# raven: nse some-func(x)", // would truncate to `some`
+            "# raven: nse obj$method(x)",
+            "# raven: nse pkg:::x(a)",
+        ] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert!(meta.nse_declarations.is_empty(), "case: {line}");
+        }
     }
 
     #[test]

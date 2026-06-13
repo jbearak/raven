@@ -153,10 +153,10 @@ Declaration directives work in any R file, whether or not it participates in cro
 # raven: func my_func(data, x, y)        # declares existence + formal order
 # raven: func my_func(data, x = NULL)    # defaults are stripped → data, x
 # raven: func pkg::my_func(data, x)      # qualified form
-# raven: func "%+%"                      # quote non-syntactic names (operators, etc.)
+# raven: func "my data fn"               # quote a name with spaces / special chars
 ```
 
-The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — including dotted names like `make.names`, since `.` is a normal identifier character in R. Only a name containing characters *outside* `[A-Za-z0-9._]` (operators like `%+%`, replacement functions like `` `dim<-` ``, or names with spaces) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
+The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — including dotted names like `make.names`, since `.` is a normal identifier character in R. Only a name containing characters *outside* `[A-Za-z0-9._]` (names with spaces, replacement functions like `` `dim<-` ``) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
 
 ### NSE Declarations
 
@@ -169,13 +169,15 @@ identifiers in its captured arguments are not flagged as undefined variables.
 # raven: nse my_func(x, y)        # `x` and `y` are captured
 # raven: nse my_func(...)         # arguments absorbed by `...` are captured
 # raven: nse pkg::my_func(x, y)   # qualified form
-# raven: nse "%+%"(lhs)           # quote non-syntactic names (operators, etc.)
+# raven: nse "my data fn"(x)      # quote a name with spaces (called `my data fn`(x))
 # @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
 ```
 
 As with `# raven: func`, the callee name accepts a bare `name` or a single
 `pkg::name` qualifier unquoted; a name with characters outside `[A-Za-z0-9._]`
-(operators like `%+%`, names with spaces) must use the quoted form.
+(e.g. spaces) must use the quoted form. The NSE policy is consulted only for
+ordinary `callee(args)` calls, so it cannot apply to operators (`a %+% b` is not
+a call) — an `# raven: nse` for an operator parses but is inert.
 
 A literal `...` in the captured list declares that the arguments a call passes
 through the function's `...` are captured (checked formals before `...` are
