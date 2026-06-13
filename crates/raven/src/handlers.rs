@@ -12648,14 +12648,10 @@ struct ReferenceClassInfo {
     methods: HashSet<String>,
 }
 
-/// How a top-level **non-literal** binding rebinds a name as a callee, so the
-/// direct-call NSE resolver can honor R's "the local binding is what's called"
-/// rule for aliases and factory results — not only literal `name <-
-/// function(...)` definitions (issue #450). Literal function definitions are
-/// tracked separately in `local_function_defs` / `local_function_policies`;
-/// obvious non-function literals (`filter <- 1`) bind no entry here, so R's
-/// function lookup (which skips non-functions in call position) still resolves
-/// the package/base verb.
+/// The payload of an [`LocalCalleeBinding::Alias`]: how a name's non-literal
+/// callable rebinding resolves in call position, so the direct-call NSE
+/// resolver can honor R's "the local binding is what's called" rule for aliases
+/// and factory results (issue #450). Stored per-name in `local_callee_aliases`.
 enum LocalCalleeAlias {
     /// `filter <- pkg::target` / `pkg:::target`. The policy is resolved through
     /// the qualified target, so `filter <- stats::filter` checks arguments
