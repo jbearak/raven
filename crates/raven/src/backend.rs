@@ -5690,6 +5690,11 @@ impl LanguageServer for Backend {
         };
         let text = doc.analysis_text();
         let root = tree.root_node();
+        // Filter base-package callees out of quick-fixes, matching the
+        // undefined-variable hint (only meaningful once the library is loaded).
+        let base_exports = state
+            .package_library_ready
+            .then(|| state.package_library.base_exports().as_ref());
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
         for diag in &params.context.diagnostics {
             let is_undef = matches!(
@@ -5706,7 +5711,7 @@ impl LanguageServer for Backend {
             let Some(usage_node) = root.descendant_for_point_range(point, point) else {
                 continue;
             };
-            if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text) {
+            if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {
                 let edit = TextEdit {
                     range: Range {
                         start: Position::new(fix.insert_line, 0),

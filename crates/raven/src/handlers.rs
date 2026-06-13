@@ -14240,10 +14240,16 @@ pub(crate) struct NseQuickFix {
 /// `usage_node` is the exact node the diagnostic range resolves to (via
 /// `descendant_for_point_range`), so the call and formal are unambiguous even
 /// when the same name appears more than once on a line. `text` is the analysis
-/// text the node's tree was parsed from.
-pub(crate) fn nse_quick_fix_edit(usage_node: Node, text: &str) -> Option<NseQuickFix> {
+/// text the node's tree was parsed from. `base_exports`, when supplied, filters
+/// out base-package callees so the quick-fix matches [`nse_hint_for_usage`]:
+/// declaring NSE on a standard-eval base function is never the right fix.
+pub(crate) fn nse_quick_fix_edit(
+    usage_node: Node,
+    text: &str,
+    base_exports: Option<&HashSet<String>>,
+) -> Option<NseQuickFix> {
     let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    if is_builtin(&callee) {
+    if is_builtin(&callee) || base_exports.is_some_and(|e| e.contains(callee.as_str())) {
         return None;
     }
     let insert_line = call.start_position().row as u32;
@@ -57063,7 +57069,7 @@ my_func <- function(a = default_value) {
         let tree = parse_r_code(src);
         // Use the second `x` (the call argument), not the formal in the def.
         let node = first_ident(tree.root_node(), src, "x");
-        let fix = super::nse_quick_fix_edit(node, src).expect("edit");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
         assert_eq!(fix.insert_line, 1);
         assert_eq!(fix.text, "  # raven: nse my_filter(<formal>)\n");
         assert!(fix.title.contains("# raven: nse"));
@@ -57074,7 +57080,7 @@ my_func <- function(a = default_value) {
         let src = "my_filter <- function(df, cond) df\nmy_filter(df = real_df, cond = x)\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "x");
-        let fix = super::nse_quick_fix_edit(node, src).expect("edit");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
         assert_eq!(fix.text, "# raven: nse my_filter(cond)\n");
     }
 
@@ -57083,7 +57089,7 @@ my_func <- function(a = default_value) {
         let src = "paste(undefined_x)\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "undefined_x");
-        assert!(super::nse_quick_fix_edit(node, src).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
     }
 
     #[test]
@@ -57091,7 +57097,22 @@ my_func <- function(a = default_value) {
         let src = "x + 1\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "x");
-        assert!(super::nse_quick_fix_edit(node, src).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_base_export() {
+        // A base-package callee not in the hardcoded `is_builtin` set is still
+        // filtered when base exports are supplied, matching `nse_hint_for_usage`.
+        let src = "some_base_fn(undefined_x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        // Without base exports, the quick-fix is offered (callee is unresolved).
+        assert!(super::nse_quick_fix_edit(node, src, None).is_some());
+        // With `some_base_fn` known as a base export, it is suppressed.
+        let base: std::collections::HashSet<String> =
+            std::iter::once("some_base_fn".to_string()).collect();
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
     }
 }
 
