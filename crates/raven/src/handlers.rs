@@ -12885,11 +12885,18 @@ impl<'a> NseAnalysis<'a> {
         // set its order is ambiguous, so the `# raven: nse` borrow below falls
         // back to safe named-only matching instead.
         let mut ambiguous_local_formal_order: HashSet<String> = HashSet::new();
+        // First-seen top-level formal order per name; the working state behind
+        // `ambiguous_local_formal_order` (a later definition whose order differs
+        // marks the name ambiguous). Persists across alias / non-callable
+        // rebindings that evict `local_function_defs`, so the ambiguity check
+        // cannot be defeated by a rebinding interposed between two definitions.
+        let mut first_formal_order: HashMap<String, Vec<String>> = HashMap::new();
         collect_nse_facts(
             root,
             text,
             &mut local_function_defs,
             &mut ambiguous_local_formal_order,
+            &mut first_formal_order,
             &mut local_callee_shadows,
             &mut local_callee_aliases,
             &mut data_table_objects,
@@ -13221,6 +13228,7 @@ fn collect_nse_facts<'t>(
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
     ambiguous_local_formal_order: &mut HashSet<String>,
+    first_formal_order: &mut HashMap<String, Vec<String>>,
     local_callee_shadows: &mut HashSet<String>,
     local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
     data_table_objects: &mut HashSet<String>,
@@ -13276,13 +13284,19 @@ fn collect_nse_facts<'t>(
                     LocalCalleeBinding::Definition(def) => {
                         // A redefinition with a different formal order makes the
                         // name's positional order ambiguous (see the set's doc in
-                        // `NseAnalysis::build`). Detect it here while the prior
-                        // definition is still in the map; the mark is monotonic.
-                        if let Some(prev) = local_function_defs.get(name)
-                            && function_formal_names(*prev, text)
-                                != function_formal_names(def, text)
-                        {
-                            ambiguous_local_formal_order.insert(name.to_string());
+                        // `NseAnalysis::build`). Compare against the FIRST-seen
+                        // order, recorded in a map that an intervening alias /
+                        // non-callable rebinding does NOT clear — `local_function_defs`
+                        // is evicted by such a rebinding, so comparing against it
+                        // would miss a `def → alias → permuted-def` sequence. The
+                        // mark is monotonic.
+                        let formals = function_formal_names(def, text);
+                        if let Some(first) = first_formal_order.get(name) {
+                            if *first != formals {
+                                ambiguous_local_formal_order.insert(name.to_string());
+                            }
+                        } else {
+                            first_formal_order.insert(name.to_string(), formals);
                         }
                         local_function_defs.insert(name.to_string(), def);
                         local_callee_aliases.remove(name);
@@ -13331,6 +13345,7 @@ fn collect_nse_facts<'t>(
             text,
             local_function_defs,
             ambiguous_local_formal_order,
+            first_formal_order,
             local_callee_shadows,
             local_callee_aliases,
             data_table_objects,
@@ -47130,6 +47145,44 @@ x <- myvar + 1"#;
     }
 
     #[test]
+    fn test_goto_definition_declared_nonsyntactic_variable() {
+        // End-to-end guard for the declare_var wrap fix: a non-syntactic declared
+        // variable (`# raven: var "my fn"`) is stored backtick-wrapped, so
+        // go-to-definition from a `` `my fn` `` usage (whose node_text carries the
+        // backticks) resolves via the exact-name match. Before the wrap, the
+        // declaration stored the bare `my fn` and this lookup missed.
+        use crate::cross_file::directive::parse_directives;
+        use crate::handlers::goto_definition;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "# raven: var \"my fn\"\nx <- `my fn` + 1";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let metadata = parse_directives(code);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, None, |_| None);
+
+        // The `` `my fn` `` usage spans cols 5-12 of line 1; pick a column inside.
+        let result = goto_definition(&state, &uri, Position::new(1, 7));
+        assert!(
+            result.is_some(),
+            "should resolve a non-syntactic declared variable"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(
+                location.range.start.line, 0,
+                "should navigate to the directive line"
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
     fn test_goto_definition_declared_function() {
         // Test that go-to-definition on a declared function navigates to the directive line
         // Validates: Requirements 8.1, 8.2
@@ -57523,6 +57576,25 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_ambiguity_guard_survives_interposed_rebinding() {
+        // The formal-order ambiguity guard must survive an intervening rebinding
+        // that EVICTS the prior definition from `local_function_defs` — an alias
+        // (`f <- g`) or a non-callable value (`f <- 5`). Otherwise the later
+        // permuted definition has no prior def to compare against, is not flagged
+        // ambiguous, and the directive borrows its `(x, data)` order — wrongly
+        // suppressing the earlier call's positional `real_undef` (a hidden
+        // undefined variable). The guard compares against the FIRST-seen order,
+        // which a rebinding does not clear.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_undef, masked_col)\nf <- 5\nf <- function(x, data) data\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "ambiguity guard must survive an interposed rebinding; got {diags:?}"
+        );
+    }
+
+    #[test]
     fn nse_directive_borrows_formals_when_redefinition_keeps_order() {
         // Redefining `f` with the SAME formal order is not ambiguous, so
         // positional borrowing still applies: the captured formal `x` (slot 2)
@@ -58392,6 +58464,28 @@ mod dollar_member_completion_tests {
                 assert_eq!(edit.new_text, "beta");
             }
             other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dollar_member_completion_inserts_non_ascii_member_bare() {
+        // A non-ASCII but syntactic member name (`données`) is a valid R name in
+        // a UTF-8 locale, so it must be inserted WITHOUT backticks. Guards the
+        // Unicode-aware `is_syntactic_r_name` at the completion consumer (the old
+        // ASCII-only predicate would have wrongly wrapped it).
+        let items = completion_items("foo <- list(données = 1)\nfoo$|");
+        let item = items
+            .iter()
+            .find(|item| item.label == "données")
+            .expect("données member");
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.new_text, "données");
+            }
+            other => panic!(
+                "expected bare insert text for non-ASCII member, got {:?}",
+                other
+            ),
         }
     }
 
