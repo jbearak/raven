@@ -212,7 +212,7 @@ fn open_disk_fallback_target(
         crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
     }
 
-    // Pre-collect parent content for any backward directives (`@lsp-sourced-by`
+    // Pre-collect parent content for any backward directives (`# raven: sourced-by`
     // with `match=`/inference call sites) before the mutable `update_file`
     // borrow, mirroring did_open. Forward `source()` edges — the only kind chunk
     // targets normally have — don't consult this closure, so it's empty in the

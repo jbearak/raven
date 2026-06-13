@@ -58,10 +58,11 @@ pub enum FilePathContext {
 /// Type of LSP directive for path context
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveType {
-    /// Backward directives: @lsp-sourced-by, @lsp-run-by, @lsp-included-by
-    /// These declare that the current file is sourced BY another file
+    /// Backward directives: `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`
+    /// These declare that the current file is sourced BY another file.
+    /// (The `@lsp-` forms — e.g. `@lsp-sourced-by` — are permanent aliases that parse identically.)
     SourcedBy,
-    /// Forward directive: @lsp-source
+    /// Forward directive: `# raven: source`
     /// This declares that the current file sources another file
     Source,
 }
@@ -348,8 +349,8 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// Check if cursor is after an LSP directive where a path is expected
 ///
 /// Uses regex patterns consistent with cross_file/directive.rs to detect
-/// @lsp-sourced-by, @lsp-run-by, @lsp-included-by, and forward source directives
-/// (`@lsp-source`, `@lsp-run`, `@lsp-include`).
+/// `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`, and forward source directives
+/// (`# raven: source`, `# raven: run`, `# raven: include`).
 /// Handles optional colon and quotes syntax variations.
 ///
 /// # Arguments
@@ -575,8 +576,8 @@ fn unescape_string(s: &str) -> String {
 /// Generate file path completions for the given context
 ///
 /// Determines the base directory based on context type:
-/// - SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// - SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
+/// - Directive: Uses PathContext::new() (ignores `# raven: cd`)
 ///
 /// # Arguments
 /// * `context` - The detected file path context
@@ -878,8 +879,8 @@ fn create_path_completion_item(
 /// Get definition location for a file path at the given position
 ///
 /// Detects context type and resolves path using appropriate PathContext:
-/// - SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// - SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
+/// - Directive: Uses PathContext::new() (ignores `# raven: cd`)
 ///
 /// If workspace_root is provided, enforces workspace boundary: paths resolving
 /// outside the workspace return None.
@@ -930,7 +931,7 @@ pub fn file_path_definition(
         }
         FilePathContext::Directive { directive_type, .. } => match directive_type {
             DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                // Backward directives: relative to file's directory (ignore `# raven: cd`)
                 let path_context = PathContext::new(file_uri, workspace_root)?;
                 resolve_path(&normalized_path, &path_context)?
             }
@@ -1304,8 +1305,8 @@ fn try_extract_full_directive_path(
 /// Resolve the base directory for file path completions
 ///
 /// Determines the base directory based on context type and partial path:
-/// - For SourceCall: Uses PathContext::from_metadata() (respects @lsp-cd)
-/// - For Directive: Uses PathContext::new() (ignores @lsp-cd)
+/// - For SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
+/// - For Directive: Uses PathContext::new() (ignores `# raven: cd`)
 /// - For paths starting with `/`: Resolves relative to workspace root (both contexts)
 ///
 /// The partial path's directory component (e.g., `../`, `subdir/`) is joined
@@ -1387,7 +1388,7 @@ pub fn resolve_base_directory(
         }
         FilePathContext::Directive { directive_type, .. } => match directive_type {
             DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore @lsp-cd)
+                // Backward directives: relative to file's directory (ignore `# raven: cd`)
                 let path_context = PathContext::new(file_uri, workspace_root)?;
                 if partial_dir.is_empty() {
                     Some(path_context.effective_working_directory())
@@ -1508,11 +1509,13 @@ fn normalize_path_separators(path: &str) -> String {
 /// These patterns match the directive prefix only (not the path itself),
 /// allowing us to determine where the path portion begins.
 struct DirectivePathPatterns {
-    /// Pattern for backward directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
-    /// Matches: `# @lsp-sourced-by:` or `# @lsp-run-by` etc. (with optional leading whitespace)
+    /// Pattern for backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`)
+    /// Matches the canonical `# raven:` forms and the equivalent `@lsp-` aliases, e.g.
+    /// `# @lsp-sourced-by:` or `# @lsp-run-by` (with optional leading whitespace).
     backward: Regex,
-    /// Pattern for forward directives (@lsp-source, @lsp-run, @lsp-include)
-    /// Matches: `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
+    /// Pattern for forward directives (`# raven: source`, `# raven: run`, `# raven: include`)
+    /// Matches the canonical `# raven:` forms and the equivalent `@lsp-` aliases, e.g.
+    /// `# @lsp-source:`, `# @lsp-run`, `# @lsp-include`, etc.
     /// (with optional leading whitespace)
     forward: Regex,
 }

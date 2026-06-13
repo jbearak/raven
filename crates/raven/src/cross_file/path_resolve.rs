@@ -5,19 +5,21 @@
 //
 // CRITICAL DESIGN NOTE: Forward vs Backward Directive Path Resolution
 // ====================================================================
+// Directives are written with the canonical `# raven:` prefix; the `@lsp-`
+// forms named below are permanent aliases that parse identically.
 // This module provides two PathContext constructors with DIFFERENT behaviors:
 //
-// 1. PathContext::new() - For BACKWARD directives (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
-//    - IGNORES @lsp-cd working directory
+// 1. PathContext::new() - For BACKWARD directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`)
+//    - IGNORES `# raven: cd` working directory
 //    - Always resolves paths relative to the file's own directory
 //    - Rationale: Backward directives describe static file relationships from the child's
 //      perspective. They declare "this file is sourced by that parent file" - a relationship
 //      that should NOT change based on runtime working directory.
 //
-// 2. PathContext::from_metadata() - For FORWARD directives (@lsp-source, @lsp-run, @lsp-include)
+// 2. PathContext::from_metadata() - For FORWARD directives (`# raven: source`, `# raven: run`, `# raven: include`)
 //                                   and source() calls
-//    - USES @lsp-cd working directory when present
-//    - Resolves paths relative to the working directory (or file's directory if no @lsp-cd)
+//    - USES `# raven: cd` working directory when present
+//    - Resolves paths relative to the working directory (or file's directory if no `# raven: cd`)
 //    - Rationale: Forward directives and source() calls describe runtime execution behavior.
 //      They are semantically equivalent to R's source() function, which is affected by
 //      the current working directory at runtime.
@@ -47,15 +49,15 @@ pub struct PathContext {
 impl PathContext {
     /// Create a new context for a file WITHOUT working directory support.
     ///
-    /// **USE FOR: Backward directives only** (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`)
+    /// **USE FOR: Backward directives only** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`)
     ///
     /// This constructor creates a PathContext that resolves paths relative to the file's
-    /// own directory, ignoring any `@lsp-cd` directive. This is intentional because backward
+    /// own directory, ignoring any `# raven: cd` directive. This is intentional because backward
     /// directives describe static file relationships that should not change based on runtime
     /// working directory.
     ///
-    /// **DO NOT USE FOR:** Forward directives (`@lsp-source`) or `source()` calls.
-    /// Use `PathContext::from_metadata()` instead, which respects `@lsp-cd`.
+    /// **DO NOT USE FOR:** Forward directives (`# raven: source`) or `source()` calls.
+    /// Use `PathContext::from_metadata()` instead, which respects `# raven: cd`.
     pub fn new(file_uri: &Url, workspace_root: Option<&Url>) -> Option<Self> {
         let file_path = file_uri.to_file_path().ok()?;
         let workspace_root = workspace_root.and_then(|u| u.to_file_path().ok());
@@ -69,15 +71,15 @@ impl PathContext {
 
     /// Create a context from a file URI and its metadata WITH working directory support.
     ///
-    /// **USE FOR: Forward directives** (`@lsp-source`, `@lsp-run`, `@lsp-include`) **and source() calls**
+    /// **USE FOR: Forward directives** (`# raven: source`, `# raven: run`, `# raven: include`) **and source() calls**
     ///
-    /// This constructor creates a PathContext that respects `@lsp-cd` working directory
+    /// This constructor creates a PathContext that respects `# raven: cd` working directory
     /// directives. Paths are resolved relative to the working directory (if set) or the
     /// file's directory (if no working directory). This matches R's runtime behavior where
     /// `source()` calls are affected by the current working directory.
     ///
-    /// **DO NOT USE FOR:** Backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`).
-    /// Use `PathContext::new()` instead, which ignores `@lsp-cd`.
+    /// **DO NOT USE FOR:** Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`).
+    /// Use `PathContext::new()` instead, which ignores `# raven: cd`.
     ///
     /// Priority for path resolution: explicit working_directory > inherited > file's directory
     pub fn from_metadata(
@@ -171,18 +173,18 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
 
 /// Resolve a path with workspace-root fallback for source() statements and forward directives.
 ///
-/// This function first tries normal resolution (relative to file's directory or @lsp-cd).
+/// This function first tries normal resolution (relative to file's directory or `# raven: cd`).
 /// If that fails AND the file has no explicit working directory directive, it falls back
 /// to trying the path relative to workspace root.
 ///
-/// This is useful for codebases that haven't been annotated with LSP directives but where
+/// This is useful for codebases that haven't been annotated with directives but where
 /// source() calls use paths relative to the project root (a common pattern in R projects).
 ///
-/// Use this for AST-detected `source()` calls AND for forward directives (`@lsp-source`,
-/// `@lsp-run`, `@lsp-include`). Forward directives are semantically equivalent to
+/// Use this for AST-detected `source()` calls AND for forward directives (`# raven: source`,
+/// `# raven: run`, `# raven: include`). Forward directives are semantically equivalent to
 /// `source()` calls (see `.kiro/specs/lsp-source-directive/`) and must resolve identically.
-/// Do NOT use for backward directives (`@lsp-sourced-by`, `@lsp-run-by`,
-/// `@lsp-included-by`) which always resolve relative to the file's directory.
+/// Do NOT use for backward directives (`# raven: sourced-by`, `# raven: run-by`,
+/// `# raven: included-by`) which always resolve relative to the file's directory.
 pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -> Option<PathBuf> {
     resolve_path_impl(path, context, true)
 }
@@ -250,7 +252,7 @@ fn resolve_path_impl(
         // File doesn't exist at the resolved path
         // Try workspace-root fallback if:
         // 1. Fallback is enabled (for source() statements)
-        // 2. No explicit @lsp-cd directive (working_directory is None)
+        // 2. No explicit `# raven: cd` directive (working_directory is None)
         // 3. No inherited working directory
         // 4. Workspace root is available
         let has_explicit_wd = context.working_directory.is_some();
@@ -295,7 +297,7 @@ fn resolve_path_impl(
 }
 
 /// Resolve a working directory path.
-/// Used for @lsp-cd directive resolution with workspace-relative and absolute path support.
+/// Used for `# raven: cd` directive resolution with workspace-relative and absolute path support.
 pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
         log::trace!("Working directory resolution: empty path provided");

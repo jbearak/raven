@@ -32,7 +32,7 @@
 pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 /// Umbrella for parse failures; parent of the concrete `*-paren`/`*-brace`/… kinds.
 pub const SYNTAX_ERROR: &str = "syntax-error";
-/// A `source()` / `@lsp-source` path that does not resolve to a file.
+/// A `source()` / `# raven: source` path that does not resolve to a file.
 pub const UNRESOLVED_SOURCE_PATH: &str = "unresolved-source-path";
 /// Assignment whose target is a string literal (`"x" <- 1`) or other
 /// almost-certainly-unintended target.

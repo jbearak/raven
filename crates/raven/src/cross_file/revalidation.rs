@@ -321,7 +321,8 @@ impl CrossFileActivityState {
 
 /// Detect if a parent file's working directory has changed and find affected children.
 ///
-/// When a parent file's `@lsp-cd` directive is added, changed, or removed, all child files
+/// When a parent file's `# raven: cd` directive (the `@lsp-cd` alias parses
+/// identically) is added, changed, or removed, all child files
 /// that have backward directives pointing to this parent need to be revalidated so they
 /// can re-compute their `inherited_working_directory`.
 ///
@@ -398,7 +399,7 @@ pub fn detect_parent_wd_change_affected_children(
 /// Invalidate metadata cache entries for children affected by a parent's working directory change.
 ///
 /// This function combines `detect_parent_wd_change_affected_children` with cache invalidation.
-/// When a parent file's `@lsp-cd` directive is added, changed, or removed, this function:
+/// When a parent file's `# raven: cd` directive is added, changed, or removed, this function:
 /// 1. Detects which children have backward directives pointing to the parent
 /// 2. Invalidates their metadata cache entries so they will re-compute their
 ///    `inherited_working_directory` on the next access
@@ -416,7 +417,7 @@ pub fn detect_parent_wd_change_affected_children(
 ///
 /// # Example
 /// ```text
-/// // When parent's @lsp-cd changes, invalidate affected children
+/// // When parent's # raven: cd changes, invalidate affected children
 /// let affected = invalidate_children_on_parent_wd_change(
 ///     &parent_uri,
 ///     Some(&old_meta),

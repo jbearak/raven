@@ -10,7 +10,8 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 /// How backward dependencies (parent files that source this file) are resolved
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackwardDependencyMode {
-    /// Only use backward relationships from explicit `@lsp-sourced-by` directives.
+    /// Only use backward relationships from explicit `# raven: sourced-by`
+    /// directives (`@lsp-sourced-by` is a permanent alias that parses identically).
     /// Diagnostics are not deferred for the workspace scan.
     Explicit,
     /// Automatically infer backward relationships from forward directives and
@@ -79,7 +80,7 @@ pub struct CrossFileConfig {
     /// Severity for out-of-scope symbol diagnostics (None = disabled)
     pub out_of_scope_severity: Option<DiagnosticSeverity>,
     /// Extend the `unused-suppression` sweep to *every* suppression directive
-    /// (`# raven: ignore` / `@lsp-ignore` / `# nolint`-equivalent), not just
+    /// (`# raven: ignore`, alias `@lsp-ignore`, or `# nolint`-equivalent), not just
     /// `# raven: expect` (F2 Step 3). Pyright-style; default `false`. When
     /// `false`, only `expect` directives that suppressed nothing are reported.
     pub report_unused_suppressions: bool,
@@ -102,7 +103,7 @@ pub struct CrossFileConfig {
     /// Debounce window for libpath watcher events, in milliseconds.
     /// Clamped to `[100, 5000]` by the parser.
     pub packages_watch_debounce_ms: u64,
-    /// Severity for redundant directive diagnostics (when @lsp-source without line= targets
+    /// Severity for redundant directive diagnostics (when `# raven: source` without line= targets
     /// same file as earlier source() call)
     /// _Requirements: 6.2_
     pub redundant_directive_severity: Option<DiagnosticSeverity>,
@@ -133,7 +134,7 @@ pub struct CrossFileConfig {
     pub hoist_globals_in_functions: bool,
     /// How backward dependencies are resolved.
     /// Controls whether the LSP auto-detects parent files from forward source() calls
-    /// in other workspace files, or requires explicit @lsp-sourced-by directives.
+    /// in other workspace files, or requires explicit `# raven: sourced-by` directives.
     pub backward_dependencies: BackwardDependencyMode,
     /// Maximum nodes visited during transitive dependent search (caps DFS in dense graphs).
     pub max_transitive_dependents_visited: usize,

@@ -66,8 +66,13 @@
 //! Suppression supports both lintr and Raven conventions:
 //! * `# nolint` (with optional `: rule_a, rule_b` filter) suppresses the line.
 //! * `# nolint start` / `# nolint end` brackets a region.
-//! * `# @lsp-ignore` suppresses the line it appears on.
-//! * `# @lsp-ignore-next` suppresses the *following* source line.
+//! * `# raven: ignore` (alias `# @lsp-ignore`) suppresses the line it appears
+//!   on.
+//! * `# raven: ignore-next` (alias `# @lsp-ignore-next`) suppresses the
+//!   *following* source line.
+//!
+//! The `@lsp-` forms are permanent aliases that parse identically to the
+//! canonical `# raven:` forms.
 //!
 //! Same-line markers (`# nolint`, `# nolint start/end`, `# @lsp-ignore`) are
 //! additionally recognised when nested inside a commented-code line — e.g.

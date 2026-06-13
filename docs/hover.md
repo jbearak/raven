@@ -53,7 +53,7 @@ Symbols declared via [`# raven: var` or `# raven: func`](directives.md#declarati
 name (declared function)
 ```
 
-…then, as markdown beneath it, `Declared via @lsp-func directive at line 12` and *Defined in analysis/helpers.R*.
+…then, as markdown beneath it, `Declared via # raven: func directive at line 12` and *Defined in analysis/helpers.R*.
 
 The "Defined in" line is omitted when the declaration lives in the current file. If the same name is declared more than once in the providing file, hover shows the **most recent declaration at or before the cursor** — the same position-aware scope [completions](completion.md) and [diagnostics](diagnostics.md) use. [Go-to-definition](go-to-definition.md#declared-symbols) differs here: it navigates to the *first* declaration by line number.
 

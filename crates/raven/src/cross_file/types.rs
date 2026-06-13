@@ -10,7 +10,8 @@ use tower_lsp::lsp_types::Url;
 
 use super::source_detect::LibraryCall;
 
-/// What a `# raven: ignore` / `@lsp-ignore` directive on a given line targets.
+/// What a `# raven: ignore` directive (the `@lsp-` forms named throughout this
+/// file are permanent aliases that parse identically) on a given line targets.
 ///
 /// A blanket directive suppresses every analyzer diagnostic on its line; a
 /// code-scoped directive (`# raven: ignore[undefined-variable]`) suppresses
@@ -60,7 +61,7 @@ impl LineSuppression {
     }
 }
 
-/// A declared symbol from an @lsp-var or @lsp-func directive.
+/// A declared symbol from a `# raven: var` or `# raven: func` directive.
 /// These directives allow users to declare symbols that cannot be statically
 /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,7 +70,7 @@ pub struct DeclaredSymbol {
     pub name: String,
     /// 0-based line number where the directive appears
     pub line: u32,
-    /// true for @lsp-func, false for @lsp-var
+    /// true for `# raven: func`, false for `# raven: var`
     pub is_function: bool,
 }
 
@@ -140,18 +141,18 @@ pub struct CrossFileMetadata {
     pub sourced_by: Vec<BackwardDirective>,
     /// Forward directives and detected source() calls
     pub sources: Vec<ForwardSource>,
-    /// Working directory override (explicit @lsp-cd)
+    /// Working directory override (explicit `# raven: cd`)
     pub working_directory: Option<String>,
     /// Working directory inherited from parent via backward directive.
-    /// This is populated when a file has a backward directive (@lsp-sourced-by, etc.)
+    /// This is populated when a file has a backward directive (`# raven: sourced-by`, etc.)
     /// pointing to a parent file, and the parent has an effective working directory.
     /// Priority for path resolution: explicit working_directory > inherited > file's directory.
     pub inherited_working_directory: Option<String>,
-    /// Lines with a line-scoped ignore (`@lsp-ignore` / `# raven: ignore`),
+    /// Lines with a line-scoped ignore (`# raven: ignore`, alias `@lsp-ignore`),
     /// 0-based, mapped to what each suppresses.
     pub ignored_lines: HashMap<u32, LineSuppression>,
-    /// Lines targeted by a next-line ignore (`@lsp-ignore-next` /
-    /// `# raven: ignore-next`), 0-based, mapped to what each suppresses.
+    /// Lines targeted by a next-line ignore (`# raven: ignore-next`, alias
+    /// `@lsp-ignore-next`), 0-based, mapped to what each suppresses.
     pub ignored_next_lines: HashMap<u32, LineSuppression>,
     /// File-level ignore (`# raven: ignore-file`), if present. Suppresses the
     /// matching analyzer diagnostics on every line in the file. Header-only.
@@ -170,10 +171,10 @@ pub struct CrossFileMetadata {
     pub suppression_directives: Vec<SuppressionDirective>,
     /// Detected library(), require(), loadNamespace() calls
     pub library_calls: Vec<LibraryCall>,
-    /// Variables declared via @lsp-var directives
+    /// Variables declared via `# raven: var` directives
     #[serde(default)]
     pub declared_variables: Vec<DeclaredSymbol>,
-    /// Functions declared via @lsp-func directives
+    /// Functions declared via `# raven: func` directives
     #[serde(default)]
     pub declared_functions: Vec<DeclaredSymbol>,
 }
@@ -198,7 +199,7 @@ pub struct ForwardSource {
     /// 0-based UTF-16 column
     #[serde(default)]
     pub column: u32,
-    /// true if @lsp-source directive, false if detected source()
+    /// true if `# raven: source` directive, false if detected source()
     #[serde(default)]
     pub is_directive: bool,
     /// source(..., local = TRUE)
@@ -237,7 +238,7 @@ pub struct ForwardSource {
     /// Function-body source() calls only execute when the enclosing function
     /// is invoked, so they are not load-time ordering constraints for
     /// top-level usages. Used by the "used before it's available" diagnostic
-    /// to skip blame attribution. Always false for `@lsp-source` directives,
+    /// to skip blame attribution. Always false for `# raven: source` directives,
     /// which are header-only and run at load time.
     #[serde(default)]
     pub is_function_scoped: bool,
@@ -315,7 +316,7 @@ pub use crate::utf16::byte_offset_to_utf16_column;
 ///
 /// Only sets `inherited_working_directory` when:
 /// - `sourced_by` is not empty (file has backward directives)
-/// - `working_directory` is None (no explicit @lsp-cd)
+/// - `working_directory` is None (no explicit `# raven: cd`)
 ///
 /// Uses `compute_inherited_working_directory` from dependency module.
 pub fn enrich_metadata_with_inherited_wd<F>(
