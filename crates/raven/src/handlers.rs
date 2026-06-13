@@ -12732,6 +12732,26 @@ struct DirectiveNsePolicy {
     policy: crate::nse::ArgPolicy,
 }
 
+/// How a call site is qualified, for matching it against `# raven: nse`
+/// directives. A bare `name(...)` call is resolved in two passes so that an
+/// authoritative unqualified directive can override local inference, while a
+/// qualified directive only reaches a bare call once local shadowing has been
+/// ruled out (see [`resolve_call_arg_policy`]).
+enum CallQualifier<'a> {
+    /// Explicit `pkg::name(...)` call: matches a qualified directive for the
+    /// same package only.
+    Qualified(&'a str),
+    /// Bare `name(...)`: consider only an exact unqualified directive
+    /// (`# raven: nse name`). This is the authoritative override that beats
+    /// local definitions/aliases.
+    BareExact,
+    /// Bare `name(...)`: consider a qualified directive (`# raven: nse
+    /// pkg::name`) whose package is in play. Consulted only *after* local
+    /// definitions/aliases are ruled out, because a local binding — not the
+    /// package export — is what such a call actually invokes.
+    BareInPlayQualified,
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -12977,13 +12997,17 @@ impl<'a> NseAnalysis<'a> {
             let policy = match &decl.scope {
                 NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
                 NseScope::Formals(captured) => {
-                    let order =
-                        declared_function_formals(declared_functions, &decl.name).or_else(|| {
-                            local_function_defs
-                                .get(&decl.name)
-                                .map(|def| function_formal_names(*def, text))
-                                .filter(|f| !f.is_empty())
-                        });
+                    let order = declared_function_formals(
+                        declared_functions,
+                        &decl.name,
+                        decl.package.as_deref(),
+                    )
+                    .or_else(|| {
+                        local_function_defs
+                            .get(&decl.name)
+                            .map(|def| function_formal_names(*def, text))
+                            .filter(|f| !f.is_empty())
+                    });
                     match order {
                         Some(mut formals) => {
                             for c in captured {
@@ -13033,7 +13057,7 @@ impl<'a> NseAnalysis<'a> {
     fn directive_nse_policy(
         &self,
         name: &str,
-        qualifier: Option<&str>,
+        qualifier: CallQualifier,
         call_line: u32,
     ) -> Option<crate::nse::ArgPolicy> {
         let entries = self.directive_nse.get(name)?;
@@ -13042,11 +13066,20 @@ impl<'a> NseAnalysis<'a> {
             .rev()
             .find(|e| {
                 e.line < call_line
-                    && match (&e.package, qualifier) {
-                        (None, None) => true,
-                        (None, Some(_)) => false,
-                        (Some(p), Some(q)) => p == q,
-                        (Some(p), None) => self.in_play_packages.iter().any(|ip| ip == p),
+                    && match (&e.package, &qualifier) {
+                        // An unqualified directive matches only the BareExact
+                        // pass (the authoritative override); never a qualified
+                        // call, never the qualified-fallback pass.
+                        (None, CallQualifier::BareExact) => true,
+                        (None, _) => false,
+                        // A qualified directive matches a same-package qualified
+                        // call, or a bare call whose package is in play — but
+                        // the latter only on the BareInPlayQualified pass.
+                        (Some(p), CallQualifier::Qualified(q)) => p == q,
+                        (Some(p), CallQualifier::BareInPlayQualified) => {
+                            self.in_play_packages.iter().any(|ip| ip == p)
+                        }
+                        (Some(_), CallQualifier::BareExact) => false,
                     }
             })
             .map(|e| e.policy.clone())
@@ -13614,28 +13647,45 @@ fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
     names
 }
 
-/// The declared formal order for callee `name` from the most recent
-/// `# raven: func …(formals…)` directive, if any. Formal order is a
-/// position-independent signature fact, so this is NOT gated on the directive's
-/// line relative to the `# raven: nse` it serves — a `# raven: func` works
-/// whether it precedes or follows the `# raven: nse`. A qualified
+/// The declared formal order for the callee named by a `# raven: nse`
+/// declaration — bare `name`, optionally qualified by `package` — from the most
+/// recent matching `# raven: func …(formals…)` directive, if any. Formal order
+/// is a position-independent signature fact, so this is NOT gated on the
+/// directive's line relative to the `# raven: nse` it serves — a `# raven: func`
+/// works whether it precedes or follows the `# raven: nse`. A qualified
 /// `# raven: func pkg::name(...)` is stored under its full `pkg::name`, so the
-/// bare suffix is compared too (the `# raven: nse` form splits the qualifier off).
+/// match is package-aware (see [`declared_name_matches`]): a `# raven: func`
+/// for a different package must not supply formals here.
 fn declared_function_formals(
     declared_functions: &[crate::cross_file::types::DeclaredSymbol],
     name: &str,
+    package: Option<&str>,
 ) -> Option<Vec<String>> {
     declared_functions
         .iter()
-        .filter(|d| d.formals.is_some() && declared_name_matches(&d.name, name))
+        .filter(|d| d.formals.is_some() && declared_name_matches(&d.name, name, package))
         .max_by_key(|d| d.line)
         .and_then(|d| d.formals.clone())
 }
 
-/// Whether a declared-function name (possibly written `pkg::name`) refers to the
-/// bare callee `name`: exact match, or the suffix after the last `::`.
-fn declared_name_matches(declared: &str, name: &str) -> bool {
-    declared == name || declared.rsplit("::").next() == Some(name)
+/// Whether a `# raven: func` declaration (its name possibly written
+/// `pkg::name`) pairs with a `# raven: nse` reference to bare callee `name`,
+/// optionally qualified by `package`. The bare names must match; and when
+/// **both** the declaration and the reference name a package, those packages
+/// must be equal — so `# raven: func otherpkg::foo(...)` never supplies the
+/// formal order for `# raven: nse pkg::foo(...)`. A missing qualifier on either
+/// side stays lenient (a bare `# raven: func foo` still serves a qualified nse,
+/// and vice versa).
+fn declared_name_matches(declared: &str, name: &str, package: Option<&str>) -> bool {
+    let (decl_pkg, decl_name) = match declared.rsplit_once("::") {
+        Some((p, n)) => (Some(p), n),
+        None => (None, declared),
+    };
+    decl_name == name
+        && match (decl_pkg, package) {
+            (Some(dp), Some(np)) => dp == np,
+            _ => true,
+        }
 }
 
 /// True when the function declares a `...` formal — the allocation-free
@@ -14297,7 +14347,8 @@ fn resolve_call_arg_policy(
     if func.kind() == "namespace_operator" {
         let call_line = call_node.start_position().row as u32;
         if let Some((pkg, n)) = namespace_parts(func, text)
-            && let Some(p) = analysis.directive_nse_policy(n, Some(pkg), call_line)
+            && let Some(p) =
+                analysis.directive_nse_policy(n, CallQualifier::Qualified(pkg), call_line)
         {
             return p;
         }
@@ -14311,10 +14362,12 @@ fn resolve_call_arg_policy(
     }
     let name = node_text(func, text);
 
-    // 0. An explicit `# raven: nse` declaration is an authoritative user
-    //    override, position-gated to calls after the directive line.
+    // 0. An exact unqualified `# raven: nse name` declaration is an
+    //    authoritative user override of Raven's own inference for this name —
+    //    it names the binding itself, so it beats even a local definition.
+    //    Position-gated to calls after the directive line.
     let call_line = call_node.start_position().row as u32;
-    if let Some(policy) = analysis.directive_nse_policy(name, None, call_line) {
+    if let Some(policy) = analysis.directive_nse_policy(name, CallQualifier::BareExact, call_line) {
         return policy;
     }
 
@@ -14341,6 +14394,15 @@ fn resolve_call_arg_policy(
             // conservatively rather than inherit any package verb's policy.
             LocalCalleeAlias::Unknown => ArgPolicy::WholeCall,
         };
+    }
+    // 1c. A qualified `# raven: nse pkg::name` directive matches this bare call
+    //     only now that no local binding shadowed it above — R invokes the
+    //     local value, not `pkg::name`, when one exists. It still overrides the
+    //     built-in policy tables below, so it is consulted before them.
+    if let Some(policy) =
+        analysis.directive_nse_policy(name, CallQualifier::BareInPlayQualified, call_line)
+    {
+        return policy;
     }
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
     // owner resolution).
@@ -56489,6 +56551,84 @@ my_func <- function(a = default_value) {
             !diags.iter().any(|m| m.contains("masked_col")),
             "got {diags:?}"
         );
+    }
+
+    #[test]
+    fn nse_qualified_directive_still_applies_to_bare_call_without_local() {
+        // The legitimate qualified→bare case: `pkg` is in play and nothing
+        // shadows `my_func`, so the qualified directive governs the bare call.
+        let src = "library(pkg)\n# raven: nse pkg::my_func(x)\nmy_func(x = masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "qualified directive should still reach an unshadowed bare call; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_qualified_directive_does_not_override_shadowing_local() {
+        // A qualified `# raven: nse pkg::my_func` must NOT suppress arguments to a
+        // bare `my_func(...)` call when a local standard-eval `my_func` shadows
+        // the package export — R invokes the local, not `pkg::my_func`. (A bare
+        // `# raven: nse my_func` *would* override the local; that authoritative
+        // behavior is covered by `nse_directive_overrides_local_inference`.)
+        let src = "library(pkg)\nmy_func <- function(a, b) a + b\n# raven: nse pkg::my_func\nmy_func(undefined_a, undefined_b)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("undefined_a")),
+            "local shadow is standard-eval; first arg must be checked; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("undefined_b")),
+            "local shadow is standard-eval; second arg must be checked; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_cross_package_func_does_not_supply_formals() {
+        // A `# raven: func` for a *different* package must not provide the formal
+        // order for a qualified `# raven: nse` — otherwise positional matching
+        // binds against the wrong signature. With no usable order the directive
+        // falls back to named-only matching, so the positional args stay checked.
+        let src = "# raven: func otherpkg::my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("m1")),
+            "cross-package func must not supply order; m1 stays checked; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("m2")),
+            "cross-package func must not supply order; m2 stays checked; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_same_package_func_supplies_formals() {
+        // The matching case: a same-package `# raven: func` supplies the formal
+        // order, so positional captured args are suppressed and the data arg is
+        // checked.
+        let src = "# raven: func pkg::my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
+    fn nse_unqualified_func_serves_qualified_nse() {
+        // Leniency is preserved: an unqualified `# raven: func` still supplies
+        // the formal order for a qualified `# raven: nse` of the same bare name.
+        let src = "# raven: func my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
     }
 
     #[test]
