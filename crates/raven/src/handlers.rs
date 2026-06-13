@@ -13751,9 +13751,15 @@ fn table_verb_policy(
 /// exempted exactly like the verb's own.
 ///
 /// A forwarded `...` counts when its own argument position is suppressed, or
-/// when it is positional and the verb captures its own dots — splicing spreads
-/// across the remaining formals, so in `function(...) filter(...)` the single
-/// `...` feeds `.data` *and* overflows into filter's captured `...`.
+/// when it is positional and splicing would reach any captured position —
+/// spread elements fill the verb's remaining formals, so in `function(...)
+/// filter(...)` the single `...` feeds `.data` *and* overflows into filter's
+/// captured `...`, and in `function(...) subset(...)` it overflows into base
+/// subset's captured `subset` formal. The overflow test reuses
+/// [`crate::nse::suppressed_arguments`] by expanding the dots into enough
+/// positional slots to cover every formal (see
+/// [`positional_dots_splice_suppressed`]), so it cannot drift from the
+/// call-site matching rules.
 ///
 /// Deliberately one level deep: the inner callee is resolved against the
 /// built-in tables only ([`table_verb_policy`]), never against other local
@@ -13762,26 +13768,38 @@ fn table_verb_policy(
 /// forwarding, and dots buried deeper in an argument expression
 /// (`summarise(d, across(c(...)))`) are not recognized. A bare callee that is
 /// locally shadowed — by a top-level definition (`local_function_policies`) or
-/// by an entry in `shadows` (function-valued bindings inside the wrapper body
-/// plus the wrapper's own formal names; see the upgrade loop in
-/// [`NseAnalysis::build`]) — is skipped entirely, preserving the "local
+/// by an entry in `shadows` (function-valued bindings inside the wrapper body,
+/// the wrapper's own formal names, and the formals of every nested closure the
+/// walk descends through) — is skipped entirely, preserving the "local
 /// definition shadows any package / base policy" rule the direct-call resolver
 /// applies.
 ///
 /// Nested function definitions are descended into unless they declare their
 /// own `...` (R's dots are lexical, so `function(...) function() filter(d,
-/// ...)` forwards the factory's dots). The walk also descends into captured
-/// argument subtrees — a data-masked argument is eventually evaluated, at the
-/// cost of also matching purely quoted contexts (`quote(filter(d, ...))`),
-/// which lean toward suppression like the rest of the NSE machinery.
+/// ...)` forwards the factory's dots); their formal names join `shadows` for
+/// that subtree. The walk also descends into captured argument subtrees — a
+/// data-masked argument is eventually evaluated, at the cost of also matching
+/// purely quoted contexts (`quote(filter(d, ...))`), which lean toward
+/// suppression like the rest of the NSE machinery.
 fn body_forwards_dots_to_covered_verb(
     node: Node,
     text: &str,
     analysis: &NseAnalysis,
     shadows: &HashSet<String>,
 ) -> bool {
-    if node.kind() == "function_definition" && function_has_dots_formal(node, text) {
-        return false;
+    if node.kind() == "function_definition" {
+        if function_has_dots_formal(node, text) {
+            return false;
+        }
+        let nested = function_formal_names(node, text);
+        if !nested.is_empty() {
+            let mut extended = shadows.clone();
+            extended.extend(nested);
+            let mut cursor = node.walk();
+            return node
+                .children(&mut cursor)
+                .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis, &extended));
+        }
     }
     if node.kind() == "call"
         && let Some(func) = node.child_by_field_name("function")
@@ -13795,21 +13813,21 @@ fn body_forwards_dots_to_covered_verb(
                 || shadows.contains(node_text(func, text))))
         && let Some(policy) = table_verb_policy(func, text, analysis)
     {
-        let verb_captures_dots = matches!(
-            &policy,
-            crate::nse::ArgPolicy::PerFormal {
-                captured_dots: true,
-                ..
+        let pipe_fed = call_is_pipe_fed(node, text);
+        let pairs = call_argument_suppression(args, text, &policy, pipe_fed);
+        let forwards = pairs.iter().enumerate().any(|(i, (arg, suppressed))| {
+            if arg
+                .child_by_field_name("value")
+                .is_none_or(|value| value.kind() != "dots")
+            {
+                return false;
             }
-        );
-        let forwards = call_argument_suppression(args, text, &policy, call_is_pipe_fed(node, text))
-            .iter()
-            .any(|(arg, suppressed)| {
-                arg.child_by_field_name("value")
-                    .is_some_and(|value| value.kind() == "dots")
-                    && (*suppressed
-                        || (verb_captures_dots && arg.child_by_field_name("name").is_none()))
-            });
+            if *suppressed {
+                return true;
+            }
+            arg.child_by_field_name("name").is_none()
+                && positional_dots_splice_suppressed(&pairs, i, text, &policy, pipe_fed)
+        });
         if forwards {
             return true;
         }
@@ -13817,6 +13835,37 @@ fn body_forwards_dots_to_covered_verb(
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|child| body_forwards_dots_to_covered_verb(child, text, analysis, shadows))
+}
+
+/// Would splicing a positional `...` (the argument at `dots_index`) into this
+/// call reach at least one suppressed position? Answered by re-running the
+/// shared mask with the dots slot expanded into enough positional slots to
+/// bind every formal of the policy (plus one for dots overflow) and checking
+/// whether any expanded slot is suppressed — reusing R's named-then-positional
+/// matching from [`crate::nse::suppressed_arguments`] instead of restating it.
+fn positional_dots_splice_suppressed(
+    pairs: &[(Node, bool)],
+    dots_index: usize,
+    text: &str,
+    policy: &crate::nse::ArgPolicy,
+    pipe_fed: bool,
+) -> bool {
+    let crate::nse::ArgPolicy::PerFormal { formals, .. } = policy else {
+        // Standard never suppresses; WholeCall already suppressed the dots
+        // argument itself.
+        return false;
+    };
+    let expansion = formals.len() + 1;
+    let mut labels: Vec<Option<&str>> = Vec::with_capacity(pairs.len() + expansion - 1);
+    for (i, (arg, _)) in pairs.iter().enumerate() {
+        if i == dots_index {
+            labels.extend(std::iter::repeat_n(None, expansion));
+        } else {
+            labels.push(arg.child_by_field_name("name").map(|n| node_text(n, text)));
+        }
+    }
+    let mask = crate::nse::suppressed_arguments(policy, &labels, pipe_fed);
+    mask[dots_index..dots_index + expansion].iter().any(|s| *s)
 }
 
 /// Collect every name bound to a function definition anywhere inside `node`
@@ -21670,6 +21719,31 @@ mod tests {
             collect_with_packages(tree.root_node(), &code, &["dplyr"], &mut used);
             assert!(!was_collected(&used, "x"), "{label}: x must be suppressed");
         }
+    }
+
+    /// Positional dots splice into a captured NON-dots formal: in
+    /// `function(...) subset(...)` the second spliced element lands on base
+    /// subset's captured `subset` formal, so the wrapper forwards.
+    #[test]
+    fn nse_wrapper_dots_splice_reaches_captured_formal() {
+        let code = "my_subset <- function(...) subset(...)\nmy_subset(df2, x > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(!was_collected(&used, "x"));
+    }
+
+    /// A nested-lambda formal named after a covered verb shadows it for that
+    /// subtree of the dots walk: the lambda calls the caller-supplied
+    /// function, not the package verb.
+    #[test]
+    fn nse_nested_lambda_formal_shadows_verb_in_dots_walk() {
+        let code = "wrap <- function(fs, ...) sapply(fs, function(filter) filter(d2, ...))\n\
+                    wrap(lst2, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "undefined_sym"));
     }
 
     /// Intent pin: a triple-brace block wrapping a single formal inside a call
