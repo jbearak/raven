@@ -12671,6 +12671,12 @@ pub(crate) struct NseAnalysis<'a> {
     /// [`NseAnalysis::build`]). A local definition shadows any package / base
     /// policy.
     local_function_policies: HashMap<String, crate::nse::ArgPolicy>,
+    /// Top-level names assigned values that may be callable. This overlaps
+    /// `local_function_policies` for literal function definitions and also
+    /// covers aliases/factory results such as `filter <- stats::filter`. The
+    /// dots-forwarding inference uses it as a conservative veto before treating
+    /// a bare covered-verb call as a package verb.
+    local_callee_shadows: HashSet<String>,
     /// Packages detectably in play across the file/workspace: `library()` /
     /// `require()` calls, DESCRIPTION `Imports`, `importFrom`, and test-attached
     /// packages. A loaded package shadows base when classifying a bare callee.
@@ -12738,6 +12744,7 @@ impl<'a> NseAnalysis<'a> {
         base_exports: Option<&'a HashSet<String>>,
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
+        let mut local_callee_shadows = HashSet::new();
         let mut data_table_objects = HashSet::new();
         let mut non_data_table_objects = HashSet::new();
         let mut class_transitions: HashMap<String, Vec<(usize, DataTableClass)>> = HashMap::new();
@@ -12749,6 +12756,7 @@ impl<'a> NseAnalysis<'a> {
             root,
             text,
             &mut local_function_defs,
+            &mut local_callee_shadows,
             &mut data_table_objects,
             &mut non_data_table_objects,
             &mut class_transitions,
@@ -12778,6 +12786,7 @@ impl<'a> NseAnalysis<'a> {
             call_args_enabled,
             bracket_indices_enabled,
             local_function_policies,
+            local_callee_shadows,
             in_play_packages,
             self_nse_package,
             data_table_in_play,
@@ -12826,12 +12835,13 @@ impl<'a> NseAnalysis<'a> {
             let Some(body) = function_body_node(*fn_def) else {
                 continue;
             };
-            // Shadow sources for the covered-verb resolution: function-valued
-            // bindings inside the body, plus the wrapper's own formals — a
-            // parameter named after a covered verb (`function(filter, ...)
-            // filter(d, ...)`) is the caller's function, not the verb.
-            let mut shadows = HashSet::new();
-            function_binding_names(body, text, &mut shadows);
+            // Shadow sources for the covered-verb resolution: top-level
+            // possible callees, possible callee bindings inside the body, plus
+            // the wrapper's own formals — a parameter named after a covered
+            // verb (`function(filter, ...) filter(d, ...)`) is the caller's
+            // function, not the verb.
+            let mut shadows = analysis.local_callee_shadows.clone();
+            potential_function_binding_names(body, text, &mut shadows);
             shadows.extend(function_formal_names(*fn_def, text));
             if body_forwards_dots_to_covered_verb(body, text, &analysis, &shadows) {
                 let (formals, captured) = match baseline {
@@ -12925,6 +12935,7 @@ fn collect_nse_facts<'t>(
     node: Node<'t>,
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
+    local_callee_shadows: &mut HashSet<String>,
     data_table_objects: &mut HashSet<String>,
     non_data_table_objects: &mut HashSet<String>,
     class_transitions: &mut HashMap<String, Vec<(usize, DataTableClass)>>,
@@ -12965,6 +12976,11 @@ fn collect_nse_facts<'t>(
     {
         let name = node_text(target, text);
         let value = unwrap_parenthesized(value);
+        if value_may_bind_function(value, text) {
+            local_callee_shadows.insert(name.to_string());
+        } else {
+            local_callee_shadows.remove(name);
+        }
         if let Some(info) = reference_class_info_from_set_ref_class(value, text) {
             let generator = name.to_string();
             if let Some(class_name) = info.class_name.clone() {
@@ -12995,6 +13011,7 @@ fn collect_nse_facts<'t>(
             child,
             text,
             local_function_defs,
+            local_callee_shadows,
             data_table_objects,
             non_data_table_objects,
             class_transitions,
@@ -13768,11 +13785,10 @@ fn table_verb_policy(
 /// forwarding, and dots buried deeper in an argument expression
 /// (`summarise(d, across(c(...)))`) are not recognized. A bare callee that is
 /// locally shadowed — by a top-level definition (`local_function_policies`) or
-/// by an entry in `shadows` (function-valued bindings inside the wrapper body,
-/// the wrapper's own formal names, and the formals of every nested closure the
-/// walk descends through) — is skipped entirely, preserving the "local
-/// definition shadows any package / base policy" rule the direct-call resolver
-/// applies.
+/// by an entry in `shadows` (possible function-valued bindings, the wrapper's
+/// own formal names, and the formals of every nested closure the walk descends
+/// through) — is skipped entirely, preserving the "local definition shadows
+/// any package / base policy" rule the direct-call resolver applies.
 ///
 /// Nested function definitions are descended into unless they declare their
 /// own `...` (R's dots are lexical, so `function(...) function() filter(d,
@@ -13868,24 +13884,53 @@ fn positional_dots_splice_suppressed(
     mask[dots_index..dots_index + expansion].iter().any(|s| *s)
 }
 
-/// Collect every name bound to a function definition anywhere inside `node`
-/// (the wrapper body), at any depth. Used by the dots-forwarding inference to
-/// honor body-local shadowing of covered verbs: `function(...) { filter <-
-/// function(x, ...) x; filter(d, ...) }` calls the local standard-eval
-/// `filter`, not dplyr's. Deliberately position-blind (a definition after the
-/// call still disables the upgrade) — erring toward keeping diagnostics.
-fn function_binding_names(node: Node, text: &str, names: &mut HashSet<String>) {
+/// Collect every name bound to a value that may be callable anywhere inside
+/// `node` (the wrapper body), at any depth. Used by the dots-forwarding
+/// inference to honor body-local shadowing of covered verbs: `function(...) {
+/// filter <- stats::filter; filter(d, ...) }` calls the local alias, not
+/// dplyr's. Deliberately position-blind (a binding after the call still
+/// disables the upgrade) — erring toward keeping diagnostics.
+fn potential_function_binding_names(node: Node, text: &str, names: &mut HashSet<String>) {
     if let Some(target) = assignment_target_node(node)
         && target.kind() == "identifier"
         && let Some(value) = assignment_value_node(node)
-        && unwrap_parenthesized(value).kind() == "function_definition"
+        && value_may_bind_function(unwrap_parenthesized(value), text)
     {
         names.insert(node_text(target, text).to_string());
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        function_binding_names(child, text, names);
+        potential_function_binding_names(child, text, names);
     }
+}
+
+/// True when a binding RHS might produce a callable value. Obvious scalar
+/// literals do not shadow R's function lookup, which skips non-functions in
+/// call position; identifiers, namespace references, calls, and other computed
+/// expressions are treated as possible functions because static syntax cannot
+/// prove otherwise.
+fn value_may_bind_function(value: Node, text: &str) -> bool {
+    let value = unwrap_parenthesized(value);
+    match value.kind() {
+        "float" | "integer" | "complex" | "string" | "true" | "false" | "null" | "na" | "inf"
+        | "nan" => false,
+        "identifier" => !is_reserved_word(node_text(value, text)),
+        "unary_operator" => unary_literal_may_bind_function(value, text),
+        _ => true,
+    }
+}
+
+fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
+    let mut cursor = value.walk();
+    let children = crate::parser_pool::non_extra_children(value, &mut cursor);
+    if children.len() != 2 {
+        return true;
+    }
+    let op = node_text(children[0], text);
+    if !matches!(op, "+" | "-") {
+        return true;
+    }
+    value_may_bind_function(children[1], text)
 }
 
 /// Resolve a `call` node's argument policy by classifying its callee against
@@ -21559,6 +21604,40 @@ mod tests {
         let mut used = Vec::new();
         collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
         assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// A top-level alias of a covered verb to a non-literal function value
+    /// shadows the package policy for the dots-forwarding inference. Raven
+    /// cannot prove the alias is data-masking, so the wrapper's dots stay
+    /// checked.
+    #[test]
+    fn nse_wrapper_top_level_alias_shadow_disables_forwarding() {
+        let code = "filter <- stats::filter\n\
+                    wrap <- function(data, ...) filter(data, ...)\n\
+                    wrap(df, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "forwarding to a locally aliased covered verb must not suppress"
+        );
+    }
+
+    /// Same conservative shadow rule for bindings introduced inside the wrapper
+    /// body: a non-literal local alias hides the package verb before `...` is
+    /// forwarded.
+    #[test]
+    fn nse_wrapper_body_local_alias_shadow_disables_forwarding() {
+        let code = "wrap <- function(data, ...) {\n  filter <- stats::filter\n  filter(data, ...)\n}\n\
+                    wrap(df, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "forwarding to a body-local aliased covered verb must not suppress"
+        );
     }
 
     /// Named call-site arguments map onto the wrapper's formals: the embraced
