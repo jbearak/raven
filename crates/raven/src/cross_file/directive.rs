@@ -181,6 +181,21 @@ pub(crate) const FORWARD_DIRECTIVE_KEYWORDS: &str = "source|run|include";
 /// this is factored out.
 pub(crate) const BACKWARD_DIRECTIVE_KEYWORDS: &str = "sourced-by|run-by|included-by";
 
+/// Prefix alternation accepted by every structural directive family: the
+/// canonical `# raven:` form and the permanent `@lsp-` alias (#421). It is the
+/// regex slice that sits between the `#\s*` comment opener and the keyword
+/// group, e.g. `^\s*#\s*` + `DIRECTIVE_PREFIX` + `(?:source|run|include)`.
+///
+/// Shared — for the same no-drift reason as [`FORWARD_DIRECTIVE_KEYWORDS`] —
+/// across both directive regex sets (the full parser in [`patterns`] and the
+/// path-context matcher in `file_path_intellisense::directive_path_patterns`),
+/// so the two seams cannot disagree about which prefixes are accepted. The
+/// suppression patterns are deliberately *not* built from this const: they keep
+/// separate `@lsp-`/`raven:` regexes because their shapes diverge (e.g.
+/// `@lsp-ignore` permits a trailing `:?`, and the block/file forms exist only
+/// under `raven:`).
+pub(crate) const DIRECTIVE_PREFIX: &str = r"(?:@lsp-|raven:\s*)";
+
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -191,15 +206,18 @@ fn patterns() -> &'static DirectivePatterns {
         // The forward/backward keyword alternations are shared with
         // file_path_intellisense via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS,
         // plugged into the middle of each pattern by concatenation.
-        // Every structural family accepts either prefix via `(?:@lsp-|raven:\s*)`:
-        // `# raven:` is the canonical user-facing form and `@lsp-` a permanent
-        // alias (#421). The keyword groups are disjoint from the suppression
-        // verbs (`ignore`/`expect`), so `# raven: ignore` still routes to the
-        // suppression patterns below and `# raven: source` to `forward`.
+        // Every structural family accepts either prefix via the shared
+        // [`DIRECTIVE_PREFIX`] alternation: `# raven:` is the canonical
+        // user-facing form and `@lsp-` a permanent alias (#421). The keyword
+        // groups are disjoint from the suppression verbs (`ignore`/`expect`),
+        // so `# raven: ignore` still routes to the suppression patterns below
+        // and `# raven: source` to `forward`.
         DirectivePatterns {
             backward: Regex::new(
                 &[
-                    r#"^\s*#\s*(?:@lsp-|raven:\s*)(?:"#,
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     BACKWARD_DIRECTIVE_KEYWORDS,
                     r#")\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?(?:\s+match\s*=\s*["']([^"']+)["'])?"#,
                 ]
@@ -208,7 +226,9 @@ fn patterns() -> &'static DirectivePatterns {
             .unwrap(),
             forward: Regex::new(
                 &[
-                    r#"^\s*#\s*(?:@lsp-|raven:\s*)(?:"#,
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     FORWARD_DIRECTIVE_KEYWORDS,
                     r#")(?:\s+:?\s*|:\s*)(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+line\s*=\s*(\d+|eof|end))?"#,
                 ]
@@ -216,8 +236,14 @@ fn patterns() -> &'static DirectivePatterns {
             )
             .unwrap(),
             working_dir: Regex::new(
-                r#"^\s*#\s*(?:@lsp-|raven:\s*)(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
-            ).unwrap(),
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:working-directory|working-dir|current-directory|current-dir|cd|wd)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
+            )
+            .unwrap(),
             ignore: Regex::new(
                 r"#\s*@lsp-(ignore|expect)(?:\[([^\]]*)\])?\s*:?\s*$"
             ).unwrap(),
@@ -255,14 +281,24 @@ fn patterns() -> &'static DirectivePatterns {
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 1.1, 1.2, 1.3
             declare_var: Regex::new(
-                r#"^\s*#\s*(?:@lsp-|raven:\s*)(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
             ).unwrap(),
             // Declaration directives for functions
             // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
             // Requirements: 2.1, 2.2, 2.3
             declare_func: Regex::new(
-                r#"^\s*#\s*(?:@lsp-|raven:\s*)(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+                ]
+                .concat(),
             ).unwrap(),
         }
     })

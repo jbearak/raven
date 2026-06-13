@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Url};
 use tree_sitter::{Node, Tree};
 
-use crate::cross_file::directive::{BACKWARD_DIRECTIVE_KEYWORDS, FORWARD_DIRECTIVE_KEYWORDS};
+use crate::cross_file::directive::{
+    BACKWARD_DIRECTIVE_KEYWORDS, DIRECTIVE_PREFIX, FORWARD_DIRECTIVE_KEYWORDS,
+};
 use crate::cross_file::path_resolve::PathContext;
 use crate::cross_file::types::{CrossFileMetadata, byte_offset_to_utf16_column};
 use crate::utf16::utf16_column_to_byte_offset;
@@ -1523,13 +1525,14 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
     static PATTERNS: OnceLock<DirectivePathPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         // Patterns match the directive keyword and trailing whitespace/colon.
-        // The keyword alternations are shared verbatim with
-        // cross_file/directive.rs via {FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS so
-        // the recognized keyword set cannot drift between the two regex sets;
-        // they are plugged into the middle of each pattern by concatenation.
-        // Either prefix is accepted: `@lsp-` (the `@` is required) or the
-        // canonical `# raven:` form (#421). Colon after the keyword is optional,
-        // leading whitespace is allowed.
+        // Both the keyword alternations ({FORWARD,BACKWARD}_DIRECTIVE_KEYWORDS)
+        // and the prefix alternation (DIRECTIVE_PREFIX) are shared verbatim with
+        // cross_file/directive.rs so neither the recognized keyword set nor the
+        // accepted prefixes can drift between the two regex sets; they are
+        // plugged into the middle of each pattern by concatenation. Either
+        // prefix is accepted: `@lsp-` (the `@` is required) or the canonical
+        // `# raven:` form (#421). Colon after the keyword is optional, leading
+        // whitespace is allowed.
         // `\u{feff}` in the leading class tolerates a raw BOM on a first-line
         // directive (in-memory text keeps it verbatim); matching against the
         // BOM-bearing line keeps the reported path column client-aligned. #346.
@@ -1539,18 +1542,22 @@ fn directive_path_patterns() -> &'static DirectivePathPatterns {
         DirectivePathPatterns {
             backward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*(?:@lsp-|raven:\s*)(?:"#,
+                    r"^[\s\u{feff}]*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     BACKWARD_DIRECTIVE_KEYWORDS,
-                    r#")(?:\s+:?\s*|:\s*)"#,
+                    r")(?:\s+:?\s*|:\s*)",
                 ]
                 .concat(),
             )
             .unwrap(),
             forward: Regex::new(
                 &[
-                    r#"^[\s\u{feff}]*#\s*(?:@lsp-|raven:\s*)(?:"#,
+                    r"^[\s\u{feff}]*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:",
                     FORWARD_DIRECTIVE_KEYWORDS,
-                    r#")(?:\s+:?\s*|:\s*)"#,
+                    r")(?:\s+:?\s*|:\s*)",
                 ]
                 .concat(),
             )
