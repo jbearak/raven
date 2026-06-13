@@ -340,22 +340,30 @@ fn bench_diagnostics_fanout(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 /// Generate a deterministic, NSE-saturated R document of `blocks` repeated
-/// units. Each unit pulls dplyr/data.table into play, defines a verb-shadowing
-/// local function, binds qualified aliases (standard-eval `stats::filter` and
-/// masking `dplyr::filter`) and opaque callables (`get_filter()`, bare
-/// identifier), then issues bare covered-verb calls and calls through every
-/// alias — so collection records many disjoint definition/alias entries and the
-/// resolver walks every policy branch. Names are unique per block (no
-/// last-binding-wins collapse), and the many undefined references are
-/// intentional: deciding which to suppress is exactly the NSE work being timed.
+/// units. A preamble pulls dplyr/data.table into play and defines a local
+/// function over the covered verb `mutate`, which shadows the package export.
+/// Each unit binds qualified aliases (standard-eval `stats::filter` and masking
+/// `dplyr::filter`) and opaque callables (`get_filter()`, a bare identifier),
+/// then **calls** bare covered verbs, the shadowing local def, and every alias —
+/// so the resolver walks each branch of `resolve_call_arg_policy`: the
+/// local-definition shadow (`mutate(...)`), the qualified-target policy
+/// (`std_filter`/`masked_filter`), the opaque `Unknown` suppression (`opaque`,
+/// `ref`), and the built-in package policy (the bare verbs). Alias/def names are
+/// unique per block (no last-binding-wins collapse) so collection records many
+/// disjoint entries; the many undefined references are intentional — deciding
+/// which to suppress is exactly the NSE work being timed.
 fn generate_nse_dense_file(blocks: usize) -> String {
     use std::fmt::Write;
-    let mut content = String::from("library(dplyr)\nlibrary(data.table)\n\n");
+    // The shadowing def lives in the preamble: `mutate` is a single top-level
+    // binding (R semantics), but the per-block `mutate(...)` calls below drive
+    // the local-definition branch on every iteration.
+    let mut content = String::from(
+        "library(dplyr)\nlibrary(data.table)\nmutate <- function(data, expr) data\n\n",
+    );
     for i in 0..blocks {
         write!(
             content,
-            "mutate_helper_{i} <- function(x, y) x + y\n\
-             std_filter_{i} <- stats::filter\n\
+            "std_filter_{i} <- stats::filter\n\
              masked_filter_{i} <- dplyr::filter\n\
              opaque_{i} <- get_filter()\n\
              ref_{i} <- some_fn\n\
@@ -366,6 +374,7 @@ fn generate_nse_dense_file(blocks: usize) -> String {
              res_e_{i} <- std_filter_{i}(df_{i}, typo_{i})\n\
              res_f_{i} <- masked_filter_{i}(df_{i}, col_{i})\n\
              res_g_{i} <- opaque_{i}(df_{i}, arg_{i})\n\
+             res_h_{i} <- ref_{i}(df_{i}, more_{i})\n\
              dt_{i} <- data.table(a_{i} = 1, b_{i} = 2)\n\
              dt_{i}[value_{i} > 1, sum(x_{i}), by = grp_{i}]\n\n",
         )
