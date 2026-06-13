@@ -1926,6 +1926,16 @@ mod tests {
     }
 
     #[test]
+    fn plural_capture_helpers_recognized() {
+        for name in ["enquos", "enexprs", "ensyms"] {
+            assert!(is_plural_capture_helper(name));
+        }
+        for name in ["quos", "exprs", "syms", "enquo", "substitute"] {
+            assert!(!is_plural_capture_helper(name));
+        }
+    }
+
+    #[test]
     fn per_formal_named_arg_for_captured_formal_is_suppressed() {
         // f(env = typo_env, expr = col) for substitute-like (expr captured):
         // expr named -> suppressed; env named -> checked.
