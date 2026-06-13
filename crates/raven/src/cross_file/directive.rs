@@ -171,7 +171,9 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 /// positional matching. Defaults containing commas or `)` (e.g. `x = c(1, 2)`)
 /// are out of scope — the surrounding regex captures only up to the first `)`,
 /// and the comma split would mis-segment them — but simple literal defaults
-/// (`= NULL`, `= TRUE`, `= 10`) are handled.
+/// (`= NULL`, `= TRUE`, `= 10`) are handled. Entries that are not syntactic R
+/// names (e.g. the `2` left over from a mis-segmented `c(1, 2)` default) are
+/// dropped via [`is_formal_name`] rather than recorded as bogus formals.
 fn split_formal_list(body: &str) -> Option<Vec<String>> {
     let names: Vec<String> = body
         .split(',')
@@ -181,9 +183,25 @@ fn split_formal_list(body: &str) -> Option<Vec<String>> {
                 .trim()
                 .to_string()
         })
-        .filter(|s| !s.is_empty())
+        .filter(|s| is_formal_name(s))
         .collect();
     if names.is_empty() { None } else { Some(names) }
+}
+
+/// Whether `s` is a syntactic R formal name: the dots `...`, or an identifier
+/// starting with a letter or `.` followed by name characters (`[A-Za-z0-9._]`).
+/// Used to discard non-name tokens that fall out of a mis-segmented default
+/// (a bare number, `c(1`, etc.) instead of treating them as formals.
+fn is_formal_name(s: &str) -> bool {
+    if s == "..." {
+        return true;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '.' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
 }
 
 /// Keyword alternation for forward source directives: `@lsp-source`, `@lsp-run`,
@@ -319,25 +337,39 @@ fn patterns() -> &'static DirectivePatterns {
             // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
             // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted, 4=optional formal list body
             // Requirements: 2.1, 2.2, 2.3
+            //
+            // The unquoted name accepts a bare `name` or a single well-formed
+            // `pkg::name` qualifier only — the same shape as the `nse` directive
+            // below — so a malformed `pkg:::name` / `::name` / `a:b` cannot be
+            // stored as a stray-colon symbol that `declared_name_matches`'
+            // `rsplit_once("::")` would later mis-pair. A name with characters
+            // outside `[A-Za-z0-9._]` (operators, replacement functions, spaces)
+            // must use the quoted form.
             declare_func: Regex::new(
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:]+))(?:\s*\(([^)]*)\))?"#,
+                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))(?:\s*\(([^)]*)\))?"#,
                 ]
                 .concat(),
             ).unwrap(),
             // NSE contract directive: `# raven: nse [pkg::]name[(formals…)]`
             // Group 1: qualified or bare name (e.g. "my_func" or "pkg::my_func")
             // Group 2: optional formal list body (text between `(` and `)`)
-            // A trailing `# comment` is tolerated (parity with func/var, which
-            // are not end-anchored), but an unclosed `(` still fails to match so
-            // a malformed payload is ignored rather than blanket-suppressing.
+            //
+            // A separator (whitespace or `:`) is REQUIRED after the `nse`
+            // keyword, so a run-together `nseg(col)` is not misread as a
+            // declaration for callee `g`. The pattern is end-anchored (only an
+            // optional trailing `# comment` may follow): an unclosed `(` or any
+            // unexpected trailing text fails to match, so a malformed payload is
+            // ignored rather than producing a partial/blanket suppression. This
+            // is intentionally stricter than the `func`/`var` directives, which
+            // match a prefix and silently ignore trailing tokens.
             nse: Regex::new(
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"nse\s*:?\s*([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
+                    r#"nse(?:\s+|\s*:\s*)([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?)\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
                 ]
                 .concat(),
             ).unwrap(),
@@ -2334,6 +2366,66 @@ x <- undefined"#;
         assert_eq!(
             meta.declared_functions[0].formals,
             Some(vec!["data".to_string(), "x".to_string(), "n".to_string()])
+        );
+    }
+
+    #[test]
+    fn nse_requires_separator_after_keyword() {
+        // Without a separator, `nse` run together with a name must NOT be read
+        // as a declaration for a truncated callee (`nseg(col)` -> `g`).
+        for line in ["# raven: nseg(col)", "# raven: nse_helper(x)"] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert!(meta.nse_declarations.is_empty(), "case: {line}");
+        }
+        // A real separator (space or colon) still parses.
+        for line in ["# raven: nse my_func(x)", "# raven: nse:my_func(x)"] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert_eq!(meta.nse_declarations.len(), 1, "case: {line}");
+            assert_eq!(meta.nse_declarations[0].name, "my_func", "case: {line}");
+        }
+    }
+
+    #[test]
+    fn func_rejects_malformed_namespace_qualifier() {
+        // A stray-colon name (`pkg:::name`) must not be stored as a
+        // mis-splittable symbol that `declared_name_matches`' rsplit_once("::")
+        // would later mis-pair against a well-formed `# raven: nse pkg::name`.
+        let meta = parse_directives("# raven: func pkg:::my_func(x)\n");
+        assert!(
+            !meta
+                .declared_functions
+                .iter()
+                .any(|d| d.name.contains(":::")),
+            "stray-colon name stored: {:?}",
+            meta.declared_functions
+        );
+        // A leading `::name` has no valid bare name and is dropped entirely.
+        let meta = parse_directives("# raven: func ::my_func(x)\n");
+        assert!(meta.declared_functions.is_empty());
+        // A well-formed qualified name is still captured whole, with formals.
+        let meta = parse_directives("# raven: func pkg::my_func(a, b)\n");
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "pkg::my_func");
+        assert_eq!(
+            meta.declared_functions[0].formals,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn func_default_with_comma_drops_bogus_formal() {
+        // A default containing a comma/parens is out of scope (the regex
+        // captures only up to the first `)`), but the leftover token must be
+        // dropped rather than recorded as a bogus formal name like `2`.
+        let meta = parse_directives("# raven: func f(a, x = c(1, 2), y)\n");
+        let formals = meta.declared_functions[0].formals.clone().unwrap();
+        assert!(
+            !formals.iter().any(|f| f == "2"),
+            "bogus formal recorded: {formals:?}"
+        );
+        assert!(
+            formals.iter().all(|f| is_formal_name(f)),
+            "non-name formal recorded: {formals:?}"
         );
     }
 }

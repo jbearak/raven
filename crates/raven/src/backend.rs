@@ -5696,6 +5696,12 @@ impl LanguageServer for Backend {
             .package_library_ready
             .then(|| state.package_library.base_exports().as_ref());
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        // Several undefined identifiers in one call's positional argument list
+        // (e.g. `f(undef_a, undef_b)`) resolve to the same quick-fix — identical
+        // insert line and directive text — so dedupe to avoid duplicate
+        // lightbulb entries. Two calls on different lines keep distinct insert
+        // lines and so are not collapsed.
+        let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
         for diag in &params.context.diagnostics {
             let is_undef = matches!(
                 &diag.code,
@@ -5712,6 +5718,9 @@ impl LanguageServer for Backend {
                 continue;
             };
             if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {
+                if !seen.insert((fix.insert_line, fix.text.clone())) {
+                    continue;
+                }
                 let edit = TextEdit {
                     range: Range {
                         start: Position::new(fix.insert_line, 0),
@@ -12158,6 +12167,66 @@ lineLength = 200
             edits.is_none() || edits.as_ref().is_some_and(|e| e.is_empty()),
             "on_type_formatting must be inert on a prose line, got {:?}",
             edits
+        );
+    }
+
+    /// Issue #455: two undefined positional arguments in one call resolve to the
+    /// same NSE quick-fix (identical insert line and directive text); the
+    /// code-action handler must offer it once, not once per diagnostic. The
+    /// diagnostics are synthesized so the test targets the handler's dedup,
+    /// not the upstream diagnostic-production pipeline.
+    #[tokio::test]
+    async fn code_action_dedupes_identical_nse_quick_fixes() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // `my_fn(undef_a, undef_b)` on line 1: `undef_a` at cols 6-13,
+        // `undef_b` at cols 15-22. Both are positional args of the local
+        // (non-builtin) `my_fn`, so each maps to `# raven: nse my_fn(<formal>)`.
+        let content = "my_fn <- function(a, b) a\nmy_fn(undef_a, undef_b)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = |start_char: u32, end_char: u32| Diagnostic {
+            range: Range {
+                start: Position::new(1, start_char),
+                end: Position::new(1, end_char),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef(6, 13), undef(15, 22)],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .expect("some actions");
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 1,
+            "duplicate NSE quick-fixes must be deduped: {actions:?}"
         );
     }
 

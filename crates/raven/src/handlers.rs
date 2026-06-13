@@ -13014,6 +13014,18 @@ impl<'a> NseAnalysis<'a> {
                         decl.package.as_deref(),
                     )
                     .or_else(|| {
+                        // Only a *bare* `# raven: nse name` may borrow a visible
+                        // local `name <- function(...)`'s signature. A qualified
+                        // `# raven: nse pkg::name` must NOT: `local_function_defs`
+                        // is keyed by bare name, so an unrelated local `name`
+                        // that merely shares the suffix would supply the wrong
+                        // formal order and invert which positionals are
+                        // suppressed. With no matching `# raven: func`, a
+                        // qualified declaration falls through to the named-only
+                        // `None` arm below.
+                        if decl.package.is_some() {
+                            return None;
+                        }
                         local_function_defs
                             .get(&decl.name)
                             .map(|def| function_formal_names(*def, text))
@@ -13021,9 +13033,22 @@ impl<'a> NseAnalysis<'a> {
                     });
                     match order {
                         Some(mut formals) => {
-                            for c in &captured {
-                                if !formals.contains(c) {
-                                    formals.push(c.clone());
+                            // Captured names absent from the resolved formal
+                            // order (an incomplete `# raven: func` list, or a
+                            // name only ever passed by keyword) may be matched by
+                            // NAME but must never bind a positional slot —
+                            // otherwise a positional argument beyond the real
+                            // arity would bind the synthetic formal and be
+                            // wrongly suppressed. Place them after a `...`
+                            // boundary so the positional pass stops before them.
+                            if captured.iter().any(|c| !formals.contains(c)) {
+                                if !formals.iter().any(|f| f == "...") {
+                                    formals.push("...".to_string());
+                                }
+                                for c in &captured {
+                                    if !formals.contains(c) {
+                                        formals.push(c.clone());
+                                    }
                                 }
                             }
                             crate::nse::ArgPolicy::PerFormal {
@@ -14242,13 +14267,15 @@ fn nse_hint_for_usage<'t>(
     text: &'t str,
     analysis: &NseAnalysis<'_>,
 ) -> Option<(String, Option<String>)> {
-    let (_call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    // Suppress the hint for high-confidence standard-eval builtins and base
-    // exports (paste, c, print, …). Filter on the bare suffix so a qualified
-    // `base::paste(...)` is recognized too, while the returned `callee` keeps
-    // the qualifier for the suggested directive.
+    let (_call, callee, formal) = nse_eligible_call_arg(usage_node, text, analysis.base_exports)?;
+    // Discoverability only: once the user has written ANY `# raven: nse`
+    // directive for this callee, they know the feature exists and have chosen
+    // which arguments are captured. A surviving diagnostic on a *non*-captured
+    // argument is then intentional, so urging them to "declare it" would be
+    // redundant and contradict their own directive. (Keyed on the bare suffix,
+    // matching how `directive_nse` is keyed.)
     let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
-    if is_builtin(bare) || analysis.base_exports.is_some_and(|e| e.contains(bare)) {
+    if analysis.directive_nse.contains_key(bare) {
         return None;
     }
     Some((callee, formal))
@@ -14269,6 +14296,16 @@ fn enclosing_call_arg_context<'t>(
     usage_node: Node<'t>,
     text: &'t str,
 ) -> Option<(Node<'t>, String, Option<String>)> {
+    // An identifier in callee position — the `function` child of a call, e.g.
+    // `undefined_fn` in `g(undefined_fn(x))` — is an (undefined) function name,
+    // not an NSE-captured argument. Climbing from it would resolve the *outer*
+    // call and wrongly suggest `# raven: nse g(...)`, so bail before climbing.
+    if let Some(parent) = usage_node.parent()
+        && parent.kind() == "call"
+        && parent.child_by_field_name("function") == Some(usage_node)
+    {
+        return None;
+    }
     let mut cur = usage_node;
     let arg = loop {
         let parent = cur.parent()?;
@@ -14295,6 +14332,28 @@ fn enclosing_call_arg_context<'t>(
     Some((call, callee, formal))
 }
 
+/// The eligible NSE call-argument context for `usage_node`, shared by the
+/// diagnostic hint ([`nse_hint_for_usage`]) and the code-action quick-fix
+/// ([`nse_quick_fix_edit`]) so the two cannot drift on what counts as an NSE
+/// candidate. Returns the enclosing `call`, the callee name (qualified for a
+/// `pkg::name` call), and the matched formal name (named arguments only) — or
+/// `None` when the usage is not a candidate: top-level, callee position, or a
+/// high-confidence standard-eval builtin / base export. The builtin/base filter
+/// matches on the bare suffix (so a qualified `base::paste(...)` is caught)
+/// while the returned `callee` keeps its qualifier for the suggested directive.
+fn nse_eligible_call_arg<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+    base_exports: Option<&HashSet<String>>,
+) -> Option<(Node<'t>, String, Option<String>)> {
+    let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
+    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
+    if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
+        return None;
+    }
+    Some((call, callee, formal))
+}
+
 /// A quick-fix edit that declares an NSE contract for the call surrounding an
 /// undefined identifier. `insert_line` is the 0-based line to insert before;
 /// `text` is the directive line (with trailing newline and matching indent).
@@ -14317,13 +14376,7 @@ pub(crate) fn nse_quick_fix_edit(
     text: &str,
     base_exports: Option<&HashSet<String>>,
 ) -> Option<NseQuickFix> {
-    let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    // Filter on the bare suffix (so a qualified `base::paste(...)` is caught),
-    // while the suggested directive below keeps the qualifier from `callee`.
-    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
-    if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
-        return None;
-    }
+    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, base_exports)?;
     let insert_line = call.start_position().row as u32;
     let indent: String = text
         .lines()
@@ -54709,9 +54762,10 @@ mod function_parameter_tests {
     }
 
     /// Collect the names reported as "Undefined variable: <name>" for `code`.
-    /// Extracts only the bare identifier (text up to the first space, period,
-    /// or end of string), so the result is stable even when the message has a
-    /// trailing hint (e.g. ". If `f()` captures …").
+    /// Extracts just the bare identifier, stripping the optional
+    /// " (defined later …)" forward-reference note and the optional
+    /// ". If `f()` captures …" NSE hint, so the result is stable while
+    /// preserving dotted R identifiers like `my.var` intact.
     fn undefined_variable_names(code: &str) -> Vec<String> {
         let mut state = create_test_state();
         let uri = add_document(&mut state, "file:///test.R", code);
@@ -54736,12 +54790,27 @@ mod function_parameter_tests {
             .iter()
             .filter_map(|d| {
                 d.message.strip_prefix("Undefined variable: ").map(|rest| {
-                    // Take only the identifier: stop at space, period, or
-                    // the parenthesized forward-reference note.
-                    rest.split([' ', '.']).next().unwrap_or(rest).to_string()
+                    // Strip the optional " (defined later …)" forward-ref note
+                    // and the optional ". If `f()` captures …" NSE hint, leaving
+                    // the bare name. A `.split('.')` would truncate dotted R
+                    // identifiers (`my.var` -> `my`).
+                    let rest = rest.split(" (defined later").next().unwrap_or(rest);
+                    rest.split(". If `").next().unwrap_or(rest).to_string()
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn undefined_variable_names_preserves_dotted_identifier() {
+        // The helper must return dotted R identifiers intact (regression: a
+        // bare `.split('.')` truncated `my.var` to `my`, masking dotted-name
+        // diagnostics and any future test that asserts on them).
+        let names = undefined_variable_names("f <- function(a) a\nf(my.var)\n");
+        assert!(
+            names.iter().any(|n| n == "my.var"),
+            "dotted name truncated: {names:?}"
+        );
     }
 
     // Issues #404 / #410: `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
@@ -57298,6 +57367,69 @@ my_func <- function(a = default_value) {
         }
     }
 
+    #[test]
+    fn undefined_callee_in_nested_call_has_no_hint() {
+        // `undefined_fn` is the callee of the inner call, not an NSE-captured
+        // argument of `g(...)`. Its diagnostic must not suggest declaring NSE
+        // on the outer call.
+        let diags = collect_undefined_messages("g <- function(a) a\ng(undefined_fn(1))\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undefined_fn"))
+            .expect("undefined_fn flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "callee-position identifier gets no NSE hint: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_suppressed_when_directive_covers_callee() {
+        // With `# raven: nse my_func(y)` already in effect, a surviving
+        // diagnostic on a non-captured argument is intentional — the message
+        // must not redundantly suggest declaring NSE for the same callee.
+        let diags = collect_undefined_messages(
+            "my_func <- function(x, y, z) x\n# raven: nse my_func(y)\nmy_func(p1, masked_y, p3)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: p1"))
+            .expect("p1 flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "no redundant hint when a directive already covers the callee: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_captured_name_absent_from_formals_keeps_extra_positional_checked() {
+        // `# raven: nse my_func(x)` names `x`, not a formal of `function(a, b)`.
+        // A third positional beyond the real arity must still be checked, not
+        // bound to a synthetic `x` slot and suppressed.
+        let diags = collect_undefined_messages(
+            "my_func <- function(a, b) a\n# raven: nse my_func(x)\nmy_func(p_a, p_b, third_undef)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("third_undef")),
+            "extra positional must still be flagged; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_nse_does_not_borrow_unrelated_local_formals() {
+        // `# raven: nse pkg::my_func(masked)` is qualified; a local `my_func`
+        // sharing only the bare name must not supply its formal order. With no
+        // `# raven: func`, the qualified directive uses named-only matching, so
+        // a positional argument to the qualified call is still checked.
+        let diags = collect_undefined_messages(
+            "my_func <- function(masked, real) masked\n# raven: nse pkg::my_func(masked)\npkg::my_func(undef_arg)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("undef_arg")),
+            "qualified-call positional must be checked, not suppressed via an unrelated local; got {diags:?}"
+        );
+    }
+
     /// Find the first `identifier` node named `name` anywhere in the tree, so the
     /// quick-fix tests can pass the exact node the production handler resolves
     /// from the diagnostic range via `descendant_for_point_range`.
@@ -57350,6 +57482,16 @@ my_func <- function(a = default_value) {
         let src = "x + 1\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "x");
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_callee_position() {
+        // The undefined identifier is the callee of the inner call, not an
+        // argument of `g(...)` — no NSE quick-fix should be offered.
+        let src = "g(undefined_fn(1))\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_fn");
         assert!(super::nse_quick_fix_edit(node, src, None).is_none());
     }
 
