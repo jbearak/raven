@@ -6237,12 +6237,17 @@ fn collect_undefined_variables_from_snapshot(
             None => format!("Undefined variable: {}", name),
         };
         if let Some((callee, formal)) = nse_hint_for_usage(usage_node, text, &nse_analysis) {
+            // The call is described by the source callee (`callee`, which keeps
+            // backticks for a non-syntactic name); the suggested directive uses
+            // the directive spelling (`dir`, which quotes a non-syntactic name)
+            // so the user can copy it verbatim.
+            let dir = callee_directive_form(&callee);
             match formal {
                 Some(f) => message.push_str(&format!(
-                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: nse {callee}({f})`"
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: nse {dir}({f})`"
                 )),
                 None => message.push_str(&format!(
-                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: func {callee}(<formals>)` and `# raven: nse {callee}(<nse-formals>)`"
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: func {dir}(<formals>)` and `# raven: nse {dir}(<nse-formals>)`"
                 )),
             }
         }
@@ -14293,6 +14298,24 @@ pub(crate) fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Render a source callee — `name`, `pkg::name`, or a backtick-quoted
+/// non-syntactic name (`` `my fn` `` as it appears in code) — in the spelling to
+/// WRITE in a `# raven: nse`/`func` directive: a backtick-quoted bare name
+/// becomes the double-quoted form (`"my fn"`) so a suggested directive parses.
+/// Internal lookup keys keep the raw (backtick) form — only user-facing
+/// suggestions are converted.
+fn callee_directive_form(callee: &str) -> String {
+    let (pkg, bare) = split_callee_qualifier(callee);
+    let bare = match bare.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        Some(inner) => format!("\"{inner}\""),
+        None => bare.to_string(),
+    };
+    match pkg {
+        Some(p) => format!("{p}::{bare}"),
+        None => bare,
+    }
+}
+
 /// If `usage_node` (an undefined identifier) sits inside a call argument whose
 /// callee is a *plausible* NSE boundary (not a high-confidence standard-eval
 /// builtin or base export), return the callee name and the matched formal name
@@ -14435,11 +14458,15 @@ pub(crate) fn nse_quick_fix_edit(
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    // Build the directive body once and reuse it for the inserted text and the
-    // action title so the two cannot spell the directive differently.
+    // The inserted directive uses the directive spelling (a non-syntactic
+    // backtick callee becomes the quoted form) so the fix parses; the raw
+    // `callee` is retained on the struct for the directive-governs lookup, which
+    // keys on the source callee text. Build the body once so the inserted text
+    // and the action title can't spell the directive differently.
+    let dir = callee_directive_form(&callee);
     let payload = match &formal {
-        Some(f) => format!("{callee}({f})"),
-        None => format!("{callee}(<formal>)"),
+        Some(f) => format!("{dir}({f})"),
+        None => format!("{dir}(<formal>)"),
     };
     let mut title = format!("Declare NSE: # raven: nse {payload}");
     if formal.is_none() {
@@ -57491,6 +57518,26 @@ my_func <- function(a = default_value) {
         assert!(
             d.contains("# raven: nse"),
             "hint must fire when the only directive is declared after the call: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_quoted_name_governs_backtick_call() {
+        // End-to-end: a quoted-name directive must actually govern the matching
+        // backtick call. The directive stores the name backtick-wrapped so it
+        // aligns with the call-site callee text; the local def supplies formal
+        // order. `masked_x` (captured `x`) is suppressed; `real_a` (formal `a`,
+        // not captured) is still flagged.
+        let diags = collect_undefined_messages(
+            "`my data fn` <- function(a, x) a\n# raven: nse \"my data fn\"(x)\n`my data fn`(real_a, masked_x)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_a")),
+            "non-captured formal `a` must still be flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured formal `x` must be suppressed by the quoted-name directive; got {diags:?}"
         );
     }
 

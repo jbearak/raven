@@ -224,6 +224,22 @@ fn is_well_formed_callee_name(name: &str) -> bool {
     }
 }
 
+/// Store a declared callee `name` (the bare part, never the `pkg::` qualifier)
+/// in the form it appears at a call site. A non-syntactic R name (spaces,
+/// operators, a leading digit, …) must be backtick-quoted in source, so its
+/// tree-sitter `node_text` carries the backticks; a directive captures the name
+/// WITHOUT its quoting delimiters, so we re-add backticks for a non-syntactic
+/// name to keep the stored key aligned with the callee text matched at use
+/// sites (`# raven: nse "my fn"(x)` must govern a `` `my fn`(x) `` call).
+/// Syntactic names are stored bare — they appear without backticks in source.
+fn callee_name_for_match(name: &str) -> String {
+    if is_formal_name(name) {
+        name.to_string()
+    } else {
+        format!("`{name}`")
+    }
+}
+
 /// Keyword alternation for forward source directives: `@lsp-source`, `@lsp-run`,
 /// `@lsp-include` (and their `# raven: source` / `run` / `include` aliases).
 /// This is the inner body of the `(?:@lsp-|raven:\s*)(?:…)` group only — the
@@ -754,6 +770,13 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 if !is_well_formed_callee_name(&name) || unquoted_truncated {
                     continue;
                 }
+                // Store the bare name in call-site form (backtick-wrapped if
+                // non-syntactic) so it matches the callee text at use sites and
+                // pairs with a `# raven: nse` reference written the same way.
+                let name = match name.split_once("::") {
+                    Some((p, n)) => format!("{p}::{}", callee_name_for_match(n)),
+                    None => callee_name_for_match(&name),
+                };
                 log::trace!(
                     "  Parsed function declaration directive at line {}: name='{}'",
                     line_num,
@@ -783,9 +806,11 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 let (package, name) = match raw.split_once("::") {
                     // `is_well_formed_callee_name` guarantees both halves are
                     // non-empty and colon-free, so any `::` split is a valid
-                    // qualifier.
-                    Some((p, n)) => (Some(p.to_string()), n.to_string()),
-                    None => (None, raw),
+                    // qualifier. The bare name is stored in call-site form
+                    // (backtick-wrapped if non-syntactic) so it matches the
+                    // callee text at use sites.
+                    Some((p, n)) => (Some(p.to_string()), callee_name_for_match(n)),
+                    None => (None, callee_name_for_match(&raw)),
                 };
                 // No parentheses (`nse f`) and empty parentheses (`nse f()`)
                 // both mean whole-call NSE — `f()` lists zero captured formals,
@@ -2449,11 +2474,12 @@ x <- undefined"#;
     fn nse_accepts_quoted_nonsyntactic_name() {
         use crate::cross_file::types::NseScope;
         // A callee whose name has characters outside `[A-Za-z0-9._]` (e.g. a
-        // name with spaces, called `` `my fn`(x) ``) uses the quoted form,
-        // mirroring `func`.
+        // name with spaces, called `` `my data fn`(x) ``) uses the quoted form,
+        // mirroring `func`. The name is stored backtick-wrapped so it matches
+        // the call-site callee text.
         let meta = parse_directives("# raven: nse \"my data fn\"(x)\n");
         assert_eq!(meta.nse_declarations.len(), 1);
-        assert_eq!(meta.nse_declarations[0].name, "my data fn");
+        assert_eq!(meta.nse_declarations[0].name, "`my data fn`");
         assert_eq!(meta.nse_declarations[0].package, None);
         assert_eq!(
             meta.nse_declarations[0].scope,
@@ -2462,8 +2488,11 @@ x <- undefined"#;
         // A quoted name with no formals is whole-call.
         let meta = parse_directives("# raven: nse 'my data fn'\n");
         assert_eq!(meta.nse_declarations.len(), 1);
-        assert_eq!(meta.nse_declarations[0].name, "my data fn");
+        assert_eq!(meta.nse_declarations[0].name, "`my data fn`");
         assert_eq!(meta.nse_declarations[0].scope, NseScope::WholeCall);
+        // A quoted syntactic name is stored bare (no backticks needed).
+        let meta = parse_directives("# raven: nse \"my_func\"(x)\n");
+        assert_eq!(meta.nse_declarations[0].name, "my_func");
         // A malformed `::` qualifier is still rejected even when quoted.
         let meta = parse_directives("# raven: nse \"pkg:::x\"(a)\n");
         assert!(meta.nse_declarations.is_empty());
@@ -2514,10 +2543,11 @@ x <- undefined"#;
         );
         // Non-`::` special characters are still accepted via the quoted form,
         // including a lone `:` (a valid backtick-quoted R symbol `` `a:b` ``):
-        // it has no `::` qualifier, so it cannot mis-pair.
+        // it has no `::` qualifier, so it cannot mis-pair. Such names are stored
+        // backtick-wrapped (their call-site form) so they match usages.
         for (line, expected) in [
-            ("# raven: func \"my-helper\"\n", "my-helper"),
-            ("# raven: func \"a:b\"\n", "a:b"),
+            ("# raven: func \"my-helper\"\n", "`my-helper`"),
+            ("# raven: func \"a:b\"\n", "`a:b`"),
         ] {
             let meta = parse_directives(line);
             assert_eq!(meta.declared_functions.len(), 1, "case: {line}");
