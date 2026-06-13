@@ -13041,15 +13041,16 @@ impl<'a> NseAnalysis<'a> {
                             // arity would bind the synthetic formal and be
                             // wrongly suppressed. Place them after a `...`
                             // boundary so the positional pass stops before them.
-                            if captured.iter().any(|c| !formals.contains(c)) {
+                            let missing: Vec<String> = captured
+                                .iter()
+                                .filter(|c| !formals.contains(*c))
+                                .cloned()
+                                .collect();
+                            if !missing.is_empty() {
                                 if !formals.iter().any(|f| f == "...") {
                                     formals.push("...".to_string());
                                 }
-                                for c in &captured {
-                                    if !formals.contains(c) {
-                                        formals.push(c.clone());
-                                    }
-                                }
+                                formals.extend(missing);
                             }
                             crate::nse::ArgPolicy::PerFormal {
                                 formals,
@@ -14256,26 +14257,63 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
     value_may_bind_function(children[1], text)
 }
 
+/// Whether a `# raven: nse` directive already governs a call to a callee with
+/// the given bare name + optional `call_pkg` qualifier at `call_line`.
+/// `entries` are the `(package, declaration-line)` pairs of every directive for
+/// that bare name. A directive governs the call when it is declared before the
+/// call line and its qualifier matches the call's: a bare directive matches a
+/// bare call, and a `pkg::name` directive matches a `pkg::name` call. This
+/// mirrors the package/position gating of [`NseAnalysis::directive_nse_policy`]
+/// and is shared by the discoverability hint and the quick-fix so neither
+/// nags the user to declare NSE they have already declared, and neither
+/// over-suppresses (a bare directive does not silence a `pkg::name` call, and a
+/// directive written after the call does not silence an earlier call).
+pub(crate) fn nse_directive_governs<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, u32)>,
+    call_pkg: Option<&str>,
+    call_line: u32,
+) -> bool {
+    entries
+        .into_iter()
+        .any(|(pkg, line)| line < call_line && pkg == call_pkg)
+}
+
+/// Split a callee name (`name` or `pkg::name`) into `(package, bare name)`.
+fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
+    match callee.split_once("::") {
+        Some((p, n)) => (Some(p), n),
+        None => (None, callee),
+    }
+}
+
 /// If `usage_node` (an undefined identifier) sits inside a call argument whose
 /// callee is a *plausible* NSE boundary (not a high-confidence standard-eval
 /// builtin or base export), return the callee name and the matched formal name
 /// (when the argument is named) so the diagnostic can suggest `# raven: nse`.
 /// Returns `None` when no hint should be shown (top-level usage, builtin
-/// callee, base-export callee, etc.).
+/// callee, base-export callee, or a callee already governed by a directive).
 fn nse_hint_for_usage<'t>(
     usage_node: Node<'t>,
     text: &'t str,
     analysis: &NseAnalysis<'_>,
 ) -> Option<(String, Option<String>)> {
-    let (_call, callee, formal) = nse_eligible_call_arg(usage_node, text, analysis.base_exports)?;
-    // Discoverability only: once the user has written ANY `# raven: nse`
-    // directive for this callee, they know the feature exists and have chosen
-    // which arguments are captured. A surviving diagnostic on a *non*-captured
-    // argument is then intentional, so urging them to "declare it" would be
-    // redundant and contradict their own directive. (Keyed on the bare suffix,
-    // matching how `directive_nse` is keyed.)
-    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
-    if analysis.directive_nse.contains_key(bare) {
+    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, analysis.base_exports)?;
+    // Discoverability only: suppress the hint when a `# raven: nse` directive
+    // ALREADY governs this exact call. A surviving diagnostic under a governing
+    // directive is on an argument the user deliberately left uncaptured, so
+    // urging them to "declare it" would contradict their own directive. The
+    // precise package/position match (not a bare-name probe) means a bare
+    // directive never suppresses the hint for a `pkg::name` call, nor does a
+    // directive written after the call suppress it for an earlier call.
+    let call_line = call.start_position().row as u32;
+    let (call_pkg, bare) = split_callee_qualifier(&callee);
+    if analysis.directive_nse.get(bare).is_some_and(|entries| {
+        nse_directive_governs(
+            entries.iter().map(|e| (e.package.as_deref(), e.line)),
+            call_pkg,
+            call_line,
+        )
+    }) {
         return None;
     }
     Some((callee, formal))
@@ -14347,7 +14385,7 @@ fn nse_eligible_call_arg<'t>(
     base_exports: Option<&HashSet<String>>,
 ) -> Option<(Node<'t>, String, Option<String>)> {
     let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    let bare = callee.rsplit("::").next().unwrap_or(callee.as_str());
+    let (_pkg, bare) = split_callee_qualifier(&callee);
     if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
         return None;
     }
@@ -14361,6 +14399,11 @@ pub(crate) struct NseQuickFix {
     pub insert_line: u32,
     pub text: String,
     pub title: String,
+    /// The callee the directive targets (`name` or `pkg::name`). `insert_line`
+    /// doubles as the call line, so the code-action layer can check whether a
+    /// directive already governs the call (via [`nse_directive_governs`]) and
+    /// skip a redundant fix — mirroring the message-hint suppression.
+    pub callee: String,
 }
 
 /// Build a `# raven: nse` quick-fix for the undefined identifier at
@@ -14385,22 +14428,23 @@ pub(crate) fn nse_quick_fix_edit(
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let (payload, title) = match &formal {
-        Some(f) => (
-            format!("{callee}({f})"),
-            format!("Declare NSE: # raven: nse {callee}({f})"),
-        ),
-        None => (
-            format!("{callee}(<formal>)"),
-            format!(
-                "Declare NSE: # raven: nse {callee}(<formal>) (replace <formal> with the captured parameter; pair with `# raven: func` for positional matching)"
-            ),
-        ),
+    // Build the directive body once and reuse it for the inserted text and the
+    // action title so the two cannot spell the directive differently.
+    let payload = match &formal {
+        Some(f) => format!("{callee}({f})"),
+        None => format!("{callee}(<formal>)"),
     };
+    let mut title = format!("Declare NSE: # raven: nse {payload}");
+    if formal.is_none() {
+        title.push_str(
+            " (replace <formal> with the captured parameter; pair with `# raven: func` for positional matching)",
+        );
+    }
     Some(NseQuickFix {
         insert_line,
         text: format!("{indent}# raven: nse {payload}\n"),
         title,
+        callee,
     })
 }
 
@@ -57398,6 +57442,39 @@ my_func <- function(a = default_value) {
         assert!(
             !d.contains("# raven: nse"),
             "no redundant hint when a directive already covers the callee: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_fires_for_qualified_call_with_only_bare_directive() {
+        // A bare `# raven: nse foo(x)` does NOT govern a `pkg::foo(...)` call,
+        // so the hint must still fire for the qualified call's undefined arg
+        // (the suppression is package-aware, not a bare-name probe).
+        let diags = collect_undefined_messages("# raven: nse foo(x)\notherpkg::foo(undef_arg)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "qualified-call hint must fire despite an unrelated bare directive: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_fires_when_directive_is_after_the_call() {
+        // A directive written AFTER the call does not govern it, so the hint
+        // must still fire on the earlier call (suppression is position-aware).
+        let diags = collect_undefined_messages(
+            "my_func <- function(a) a\nmy_func(undef_arg)\n# raven: nse my_func\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "hint must fire when the only directive is declared after the call: {d}"
         );
     }
 

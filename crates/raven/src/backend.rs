@@ -5702,6 +5702,20 @@ impl LanguageServer for Backend {
         // lightbulb entries. Two calls on different lines keep distinct insert
         // lines and so are not collapsed.
         let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
+        // The `# raven: nse` declarations in this document, parsed once, so the
+        // quick-fix can be skipped when a directive already governs the call —
+        // mirroring `nse_hint_for_usage`'s suppression so the message hint and
+        // the lightbulb action stay in lockstep. Only parsed when an undefined
+        // diagnostic is actually present.
+        let has_undef = params.context.diagnostics.iter().any(|d| {
+            matches!(&d.code, Some(NumberOrString::String(c))
+                if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
+        });
+        let nse_decls = if has_undef {
+            crate::cross_file::directive::parse_directives(&text).nse_declarations
+        } else {
+            Vec::new()
+        };
         for diag in &params.context.diagnostics {
             let is_undef = matches!(
                 &diag.code,
@@ -5718,6 +5732,23 @@ impl LanguageServer for Backend {
                 continue;
             };
             if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {
+                // Skip when a directive already governs this call: the user has
+                // declared NSE for the callee, so offering to (re)declare it
+                // would insert a conflicting directive.
+                let (call_pkg, bare) = match fix.callee.split_once("::") {
+                    Some((p, n)) => (Some(p), n),
+                    None => (None, fix.callee.as_str()),
+                };
+                if handlers::nse_directive_governs(
+                    nse_decls
+                        .iter()
+                        .filter(|d| d.name == bare)
+                        .map(|d| (d.package.as_deref(), d.line)),
+                    call_pkg,
+                    fix.insert_line,
+                ) {
+                    continue;
+                }
                 if !seen.insert((fix.insert_line, fix.text.clone())) {
                     continue;
                 }
@@ -12227,6 +12258,62 @@ lineLength = 200
         assert_eq!(
             nse_actions, 1,
             "duplicate NSE quick-fixes must be deduped: {actions:?}"
+        );
+    }
+
+    /// Issue #455: when a `# raven: nse` directive already governs the call, the
+    /// code-action must NOT offer a redundant "Declare NSE" quick-fix (it would
+    /// insert a conflicting directive) — mirroring the message-hint suppression.
+    #[tokio::test]
+    async fn code_action_skips_quick_fix_when_directive_governs() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Line 0: def; line 1: directive; line 2: call. `p1` (the non-captured
+        // first positional) at cols 8-10 of line 2.
+        let content = "my_func <- function(x, y) x\n# raven: nse my_func(y)\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_p1 = Diagnostic {
+            range: Range {
+                start: Position::new(2, 8),
+                end: Position::new(2, 10),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_p1],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "no quick-fix when a directive already governs the call: {actions:?}"
         );
     }
 

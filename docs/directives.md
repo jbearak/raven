@@ -153,10 +153,10 @@ Declaration directives work in any R file, whether or not it participates in cro
 # raven: func my_func(data, x, y)        # declares existence + formal order
 # raven: func my_func(data, x = NULL)    # defaults are stripped → data, x
 # raven: func pkg::my_func(data, x)      # qualified form
-# raven: func "make.names"               # quote non-syntactic names
+# raven: func "%+%"                      # quote non-syntactic names (operators, etc.)
 ```
 
-The unquoted name accepts a bare `name` or a single `pkg::name` qualifier; a name containing characters outside `[A-Za-z0-9._]` (operators, replacement functions, spaces) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
+The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — including dotted names like `make.names`, since `.` is a normal identifier character in R. Only a name containing characters *outside* `[A-Za-z0-9._]` (operators like `%+%`, replacement functions like `` `dim<-` ``, or names with spaces) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
 
 ### NSE Declarations
 
