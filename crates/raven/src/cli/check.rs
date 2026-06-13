@@ -1627,6 +1627,38 @@ mod tests {
         assert_eq!(run_blocking(base_args(tmp.path())), EXIT_LINT_FAILED);
     }
 
+    /// Issue #433 acceptance criteria on the `raven check` surface: the
+    /// tidy-eval wrapper repro produces no undefined-variable diagnostic,
+    /// while a bare-symbol argument to a non-forwarding function still fails.
+    ///
+    /// The unqualified `filter` (no `library(dplyr)`) is deliberate — it is
+    /// the issue's repro verbatim, and it pins the callee-blind embrace
+    /// design: a bare `filter` resolves standard-eval through the builtin
+    /// registry, so a covered-verb-position requirement would regress this.
+    #[test]
+    fn wrapper_mask_forwarding_passes_check() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("wrapper.R"),
+            "df <- data.frame(x = 1:5)\n\
+             my_filter <- function(data, cond) filter(data, {{ cond }})\n\
+             my_filter(df, x > 2)\n",
+        )
+        .unwrap();
+        assert_eq!(run_blocking(base_args(tmp.path())), EXIT_OK);
+    }
+
+    #[test]
+    fn non_forwarding_function_argument_fails_check() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("plain.R"),
+            "f <- function(x) x\nf(undefined_sym)\n",
+        )
+        .unwrap();
+        assert_eq!(run_blocking(base_args(tmp.path())), EXIT_LINT_FAILED);
+    }
+
     #[test]
     fn reports_undefined_symbol_from_attached_package() {
         // Regression (#8): editor/CI parity. When an installed package is
