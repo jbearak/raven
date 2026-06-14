@@ -16,7 +16,7 @@
 2. **Semantics.**
    - No parens → `ArgPolicy::WholeCall` for that callee.
    - `name(x, y)` → per-formal: suppress args bound to `x`/`y` only.
-   - Empty parens `name()` → **malformed**, ignored (no blanket suppression).
+   - Empty parens `name()` → `ArgPolicy::WholeCall` (same as no parens; lists zero captured formals, read as whole-call rather than a silent no-op).
 3. **Position-aware.** A declaration on line `L` (0-based) applies only to calls whose start line is `> L` ("from the line after the directive"). The most recent applicable declaration (largest `L < call_line`) for a given callee wins.
 4. **Resolution / precedence.** The directive is an explicit user override and is consulted **first** in `resolve_call_arg_policy` (before local-definition inference). It is authoritative and standalone (does not union with inferred captures).
    - Unqualified directive (`package=None`) matches unqualified calls to that name.

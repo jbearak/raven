@@ -615,6 +615,54 @@ fn extract_function_name_before_paren(line: &str, paren_pos: usize) -> Option<Fu
         return None;
     }
 
+    // Backtick-delimited callee: `` `my fn`( `` or `` pkg::`my fn`( `` (issue
+    // #459). A backtick name may contain ANY character (spaces, operators, even
+    // `::`), so the identifier scanner below would stop at the backtick and miss
+    // it. Scan to the matching opening backtick instead, then apply the same
+    // `canonical_use_name` normalization the AST path uses (a redundantly quoted
+    // syntactic name → bare; a genuinely non-syntactic name keeps its backticks),
+    // so signature help / parameter completion work in the error-recovered path
+    // this fallback exists to cover.
+    if bytes[end - 1] == b'`' {
+        let close = end - 1;
+        let open = line[..close].rfind('`')?; // unmatched backtick → bail
+        let bare = &line[open..end]; // includes both backticks
+        let function_name = crate::r_names::canonical_use_name(bare).to_string();
+
+        // Optional `pkg::` / `pkg:::` qualifier immediately before the open
+        // backtick (identifier chars plus the namespace colons).
+        let mut q = open;
+        while q > 0 {
+            let b = bytes[q - 1];
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' {
+                q -= 1;
+            } else {
+                break;
+            }
+        }
+        let qualifier = &line[q..open];
+        let (namespace, is_internal) = if let Some(ns) = qualifier.strip_suffix(":::") {
+            (ns, true)
+        } else if let Some(ns) = qualifier.strip_suffix("::") {
+            (ns, false)
+        } else if qualifier.is_empty() {
+            ("", false)
+        } else {
+            // Junk between the name and the backtick (not a `::`/`:::` qualifier).
+            return None;
+        };
+        // A written-but-malformed qualifier (empty or with a stray colon) is not
+        // a usable namespace — bail rather than emit a bogus context.
+        if !qualifier.is_empty() && (namespace.is_empty() || namespace.contains(':')) {
+            return None;
+        }
+        return Some(FunctionCallContext {
+            function_name,
+            namespace: (!namespace.is_empty()).then(|| namespace.to_string()),
+            is_internal,
+        });
+    }
+
     // Collect the token: identifier chars and `::` / `:::` namespace qualifiers.
     // R identifiers can contain: letters, digits, `.`, `_`
     let mut start = end;
@@ -1312,6 +1360,23 @@ y <- second(a, )
     }
 
     #[test]
+    fn test_fallback_backtick_callee_incomplete_call() {
+        // Issue #459 (CC2): an error-recovered (unclosed) backtick call must still
+        // resolve through the bracket-heuristic fallback, not just the AST path.
+        // Cursor is just inside the open paren of `` `my fn`( ``.
+        let code = "`my fn`(";
+        let ctx = detect_via_bracket_heuristic(code, Position::new(0, 8));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`my fn`".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
+    #[test]
     fn test_fallback_multiline_string_bailout() {
         // When the cursor is on a line that requires looking at a previous line
         // that ends with an unmatched quote, the heuristic should bail out.
@@ -1430,6 +1495,65 @@ y <- second(a, )
     fn test_extract_function_name_at_pos_0() {
         let ctx = extract_function_name_before_paren("(", 0);
         assert_eq!(ctx, None);
+    }
+
+    // Issue #459 (CC2): the bracket-heuristic fallback must recognize
+    // backtick-delimited callees in the error-recovered path, applying the same
+    // `canonical_use_name` normalization as the AST path.
+    #[test]
+    fn test_extract_function_name_backtick_non_syntactic() {
+        // `` `my fn`( `` — non-syntactic name keeps its required backticks.
+        let ctx = extract_function_name_before_paren("`my fn`(", 7);
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`my fn`".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_function_name_backtick_redundant_is_canonicalized() {
+        // `` `func`( `` — redundantly quoted syntactic name → bare `func`.
+        let ctx = extract_function_name_before_paren("`func`(", 6);
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "func".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_function_name_backtick_qualified() {
+        // `` pkg::`my fn`( `` — qualifier preserved, bare name canonicalized.
+        let ctx = extract_function_name_before_paren("pkg::`my fn`(", 12);
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`my fn`".to_string(),
+                namespace: Some("pkg".to_string()),
+                is_internal: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_function_name_backtick_internal_qualified() {
+        // `` pkg:::`x y`( `` — `:::` qualifier marks an internal reference.
+        let ctx = extract_function_name_before_paren("pkg:::`x y`(", 11);
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`x y`".to_string(),
+                namespace: Some("pkg".to_string()),
+                is_internal: true,
+            })
+        );
     }
 
     #[test]

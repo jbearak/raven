@@ -163,7 +163,8 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 
 /// Split a directive parameter list body (the text between `(` and `)`) into
 /// trimmed, non-empty formal names. Returns `None` when the body has no usable
-/// names (so an empty `()` is treated as malformed by callers).
+/// names (so an empty `()` is treated as whole-call by callers) or when it is
+/// malformed (see below).
 ///
 /// Each comma-separated entry is reduced to its formal *name* by dropping any
 /// `= default` suffix, so a user can paste a real signature
@@ -174,17 +175,32 @@ fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<Stri
 /// (`= NULL`, `= TRUE`, `= 10`) are handled. Entries that are not syntactic R
 /// names (e.g. the `2` left over from a mis-segmented `c(1, 2)` default) are
 /// dropped via [`is_formal_name`] rather than recorded as bogus formals.
+///
+/// A *blank* slot — an empty comma-separated entry (`f(x,,y)`, `f(a,)`) or one
+/// whose name part before `=` is empty (`f(= 5)`) — means the directive is
+/// malformed: returning a partial list would record a wrong formal order or
+/// suppress the wrong argument positions, so the whole list is rejected
+/// (`None`). Callers map that to whole-call NSE / "no declared formals" rather
+/// than an authoritative partial policy. This is distinct from a non-name
+/// *leftover* (the `2)` fragment of a mis-segmented `c(1, 2)` default), which is
+/// still dropped without rejecting the list.
 fn split_formal_list(body: &str) -> Option<Vec<String>> {
-    let names: Vec<String> = body
-        .split(',')
-        .map(|s| {
-            s.split_once('=')
-                .map_or(s, |(name, _)| name)
-                .trim()
-                .to_string()
-        })
-        .filter(|s| is_formal_name(s))
-        .collect();
+    let mut names = Vec::new();
+    for segment in body.split(',') {
+        let name = segment
+            .split_once('=')
+            .map_or(segment, |(name, _)| name)
+            .trim();
+        if name.is_empty() {
+            // Blank slot ⇒ malformed directive; reject the whole list.
+            return None;
+        }
+        if is_formal_name(name) {
+            names.push(name.to_string());
+        }
+        // else: a non-name leftover from a mis-segmented default (`c(1, 2)` →
+        // the `2)` fragment) — drop it, as before, without rejecting the list.
+    }
     if names.is_empty() { None } else { Some(names) }
 }
 
@@ -2461,6 +2477,46 @@ x <- undefined"#;
         assert_eq!(
             meta.nse_declarations[0].scope,
             crate::cross_file::types::NseScope::WholeCall
+        );
+    }
+
+    #[test]
+    fn nse_blank_formal_slot_is_not_a_partial_policy() {
+        use crate::cross_file::types::NseScope;
+        // A blank slot (double comma / trailing comma) is malformed: it must NOT
+        // become an authoritative partial per-formal policy (which could suppress
+        // the wrong argument positions). It falls back to whole-call instead.
+        for line in ["# raven: nse my_func(x,,y)", "# raven: nse my_func(a,)"] {
+            let meta = parse_directives(&format!("{line}\n"));
+            assert_eq!(meta.nse_declarations.len(), 1, "case: {line}");
+            assert_eq!(
+                meta.nse_declarations[0].scope,
+                NseScope::WholeCall,
+                "case: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn func_blank_formal_slot_records_no_formals() {
+        // A blank slot in a func declaration must not record a wrong formal
+        // order; the declaration keeps its existence with no formals (so NSE
+        // matching for it stays named-only).
+        let meta = parse_directives("# raven: func my_func(a,)\n");
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].formals, None);
+    }
+
+    #[test]
+    fn nse_non_name_leftover_drops_not_rejects() {
+        use crate::cross_file::types::NseScope;
+        // A non-name token (`2`) is dropped via `is_formal_name`, NOT treated as a
+        // blank slot that rejects the whole list — so the valid `x` is still kept.
+        let meta = parse_directives("# raven: nse my_func(x, 2)\n");
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["x".to_string()])
         );
     }
 
