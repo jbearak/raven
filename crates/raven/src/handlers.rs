@@ -5657,13 +5657,13 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
 
 /// Foreign `# raven: nse` / `# raven: func` declarations propagated to `uri` from
 /// the files connected to it through the source graph (issue #460).
-pub(crate) struct CrossFileNse {
+struct CrossFileNse {
     /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
-    pub(crate) nse: Vec<crate::cross_file::types::NseDeclaration>,
-    /// Foreign `# raven: func` declarations, collapsed to at most one per `name`
-    /// (so the name+package-keyed `declared_function_formals`, which breaks ties
-    /// by `max_by_key(line)`, never compares lines across files).
-    pub(crate) funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
+    nse: Vec<crate::cross_file::types::NseDeclaration>,
+    /// Foreign `# raven: func` declarations, collapsed to at most one per bare
+    /// name (so `declared_function_formals`, which matches by bare name and
+    /// breaks ties by `max_by_key(line)`, never compares lines across files).
+    funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
 }
 
 /// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
@@ -5682,8 +5682,8 @@ pub(crate) struct CrossFileNse {
 /// sorted-URI order, the first (smallest URI) file to set a key wins, and within
 /// one file the highest-line declaration wins (mirroring the within-file
 /// latest-wins rule, since a foreign file has no call site). This yields at most
-/// one foreign declaration per `(name, package)` (NSE) / `name` (func).
-pub(crate) fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
+/// one foreign declaration per `(name, package)` (NSE) / bare `name` (func).
+fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
     use std::collections::BTreeMap;
 
     let graph = snapshot.cross_file_graph.as_ref();
@@ -5691,10 +5691,15 @@ pub(crate) fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) 
     let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
 
     let ancestors = graph.get_transitive_dependents(uri, max_depth, max_visited);
-    let mut roots: Vec<Url> = ancestors.clone();
-    roots.push(uri.clone());
-    let descendants =
-        graph.get_transitive_dependencies_multi_root(roots.iter(), max_depth, max_visited);
+    // `uri` first matches `compute_affected_dependents_after_edit`'s
+    // `once(edited).chain(ancestors)` convention, so the shared `max_visited`
+    // budget prioritizes the queried file's own subtree (and avoids cloning
+    // `ancestors`, which is reused for `members` below).
+    let descendants = graph.get_transitive_dependencies_multi_root(
+        std::iter::once(uri).chain(ancestors.iter()),
+        max_depth,
+        max_visited,
+    );
 
     let mut members: Vec<Url> = ancestors
         .into_iter()
@@ -5710,6 +5715,12 @@ pub(crate) fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) 
         (String, Option<String>),
         (Url, crate::cross_file::types::NseDeclaration),
     > = BTreeMap::new();
+    // Keyed by the BARE callee name (any `pkg::` stripped) and limited to
+    // declarations that carry formals — exactly what `declared_function_formals`
+    // consumes (it matches by bare name with lenient package, then
+    // `max_by_key(line)`). Collapsing to one entry per bare name guarantees that
+    // lookup never compares `line` across files, and a parens-less `# raven: func`
+    // can never shadow a formal-bearing one for the same name.
     let mut func_chosen: BTreeMap<String, (Url, crate::cross_file::types::DeclaredSymbol)> =
         BTreeMap::new();
     for m in &members {
@@ -5727,11 +5738,15 @@ pub(crate) fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) 
             }
         }
         for d in &meta.declared_functions {
-            match func_chosen.get(&d.name) {
+            if d.formals.is_none() {
+                continue;
+            }
+            let bare = d.name.rsplit_once("::").map_or(d.name.as_str(), |(_, n)| n);
+            match func_chosen.get(bare) {
                 Some((u, _)) if u != m => {}
                 Some((_, existing)) if existing.line >= d.line => {}
                 _ => {
-                    func_chosen.insert(d.name.clone(), (m.clone(), d.clone()));
+                    func_chosen.insert(bare.to_string(), (m.clone(), d.clone()));
                 }
             }
         }
@@ -13003,8 +13018,10 @@ pub(crate) struct NseAnalysis<'a> {
     ///
     /// `# raven: nse` is intentionally a coarse, file-level, name-keyed
     /// authoritative override (see `docs/directives.md`). Apart from the
-    /// position-gating of the directive LINE (`directive_nse_policy` only matches
-    /// declarations before the call line), it is deliberately NOT scope-aware (it
+    /// position-gating of the directive LINE (`own_directive_nse_policy` only
+    /// matches own declarations before the call line; foreign declarations
+    /// propagated from connected files are file-level — issue #460), it is
+    /// deliberately NOT scope-aware (it
     /// governs every call of the name in the file, including nested rebindings),
     /// NOT `library()`-position-aware (a `pkg::` qualifier's in-scope test is
     /// file-wide), and NOT arity/signature-aware (it does not validate captured
@@ -13334,6 +13351,25 @@ impl<'a> NseAnalysis<'a> {
         analysis
     }
 
+    /// Whether a directive entry's package qualifier matches a call's qualifier.
+    /// Shared by the own and foreign lookups so both resolve qualified/bare/in-play
+    /// calls identically:
+    /// - An unqualified directive matches only the `BareExact` pass (the
+    ///   authoritative override); never a qualified call, never the fallback pass.
+    /// - A qualified directive matches a same-package qualified call, or a bare
+    ///   call whose package is in play — the latter only on `BareInPlayQualified`.
+    fn qualifier_matches(&self, entry: &DirectiveNsePolicy, qualifier: &CallQualifier) -> bool {
+        match (&entry.package, qualifier) {
+            (None, CallQualifier::BareExact) => true,
+            (None, _) => false,
+            (Some(p), CallQualifier::Qualified(q)) => p == q,
+            (Some(p), CallQualifier::BareInPlayQualified) => {
+                self.in_play_packages.iter().any(|ip| ip == p)
+            }
+            (Some(_), CallQualifier::BareExact) => false,
+        }
+    }
+
     /// The most recent OWN (current-file) `# raven: nse` policy applicable to a
     /// call to `name` (optionally qualified) at `call_line`. Position-gated to
     /// own declarations strictly before `call_line`; file-level foreign entries
@@ -13348,25 +13384,7 @@ impl<'a> NseAnalysis<'a> {
         entries
             .iter()
             .rev()
-            .find(|e| {
-                !e.file_level
-                    && e.line < call_line
-                    && match (&e.package, &qualifier) {
-                        // An unqualified directive matches only the BareExact
-                        // pass (the authoritative override); never a qualified
-                        // call, never the qualified-fallback pass.
-                        (None, CallQualifier::BareExact) => true,
-                        (None, _) => false,
-                        // A qualified directive matches a same-package qualified
-                        // call, or a bare call whose package is in play — but
-                        // the latter only on the BareInPlayQualified pass.
-                        (Some(p), CallQualifier::Qualified(q)) => p == q,
-                        (Some(p), CallQualifier::BareInPlayQualified) => {
-                            self.in_play_packages.iter().any(|ip| ip == p)
-                        }
-                        (Some(_), CallQualifier::BareExact) => false,
-                    }
-            })
+            .find(|e| !e.file_level && e.line < call_line && self.qualifier_matches(e, &qualifier))
             .map(|e| e.policy.clone())
     }
 
@@ -13384,18 +13402,7 @@ impl<'a> NseAnalysis<'a> {
         let entries = self.directive_nse.get(name)?;
         entries
             .iter()
-            .find(|e| {
-                e.file_level
-                    && match (&e.package, &qualifier) {
-                        (None, CallQualifier::BareExact) => true,
-                        (None, _) => false,
-                        (Some(p), CallQualifier::Qualified(q)) => p == q,
-                        (Some(p), CallQualifier::BareInPlayQualified) => {
-                            self.in_play_packages.iter().any(|ip| ip == p)
-                        }
-                        (Some(_), CallQualifier::BareExact) => false,
-                    }
-            })
+            .find(|e| e.file_level && self.qualifier_matches(e, &qualifier))
             .map(|e| e.policy.clone())
     }
 
@@ -14638,8 +14645,8 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
 ///
 /// Shared by the discoverability hint and the quick-fix so they agree on when
 /// to step aside for a user who has already declared NSE. It deliberately does
-/// NOT model [`NseAnalysis::directive_nse_policy`]'s `BareInPlayQualified` pass
-/// (a `pkg::name` directive governing a *bare* call when `pkg` is in play):
+/// NOT model [`NseAnalysis::own_directive_nse_policy`]'s `BareInPlayQualified`
+/// pass (a `pkg::name` directive governing a *bare* call when `pkg` is in play):
 /// covering that would require the in-play package set here and in the
 /// code-action layer. The omission only ever errs toward *showing* the hint /
 /// offering the quick-fix for such a call — never toward hiding a diagnostic —
@@ -14744,7 +14751,7 @@ fn nse_hint_for_usage<'t>(
 /// For a `package::name` call the callee is the **full qualified** `pkg::name`,
 /// not the bare suffix: the suggested `# raven: nse` directive must carry the
 /// qualifier so it actually matches the qualified call (an unqualified
-/// directive does not — see [`NseAnalysis::directive_nse_policy`]). Callers that
+/// directive does not — see [`NseAnalysis::own_directive_nse_policy`]). Callers that
 /// filter against builtin/base names use the bare suffix.
 fn enclosing_call_arg_context<'t>(
     usage_node: Node<'t>,
@@ -57949,6 +57956,37 @@ my_func <- function(a = default_value) {
         );
     }
 
+    // Issue #460 regression: a formals-bearing `# raven: func` must win the foreign
+    // collapse over a LATER parens-less `# raven: func` of the same name (the
+    // collector skips formals-less entries; `declared_function_formals` filters
+    // `formals.is_some()`, so a max-line collapse would otherwise drop the order).
+    #[test]
+    fn foreign_func_collapse_prefers_formals_bearing_declaration() {
+        let msgs = cross_file_diag_messages(
+            &[
+                // Formals-bearing first, then a parens-less redeclaration on a
+                // higher line.
+                (
+                    "helper.R",
+                    "# raven: func myverb(data, expr)\n# raven: func myverb\n",
+                ),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed — formals-bearing func must win; got {msgs:?}"
+        );
+    }
+
     // B7b: cross-file ordering — the `# raven: func` lives in a connected file and
     // is declared regardless of order relative to the `# raven: nse` directive.
     #[test]
@@ -58208,7 +58246,7 @@ my_func <- function(a = default_value) {
     /// Issue #459: a redundantly backtick-quoted QUALIFIED callee
     /// `` pkg::`my_func`(...) `` must match a qualified `# raven: nse
     /// pkg::my_func(x)` directive. `resolve_call_arg_policy` canonicalizes the
-    /// bare `rhs` component before `directive_nse_policy(..., Qualified(pkg))`,
+    /// bare `rhs` component before `own_directive_nse_policy(..., Qualified(pkg))`,
     /// so the backticks are stripped and the directive's PerFormal policy
     /// applies: the captured `x` is suppressed while the non-captured `y` stays
     /// checked. Without canonicalization the lookup would miss and the call

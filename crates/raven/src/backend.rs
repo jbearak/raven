@@ -5731,28 +5731,28 @@ impl LanguageServer for Backend {
             matches!(&d.code, Some(NumberOrString::String(c))
                 if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
         };
-        // Each entry is `(declaration, file_level)`: own (current-file)
-        // declarations are `false`; foreign declarations propagated from connected
-        // files (issue #460) are `true` and govern regardless of line. Built once
-        // per request, only when an undefined diagnostic is present, so the
-        // lightbulb steps aside in lockstep with the foreign-aware hint.
+        // Own (current-file) `# raven: nse` declarations governing this document
+        // (`file_level = false`). Foreign cross-file declarations (issue #460) are
+        // intentionally NOT collected here: doing so would require building a full
+        // `DiagnosticsSnapshot` (tree clone + metadata deep-clone + neighborhood
+        // BFS) on every code-action request, an expensive UI-path cost for a
+        // presentation-only suppression. The only case foreign awareness would add
+        // is a foreign PER-FORMAL directive whose surviving arg is uncaptured;
+        // there the quick-fix may offer a (harmless, valid) local re-declaration.
+        // The inline hint path stays foreign-aware via the diagnostic snapshot it
+        // already holds (see `nse_hint_for_usage`).
         let nse_decls: Vec<(crate::cross_file::types::NseDeclaration, bool)> =
             if params.context.diagnostics.iter().any(&is_undefined) {
-                let mut v: Vec<_> = state
+                state
                     .get_enriched_metadata(&uri)
                     .map(|m| {
                         m.nse_declarations
                             .iter()
                             .cloned()
                             .map(|d| (d, false))
-                            .collect::<Vec<_>>()
+                            .collect()
                     })
-                    .unwrap_or_default();
-                if let Some(snapshot) = handlers::DiagnosticsSnapshot::build(&state, &uri) {
-                    let foreign = handlers::collect_cross_file_nse(&snapshot, &uri);
-                    v.extend(foreign.nse.into_iter().map(|d| (d, true)));
-                }
-                v
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
