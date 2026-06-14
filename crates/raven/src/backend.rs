@@ -12400,47 +12400,59 @@ lineLength = 200
         };
         // The `is_undefined` filter: a diagnostic whose code is NOT
         // UNDEFINED_VARIABLE must yield no NSE quick-fix even when it sits on an
-        // eligible call argument.
+        // eligible call argument. The positive control (same range, UNDEFINED
+        // code) DOES yield the fix, so the zero below is the filter at work, not
+        // an ineligible setup.
         let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
         let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
 
-        let not_undef = Diagnostic {
-            range: Range {
-                start: Position::new(1, 8),
-                end: Position::new(1, 10),
-            },
-            code: Some(NumberOrString::String("some-other-lint".to_string())),
-            message: "Something else".to_string(),
-            ..Default::default()
+        let nse_action_count = |code: &'static str| {
+            let svc = &svc;
+            let uri = uri.clone();
+            async move {
+                let diag = Diagnostic {
+                    range: Range {
+                        start: Position::new(1, 8),
+                        end: Position::new(1, 10),
+                    },
+                    code: Some(NumberOrString::String(code.to_string())),
+                    message: "diag".to_string(),
+                    ..Default::default()
+                };
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    range: Range::default(),
+                    context: CodeActionContext {
+                        diagnostics: vec![diag],
+                        only: None,
+                        trigger_kind: None,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                svc.inner()
+                    .code_action(params)
+                    .await
+                    .expect("code_action ok")
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|a| {
+                        matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+                    })
+                    .count()
+            }
         };
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: Range::default(),
-            context: CodeActionContext {
-                diagnostics: vec![not_undef],
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-        let actions = svc
-            .inner()
-            .code_action(params)
-            .await
-            .expect("code_action ok")
-            .unwrap_or_default();
-        let nse_actions = actions
-            .iter()
-            .filter(|a| {
-                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
-            })
-            .count();
+
+        assert!(
+            nse_action_count(crate::diagnostic_code::UNDEFINED_VARIABLE).await >= 1,
+            "positive control: an undefined-variable diagnostic yields the NSE quick-fix"
+        );
         assert_eq!(
-            nse_actions, 0,
-            "no NSE quick-fix for a non-undefined diagnostic: {actions:?}"
+            nse_action_count("some-other-lint").await,
+            0,
+            "no NSE quick-fix for a non-undefined diagnostic (is_undefined filter)"
         );
     }
 
@@ -12503,6 +12515,10 @@ lineLength = 200
         assert!(
             nse_action_count(None).await >= 1,
             "without a kind filter the diagnostic yields the NSE quick-fix"
+        );
+        assert!(
+            nse_action_count(Some(vec![])).await >= 1,
+            "an empty `only` list is treated as no restriction, so the fix is offered"
         );
         assert_eq!(
             nse_action_count(Some(vec![CodeActionKind::REFACTOR])).await,

@@ -66,7 +66,11 @@ impl LineSuppression {
 /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeclaredSymbol {
-    /// The symbol name (e.g., "myvar", "my.func")
+    /// The symbol name in CALL-SITE form (e.g. `myvar`, `my.func`). A
+    /// non-syntactic name is stored backtick-wrapped (`` `my fn` `` for
+    /// `# raven: func "my fn"`) so it matches the usage's `node_text`; a
+    /// `pkg::` qualifier on a `# raven: func` is kept as `pkg::name`. See
+    /// `callee_name_for_match` in `cross_file::directive`.
     pub name: String,
     /// 0-based line number where the directive appears
     pub line: u32,
@@ -103,7 +107,10 @@ pub enum NseScope {
 /// `package` is in scope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NseDeclaration {
-    /// Callee name as written (the `name` of a `package::name`, or the bare name).
+    /// Bare callee name (the `name` of a `package::name`, or the whole name) in
+    /// CALL-SITE form: a non-syntactic name is stored backtick-wrapped
+    /// (`` `my fn` `` for `# raven: nse "my fn"`) so it matches the call's
+    /// `node_text`. See `callee_name_for_match` in `cross_file::directive`.
     pub name: String,
     /// Package qualifier when written `package::name`, else `None`.
     pub package: Option<String>,

@@ -12892,25 +12892,22 @@ impl<'a> NseAnalysis<'a> {
         let mut reference_class_method_functions = HashMap::new();
         let mut data_table_qualifier_seen = false;
         // Names redefined within the file under two or more DIFFERENT formal
-        // orders. `local_function_defs` is last-binding-wins, so a later
-        // redefinition with permuted parameters would otherwise lend its order
-        // to an earlier call's positional NSE matching and invert which slot is
-        // suppressed (hiding a real undefined variable). When a name is in this
-        // set its order is ambiguous, so the `# raven: nse` borrow below falls
-        // back to safe named-only matching instead.
-        let mut ambiguous_local_formal_order: HashSet<String> = HashSet::new();
-        // First-seen top-level formal order per name; the working state behind
-        // `ambiguous_local_formal_order` (a later definition whose order differs
-        // marks the name ambiguous). Persists across alias / non-callable
-        // rebindings that evict `local_function_defs`, so the ambiguity check
-        // cannot be defeated by a rebinding interposed between two definitions.
-        let mut first_formal_order: HashMap<String, Vec<String>> = HashMap::new();
+        // orders (see [`FormalOrderTracker`]). `local_function_defs` is
+        // last-binding-wins, so a later redefinition with permuted parameters
+        // would otherwise lend its order to an earlier call's positional NSE
+        // matching and invert which slot is suppressed (hiding a real undefined
+        // variable). Enabled only when the file declares `# raven: nse`
+        // directives — the only consumer of the result — so a no-directive file
+        // skips the per-definition formal-name walk on the hot path.
+        let mut formal_order = FormalOrderTracker {
+            enabled: !nse_declarations.is_empty(),
+            ..FormalOrderTracker::default()
+        };
         collect_nse_facts(
             root,
             text,
             &mut local_function_defs,
-            &mut ambiguous_local_formal_order,
-            &mut first_formal_order,
+            &mut formal_order,
             &mut local_callee_shadows,
             &mut local_callee_aliases,
             &mut data_table_objects,
@@ -13066,7 +13063,7 @@ impl<'a> NseAnalysis<'a> {
                         // would lend a later redefinition's permuted order to an
                         // earlier call and hide a real undefined variable). Fall
                         // through to the safe named-only `None` arm.
-                        if ambiguous_local_formal_order.contains(&decl.name) {
+                        if formal_order.is_ambiguous(&decl.name) {
                             return None;
                         }
                         local_function_defs
@@ -13220,6 +13217,55 @@ impl<'a> NseAnalysis<'a> {
     }
 }
 
+/// Tracks whether each top-level function name has a single authoritative formal
+/// ORDER, so a bare `# raven: nse` borrow (which reads the last-binding-wins
+/// `local_function_defs`) can fall back to safe named-only matching when it does
+/// not. Without this, a later redefinition with permuted parameters would lend
+/// its order to an earlier call's positional matching and invert which slot is
+/// suppressed — hiding a real undefined variable.
+///
+/// Bundles the working `first_seen` map with the resulting `ambiguous` set so the
+/// invariant (compare every definition against the FIRST-seen order; a differing
+/// one marks the name ambiguous) lives in one place, and carries an `enabled`
+/// flag: the result is consulted ONLY when the file declares `# raven: nse`
+/// directives, so for the common no-directive file [`observe`](Self::observe) is a
+/// no-op that skips the per-definition formal-name walk on the hot diagnostics
+/// path. `first_seen` persists across alias / non-callable rebindings (which
+/// evict `local_function_defs`), so a `def → rebind → permuted-def` sequence is
+/// still detected.
+#[derive(Default)]
+struct FormalOrderTracker {
+    enabled: bool,
+    first_seen: HashMap<String, Vec<String>>,
+    ambiguous: HashSet<String>,
+}
+
+impl FormalOrderTracker {
+    /// Observe a top-level function definition's formal order, computed lazily so
+    /// the walk is skipped entirely when tracking is disabled. Marks the name
+    /// ambiguous if an earlier definition had a different order.
+    fn observe(&mut self, name: &str, formals: impl FnOnce() -> Vec<String>) {
+        if !self.enabled {
+            return;
+        }
+        let formals = formals();
+        if let Some(first) = self.first_seen.get(name) {
+            if *first != formals {
+                self.ambiguous.insert(name.to_string());
+            }
+        } else {
+            self.first_seen.insert(name.to_string(), formals);
+        }
+    }
+
+    /// Whether `name`'s positional formal order is ambiguous (defined more than
+    /// once with differing orders), in which case the directive borrow must fall
+    /// back to named-only matching.
+    fn is_ambiguous(&self, name: &str) -> bool {
+        self.ambiguous.contains(name)
+    }
+}
+
 /// Walk the tree gathering the facts [`NseAnalysis`] needs: top-level function
 /// definitions (their capture policies are inferred afterwards in
 /// [`NseAnalysis::build`]), top-level non-literal callee aliases/rebindings
@@ -13241,8 +13287,7 @@ fn collect_nse_facts<'t>(
     node: Node<'t>,
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
-    ambiguous_local_formal_order: &mut HashSet<String>,
-    first_formal_order: &mut HashMap<String, Vec<String>>,
+    formal_order: &mut FormalOrderTracker,
     local_callee_shadows: &mut HashSet<String>,
     local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
     data_table_objects: &mut HashSet<String>,
@@ -13296,22 +13341,12 @@ fn collect_nse_facts<'t>(
                 local_callee_shadows.insert(name.to_string());
                 match binding {
                     LocalCalleeBinding::Definition(def) => {
-                        // A redefinition with a different formal order makes the
-                        // name's positional order ambiguous (see the set's doc in
-                        // `NseAnalysis::build`). Compare against the FIRST-seen
-                        // order, recorded in a map that an intervening alias /
-                        // non-callable rebinding does NOT clear — `local_function_defs`
-                        // is evicted by such a rebinding, so comparing against it
-                        // would miss a `def → alias → permuted-def` sequence. The
-                        // mark is monotonic.
-                        let formals = function_formal_names(def, text);
-                        if let Some(first) = first_formal_order.get(name) {
-                            if *first != formals {
-                                ambiguous_local_formal_order.insert(name.to_string());
-                            }
-                        } else {
-                            first_formal_order.insert(name.to_string(), formals);
-                        }
+                        // Record this definition's formal order for the
+                        // positional-borrow ambiguity check (see
+                        // [`FormalOrderTracker`]). The formal-name walk is
+                        // computed lazily and skipped entirely when the file has
+                        // no `# raven: nse` directives.
+                        formal_order.observe(name, || function_formal_names(def, text));
                         local_function_defs.insert(name.to_string(), def);
                         local_callee_aliases.remove(name);
                     }
@@ -13358,8 +13393,7 @@ fn collect_nse_facts<'t>(
             child,
             text,
             local_function_defs,
-            ambiguous_local_formal_order,
-            first_formal_order,
+            formal_order,
             local_callee_shadows,
             local_callee_aliases,
             data_table_objects,

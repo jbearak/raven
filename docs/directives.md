@@ -189,7 +189,11 @@ still verified). Combine it with named formals, e.g. `# raven: nse my_func(x, ..
 line, and the most recent declaration for a function wins. It is an
 authoritative declaration that overrides Raven's own inference for that callee —
 but it is **not** a blanket diagnostic ignore: it declares a reusable
-argument-evaluation policy for the named function.
+argument-evaluation policy for the named function. An *unqualified* declaration
+overrides even a local `name <- function(...)` definition's inferred policy
+(R calls the named binding, and you are declaring how it evaluates its
+arguments); a *qualified* one yields to a local binding of the bare name, as
+below.
 
 A qualified declaration (`pkg::my_func`) matches both `pkg::my_func(...)` calls
 and unqualified `my_func(...)` calls when `pkg` is in scope (loaded via
