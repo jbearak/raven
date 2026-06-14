@@ -131,9 +131,12 @@ pub(crate) struct DiagnosticsSnapshot {
     /// subgraph). So if no entry in `metadata_map` is directive-bearing, the
     /// collected result is necessarily `{ nse: [], funcs: [] }` — this signal is
     /// read from the exact same data, via the exact same content provider, that
-    /// the collector would consult. (The OR with `directive_meta` is for Q's own
-    /// entry, which the masked Rmd path may enrich after the map is built; it is
-    /// belt-and-suspenders and never wrongly skips.)
+    /// the collector would consult. (The OR with Q's own `directive_meta` is a
+    /// conservative over-count, not a correctness requirement: the collector
+    /// excludes Q itself and Q's own directives flow through the local NSE path,
+    /// and chunk enrichment only touches suppressions — never `nse`/`func`
+    /// declarations — so this term can only make the signal *more* true, never
+    /// wrongly skip.)
     pub any_nse_or_func_directives: bool,
 
     // Pre-collected scope data for all reachable files
