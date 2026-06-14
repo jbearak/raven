@@ -14903,6 +14903,12 @@ fn nse_eligible_call_arg<'t>(
 ) -> Option<(Node<'t>, String, Option<String>)> {
     let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
     let (_pkg, bare) = split_callee_qualifier(&callee);
+    // Canonicalize a redundantly backticked syntactic callee before the
+    // builtin/base filter (issue #460 Codex review): `resolve_call_arg_policy`
+    // canonicalizes too, so `` `mean`(missing) `` / `` base::`paste`(missing) ``
+    // emit a standard-eval diagnostic — without this, the raw `` `mean` `` would
+    // miss `is_builtin`/`base_exports` and offer a misleading `# raven: nse` fix.
+    let bare = crate::r_names::canonical_use_name(bare);
     if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
         return None;
     }
@@ -57923,6 +57929,52 @@ my_func <- function(a = default_value) {
             super::nse_hint_for_usage(usage, code, &analysis).is_none(),
             "a governing `# raven: nse my_func` must suppress the hint for a `\
              `my_func`(...)` call despite the redundant backticks"
+        );
+    }
+
+    // Issue #460 (Codex review): a redundantly backticked BUILTIN/base callee
+    // (`` `mean`(missing) ``) must be recognized as standard-eval by the
+    // hint/quick-fix eligibility filter (which canonicalizes the bare name), so no
+    // misleading `# raven: nse` suggestion is offered for a normal base call.
+    #[test]
+    fn no_hint_for_backticked_builtin_callee() {
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let code = "`mean`(missing_obj)\n";
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let usage = find_ident(root, code, "missing_obj").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a backticked builtin callee `mean` is standard-eval — no NSE hint"
         );
     }
 
