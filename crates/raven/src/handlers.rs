@@ -5862,7 +5862,21 @@ fn collect_undefined_variables_from_snapshot(
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
     let in_play_packages = collect_in_play_packages(snapshot, uri);
-    let cross_file_nse = collect_cross_file_nse(snapshot, uri);
+    // Only walk the source graph for foreign NSE/func declarations when call-
+    // argument checking is on: with it off, `NseAnalysis::build` returns before
+    // it ever translates directives, so the declarations (and the two graph
+    // traversals + metadata clones that gather them) would be pure waste.
+    let cross_file_nse = if snapshot
+        .cross_file_config
+        .undefined_variable_in_call_arguments
+    {
+        collect_cross_file_nse(snapshot, uri)
+    } else {
+        CrossFileNse {
+            nse: Vec::new(),
+            funcs: Vec::new(),
+        }
+    };
     let nse_analysis = NseAnalysis::build(
         node,
         text,
