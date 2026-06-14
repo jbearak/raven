@@ -225,9 +225,18 @@ neighborhood (`cached_neighborhood_subgraph`, `handlers.rs:223`), which can be
 narrower than a directed `S(Q)` computed on the full graph — a deep up-then-down
 chain could name a file the snapshot never precollected, leaving its metadata
 unreadable. Computing `S(Q)` over `snapshot.cross_file_graph` (the trimmed
-neighborhood subgraph, `handlers.rs:110-113`) restricts `S(Q)` to nodes that are
-provably present in `metadata_map`, so every collected member is readable and
-no full-graph traversal or snapshot-precollection change is needed.
+neighborhood subgraph, `handlers.rs:110-113`) restricts `S(Q)` to the
+neighborhood's nodes (its edges only touch `payload.neighborhood` URIs), so no
+full-graph traversal or snapshot-precollection change is needed.
+
+The collector reads each member's metadata with `metadata_map.get(uri)` and
+**skips any member without an entry** (`if let Some(meta) = …`). `metadata_map`
+is filled conditionally (`handlers.rs:236-242`), so a node can be in the trimmed
+graph yet have no metadata — most plausibly an *unresolved / missing-file* node
+created from a forward directive or AST `source()` whose path does not resolve
+(`path_resolve.rs`, `dependency.rs` edge creation). Such a node has no
+`nse_declarations` to contribute anyway, so skipping it is correct, not a
+degradation; the collector must not assume every member is present.
 
 **Bound (OD4).** Propagation is therefore limited to `max_chain_depth` (default
 **20**) undirected hops. Every required behavior (B1–B4b) is within undirected
@@ -402,7 +411,8 @@ reachability changes are covered without new work.
   - New foreign-NSE/func collector computing `S(Q)` (§4.1).
   - `NseAnalysis::build` — `foreign_nse_declarations` + `foreign_funcs` params;
     `DirectiveNsePolicy.file_level`; split own/foreign policy lookups; foreign
-    tier 1d in `resolve_call_arg_policy`; own-first formal-order helper (§4.5);
+    tier 3.6 in `resolve_call_arg_policy` (both bare and namespace-qualified
+    branches, §4.3); own-first formal-order helper (§4.5);
     `FormalOrderTracker` enablement (§4.6); updated call at `handlers.rs:5712`.
   - `nse_directive_governs` / `nse_hint_for_usage` — file-level foreign handling
     (§4.7).
