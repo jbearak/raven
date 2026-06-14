@@ -11582,6 +11582,69 @@ mod semantic_warning_pipeline_tests {
         );
     }
 
+    /// Issue #459 (Task 3): a redundantly backtick-quoted syntactic call
+    /// `` `my_func`() `` whose name is declared via `# raven: func` must not be
+    /// flagged "Undefined variable". The func-directive existence comparison
+    /// canonicalizes the backticked callee to the bare name the directive
+    /// declares (`canonical_use_name`, Seam B). Before that, the backticks made
+    /// the use-site key (`` `my_func` ``) miss the declared bare `my_func`.
+    #[test]
+    fn backtick_quoted_func_directive_callee_not_flagged_undefined() {
+        let code = "# raven: func my_func(x)\nresult <- `my_func`(1)\nother <- `undeclared_helper`(2)\nz <- totally_undefined_baseline\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        // Sanity: the baseline undefined symbol MUST still be flagged —
+        // otherwise the collector isn't running and the test is vacuous.
+        assert!(
+            messages.contains(&"Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must still flag; pipeline may not be firing. messages: {messages:?}"
+        );
+        // Control: a backtick-quoted call to an UNDECLARED function IS collected
+        // and flagged (its raw spelling keeps the backticks). This proves the
+        // callee position is inspected at all, so the `my_func` non-flagging
+        // below is a genuine resolution, not a vacuous "callees aren't checked".
+        assert!(
+            messages.contains(&"Undefined variable: `undeclared_helper`"),
+            "an undeclared backtick-quoted callee must still flag. messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("my_func")),
+            "backtick-quoted `my_func`() declared via `# raven: func` must not be \
+             flagged undefined. messages: {messages:?}"
+        );
+    }
+
+    /// Issue #459 (Task 3) regression tripwire: a NON-syntactic local definition
+    /// `` `my fn` <- function() {} `` used backticked `` `my fn`() `` must still
+    /// resolve. Canonicalizing the existence comparison must NOT strip the
+    /// required backticks of a non-syntactic name (which would key the lookup on
+    /// the bare `my fn` and lose the stored definition). This pins that the
+    /// Seam-A unconditional unquote (def stored bare, use unquoted bare) keeps
+    /// working unchanged alongside the Seam-B canonicalization.
+    #[test]
+    fn backtick_quoted_nonsyntactic_local_used_backticked_resolves() {
+        let code =
+            "`my fn` <- function() {}\nresult <- `my fn`()\nz <- totally_undefined_baseline\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must still flag; pipeline may not be firing. messages: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("my fn")),
+            "backtick-quoted non-syntactic local `my fn`() must still resolve to its \
+             local definition. messages: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     /// Build a snapshot for a `.Rmd` document with the opt-in lint master switch
     /// off, exercising the `params`-frontmatter recognition path. Wraps the
     /// shared file-level [`build_rmd_snapshot`] with a configure closure that
@@ -12999,8 +13062,28 @@ impl<'a> NseAnalysis<'a> {
             // verb (`function(filter, ...) filter(d, ...)`) is the caller's
             // function, not the verb.
             let mut shadows = analysis.local_callee_shadows.clone();
-            potential_function_binding_names(body, text, &mut shadows);
-            shadows.extend(function_formal_names(*fn_def, text));
+            // Canonicalize shadow-set entries as they ENTER the set (issue
+            // #459): `body_forwards_dots_to_covered_verb` looks up its key via
+            // `canonical_use_name`, and `local_callee_shadows` is already stored
+            // canonical, so the body-binding and formal-name sources must match
+            // it — otherwise a redundantly backticked formal/binding named after
+            // a covered verb (`` function(`filter`, ...) `filter`(d, ...) ``)
+            // misses the shadow and the wrapper is wrongly upgraded. NOTE: the
+            // canonicalization is applied here, NOT inside `function_formal_names`
+            // itself, which also supplies backtick-significant formal ORDER to
+            // the directive NSE policy path.
+            let mut raw_bindings = HashSet::new();
+            potential_function_binding_names(body, text, &mut raw_bindings);
+            shadows.extend(
+                raw_bindings
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
+            shadows.extend(
+                function_formal_names(*fn_def, text)
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
             if body_forwards_dots_to_covered_verb(body, text, &analysis, &shadows) {
                 let (formals, captured) = match baseline {
                     Some((formals, captured)) => (formals.clone(), captured.clone()),
@@ -13334,6 +13417,17 @@ fn collect_nse_facts<'t>(
         && let Some(value) = assignment_value_node(node)
     {
         let name = node_text(target, text);
+        // Seam C storage key (issue #459). The callee-policy structures below
+        // are looked up at call sites by `resolve_call_arg_policy`, which keys
+        // on the call's `canonical_use_name`; storage and lookup MUST move
+        // together, so a redundantly backtick-quoted syntactic definition
+        // (`` `my_func` <- function(...) ``) is stored under the bare key the
+        // matching `` `my_func`() `` call will resolve to, while a genuinely
+        // non-syntactic name (`` `my fn` ``) keeps its required backticks on
+        // both sides. The data.table / reference-class object bookkeeping below
+        // intentionally stays on the raw `name`: those facts are looked up by
+        // raw object node_text, not via `canonical_use_name`.
+        let callee_name = crate::r_names::canonical_use_name(name);
         let value = unwrap_parenthesized(value);
         // Callee-binding bookkeeping for the NSE policy resolver (issue #450).
         // `local_function_defs`, `local_callee_aliases`, and the shadow set are
@@ -13343,7 +13437,7 @@ fn collect_nse_facts<'t>(
         // belongs to — so the structures never disagree about what `name` is.
         match classify_callee_binding(value, text) {
             Some(binding) => {
-                local_callee_shadows.insert(name.to_string());
+                local_callee_shadows.insert(callee_name.to_string());
                 match binding {
                     LocalCalleeBinding::Definition(def) => {
                         // Record this definition's formal order for the
@@ -13351,20 +13445,20 @@ fn collect_nse_facts<'t>(
                         // [`FormalOrderTracker`]). The formal-name walk is
                         // computed lazily and skipped entirely when the file has
                         // no `# raven: nse` directives.
-                        formal_order.observe(name, || function_formal_names(def, text));
-                        local_function_defs.insert(name.to_string(), def);
-                        local_callee_aliases.remove(name);
+                        formal_order.observe(callee_name, || function_formal_names(def, text));
+                        local_function_defs.insert(callee_name.to_string(), def);
+                        local_callee_aliases.remove(callee_name);
                     }
                     LocalCalleeBinding::Alias(alias) => {
-                        local_callee_aliases.insert(name.to_string(), alias);
-                        local_function_defs.remove(name);
+                        local_callee_aliases.insert(callee_name.to_string(), alias);
+                        local_function_defs.remove(callee_name);
                     }
                 }
             }
             None => {
-                local_callee_shadows.remove(name);
-                local_function_defs.remove(name);
-                local_callee_aliases.remove(name);
+                local_callee_shadows.remove(callee_name);
+                local_function_defs.remove(callee_name);
+                local_callee_aliases.remove(callee_name);
             }
         }
         // Reference-class generators and data.table object classification are
@@ -14142,13 +14236,20 @@ fn table_verb_policy(
     analysis: &NseAnalysis,
 ) -> Option<crate::nse::ArgPolicy> {
     if func.kind() == "namespace_operator" {
-        return namespace_parts(func, text)
-            .and_then(|(pkg, name)| crate::nse::package_policy(pkg, name));
+        // Canonicalize the bare `name` of `pkg::name` (issue #459) so a
+        // redundantly backtick-quoted `` pkg::`name` `` resolves the package
+        // policy; `namespace_parts` does not strip backticks. The package
+        // qualifier is left as-is.
+        return namespace_parts(func, text).and_then(|(pkg, name)| {
+            crate::nse::package_policy(pkg, crate::r_names::canonical_use_name(name))
+        });
     }
     if func.kind() != "identifier" {
         return None;
     }
-    let name = node_text(func, text);
+    // Canonicalize a redundantly backtick-quoted syntactic callee (issue #459)
+    // so the built-in policy tables, keyed on bare names, are reached.
+    let name = crate::r_names::canonical_use_name(node_text(func, text));
 
     // 2. A loaded/imported package's NSE policy shadows base.
     for pkg in &analysis.in_play_packages {
@@ -14242,7 +14343,14 @@ fn body_forwards_dots_to_covered_verb(
         let nested = function_formal_names(node, text);
         if !nested.is_empty() {
             let mut extended = shadows.clone();
-            extended.extend(nested);
+            // Canonicalize nested formals on entry (issue #459) to match the
+            // canonicalized lookup key; see the shadow-set construction in the
+            // dots-upgrade pass.
+            extended.extend(
+                nested
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
             let mut cursor = node.walk();
             return node
                 .children(&mut cursor)
@@ -14254,11 +14362,16 @@ fn body_forwards_dots_to_covered_verb(
         && let Some(args) = node.child_by_field_name("arguments")
         // Cheap pre-filter: most body calls pass no `...` at all.
         && call_args_contain_dots(args)
-        && !(func.kind() == "identifier"
-            && (analysis
-                .local_function_policies
-                .contains_key(node_text(func, text))
-                || shadows.contains(node_text(func, text))))
+        // Canonicalize the local-shadow lookup key (issue #459): the shadow set
+        // and `local_function_policies` are keyed on `canonical_use_name`, so a
+        // redundantly backtick-quoted callee (`` `filter`(d, ...) ``) must be
+        // canonicalized here too — otherwise a locally-shadowed verb called
+        // through redundant backticks bypasses the shadow guard and the wrapper
+        // is wrongly upgraded to a covered-verb policy.
+        && !(func.kind() == "identifier" && {
+            let key = crate::r_names::canonical_use_name(node_text(func, text));
+            analysis.local_function_policies.contains_key(key) || shadows.contains(key)
+        })
         && let Some(policy) = table_verb_policy(func, text, analysis)
     {
         let pipe_fed = call_is_pipe_fed(node, text);
@@ -14624,8 +14737,11 @@ fn resolve_call_arg_policy(
     if func.kind() == "namespace_operator" {
         let call_line = call_node.start_position().row as u32;
         if let Some((pkg, n)) = namespace_parts(func, text)
-            && let Some(p) =
-                analysis.directive_nse_policy(n, CallQualifier::Qualified(pkg), call_line)
+            && let Some(p) = analysis.directive_nse_policy(
+                crate::r_names::canonical_use_name(n),
+                CallQualifier::Qualified(pkg),
+                call_line,
+            )
         {
             return p;
         }
@@ -14637,7 +14753,14 @@ fn resolve_call_arg_policy(
         // Computed callee (`fns[[1]](x)`, `(function(x) x)(y)`): unresolved.
         return ArgPolicy::WholeCall;
     }
-    let name = node_text(func, text);
+    // Canonicalize a redundantly backtick-quoted syntactic callee (issue #459):
+    // `` `my_func`() `` is identical to `my_func()`, so every downstream lookup
+    // (directive policies, local definitions/aliases, the built-in tables via
+    // `table_verb_policy`, builtin/base/in-play classification, and the Shiny
+    // helper) must key on the bare name. The Seam-C storage keys in
+    // `collect_nse_facts` are canonicalized in lockstep. A genuinely
+    // non-syntactic name keeps its backticks here and there alike.
+    let name = crate::r_names::canonical_use_name(node_text(func, text));
 
     // 0. An exact unqualified `# raven: nse name` declaration is an
     //    authoritative user override of Raven's own inference for this name —
@@ -15301,7 +15424,7 @@ fn is_builtin(name: &str) -> bool {
     builtins::is_builtin(name) || unquote_backtick_name(name).is_some_and(is_builtin)
 }
 
-fn unquote_backtick_name(name: &str) -> Option<&str> {
+pub(crate) fn unquote_backtick_name(name: &str) -> Option<&str> {
     name.strip_prefix('`')?.strip_suffix('`')
 }
 
@@ -17857,12 +17980,19 @@ fn member_definition_info(
     state: &WorldState,
     location: &tower_lsp::lsp_types::Location,
 ) -> Option<DefinitionInfo> {
+    let name: std::sync::Arc<str> = std::sync::Arc::from("");
+    // Synthetic symbol consumed by `extract_definition_statement` (keys off
+    // source_uri + position); the highlight end is unused. Preserve the old
+    // `defined_column + utf16_len(name)` value via the shared helper (empty
+    // name ⇒ end == start column).
+    let defined_end_column = scoped_symbol_default_end(location.range.start.character, &name);
     let symbol = ScopedSymbol {
-        name: std::sync::Arc::from(""),
+        name,
         kind: scope::SymbolKind::Variable,
         source_uri: location.uri.clone(),
         defined_line: location.range.start.line,
         defined_column: location.range.start.character,
+        defined_end_column,
         signature: None,
         is_declared: false,
     };
@@ -18447,7 +18577,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         "Got {} symbols from cross-file scope",
         cross_file_symbols.len()
     );
-    if let Some(symbol) = cross_file_symbols.get(name) {
+    // Issue #459: a cross-file scope entry is keyed either bare (a regular
+    // assignment def) or backtick-wrapped (a directive-declared non-syntactic
+    // symbol). Mirror go-to-definition: try the RAW spelling first (matches a
+    // wrapped declared key), then the unconditionally-unquoted spelling (matches
+    // a bare regular-def key). Only the lookup key is normalized; `name` keeps
+    // its raw spelling for the rendered hover.
+    let symbol_key: &str = unquote_backtick_name(name).unwrap_or(name);
+    if let Some(symbol) = cross_file_symbols
+        .get(name)
+        .or_else(|| cross_file_symbols.get(symbol_key))
+    {
         log::trace!(
             "hover: found symbol '{}' in cross_file_symbols, source_uri={}, is_declared={}",
             name,
@@ -19470,6 +19610,21 @@ pub fn goto_definition_with_cancel(
     }
 
     let name = node_text(node, &text);
+    // Seam-A (#459): a scope / exported-interface entry is keyed either bare
+    // (a regular assignment def — `assignment_identifier_name` strips backticks)
+    // or in its call-site form (a directive-declared *non-syntactic* var/func is
+    // stored backtick-wrapped — `callee_name_for_match`). So a backtick-quoted
+    // use-site must try the RAW spelling first (matches a wrapped declared key)
+    // and then the unconditionally-unquoted spelling (matches a bare regular-def
+    // key). This try-raw-then-unquote order is the same Seam-A discipline the
+    // undefined-variable loop uses; it is NOT `canonical_use_name` (which would
+    // leave a non-syntactic name wrapped and miss the bare key). A non-declared
+    // (bare-stored) symbol can only match via the unquoted form. `scope_key`'s
+    // only role is that bare lookup-key fallback; the highlight range does NOT
+    // depend on `scope_key`/`name` — it comes from the matched symbol's stored
+    // token columns via `scoped_symbol_range`. The directive-declared branch
+    // below canonicalizes against the raw `name` (Seam B).
+    let scope_key: &str = unquote_backtick_name(name).unwrap_or(name);
 
     // Search using position-aware scope resolution
     // This unifies same-file and cross-file lookups, respecting:
@@ -19485,7 +19640,11 @@ pub fn goto_definition_with_cancel(
         Some(state.package_state.scope_contribution()),
     );
 
-    if let Some(symbol) = scope.symbols.get(name) {
+    if let Some(symbol) = scope
+        .symbols
+        .get(name)
+        .or_else(|| scope.symbols.get(scope_key))
+    {
         // Check if this is a package export (source_uri starts with "package:")
         // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
         // Validates: Requirements 11.1, 11.2
@@ -19509,16 +19668,24 @@ pub fn goto_definition_with_cancel(
         if symbol.is_declared {
             // Get metadata for the symbol's source file to find the first declaration
             if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
-                // Find all declarations of this symbol name (both variables and functions)
+                // Find all declarations of this symbol name (both variables and
+                // functions). This is the DIRECTIVE seam (Seam B, #459):
+                // declarations store the call-site form (bare for a syntactic
+                // name, backtick-wrapped for a non-syntactic one), so match on
+                // `canonical_use_name` of BOTH operands — a redundantly-quoted
+                // `` `my_func` `` use canonicalizes to the bare declared key,
+                // while a required `` `my fn` `` keeps its backticks to match the
+                // wrapped declared key.
+                let canonical_name = crate::r_names::canonical_use_name(name);
                 let mut first_line: Option<u32> = None;
 
                 for decl in &metadata.declared_variables {
-                    if decl.name == name {
+                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
                     }
                 }
                 for decl in &metadata.declared_functions {
-                    if decl.name == name {
+                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
                     }
                 }
@@ -19547,7 +19714,7 @@ pub fn goto_definition_with_cancel(
 
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
-            range: scoped_symbol_range(symbol, name),
+            range: scoped_symbol_range(symbol),
         }));
     }
 
@@ -19560,7 +19727,10 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
-            && let Some(symbol) = artifacts.exported_interface.get(name)
+            && let Some(symbol) = artifacts
+                .exported_interface
+                .get(name)
+                .or_else(|| artifacts.exported_interface.get(scope_key))
         {
             // Skip package exports (they have pseudo-URIs that can't be navigated to)
             if symbol.source_uri.as_str().starts_with("package:") {
@@ -19568,7 +19738,7 @@ pub fn goto_definition_with_cancel(
             }
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
-                range: scoped_symbol_range(symbol, name),
+                range: scoped_symbol_range(symbol),
             }));
         }
     }
@@ -19582,7 +19752,10 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
-            && let Some(symbol) = artifacts.exported_interface.get(name)
+            && let Some(symbol) = artifacts
+                .exported_interface
+                .get(name)
+                .or_else(|| artifacts.exported_interface.get(scope_key))
         {
             // Skip package exports (they have pseudo-URIs that can't be navigated to)
             if symbol.source_uri.as_str().starts_with("package:") {
@@ -19590,7 +19763,7 @@ pub fn goto_definition_with_cancel(
             }
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
-                range: scoped_symbol_range(symbol, name),
+                range: scoped_symbol_range(symbol),
             }));
         }
     }
@@ -19606,7 +19779,9 @@ pub fn goto_definition_with_cancel(
         if let Some(tree) = &doc.tree {
             // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
             let file_text = doc.analysis_text();
-            if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
+            if let Some(def_range) =
+                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
+            {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
                     range: def_range,
@@ -19626,7 +19801,9 @@ pub fn goto_definition_with_cancel(
         if let Some(tree) = &doc.tree {
             // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
             let file_text = doc.analysis_text();
-            if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
+            if let Some(def_range) =
+                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
+            {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
                     range: def_range,
@@ -19636,6 +19813,25 @@ pub fn goto_definition_with_cancel(
     }
 
     None
+}
+
+/// Look up a definition for `name` in `root`, falling back to `scope_key` (the
+/// unquoted spelling) only when it differs from `name`. Skipping the second
+/// walk when `scope_key == name` (the common bare-callee case:
+/// `unquote_backtick_name` returns `None`, so `scope_key == name`) avoids a
+/// byte-for-byte identical full tree walk guaranteed to also miss — pure wasted
+/// work on the not-found path, doubled per scanned file.
+fn find_definition_try_both(
+    root: tree_sitter::Node,
+    name: &str,
+    scope_key: &str,
+    text: &str,
+) -> Option<Range> {
+    find_definition_in_tree(root, name, text).or_else(|| {
+        (scope_key != name)
+            .then(|| find_definition_in_tree(root, scope_key, text))
+            .flatten()
+    })
 }
 
 fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> {
@@ -19670,11 +19866,26 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
     None
 }
 
-fn scoped_symbol_range(symbol: &ScopedSymbol, name: &str) -> Range {
+/// The go-to-definition highlight range for a scope symbol: from the
+/// definition token's start column to its end column. Both are carried on the
+/// symbol (`defined_column` / `defined_end_column`), so a backtick-quoted name
+/// highlights its full source token rather than the bare inner name (issue
+/// #459 / I-B2).
+fn scoped_symbol_range(symbol: &ScopedSymbol) -> Range {
     Range {
         start: Position::new(symbol.defined_line, symbol.defined_column),
-        end: Position::new(symbol.defined_line, symbol.defined_column + utf16_len(name)),
+        end: Position::new(symbol.defined_line, symbol.defined_end_column),
     }
+}
+
+/// Behavior-preserving default for [`ScopedSymbol::defined_end_column`] at
+/// construction sites with no real source token (synthetic / test symbols):
+/// the name rendered at the definition column, i.e. the old
+/// `defined_column + utf16_len(name)`. Wrapping the addition in a function
+/// keeps clippy's `identity_op` quiet for the common `defined_column == 0` case
+/// (a literal `0 + _` would lint; a `0` *argument* does not).
+fn scoped_symbol_default_end(defined_column: u32, name: &str) -> u32 {
+    defined_column + crate::utf16::utf16_len(name)
 }
 
 // ============================================================================
@@ -19944,7 +20155,16 @@ fn find_references_in_tree(
     uri: &Url,
     locations: &mut Vec<Location>,
 ) {
-    if node.kind() == "identifier" && node_text(node, text) == name {
+    // Issue #459: union bare and backticked occurrences. Canonicalize BOTH
+    // equality operands so a redundantly-quoted syntactic `` `my_func` `` and a
+    // bare `my_func` resolve to one reference set, while a genuinely
+    // non-syntactic name (`` `my fn` ``) keeps its required backticks and only
+    // matches other backticked spellings. The pushed range is still the raw
+    // node span (backticks included) — only the match KEY is canonicalized.
+    if node.kind() == "identifier"
+        && crate::r_names::canonical_use_name(node_text(node, text))
+            == crate::r_names::canonical_use_name(name)
+    {
         let start_pos = node.start_position();
         let end_pos = node.end_position();
         locations.push(Location {
@@ -21405,6 +21625,233 @@ mod tests {
         assert!(!was_collected(&used, "col"));
     }
 
+    // ---- Issue #459: redundant backtick-quoting of syntactic callees ----
+
+    /// A redundantly backtick-quoted syntactic callee `` `my_func`() `` is
+    /// semantically identical to `my_func()`, so it must pick up the bare
+    /// `# raven: nse` directive governing it. With a `# raven: func` supplying
+    /// the formal order, the captured formal's argument is suppressed while the
+    /// other positional argument is still checked. Before canonicalization the
+    /// backticked callee missed the directive lookup and the whole call was
+    /// suppressed, hiding the checked argument.
+    #[test]
+    fn nse_backtick_quoted_callee_governed_by_directive() {
+        use crate::cross_file::directive::parse_directives;
+        let code =
+            "# raven: func my_func(a, b)\n# raven: nse my_func(b)\n`my_func`(checked_a, masked_b)";
+        let tree = parse_r_code(code);
+        let meta = parse_directives(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            None,
+            None,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            was_collected(&used, "checked_a"),
+            "positional arg bound to a non-captured formal must be checked"
+        );
+        assert!(
+            !was_collected(&used, "masked_b"),
+            "arg bound to the NSE-captured formal must be suppressed"
+        );
+    }
+
+    /// A backtick-quoted call `` `my_func`(...) `` must borrow the formal order
+    /// of a visible local definition `my_func <- function(a, b) ...` for the
+    /// bare `# raven: nse my_func(b)` directive's positional matching, exactly
+    /// as a bare call would. Before canonicalization the backticked call missed
+    /// both the directive and the local-definition formal-order borrow.
+    #[test]
+    fn nse_backtick_quoted_callee_picks_up_local_def_formal_order() {
+        use crate::cross_file::directive::parse_directives;
+        let code =
+            "my_func <- function(a, b) a\n# raven: nse my_func(b)\n`my_func`(checked_a, masked_b)";
+        let tree = parse_r_code(code);
+        let meta = parse_directives(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            None,
+            None,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            was_collected(&used, "checked_a"),
+            "positional arg bound to a non-captured formal must be checked"
+        );
+        assert!(
+            !was_collected(&used, "masked_b"),
+            "arg bound to the NSE-captured formal must be suppressed"
+        );
+    }
+
+    /// A backtick-quoted in-play data-masking verb `` `filter`(df, col) ``
+    /// resolves through `table_verb_policy` to dplyr's policy: `.data` (`df`) is
+    /// checked, the data-masked `col` is suppressed. Before canonicalization the
+    /// backticked callee missed every policy table and fell through to
+    /// whole-call suppression, wrongly hiding `df`.
+    #[test]
+    fn nse_backtick_quoted_filter_resolves_data_mask_via_table_verb_policy() {
+        let code = "`filter`(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "the `.data` argument must still be checked"
+        );
+        assert!(
+            !was_collected(&used, "col"),
+            "the data-masked column must be suppressed via dplyr's policy"
+        );
+    }
+
+    /// A redundantly backtick-quoted QUALIFIED data-masking callee
+    /// `` dplyr::`filter`(df, col) `` resolves through the `namespace_operator`
+    /// branch of `table_verb_policy` to dplyr's policy: `.data` (`df`) is
+    /// checked and the data-masked `col` is suppressed. `namespace_parts` does
+    /// not strip backticks, so without canonicalizing the bare `name` component
+    /// the policy lookup would miss and the call would fall through to
+    /// standard-eval, wrongly checking `col`.
+    #[test]
+    fn nse_qualified_backtick_quoted_callee_resolves_data_mask() {
+        let code = "dplyr::`filter`(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "the `.data` argument must still be checked"
+        );
+        assert!(
+            !was_collected(&used, "col"),
+            "the data-masked column must be suppressed via dplyr's qualified policy"
+        );
+    }
+
+    /// A redundantly backtick-quoted DEFINITION `` `my_func` <- function(x) x ``
+    /// and a backtick-quoted call `` `my_func`(undefined_var) `` must still
+    /// resolve to the local (standard-eval) definition, so the argument is
+    /// checked. This guards the storage/lookup lockstep: canonicalizing only the
+    /// lookup key (and not the `collect_nse_facts` storage key) would make the
+    /// stored `` `my_func` `` and the canonical lookup `my_func` mismatch.
+    ///
+    /// The callee is a NON-builtin syntactic name on purpose: were it a builtin
+    /// (e.g. `filter`), a storage/lookup mismatch would fall through to the
+    /// builtin classification and still check the argument, making the test
+    /// vacuous. With `my_func`, a mismatch instead drops to unresolved
+    /// whole-call suppression, so the assertion below genuinely bites only when
+    /// storage and lookup canonicalize in lockstep.
+    #[test]
+    fn nse_redundantly_backticked_definition_and_call_match() {
+        let code = "`my_func` <- function(x) x\n`my_func`(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "undefined_var"),
+            "local standard-eval definition must make the argument checked"
+        );
+    }
+
+    /// Seam C clearing-arm lockstep (issue #459): a redundantly backtick-quoted
+    /// function definition `` `my_func` <- function(captured) 1 `` rebound to a
+    /// non-callee literal `` `my_func` <- 5 `` must CLEAR the local definition,
+    /// so the subsequent `` `my_func`(undefined_arg) `` call falls to
+    /// unresolved whole-call suppression rather than standard-eval argument
+    /// checking — i.e. `undefined_arg` is NOT collected. This guards the
+    /// `collect_nse_facts` None-arm storage key: the `local_function_defs`
+    /// removal must canonicalize its key (`my_func`) in lockstep with the
+    /// Definition/Alias arms' inserts. Were the None arm to revert to the raw
+    /// `` `my_func` `` (backticked) key, the clear would miss the canonically
+    /// stored definition, the stale `function(captured) 1` would linger,
+    /// `user_defined_call_policy` would return Standard, and `undefined_arg`
+    /// would be wrongly collected.
+    #[test]
+    fn nse_redundantly_backticked_rebind_to_noncallee_clears_def() {
+        let code = "`my_func` <- function(captured) 1\n`my_func` <- 5\n`my_func`(undefined_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            !was_collected(&used, "undefined_arg"),
+            "rebinding the backticked definition to a non-callee literal must clear \
+             the local def, so the call falls to whole-call suppression and the \
+             argument is not checked"
+        );
+    }
+
+    /// A genuinely non-syntactic local `` `my fn` <- function(x) x `` used
+    /// backticked `` `my fn`(undefined_var) `` keeps its required backticks on
+    /// BOTH the storage and lookup key, so the definition still shadows and the
+    /// argument is checked. Canonicalization must NOT strip these backticks.
+    #[test]
+    fn nse_nonsyntactic_backtick_local_def_used_backticked_matches() {
+        let code = "`my fn` <- function(x) x\n`my fn`(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "undefined_var"),
+            "non-syntactic local definition must still shadow and check its argument"
+        );
+    }
+
+    /// Issue #459 dots-forwarding guard: a locally-shadowed verb called through
+    /// redundant backticks inside a `...`-forwarding wrapper must still be
+    /// recognized as a local shadow, so the wrapper is NOT upgraded to a
+    /// covered-verb (data-masking) policy. Here `filter` is a local
+    /// standard-eval definition, so `` wrap <- function(...) `filter`(d, ...) ``
+    /// forwards its dots into a *standard* function, not dplyr's data-mask verb,
+    /// and `wrap(undefined_sym)` must keep its argument checked. Before the guard
+    /// canonicalized its lookup key, the backticked `` `filter` `` missed the
+    /// shadow set (stored under the bare `filter`), so the wrapper was wrongly
+    /// upgraded and `undefined_sym` was over-suppressed.
+    #[test]
+    fn nse_backtick_quoted_locally_shadowed_verb_in_wrapper_not_upgraded() {
+        let code = "filter <- function(a, b) a\n\
+                    wrap <- function(...) `filter`(d, ...)\n\
+                    wrap(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        // dplyr is in play, so absent the local shadow `filter` would resolve to
+        // dplyr's data-mask policy and the wrapper would be upgraded.
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "the local standard-eval shadow of `filter` must be honored through \
+             redundant backticks, so the wrapper is not upgraded and its arg is checked"
+        );
+    }
+
     /// Issue #407: a NON-hardcoded aggregate `myagg` that `Depends` on dplyr
     /// makes `mutate` visible. NSE classification must resolve the true owner
     /// (dplyr) and apply dplyr's policy, suppressing the data-masked column
@@ -22330,7 +22777,30 @@ mod tests {
         assert!(was_collected(&used, "undefined_sym"));
     }
 
-    /// A top-level alias of a covered verb to a non-literal function value
+    /// Issue #459 dots-forwarding shadow-set canonicalization, body-local
+    /// binding variant: a wrapper that forwards `...` and has a BODY-LOCAL
+    /// binding (neither a top-level def nor a formal) to a covered verb written
+    /// with redundant backticks (`` `filter` <- get_fn() ``) must still shadow
+    /// the verb, so the wrapper is NOT upgraded to captured-dots and its
+    /// forwarded argument stays checked. A body-local binding never reaches
+    /// `local_callee_shadows` (`collect_nse_facts` records callee bindings there
+    /// only at top level), so it enters the shadow set EXCLUSIVELY via the
+    /// `potential_function_binding_names` → `raw_bindings` arm — which stores
+    /// the raw spelling. Without canonicalizing as it ENTERS the set the raw
+    /// `` `filter` `` misses the canonical lookup key `filter` and the wrapper
+    /// is wrongly upgraded (over-suppression). Backtick + body-local mirror of
+    /// `nse_wrapper_body_local_shadow_disables_forwarding`.
+    #[test]
+    fn nse_backtick_wrapper_body_local_shadow_disables_forwarding() {
+        let code = "wrap <- function(...) {\n  `filter` <- get_fn()\n  `filter`(d, ...)\n}\nwrap(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked body-local binding shadowing `filter` must disable the dots-forwarding upgrade"
+        );
+    }
     /// shadows the package policy for the dots-forwarding inference. Raven
     /// cannot prove the alias is data-masking, so the wrapper's dots stay
     /// checked.
@@ -22444,6 +22914,48 @@ mod tests {
         let mut used = Vec::new();
         collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
         assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// Issue #459 dots-forwarding shadow-set canonicalization: a wrapper FORMAL
+    /// named after a covered verb but written with redundant backticks
+    /// (`` function(`filter`, ...) ``) must still shadow the verb, so the
+    /// wrapper is NOT upgraded to a covered-verb (data-masking) policy and its
+    /// forwarded argument stays checked. The shadow set is fed raw
+    /// `function_formal_names`, but `body_forwards_dots_to_covered_verb` looks
+    /// up its key canonicalized — so without canonicalizing the formal as it
+    /// ENTERS the set, the backticked formal misses the shadow and the wrapper
+    /// is wrongly upgraded (over-suppression). Backtick mirror of
+    /// `nse_wrapper_formal_shadowing_verb_disables_forwarding`.
+    #[test]
+    fn nse_backtick_wrapper_formal_shadowing_verb_disables_forwarding() {
+        let code = "wrap <- function(`filter`, ...) `filter`(d2, ...)\nwrap(my_fn, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked formal shadowing `filter` must disable the dots-forwarding upgrade"
+        );
+    }
+
+    /// Issue #459 dots-forwarding shadow-set canonicalization, nested-closure
+    /// variant: a nested-lambda formal named after a covered verb but written
+    /// with redundant backticks must shadow the verb for that subtree of the
+    /// dots walk. The nested formals join `shadows` via `extended.extend(...)`
+    /// raw, so without canonicalizing them on entry the backticked
+    /// `` `filter` `` misses the shadow and the wrapper is wrongly upgraded.
+    /// Backtick mirror of `nse_nested_lambda_formal_shadows_verb_in_dots_walk`.
+    #[test]
+    fn nse_backtick_nested_lambda_formal_shadows_verb_in_dots_walk() {
+        let code = "wrap <- function(fs, ...) sapply(fs, function(`filter`) `filter`(d2, ...))\n\
+                    wrap(lst2, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked nested-lambda formal shadowing `filter` must disable the upgrade"
+        );
     }
 
     /// `substitute()` is frame-local: inside a nested closure it inspects the
@@ -22593,6 +23105,31 @@ mod tests {
         assert!(
             was_collected(&used, "typo"),
             "stats::filter is standard-eval; its argument must be checked"
+        );
+    }
+
+    /// Seam-C storage-key canonicalization for a redundantly backtick-quoted
+    /// alias: `` `filter` <- stats::filter `` is stored under the canonical bare
+    /// key the matching `` `filter`(df, typo) `` call resolves to, so the
+    /// standard-eval target's policy is honored and `typo` stays checked even
+    /// with dplyr in play. This bites the storage key specifically: were the
+    /// alias stored under the raw backticked `` `filter` `` (the pre-canonical
+    /// behavior), the canonical lookup would miss, fall through to dplyr's
+    /// `filter` table-verb policy, and SUPPRESS `typo`. A standard-eval target
+    /// is required so the fallthrough cannot coincidentally re-derive the same
+    /// (checked) policy. Backticked sibling of
+    /// `nse_alias_qualified_standard_target_checks_args`.
+    #[test]
+    fn nse_backtick_alias_qualified_standard_target_checks_args() {
+        let code = "`filter` <- stats::filter\n`filter`(df, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "df"), "data argument stays checked");
+        assert!(
+            was_collected(&used, "typo"),
+            "the standard-eval alias is honored through redundant backticks; \
+             its argument must be checked, not suppressed by dplyr's filter policy"
         );
     }
 
@@ -38425,6 +38962,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "x"),
             signature: None,
             is_declared: false,
         };
@@ -38446,6 +38984,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "f"),
             signature: Some("f(a, b)".to_string()),
             is_declared: false,
         };
@@ -38472,6 +39011,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "long_func"),
             signature: None,
             is_declared: false,
         };
@@ -38504,6 +39044,7 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(0, var_name),
                 signature: None,
                 is_declared: false,
             };
@@ -38530,6 +39071,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 5, // Position of 'i' in for loop
+            defined_end_column: crate::handlers::scoped_symbol_default_end(5, "i"),
             signature: None,
             is_declared: false,
         };
@@ -38631,6 +39173,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    var_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38661,6 +39207,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38697,6 +39247,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38830,6 +39384,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    "long_func",
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38864,6 +39422,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: indent_size as u32,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    indent_size as u32,
+                    "func",
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38916,6 +39478,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    var_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38948,6 +39514,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38975,6 +39545,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 5, // Position of iterator in for loop
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    5,
+                    iterator.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -39009,6 +39583,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: func_name.len() as u32 + 15, // Approximate position in function signature
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    func_name.len() as u32 + 15,
+                    param_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -46870,6 +47448,7 @@ mod integration_tests {
             source_uri: uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "my_var"),
             signature: None,
             is_declared: false,
         };
@@ -46920,6 +47499,7 @@ mod integration_tests {
             source_uri: rmd_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "my_var"),
             signature: None,
             is_declared: false,
         };
@@ -47043,6 +47623,7 @@ mod integration_tests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 4, // 0-based line 4 = display line 5
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "myvar"),
             signature: None,
             is_declared: true,
         };
@@ -47090,6 +47671,7 @@ mod integration_tests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 9, // 0-based line 9 = display line 10
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "myfunc"),
             signature: None,
             is_declared: true,
         };
@@ -47144,6 +47726,7 @@ mod integration_tests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(0, "test_symbol"),
                 signature: None,
                 is_declared: true,
             };
@@ -48575,6 +49158,7 @@ result <- missing_func(42)"#;
             source_uri: missing_uri, // This file doesn't exist in state
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "missing_func"),
             signature: Some("missing_func(x)".to_string()),
             is_declared: false,
         };
@@ -49199,6 +49783,7 @@ result <- helper_with_spaces(42)"#;
             source_uri: package_uri,
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: None,
             is_declared: false,
         };
@@ -49275,6 +49860,7 @@ result <- helper_with_spaces(42)"#;
             source_uri: file_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
             is_declared: false,
         };
@@ -51303,6 +51889,7 @@ result <- filter(c(1, -2, 3))"#;
             source_uri: package_uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate(.data, ...)".to_string()),
             is_declared: false,
         };
@@ -51449,6 +52036,7 @@ z <- mutate(5)  # Uses local definition"#;
             source_uri: package_uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate(.data, ...)".to_string()),
             is_declared: false,
         };
@@ -51483,6 +52071,7 @@ z <- mutate(5)  # Uses local definition"#;
             source_uri: file_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
             is_declared: false,
         };
@@ -56919,6 +57508,28 @@ my_func <- function(a = default_value) {
         );
     }
 
+    /// Issue #459: a redundantly backtick-quoted QUALIFIED callee
+    /// `` pkg::`my_func`(...) `` must match a qualified `# raven: nse
+    /// pkg::my_func(x)` directive. `resolve_call_arg_policy` canonicalizes the
+    /// bare `rhs` component before `directive_nse_policy(..., Qualified(pkg))`,
+    /// so the backticks are stripped and the directive's PerFormal policy
+    /// applies: the captured `x` is suppressed while the non-captured `y` stays
+    /// checked. Without canonicalization the lookup would miss and the call
+    /// would resolve to standard-eval, wrongly checking `masked_col`.
+    #[test]
+    fn nse_qualified_backticked_callee_matches_qualified_directive() {
+        let src = "# raven: nse pkg::my_func(x)\npkg::`my_func`(x = masked_col, y = real_undef)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "captured `x` must be suppressed via the qualified directive; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "non-captured `y` must still be checked (PerFormal, not WholeCall); got {diags:?}"
+        );
+    }
+
     #[test]
     fn nse_qualified_directive_still_applies_to_bare_call_without_local() {
         // The legitimate qualified→bare case: `pkg` is in play and nothing
@@ -61122,5 +61733,410 @@ mod issue_149_utf16_handlers {
             .unwrap();
         let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
         assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
+    }
+}
+
+/// Issue #459 (Task 4): redundant backtick-quoting of a *syntactic* name must
+/// not break go-to-definition or find-references, while a genuinely
+/// non-syntactic backtick name (whose backticks are required) stays navigable.
+///
+/// Seam-A storage (scope / goto / find-refs) keeps definition names bare, so a
+/// use-site `` `my_func` `` must drop its redundant backticks (unconditional
+/// `unquote_backtick_name`) to hit the bare key. find-references canonicalizes
+/// BOTH equality operands so a bare `my_func` and a backticked `` `my_func` ``
+/// are unioned into one reference set.
+#[cfg(test)]
+mod issue_459_backtick_navigation_tests {
+    use super::{goto_definition, references};
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
+
+    fn create_state() -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state
+    }
+
+    fn add_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        state
+            .documents
+            .insert(uri.clone(), Document::new(content, None));
+        uri
+    }
+
+    fn scalar(result: Option<GotoDefinitionResponse>) -> tower_lsp::lsp_types::Location {
+        match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar location, got {other:?}"),
+        }
+    }
+
+    fn ref_lines(refs: &[tower_lsp::lsp_types::Location]) -> Vec<u32> {
+        let mut lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Goto-definition from a redundantly backtick-quoted *syntactic* call
+    /// `` `my_func`() `` lands on the bare `my_func` definition. The definition
+    /// is stored bare (Seam-A), so the use-site key must drop the redundant
+    /// backticks to match.
+    #[test]
+    fn goto_from_backtick_quoted_syntactic_name_lands_on_definition() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+    }
+
+    /// Find-references unions bare and backticked occurrences of a syntactic
+    /// name: querying from the backticked use returns the bare definition, the
+    /// bare call, and the backticked call.
+    #[test]
+    fn references_union_bare_and_backticked_syntactic_occurrences() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\nmy_func()\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on the backticked occurrence (line 2).
+        let refs = references(&state, &uri, Position::new(2, 3)).expect("references Some");
+        assert_eq!(
+            ref_lines(&refs),
+            vec![0, 1, 2],
+            "all three occurrences are references"
+        );
+    }
+
+    /// Symmetry: querying from a *bare* occurrence must also surface the
+    /// backticked one.
+    #[test]
+    fn references_from_bare_includes_backticked_syntactic_occurrence() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\nmy_func()\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let refs = references(&state, &uri, Position::new(1, 0)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1, 2]);
+    }
+
+    /// A genuinely non-syntactic backtick local (`` `my fn` ``) remains
+    /// navigable: goto from a backticked use lands on the backticked
+    /// definition. Seam-A unconditional unquote handles this; canonicalization
+    /// must not strip the *required* backticks and break the lookup.
+    #[test]
+    fn goto_from_nonsyntactic_backtick_local_still_navigable() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() 1\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Find-references on a non-syntactic backtick local returns both
+    /// occurrences (definition + use); only backticked spellings exist.
+    #[test]
+    fn references_nonsyntactic_backtick_local() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() 1\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let refs = references(&state, &uri, Position::new(1, 3)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1]);
+    }
+
+    /// Goto from a use of a backtick-quoted zeallot destructuring target
+    /// highlights its FULL source token (`` `my var` ``), not the bare inner
+    /// name. `defined_column` anchors at the opening backtick, so the highlight
+    /// end must be derived from the real token width — matching the parameter /
+    /// for-loop sibling sites — rather than `defined_column + utf16_len(bare)`,
+    /// which would under-cover the 8-column token by 2 (issue #459 / I-B2).
+    #[test]
+    fn goto_from_backtick_destructuring_target_highlights_full_token() {
+        let mut state = create_state();
+        let code = "c(`my var`, y) %<-% list(1, 2)\n`my var`\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my var` `` on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 2,
+            "highlight starts at the opening backtick"
+        );
+        assert_eq!(
+            l.range.end.character, 10,
+            "highlight ends one past the closing backtick (full 8-col token), \
+             not the 6-col bare name"
+        );
+    }
+
+    /// Goto from a backtick-quoted symbol declared via `# raven: func` lands on
+    /// the directive line (the directive-declared go-to-definition path keys on
+    /// the canonical bare name).
+    #[test]
+    fn goto_from_backtick_quoted_directive_declared_func() {
+        let mut state = create_state();
+        let code = "# raven: func my_func(x)\nresult <- `my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 1 (after `result <- `).
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 13)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "directive is on line 0");
+    }
+
+    /// Issue #459: goto from a redundantly backtick-quoted *syntactic* use
+    /// `` `my_func`() `` of a symbol declared via directives at TWO different
+    /// lines navigates to the MIN declaration line. This pins the directive-seam
+    /// (Seam B) canonicalization in the `declared_variables`/`declared_functions`
+    /// goto loops, which compare `canonical_use_name(&decl.name)` against
+    /// `canonical_use_name(name)`.
+    ///
+    /// It is arranged to FAIL under a raw `decl.name == name` revert: the
+    /// declarations store the *bare* `my_func` (a syntactic name), but the use
+    /// site `name` is the raw, still-backticked `` `my_func` ``. A raw `==`
+    /// therefore matches NEITHER loop, leaving `first_line == None`, so goto
+    /// falls back to `symbol.defined_line`. The in-scope declared symbol is the
+    /// LAST declaration before the use (later declarations overwrite earlier in
+    /// the position-aware timeline), i.e. line 1 — NOT the min (line 0). So a
+    /// raw-`==` revert would navigate to line 1; only the canonical comparison
+    /// reaches the correct min line 0.
+    #[test]
+    fn goto_from_backtick_quoted_multi_declared_lands_on_min_line() {
+        let mut state = create_state();
+        // `my_func` declared twice via directives: a `var` on line 0 and a
+        // `func` on line 1. The use on line 2 is redundantly backtick-quoted.
+        let code = "# raven: var my_func\n# raven: func my_func(x)\nresult <- `my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 2 (after `result <- `, which is
+        // 10 chars, so the backtick is at column 10 and the name follows).
+        let l = scalar(goto_definition(&state, &uri, Position::new(2, 13)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(
+            l.range.start.line, 0,
+            "must navigate to the MIN declaration line (the `var` on line 0), \
+             not the in-scope symbol's last-declaration fallback (line 1)"
+        );
+    }
+
+    /// Hover on a redundantly backtick-quoted syntactic call resolves to the
+    /// bare definition (the hover symbol lookup strips backticks unconditionally,
+    /// consistent with go-to-definition).
+    #[tokio::test]
+    async fn hover_on_backtick_quoted_syntactic_call_resolves() {
+        let mut state = create_state();
+        let code = "my_func <- function(x) x\n`my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let result = super::hover(&state, &uri, Position::new(1, 3)).await;
+        assert!(
+            result.is_some(),
+            "hover on a backtick-quoted syntactic call must resolve to the bare definition"
+        );
+    }
+
+    /// Issue #459 regression: the cross-file goto FALLBACKS must mirror the
+    /// primary scope lookup's try-RAW-then-unquote order. A directive-declared
+    /// NON-syntactic symbol is keyed in `exported_interface` WRAPPED (via
+    /// `callee_name_for_match`), so a `` `my fn`() `` use reaches it only via
+    /// the raw `name`; resolving on the bare `scope_key` alone misses it. The
+    /// using file has NO `source()` link to the defining file, so the in-scope
+    /// primary lookup misses and resolution falls through to the
+    /// `exported_interface` arm under test (here via the workspace index).
+    #[test]
+    fn goto_backtick_resolves_via_exported_interface_fallback_without_source_link() {
+        use crate::workspace_index::IndexEntry;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let mut state = create_state();
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let lib_uri = Url::parse("file:///workspace/lib.R").unwrap();
+
+        // No `source("lib.R")`: the using file is unrelated to the defining
+        // file, so the only path to lib.R is the workspace `exported_interface`
+        // fallback, not the in-scope primary lookup.
+        let main_code = "`my_func`()\n`my fn`()\n";
+        // lib.R: a bare regular def (`my_func`, stored bare) and a
+        // directive-declared NON-syntactic func (`my fn`, stored backtick-
+        // WRAPPED in `exported_interface`).
+        let lib_code = "my_func <- function() 1\n# raven: func \"my fn\"(x)\n";
+
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+
+        let lib_doc = Document::new_with_uri(lib_code, None, &lib_uri);
+        let lib_metadata = Arc::new(crate::cross_file::extract_metadata(lib_code));
+        let lib_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &lib_uri,
+            lib_doc.tree.as_ref().expect("lib.R parses"),
+            lib_code,
+            Some(&lib_metadata),
+        ));
+        let entry = IndexEntry {
+            contents: lib_doc.contents.clone(),
+            tree: lib_doc.tree.clone(),
+            loaded_packages: lib_doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: lib_code.len() as u64,
+                content_hash: None,
+            },
+            metadata: lib_metadata,
+            artifacts: lib_artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+
+        // Bare syntactic `my_func`: hits `exported_interface` via the unquoted
+        // key (works pre-fix), proving the fallback path is actually reached.
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(l.uri, lib_uri, "`my_func` resolves to lib.R");
+
+        // Non-syntactic `my fn`: `exported_interface` stores it WRAPPED, so only
+        // the raw-`name` lookup hits — the regression site.
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(1, 3)));
+        assert_eq!(
+            l.uri, lib_uri,
+            "`my fn` resolves to lib.R via the WRAPPED exported_interface key"
+        );
+    }
+
+    /// Issue #459 regression companion: the legacy tree-text fallback
+    /// (`find_definition_in_tree`) matches RAW tree text, so a non-syntactic
+    /// assignment def has a backticked LHS (`` `my fn` <- ... ``). A `` `my fn`()
+    /// `` use must therefore be searched RAW first; passing only the bare
+    /// `scope_key` misses the backticked LHS. The using file is unrelated to the
+    /// defining file (no `source()`), so the in-scope primary lookup misses and
+    /// resolution falls through to the tree-text fallback.
+    #[test]
+    fn goto_backtick_nonsyntactic_resolves_via_tree_text_fallback() {
+        let mut state = create_state();
+        // Both files are plain open documents; no `source()` edge between them.
+        let main_uri = add_doc(&mut state, "file:///b.R", "`my fn`()\n");
+        let _lib_uri = add_doc(&mut state, "file:///a.R", "`my fn` <- function() 1\n");
+
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(
+            l.uri.as_str(),
+            "file:///a.R",
+            "`my fn` resolves to a.R via the RAW tree-text fallback"
+        );
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Issue #459 regression: the SECOND (unquoted) walk in the legacy
+    /// tree-text fallback. A redundantly backtick-quoted *syntactic* use
+    /// `` `my_func`() `` of a BARE regular definition `my_func <- function() 1`
+    /// is reachable ONLY through `find_definition_in_tree`'s `scope_key`
+    /// fallback: the def's LHS is the bare identifier `my_func`, but the
+    /// use-site `name` is the still-backticked raw `` `my_func` ``. The first
+    /// walk searches RAW and misses the bare LHS; only the second walk on the
+    /// unquoted `scope_key` (`my_func`) matches.
+    ///
+    /// The defining file is added via the legacy `add_doc` harness (writes only
+    /// `state.documents`, not the workspace index / `document_store`) and has NO
+    /// `source()` link to the using file. So the in-scope primary
+    /// `scope.symbols` lookup misses, BOTH `exported_interface` arms miss (the
+    /// def was never indexed), and resolution falls through to the legacy
+    /// tree-text fallback — where the syntactic name lands on the second walk.
+    ///
+    /// It BITES: reverting `find_definition_try_both` to a raw-only single walk
+    /// (`find_definition_in_tree(root, name, text)` with no `scope_key`
+    /// fallback) leaves the backticked `name` missing the bare LHS, so goto
+    /// returns `None` and `scalar(..)` panics.
+    #[test]
+    fn goto_backtick_syntactic_resolves_via_tree_text_fallback() {
+        let mut state = create_state();
+        // Both files are plain open documents; no `source()` edge between them.
+        let main_uri = add_doc(&mut state, "file:///b.R", "`my_func`()\n");
+        let _lib_uri = add_doc(&mut state, "file:///a.R", "my_func <- function() 1\n");
+
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(
+            l.uri.as_str(),
+            "file:///a.R",
+            "`my_func` resolves to a.R via the unquoted `scope_key` tree-text walk"
+        );
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Issue #459 (I-B2): go-to-definition on a NON-syntactic backtick-quoted
+    /// local `` `my fn` <- function() {} `` (used as `` `my fn`() ``) must
+    /// highlight the FULL source token of the definition — from the opening
+    /// backtick through one past the closing backtick (a 7-column span), not
+    /// just the bare inner name. Scope storage keeps the name bare (`my fn`, 5
+    /// cols) while `defined_column` points at the opening backtick, so the old
+    /// `defined_column + utf16_len(name)` end column covered only 5 of the 7
+    /// source columns (`` `my f ``). `scoped_symbol_range` now carries the
+    /// definition token's true end column.
+    #[test]
+    fn goto_backtick_nonsyntactic_def_highlights_full_token() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() {}\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside the backticked use on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 0,
+            "highlight starts at the opening backtick"
+        );
+        assert_eq!(
+            l.range.end.character, 7,
+            "highlight ends one past the closing backtick (full 7-col `` `my fn` `` token)"
+        );
+    }
+
+    /// Issue #459 (I-B2) regression guard for the common SYNTACTIC case: a bare
+    /// definition `my_func <- function() {}` used through redundant backticks
+    /// (`` `my_func`() ``) must keep highlighting exactly the 7-column bare
+    /// definition token — the fix must not over- or under-size the common case.
+    /// Here the stored name (`my_func`, 7 cols) and the definition token span
+    /// agree, so both the old and the new end column are 7; this pins that they
+    /// stay equal.
+    #[test]
+    fn goto_backtick_redundant_on_syntactic_def_highlights_full_bare_token() {
+        let mut state = create_state();
+        let code = "my_func <- function() {}\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(l.range.start.character, 0);
+        assert_eq!(
+            l.range.end.character, 7,
+            "bare `my_func` definition token is 7 cols"
+        );
+    }
+
+    /// Issue #459 (I-B2 / TC3): the RIGHT-assignment definition path. A
+    /// NON-syntactic backtick-quoted name defined via `-> `my fn`` (used as
+    /// `` `my fn`() ``) must highlight the FULL source token of the definition
+    /// — from the opening backtick through one past the closing backtick (a
+    /// 7-column span). The `->` branch (scope.rs) sets `defined_end_column` from
+    /// the RHS name token's true end; both existing range tests use `<-`, so
+    /// this is the only coverage of the `->` highlight width.
+    #[test]
+    fn goto_backtick_nonsyntactic_right_assignment_def_highlights_full_token() {
+        let mut state = create_state();
+        let code = "(function() {}) -> `my fn`\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside the backticked use on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 19,
+            "highlight starts at the opening backtick of the `-> ` name"
+        );
+        assert_eq!(
+            l.range.end.character, 26,
+            "highlight ends one past the closing backtick (full 7-col `` `my fn` `` token)"
+        );
     }
 }

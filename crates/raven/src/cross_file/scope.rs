@@ -568,19 +568,50 @@ pub enum SymbolKind {
 }
 
 /// A symbol with its definition location
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// `PartialEq`/`Hash` are hand-written below and deliberately EXCLUDE
+// `defined_end_column` (it is positional metadata, not identity — two symbols
+// that differ only in their highlight width are the same binding for cache /
+// dedup purposes). They preserve the pre-existing field sets exactly:
+// `PartialEq` compares every other field (including `signature`); `Hash`
+// omits `signature`. That asymmetry is sound — equal values still hash equal —
+// and is intentionally left unchanged here.
+#[derive(Debug, Clone, Eq)]
 pub struct ScopedSymbol {
     pub name: Arc<str>,
     pub kind: SymbolKind,
     pub source_uri: Url,
     /// 0-based line of definition
     pub defined_line: u32,
-    /// 0-based UTF-16 column of definition
+    /// 0-based UTF-16 column of definition (start of the definition token)
     pub defined_column: u32,
+    /// 0-based UTF-16 column one past the end of the definition token — the
+    /// go-to-definition highlight end. For an assignment def this is
+    /// the LHS (or `->` RHS) token's true end, so a backtick-quoted name like
+    /// `` `my fn` `` (stored bare as `my fn`, but anchored at the opening
+    /// backtick) highlights its full 7-column source span rather than the
+    /// 5-column bare name. For symbols with no source token (synthetic /
+    /// package / directive / test) it is the behavior-preserving
+    /// `defined_column + utf16_len(name)`. EXCLUDED from `PartialEq`/`Hash`.
+    pub defined_end_column: u32,
     pub signature: Option<String>,
     /// Whether this symbol was declared via `# raven: var` or `# raven: func`
     /// directive (as opposed to being statically detected from code)
     pub is_declared: bool,
+}
+
+impl PartialEq for ScopedSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        // Excludes `defined_end_column` (positional metadata). Matches the
+        // pre-existing derived field set otherwise — including `signature`.
+        self.name == other.name
+            && self.kind == other.kind
+            && self.source_uri == other.source_uri
+            && self.defined_line == other.defined_line
+            && self.defined_column == other.defined_column
+            && self.signature == other.signature
+            && self.is_declared == other.is_declared
+    }
 }
 
 impl Hash for ScopedSymbol {
@@ -1409,6 +1440,7 @@ pub fn compute_artifacts_with_metadata(
                 source_uri: uri.clone(),
                 defined_line: decl.line,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
                 signature: None,
                 is_declared: true,
             };
@@ -1431,6 +1463,7 @@ pub fn compute_artifacts_with_metadata(
                 source_uri: uri.clone(),
                 defined_line: decl.line,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
                 signature: None,
                 is_declared: true,
             };
@@ -1800,6 +1833,7 @@ where
                 source_uri: base_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                 signature: None,
                 is_declared: false,
             },
@@ -1927,6 +1961,7 @@ where
 
                             if should_insert {
                                 let name: Arc<str> = Arc::from(export_name);
+                                let defined_end_column = crate::utf16::utf16_len(&name);
                                 scope.symbols.insert(
                                     name.clone(),
                                     ScopedSymbol {
@@ -1935,6 +1970,7 @@ where
                                         source_uri: package_uri.clone(),
                                         defined_line: 0,
                                         defined_column: 0,
+                                        defined_end_column,
                                         signature: None,
                                         is_declared: false,
                                     },
@@ -2753,6 +2789,8 @@ fn extract_parameter_symbol(
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
                         defined_column: column,
+                        defined_end_column: column
+                            + crate::utf16::utf16_len(node_text(child, line_index.text)),
                         signature: None,
                         is_declared: false,
                     });
@@ -2767,6 +2805,7 @@ fn extract_parameter_symbol(
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
                         defined_column: column,
+                        defined_end_column: column + crate::utf16::utf16_len("..."),
                         signature: None,
                         is_declared: false,
                     });
@@ -2786,6 +2825,8 @@ fn extract_parameter_symbol(
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
+                defined_end_column: column
+                    + crate::utf16::utf16_len(node_text(param_node, line_index.text)),
                 signature: None,
                 is_declared: false,
             });
@@ -2802,6 +2843,7 @@ fn extract_parameter_symbol(
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len("..."),
                 signature: None,
                 is_declared: false,
             });
@@ -2872,6 +2914,7 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -2934,6 +2977,7 @@ fn try_extract_delayed_assign_call(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3069,6 +3113,7 @@ fn try_extract_global_variables_definitions(
                 source_uri: uri.clone(),
                 defined_line: line,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len(name_str),
                 signature: None,
                 is_declared: false,
             });
@@ -3164,6 +3209,7 @@ fn try_extract_env_bind_definitions(
                 source_uri: uri.clone(),
                 defined_line: line,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len(name),
                 signature: None,
                 is_declared: false,
             });
@@ -3229,6 +3275,7 @@ fn try_extract_set_generic_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3302,6 +3349,7 @@ fn try_extract_text_connection_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3360,6 +3408,7 @@ fn try_extract_literal_load_call_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(stem),
         signature: None,
         is_declared: false,
     };
@@ -3463,6 +3512,7 @@ fn try_extract_data_call_definitions(
             source_uri: uri.clone(),
             defined_line: line,
             defined_column: column,
+            defined_end_column: column + crate::utf16::utf16_len(name),
             signature: None,
             is_declared: false,
         });
@@ -3551,6 +3601,7 @@ fn try_extract_for_loop_iterator(
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(node_text(var_node, line_index.text)),
         signature: None,
         is_declared: false,
     })
@@ -3596,6 +3647,11 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         let start = rhs.start_position();
         let line_text = line_index.get_line(start.row);
         let column = byte_offset_to_utf16_column(line_text, start.column);
+        // Highlight end = the RHS name token's true end (issue #459 / I-B2): a
+        // backtick-quoted name is stored bare (`my fn`) but anchored at the
+        // opening backtick, so the bare width would under-cover the source span.
+        let end = rhs.end_position();
+        let end_column = byte_offset_to_utf16_column(line_index.get_line(end.row), end.column);
 
         return Some(ScopedSymbol {
             name: Arc::from(name_str),
@@ -3603,6 +3659,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
             source_uri: uri.clone(),
             defined_line: start.row as u32,
             defined_column: column,
+            defined_end_column: end_column,
             signature,
             is_declared: false,
         });
@@ -3637,6 +3694,12 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
     let start = lhs.start_position();
     let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
+    // Highlight end = the LHS name token's true end (issue #459 / I-B2): a
+    // backtick-quoted name is stored bare (`my fn`) but `defined_column` points
+    // at the opening backtick, so `defined_column + utf16_len(name)` would cover
+    // only the bare inner name. Carry the token's actual end column instead.
+    let end = lhs.end_position();
+    let end_column = byte_offset_to_utf16_column(line_index.get_line(end.row), end.column);
 
     Some(ScopedSymbol {
         name: Arc::from(name_str),
@@ -3644,6 +3707,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: end_column,
         signature,
         is_declared: false,
     })
@@ -3750,6 +3814,12 @@ fn destructuring_symbol_from_identifier(
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        // Highlight end = the token's true end (issue #459 / I-B2): a
+        // backtick-quoted destructuring target is stored bare (`my var`) but
+        // `defined_column` anchors at the opening backtick, so the bare width
+        // would under-cover the source span. Use the real token width, matching
+        // the parameter / for-loop sibling sites.
+        defined_end_column: column + crate::utf16::utf16_len(node_text(node, line_index.text)),
         signature: None,
         is_declared: false,
     })
@@ -3897,7 +3967,12 @@ fn assignment_rhs_is_function_definition(node: Node, line_index: &LineIndex) -> 
 /// me the function node so I can extract its signature", we strip them.
 ///
 /// Returns `None` for non-function nodes.
-fn unwrap_function_definition(node: Node) -> Option<Node> {
+///
+/// Shared (issue #459, SC1): `parameter_resolver` resolves cross-file/current-
+/// file function signatures and needs the same paren-unwrapping for its
+/// right-assignment branches, so this is the single source of truth rather than
+/// a verbatim copy. Pure tree-sitter `Node` walker — no scope/state coupling.
+pub(crate) fn unwrap_function_definition(node: Node) -> Option<Node> {
     let mut current = node;
     loop {
         match current.kind() {
@@ -4213,6 +4288,7 @@ fn expand_data_load(
                     source_uri: package_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(obj.as_str()),
                     signature: None,
                     is_declared: false,
                 },
@@ -4930,6 +5006,7 @@ where
                     source_uri: base_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                     signature: None,
                     is_declared: false,
                 },
@@ -5771,6 +5848,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5805,6 +5883,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5820,6 +5899,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5835,6 +5915,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5850,6 +5931,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5878,6 +5960,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5894,6 +5977,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5910,6 +5994,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5926,6 +6011,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5983,6 +6069,7 @@ pub(crate) fn append_package_contribution(
                         source_uri: pkg_uri.clone(),
                         defined_line: 0,
                         defined_column: 0,
+                        defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                         signature: None,
                         is_declared: false,
                     });
@@ -6857,6 +6944,7 @@ where
                 source_uri: pkg_uri,
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(name),
                 signature: None,
                 is_declared: false,
             });
@@ -7327,6 +7415,7 @@ fn seed_base_exports(frame: &mut ScopeFrame, base_exports: &HashSet<String>) {
                 source_uri: base_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                 signature: None,
                 is_declared: false,
             },
@@ -8961,6 +9050,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("declared_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -9087,6 +9177,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("before_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -9100,6 +9191,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 2,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("after_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -10326,6 +10418,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 1,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("x"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10342,6 +10435,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 5,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("y"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10457,6 +10551,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 1,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("x"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10557,6 +10652,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 2,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("y"),
                     signature: None,
                     is_declared: false,
                 },

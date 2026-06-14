@@ -262,16 +262,28 @@ fn extract_call_info(func_node: Node, text: &str) -> Option<FunctionCallContext>
             let operator = node_text(children[1], text);
             let func_name = node_text(children[2], text);
 
+            // Issue #459 (CC2): canonicalize ONLY the bare name component — a
+            // redundantly backtick-quoted syntactic name (`` pkg::`f` `` → the
+            // bare `f` key the `pkg::f` signature / formals query is keyed on);
+            // a genuinely non-syntactic name keeps its required backticks. The
+            // `pkg` qualifier is never touched.
             return Some(FunctionCallContext {
-                function_name: func_name.to_string(),
+                function_name: crate::r_names::canonical_use_name(func_name).to_string(),
                 namespace: Some(ns_name.to_string()),
                 is_internal: operator == ":::",
             });
         }
         None
     } else if func_node.kind() == "identifier" {
+        // Issue #459: the callee name is a signature/parameter-completion
+        // LOOKUP KEY, so canonicalize a redundantly backtick-quoted syntactic
+        // name (`` `f` `` → `f`) to the bare key user-function / package
+        // resolution stores; a genuinely non-syntactic name keeps its required
+        // backticks. Only the resolution key is normalized — nothing is
+        // inserted or re-spelled.
         Some(FunctionCallContext {
-            function_name: node_text(func_node, text).to_string(),
+            function_name: crate::r_names::canonical_use_name(node_text(func_node, text))
+                .to_string(),
             namespace: None,
             is_internal: false,
         })
@@ -677,6 +689,42 @@ mod tests {
 
     // --- AST-based detection tests ---
 
+    /// Issue #459: a redundantly backtick-quoted *syntactic* callee yields the
+    /// bare resolution key (`` `func` `` → `func`), so signature / parameter
+    /// resolution finds the bare definition.
+    #[test]
+    fn test_backtick_quoted_syntactic_callee_canonicalized() {
+        let code = "`func`(x, )";
+        let tree = parse_r(code);
+        // Cursor after the comma inside the call.
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 10));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "func".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
+    /// A genuinely non-syntactic backtick callee keeps its required backticks
+    /// (the resolution key must still match the backticked definition).
+    #[test]
+    fn test_backtick_quoted_nonsyntactic_callee_keeps_backticks() {
+        let code = "`my fn`(x, )";
+        let tree = parse_r(code);
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 11));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`my fn`".to_string(),
+                namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
     #[test]
     fn test_simple_function_call() {
         let code = "func(x, )";
@@ -740,6 +788,46 @@ mod tests {
             Some(FunctionCallContext {
                 function_name: "outer".to_string(),
                 namespace: None,
+                is_internal: false,
+            })
+        );
+    }
+
+    /// Issue #459 (CC2): a qualified, redundantly backtick-quoted callee
+    /// (`` pkg::`func`( ``) must canonicalize ONLY the bare name component to
+    /// the bare resolution key (`func`) while preserving the `pkg` qualifier,
+    /// so the `pkg::func` signature / formals query is keyed correctly. The raw
+    /// (backticked) name component would produce a `pkg::`func`` cache key and
+    /// miss the bare `pkg::func` signature.
+    #[test]
+    fn test_namespace_backtick_quoted_syntactic_name_canonicalized() {
+        let code = "pkg::`func`(df, )";
+        let tree = parse_r(code);
+        // Cursor after the comma inside the call.
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 15));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "func".to_string(),
+                namespace: Some("pkg".to_string()),
+                is_internal: false,
+            })
+        );
+    }
+
+    /// A genuinely non-syntactic backtick name component under a `pkg::`
+    /// qualifier keeps its required backticks (the resolution key must still
+    /// match the backticked export), while the qualifier is untouched.
+    #[test]
+    fn test_namespace_backtick_quoted_nonsyntactic_name_keeps_backticks() {
+        let code = "pkg::`my fn`(df, )";
+        let tree = parse_r(code);
+        let ctx = detect_function_call_context(&tree, code, Position::new(0, 16));
+        assert_eq!(
+            ctx,
+            Some(FunctionCallContext {
+                function_name: "`my fn`".to_string(),
+                namespace: Some("pkg".to_string()),
                 is_internal: false,
             })
         );

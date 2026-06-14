@@ -46,9 +46,43 @@ pub(crate) fn is_syntactic_r_name(name: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '.' || c == '_') && !is_reserved_word(name)
 }
 
+/// Normalizes a use-site callee/identifier spelling to the canonical bare-name
+/// form: strip surrounding backticks iff the inner name is syntactic, so a
+/// redundantly-quoted `` `my_func` `` matches the bare key that resolution
+/// stores, while a genuinely non-syntactic name (`` `my fn` ``, `` `if` ``,
+/// `` `.2way` ``) keeps its required backticks.
+///
+/// Applied wherever a use site is matched against a bare-keyed store: it is the
+/// use-site counterpart to [`crate::cross_file::directive::callee_name_for_match`]
+/// at the directive seam (Seam B), and is also used for NSE local-policy lookups
+/// and storage (Seam C), `table_verb_policy`, go-to-definition, find-references,
+/// and completion signature lookups. (Seam A — the position-aware scope symbol
+/// table — instead uses an unconditional `unquote_backtick_name`, since it stores
+/// every definition bare regardless of syntacticity.)
+///
+/// This is NOT a literal round-trip inverse of `callee_name_for_match`: it is
+/// many-to-one (both `foo` and `` `foo` `` map to `foo`), so it cannot
+/// reconstruct which spelling a caller used.
+///
+/// Contract: `raw` is a BARE callee/identifier only — never a `pkg::` qualifier
+/// and never surrounding context. It uses the Unicode-aware
+/// [`is_syntactic_r_name`] (NOT scope.rs's ASCII-only
+/// `is_valid_unquoted_r_identifier`), so a non-ASCII syntactic name such as
+/// `` `données` `` is correctly unwrapped. The return is borrowed from `raw`.
+pub(crate) fn canonical_use_name(raw: &str) -> &str {
+    // Leading-backtick fast path keeps the hot diagnostic/find-refs loops cheap.
+    let Some(rest) = raw.strip_prefix('`') else {
+        return raw;
+    };
+    match rest.strip_suffix('`') {
+        Some(inner) if is_syntactic_r_name(inner) => inner,
+        _ => raw,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_syntactic_r_name;
+    use super::{canonical_use_name, is_syntactic_r_name};
 
     #[test]
     fn plain_identifiers_are_syntactic() {
@@ -86,5 +120,40 @@ mod tests {
         assert!(!is_syntactic_r_name("a:b"));
         assert!(!is_syntactic_r_name("`quoted`"));
         assert!(!is_syntactic_r_name(""));
+    }
+
+    #[test]
+    fn canonical_use_name_strips_redundant_backticks_on_syntactic_names() {
+        assert_eq!(canonical_use_name("`f`"), "f");
+        assert_eq!(canonical_use_name("`foo.bar`"), "foo.bar");
+        // Unicode-aware: a non-ASCII syntactic name has its backticks stripped.
+        assert_eq!(canonical_use_name("`données`"), "données");
+    }
+
+    #[test]
+    fn canonical_use_name_keeps_backticks_on_non_syntactic_names() {
+        assert_eq!(canonical_use_name("`my fn`"), "`my fn`");
+        assert_eq!(canonical_use_name("`if`"), "`if`");
+        assert_eq!(canonical_use_name("`TRUE`"), "`TRUE`");
+        // Leading-dot-digit name is non-syntactic and must keep its backticks.
+        assert_eq!(canonical_use_name("`.2way`"), "`.2way`");
+    }
+
+    #[test]
+    fn canonical_use_name_leaves_bare_names_unchanged() {
+        assert_eq!(canonical_use_name("f"), "f");
+        assert_eq!(canonical_use_name("pkg"), "pkg");
+    }
+
+    #[test]
+    fn canonical_use_name_leaves_degenerate_inputs_unchanged() {
+        // Empty input has no backticks: returned as-is.
+        assert_eq!(canonical_use_name(""), "");
+        // Lone backtick: no closing backtick, so untouched.
+        assert_eq!(canonical_use_name("`"), "`");
+        // Empty pair of backticks wraps a non-syntactic (empty) inner name.
+        assert_eq!(canonical_use_name("``"), "``");
+        // A backslash inside backticks is non-syntactic and stays quoted.
+        assert_eq!(canonical_use_name("`a\\b`"), "`a\\b`");
     }
 }

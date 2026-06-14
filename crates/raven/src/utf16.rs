@@ -1,3 +1,9 @@
+/// Number of UTF-16 code units in `s` — the width unit LSP uses for
+/// `Position.character` / column offsets.
+pub fn utf16_len(s: &str) -> u32 {
+    s.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
 /// Convert a UTF-16 column offset (from LSP Position.character) to a byte
 /// offset within the given line. Tree-sitter Points expect byte offsets, not
 /// UTF-16 code units.
