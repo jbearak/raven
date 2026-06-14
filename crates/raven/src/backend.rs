@@ -5717,8 +5717,13 @@ impl LanguageServer for Backend {
         // (e.g. `f(undef_a, undef_b)`) resolve to the same quick-fix — identical
         // insert line and directive text — so dedupe to avoid duplicate
         // lightbulb entries. Two calls on different lines keep distinct insert
-        // lines and so are not collapsed.
-        let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
+        // lines and so are not collapsed. The map value is the index of the
+        // already-emitted action for that edit, so a collapsed diagnostic can be
+        // appended to that action's `diagnostics` list (per LSP, a code action's
+        // `diagnostics` enumerates every diagnostic it resolves; listing only the
+        // first would let clients hide or mis-group the fix for the others).
+        let mut seen: std::collections::HashMap<(u32, String), usize> =
+            std::collections::HashMap::new();
         // The `# raven: nse` declarations governing this document, so the
         // quick-fix can be skipped when a directive already governs the call —
         // mirroring `nse_hint_for_usage`'s suppression so the message hint and
@@ -5779,7 +5784,17 @@ impl LanguageServer for Backend {
                 ) {
                     continue;
                 }
-                if !seen.insert((fix.insert_line, fix.text.clone())) {
+                let key = (fix.insert_line, fix.text.clone());
+                if let Some(&existing_idx) = seen.get(&key) {
+                    // Same edit already queued by an earlier diagnostic — record
+                    // that this diagnostic is also resolved by that action rather
+                    // than emitting a duplicate lightbulb.
+                    if let CodeActionOrCommand::CodeAction(action) = &mut actions[existing_idx] {
+                        action
+                            .diagnostics
+                            .get_or_insert_with(Vec::new)
+                            .push(diag.clone());
+                    }
                     continue;
                 }
                 let edit = TextEdit {
@@ -5791,6 +5806,7 @@ impl LanguageServer for Backend {
                 };
                 let mut changes = std::collections::HashMap::new();
                 changes.insert(uri.clone(), vec![edit]);
+                seen.insert(key, actions.len());
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title: fix.title,
                     kind: Some(CodeActionKind::QUICKFIX),
@@ -12288,6 +12304,22 @@ lineLength = 200
         assert_eq!(
             nse_actions, 1,
             "duplicate NSE quick-fixes must be deduped: {actions:?}"
+        );
+        // The single deduped action must list BOTH diagnostics it resolves (per
+        // LSP, `diagnostics` enumerates every diagnostic a code action addresses).
+        let merged = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse") => {
+                    Some(ca.diagnostics.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .expect("nse action present");
+        assert_eq!(
+            merged.len(),
+            2,
+            "deduped action must list both resolved diagnostics: {merged:?}"
         );
     }
 
