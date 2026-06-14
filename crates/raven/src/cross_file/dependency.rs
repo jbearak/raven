@@ -1280,10 +1280,10 @@ impl DependencyGraph {
     /// `ancestors(root) ∪ descendants(ancestors(root) ∪ {root})`, i.e. every
     /// file whose cross-file scope-resolution would visit `root`.
     ///
-    /// This is the single source of truth for the directed-inverse property
-    /// that ties together NSE/func directive *collection* and dependency
-    /// *revalidation* (CLAUDE.md "Cross-file `# raven: nse` / `# raven: func`
-    /// propagation"). Concretely:
+    /// This is the single source of truth for the *traversal shape* that ties
+    /// together NSE/func directive *collection* and dependency *revalidation*
+    /// (CLAUDE.md "Cross-file `# raven: nse` / `# raven: func` propagation").
+    /// Concretely:
     ///
     /// 1. [`Self::get_transitive_dependents`] — all backward ancestors of `root`.
     /// 2. [`Self::get_transitive_dependencies_multi_root`] over
@@ -1291,12 +1291,20 @@ impl DependencyGraph {
     ///    each ancestor (sibling subtrees), sharing one `visited` set.
     ///
     /// Both [`super::revalidation::compute_affected_dependents_after_edit`]
-    /// (over the FULL graph) and
-    /// [`crate::handlers::collect_cross_file_nse`] (over the TRIMMED snapshot
-    /// subgraph) build their working set from this method, so the two stay the
-    /// exact directed inverse of each other by construction rather than by
-    /// convention: for any `D ∈ revalidation_consistent_set(Q)`, `Q` lies in
-    /// `revalidation_consistent_set(D)`'s revalidation, and vice versa.
+    /// (over the FULL graph) and [`crate::handlers::collect_cross_file_nse`]
+    /// (over the TRIMMED snapshot subgraph) build their working set from this
+    /// method, so they use the **identical traversal shape** — the same two
+    /// graph primitives chained the same way — and can no longer drift in
+    /// edge-selection logic. The full directed-inverse equivalence additionally
+    /// depends on inputs this helper does not encode: both callers passing
+    /// matching `max_depth` / `max_visited` budgets, and the deliberate graph
+    /// asymmetry (collection over the trimmed subgraph, revalidation over the
+    /// full graph). That asymmetry is intentional and **safe-direction**:
+    /// `S_trimmed ⊆ S_full`, so collection can only ever *omit* a foreign
+    /// suppression (leaving a real diagnostic in place — a false positive at
+    /// worst), never fabricate one or drop a needed revalidation. Under budget
+    /// truncation the two graphs can reach different sets — the same safe
+    /// direction.
     ///
     /// Returns the union with the backward ancestors FIRST, then the forward
     /// descendants, matching both callers' historical ordering. **`root` itself
@@ -1313,7 +1321,7 @@ impl DependencyGraph {
         root: &Url,
         max_depth: usize,
         max_visited: usize,
-    ) -> Vec<Url> {
+    ) -> impl Iterator<Item = Url> {
         let ancestors = self.get_transitive_dependents(root, max_depth, max_visited);
         // `root` first matches the historical `once(root).chain(ancestors)`
         // convention so the shared `max_visited` budget prioritizes the queried
@@ -1323,7 +1331,11 @@ impl DependencyGraph {
             max_depth,
             max_visited,
         );
-        ancestors.into_iter().chain(descendants).collect()
+        // The chained iterator owns both Vecs, so it carries no borrow of `&self`.
+        // Callers fold it through their own post-processing (revalidation: a
+        // shared `seen` set; collection: filter self, then sort + dedup), so the
+        // intermediate `.collect()` neither caller historically had is dropped.
+        ancestors.into_iter().chain(descendants)
     }
 
     /// `visited` tracks the *shallowest* depth at which each URI has been
@@ -4203,7 +4215,6 @@ z <- 3
             let root = url(name);
             let mut from_helper: Vec<Url> = graph
                 .revalidation_consistent_set(&root, 20, 200)
-                .into_iter()
                 .filter(|u| *u != root)
                 .collect();
             from_helper.sort();
@@ -4272,8 +4283,11 @@ z <- 3
     /// where the LHS is `collect_cross_file_nse`'s membership test (helper,
     /// drop-self) and the RHS is `compute_affected_dependents_after_edit`'s
     /// result (helper, dedup, drop-self). Both sides now derive from
-    /// `revalidation_consistent_set`, so this is true by construction; the test
-    /// guards against a future edit that re-splits them. Includes the
+    /// `revalidation_consistent_set` over the SAME graph with the SAME budgets,
+    /// so the shared traversal shape makes this hold here; the test guards
+    /// against a future edit that re-splits them. (In production the two run
+    /// over different graphs — trimmed vs full — a deliberate, safe-direction
+    /// asymmetry; see the helper's doc.) Includes the
     /// sibling-subtree case (A sources B and C; B sources D): D ∈ S(C) ⟺ C
     /// revalidates D — i.e. editing C must republish its sibling-subtree node D.
     #[test]
@@ -4288,7 +4302,6 @@ z <- 3
         let in_consistent_set = |q: &Url, member: &Url| -> bool {
             graph
                 .revalidation_consistent_set(q, 20, 200)
-                .into_iter()
                 .any(|u| &u == member && member != q)
         };
         // Revalidation-side: does editing `member` revalidate `q`? (all open)
@@ -4296,7 +4309,6 @@ z <- 3
             let mut seen: HashSet<Url> = HashSet::new();
             graph
                 .revalidation_consistent_set(member, 20, 200)
-                .into_iter()
                 .filter(|d| d != member)
                 .filter(|d| seen.insert(d.clone()))
                 .any(|d| &d == q)

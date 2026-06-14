@@ -5710,13 +5710,15 @@ struct CrossFileNse {
 /// over the snapshot's TRIMMED neighborhood subgraph
 /// (`snapshot.cross_file_graph`). Sharing that helper with
 /// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]
-/// (which runs it over the FULL graph) makes the two the exact directed inverse
-/// of each other by construction: for any `D ∈ S(uri)`, editing `D` already
-/// revalidates `uri`, so collection and revalidation stay consistent. Computing
-/// over the trimmed subgraph (rather than
-/// the full graph) restricts members to the neighborhood, so every member is read
-/// from `metadata_map`; a member absent from it (an unresolved / missing-file
-/// node) simply contributes nothing — it has no declarations.
+/// (which runs it over the FULL graph) gives the two the **identical traversal
+/// shape**, so they can no longer drift in edge-selection logic. They are the
+/// directed inverse of each other when the budgets match and modulo the
+/// deliberate trimmed-vs-full graph asymmetry: for any `D ∈ S(uri)` within the
+/// trimmed neighborhood, editing `D` already revalidates `uri`. Computing over
+/// the trimmed subgraph (rather than the full graph) restricts members to the
+/// neighborhood, so every member is read from `metadata_map`; a member absent
+/// from it (an unresolved / missing-file node) simply contributes nothing — it
+/// has no declarations.
 ///
 /// Because the trimmed subgraph is the bounded (`max_chain_depth` /
 /// `max_transitive_dependents_visited`) neighborhood, propagation is likewise
@@ -5744,12 +5746,13 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     // ∪ {uri})`, shared with
     // `compute_affected_dependents_after_edit` via
     // `DependencyGraph::revalidation_consistent_set` so collection and
-    // revalidation are the exact directed inverse of each other by construction.
-    // The helper does not exclude `uri` or dedup across its two halves; we apply
-    // the collection-side post-processing (drop self, sort, dedup) here.
+    // revalidation use the identical traversal shape (full directed-inverse
+    // equivalence also requires matching budgets + the safe trimmed-vs-full graph
+    // asymmetry — see the helper's doc). The helper does not exclude `uri` or
+    // dedup across its two halves; we apply the collection-side post-processing
+    // (drop self, sort, dedup) here.
     let mut members: Vec<Url> = graph
         .revalidation_consistent_set(uri, max_depth, max_visited)
-        .into_iter()
         .filter(|u| u != uri)
         .collect();
     members.sort();

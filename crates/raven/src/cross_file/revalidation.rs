@@ -487,10 +487,15 @@ pub fn invalidate_children_on_parent_wd_change(
 ///    even though they are not directly connected in the graph.
 ///
 /// Sharing [`DependencyGraph::revalidation_consistent_set`] with
-/// [`crate::handlers::collect_cross_file_nse`] makes this function and NSE/func
-/// collection the exact directed inverse of each other by construction (see the
-/// helper's doc and CLAUDE.md "Cross-file `# raven: nse` / `# raven: func`
-/// propagation").
+/// [`crate::handlers::collect_cross_file_nse`] gives this function and NSE/func
+/// collection the **identical traversal shape**, so they can no longer drift in
+/// edge-selection logic. The full directed-inverse equivalence additionally
+/// relies on both callers passing matching `max_depth` / `max_visited` budgets
+/// and on the deliberate graph asymmetry — revalidation here runs over the FULL
+/// graph, collection over the TRIMMED subgraph. That asymmetry is safe-direction
+/// (`S_trimmed ⊆ S_full`): collection can only omit a foreign suppression, never
+/// drop a needed revalidation. See the helper's doc and CLAUDE.md "Cross-file
+/// `# raven: nse` / `# raven: func` propagation".
 ///
 /// Returns deduplicated URIs filtered through `is_open`; never includes
 /// `edited_uri` itself. Returns an empty vec if neither `interface_changed`
@@ -534,7 +539,9 @@ where
     //     the revalidation-consistent set — the directed inverse of the
     //     NSE/func collection set in `collect_cross_file_nse`. Both build their
     //     working set from `DependencyGraph::revalidation_consistent_set`, so the
-    //     two stay consistent by construction. The helper returns ancestors
+    //     two share the identical traversal shape (full equivalence also needs
+    //     matching budgets + the safe trimmed-vs-full graph asymmetry — see the
+    //     helper's doc). The helper returns ancestors
     //     first then descendants and does NOT exclude `edited_uri`; `push_if_new`
     //     dedups via the shared `seen` set and drops `edited_uri` / unopened
     //     files, matching the historical two-loop behavior exactly.
