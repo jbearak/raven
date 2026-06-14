@@ -568,19 +568,50 @@ pub enum SymbolKind {
 }
 
 /// A symbol with its definition location
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// `PartialEq`/`Hash` are hand-written below and deliberately EXCLUDE
+// `defined_end_column` (it is positional metadata, not identity — two symbols
+// that differ only in their highlight width are the same binding for cache /
+// dedup purposes). They preserve the pre-existing field sets exactly:
+// `PartialEq` compares every other field (including `signature`); `Hash`
+// omits `signature`. That asymmetry is sound — equal values still hash equal —
+// and is intentionally left unchanged here.
+#[derive(Debug, Clone, Eq)]
 pub struct ScopedSymbol {
     pub name: Arc<str>,
     pub kind: SymbolKind,
     pub source_uri: Url,
     /// 0-based line of definition
     pub defined_line: u32,
-    /// 0-based UTF-16 column of definition
+    /// 0-based UTF-16 column of definition (start of the definition token)
     pub defined_column: u32,
+    /// 0-based UTF-16 column one past the end of the definition token — the
+    /// go-to-definition highlight end. For an assignment def this is
+    /// the LHS (or `->` RHS) token's true end, so a backtick-quoted name like
+    /// `` `my fn` `` (stored bare as `my fn`, but anchored at the opening
+    /// backtick) highlights its full 7-column source span rather than the
+    /// 5-column bare name. For symbols with no source token (synthetic /
+    /// package / directive / test) it is the behavior-preserving
+    /// `defined_column + utf16_len(name)`. EXCLUDED from `PartialEq`/`Hash`.
+    pub defined_end_column: u32,
     pub signature: Option<String>,
     /// Whether this symbol was declared via `# raven: var` or `# raven: func`
     /// directive (as opposed to being statically detected from code)
     pub is_declared: bool,
+}
+
+impl PartialEq for ScopedSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        // Excludes `defined_end_column` (positional metadata). Matches the
+        // pre-existing derived field set otherwise — including `signature`.
+        self.name == other.name
+            && self.kind == other.kind
+            && self.source_uri == other.source_uri
+            && self.defined_line == other.defined_line
+            && self.defined_column == other.defined_column
+            && self.signature == other.signature
+            && self.is_declared == other.is_declared
+    }
 }
 
 impl Hash for ScopedSymbol {
@@ -1270,6 +1301,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &top_level,
         &loaded_packages,
         &[],
+        &[],
         &removal_refs,
         &data_loads,
     );
@@ -1409,6 +1441,7 @@ pub fn compute_artifacts_with_metadata(
                 source_uri: uri.clone(),
                 defined_line: decl.line,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
                 signature: None,
                 is_declared: true,
             };
@@ -1431,6 +1464,7 @@ pub fn compute_artifacts_with_metadata(
                 source_uri: uri.clone(),
                 defined_line: decl.line,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
                 signature: None,
                 is_declared: true,
             };
@@ -1569,10 +1603,14 @@ pub fn compute_artifacts_with_metadata(
     // function-local rename never invalidates dependents that source this file.
     let top_level = top_level_interface(&artifacts);
     let data_loads = extract_top_level_data_loads(&artifacts.timeline);
+    let nse_decls: &[super::types::NseDeclaration] = metadata
+        .map(|m| m.nse_declarations.as_slice())
+        .unwrap_or(&[]);
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
         &declared_symbols,
+        nse_decls,
         &removal_refs,
         &data_loads,
     );
@@ -1800,6 +1838,7 @@ where
                 source_uri: base_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                 signature: None,
                 is_declared: false,
             },
@@ -1927,6 +1966,7 @@ where
 
                             if should_insert {
                                 let name: Arc<str> = Arc::from(export_name);
+                                let defined_end_column = crate::utf16::utf16_len(&name);
                                 scope.symbols.insert(
                                     name.clone(),
                                     ScopedSymbol {
@@ -1935,6 +1975,7 @@ where
                                         source_uri: package_uri.clone(),
                                         defined_line: 0,
                                         defined_column: 0,
+                                        defined_end_column,
                                         signature: None,
                                         is_declared: false,
                                     },
@@ -2753,6 +2794,8 @@ fn extract_parameter_symbol(
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
                         defined_column: column,
+                        defined_end_column: column
+                            + crate::utf16::utf16_len(node_text(child, line_index.text)),
                         signature: None,
                         is_declared: false,
                     });
@@ -2767,6 +2810,7 @@ fn extract_parameter_symbol(
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
                         defined_column: column,
+                        defined_end_column: column + crate::utf16::utf16_len("..."),
                         signature: None,
                         is_declared: false,
                     });
@@ -2786,6 +2830,8 @@ fn extract_parameter_symbol(
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
+                defined_end_column: column
+                    + crate::utf16::utf16_len(node_text(param_node, line_index.text)),
                 signature: None,
                 is_declared: false,
             });
@@ -2802,6 +2848,7 @@ fn extract_parameter_symbol(
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len("..."),
                 signature: None,
                 is_declared: false,
             });
@@ -2872,6 +2919,7 @@ fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Opt
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -2934,6 +2982,7 @@ fn try_extract_delayed_assign_call(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3069,6 +3118,7 @@ fn try_extract_global_variables_definitions(
                 source_uri: uri.clone(),
                 defined_line: line,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len(name_str),
                 signature: None,
                 is_declared: false,
             });
@@ -3164,6 +3214,7 @@ fn try_extract_env_bind_definitions(
                 source_uri: uri.clone(),
                 defined_line: line,
                 defined_column: column,
+                defined_end_column: column + crate::utf16::utf16_len(name),
                 signature: None,
                 is_declared: false,
             });
@@ -3229,6 +3280,7 @@ fn try_extract_set_generic_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3302,6 +3354,7 @@ fn try_extract_text_connection_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(name_str),
         signature: None,
         is_declared: false,
     })
@@ -3360,6 +3413,7 @@ fn try_extract_literal_load_call_definition(
         source_uri: uri.clone(),
         defined_line: line,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(stem),
         signature: None,
         is_declared: false,
     };
@@ -3463,6 +3517,7 @@ fn try_extract_data_call_definitions(
             source_uri: uri.clone(),
             defined_line: line,
             defined_column: column,
+            defined_end_column: column + crate::utf16::utf16_len(name),
             signature: None,
             is_declared: false,
         });
@@ -3551,6 +3606,7 @@ fn try_extract_for_loop_iterator(
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: column + crate::utf16::utf16_len(node_text(var_node, line_index.text)),
         signature: None,
         is_declared: false,
     })
@@ -3596,6 +3652,11 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         let start = rhs.start_position();
         let line_text = line_index.get_line(start.row);
         let column = byte_offset_to_utf16_column(line_text, start.column);
+        // Highlight end = the RHS name token's true end (issue #459 / I-B2): a
+        // backtick-quoted name is stored bare (`my fn`) but anchored at the
+        // opening backtick, so the bare width would under-cover the source span.
+        let end = rhs.end_position();
+        let end_column = byte_offset_to_utf16_column(line_index.get_line(end.row), end.column);
 
         return Some(ScopedSymbol {
             name: Arc::from(name_str),
@@ -3603,6 +3664,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
             source_uri: uri.clone(),
             defined_line: start.row as u32,
             defined_column: column,
+            defined_end_column: end_column,
             signature,
             is_declared: false,
         });
@@ -3637,6 +3699,12 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
     let start = lhs.start_position();
     let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
+    // Highlight end = the LHS name token's true end (issue #459 / I-B2): a
+    // backtick-quoted name is stored bare (`my fn`) but `defined_column` points
+    // at the opening backtick, so `defined_column + utf16_len(name)` would cover
+    // only the bare inner name. Carry the token's actual end column instead.
+    let end = lhs.end_position();
+    let end_column = byte_offset_to_utf16_column(line_index.get_line(end.row), end.column);
 
     Some(ScopedSymbol {
         name: Arc::from(name_str),
@@ -3644,6 +3712,7 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        defined_end_column: end_column,
         signature,
         is_declared: false,
     })
@@ -3750,6 +3819,12 @@ fn destructuring_symbol_from_identifier(
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
+        // Highlight end = the token's true end (issue #459 / I-B2): a
+        // backtick-quoted destructuring target is stored bare (`my var`) but
+        // `defined_column` anchors at the opening backtick, so the bare width
+        // would under-cover the source span. Use the real token width, matching
+        // the parameter / for-loop sibling sites.
+        defined_end_column: column + crate::utf16::utf16_len(node_text(node, line_index.text)),
         signature: None,
         is_declared: false,
     })
@@ -3897,7 +3972,12 @@ fn assignment_rhs_is_function_definition(node: Node, line_index: &LineIndex) -> 
 /// me the function node so I can extract its signature", we strip them.
 ///
 /// Returns `None` for non-function nodes.
-fn unwrap_function_definition(node: Node) -> Option<Node> {
+///
+/// Shared (issue #459, SC1): `parameter_resolver` resolves cross-file/current-
+/// file function signatures and needs the same paren-unwrapping for its
+/// right-assignment branches, so this is the single source of truth rather than
+/// a verbatim copy. Pure tree-sitter `Node` walker — no scope/state coupling.
+pub(crate) fn unwrap_function_definition(node: Node) -> Option<Node> {
     let mut current = node;
     loop {
         match current.kind() {
@@ -4088,6 +4168,7 @@ fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
+    nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
 ) -> u64 {
@@ -4120,6 +4201,33 @@ fn compute_interface_hash(
         decl.name.hash(&mut hasher);
         decl.is_function.hash(&mut hasher);
         decl.line.hash(&mut hasher);
+        // Issue #460 Gap B: a `# raven: func` declaration's formal ORDER feeds
+        // cross-file NSE positional matching in dependents, so a formal-list
+        // change must invalidate them even when name/is_function/line are equal.
+        decl.formals.hash(&mut hasher);
+    }
+
+    // Include `# raven: nse` declarations (issue #460 Gap A). These govern
+    // undefined-variable suppression in every connected file in the source
+    // graph, so adding / removing / reshaping / reordering one must invalidate
+    // dependents. `line` is included because file-level cross-file propagation
+    // keeps the highest-line declaration per callee, so a pure reorder changes
+    // the propagated winner. `NseDeclaration`/`NseScope` are not `Hash`-derived,
+    // so the scope is hashed by discriminant + formals (mirroring the
+    // field-by-field approach used for declared symbols above).
+    let mut sorted_nse: Vec<_> = nse_declarations.iter().collect();
+    sorted_nse.sort_by_key(|d| (&d.name, &d.package, d.line));
+    for decl in sorted_nse {
+        decl.name.hash(&mut hasher);
+        decl.package.hash(&mut hasher);
+        decl.line.hash(&mut hasher);
+        match &decl.scope {
+            super::types::NseScope::WholeCall => 0u8.hash(&mut hasher),
+            super::types::NseScope::Formals(formals) => {
+                1u8.hash(&mut hasher);
+                formals.hash(&mut hasher);
+            }
+        }
     }
 
     // Include top-level rm()/remove() events (sorted for determinism).
@@ -4213,6 +4321,7 @@ fn expand_data_load(
                     source_uri: package_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(obj.as_str()),
                     signature: None,
                     is_declared: false,
                 },
@@ -4930,6 +5039,7 @@ where
                     source_uri: base_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                     signature: None,
                     is_declared: false,
                 },
@@ -5771,6 +5881,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5805,6 +5916,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5820,6 +5932,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5835,6 +5948,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5850,6 +5964,7 @@ pub(crate) fn append_package_contribution(
                     source_uri: pkg_uri.clone(),
                     defined_line: 0,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                     signature: None,
                     is_declared: false,
                 });
@@ -5878,6 +5993,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5894,6 +6010,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5910,6 +6027,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5926,6 +6044,7 @@ pub(crate) fn append_package_contribution(
                 source_uri: pkg_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                 signature: None,
                 is_declared: false,
             });
@@ -5983,6 +6102,7 @@ pub(crate) fn append_package_contribution(
                         source_uri: pkg_uri.clone(),
                         defined_line: 0,
                         defined_column: 0,
+                        defined_end_column: crate::utf16::utf16_len(sym.as_str()),
                         signature: None,
                         is_declared: false,
                     });
@@ -6857,6 +6977,7 @@ where
                 source_uri: pkg_uri,
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(name),
                 signature: None,
                 is_declared: false,
             });
@@ -7327,6 +7448,7 @@ fn seed_base_exports(frame: &mut ScopeFrame, base_exports: &HashSet<String>) {
                 source_uri: base_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(export_name.as_str()),
                 signature: None,
                 is_declared: false,
             },
@@ -7480,6 +7602,93 @@ mod tests {
         assert_ne!(
             ha, hb,
             "renaming a top-level export must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap A: a `# raven: nse` directive participates in cross-file
+    /// suppression, so adding one must change the interface hash (else dependents
+    /// that propagate it would never be revalidated).
+    #[test]
+    fn interface_hash_changes_when_nse_directive_added() {
+        let a = "nrow(x)\n";
+        let b = "# raven: nse: nrow\nnrow(x)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "adding a # raven: nse directive must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap A: two declarations for the same callee; swapping their
+    /// lines changes which is "last" under file-level cross-file collapse, so
+    /// dependents must be revalidated — hence `line` is part of the NSE hash.
+    #[test]
+    fn interface_hash_changes_when_nse_directive_reordered() {
+        let a = "# raven: nse f(x)\n# raven: nse f(y)\nf(1)\n";
+        let b = "# raven: nse f(y)\n# raven: nse f(x)\nf(1)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "reordering same-callee NSE directives must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap B: a `# raven: func` declaration's formal ORDER feeds
+    /// cross-file NSE positional matching, so reordering its formals must change
+    /// the interface hash even though name/is_function/line are unchanged.
+    #[test]
+    fn interface_hash_changes_when_func_formals_reordered() {
+        let a = "# raven: func g(a, b)\n";
+        let b = "# raven: func g(b, a)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "reordering # raven: func formals must change interface_hash"
         );
     }
 
@@ -8961,6 +9170,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("declared_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -9003,6 +9213,7 @@ outside_var <- 2"#;
                 name: "declared_var".to_string(),
                 line: 0,
                 is_function: false,
+                formals: None,
             }],
             ..Default::default()
         };
@@ -9086,6 +9297,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("before_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -9099,6 +9311,7 @@ outside_var <- 2"#;
                 source_uri: parent_uri.clone(),
                 defined_line: 2,
                 defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len("after_var"),
                 signature: None,
                 is_declared: true,
             },
@@ -9142,11 +9355,13 @@ outside_var <- 2"#;
                     name: "before_var".to_string(),
                     line: 0,
                     is_function: false,
+                    formals: None,
                 },
                 DeclaredSymbol {
                     name: "after_var".to_string(),
                     line: 2,
                     is_function: false,
+                    formals: None,
                 },
             ],
             ..Default::default()
@@ -10323,6 +10538,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 1,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("x"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10339,6 +10555,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 5,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("y"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10454,6 +10671,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 1,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("x"),
                     signature: None,
                     is_declared: false,
                 },
@@ -10554,6 +10772,7 @@ outside_var <- 2"#;
                     source_uri: uri.clone(),
                     defined_line: 2,
                     defined_column: 0,
+                    defined_end_column: crate::utf16::utf16_len("y"),
                     signature: None,
                     is_declared: false,
                 },

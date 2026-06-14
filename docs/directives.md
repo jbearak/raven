@@ -147,6 +147,142 @@ Declaration directives work in any R file, whether or not it participates in cro
 # @lsp-func myfunc                # alias (every synonym also has an @lsp- form)
 ```
 
+`# raven: func` can also declare a formal list alongside the symbol, which records the order of parameters for use by `# raven: nse` positional matching (see below). You can paste a real signature — `= default` suffixes are dropped, keeping just the formal names:
+
+```r
+# raven: func my_func(data, x, y)        # declares existence + formal order
+# raven: func my_func(data, x = NULL)    # defaults are stripped → data, x
+# raven: func pkg::my_func(data, x)      # qualified form
+# raven: func "my data fn"               # quote a name with spaces / special chars
+```
+
+The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — including dotted names like `make.names`, since `.` is a normal identifier character in R. Only a name containing characters *outside* `[A-Za-z0-9._]` (names with spaces, replacement functions like `` `dim<-` ``) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
+
+### NSE Declarations
+
+Teach Raven that a function uses non-standard evaluation (NSE), so bare
+identifiers in its captured arguments are not flagged as undefined variables.
+
+```r
+# raven: nse my_func              # whole-call: every argument is NSE
+# raven: nse my_func(x)           # only the `x` formal is captured
+# raven: nse my_func(x, y)        # `x` and `y` are captured
+# raven: nse my_func(...)         # arguments absorbed by `...` are captured
+# raven: nse pkg::my_func(x, y)   # qualified form
+# raven: nse "my data fn"(x)      # quote a name with spaces (called `my data fn`(x))
+# @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
+```
+
+As with `# raven: func`, the callee name accepts a bare `name` or a single
+`pkg::name` qualifier unquoted; a name with characters outside `[A-Za-z0-9._]`
+(e.g. spaces) must use the quoted form. The NSE policy is consulted only for
+ordinary `callee(args)` calls, so it cannot apply to operators (`a %+% b` is not
+a call). An operator name contains characters outside `[A-Za-z0-9._]`, so it
+would have to use the quoted form (`# raven: nse "%+%"`) to parse at all — and
+even then it is inert, because operator calls are not `callee(args)` calls.
+
+A literal `...` in the captured list declares that the arguments a call passes
+through the function's `...` are captured (checked formals before `...` are
+still verified). Combine it with named formals, e.g. `# raven: nse my_func(x, ...)`.
+
+`# raven: nse` is position-aware: it applies to calls **after** the directive
+line, and the most recent declaration for a function wins. It is an
+authoritative declaration that overrides Raven's own inference for that callee —
+but it is **not** a blanket diagnostic ignore: it declares a reusable
+argument-evaluation policy for the named function. An *unqualified* declaration
+overrides even a local `name <- function(...)` definition's inferred policy
+(R calls the named binding, and you are declaring how it evaluates its
+arguments); a *qualified* one yields to a local binding of the bare name, as
+below.
+
+A qualified declaration (`pkg::my_func`) matches both `pkg::my_func(...)` calls
+and unqualified `my_func(...)` calls when `pkg` is in scope (loaded via
+`library()` or package imports) — except when a local binding shadows the bare
+name, since R would then invoke the local value rather than `pkg::my_func`.
+
+#### `# raven: nse` is deliberately coarse
+
+`# raven: nse` is a file-level, name-keyed, authoritative override. Apart from
+the position-awareness of the directive line itself (it governs calls *after*
+it), it is intentionally **not**:
+
+- **Scope-aware.** It applies to every call of the named function in the file,
+  including calls inside nested function bodies that locally rebind the name — a
+  nested helper sharing a top-level name is still governed by the file-level
+  directive, not its inner definition.
+- **`library()`-position-aware.** Whether a `pkg::` qualifier's package is "in
+  scope" is judged file-wide, so a qualified declaration can govern a bare call
+  even if the matching `library(pkg)` appears later in the file.
+- **Arity- or signature-aware.** It does not validate the captured formals
+  against the callee's real definition. In particular, `# raven: nse f(...)`
+  captures a call's trailing arguments even if `f` does not actually declare a
+  `...` formal.
+
+This is by design: the directive is an opt-in escape hatch where you take
+responsibility for declaring an accurate policy. It **replaces** Raven's own
+inference for the named callee rather than merely adding to it, so an inaccurate
+or stale directive cuts both ways — one *broader* than the real NSE behavior
+hides diagnostics you may have wanted, while one *narrower* than Raven's own
+inference (for example declaring a partial capture on a function Raven already
+recognizes as data-masking) can re-surface diagnostics it would otherwise have
+suppressed.
+
+Named arguments are matched by formal name regardless of order. For
+**positional** arguments Raven needs the formal order, which it reads from a
+visible local definition or from a paired `# raven: func` declaration:
+
+```r
+# raven: func my_func(data, x, y)   # declares existence + formal order
+# raven: nse my_func(x, y)          # declares which formals are captured
+my_func(df, col_a, col_b)           # col_a, col_b suppressed; df checked
+```
+
+Installed-package functions expose only export names (not formals) to the
+synchronous diagnostic pass, so positional matching for an installed-package
+callee also requires a paired `# raven: func` with formals.
+
+#### `# raven: nse` propagates across the source graph
+
+A `# raven: nse` declaration governs matching call sites in **every file
+connected to it through the resolved `source()` graph** — not just the file that
+physically contains it. So you can declare a helper's NSE contract next to its
+`library()` call, its definition, or in a sourced setup file, and it suppresses
+the corresponding false positives wherever the helper is called. Propagation
+works in both directions and transitively:
+
+```r
+# setup.R
+library(arm)
+# raven: nse: lmer
+
+# analysis.R
+source("setup.R")
+lmer(undefined_var)   # `undefined_var` suppressed — lmer is declared NSE in setup.R
+```
+
+Cross-file propagation is intentionally **coarse and file-level**: a propagated
+declaration ignores its original line in the other file and governs the whole
+connected file. Within the file that *physically contains* the directive, the
+usual position-aware, latest-wins behavior still applies, and an own directive
+takes precedence over one propagated from a connected file. A directive
+propagated from another file is consulted *below* the precise built-in policy
+tables, so it never coarsens a known verb (e.g. `dplyr::filter`) — it governs
+callees that would otherwise be checked as standard-eval (like `lmer`). Two
+unconnected files never share NSE directives. The context an NSE directive needs
+to resolve — the `library()` call, a `# raven: func` formal-order declaration —
+may live in any connected file and may appear before or after the directive.
+
+Propagation reuses the same dependency graph as cross-file scope analysis, so it
+honors the `# raven: cd` and workspace-root path-resolution rules and the
+`max_chain_depth` limit, and editing a directive in any connected file
+revalidates the dependents that rely on it. A propagated **per-formal** directive
+needs the callee's formal order from a `# raven: func` declaration in some
+connected file; without one it falls back to named-argument-only matching. A
+local `name <- function(...)` definition does **not** supply that order — a local
+binding *shadows* the propagated directive entirely (R would call the local
+value, so the local definition's own inferred policy applies instead), exactly as
+a local binding overrides a qualified `# raven: nse pkg::name`.
+
 ### Position-Aware Behavior
 
 Declared symbols are available starting from the next line (line N+1):

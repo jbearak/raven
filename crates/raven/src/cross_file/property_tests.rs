@@ -20058,6 +20058,7 @@ proptest! {
                 name: name.clone(),
                 line,
                 is_function: false,
+                formals: None,
             })
             .collect();
 
@@ -20069,6 +20070,7 @@ proptest! {
                 name: name.clone(),
                 line,
                 is_function: true,
+                formals: None,
             })
             .collect();
 
@@ -20145,11 +20147,13 @@ proptest! {
                 name: var_name.clone(),
                 line: var_line,
                 is_function: false,
+                formals: None,
             }],
             declared_functions: vec![DeclaredSymbol {
                 name: func_name.clone(),
                 line: func_line,
                 is_function: true,
+                formals: None,
             }],
             ..Default::default()
         };

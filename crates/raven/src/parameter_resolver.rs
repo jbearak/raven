@@ -516,8 +516,17 @@ fn resolve_from_cross_file(
 ) -> Option<FunctionSignature> {
     let scope = get_scope(state, uri, position);
 
-    // Look for the function in cross-file symbols
-    let symbol = scope.symbols.get(function_name)?;
+    // Look for the function in cross-file symbols. Issue #459: a cross-file
+    // scope entry is keyed either bare (a regular assignment def) or
+    // backtick-wrapped (a directive-declared non-syntactic symbol). Mirror
+    // go-to-definition: try the RAW spelling first, then the
+    // unconditionally-unquoted spelling, so a redundantly-quoted `` `f` `` and a
+    // required `` `my fn` `` both resolve to their stored binding.
+    let lookup_key = crate::handlers::unquote_backtick_name(function_name).unwrap_or(function_name);
+    let symbol = scope
+        .symbols
+        .get(function_name)
+        .or_else(|| scope.symbols.get(lookup_key))?;
 
     // Only consider function symbols from other files (not the current file,
     // which was already checked in Phase 1)
@@ -584,6 +593,14 @@ fn find_function_definition_before_position<'a>(
     best
 }
 
+/// Recursive helper for [`find_function_definition_before_position`].
+///
+/// Issue #459: definition names are matched against the *raw* AST node text
+/// (which carries backticks for a non-syntactic name), so both equality
+/// operands are run through `canonical_use_name`. That unions a redundantly
+/// backtick-quoted syntactic call (`` `f`(...) ``) with the bare `f <- function`
+/// definition while a genuinely non-syntactic def/use pair (`` `my fn` ``) keeps
+/// its required backticks and still matches.
 fn find_func_def_recursive<'a>(
     node: Node<'a>,
     function_name: &str,
@@ -591,6 +608,11 @@ fn find_func_def_recursive<'a>(
     position: tower_lsp::lsp_types::Position,
     best: &mut Option<Node<'a>>,
 ) {
+    // Match both left- (`<-`/`=`/`<<-`) and right-assignment (`->`/`->>`)
+    // definitions. In tree-sitter-r both are `binary_operator` nodes (there is
+    // no distinct `right_assignment` kind), so fetch the children and `op_text`
+    // ONCE and branch on the operator; the `op_text` guards keep the two arms
+    // mutually exclusive.
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
         // Filter extras (e.g., comments) so positional indexing is reliable
@@ -604,10 +626,12 @@ fn find_func_def_recursive<'a>(
             let op_text = node_text(op, text);
             if matches!(op_text, "<-" | "=" | "<<-")
                 && lhs.kind() == "identifier"
-                && node_text(lhs, text) == function_name
+                && crate::r_names::canonical_use_name(node_text(lhs, text))
+                    == crate::r_names::canonical_use_name(function_name)
                 && rhs.kind() == "function_definition"
             {
-                // Only consider definitions before the cursor position
+                // Left-assignment: `name <- function(...)`, name on the LHS.
+                // Only consider definitions before the cursor position.
                 let def_line = lhs.start_position().row as u32;
                 if def_line <= position.line {
                     // Take the last (nearest) definition before cursor
@@ -622,34 +646,28 @@ fn find_func_def_recursive<'a>(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Also check right-assignment: function_definition -> name
-    if node.kind() == "right_assignment" {
-        let mut cursor = node.walk();
-        // Filter extras (e.g., comments) so positional indexing is reliable
-        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-
-        if children.len() >= 3 {
-            let lhs = children[0]; // value (function_definition)
-            let rhs = children[2]; // name (identifier)
-
-            if rhs.kind() == "identifier"
-                && node_text(rhs, text) == function_name
-                && lhs.kind() == "function_definition"
+            } else if matches!(op_text, "->" | "->>")
+                && rhs.kind() == "identifier"
+                && crate::r_names::canonical_use_name(node_text(rhs, text))
+                    == crate::r_names::canonical_use_name(function_name)
+                && let Some(func) = crate::cross_file::scope::unwrap_function_definition(lhs)
             {
+                // Right-assignment: `(function(...)) -> name`, the mirror of the
+                // `<-` arm with the value on the LHS and the name on the RHS.
+                // The function value must be parenthesized (a bare
+                // `function(...) body -> name` parses with `-> name` *inside*
+                // the body), so the LHS is unwrapped through
+                // `parenthesized_expression` layers.
                 let def_line = rhs.start_position().row as u32;
                 if def_line <= position.line {
                     match best {
                         Some(prev) => {
                             if def_line >= prev.start_position().row as u32 {
-                                *best = Some(lhs);
+                                *best = Some(func);
                             }
                         }
                         None => {
-                            *best = Some(lhs);
+                            *best = Some(func);
                         }
                     }
                 }
@@ -665,7 +683,14 @@ fn find_func_def_recursive<'a>(
 
 /// Find a function definition at a specific line in the AST.
 ///
-/// Used for cross-file resolution where we know the exact line of the definition.
+/// Used for cross-file resolution where we know the exact line of the
+/// definition. Issue #459: like the sibling `find_func_def_recursive`, both
+/// equality operands are run through `canonical_use_name` so a redundantly
+/// backtick-quoted call (`` `f`(...) ``) matches a bare cross-file def
+/// (`f <- function`, stored bare by Seam A) while a genuinely non-syntactic
+/// def/use pair keeps its required backticks. `resolve_from_cross_file` passes
+/// the RAW (still-backticked) `function_name` here, so canonicalizing the call
+/// side is required for the bare-stored def node to match.
 fn find_function_definition_at_line<'a>(
     root: Node<'a>,
     function_name: &str,
@@ -688,6 +713,11 @@ fn find_func_def_at_line_recursive<'a>(
         return; // Already found
     }
 
+    // Match both left- (`<-`/`=`/`<<-`) and right-assignment (`->`/`->>`)
+    // definitions; both are `binary_operator` nodes in tree-sitter-r, so fetch
+    // the children and `op_text` ONCE and branch on the operator (the `op_text`
+    // guards keep the two arms mutually exclusive). Return on the first match at
+    // `target_line`.
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
         let children = crate::parser_pool::non_extra_children(node, &mut cursor);
@@ -700,31 +730,23 @@ fn find_func_def_at_line_recursive<'a>(
             let op_text = node_text(op, text);
             if matches!(op_text, "<-" | "=" | "<<-")
                 && lhs.kind() == "identifier"
-                && node_text(lhs, text) == function_name
+                && crate::r_names::canonical_use_name(node_text(lhs, text))
+                    == crate::r_names::canonical_use_name(function_name)
                 && rhs.kind() == "function_definition"
                 && lhs.start_position().row as u32 == target_line
             {
                 *result = Some(rhs);
                 return;
-            }
-        }
-    }
-
-    // Also check right-assignment
-    if node.kind() == "right_assignment" {
-        let mut cursor = node.walk();
-        let children = crate::parser_pool::non_extra_children(node, &mut cursor);
-
-        if children.len() >= 3 {
-            let lhs = children[0];
-            let rhs = children[2];
-
-            if rhs.kind() == "identifier"
-                && node_text(rhs, text) == function_name
-                && lhs.kind() == "function_definition"
+            } else if matches!(op_text, "->" | "->>")
+                && rhs.kind() == "identifier"
+                && crate::r_names::canonical_use_name(node_text(rhs, text))
+                    == crate::r_names::canonical_use_name(function_name)
                 && rhs.start_position().row as u32 == target_line
+                && let Some(func) = crate::cross_file::scope::unwrap_function_definition(lhs)
             {
-                *result = Some(lhs);
+                // Right-assignment: `(function(...)) -> name`, the value
+                // unwrapped through `parenthesized_expression` layers.
+                *result = Some(func);
                 return;
             }
         }
@@ -1149,6 +1171,258 @@ f(beta = 2)
         )
         .expect("later call resolves to a user signature");
         assert_eq!(names(late), vec!["beta"]);
+    }
+
+    /// Issue #459: a redundantly backtick-quoted *syntactic* callee resolves to
+    /// the bare current-file definition (the raw-AST-text match canonicalizes
+    /// both operands).
+    #[test]
+    fn backtick_quoted_syntactic_callee_resolves_current_file_signature() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///bt.R").unwrap();
+        let code = "f <- function(alpha, beta) alpha\n`f`(\n";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let sig = resolve_user_only(
+            &state,
+            "`f`",
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 3),
+        )
+        .expect("backtick-quoted syntactic callee must resolve to the bare def");
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    /// A genuinely non-syntactic backtick local definition is matched by a
+    /// backtick-quoted call (canonicalizing both operands keeps the required
+    /// backticks, so the backticked def still matches).
+    #[test]
+    fn backtick_quoted_nonsyntactic_callee_resolves_current_file_signature() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///bt2.R").unwrap();
+        let code = "`my fn` <- function(alpha) alpha\n`my fn`(\n";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let sig = resolve_user_only(
+            &state,
+            "`my fn`",
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 8),
+        )
+        .expect("non-syntactic backtick local must still resolve");
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha"]);
+    }
+
+    /// Issue #459 Phase-2 cross-file fallback (CC1/TC2): a redundantly
+    /// backtick-quoted callee `` `my_func`( `` whose definition lives in a
+    /// SEPARATE sourced file as a BARE `<-` def resolves its signature through
+    /// the cross-file scope. Phase 1 (current file) misses — the def isn't here
+    /// — so resolution reaches `resolve_from_cross_file`. Cross-file scope
+    /// stores the def under the bare `my_func` (Seam A strips backticks
+    /// unconditionally), so the raw `` `my_func` `` lookup misses and the
+    /// `lookup_key` (unconditionally unquoted) `.or_else` fallback resolves the
+    /// symbol. The def-node match in `find_function_definition_at_line` then
+    /// also canonicalizes both operands, so the RAW `` `my_func` `` matches the
+    /// bare `my_func <-` def node. Writing the lib def BARE (not backticked) is
+    /// load-bearing: a backticked def would coincidentally match on raw equality
+    /// and mask the at-line canonicalization bug.
+    #[test]
+    fn backtick_quoted_callee_resolves_cross_file_signature_via_lookup_key() {
+        use crate::state::Document;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let lib_uri = Url::parse("file:///workspace/lib.R").unwrap();
+
+        let main_code = "source(\"lib.R\")\n`my_func`(\n";
+        let lib_code = "my_func <- function(alpha, beta) alpha\n";
+
+        // Current file: a plain open document.
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+
+        // Sourced file: indexed with artifacts/metadata so the cross-file scope
+        // resolver can read its symbols.
+        let lib_doc = Document::new_with_uri(lib_code, None, &lib_uri);
+        let lib_metadata = Arc::new(crate::cross_file::extract_metadata(lib_code));
+        let lib_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &lib_uri,
+            lib_doc.tree.as_ref().expect("lib.R parses"),
+            lib_code,
+            Some(&lib_metadata),
+        ));
+        let entry = crate::workspace_index::IndexEntry {
+            contents: lib_doc.contents.clone(),
+            tree: lib_doc.tree.clone(),
+            loaded_packages: lib_doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: lib_code.len() as u64,
+                content_hash: None,
+            },
+            metadata: lib_metadata,
+            artifacts: lib_artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+
+        // Build the dependency edge main.R -> lib.R via `source("lib.R")`.
+        for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        // At the backticked call on line 1, Phase 1 misses (the def is in
+        // lib.R) and the Phase-2 `lookup_key` fallback resolves the bare-stored
+        // cross-file signature.
+        let sig = resolve_user_only(
+            &state,
+            "`my_func`",
+            &main_uri,
+            tower_lsp::lsp_types::Position::new(1, 3),
+        )
+        .expect("backticked cross-file callee must resolve via the Phase-2 lookup_key fallback");
+        assert!(
+            matches!(sig.source, SignatureSource::CrossFile { .. }),
+            "must resolve from the sourced file (Phase 2), not the current file"
+        );
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    /// Issue #459 coverage (TC1): the RIGHT-assignment branch of the *at-line*
+    /// cross-file lookup `find_func_def_at_line_recursive` (`(function(...)) ->
+    /// name`). A redundantly backtick-quoted callee `` `my_func`( `` whose
+    /// definition lives in a SEPARATE sourced file as a BARE `->` def must
+    /// resolve through the Phase-2 cross-file path. The only other cross-file
+    /// signature test uses `<-`, and both current-file `->` tests reach
+    /// `find_func_def_recursive`, not the at-line branch — so this is the only
+    /// test that reaches the at-line `->` branch with a bare def, where both
+    /// equality operands must be canonicalized for the bare def node to match
+    /// the backticked call name.
+    #[test]
+    fn backtick_quoted_callee_resolves_cross_file_right_assignment_bare_def() {
+        use crate::state::Document;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let lib_uri = Url::parse("file:///workspace/lib.R").unwrap();
+
+        let main_code = "source(\"lib.R\")\n`my_func`(\n";
+        let lib_code = "(function(alpha, beta) alpha) -> my_func\n";
+
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+
+        let lib_doc = Document::new_with_uri(lib_code, None, &lib_uri);
+        let lib_metadata = Arc::new(crate::cross_file::extract_metadata(lib_code));
+        let lib_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &lib_uri,
+            lib_doc.tree.as_ref().expect("lib.R parses"),
+            lib_code,
+            Some(&lib_metadata),
+        ));
+        let entry = crate::workspace_index::IndexEntry {
+            contents: lib_doc.contents.clone(),
+            tree: lib_doc.tree.clone(),
+            loaded_packages: lib_doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: lib_code.len() as u64,
+                content_hash: None,
+            },
+            metadata: lib_metadata,
+            artifacts: lib_artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+
+        for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let sig = resolve_user_only(
+            &state,
+            "`my_func`",
+            &main_uri,
+            tower_lsp::lsp_types::Position::new(1, 3),
+        )
+        .expect("backticked cross-file `->` callee must resolve via the Phase-2 at-line path");
+        assert!(
+            matches!(sig.source, SignatureSource::CrossFile { .. }),
+            "must resolve from the sourced file (Phase 2), not the current file"
+        );
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    /// Issue #459 coverage: the RIGHT-assignment branch of
+    /// `find_func_def_recursive` (`function(...) -> name`) canonicalizes both
+    /// the stored name and the call name, so a redundantly backtick-quoted
+    /// syntactic callee `` `f`( `` resolves to a `-> `f`` definition. No
+    /// existing test exercised the `->` branch, so this pins it.
+    #[test]
+    fn backtick_quoted_syntactic_callee_resolves_right_assignment_signature() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///rassign.R").unwrap();
+        let code = "(function(alpha, beta) alpha) -> `f`\n`f`(\n";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let sig = resolve_user_only(
+            &state,
+            "`f`",
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 3),
+        )
+        .expect("backtick-quoted syntactic callee must resolve to the `->` def");
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    /// A genuinely non-syntactic right-assignment definition (`-> `my fn``) is
+    /// matched by a backtick-quoted call (canonicalizing both operands keeps the
+    /// required backticks, so the backticked def still matches).
+    #[test]
+    fn backtick_quoted_nonsyntactic_callee_resolves_right_assignment_signature() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///rassign2.R").unwrap();
+        let code = "(function(alpha, beta) alpha) -> `my fn`\n`my fn`(\n";
+        state
+            .documents
+            .insert(uri.clone(), crate::state::Document::new(code, None));
+        let sig = resolve_user_only(
+            &state,
+            "`my fn`",
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 8),
+        )
+        .expect("non-syntactic right-assignment local must still resolve");
+        let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
     }
 
     // -- Comment between assignment and function definition --

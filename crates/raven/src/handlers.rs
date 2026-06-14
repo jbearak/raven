@@ -5655,6 +5655,184 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     packages
 }
 
+/// Foreign `# raven: nse` / `# raven: func` declarations propagated to `uri` from
+/// the files connected to it through the source graph (issue #460).
+struct CrossFileNse {
+    /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
+    nse: Vec<crate::cross_file::types::NseDeclaration>,
+    /// Every formals-bearing foreign `# raven: func` declaration (package
+    /// qualifier retained). Conflict resolution is deferred to
+    /// [`unanimous_declared_formals`], which matches by name+package and accepts
+    /// an order only when all matching declarations agree — so distinct qualified
+    /// functions sharing a bare name keep their own orders and `line` is never
+    /// compared across files.
+    funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
+}
+
+/// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
+///
+/// The propagation set is `S(uri) = ancestors ∪ descendants(ancestors ∪ {uri})`,
+/// computed over the snapshot's TRIMMED neighborhood subgraph
+/// (`snapshot.cross_file_graph`). This is the directed inverse of
+/// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]:
+/// for any `D ∈ S(uri)`, editing `D` already revalidates `uri`, so collection and
+/// revalidation stay consistent. Computing over the trimmed subgraph (rather than
+/// the full graph) restricts members to the neighborhood, so every member is read
+/// from `metadata_map`; a member absent from it (an unresolved / missing-file
+/// node) simply contributes nothing — it has no declarations.
+///
+/// Because the trimmed subgraph is the bounded (`max_chain_depth` /
+/// `max_transitive_dependents_visited`) neighborhood, propagation is likewise
+/// bounded: a declaration on an `S(uri)` member beyond the neighborhood bound
+/// (a source chain longer than the depth limit in an up-then-down shape) is not
+/// collected here even though editing it may revalidate `uri` over the full
+/// graph. This is the SAFE direction — `S_trimmed ⊆ S_full`, so it can only
+/// *miss* a suppression (leaving a real diagnostic), never add a wrong one — and
+/// matches the existing scope/in-play depth-bound behavior (default depth 20, so
+/// the bound never bites for the issue's required topologies).
+///
+/// Declarations are collapsed deterministically: members are visited in
+/// sorted-URI order, the first (smallest URI) file to set a key wins, and within
+/// one file the highest-line declaration wins (mirroring the within-file
+/// latest-wins rule, since a foreign file has no call site). This yields at most
+/// one foreign declaration per `(name, package)` (NSE) / bare `name` (func).
+fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
+    use std::collections::BTreeMap;
+
+    let graph = snapshot.cross_file_graph.as_ref();
+    let max_depth = snapshot.cross_file_config.max_chain_depth;
+    let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
+
+    let ancestors = graph.get_transitive_dependents(uri, max_depth, max_visited);
+    // `uri` first matches `compute_affected_dependents_after_edit`'s
+    // `once(edited).chain(ancestors)` convention, so the shared `max_visited`
+    // budget prioritizes the queried file's own subtree (and avoids cloning
+    // `ancestors`, which is reused for `members` below).
+    let descendants = graph.get_transitive_dependencies_multi_root(
+        std::iter::once(uri).chain(ancestors.iter()),
+        max_depth,
+        max_visited,
+    );
+
+    let mut members: Vec<Url> = ancestors
+        .into_iter()
+        .chain(descendants)
+        .filter(|u| u != uri)
+        .collect();
+    members.sort();
+    members.dedup();
+
+    // Per `(name, package)`: within a file the highest-line declaration wins
+    // (file-level intent); across files the smallest-URI declaration wins —
+    // EXCEPT that a narrower per-formal scope always beats a broader whole-call,
+    // even from a larger-URI file. NSE scope (unlike a `# raven: func` formal
+    // order) has a well-defined "less suppressive" choice, so on a cross-file
+    // whole-call-vs-per-formal conflict we keep the per-formal rather than risk a
+    // broad propagated whole-call masking an argument a connected file's narrower
+    // directive would keep checked. (Two differing per-formal scopes still resolve
+    // by smallest URI — both are explicit user captures.)
+    use crate::cross_file::types::NseScope;
+    let mut nse_chosen: BTreeMap<
+        (String, Option<String>),
+        (Url, crate::cross_file::types::NseDeclaration),
+    > = BTreeMap::new();
+    // All formals-bearing foreign `# raven: func` declarations, kept verbatim
+    // (package qualifier and all). Conflict resolution is deferred to
+    // `unanimous_declared_formals`, which matches by name+package via
+    // `declared_name_matches` and accepts an order only when every matching
+    // declaration agrees — so distinct qualified functions sharing a bare name
+    // (`pkgA::f` vs `pkgB::f`) keep their own orders (issue #460 review: a
+    // bare-name collapse here wrongly conflated them), genuinely-conflicting
+    // same-name+package orders fall back to safe named-only matching, and `line`
+    // is never compared across files.
+    let mut funcs: Vec<crate::cross_file::types::DeclaredSymbol> = Vec::new();
+    for m in &members {
+        let Some(meta) = snapshot.metadata_map.get(m) else {
+            continue;
+        };
+        for d in &meta.nse_declarations {
+            let key = (d.name.clone(), d.package.clone());
+            match nse_chosen.get(&key) {
+                None => {
+                    nse_chosen.insert(key, (m.clone(), d.clone()));
+                }
+                // Same file: latest line wins (file-level latest-wins).
+                Some((u, existing)) if u == m => {
+                    if d.line > existing.line {
+                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                    }
+                }
+                // Earlier (smaller-URI) file already chose: switch only if the new
+                // declaration is strictly LESS suppressive (per-formal beats the
+                // existing whole-call), so a broad propagated whole-call cannot
+                // mask args a narrower directive keeps checked.
+                Some((_, existing)) => {
+                    if matches!(existing.scope, NseScope::WholeCall)
+                        && matches!(d.scope, NseScope::Formals(_))
+                    {
+                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                    }
+                }
+            }
+        }
+        // Within a file, keep only the LATEST (highest-line) formals-bearing
+        // declaration per full callee name (`pkg::name` is distinct from bare
+        // `name`), mirroring the own-file latest-wins rule — so an obsolete
+        // earlier `# raven: func` line does not make `unanimous_declared_formals`
+        // see a same-file old/new pair as a cross-file conflict. Cross-file
+        // conflicts between the per-file winners are still resolved there.
+        let mut latest: BTreeMap<&str, &crate::cross_file::types::DeclaredSymbol> = BTreeMap::new();
+        for d in &meta.declared_functions {
+            if d.formals.is_none() {
+                continue;
+            }
+            match latest.get(d.name.as_str()) {
+                Some(prev) if prev.line >= d.line => {}
+                _ => {
+                    latest.insert(d.name.as_str(), d);
+                }
+            }
+        }
+        funcs.extend(latest.into_values().cloned());
+    }
+    CrossFileNse {
+        nse: nse_chosen.into_values().map(|(_, d)| d).collect(),
+        funcs,
+    }
+}
+
+/// The formal order a set of `# raven: func` declarations supplies for a
+/// per-formal NSE directive on `(name, package)`, resolved by UNANIMITY: every
+/// declaration matching via [`declared_name_matches`] must agree on the formal
+/// list, else `None` (the directive then falls back to safe named-only
+/// matching). Used for FOREIGN declarations collected across the source graph,
+/// where `line` is not comparable between files — so `declared_function_formals`'
+/// `max_by_key(line)` tie-break cannot apply. A bare-name query matching two
+/// distinct qualified functions with differing orders is correctly ambiguous; a
+/// package-qualified query only matches a same-package (or unqualified)
+/// declaration, so `pkgA::f` and `pkgB::f` never collide (issue #460).
+fn unanimous_declared_formals(
+    declared: &[crate::cross_file::types::DeclaredSymbol],
+    name: &str,
+    package: Option<&str>,
+) -> Option<Vec<String>> {
+    let mut chosen: Option<&Vec<String>> = None;
+    for d in declared {
+        let Some(formals) = d.formals.as_ref() else {
+            continue;
+        };
+        if !declared_name_matches(&d.name, name, package) {
+            continue;
+        }
+        match chosen {
+            None => chosen = Some(formals),
+            Some(prev) if prev == formals => {}
+            Some(_) => return None, // conflicting orders → ambiguous
+        }
+    }
+    chosen.cloned()
+}
+
 /// Issue #431: the name of the package under development, but only when the
 /// queried file (`uri`) belongs to that package's own tree (R/, tests,
 /// vignettes, man/rmd — anything [`crate::package_state::is_package_workspace_r_file`]
@@ -5709,6 +5887,21 @@ fn collect_undefined_variables_from_snapshot(
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
     let in_play_packages = collect_in_play_packages(snapshot, uri);
+    // Only walk the source graph for foreign NSE/func declarations when call-
+    // argument checking is on: with it off, `NseAnalysis::build` returns before
+    // it ever translates directives, so the declarations (and the two graph
+    // traversals + metadata clones that gather them) would be pure waste.
+    let cross_file_nse = if snapshot
+        .cross_file_config
+        .undefined_variable_in_call_arguments
+    {
+        collect_cross_file_nse(snapshot, uri)
+    } else {
+        CrossFileNse {
+            nse: Vec::new(),
+            funcs: Vec::new(),
+        }
+    };
     let nse_analysis = NseAnalysis::build(
         node,
         text,
@@ -5722,6 +5915,10 @@ fn collect_undefined_variables_from_snapshot(
         self_nse_package_for_file(snapshot, uri),
         Some(snapshot.package_library.as_ref()),
         Some(snapshot.base_exports.as_ref()),
+        &snapshot.directive_meta.nse_declarations,
+        &snapshot.directive_meta.declared_functions,
+        &cross_file_nse.nse,
+        &cross_file_nse.funcs,
     );
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
@@ -6214,15 +6411,8 @@ fn collect_undefined_variables_from_snapshot(
             })
             .map(|&(line, _col)| line);
 
-        let message = match forward_ref_defined_line {
-            Some(line) => format!(
-                "Undefined variable: {} (defined later on line {})",
-                name,
-                line + 1
-            ),
-            None => format!("Undefined variable: {}", name),
-        };
-
+        // A suppressed diagnostic is discarded below, so compute the (cheap but
+        // non-trivial) NSE discoverability hint only after the suppression check.
         if suppressed_line {
             if let Some(out) = suppressed_out.as_deref_mut() {
                 out.push((
@@ -6231,6 +6421,30 @@ fn collect_undefined_variables_from_snapshot(
                 ));
             }
             continue;
+        }
+
+        let mut message = match forward_ref_defined_line {
+            Some(line) => format!(
+                "Undefined variable: {} (defined later on line {})",
+                name,
+                line + 1
+            ),
+            None => format!("Undefined variable: {}", name),
+        };
+        if let Some((callee, formal)) = nse_hint_for_usage(usage_node, text, &nse_analysis) {
+            // The call is described by the source callee (`callee`, which keeps
+            // backticks for a non-syntactic name); the suggested directive uses
+            // the directive spelling (`dir`, which quotes a non-syntactic name)
+            // so the user can copy it verbatim.
+            let dir = callee_directive_form(&callee);
+            match formal {
+                Some(f) => message.push_str(&format!(
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: nse {dir}({f})`"
+                )),
+                None => message.push_str(&format!(
+                    ". If `{callee}()` captures this argument with non-standard evaluation, declare it with `# raven: func {dir}(<formals>)` and `# raven: nse {dir}(<nse-formals>)`"
+                )),
+            }
         }
 
         diagnostics.push(Diagnostic {
@@ -11563,6 +11777,69 @@ mod semantic_warning_pipeline_tests {
         );
     }
 
+    /// Issue #459 (Task 3): a redundantly backtick-quoted syntactic call
+    /// `` `my_func`() `` whose name is declared via `# raven: func` must not be
+    /// flagged "Undefined variable". The func-directive existence comparison
+    /// canonicalizes the backticked callee to the bare name the directive
+    /// declares (`canonical_use_name`, Seam B). Before that, the backticks made
+    /// the use-site key (`` `my_func` ``) miss the declared bare `my_func`.
+    #[test]
+    fn backtick_quoted_func_directive_callee_not_flagged_undefined() {
+        let code = "# raven: func my_func(x)\nresult <- `my_func`(1)\nother <- `undeclared_helper`(2)\nz <- totally_undefined_baseline\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        // Sanity: the baseline undefined symbol MUST still be flagged —
+        // otherwise the collector isn't running and the test is vacuous.
+        assert!(
+            messages.contains(&"Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must still flag; pipeline may not be firing. messages: {messages:?}"
+        );
+        // Control: a backtick-quoted call to an UNDECLARED function IS collected
+        // and flagged (its raw spelling keeps the backticks). This proves the
+        // callee position is inspected at all, so the `my_func` non-flagging
+        // below is a genuine resolution, not a vacuous "callees aren't checked".
+        assert!(
+            messages.contains(&"Undefined variable: `undeclared_helper`"),
+            "an undeclared backtick-quoted callee must still flag. messages: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("my_func")),
+            "backtick-quoted `my_func`() declared via `# raven: func` must not be \
+             flagged undefined. messages: {messages:?}"
+        );
+    }
+
+    /// Issue #459 (Task 3) regression tripwire: a NON-syntactic local definition
+    /// `` `my fn` <- function() {} `` used backticked `` `my fn`() `` must still
+    /// resolve. Canonicalizing the existence comparison must NOT strip the
+    /// required backticks of a non-syntactic name (which would key the lookup on
+    /// the bare `my fn` and lose the stored definition). This pins that the
+    /// Seam-A unconditional unquote (def stored bare, use unquoted bare) keeps
+    /// working unchanged alongside the Seam-B canonicalization.
+    #[test]
+    fn backtick_quoted_nonsyntactic_local_used_backticked_resolves() {
+        let code =
+            "`my fn` <- function() {}\nresult <- `my fn`()\nz <- totally_undefined_baseline\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must still flag; pipeline may not be firing. messages: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("my fn")),
+            "backtick-quoted non-syntactic local `my fn`() must still resolve to its \
+             local definition. messages: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     /// Build a snapshot for a `.Rmd` document with the opt-in lint master switch
     /// off, exercising the `params`-frontmatter recognition path. Wraps the
     /// shared file-level [`build_rmd_snapshot`] with a configure closure that
@@ -12709,6 +12986,42 @@ fn namespace_parts<'t>(node: Node<'t>, text: &'t str) -> Option<(&'t str, &'t st
     Some((node_text(lhs, text), node_text(rhs, text)))
 }
 
+/// A `# raven: nse` declaration resolved to an `ArgPolicy`, retaining the
+/// directive line (for position gating) and the optional package qualifier
+/// (for qualified/unqualified call matching).
+struct DirectiveNsePolicy {
+    /// 0-based directive line for own (current-file) entries; ignored (set to 0)
+    /// for file-level foreign entries. See `file_level`.
+    line: u32,
+    package: Option<String>,
+    policy: crate::nse::ArgPolicy,
+    /// True for a declaration propagated from another file in the source graph
+    /// (issue #460). A foreign entry governs the whole file and is never
+    /// position-gated by `line`; it is consulted at a lower precedence tier than
+    /// own directives, local definitions, and the built-in policy tables.
+    file_level: bool,
+}
+
+/// How a call site is qualified, for matching it against `# raven: nse`
+/// directives. A bare `name(...)` call is resolved in two passes so that an
+/// authoritative unqualified directive can override local inference, while a
+/// qualified directive only reaches a bare call once local shadowing has been
+/// ruled out (see [`resolve_call_arg_policy`]).
+enum CallQualifier<'a> {
+    /// Explicit `pkg::name(...)` call: matches a qualified directive for the
+    /// same package only.
+    Qualified(&'a str),
+    /// Bare `name(...)`: consider only an exact unqualified directive
+    /// (`# raven: nse name`). This is the authoritative override that beats
+    /// local definitions/aliases.
+    BareExact,
+    /// Bare `name(...)`: consider a qualified directive (`# raven: nse
+    /// pkg::name`) whose package is in play. Consulted only *after* local
+    /// definitions/aliases are ruled out, because a local binding — not the
+    /// package export — is what such a call actually invokes.
+    BareInPlayQualified,
+}
+
 /// Pre-computed inputs the undefined-variable collector needs to decide, per
 /// `call` / `subset` / `subset2`, which argument subtrees are NSE and should be
 /// suppressed (issue #398). All AST-derived facts are owned, so this carries no
@@ -12788,6 +13101,27 @@ pub(crate) struct NseAnalysis<'a> {
     package_library: Option<&'a crate::package_library::PackageLibrary>,
     /// Live base/builtin exports, consulted alongside `is_builtin`.
     base_exports: Option<&'a HashSet<String>>,
+    /// Per-callee NSE contracts declared via `# raven: nse` directives, already
+    /// translated to policies and resolved against available formal-order
+    /// sources (`# raven: func`, local definitions). Keyed by bare callee name;
+    /// each vec sorted ascending by directive line for position-gated lookup.
+    ///
+    /// `# raven: nse` is intentionally a coarse, file-level, name-keyed
+    /// authoritative override (see `docs/directives.md`). Apart from the
+    /// position-gating of the directive LINE (`own_directive_nse_policy` only
+    /// matches own declarations before the call line; foreign declarations
+    /// propagated from connected files are file-level — issue #460), it is
+    /// deliberately NOT scope-aware (it
+    /// governs every call of the name in the file, including nested rebindings),
+    /// NOT `library()`-position-aware (a `pkg::` qualifier's in-scope test is
+    /// file-wide), and NOT arity/signature-aware (it does not validate captured
+    /// formals against the callee's real definition). It REPLACES Raven's own
+    /// inference for the callee (consulted in `resolve_call_arg_policy` before the
+    /// built-in/verb policy tables), so an inaccurate directive cuts both ways: a
+    /// directive broader than the real NSE behavior hides diagnostics, while one
+    /// narrower than Raven's own inference can re-surface diagnostics the verb
+    /// tables would otherwise have suppressed. The user owns the accuracy.
+    directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -12811,6 +13145,10 @@ impl<'a> NseAnalysis<'a> {
         self_nse_package: Option<String>,
         package_library: Option<&'a crate::package_library::PackageLibrary>,
         base_exports: Option<&'a HashSet<String>>,
+        nse_declarations: &[crate::cross_file::types::NseDeclaration],
+        declared_functions: &[crate::cross_file::types::DeclaredSymbol],
+        foreign_nse_declarations: &[crate::cross_file::types::NseDeclaration],
+        foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
@@ -12822,10 +13160,36 @@ impl<'a> NseAnalysis<'a> {
         let mut reference_class_by_class = HashMap::new();
         let mut reference_class_method_functions = HashMap::new();
         let mut data_table_qualifier_seen = false;
+        // Names redefined within the file under two or more DIFFERENT formal
+        // orders (see [`FormalOrderTracker`]). `local_function_defs` is
+        // last-binding-wins, so a later redefinition with permuted parameters
+        // would otherwise lend its order to an earlier call's positional NSE
+        // matching and invert which slot is suppressed (hiding a real undefined
+        // variable). Enabled only when the result will actually be consulted:
+        // the directive-policy build that reads it (below) both requires
+        // `# raven: nse` directives AND is skipped by the `!call_args_enabled`
+        // early return, so gating on both lets a no-directive file — or one
+        // analyzed with call-argument checking off — skip the per-definition
+        // formal-name walk on the hot path.
+        //
+        // Issue #460: this gate is deliberately NOT widened to include
+        // `foreign_nse_declarations`. The tracker only guards the "borrow a local
+        // `name <- function(...)` order" branch of `to_policy`, and that branch is
+        // unreachable for a FOREIGN per-formal directive: a foreign directive
+        // resolves at tier 3.6 of `resolve_call_arg_policy`, which is reached only
+        // when no local definition of the callee exists (a local def resolves at
+        // step 1, before 3.6) — i.e. exactly when the local-order borrow would NOT
+        // fire. So a foreign-only file never consults this tracker, and enabling it
+        // there would only add the per-definition walk with no observable effect.
+        let mut formal_order = FormalOrderTracker {
+            enabled: call_args_enabled && !nse_declarations.is_empty(),
+            ..FormalOrderTracker::default()
+        };
         collect_nse_facts(
             root,
             text,
             &mut local_function_defs,
+            &mut formal_order,
             &mut local_callee_shadows,
             &mut local_callee_aliases,
             &mut data_table_objects,
@@ -12870,6 +13234,7 @@ impl<'a> NseAnalysis<'a> {
             reference_class_method_functions,
             package_library,
             base_exports,
+            directive_nse: HashMap::new(),
         };
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
@@ -12913,8 +13278,28 @@ impl<'a> NseAnalysis<'a> {
             // verb (`function(filter, ...) filter(d, ...)`) is the caller's
             // function, not the verb.
             let mut shadows = analysis.local_callee_shadows.clone();
-            potential_function_binding_names(body, text, &mut shadows);
-            shadows.extend(function_formal_names(*fn_def, text));
+            // Canonicalize shadow-set entries as they ENTER the set (issue
+            // #459): `body_forwards_dots_to_covered_verb` looks up its key via
+            // `canonical_use_name`, and `local_callee_shadows` is already stored
+            // canonical, so the body-binding and formal-name sources must match
+            // it — otherwise a redundantly backticked formal/binding named after
+            // a covered verb (`` function(`filter`, ...) `filter`(d, ...) ``)
+            // misses the shadow and the wrapper is wrongly upgraded. NOTE: the
+            // canonicalization is applied here, NOT inside `function_formal_names`
+            // itself, which also supplies backtick-significant formal ORDER to
+            // the directive NSE policy path.
+            let mut raw_bindings = HashSet::new();
+            potential_function_binding_names(body, text, &mut raw_bindings);
+            shadows.extend(
+                raw_bindings
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
+            shadows.extend(
+                function_formal_names(*fn_def, text)
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
             if body_forwards_dots_to_covered_verb(body, text, &analysis, &shadows) {
                 let (formals, captured) = match baseline {
                     Some((formals, captured)) => (formals.clone(), captured.clone()),
@@ -12931,7 +13316,196 @@ impl<'a> NseAnalysis<'a> {
             }
         }
         analysis.local_function_policies.extend(dots_upgrades);
+
+        // Translate `# raven: nse` declarations into per-callee policies,
+        // resolving formal order (for positional matching) from `# raven: func`
+        // declarations first, then visible local function definitions. When no
+        // order is available, fall back to named-only matching by placing "..."
+        // first so the positional pass suppresses nothing. Built only here, in
+        // the call-args-enabled path: when call arguments are blanket-suppressed
+        // the policies are never consulted, so the work is skipped via the
+        // `!call_args_enabled` early return above.
+        let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
+        // Translate one declaration into an `ArgPolicy`. Formal order (for
+        // positional per-formal matching) resolves OWN-first — own `# raven: func`,
+        // then a visible local `name <- function(...)` (bare names only,
+        // non-ambiguous), then a FOREIGN `# raven: func` propagated from a
+        // connected file (issue #460) — and finally named-only. Foreign order is
+        // consulted last via `unanimous_declared_formals`, which resolves by
+        // name+package agreement (not `max_by_key(line)`, since cross-file lines
+        // are not comparable) — so distinct qualified functions sharing a bare
+        // name keep their own orders. Shared by the own- and foreign-declaration
+        // loops below so both honor identical shaping (the `...`-boundary handling
+        // for captured-but-unordered names).
+        let to_policy = |decl: &crate::cross_file::types::NseDeclaration| -> crate::nse::ArgPolicy {
+            use crate::cross_file::types::NseScope;
+            match &decl.scope {
+                NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
+                NseScope::Formals(listed) => {
+                    let captured_dots = listed.iter().any(|c| c == "...");
+                    let captured: Vec<String> = listed
+                        .iter()
+                        .filter(|c| c.as_str() != "...")
+                        .cloned()
+                        .collect();
+                    let order = declared_function_formals(
+                        declared_functions,
+                        &decl.name,
+                        decl.package.as_deref(),
+                    )
+                    .or_else(|| {
+                        // Only a *bare* `# raven: nse name` may borrow a
+                        // visible local `name <- function(...)` signature.
+                        // A qualified `pkg::name` must not (local defs are
+                        // keyed by bare name). A name redefined under
+                        // conflicting orders is ambiguous → fall through.
+                        if decl.package.is_some() {
+                            return None;
+                        }
+                        if formal_order.is_ambiguous(&decl.name) {
+                            return None;
+                        }
+                        local_function_defs
+                            .get(&decl.name)
+                            .map(|def| function_formal_names(*def, text))
+                            .filter(|f| !f.is_empty())
+                    })
+                    // Issue #460: a foreign `# raven: func` from a connected
+                    // file supplies order when no own context does, resolved by
+                    // unanimity (no cross-file line comparison).
+                    .or_else(|| {
+                        unanimous_declared_formals(
+                            foreign_funcs,
+                            &decl.name,
+                            decl.package.as_deref(),
+                        )
+                    });
+                    match order {
+                        Some(mut formals) => {
+                            // Captured names absent from the resolved order may be
+                            // matched by NAME but must never bind a positional slot;
+                            // place them after a `...` boundary so the positional
+                            // pass stops before them.
+                            let missing: Vec<String> = captured
+                                .iter()
+                                .filter(|c| !formals.contains(*c))
+                                .cloned()
+                                .collect();
+                            if !missing.is_empty() {
+                                if !formals.iter().any(|f| f == "...") {
+                                    formals.push("...".to_string());
+                                }
+                                formals.extend(missing);
+                            }
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured,
+                                captured_dots,
+                            }
+                        }
+                        None => {
+                            let mut formals = vec!["...".to_string()];
+                            formals.extend(captured.iter().cloned());
+                            crate::nse::ArgPolicy::PerFormal {
+                                formals,
+                                captured,
+                                captured_dots,
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // Own (current-file) declarations: position-gated, latest-wins.
+        for decl in nse_declarations {
+            directive_nse
+                .entry(decl.name.clone())
+                .or_default()
+                .push(DirectiveNsePolicy {
+                    line: decl.line,
+                    package: decl.package.clone(),
+                    policy: to_policy(decl),
+                    file_level: false,
+                });
+        }
+        // Foreign declarations propagated from connected files (issue #460):
+        // file-level (no line gate), one per (name, package) after the collector's
+        // collapse. `line` is set to 0 (unused for file-level entries).
+        for decl in foreign_nse_declarations {
+            directive_nse
+                .entry(decl.name.clone())
+                .or_default()
+                .push(DirectiveNsePolicy {
+                    line: 0,
+                    package: decl.package.clone(),
+                    policy: to_policy(decl),
+                    file_level: true,
+                });
+        }
+        // Sort own entries by line (latest-wins via reverse scan); file-level
+        // foreign entries sort after own ones so the own-first lookup tier finds
+        // a position-applicable own directive before any foreign fallback.
+        for entries in directive_nse.values_mut() {
+            entries.sort_by_key(|e| (e.file_level, e.line));
+        }
+        analysis.directive_nse = directive_nse;
+
         analysis
+    }
+
+    /// Whether a directive entry's package qualifier matches a call's qualifier.
+    /// Shared by the own and foreign lookups so both resolve qualified/bare/in-play
+    /// calls identically:
+    /// - An unqualified directive matches only the `BareExact` pass (the
+    ///   authoritative override); never a qualified call, never the fallback pass.
+    /// - A qualified directive matches a same-package qualified call, or a bare
+    ///   call whose package is in play — the latter only on `BareInPlayQualified`.
+    fn qualifier_matches(&self, entry: &DirectiveNsePolicy, qualifier: &CallQualifier) -> bool {
+        match (&entry.package, qualifier) {
+            (None, CallQualifier::BareExact) => true,
+            (None, _) => false,
+            (Some(p), CallQualifier::Qualified(q)) => p == q,
+            (Some(p), CallQualifier::BareInPlayQualified) => {
+                self.in_play_packages.iter().any(|ip| ip == p)
+            }
+            (Some(_), CallQualifier::BareExact) => false,
+        }
+    }
+
+    /// The most recent OWN (current-file) `# raven: nse` policy applicable to a
+    /// call to `name` (optionally qualified) at `call_line`. Position-gated to
+    /// own declarations strictly before `call_line`; file-level foreign entries
+    /// are skipped here and handled by [`Self::foreign_directive_nse_policy`].
+    fn own_directive_nse_policy(
+        &self,
+        name: &str,
+        qualifier: CallQualifier,
+        call_line: u32,
+    ) -> Option<crate::nse::ArgPolicy> {
+        let entries = self.directive_nse.get(name)?;
+        entries
+            .iter()
+            .rev()
+            .find(|e| !e.file_level && e.line < call_line && self.qualifier_matches(e, &qualifier))
+            .map(|e| e.policy.clone())
+    }
+
+    /// A FOREIGN (propagated from a connected file) `# raven: nse` policy
+    /// applicable to a call to `name` (issue #460). File-level: not gated by any
+    /// line. The collector emits at most one foreign entry per `(name, package)`,
+    /// so the first match in deterministic order is the resolution. Consulted at
+    /// a lower precedence tier than own directives, local definitions, and the
+    /// built-in policy tables (see [`resolve_call_arg_policy`]).
+    fn foreign_directive_nse_policy(
+        &self,
+        name: &str,
+        qualifier: CallQualifier,
+    ) -> Option<crate::nse::ArgPolicy> {
+        let entries = self.directive_nse.get(name)?;
+        entries
+            .iter()
+            .find(|e| e.file_level && self.qualifier_matches(e, &qualifier))
+            .map(|e| e.policy.clone())
     }
 
     /// The data.table class of `name` as of byte `pos`, per the latest
@@ -12989,6 +13563,57 @@ impl<'a> NseAnalysis<'a> {
     }
 }
 
+/// Tracks whether each top-level function name has a single authoritative formal
+/// ORDER, so a bare `# raven: nse` borrow (which reads the last-binding-wins
+/// `local_function_defs`) can fall back to safe named-only matching when it does
+/// not. Without this, a later redefinition with permuted parameters would lend
+/// its order to an earlier call's positional matching and invert which slot is
+/// suppressed — hiding a real undefined variable.
+///
+/// Bundles the working `first_seen` map with the resulting `ambiguous` set so the
+/// invariant (compare every definition against the FIRST-seen order; a differing
+/// one marks the name ambiguous) lives in one place, and carries an `enabled`
+/// flag: the result is consulted only by the `directive_nse` build, which both
+/// requires `# raven: nse` directives AND is skipped when call-argument checking
+/// is off. So `enabled` is set to `call_args_enabled && !nse_declarations.is_empty()`
+/// and, when false, [`observe`](Self::observe) is a no-op that skips the
+/// per-definition formal-name walk on the hot diagnostics path. `first_seen`
+/// persists across alias / non-callable rebindings (which evict
+/// `local_function_defs`), so a `def → rebind → permuted-def` sequence is still
+/// detected.
+#[derive(Default)]
+struct FormalOrderTracker {
+    enabled: bool,
+    first_seen: HashMap<String, Vec<String>>,
+    ambiguous: HashSet<String>,
+}
+
+impl FormalOrderTracker {
+    /// Observe a top-level function definition's formal order, computed lazily so
+    /// the walk is skipped entirely when tracking is disabled. Marks the name
+    /// ambiguous if an earlier definition had a different order.
+    fn observe(&mut self, name: &str, formals: impl FnOnce() -> Vec<String>) {
+        if !self.enabled {
+            return;
+        }
+        let formals = formals();
+        if let Some(first) = self.first_seen.get(name) {
+            if *first != formals {
+                self.ambiguous.insert(name.to_string());
+            }
+        } else {
+            self.first_seen.insert(name.to_string(), formals);
+        }
+    }
+
+    /// Whether `name`'s positional formal order is ambiguous (defined more than
+    /// once with differing orders), in which case the directive borrow must fall
+    /// back to named-only matching.
+    fn is_ambiguous(&self, name: &str) -> bool {
+        self.ambiguous.contains(name)
+    }
+}
+
 /// Walk the tree gathering the facts [`NseAnalysis`] needs: top-level function
 /// definitions (their capture policies are inferred afterwards in
 /// [`NseAnalysis::build`]), top-level non-literal callee aliases/rebindings
@@ -13010,6 +13635,7 @@ fn collect_nse_facts<'t>(
     node: Node<'t>,
     text: &str,
     local_function_defs: &mut HashMap<String, Node<'t>>,
+    formal_order: &mut FormalOrderTracker,
     local_callee_shadows: &mut HashSet<String>,
     local_callee_aliases: &mut HashMap<String, LocalCalleeAlias>,
     data_table_objects: &mut HashSet<String>,
@@ -13051,6 +13677,17 @@ fn collect_nse_facts<'t>(
         && let Some(value) = assignment_value_node(node)
     {
         let name = node_text(target, text);
+        // Seam C storage key (issue #459). The callee-policy structures below
+        // are looked up at call sites by `resolve_call_arg_policy`, which keys
+        // on the call's `canonical_use_name`; storage and lookup MUST move
+        // together, so a redundantly backtick-quoted syntactic definition
+        // (`` `my_func` <- function(...) ``) is stored under the bare key the
+        // matching `` `my_func`() `` call will resolve to, while a genuinely
+        // non-syntactic name (`` `my fn` ``) keeps its required backticks on
+        // both sides. The data.table / reference-class object bookkeeping below
+        // intentionally stays on the raw `name`: those facts are looked up by
+        // raw object node_text, not via `canonical_use_name`.
+        let callee_name = crate::r_names::canonical_use_name(name);
         let value = unwrap_parenthesized(value);
         // Callee-binding bookkeeping for the NSE policy resolver (issue #450).
         // `local_function_defs`, `local_callee_aliases`, and the shadow set are
@@ -13060,22 +13697,28 @@ fn collect_nse_facts<'t>(
         // belongs to — so the structures never disagree about what `name` is.
         match classify_callee_binding(value, text) {
             Some(binding) => {
-                local_callee_shadows.insert(name.to_string());
+                local_callee_shadows.insert(callee_name.to_string());
                 match binding {
                     LocalCalleeBinding::Definition(def) => {
-                        local_function_defs.insert(name.to_string(), def);
-                        local_callee_aliases.remove(name);
+                        // Record this definition's formal order for the
+                        // positional-borrow ambiguity check (see
+                        // [`FormalOrderTracker`]). The formal-name walk is
+                        // computed lazily and skipped entirely when the file has
+                        // no `# raven: nse` directives.
+                        formal_order.observe(callee_name, || function_formal_names(def, text));
+                        local_function_defs.insert(callee_name.to_string(), def);
+                        local_callee_aliases.remove(callee_name);
                     }
                     LocalCalleeBinding::Alias(alias) => {
-                        local_callee_aliases.insert(name.to_string(), alias);
-                        local_function_defs.remove(name);
+                        local_callee_aliases.insert(callee_name.to_string(), alias);
+                        local_function_defs.remove(callee_name);
                     }
                 }
             }
             None => {
-                local_callee_shadows.remove(name);
-                local_function_defs.remove(name);
-                local_callee_aliases.remove(name);
+                local_callee_shadows.remove(callee_name);
+                local_function_defs.remove(callee_name);
+                local_callee_aliases.remove(callee_name);
             }
         }
         // Reference-class generators and data.table object classification are
@@ -13109,6 +13752,7 @@ fn collect_nse_facts<'t>(
             child,
             text,
             local_function_defs,
+            formal_order,
             local_callee_shadows,
             local_callee_aliases,
             data_table_objects,
@@ -13496,6 +14140,53 @@ fn function_formal_names(fn_def: Node, text: &str) -> Vec<String> {
     names
 }
 
+/// The declared formal order for the callee named by a `# raven: nse`
+/// declaration — bare `name`, optionally qualified by `package` — from the most
+/// recent matching `# raven: func …(formals…)` directive, if any. Formal order
+/// is a position-independent signature fact, so this is NOT gated on the
+/// directive's line relative to the `# raven: nse` it serves — a `# raven: func`
+/// works whether it precedes or follows the `# raven: nse`. A qualified
+/// `# raven: func pkg::name(...)` is stored under its full `pkg::name`, so the
+/// match is package-aware (see [`declared_name_matches`]): a `# raven: func`
+/// for a different package must not supply formals here.
+fn declared_function_formals(
+    declared_functions: &[crate::cross_file::types::DeclaredSymbol],
+    name: &str,
+    package: Option<&str>,
+) -> Option<Vec<String>> {
+    declared_functions
+        .iter()
+        .filter(|d| d.formals.is_some() && declared_name_matches(&d.name, name, package))
+        .max_by_key(|d| d.line)
+        .and_then(|d| d.formals.clone())
+}
+
+/// Whether a `# raven: func` declaration (its name possibly written
+/// `pkg::name`) pairs with a `# raven: nse` reference to bare callee `name`,
+/// optionally qualified by `package`. The bare names must match; and when
+/// **both** the declaration and the reference name a package, those packages
+/// must be equal — so `# raven: func otherpkg::foo(...)` never supplies the
+/// formal order for `# raven: nse pkg::foo(...)`. A missing qualifier on either
+/// side stays lenient (a bare `# raven: func foo` still serves a qualified nse,
+/// and vice versa).
+fn declared_name_matches(declared: &str, name: &str, package: Option<&str>) -> bool {
+    // `declared` is stored only after `is_well_formed_callee_name` (directive.rs)
+    // guarantees at most one `::` with colon-free halves, so this `rsplit_once`
+    // and the `split_once("::")` the parser/`split_callee_qualifier` use to STORE
+    // and look up the same name coincide on the single boundary. The split
+    // directions differ only as defence-in-depth; do not relax the well-formed
+    // screen without aligning all three on one direction.
+    let (decl_pkg, decl_name) = match declared.rsplit_once("::") {
+        Some((p, n)) => (Some(p), n),
+        None => (None, declared),
+    };
+    decl_name == name
+        && match (decl_pkg, package) {
+            (Some(dp), Some(np)) => dp == np,
+            _ => true,
+        }
+}
+
 /// True when the function declares a `...` formal — the allocation-free
 /// yes/no twin of [`function_formal_names`] for the hot paths that only need
 /// this one fact.
@@ -13805,13 +14496,20 @@ fn table_verb_policy(
     analysis: &NseAnalysis,
 ) -> Option<crate::nse::ArgPolicy> {
     if func.kind() == "namespace_operator" {
-        return namespace_parts(func, text)
-            .and_then(|(pkg, name)| crate::nse::package_policy(pkg, name));
+        // Canonicalize the bare `name` of `pkg::name` (issue #459) so a
+        // redundantly backtick-quoted `` pkg::`name` `` resolves the package
+        // policy; `namespace_parts` does not strip backticks. The package
+        // qualifier is left as-is.
+        return namespace_parts(func, text).and_then(|(pkg, name)| {
+            crate::nse::package_policy(pkg, crate::r_names::canonical_use_name(name))
+        });
     }
     if func.kind() != "identifier" {
         return None;
     }
-    let name = node_text(func, text);
+    // Canonicalize a redundantly backtick-quoted syntactic callee (issue #459)
+    // so the built-in policy tables, keyed on bare names, are reached.
+    let name = crate::r_names::canonical_use_name(node_text(func, text));
 
     // 2. A loaded/imported package's NSE policy shadows base.
     for pkg in &analysis.in_play_packages {
@@ -13905,7 +14603,14 @@ fn body_forwards_dots_to_covered_verb(
         let nested = function_formal_names(node, text);
         if !nested.is_empty() {
             let mut extended = shadows.clone();
-            extended.extend(nested);
+            // Canonicalize nested formals on entry (issue #459) to match the
+            // canonicalized lookup key; see the shadow-set construction in the
+            // dots-upgrade pass.
+            extended.extend(
+                nested
+                    .iter()
+                    .map(|n| crate::r_names::canonical_use_name(n).to_string()),
+            );
             let mut cursor = node.walk();
             return node
                 .children(&mut cursor)
@@ -13917,11 +14622,16 @@ fn body_forwards_dots_to_covered_verb(
         && let Some(args) = node.child_by_field_name("arguments")
         // Cheap pre-filter: most body calls pass no `...` at all.
         && call_args_contain_dots(args)
-        && !(func.kind() == "identifier"
-            && (analysis
-                .local_function_policies
-                .contains_key(node_text(func, text))
-                || shadows.contains(node_text(func, text))))
+        // Canonicalize the local-shadow lookup key (issue #459): the shadow set
+        // and `local_function_policies` are keyed on `canonical_use_name`, so a
+        // redundantly backtick-quoted callee (`` `filter`(d, ...) ``) must be
+        // canonicalized here too — otherwise a locally-shadowed verb called
+        // through redundant backticks bypasses the shadow guard and the wrapper
+        // is wrongly upgraded to a covered-verb policy.
+        && !(func.kind() == "identifier" && {
+            let key = crate::r_names::canonical_use_name(node_text(func, text));
+            analysis.local_function_policies.contains_key(key) || shadows.contains(key)
+        })
         && let Some(policy) = table_verb_policy(func, text, analysis)
     {
         let pipe_fed = call_is_pipe_fed(node, text);
@@ -14028,6 +14738,274 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
     value_may_bind_function(children[1], text)
 }
 
+/// Whether a `# raven: nse` directive already governs a call to a callee with
+/// the given bare name + optional `call_pkg` qualifier at `call_line`.
+/// `entries` are the `(package, declaration-line)` pairs of every directive for
+/// that bare name. A directive governs the call when it is declared before the
+/// call line and its qualifier matches the call's exactly: a bare directive
+/// matches a bare call, and a `pkg::name` directive matches a `pkg::name` call.
+///
+/// Shared by the discoverability hint and the quick-fix so they agree on when
+/// to step aside for a user who has already declared NSE. It deliberately does
+/// NOT model [`NseAnalysis::own_directive_nse_policy`]'s `BareInPlayQualified`
+/// pass (a `pkg::name` directive governing a *bare* call when `pkg` is in play):
+/// covering that would require the in-play package set here and in the
+/// code-action layer. The omission only ever errs toward *showing* the hint /
+/// offering the quick-fix for such a call — never toward hiding a diagnostic —
+/// which is the safe direction (the suggestion to extend coverage is harmless
+/// guidance, whereas a wrongly-hidden hint loses discoverability).
+pub(crate) fn nse_directive_governs<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, u32, bool)>,
+    call_pkg: Option<&str>,
+    call_line: u32,
+) -> bool {
+    // Each entry is `(package, line, file_level)`. An own (current-file) directive
+    // governs only when declared before the call line; a file-level FOREIGN
+    // directive propagated from a connected file (issue #460) governs the whole
+    // file, so its line is ignored. Package match stays exact either way (a
+    // bare directive matches a bare call, `pkg::name` matches `pkg::name`).
+    entries
+        .into_iter()
+        .any(|(pkg, line, file_level)| pkg == call_pkg && (file_level || line < call_line))
+}
+
+/// Split a callee name (`name` or `pkg::name`) into `(package, bare name)`.
+/// Shared by the hint and the code-action quick-fix so both assemble the
+/// qualifier the same way before consulting [`nse_directive_governs`].
+pub(crate) fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
+    match callee.split_once("::") {
+        Some((p, n)) => (Some(p), n),
+        None => (None, callee),
+    }
+}
+
+/// Render a source callee — `name`, `pkg::name`, or a backtick-quoted
+/// non-syntactic name (`` `my fn` `` as it appears in code) — in the spelling to
+/// WRITE in a `# raven: nse`/`func` directive: a backtick-quoted bare name
+/// becomes the double-quoted form (`"my fn"`) so a suggested directive parses.
+/// Internal lookup keys keep the raw (backtick) form — only user-facing
+/// suggestions are converted.
+///
+/// When the bare name is non-syntactic AND there is a package qualifier, the
+/// WHOLE `pkg::name` goes inside the quotes (`"pkg::my fn"`), NOT `pkg::"my fn"`:
+/// the directive grammar has no `pkg::"..."` form, so `pkg::"my fn"` would fail
+/// to parse and the suggestion would silently never govern. The parser re-splits
+/// the quoted `pkg::name` on `::` back into qualifier + name, so `"pkg::my fn"`
+/// round-trips to `package=pkg, name=` `` `my fn` `` `` and governs the call.
+fn callee_directive_form(callee: &str) -> String {
+    let (pkg, bare) = split_callee_qualifier(callee);
+    match unquote_backtick_name(bare) {
+        // Non-syntactic bare name: must be quoted. With a qualifier, quote the
+        // whole `pkg::name`; without, just the name.
+        Some(inner) => match pkg {
+            Some(p) => format!("\"{p}::{inner}\""),
+            None => format!("\"{inner}\""),
+        },
+        // Syntactic bare name: emit verbatim (bare or `pkg::name`).
+        None => match pkg {
+            Some(p) => format!("{p}::{bare}"),
+            None => bare.to_string(),
+        },
+    }
+}
+
+/// If `usage_node` (an undefined identifier) sits inside a call argument whose
+/// callee is a *plausible* NSE boundary (not a high-confidence standard-eval
+/// builtin or base export), return the callee name and the matched formal name
+/// (when the argument is named) so the diagnostic can suggest `# raven: nse`.
+/// Returns `None` when no hint should be shown (top-level usage, builtin
+/// callee, base-export callee, or a callee already governed by a directive).
+fn nse_hint_for_usage<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+    analysis: &NseAnalysis<'_>,
+) -> Option<(String, Option<String>)> {
+    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, analysis.base_exports)?;
+    // Discoverability only: suppress the hint when a `# raven: nse` directive
+    // ALREADY governs this exact call. A surviving diagnostic under a governing
+    // directive is on an argument the user deliberately left uncaptured, so
+    // urging them to "declare it" would contradict their own directive. The
+    // precise package/position match (not a bare-name probe) means a bare
+    // directive never suppresses the hint for a `pkg::name` call, nor does a
+    // directive written after the call suppress it for an earlier call.
+    let call_line = call.start_position().row as u32;
+    let (call_pkg, bare) = split_callee_qualifier(&callee);
+    // `directive_nse` is keyed by the CANONICAL callee name (a redundantly
+    // backticked syntactic name is stored bare), so canonicalize the call's bare
+    // name before the governance lookup — otherwise `` `my_func`(...) `` (raw
+    // `` `my_func` ``) would miss a governing `# raven: nse my_func(...)` and the
+    // hint would be shown spuriously (issue #460 Codex P3).
+    let bare = crate::r_names::canonical_use_name(bare);
+    if analysis.directive_nse.get(bare).is_some_and(|entries| {
+        nse_directive_governs(
+            entries
+                .iter()
+                .map(|e| (e.package.as_deref(), e.line, e.file_level)),
+            call_pkg,
+            call_line,
+        )
+    }) {
+        return None;
+    }
+    Some((callee, formal))
+}
+
+/// The enclosing call-argument context of `usage_node`: walks up to the
+/// `argument` that is a direct child of a `call`'s `arguments`, returning the
+/// `call` node, the callee name, and the matched formal name when the argument
+/// is named. `None` when `usage_node` is not inside a call argument with a
+/// simple callee.
+///
+/// For a `package::name` call the callee is the **full qualified** `pkg::name`,
+/// not the bare suffix: the suggested `# raven: nse` directive must carry the
+/// qualifier so it actually matches the qualified call (an unqualified
+/// directive does not — see [`NseAnalysis::own_directive_nse_policy`]). Callers that
+/// filter against builtin/base names use the bare suffix.
+fn enclosing_call_arg_context<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+) -> Option<(Node<'t>, String, Option<String>)> {
+    // An identifier in callee position — the `function` child of a call, e.g.
+    // `undefined_fn` in `g(undefined_fn(x))` — is an (undefined) function name,
+    // not an NSE-captured argument. Climbing from it would resolve the *outer*
+    // call and wrongly suggest `# raven: nse g(...)`, so bail before climbing.
+    if let Some(parent) = usage_node.parent()
+        && parent.kind() == "call"
+        && parent.child_by_field_name("function") == Some(usage_node)
+    {
+        return None;
+    }
+    let mut cur = usage_node;
+    let arg = loop {
+        let parent = cur.parent()?;
+        if parent.kind() == "arguments" && cur.kind() == "argument" {
+            break cur;
+        }
+        cur = parent;
+    };
+    let args = arg.parent()?; // "arguments"
+    let call = args.parent().filter(|n| n.kind() == "call")?;
+    let func = call.child_by_field_name("function")?;
+    let callee = match func.kind() {
+        "identifier" => node_text(func, text).to_string(),
+        "namespace_operator" => {
+            let (pkg, n) = namespace_parts(func, text)?;
+            format!("{pkg}::{n}")
+        }
+        _ => return None,
+    };
+    // The matched formal: a named argument's name, else None (positional/unknown).
+    let formal = arg
+        .child_by_field_name("name")
+        .map(|n| node_text(n, text).to_string());
+    Some((call, callee, formal))
+}
+
+/// The eligible NSE call-argument context for `usage_node`, shared by the
+/// diagnostic hint ([`nse_hint_for_usage`]) and the code-action quick-fix
+/// ([`nse_quick_fix_edit`]) so the two cannot drift on what counts as an NSE
+/// candidate. Returns the enclosing `call`, the callee name (qualified for a
+/// `pkg::name` call), and the matched formal name (named arguments only) — or
+/// `None` when the usage is not a candidate: top-level, callee position, or a
+/// high-confidence standard-eval builtin / base export. The builtin/base filter
+/// matches on the bare suffix (so a qualified `base::paste(...)` is caught)
+/// while the returned `callee` keeps its qualifier for the suggested directive.
+fn nse_eligible_call_arg<'t>(
+    usage_node: Node<'t>,
+    text: &'t str,
+    base_exports: Option<&HashSet<String>>,
+) -> Option<(Node<'t>, String, Option<String>)> {
+    let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
+    let (_pkg, bare) = split_callee_qualifier(&callee);
+    // Canonicalize a redundantly backticked syntactic callee before the
+    // builtin/base filter (issue #460 Codex review): `resolve_call_arg_policy`
+    // canonicalizes too, so `` `mean`(missing) `` / `` base::`paste`(missing) ``
+    // emit a standard-eval diagnostic — without this, the raw `` `mean` `` would
+    // miss `is_builtin`/`base_exports` and offer a misleading `# raven: nse` fix.
+    let bare = crate::r_names::canonical_use_name(bare);
+    if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
+        return None;
+    }
+    // A non-syntactic named-argument label (e.g. `` `weird name` = x ``) cannot
+    // be expressed as a formal in the directive grammar — `split_formal_list`
+    // filters formals through `is_formal_name`, which rejects a backtick- or
+    // quote-delimited token. Emitting `# raven: nse callee(`weird name`)` would
+    // therefore re-parse to an empty formal list and silently degrade to a
+    // whole-call directive (suppressing EVERY argument). Drop such a label to
+    // `None` so both the hint and the quick-fix fall to the parseable
+    // formal-less suggestion instead of proposing a directive that misbehaves.
+    let formal = formal.filter(|f| crate::r_names::is_syntactic_r_name(f));
+    Some((call, callee, formal))
+}
+
+/// A quick-fix edit that declares an NSE contract for the call surrounding an
+/// undefined identifier. `insert_line` is the 0-based line to insert before;
+/// `text` is the directive line (with trailing newline and matching indent).
+pub(crate) struct NseQuickFix {
+    pub insert_line: u32,
+    pub text: String,
+    pub title: String,
+    /// The callee the directive targets (`name` or `pkg::name`). `insert_line`
+    /// doubles as the call line, so the code-action layer can check whether a
+    /// directive already governs the call (via [`nse_directive_governs`]) and
+    /// skip a redundant fix — mirroring the message-hint suppression.
+    pub callee: String,
+}
+
+/// Build a `# raven: nse` quick-fix for the undefined identifier at
+/// `usage_node`, if it sits inside a call argument with a non-builtin callee.
+/// `usage_node` is the exact node the diagnostic range resolves to (via
+/// `descendant_for_point_range`), so the call and formal are unambiguous even
+/// when the same name appears more than once on a line. `text` is the analysis
+/// text the node's tree was parsed from. `base_exports`, when supplied, filters
+/// out base-package callees so the quick-fix matches [`nse_hint_for_usage`]:
+/// declaring NSE on a standard-eval base function is never the right fix.
+pub(crate) fn nse_quick_fix_edit(
+    usage_node: Node,
+    text: &str,
+    base_exports: Option<&HashSet<String>>,
+) -> Option<NseQuickFix> {
+    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, base_exports)?;
+    let insert_line = call.start_position().row as u32;
+    let indent: String = text
+        .lines()
+        .nth(insert_line as usize)
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    // The inserted directive uses the directive spelling (a non-syntactic
+    // backtick callee becomes the quoted form) so the fix parses; the raw
+    // `callee` is retained on the struct for the directive-governs lookup, which
+    // keys on the source callee text. Build the body once so the inserted text
+    // and the action title can't spell the directive differently.
+    let dir = callee_directive_form(&callee);
+    // Placeholder formal name for the unknown-formal (positional) case. It MUST be
+    // a syntactic R name (issue #460 Codex review): a literal `<formal>` is not a
+    // valid formal, so `split_formal_list` drops it and the directive parses as a
+    // blanket `WholeCall` — applying the fix verbatim would then suppress EVERY
+    // argument of the callee. `CAPTURED_FORMAL` instead parses as a per-formal
+    // directive that matches no real argument, so an unedited fix is a harmless
+    // no-op (the undefined arg keeps reporting) until the user fills in the name.
+    const FORMAL_PLACEHOLDER: &str = "CAPTURED_FORMAL";
+    let payload = match &formal {
+        Some(f) => format!("{dir}({f})"),
+        None => format!("{dir}({FORMAL_PLACEHOLDER})"),
+    };
+    let mut title = format!("Declare NSE: # raven: nse {payload}");
+    if formal.is_none() {
+        title.push_str(&format!(
+            " (replace {FORMAL_PLACEHOLDER} with the captured parameter; pair with `# raven: func` for positional matching)",
+        ));
+    }
+    Some(NseQuickFix {
+        insert_line,
+        text: format!("{indent}# raven: nse {payload}\n"),
+        title,
+        callee,
+    })
+}
+
 /// Resolve a `call` node's argument policy by classifying its callee against
 /// scope and package context (issue #398 Phases 1–2.5). Resolution mirrors R's
 /// search path — local definition, then a loaded/imported package, then base —
@@ -14044,7 +15022,29 @@ fn resolve_call_arg_policy(
 
     // Namespace-qualified `pkg::name` resolves purely from syntax.
     if func.kind() == "namespace_operator" {
-        // A qualified call with no NSE policy is a resolved standard-eval call.
+        let call_line = call_node.start_position().row as u32;
+        if let Some((pkg, n)) = namespace_parts(func, text) {
+            let n = crate::r_names::canonical_use_name(n);
+            // Own qualified directive is the authoritative override.
+            if let Some(p) =
+                analysis.own_directive_nse_policy(n, CallQualifier::Qualified(pkg), call_line)
+            {
+                return p;
+            }
+            // Precise built-in policy table next.
+            if let Some(p) = table_verb_policy(func, text, analysis) {
+                return p;
+            }
+            // Issue #460: a foreign qualified directive (file-level) is consulted
+            // below the table so it cannot clobber a precise built-in policy.
+            if let Some(p) = analysis.foreign_directive_nse_policy(n, CallQualifier::Qualified(pkg))
+            {
+                return p;
+            }
+            // A qualified call with no NSE policy is a resolved standard-eval call.
+            return ArgPolicy::Standard;
+        }
+        // Malformed `pkg::name`: fall back as before.
         return table_verb_policy(func, text, analysis).unwrap_or(ArgPolicy::Standard);
     }
 
@@ -14052,7 +15052,25 @@ fn resolve_call_arg_policy(
         // Computed callee (`fns[[1]](x)`, `(function(x) x)(y)`): unresolved.
         return ArgPolicy::WholeCall;
     }
-    let name = node_text(func, text);
+    // Canonicalize a redundantly backtick-quoted syntactic callee (issue #459):
+    // `` `my_func`() `` is identical to `my_func()`, so every downstream lookup
+    // (directive policies, local definitions/aliases, the built-in tables via
+    // `table_verb_policy`, builtin/base/in-play classification, and the Shiny
+    // helper) must key on the bare name. The Seam-C storage keys in
+    // `collect_nse_facts` are canonicalized in lockstep. A genuinely
+    // non-syntactic name keeps its backticks here and there alike.
+    let name = crate::r_names::canonical_use_name(node_text(func, text));
+
+    // 0. An exact unqualified `# raven: nse name` declaration is an
+    //    authoritative user override of Raven's own inference for this name —
+    //    it names the binding itself, so it beats even a local definition.
+    //    Position-gated to calls after the directive line.
+    let call_line = call_node.start_position().row as u32;
+    if let Some(policy) =
+        analysis.own_directive_nse_policy(name, CallQualifier::BareExact, call_line)
+    {
+        return policy;
+    }
 
     // 1. A local definition shadows any package / base policy.
     if let Some(policy) = analysis.local_function_policies.get(name) {
@@ -14078,9 +15096,31 @@ fn resolve_call_arg_policy(
             LocalCalleeAlias::Unknown => ArgPolicy::WholeCall,
         };
     }
+    // 1c. A qualified `# raven: nse pkg::name` directive matches this bare call
+    //     only now that no local binding shadowed it above — R invokes the
+    //     local value, not `pkg::name`, when one exists. It still overrides the
+    //     built-in policy tables below, so it is consulted before them.
+    if let Some(policy) =
+        analysis.own_directive_nse_policy(name, CallQualifier::BareInPlayQualified, call_line)
+    {
+        return policy;
+    }
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
     // owner resolution).
     if let Some(policy) = table_verb_policy(func, text, analysis) {
+        return policy;
+    }
+    // 3.6 (issue #460). A file-level `# raven: nse` directive propagated from a
+    // connected file governs this callee — consulted BELOW own directives, local
+    // definitions/aliases, and the precise built-in tables, but ABOVE the step-4
+    // resolvable-standard-eval classification so a user can suppress a
+    // loaded-package export (e.g. `lmer`) they declared NSE in another file.
+    if let Some(policy) = analysis.foreign_directive_nse_policy(name, CallQualifier::BareExact) {
+        return policy;
+    }
+    if let Some(policy) =
+        analysis.foreign_directive_nse_policy(name, CallQualifier::BareInPlayQualified)
+    {
         return policy;
     }
     // 4. Resolvable standard-eval: builtin, base export, or a confirmed in-play
@@ -14613,7 +15653,20 @@ fn collect_usages_with_context<'a>(
     context: &UsageContext,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    let analysis = NseAnalysis::build(node, text, true, true, Vec::new(), None, None, None);
+    let analysis = NseAnalysis::build(
+        node,
+        text,
+        true,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+    );
     collect_usages_with_analysis(node, text, &analysis, context, used);
 }
 
@@ -14687,7 +15740,7 @@ fn is_builtin(name: &str) -> bool {
     builtins::is_builtin(name) || unquote_backtick_name(name).is_some_and(is_builtin)
 }
 
-fn unquote_backtick_name(name: &str) -> Option<&str> {
+pub(crate) fn unquote_backtick_name(name: &str) -> Option<&str> {
     name.strip_prefix('`')?.strip_suffix('`')
 }
 
@@ -16002,7 +17055,7 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
 /// `Position.character` and `Point.column` use different units, so passing
 /// the LSP column as-is misplaces the cursor on lines containing multi-byte
 /// UTF-8 characters before the cursor.
-fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
+pub(crate) fn lsp_position_to_ts_point(text: &str, position: Position) -> Point {
     let line_text = text.lines().nth(position.line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     Point::new(position.line as usize, byte_col)
@@ -16153,26 +17206,8 @@ fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
-fn is_syntactic_r_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '.' {
-        return false;
-    }
-    if first == '.'
-        && let Some(second) = chars.clone().next()
-        && second.is_ascii_digit()
-    {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_')
-        && !crate::reserved_words::is_reserved_word(name)
-}
-
 fn accessor_member_insert_text(name: &str) -> String {
-    if is_syntactic_r_name(name) || name.contains('`') {
+    if crate::r_names::is_syntactic_r_name(name) || name.contains('`') {
         name.to_string()
     } else {
         format!("`{name}`")
@@ -17261,12 +18296,19 @@ fn member_definition_info(
     state: &WorldState,
     location: &tower_lsp::lsp_types::Location,
 ) -> Option<DefinitionInfo> {
+    let name: std::sync::Arc<str> = std::sync::Arc::from("");
+    // Synthetic symbol consumed by `extract_definition_statement` (keys off
+    // source_uri + position); the highlight end is unused. Preserve the old
+    // `defined_column + utf16_len(name)` value via the shared helper (empty
+    // name ⇒ end == start column).
+    let defined_end_column = scoped_symbol_default_end(location.range.start.character, &name);
     let symbol = ScopedSymbol {
-        name: std::sync::Arc::from(""),
+        name,
         kind: scope::SymbolKind::Variable,
         source_uri: location.uri.clone(),
         defined_line: location.range.start.line,
         defined_column: location.range.start.character,
+        defined_end_column,
         signature: None,
         is_declared: false,
     };
@@ -17851,7 +18893,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         "Got {} symbols from cross-file scope",
         cross_file_symbols.len()
     );
-    if let Some(symbol) = cross_file_symbols.get(name) {
+    // Issue #459: a cross-file scope entry is keyed either bare (a regular
+    // assignment def) or backtick-wrapped (a directive-declared non-syntactic
+    // symbol). Mirror go-to-definition: try the RAW spelling first (matches a
+    // wrapped declared key), then the unconditionally-unquoted spelling (matches
+    // a bare regular-def key). Only the lookup key is normalized; `name` keeps
+    // its raw spelling for the rendered hover.
+    let symbol_key: &str = unquote_backtick_name(name).unwrap_or(name);
+    if let Some(symbol) = cross_file_symbols
+        .get(name)
+        .or_else(|| cross_file_symbols.get(symbol_key))
+    {
         log::trace!(
             "hover: found symbol '{}' in cross_file_symbols, source_uri={}, is_declared={}",
             name,
@@ -18874,6 +19926,21 @@ pub fn goto_definition_with_cancel(
     }
 
     let name = node_text(node, &text);
+    // Seam-A (#459): a scope / exported-interface entry is keyed either bare
+    // (a regular assignment def — `assignment_identifier_name` strips backticks)
+    // or in its call-site form (a directive-declared *non-syntactic* var/func is
+    // stored backtick-wrapped — `callee_name_for_match`). So a backtick-quoted
+    // use-site must try the RAW spelling first (matches a wrapped declared key)
+    // and then the unconditionally-unquoted spelling (matches a bare regular-def
+    // key). This try-raw-then-unquote order is the same Seam-A discipline the
+    // undefined-variable loop uses; it is NOT `canonical_use_name` (which would
+    // leave a non-syntactic name wrapped and miss the bare key). A non-declared
+    // (bare-stored) symbol can only match via the unquoted form. `scope_key`'s
+    // only role is that bare lookup-key fallback; the highlight range does NOT
+    // depend on `scope_key`/`name` — it comes from the matched symbol's stored
+    // token columns via `scoped_symbol_range`. The directive-declared branch
+    // below canonicalizes against the raw `name` (Seam B).
+    let scope_key: &str = unquote_backtick_name(name).unwrap_or(name);
 
     // Search using position-aware scope resolution
     // This unifies same-file and cross-file lookups, respecting:
@@ -18889,7 +19956,11 @@ pub fn goto_definition_with_cancel(
         Some(state.package_state.scope_contribution()),
     );
 
-    if let Some(symbol) = scope.symbols.get(name) {
+    if let Some(symbol) = scope
+        .symbols
+        .get(name)
+        .or_else(|| scope.symbols.get(scope_key))
+    {
         // Check if this is a package export (source_uri starts with "package:")
         // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
         // Validates: Requirements 11.1, 11.2
@@ -18913,16 +19984,24 @@ pub fn goto_definition_with_cancel(
         if symbol.is_declared {
             // Get metadata for the symbol's source file to find the first declaration
             if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
-                // Find all declarations of this symbol name (both variables and functions)
+                // Find all declarations of this symbol name (both variables and
+                // functions). This is the DIRECTIVE seam (Seam B, #459):
+                // declarations store the call-site form (bare for a syntactic
+                // name, backtick-wrapped for a non-syntactic one), so match on
+                // `canonical_use_name` of BOTH operands — a redundantly-quoted
+                // `` `my_func` `` use canonicalizes to the bare declared key,
+                // while a required `` `my fn` `` keeps its backticks to match the
+                // wrapped declared key.
+                let canonical_name = crate::r_names::canonical_use_name(name);
                 let mut first_line: Option<u32> = None;
 
                 for decl in &metadata.declared_variables {
-                    if decl.name == name {
+                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
                     }
                 }
                 for decl in &metadata.declared_functions {
-                    if decl.name == name {
+                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
                     }
                 }
@@ -18951,7 +20030,7 @@ pub fn goto_definition_with_cancel(
 
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
-            range: scoped_symbol_range(symbol, name),
+            range: scoped_symbol_range(symbol),
         }));
     }
 
@@ -18964,7 +20043,10 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
-            && let Some(symbol) = artifacts.exported_interface.get(name)
+            && let Some(symbol) = artifacts
+                .exported_interface
+                .get(name)
+                .or_else(|| artifacts.exported_interface.get(scope_key))
         {
             // Skip package exports (they have pseudo-URIs that can't be navigated to)
             if symbol.source_uri.as_str().starts_with("package:") {
@@ -18972,7 +20054,7 @@ pub fn goto_definition_with_cancel(
             }
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
-                range: scoped_symbol_range(symbol, name),
+                range: scoped_symbol_range(symbol),
             }));
         }
     }
@@ -18986,7 +20068,10 @@ pub fn goto_definition_with_cancel(
             continue;
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri)
-            && let Some(symbol) = artifacts.exported_interface.get(name)
+            && let Some(symbol) = artifacts
+                .exported_interface
+                .get(name)
+                .or_else(|| artifacts.exported_interface.get(scope_key))
         {
             // Skip package exports (they have pseudo-URIs that can't be navigated to)
             if symbol.source_uri.as_str().starts_with("package:") {
@@ -18994,7 +20079,7 @@ pub fn goto_definition_with_cancel(
             }
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
-                range: scoped_symbol_range(symbol, name),
+                range: scoped_symbol_range(symbol),
             }));
         }
     }
@@ -19010,7 +20095,9 @@ pub fn goto_definition_with_cancel(
         if let Some(tree) = &doc.tree {
             // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
             let file_text = doc.analysis_text();
-            if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
+            if let Some(def_range) =
+                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
+            {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
                     range: def_range,
@@ -19030,7 +20117,9 @@ pub fn goto_definition_with_cancel(
         if let Some(tree) = &doc.tree {
             // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
             let file_text = doc.analysis_text();
-            if let Some(def_range) = find_definition_in_tree(tree.root_node(), name, &file_text) {
+            if let Some(def_range) =
+                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
+            {
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: file_uri.clone(),
                     range: def_range,
@@ -19040,6 +20129,25 @@ pub fn goto_definition_with_cancel(
     }
 
     None
+}
+
+/// Look up a definition for `name` in `root`, falling back to `scope_key` (the
+/// unquoted spelling) only when it differs from `name`. Skipping the second
+/// walk when `scope_key == name` (the common bare-callee case:
+/// `unquote_backtick_name` returns `None`, so `scope_key == name`) avoids a
+/// byte-for-byte identical full tree walk guaranteed to also miss — pure wasted
+/// work on the not-found path, doubled per scanned file.
+fn find_definition_try_both(
+    root: tree_sitter::Node,
+    name: &str,
+    scope_key: &str,
+    text: &str,
+) -> Option<Range> {
+    find_definition_in_tree(root, name, text).or_else(|| {
+        (scope_key != name)
+            .then(|| find_definition_in_tree(root, scope_key, text))
+            .flatten()
+    })
 }
 
 fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> {
@@ -19074,11 +20182,26 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
     None
 }
 
-fn scoped_symbol_range(symbol: &ScopedSymbol, name: &str) -> Range {
+/// The go-to-definition highlight range for a scope symbol: from the
+/// definition token's start column to its end column. Both are carried on the
+/// symbol (`defined_column` / `defined_end_column`), so a backtick-quoted name
+/// highlights its full source token rather than the bare inner name (issue
+/// #459 / I-B2).
+fn scoped_symbol_range(symbol: &ScopedSymbol) -> Range {
     Range {
         start: Position::new(symbol.defined_line, symbol.defined_column),
-        end: Position::new(symbol.defined_line, symbol.defined_column + utf16_len(name)),
+        end: Position::new(symbol.defined_line, symbol.defined_end_column),
     }
+}
+
+/// Behavior-preserving default for [`ScopedSymbol::defined_end_column`] at
+/// construction sites with no real source token (synthetic / test symbols):
+/// the name rendered at the definition column, i.e. the old
+/// `defined_column + utf16_len(name)`. Wrapping the addition in a function
+/// keeps clippy's `identity_op` quiet for the common `defined_column == 0` case
+/// (a literal `0 + _` would lint; a `0` *argument* does not).
+fn scoped_symbol_default_end(defined_column: u32, name: &str) -> u32 {
+    defined_column + crate::utf16::utf16_len(name)
 }
 
 // ============================================================================
@@ -19348,7 +20471,16 @@ fn find_references_in_tree(
     uri: &Url,
     locations: &mut Vec<Location>,
 ) {
-    if node.kind() == "identifier" && node_text(node, text) == name {
+    // Issue #459: union bare and backticked occurrences. Canonicalize BOTH
+    // equality operands so a redundantly-quoted syntactic `` `my_func` `` and a
+    // bare `my_func` resolve to one reference set, while a genuinely
+    // non-syntactic name (`` `my fn` ``) keeps its required backticks and only
+    // matches other backticked spellings. The pushed range is still the raw
+    // node span (backticks included) — only the match KEY is canonicalized.
+    if node.kind() == "identifier"
+        && crate::r_names::canonical_use_name(node_text(node, text))
+            == crate::r_names::canonical_use_name(name)
+    {
         let start_pos = node.start_position();
         let end_pos = node.end_position();
         locations.push(Location {
@@ -20636,7 +21768,20 @@ mod tests {
         used: &mut Vec<(String, Node<'a>)>,
     ) {
         let in_play: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
-        let analysis = NseAnalysis::build(root, text, true, true, in_play, None, None, None);
+        let analysis = NseAnalysis::build(
+            root,
+            text,
+            true,
+            true,
+            in_play,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
 
@@ -20657,6 +21802,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            &[],
+            &[],
+            &[],
         );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
@@ -20806,6 +21955,237 @@ mod tests {
         assert!(!was_collected(&used, "col"));
     }
 
+    // ---- Issue #459: redundant backtick-quoting of syntactic callees ----
+
+    /// A redundantly backtick-quoted syntactic callee `` `my_func`() `` is
+    /// semantically identical to `my_func()`, so it must pick up the bare
+    /// `# raven: nse` directive governing it. With a `# raven: func` supplying
+    /// the formal order, the captured formal's argument is suppressed while the
+    /// other positional argument is still checked. Before canonicalization the
+    /// backticked callee missed the directive lookup and the whole call was
+    /// suppressed, hiding the checked argument.
+    #[test]
+    fn nse_backtick_quoted_callee_governed_by_directive() {
+        use crate::cross_file::directive::parse_directives;
+        let code =
+            "# raven: func my_func(a, b)\n# raven: nse my_func(b)\n`my_func`(checked_a, masked_b)";
+        let tree = parse_r_code(code);
+        let meta = parse_directives(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            None,
+            None,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            was_collected(&used, "checked_a"),
+            "positional arg bound to a non-captured formal must be checked"
+        );
+        assert!(
+            !was_collected(&used, "masked_b"),
+            "arg bound to the NSE-captured formal must be suppressed"
+        );
+    }
+
+    /// A backtick-quoted call `` `my_func`(...) `` must borrow the formal order
+    /// of a visible local definition `my_func <- function(a, b) ...` for the
+    /// bare `# raven: nse my_func(b)` directive's positional matching, exactly
+    /// as a bare call would. Before canonicalization the backticked call missed
+    /// both the directive and the local-definition formal-order borrow.
+    #[test]
+    fn nse_backtick_quoted_callee_picks_up_local_def_formal_order() {
+        use crate::cross_file::directive::parse_directives;
+        let code =
+            "my_func <- function(a, b) a\n# raven: nse my_func(b)\n`my_func`(checked_a, masked_b)";
+        let tree = parse_r_code(code);
+        let meta = parse_directives(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            None,
+            None,
+            None,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            was_collected(&used, "checked_a"),
+            "positional arg bound to a non-captured formal must be checked"
+        );
+        assert!(
+            !was_collected(&used, "masked_b"),
+            "arg bound to the NSE-captured formal must be suppressed"
+        );
+    }
+
+    /// A backtick-quoted in-play data-masking verb `` `filter`(df, col) ``
+    /// resolves through `table_verb_policy` to dplyr's policy: `.data` (`df`) is
+    /// checked, the data-masked `col` is suppressed. Before canonicalization the
+    /// backticked callee missed every policy table and fell through to
+    /// whole-call suppression, wrongly hiding `df`.
+    #[test]
+    fn nse_backtick_quoted_filter_resolves_data_mask_via_table_verb_policy() {
+        let code = "`filter`(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "the `.data` argument must still be checked"
+        );
+        assert!(
+            !was_collected(&used, "col"),
+            "the data-masked column must be suppressed via dplyr's policy"
+        );
+    }
+
+    /// A redundantly backtick-quoted QUALIFIED data-masking callee
+    /// `` dplyr::`filter`(df, col) `` resolves through the `namespace_operator`
+    /// branch of `table_verb_policy` to dplyr's policy: `.data` (`df`) is
+    /// checked and the data-masked `col` is suppressed. `namespace_parts` does
+    /// not strip backticks, so without canonicalizing the bare `name` component
+    /// the policy lookup would miss and the call would fall through to
+    /// standard-eval, wrongly checking `col`.
+    #[test]
+    fn nse_qualified_backtick_quoted_callee_resolves_data_mask() {
+        let code = "dplyr::`filter`(df, col)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "df"),
+            "the `.data` argument must still be checked"
+        );
+        assert!(
+            !was_collected(&used, "col"),
+            "the data-masked column must be suppressed via dplyr's qualified policy"
+        );
+    }
+
+    /// A redundantly backtick-quoted DEFINITION `` `my_func` <- function(x) x ``
+    /// and a backtick-quoted call `` `my_func`(undefined_var) `` must still
+    /// resolve to the local (standard-eval) definition, so the argument is
+    /// checked. This guards the storage/lookup lockstep: canonicalizing only the
+    /// lookup key (and not the `collect_nse_facts` storage key) would make the
+    /// stored `` `my_func` `` and the canonical lookup `my_func` mismatch.
+    ///
+    /// The callee is a NON-builtin syntactic name on purpose: were it a builtin
+    /// (e.g. `filter`), a storage/lookup mismatch would fall through to the
+    /// builtin classification and still check the argument, making the test
+    /// vacuous. With `my_func`, a mismatch instead drops to unresolved
+    /// whole-call suppression, so the assertion below genuinely bites only when
+    /// storage and lookup canonicalize in lockstep.
+    #[test]
+    fn nse_redundantly_backticked_definition_and_call_match() {
+        let code = "`my_func` <- function(x) x\n`my_func`(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "undefined_var"),
+            "local standard-eval definition must make the argument checked"
+        );
+    }
+
+    /// Seam C clearing-arm lockstep (issue #459): a redundantly backtick-quoted
+    /// function definition `` `my_func` <- function(captured) 1 `` rebound to a
+    /// non-callee literal `` `my_func` <- 5 `` must CLEAR the local definition,
+    /// so the subsequent `` `my_func`(undefined_arg) `` call falls to
+    /// unresolved whole-call suppression rather than standard-eval argument
+    /// checking — i.e. `undefined_arg` is NOT collected. This guards the
+    /// `collect_nse_facts` None-arm storage key: the `local_function_defs`
+    /// removal must canonicalize its key (`my_func`) in lockstep with the
+    /// Definition/Alias arms' inserts. Were the None arm to revert to the raw
+    /// `` `my_func` `` (backticked) key, the clear would miss the canonically
+    /// stored definition, the stale `function(captured) 1` would linger,
+    /// `user_defined_call_policy` would return Standard, and `undefined_arg`
+    /// would be wrongly collected.
+    #[test]
+    fn nse_redundantly_backticked_rebind_to_noncallee_clears_def() {
+        let code = "`my_func` <- function(captured) 1\n`my_func` <- 5\n`my_func`(undefined_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            !was_collected(&used, "undefined_arg"),
+            "rebinding the backticked definition to a non-callee literal must clear \
+             the local def, so the call falls to whole-call suppression and the \
+             argument is not checked"
+        );
+    }
+
+    /// A genuinely non-syntactic local `` `my fn` <- function(x) x `` used
+    /// backticked `` `my fn`(undefined_var) `` keeps its required backticks on
+    /// BOTH the storage and lookup key, so the definition still shadows and the
+    /// argument is checked. Canonicalization must NOT strip these backticks.
+    #[test]
+    fn nse_nonsyntactic_backtick_local_def_used_backticked_matches() {
+        let code = "`my fn` <- function(x) x\n`my fn`(undefined_var)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
+        assert!(
+            was_collected(&used, "undefined_var"),
+            "non-syntactic local definition must still shadow and check its argument"
+        );
+    }
+
+    /// Issue #459 dots-forwarding guard: a locally-shadowed verb called through
+    /// redundant backticks inside a `...`-forwarding wrapper must still be
+    /// recognized as a local shadow, so the wrapper is NOT upgraded to a
+    /// covered-verb (data-masking) policy. Here `filter` is a local
+    /// standard-eval definition, so `` wrap <- function(...) `filter`(d, ...) ``
+    /// forwards its dots into a *standard* function, not dplyr's data-mask verb,
+    /// and `wrap(undefined_sym)` must keep its argument checked. Before the guard
+    /// canonicalized its lookup key, the backticked `` `filter` `` missed the
+    /// shadow set (stored under the bare `filter`), so the wrapper was wrongly
+    /// upgraded and `undefined_sym` was over-suppressed.
+    #[test]
+    fn nse_backtick_quoted_locally_shadowed_verb_in_wrapper_not_upgraded() {
+        let code = "filter <- function(a, b) a\n\
+                    wrap <- function(...) `filter`(d, ...)\n\
+                    wrap(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        // dplyr is in play, so absent the local shadow `filter` would resolve to
+        // dplyr's data-mask policy and the wrapper would be upgraded.
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "the local standard-eval shadow of `filter` must be honored through \
+             redundant backticks, so the wrapper is not upgraded and its arg is checked"
+        );
+    }
+
     /// Issue #407: a NON-hardcoded aggregate `myagg` that `Depends` on dplyr
     /// makes `mutate` visible. NSE classification must resolve the true owner
     /// (dplyr) and apply dplyr's policy, suppressing the data-masked column
@@ -20842,6 +22222,10 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -20894,6 +22278,10 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21221,6 +22609,10 @@ mod tests {
             None,
             None,
             Some(&base_exports),
+            &[],
+            &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21725,7 +23117,30 @@ mod tests {
         assert!(was_collected(&used, "undefined_sym"));
     }
 
-    /// A top-level alias of a covered verb to a non-literal function value
+    /// Issue #459 dots-forwarding shadow-set canonicalization, body-local
+    /// binding variant: a wrapper that forwards `...` and has a BODY-LOCAL
+    /// binding (neither a top-level def nor a formal) to a covered verb written
+    /// with redundant backticks (`` `filter` <- get_fn() ``) must still shadow
+    /// the verb, so the wrapper is NOT upgraded to captured-dots and its
+    /// forwarded argument stays checked. A body-local binding never reaches
+    /// `local_callee_shadows` (`collect_nse_facts` records callee bindings there
+    /// only at top level), so it enters the shadow set EXCLUSIVELY via the
+    /// `potential_function_binding_names` → `raw_bindings` arm — which stores
+    /// the raw spelling. Without canonicalizing as it ENTERS the set the raw
+    /// `` `filter` `` misses the canonical lookup key `filter` and the wrapper
+    /// is wrongly upgraded (over-suppression). Backtick + body-local mirror of
+    /// `nse_wrapper_body_local_shadow_disables_forwarding`.
+    #[test]
+    fn nse_backtick_wrapper_body_local_shadow_disables_forwarding() {
+        let code = "wrap <- function(...) {\n  `filter` <- get_fn()\n  `filter`(d, ...)\n}\nwrap(undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked body-local binding shadowing `filter` must disable the dots-forwarding upgrade"
+        );
+    }
     /// shadows the package policy for the dots-forwarding inference. Raven
     /// cannot prove the alias is data-masking, so the wrapper's dots stay
     /// checked.
@@ -21839,6 +23254,48 @@ mod tests {
         let mut used = Vec::new();
         collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
         assert!(was_collected(&used, "undefined_sym"));
+    }
+
+    /// Issue #459 dots-forwarding shadow-set canonicalization: a wrapper FORMAL
+    /// named after a covered verb but written with redundant backticks
+    /// (`` function(`filter`, ...) ``) must still shadow the verb, so the
+    /// wrapper is NOT upgraded to a covered-verb (data-masking) policy and its
+    /// forwarded argument stays checked. The shadow set is fed raw
+    /// `function_formal_names`, but `body_forwards_dots_to_covered_verb` looks
+    /// up its key canonicalized — so without canonicalizing the formal as it
+    /// ENTERS the set, the backticked formal misses the shadow and the wrapper
+    /// is wrongly upgraded (over-suppression). Backtick mirror of
+    /// `nse_wrapper_formal_shadowing_verb_disables_forwarding`.
+    #[test]
+    fn nse_backtick_wrapper_formal_shadowing_verb_disables_forwarding() {
+        let code = "wrap <- function(`filter`, ...) `filter`(d2, ...)\nwrap(my_fn, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked formal shadowing `filter` must disable the dots-forwarding upgrade"
+        );
+    }
+
+    /// Issue #459 dots-forwarding shadow-set canonicalization, nested-closure
+    /// variant: a nested-lambda formal named after a covered verb but written
+    /// with redundant backticks must shadow the verb for that subtree of the
+    /// dots walk. The nested formals join `shadows` via `extended.extend(...)`
+    /// raw, so without canonicalizing them on entry the backticked
+    /// `` `filter` `` misses the shadow and the wrapper is wrongly upgraded.
+    /// Backtick mirror of `nse_nested_lambda_formal_shadows_verb_in_dots_walk`.
+    #[test]
+    fn nse_backtick_nested_lambda_formal_shadows_verb_in_dots_walk() {
+        let code = "wrap <- function(fs, ...) sapply(fs, function(`filter`) `filter`(d2, ...))\n\
+                    wrap(lst2, undefined_sym)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(
+            was_collected(&used, "undefined_sym"),
+            "a backticked nested-lambda formal shadowing `filter` must disable the upgrade"
+        );
     }
 
     /// `substitute()` is frame-local: inside a nested closure it inspects the
@@ -21988,6 +23445,31 @@ mod tests {
         assert!(
             was_collected(&used, "typo"),
             "stats::filter is standard-eval; its argument must be checked"
+        );
+    }
+
+    /// Seam-C storage-key canonicalization for a redundantly backtick-quoted
+    /// alias: `` `filter` <- stats::filter `` is stored under the canonical bare
+    /// key the matching `` `filter`(df, typo) `` call resolves to, so the
+    /// standard-eval target's policy is honored and `typo` stays checked even
+    /// with dplyr in play. This bites the storage key specifically: were the
+    /// alias stored under the raw backticked `` `filter` `` (the pre-canonical
+    /// behavior), the canonical lookup would miss, fall through to dplyr's
+    /// `filter` table-verb policy, and SUPPRESS `typo`. A standard-eval target
+    /// is required so the fallthrough cannot coincidentally re-derive the same
+    /// (checked) policy. Backticked sibling of
+    /// `nse_alias_qualified_standard_target_checks_args`.
+    #[test]
+    fn nse_backtick_alias_qualified_standard_target_checks_args() {
+        let code = "`filter` <- stats::filter\n`filter`(df, typo)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+        assert!(was_collected(&used, "df"), "data argument stays checked");
+        assert!(
+            was_collected(&used, "typo"),
+            "the standard-eval alias is honored through redundant backticks; \
+             its argument must be checked, not suppressed by dplyr's filter policy"
         );
     }
 
@@ -24240,15 +25722,23 @@ clean_data <- function(x) {
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
 
         // Resolved export, no policy -> standard-eval -> argument checked.
+        // Use `contains` rather than `==` because the message may have a
+        // trailing NSE-hint suffix (the callee `my_fn` is not a builtin or
+        // base export, so the hint fires — that is correct behavior per #455).
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: undefined_var"),
+                .any(|m| m.contains("Undefined variable: undefined_var")),
             "argument of a resolved no-policy export must be checked; messages: {messages:?}"
         );
-        // The resolved export itself must not be flagged.
+        // The resolved export itself must not be flagged. Use
+        // `contains("Undefined variable: my_fn")` rather than `contains("my_fn")`
+        // because the NSE hint for `undefined_var`'s diagnostic legitimately
+        // mentions `my_fn` as the callee (correct behavior per #455).
         assert!(
-            !messages.iter().any(|m| m.contains("my_fn")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: my_fn")),
             "resolved package export `my_fn` must not be flagged; messages: {messages:?}"
         );
         // Contrast: an unresolved callee falls back to WholeCall, suppressing
@@ -24423,12 +25913,19 @@ clean_data <- function(x) {
                 .any(|m| m == "Undefined variable: totally_undefined_baseline"),
             "baseline undefined must fire; messages: {messages:?}"
         );
+        // Use `contains("Undefined variable: is_true")` rather than
+        // `contains("is_true")` because `# raven: nse` hint messages for
+        // other diagnostics may legitimately mention `is_true` as the callee.
         assert!(
-            !messages.iter().any(|m| m.contains("is_true")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: is_true")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages.iter().any(|m| m.contains("deferred_run")),
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: deferred_run")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
     }
@@ -37805,6 +39302,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "x"),
             signature: None,
             is_declared: false,
         };
@@ -37826,6 +39324,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "f"),
             signature: Some("f(a, b)".to_string()),
             is_declared: false,
         };
@@ -37852,6 +39351,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "long_func"),
             signature: None,
             is_declared: false,
         };
@@ -37884,6 +39384,7 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(0, var_name),
                 signature: None,
                 is_declared: false,
             };
@@ -37910,6 +39411,7 @@ mod proptests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 5, // Position of 'i' in for loop
+            defined_end_column: crate::handlers::scoped_symbol_default_end(5, "i"),
             signature: None,
             is_declared: false,
         };
@@ -38011,6 +39513,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    var_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38041,6 +39547,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38077,6 +39587,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38210,6 +39724,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    "long_func",
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38244,6 +39762,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: indent_size as u32,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    indent_size as u32,
+                    "func",
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38296,6 +39818,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    var_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38328,6 +39854,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    0,
+                    func_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38355,6 +39885,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 5, // Position of iterator in for loop
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    5,
+                    iterator.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -38389,6 +39923,10 @@ mod proptests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: func_name.len() as u32 + 15, // Approximate position in function signature
+                defined_end_column: crate::handlers::scoped_symbol_default_end(
+                    func_name.len() as u32 + 15,
+                    param_name.as_str(),
+                ),
                 signature: None,
                 is_declared: false,
             };
@@ -46250,6 +47788,7 @@ mod integration_tests {
             source_uri: uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "my_var"),
             signature: None,
             is_declared: false,
         };
@@ -46300,6 +47839,7 @@ mod integration_tests {
             source_uri: rmd_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "my_var"),
             signature: None,
             is_declared: false,
         };
@@ -46423,6 +47963,7 @@ mod integration_tests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 4, // 0-based line 4 = display line 5
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "myvar"),
             signature: None,
             is_declared: true,
         };
@@ -46470,6 +48011,7 @@ mod integration_tests {
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 9, // 0-based line 9 = display line 10
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "myfunc"),
             signature: None,
             is_declared: true,
         };
@@ -46524,6 +48066,7 @@ mod integration_tests {
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line,
                 defined_column: 0,
+                defined_end_column: crate::handlers::scoped_symbol_default_end(0, "test_symbol"),
                 signature: None,
                 is_declared: true,
             };
@@ -46583,6 +48126,44 @@ x <- myvar + 1"#;
             assert_eq!(
                 location.range.start.character, 0,
                 "Should navigate to start of line (column 0)"
+            );
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_declared_nonsyntactic_variable() {
+        // End-to-end guard for the declare_var wrap fix: a non-syntactic declared
+        // variable (`# raven: var "my fn"`) is stored backtick-wrapped, so
+        // go-to-definition from a `` `my fn` `` usage (whose node_text carries the
+        // backticks) resolves via the exact-name match. Before the wrap, the
+        // declaration stored the bare `my fn` and this lookup missed.
+        use crate::cross_file::directive::parse_directives;
+        use crate::handlers::goto_definition;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "# raven: var \"my fn\"\nx <- `my fn` + 1";
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let metadata = parse_directives(code);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, None, |_| None);
+
+        // The `` `my fn` `` usage spans cols 5-12 of line 1; pick a column inside.
+        let result = goto_definition(&state, &uri, Position::new(1, 7));
+        assert!(
+            result.is_some(),
+            "should resolve a non-syntactic declared variable"
+        );
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(
+                location.range.start.line, 0,
+                "should navigate to the directive line"
             );
         } else {
             panic!("Expected Scalar response");
@@ -47917,6 +49498,7 @@ result <- missing_func(42)"#;
             source_uri: missing_uri, // This file doesn't exist in state
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "missing_func"),
             signature: Some("missing_func(x)".to_string()),
             is_declared: false,
         };
@@ -48541,6 +50123,7 @@ result <- helper_with_spaces(42)"#;
             source_uri: package_uri,
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: None,
             is_declared: false,
         };
@@ -48617,6 +50200,7 @@ result <- helper_with_spaces(42)"#;
             source_uri: file_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
             is_declared: false,
         };
@@ -50645,6 +52229,7 @@ result <- filter(c(1, -2, 3))"#;
             source_uri: package_uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate(.data, ...)".to_string()),
             is_declared: false,
         };
@@ -50791,6 +52376,7 @@ z <- mutate(5)  # Uses local definition"#;
             source_uri: package_uri.clone(),
             defined_line: 0,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate(.data, ...)".to_string()),
             is_declared: false,
         };
@@ -50825,6 +52411,7 @@ z <- mutate(5)  # Uses local definition"#;
             source_uri: file_uri.clone(),
             defined_line: 5,
             defined_column: 0,
+            defined_end_column: crate::handlers::scoped_symbol_default_end(0, "mutate"),
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
             is_declared: false,
         };
@@ -54326,6 +55913,10 @@ mod function_parameter_tests {
     }
 
     /// Collect the names reported as "Undefined variable: <name>" for `code`.
+    /// Extracts just the bare identifier, stripping the optional
+    /// " (defined later …)" forward-reference note and the optional
+    /// ". If `f()` captures …" NSE hint, so the result is stable while
+    /// preserving dotted R identifiers like `my.var` intact.
     fn undefined_variable_names(code: &str) -> Vec<String> {
         let mut state = create_test_state();
         let uri = add_document(&mut state, "file:///test.R", code);
@@ -54349,11 +55940,28 @@ mod function_parameter_tests {
         diagnostics
             .iter()
             .filter_map(|d| {
-                d.message
-                    .strip_prefix("Undefined variable: ")
-                    .map(str::to_string)
+                d.message.strip_prefix("Undefined variable: ").map(|rest| {
+                    // Strip the optional " (defined later …)" forward-ref note
+                    // and the optional ". If `f()` captures …" NSE hint, leaving
+                    // the bare name. A `.split('.')` would truncate dotted R
+                    // identifiers (`my.var` -> `my`).
+                    let rest = rest.split(" (defined later").next().unwrap_or(rest);
+                    rest.split(". If `").next().unwrap_or(rest).to_string()
+                })
             })
             .collect()
+    }
+
+    #[test]
+    fn undefined_variable_names_preserves_dotted_identifier() {
+        // The helper must return dotted R identifiers intact (regression: a
+        // bare `.split('.')` truncated `my.var` to `my`, masking dotted-name
+        // diagnostics and any future test that asserts on them).
+        let names = undefined_variable_names("f <- function(a) a\nf(my.var)\n");
+        assert!(
+            names.iter().any(|n| n == "my.var"),
+            "dotted name truncated: {names:?}"
+        );
     }
 
     // Issues #404 / #410: `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
@@ -56073,6 +57681,1060 @@ my_func <- function(a = default_value) {
         diagnostics.into_iter().map(|d| d.message).collect()
     }
 
+    // Issue #460: build an NseAnalysis with explicit own/foreign declaration
+    // slices (bypassing the cross-file collector) and return the used-identifier
+    // names the collector did NOT suppress. Lets the foreign-propagation
+    // resolution be unit-tested without wiring a dependency graph.
+    fn build_used(
+        code: &str,
+        own_nse: &[crate::cross_file::types::NseDeclaration],
+        own_funcs: &[crate::cross_file::types::DeclaredSymbol],
+        foreign_nse: &[crate::cross_file::types::NseDeclaration],
+        foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
+    ) -> Vec<String> {
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            own_nse,
+            own_funcs,
+            foreign_nse,
+            foreign_funcs,
+        );
+        let mut used = Vec::new();
+        super::collect_usages_with_analysis(
+            root,
+            code,
+            &analysis,
+            &super::UsageContext::default(),
+            &mut used,
+        );
+        used.into_iter().map(|(n, _)| n).collect()
+    }
+
+    // Issue #460: a foreign whole-call directive suppresses a builtin callee's
+    // args. `nrow` is is_builtin → resolves to Standard (step 4) in the test
+    // harness, so its arg is checked by DEFAULT — making the suppression
+    // attributable to the directive, not to free tier-6 WholeCall suppression.
+    #[test]
+    fn foreign_whole_call_directive_suppresses_builtin_callee() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow(undefined_var)\n";
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        assert!(
+            build_used(code, &[], &[], &[], &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "baseline: nrow's arg must be checked without a directive"
+        );
+        assert!(
+            !build_used(code, &[], &[], &foreign, &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "a foreign whole-call NSE directive must suppress the arg"
+        );
+    }
+
+    // Issue #460: a local standard-eval definition (step 1) shadows the foreign
+    // directive (tier 3.6), so the arg stays reported.
+    #[test]
+    fn foreign_directive_does_not_override_local_definition() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow <- function(x) x + 1\nnrow(undefined_var)\n";
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        assert!(
+            build_used(code, &[], &[], &foreign, &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "foreign directive must not suppress a locally-defined standard-eval callee"
+        );
+    }
+
+    // Issue #460: an own per-formal directive wins over a foreign whole-call for
+    // the same callee. Own f(x) (order from the own # raven: func) suppresses only
+    // the x-bound arg; the data-bound arg stays reported — a foreign whole-call
+    // would have suppressed BOTH.
+    #[test]
+    fn own_directive_beats_foreign_for_same_callee() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "# raven: func nrow(data, x)\n# raven: nse nrow(x)\nnrow(real_df, masked_col)\n";
+        let meta = crate::cross_file::extract_metadata(code);
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        let used = build_used(
+            code,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+            &foreign,
+            &[],
+        );
+        assert!(
+            used.iter().any(|n| n == "real_df"),
+            "own per-formal directive must win over foreign whole-call (data arg stays reported); got {used:?}"
+        );
+        assert!(
+            !used.iter().any(|n| n == "masked_col"),
+            "own per-formal directive suppresses the x-bound arg; got {used:?}"
+        );
+    }
+
+    // Issue #460: a foreign `# raven: func` supplies positional order to a foreign
+    // per-formal directive when there is no local def. Only the expr-bound
+    // positional is suppressed; the uncaptured `real_df` stays reported (a bare
+    // unresolved callee would WholeCall-suppress everything, so this is non-vacuous).
+    #[test]
+    fn foreign_per_formal_uses_foreign_func_order() {
+        use crate::cross_file::types::{DeclaredSymbol, NseDeclaration, NseScope};
+        let code = "myverb(real_df, undefined_expr)\n";
+        let foreign_nse = vec![NseDeclaration {
+            name: "myverb".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["expr".into()]),
+            line: 0,
+        }];
+        let foreign_funcs = vec![DeclaredSymbol {
+            name: "myverb".into(),
+            line: 0,
+            is_function: true,
+            formals: Some(vec!["data".into(), "expr".into()]),
+        }];
+        let used = build_used(code, &[], &[], &foreign_nse, &foreign_funcs);
+        assert!(
+            used.iter().any(|n| n == "real_df"),
+            "data-bound positional stays reported; got {used:?}"
+        );
+        assert!(
+            !used.iter().any(|n| n == "undefined_expr"),
+            "expr-bound positional suppressed; got {used:?}"
+        );
+    }
+
+    // Issue #460: a local standard-eval `myverb` (step 1) shadows the foreign
+    // per-formal directive (tier 3.6), so the positional stays reported.
+    #[test]
+    fn foreign_per_formal_yields_to_local_definition() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "myverb <- function(data, expr) data\nmyverb(a, undefined_expr)\n";
+        let foreign_nse = vec![NseDeclaration {
+            name: "myverb".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["expr".into()]),
+            line: 0,
+        }];
+        let used = build_used(code, &[], &[], &foreign_nse, &[]);
+        assert!(
+            used.iter().any(|n| n == "undefined_expr"),
+            "local def resolves at step 1; foreign tier 3.6 must not fire; got {used:?}"
+        );
+    }
+
+    // Issue #460: the discoverability hint steps aside when a FOREIGN per-formal
+    // directive already governs the callee (file-level, line ignored). Without
+    // foreign-awareness, `nse_directive_governs` would mis-handle the fabricated
+    // line-0 of a file-level entry.
+    #[test]
+    fn hint_suppressed_when_foreign_directive_governs() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow(captured = a, undefined_b)\n";
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["captured".into()]),
+            line: 0,
+        }];
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &foreign,
+            &[],
+        );
+        // Locate the `undefined_b` identifier node.
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let usage = find_ident(root, code, "undefined_b").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a governing foreign directive must suppress the add-# raven: nse hint"
+        );
+    }
+
+    // Issue #460 (Codex P3): a redundantly backticked syntactic call
+    // `` `my_func`(...) `` must be recognized as governed by `# raven: nse my_func`
+    // — the governance lookup canonicalizes the callee, so the misleading
+    // "declare NSE" hint on a surviving (non-captured) argument is suppressed.
+    #[test]
+    fn hint_suppressed_for_backticked_call_governed_by_canonical_directive() {
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        // Own directive keyed canonically as `my_func`; the call spells the callee
+        // with redundant backticks. `other = undefined_other` is the non-captured
+        // (surviving) argument.
+        let code = "# raven: nse my_func(x)\n`my_func`(x = captured, other = undefined_other)\n";
+        let own = crate::cross_file::extract_metadata(code).nse_declarations;
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &own,
+            &[],
+            &[],
+            &[],
+        );
+        let usage = find_ident(root, code, "undefined_other").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a governing `# raven: nse my_func` must suppress the hint for a `\
+             `my_func`(...)` call despite the redundant backticks"
+        );
+    }
+
+    // Issue #460 (Codex review): a redundantly backticked BUILTIN/base callee
+    // (`` `mean`(missing) ``) must be recognized as standard-eval by the
+    // hint/quick-fix eligibility filter (which canonicalizes the bare name), so no
+    // misleading `# raven: nse` suggestion is offered for a normal base call.
+    #[test]
+    fn no_hint_for_backticked_builtin_callee() {
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let code = "`mean`(missing_obj)\n";
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let usage = find_ident(root, code, "missing_obj").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a backticked builtin callee `mean` is standard-eval — no NSE hint"
+        );
+    }
+
+    // Issue #460 cross-file integration harness: insert each `(name, code)` under
+    // workspace root `file:///w/`, wire the dependency graph (open_document does
+    // NOT — only `update_file` creates edges), then run the full `diagnostics`
+    // entry point on `query` and return the diagnostic messages. The undefined
+    // message is `"Undefined variable: <name>"`.
+    fn cross_file_diag_messages(files: &[(&str, &str)], query: &str) -> Vec<String> {
+        let ws = Url::parse("file:///w/").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        // Auto + sourced_by-empty + scan-incomplete defers undefined-variable
+        // diagnostics; mark scan complete so the collector runs.
+        state.workspace_scan_complete = true;
+        for (name, code) in files {
+            let uri = ws.join(name).unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            let meta = crate::cross_file::extract_metadata(code);
+            state
+                .cross_file_graph
+                .update_file(&uri, &meta, Some(&ws), |_| None);
+        }
+        let q = ws.join(query).unwrap();
+        super::diagnostics(&state, &q, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    // B1: an NSE directive in a sourced PARENT suppresses the child call.
+    #[test]
+    fn nse_directive_propagates_from_sourced_parent_to_child() {
+        // Control: child alone (no directive reachable) → nrow's arg is reported.
+        let control = cross_file_diag_messages(&[("child.R", "nrow(undefined_var)\n")], "child.R");
+        assert!(
+            control.iter().any(|m| m.contains("undefined_var")),
+            "baseline: nrow's arg must be checked; got {control:?}"
+        );
+        let msgs = cross_file_diag_messages(
+            &[
+                ("parent.R", "# raven: nse: nrow\n"),
+                ("child.R", "source(\"parent.R\")\nnrow(undefined_var)\n"),
+            ],
+            "child.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "NSE directive in a sourced parent must suppress the child call; got {msgs:?}"
+        );
+    }
+
+    // B2: an NSE directive in a sourced CHILD suppresses the parent call.
+    #[test]
+    fn nse_directive_propagates_from_sourced_child_to_parent() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("parent.R", "source(\"child.R\")\nnrow(undefined_var)\n"),
+                ("child.R", "# raven: nse: nrow\n"),
+            ],
+            "parent.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "NSE directive in a sourced child must suppress the parent call; got {msgs:?}"
+        );
+    }
+
+    // B3: transitive over two source edges, in both directions.
+    #[test]
+    fn nse_directive_propagates_transitively_two_edges() {
+        // a.R -> b.R -> c.R; directive in a.R governs the call in c.R.
+        let down = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\nsource(\"b.R\")\n"),
+                ("b.R", "source(\"c.R\")\n"),
+                ("c.R", "nrow(undefined_var)\n"),
+            ],
+            "c.R",
+        );
+        assert!(
+            !down.iter().any(|m| m.contains("undefined_var")),
+            "directive two edges up must suppress; got {down:?}"
+        );
+        // Mirror: directive in c.R governs the call in a.R.
+        let up = cross_file_diag_messages(
+            &[
+                ("a.R", "source(\"b.R\")\nnrow(undefined_var)\n"),
+                ("b.R", "source(\"c.R\")\n"),
+                ("c.R", "# raven: nse: nrow\n"),
+            ],
+            "a.R",
+        );
+        assert!(
+            !up.iter().any(|m| m.contains("undefined_var")),
+            "directive two edges down must suppress; got {up:?}"
+        );
+    }
+
+    // B4: a directive in a shared sourced helper reaches every file that sources it.
+    #[test]
+    fn nse_directive_propagates_from_shared_sourced_helper() {
+        let files = &[
+            ("h.R", "# raven: nse: nrow\n"),
+            ("a.R", "source(\"h.R\")\nnrow(undefined_var)\n"),
+            ("b.R", "source(\"h.R\")\nnrow(undefined_var)\n"),
+        ];
+        for q in ["a.R", "b.R"] {
+            let msgs = cross_file_diag_messages(files, q);
+            assert!(
+                !msgs.iter().any(|m| m.contains("undefined_var")),
+                "shared helper's directive must suppress in {q}; got {msgs:?}"
+            );
+        }
+    }
+
+    // B4b: sibling via shared parent. main sources setup then analysis; the
+    // directive in setup governs the call in analysis (setup ∈ descendants(main),
+    // main ∈ ancestors(analysis), so setup ∈ S(analysis)).
+    #[test]
+    fn nse_directive_propagates_to_sibling_via_shared_parent() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("main.R", "source(\"setup.R\")\nsource(\"analysis.R\")\n"),
+                ("setup.R", "# raven: nse: nrow\n"),
+                ("analysis.R", "nrow(undefined_var)\n"),
+            ],
+            "analysis.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "sibling via shared parent must inherit the directive; got {msgs:?}"
+        );
+    }
+
+    // B5: unconnected files do NOT share directives (the diagnostic is reported).
+    #[test]
+    fn nse_directive_does_not_propagate_to_unconnected_file() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\n"),
+                ("b.R", "nrow(undefined_var)\n"),
+            ],
+            "b.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_var")),
+            "unconnected file must NOT inherit the directive; got {msgs:?}"
+        );
+    }
+
+    // B6: per-formal propagation. A foreign `# raven: func` (in a connected file)
+    // supplies positional order to a propagated per-formal directive; only the
+    // captured arg is suppressed, the other stays reported.
+    #[test]
+    fn nse_per_formal_propagates_with_cross_file_func_order() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("helper.R", "# raven: func myverb(data, expr)\n"),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 regression: a formals-bearing `# raven: func` must win the foreign
+    // collapse over a LATER parens-less `# raven: func` of the same name (the
+    // collector skips formals-less entries; `declared_function_formals` filters
+    // `formals.is_some()`, so a max-line collapse would otherwise drop the order).
+    #[test]
+    fn foreign_func_collapse_prefers_formals_bearing_declaration() {
+        let msgs = cross_file_diag_messages(
+            &[
+                // Formals-bearing first, then a parens-less redeclaration on a
+                // higher line.
+                (
+                    "helper.R",
+                    "# raven: func myverb(data, expr)\n# raven: func myverb\n",
+                ),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed — formals-bearing func must win; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (review round 2): when connected files declare CONFLICTING formal
+    // orders for the same callee, there is no authoritative order, so a propagated
+    // per-formal directive must fall back to named-only matching rather than risk
+    // suppressing the wrong positional (which could hide a real undefined).
+    #[test]
+    fn conflicting_cross_file_func_orders_fall_back_to_named_only() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: func myverb(data, expr)\n"),
+                ("b.R", "# raven: func myverb(expr, data)\n"),
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\n# raven: nse: myverb(expr)\nmyverb(undefined_pos1, undefined_pos2)\n",
+                ),
+            ],
+            "main.R",
+        );
+        // Named-only fallback: neither positional argument is suppressed.
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_pos1")),
+            "first positional must stay reported under ambiguous order; got {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_pos2")),
+            "second positional must stay reported under ambiguous order; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (Codex P2): two connected files declaring formals for DIFFERENT
+    // qualified functions that share a bare name (`pkgA::f` vs `pkgB::f`) must NOT
+    // collide — each keeps its own order, so a propagated per-formal directive for
+    // one of them still suppresses its captured positional.
+    #[test]
+    fn distinct_qualified_funcs_sharing_bare_name_keep_their_orders() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: func pkgA::f(a)\n"),
+                ("b.R", "# raven: func pkgB::f(b)\n"),
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\n# raven: nse: pkgA::f(a)\npkgA::f(undefined_cap)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_cap")),
+            "pkgA::f's captured positional must be suppressed (pkgB::f must not make it ambiguous); got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (Codex review): when a connected file has MORE THAN ONE
+    // `# raven: func` for the same callee, the LATEST (highest-line) declaration
+    // wins — an obsolete earlier line must not make the propagated order ambiguous.
+    #[test]
+    fn foreign_func_latest_declaration_wins_within_file() {
+        let msgs = cross_file_diag_messages(
+            &[
+                (
+                    "helper.R",
+                    "# raven: func myverb(wrong1, wrong2)\n# raven: func myverb(data, expr)\n",
+                ),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound positional stays reported under the latest order; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound positional must be suppressed via the LATEST func order; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (review round 2): when connected files declare conflicting NSE
+    // SCOPES for one callee (whole-call vs per-formal), the narrower per-formal
+    // must win — even from a larger-URI file — so a broad propagated whole-call
+    // cannot mask an argument the per-formal directive keeps checked.
+    #[test]
+    fn nse_conflict_prefers_per_formal_over_whole_call() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\n"),    // whole-call, smaller URI
+                ("b.R", "# raven: nse: nrow(x)\n"), // per-formal, larger URI
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\nnrow(x = masked_x, other = real_other)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_other")),
+            "non-captured arg must stay reported (per-formal beats whole-call); got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("masked_x")),
+            "the x-captured named arg must be suppressed; got {msgs:?}"
+        );
+    }
+
+    // B7b: cross-file ordering — the `# raven: func` lives in a connected file and
+    // is declared regardless of order relative to the `# raven: nse` directive.
+    #[test]
+    fn nse_per_formal_propagation_is_order_independent() {
+        // func order supplied by a sourced CHILD; nse + call in the parent, with
+        // the call BEFORE nothing-else — order of files/lines must not matter.
+        let msgs = cross_file_diag_messages(
+            &[
+                (
+                    "main.R",
+                    "# raven: nse: myverb(expr)\nsource(\"order.R\")\nmyverb(real_df, undefined_expr)\n",
+                ),
+                ("order.R", "# raven: func myverb(data, expr)\n"),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported regardless of order; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed regardless of order; got {msgs:?}"
+        );
+    }
+
+    // B8: revalidation — editing a connected file's directive updates the
+    // dependent's diagnostics (a fresh `diagnostics` call re-collects foreign NSE).
+    #[test]
+    fn nse_directive_change_revalidates_dependent() {
+        let ws = Url::parse("file:///w/").unwrap();
+        let parent = ws.join("parent.R").unwrap();
+        let child = ws.join("child.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        state.workspace_scan_complete = true;
+
+        let parent_code = "source(\"child.R\")\nnrow(undefined_var)\n";
+        let child_before = "# raven: nse: other\n"; // does not govern nrow
+        state
+            .documents
+            .insert(parent.clone(), Document::new(parent_code, None));
+        state
+            .documents
+            .insert(child.clone(), Document::new(child_before, None));
+        state.cross_file_graph.update_file(
+            &parent,
+            &crate::cross_file::extract_metadata(parent_code),
+            Some(&ws),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child,
+            &crate::cross_file::extract_metadata(child_before),
+            Some(&ws),
+            |_| None,
+        );
+
+        let before: Vec<String> = super::diagnostics(&state, &parent, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            before.iter().any(|m| m.contains("undefined_var")),
+            "before the edit, the unrelated directive must not suppress nrow; got {before:?}"
+        );
+
+        // Edit the child so its directive now governs `nrow`.
+        let child_after = "# raven: nse: nrow\n";
+        state
+            .documents
+            .insert(child.clone(), Document::new(child_after, None));
+        state.cross_file_graph.update_file(
+            &child,
+            &crate::cross_file::extract_metadata(child_after),
+            Some(&ws),
+            |_| None,
+        );
+
+        let after: Vec<String> = super::diagnostics(&state, &parent, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !after.iter().any(|m| m.contains("undefined_var")),
+            "after the edit, the child's directive must suppress the parent call; got {after:?}"
+        );
+    }
+
+    // Issue #455: `# raven: nse` declarations override the inferred NSE policy
+    // for a callee, position-gated to calls after the directive. These exercise
+    // the full snapshot path (`collect_undefined_messages` builds
+    // `directive_meta` via `DiagnosticsSnapshot::build`, so the `# raven: nse` /
+    // `# raven: func` lines are parsed and threaded into `NseAnalysis`).
+    #[test]
+    fn nse_whole_call_suppresses_all_args() {
+        // Local def infers `Standard` (args checked); only the `# raven: nse`
+        // whole-call override suppresses them. A bare undefined callee would be
+        // `WholeCall` already, making the assertions pass vacuously.
+        let diags = collect_undefined_messages(
+            "my_func <- function(a, b) a\n# raven: nse my_func\nmy_func(undefined_a, undefined_b > 1)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("undefined_a")),
+            "got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("undefined_b")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_directive_overrides_local_inference() {
+        // The local def has no captures (standard eval), but the explicit
+        // `# raven: nse` declaration is authoritative and declares `x` NSE.
+        let src = "my_func <- function(data, x) NULL\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg suppressed by directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn no_nse_directive_keeps_standard_checking() {
+        // Sanity: without a directive, a plain local call checks its args, so
+        // the directive tests above are not vacuously suppressing everything.
+        let src = "my_func <- function(data, x) NULL\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("masked_col")),
+            "without a directive the arg is checked; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_per_formal_with_local_def_positional() {
+        let src = "my_func <- function(data, x) data\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_named_arg_matches_without_order() {
+        let src = "# raven: nse my_func(x)\nmy_func(data = real_df, x = masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_positional_without_order_does_not_suppress() {
+        let src = "# raven: nse my_func(x)\nmy_func(masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_is_position_aware() {
+        // A local definition with a standard-eval policy makes the pre-directive
+        // call's argument checked; only after the `# raven: nse` line does the
+        // whole-call override take effect. (A bare undefined callee would
+        // suppress its args unconditionally, masking the position gate.)
+        let src = "my_func <- function(x) x\nmy_func(before_col)\n# raven: nse my_func\nmy_func(after_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("before_col")),
+            "call before directive checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("after_col")),
+            "call after directive suppressed; got {diags:?}"
+        );
+    }
+
+    /// Issue #455 manual-report regression: the exact shape a user hit — a
+    /// `library(arm)` with an installed/resolved `lmer` export, a `# raven: func`
+    /// supplying the formal order, and a `# raven: nse` declaring the captured
+    /// formals — using the **colon-after-keyword** form (`func:` / `nse:`). The
+    /// positional call `lmer(x, y)` must be fully suppressed: the paired `func`
+    /// gives the order so both positionals bind captured formals. A resolved
+    /// package export must NOT bypass the authoritative directive.
+    #[test]
+    fn nse_paired_func_colon_form_suppresses_with_resolved_package_export() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let pkg_dir = tmp.path().join("arm");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), "export(lmer)\n").unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: arm\nTitle: ARM\nDescription: x\n",
+        )
+        .unwrap();
+
+        let mut state = create_test_state();
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state.package_library_ready = true;
+
+        let code = "library(arm)\n# raven: func: lmer(formula, data)\n# raven: nse: lmer(formula, data)\nlmer(x, y)\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let msgs: Vec<String> = diagnostics.into_iter().map(|d| d.message).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("Undefined variable: x")),
+            "first positional binds captured formal `formula`; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("Undefined variable: y")),
+            "second positional binds captured formal `data`; got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn nse_qualified_matches_qualified_call() {
+        let src = "# raven: nse pkg::my_func(x)\npkg::my_func(x = masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "got {diags:?}"
+        );
+    }
+
+    /// Issue #459: a redundantly backtick-quoted QUALIFIED callee
+    /// `` pkg::`my_func`(...) `` must match a qualified `# raven: nse
+    /// pkg::my_func(x)` directive. `resolve_call_arg_policy` canonicalizes the
+    /// bare `rhs` component before `own_directive_nse_policy(..., Qualified(pkg))`,
+    /// so the backticks are stripped and the directive's PerFormal policy
+    /// applies: the captured `x` is suppressed while the non-captured `y` stays
+    /// checked. Without canonicalization the lookup would miss and the call
+    /// would resolve to standard-eval, wrongly checking `masked_col`.
+    #[test]
+    fn nse_qualified_backticked_callee_matches_qualified_directive() {
+        let src = "# raven: nse pkg::my_func(x)\npkg::`my_func`(x = masked_col, y = real_undef)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "captured `x` must be suppressed via the qualified directive; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "non-captured `y` must still be checked (PerFormal, not WholeCall); got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_qualified_directive_still_applies_to_bare_call_without_local() {
+        // The legitimate qualified→bare case: `pkg` is in play and nothing
+        // shadows `my_func`, so the qualified directive governs the bare call.
+        // The second, non-captured arg (`y`) is the load-bearing assertion: it
+        // must still be flagged, proving the directive's PerFormal policy is in
+        // effect rather than the blanket `WholeCall` fallback an unresolved
+        // callee would otherwise get (which would suppress `real_undef` too).
+        let src =
+            "library(pkg)\n# raven: nse pkg::my_func(x)\nmy_func(x = masked_col, y = real_undef)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "captured `x` must be suppressed via the in-play qualified directive; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "non-captured `y` must still be checked (PerFormal, not WholeCall); got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_qualified_directive_does_not_override_shadowing_local() {
+        // A qualified `# raven: nse pkg::my_func` must NOT suppress arguments to a
+        // bare `my_func(...)` call when a local standard-eval `my_func` shadows
+        // the package export — R invokes the local, not `pkg::my_func`. (A bare
+        // `# raven: nse my_func` *would* override the local; that authoritative
+        // behavior is covered by `nse_directive_overrides_local_inference`.)
+        let src = "library(pkg)\nmy_func <- function(a, b) a + b\n# raven: nse pkg::my_func\nmy_func(undefined_a, undefined_b)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("undefined_a")),
+            "local shadow is standard-eval; first arg must be checked; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("undefined_b")),
+            "local shadow is standard-eval; second arg must be checked; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_cross_package_func_does_not_supply_formals() {
+        // A `# raven: func` for a *different* package must not provide the formal
+        // order for a qualified `# raven: nse` — otherwise positional matching
+        // binds against the wrong signature. With no usable order the directive
+        // falls back to named-only matching, so the positional args stay checked.
+        let src = "# raven: func otherpkg::my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("m1")),
+            "cross-package func must not supply order; m1 stays checked; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("m2")),
+            "cross-package func must not supply order; m2 stays checked; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_same_package_func_supplies_formals() {
+        // The matching case: a same-package `# raven: func` supplies the formal
+        // order, so positional captured args are suppressed and the data arg is
+        // checked.
+        let src = "# raven: func pkg::my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
+    fn nse_func_formals_with_defaults_strip_to_names() {
+        // A `# raven: func` that pastes a real signature with defaults
+        // (`x = NULL`) must still yield the formal *name* `x` for positional
+        // matching — not the literal `"x = NULL"`.
+        let src = "# raven: func my_func(data, x = NULL)\n# raven: nse my_func(x)\nmy_func(real_df, masked_col)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_col")),
+            "x arg (default stripped) suppressed positionally; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dots_capture_suppresses_dots_absorbed_args() {
+        // `# raven: nse f(...)` declares that arguments absorbed by `...` are
+        // captured. With a local def `function(a, ...)`, the fixed `a` arg is
+        // checked while the trailing dots-absorbed args are suppressed.
+        let src = "my_func <- function(a, ...) a\n# raven: nse my_func(...)\nmy_func(real_arg, masked_1, masked_2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_arg")),
+            "fixed formal `a` is checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_1")),
+            "dots-absorbed arg suppressed; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_2")),
+            "dots-absorbed arg suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_unqualified_func_serves_qualified_nse() {
+        // Leniency is preserved: an unqualified `# raven: func` still supplies
+        // the formal order for a qualified `# raven: nse` of the same bare name.
+        let src = "# raven: func my_func(data, x, y)\n# raven: nse pkg::my_func(x, y)\npkg::my_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(
+            diags.iter().any(|m| m.contains("real_df")),
+            "data arg must be checked; got {diags:?}"
+        );
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
+    fn nse_func_after_nse_also_enables_positional() {
+        // Formal order is position-independent: a `# raven: func` works whether
+        // it precedes or follows the `# raven: nse` it serves.
+        let src = "# raven: nse my_func(x, y)\n# raven: func my_func(data, x, y)\nmy_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
+    #[test]
+    fn nse_paired_func_enables_positional() {
+        let src = "# raven: func my_func(data, x, y)\n# raven: nse my_func(x, y)\nmy_func(real_df, m1, m2)\n";
+        let diags = collect_undefined_messages(src);
+        assert!(diags.iter().any(|m| m.contains("real_df")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m1")), "got {diags:?}");
+        assert!(!diags.iter().any(|m| m.contains("m2")), "got {diags:?}");
+    }
+
     /// Issue #398 end-to-end: a standard-eval call argument (`paste` is a
     /// builtin callee, so its argument is checked) that is undefined reaches a
     /// published diagnostic.
@@ -56563,6 +59225,524 @@ my_func <- function(a = default_value) {
                 .any(|m| m.contains("Undefined variable: undefined_pkg")),
             "citation is standard-eval; its argument should be flagged; got {citation:?}"
         );
+    }
+
+    // Issue #455: when an `undefined-variable` diagnostic fires for an
+    // identifier inside a non-builtin call argument, the message should
+    // suggest `# raven: nse` to aid discoverability.
+    #[test]
+    fn undefined_in_user_call_arg_gets_nse_hint() {
+        // Local user function, no NSE declared: undefined `x` in its arg gets a hint.
+        let diags = collect_undefined_messages(
+            "my_filter <- function(df, cond) df\nmy_filter(real_df, x)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: x"))
+            .expect("x reported");
+        assert!(
+            d.contains("# raven: nse"),
+            "message should suggest the directive: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_drops_nonsyntactic_named_arg_formal() {
+        // A backtick-quoted (non-syntactic) named-argument label cannot be a
+        // formal in the directive grammar (`split_formal_list` rejects it), so a
+        // `# raven: nse my_fn(`weird name`)` suggestion would silently re-parse
+        // to whole-call. The hint must instead fall back to the parseable
+        // formal-less func+nse suggestion.
+        let diags = collect_undefined_messages(
+            "my_fn <- function(`weird name`) `weird name`\nmy_fn(`weird name` = undef)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef"))
+            .expect("undef reported");
+        assert!(
+            !d.contains("nse my_fn(`weird name`)"),
+            "must not propose an unparseable per-formal directive: {d}"
+        );
+        assert!(
+            d.contains("# raven: func") && d.contains("<formals>"),
+            "should fall back to the formal-less func+nse suggestion: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_suggestion_quotes_nonsyntactic_callee() {
+        // The suggested directive for a NON-SYNTACTIC callee must use the quoted
+        // form (`"my data fn"`) so it parses — not the raw backtick spelling,
+        // which the directive grammar rejects (the suggestion would then silently
+        // never govern). Guards `callee_directive_form` through the emit path;
+        // other backtick-callee tests only hand-write quoted directives.
+        let diags = collect_undefined_messages(
+            "`my data fn` <- function(df, cond) df\n`my data fn`(real_df, undef_arg)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg reported");
+        assert!(
+            d.contains("# raven: func \"my data fn\""),
+            "suggestion must quote the non-syntactic callee: {d}"
+        );
+        assert!(
+            !d.contains("# raven: func `my data fn`"),
+            "suggestion must not emit the raw backtick callee form: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_suggestion_quotes_whole_qualified_nonsyntactic_callee() {
+        // For a namespace-qualified NON-SYNTACTIC callee (`` pkg::`my fn`(...) ``)
+        // the suggested directive must quote the WHOLE `pkg::name` (`"pkg::my fn"`),
+        // NOT the unparseable `pkg::"my fn"` (the grammar has no `pkg::"..."` form,
+        // so that spelling would silently never govern). Guards the qualified
+        // branch of `callee_directive_form`.
+        let diags = collect_undefined_messages("pkg::`my fn`(undef_arg)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg reported");
+        assert!(
+            d.contains("\"pkg::my fn\""),
+            "suggestion must quote the whole qualified non-syntactic callee: {d}"
+        );
+        assert!(
+            !d.contains("pkg::\"my fn\""),
+            "must not emit the unparseable pkg::\"...\" form: {d}"
+        );
+
+        // The suggested quoted form must actually parse AND govern the call: the
+        // captured named arg `a` is suppressed when the directive is applied.
+        let governed = collect_undefined_messages(
+            "# raven: nse \"pkg::my fn\"(a)\npkg::`my fn`(a = masked)\n",
+        );
+        assert!(
+            !governed.iter().any(|m| m.contains("masked")),
+            "the suggested `\"pkg::my fn\"` form must govern the qualified call; got {governed:?}"
+        );
+    }
+
+    #[test]
+    fn nse_directive_does_not_borrow_ambiguous_reordered_formals() {
+        // `f` is redefined with PERMUTED formals, so its positional order is
+        // ambiguous. The bare `# raven: nse f(x)` must NOT borrow a formal order
+        // (last-binding-wins would lend the later `(x, data)` order to the
+        // earlier call and suppress slot 1 — hiding the real undefined
+        // `real_undef`). It falls back to named-only matching, leaving the
+        // positional `real_undef` flagged.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_undef, masked_col)\nf <- function(x, data) data\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "ambiguous formal order must not suppress positional `real_undef`; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_ambiguity_guard_survives_interposed_rebinding() {
+        // The formal-order ambiguity guard must survive an intervening rebinding
+        // that EVICTS the prior definition from `local_function_defs` — an alias
+        // (`f <- g`) or a non-callable value (`f <- 5`). Otherwise the later
+        // permuted definition has no prior def to compare against, is not flagged
+        // ambiguous, and the directive borrows its `(x, data)` order — wrongly
+        // suppressing the earlier call's positional `real_undef` (a hidden
+        // undefined variable). The guard compares against the FIRST-seen order,
+        // which a rebinding does not clear.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_undef, masked_col)\nf <- 5\nf <- function(x, data) data\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_undef")),
+            "ambiguity guard must survive an interposed rebinding; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_directive_borrows_formals_when_redefinition_keeps_order() {
+        // Redefining `f` with the SAME formal order is not ambiguous, so
+        // positional borrowing still applies: the captured formal `x` (slot 2)
+        // is suppressed and the non-captured slot 1 stays flagged. Guards the
+        // ambiguity check against over-triggering on identical redefinitions.
+        let diags = collect_undefined_messages(
+            "f <- function(data, x) data\n# raven: nse f(x)\nf(real_data, masked_x)\nf <- function(data, x) x\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_data")),
+            "non-captured slot 1 still flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured slot 2 `x` must still be suppressed when order is unchanged; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_in_builtin_call_arg_has_no_hint() {
+        // paste() is a high-confidence standard-eval builtin -> no NSE hint noise.
+        let diags = collect_undefined_messages("paste(undefined_x)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undefined_x"))
+            .expect("reported");
+        assert!(!d.contains("# raven: nse"), "no hint for builtins: {d}");
+    }
+
+    #[test]
+    fn top_level_undefined_has_no_hint() {
+        // Not inside a call argument -> no hint. `.expect` (not `if let`) so a
+        // regression that stopped flagging top-level `x` fails here loudly
+        // instead of passing vacuously without ever checking the no-hint rule.
+        let diags = collect_undefined_messages("x + 1\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: x"))
+            .expect("top-level x flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "no hint for non-call usage: {d}"
+        );
+    }
+
+    #[test]
+    fn undefined_callee_in_nested_call_has_no_hint() {
+        // `undefined_fn` is the callee of the inner call, not an NSE-captured
+        // argument of `g(...)`. Its diagnostic must not suggest declaring NSE
+        // on the outer call.
+        let diags = collect_undefined_messages("g <- function(a) a\ng(undefined_fn(1))\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undefined_fn"))
+            .expect("undefined_fn flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "callee-position identifier gets no NSE hint: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_suppressed_when_directive_covers_callee() {
+        // With `# raven: nse my_func(y)` already in effect, a surviving
+        // diagnostic on a non-captured argument is intentional — the message
+        // must not redundantly suggest declaring NSE for the same callee.
+        let diags = collect_undefined_messages(
+            "my_func <- function(x, y, z) x\n# raven: nse my_func(y)\nmy_func(p1, masked_y, p3)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: p1"))
+            .expect("p1 flagged");
+        assert!(
+            !d.contains("# raven: nse"),
+            "no redundant hint when a directive already covers the callee: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_fires_for_qualified_call_with_only_bare_directive() {
+        // A bare `# raven: nse foo(x)` does NOT govern a `pkg::foo(...)` call,
+        // so the hint must still fire for the qualified call's undefined arg
+        // (the suppression is package-aware, not a bare-name probe).
+        let diags = collect_undefined_messages("# raven: nse foo(x)\notherpkg::foo(undef_arg)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "qualified-call hint must fire despite an unrelated bare directive: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_fires_when_directive_is_after_the_call() {
+        // A directive written AFTER the call does not govern it, so the hint
+        // must still fire on the earlier call (suppression is position-aware).
+        let diags = collect_undefined_messages(
+            "my_func <- function(a) a\nmy_func(undef_arg)\n# raven: nse my_func\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "hint must fire when the only directive is declared after the call: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_quoted_name_governs_backtick_call() {
+        // End-to-end: a quoted-name directive must actually govern the matching
+        // backtick call. The directive stores the name backtick-wrapped so it
+        // aligns with the call-site callee text; the local def supplies formal
+        // order. `masked_x` (captured `x`) is suppressed; `real_a` (formal `a`,
+        // not captured) is still flagged.
+        let diags = collect_undefined_messages(
+            "`my data fn` <- function(a, x) a\n# raven: nse \"my data fn\"(x)\n`my data fn`(real_a, masked_x)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_a")),
+            "non-captured formal `a` must still be flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured formal `x` must be suppressed by the quoted-name directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dot_digit_callee_governs_backtick_call() {
+        // A leading-dot digit callee (`.2way`) is non-syntactic, so the call is
+        // written `` `.2way`(...) `` and its callee node_text carries backticks.
+        // The directive must store the name wrapped to match; before the fix
+        // `is_formal_name` accepted `.2way` bare and the directive silently never
+        // governed the call (a safe-direction miss — `masked_x` would stay
+        // flagged). `real_a` (non-captured) is still flagged.
+        let diags = collect_undefined_messages(
+            "`.2way` <- function(a, x) a\n# raven: nse \".2way\"(x)\n`.2way`(real_a, masked_x)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_a")),
+            "non-captured formal `a` must still be flagged; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured formal `x` must be suppressed by the dot-digit directive; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_dots_capture_is_not_arity_aware() {
+        // `# raven: nse f(...)` declares dots-capture. Per the directive's
+        // intentional arity-non-awareness (docs/directives.md "deliberately
+        // coarse"), a trailing positional beyond the callee's real arity is
+        // captured even though `f` has no `...` formal. Pins that documented
+        // behavior: `third_undef` is suppressed while the in-arity positionals
+        // stay checked. (Errs only toward suppression, never a false positive.)
+        let diags = collect_undefined_messages(
+            "f <- function(a, b) a\n# raven: nse f(...)\nf(p_a, p_b, third_undef)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("p_a")),
+            "in-arity non-captured positional stays checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("third_undef")),
+            "dots-capture suppresses the overflow positional (not arity-aware); got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_shows_for_bare_call_governed_only_by_in_play_qualified_directive() {
+        // `nse_directive_governs` intentionally omits the BareInPlayQualified
+        // pass (it errs toward SHOWING the hint). So a bare call whose only
+        // governing directive is an in-play `pkg::` one still gets the
+        // discoverability hint on a surviving non-captured argument. The captured
+        // named arg `x = masked` IS suppressed (proving the directive genuinely
+        // governs the bare call via BareInPlayQualified, so the test isn't
+        // vacuous), while the non-captured positional `real_undef` is still
+        // flagged AND carries the hint.
+        let diags = collect_undefined_messages(
+            "library(pkg)\n# raven: nse pkg::foo(x)\nfoo(real_undef, x = masked)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked")),
+            "captured `x` must be suppressed (directive governs the bare call); got {diags:?}"
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: real_undef"))
+            .expect("real_undef flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "hint should still show for an in-play-qualified-only directive: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_named_formal_and_dots_capture_together() {
+        // The documented combined form `# raven: nse f(x, ...)` must capture
+        // BOTH the named formal `x` AND the `...`-absorbed trailing args, while
+        // a non-captured formal (`y`) stays checked — exercising captured names
+        // and `captured_dots` simultaneously (a regression clobbering either
+        // would surface here).
+        let diags = collect_undefined_messages(
+            "my_func <- function(x, y, ...) x\n# raven: nse my_func(x, ...)\nmy_func(masked_x, real_y, dots_undef)\n",
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("masked_x")),
+            "captured named formal `x` must be suppressed; got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("real_y")),
+            "non-captured formal `y` must still be checked; got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|m| m.contains("dots_undef")),
+            "arg absorbed by captured `...` must be suppressed; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nse_captured_name_absent_from_formals_keeps_extra_positional_checked() {
+        // `# raven: nse my_func(x)` names `x`, not a formal of `function(a, b)`.
+        // A third positional beyond the real arity must still be checked, not
+        // bound to a synthetic `x` slot and suppressed.
+        let diags = collect_undefined_messages(
+            "my_func <- function(a, b) a\n# raven: nse my_func(x)\nmy_func(p_a, p_b, third_undef)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("third_undef")),
+            "extra positional must still be flagged; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_nse_does_not_borrow_unrelated_local_formals() {
+        // `# raven: nse pkg::my_func(masked)` is qualified; a local `my_func`
+        // sharing only the bare name must not supply its formal order. With no
+        // `# raven: func`, the qualified directive uses named-only matching, so
+        // a positional argument to the qualified call is still checked.
+        let diags = collect_undefined_messages(
+            "my_func <- function(masked, real) masked\n# raven: nse pkg::my_func(masked)\npkg::my_func(undef_arg)\n",
+        );
+        assert!(
+            diags.iter().any(|m| m.contains("undef_arg")),
+            "qualified-call positional must be checked, not suppressed via an unrelated local; got {diags:?}"
+        );
+    }
+
+    /// Find the first `identifier` node named `name` anywhere in the tree, so the
+    /// quick-fix tests can pass the exact node the production handler resolves
+    /// from the diagnostic range via `descendant_for_point_range`.
+    fn first_ident<'t>(root: super::Node<'t>, text: &'t str, name: &str) -> super::Node<'t> {
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return node;
+            }
+            let children: Vec<super::Node> = node.children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        panic!("identifier `{name}` not found");
+    }
+
+    #[test]
+    fn nse_quick_fix_inserts_directive_above_call() {
+        let src = "my_filter <- function(df, cond) df\n  my_filter(real_df, x)\n";
+        let tree = parse_r_code(src);
+        // Use the second `x` (the call argument), not the formal in the def.
+        let node = first_ident(tree.root_node(), src, "x");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        assert_eq!(fix.insert_line, 1);
+        assert_eq!(fix.text, "  # raven: nse my_filter(CAPTURED_FORMAL)\n");
+        assert!(fix.title.contains("# raven: nse"));
+    }
+
+    #[test]
+    fn nse_quick_fix_named_arg_uses_formal_name() {
+        let src = "my_filter <- function(df, cond) df\nmy_filter(df = real_df, cond = x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "x");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        assert_eq!(fix.text, "# raven: nse my_filter(cond)\n");
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_builtin() {
+        let src = "paste(undefined_x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_when_not_in_call_arg() {
+        let src = "x + 1\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "x");
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_callee_position() {
+        // The undefined identifier is the callee of the inner call, not an
+        // argument of `g(...)` — no NSE quick-fix should be offered.
+        let src = "g(undefined_fn(1))\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_fn");
+        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_none_for_base_export() {
+        // A base-package callee not in the hardcoded `is_builtin` set is still
+        // filtered when base exports are supplied, matching `nse_hint_for_usage`.
+        let src = "some_base_fn(undefined_x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        // Without base exports, the quick-fix is offered (callee is unresolved).
+        assert!(super::nse_quick_fix_edit(node, src, None).is_some());
+        // With `some_base_fn` known as a base export, it is suppressed.
+        let base: std::collections::HashSet<String> =
+            std::iter::once("some_base_fn".to_string()).collect();
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
+    }
+
+    #[test]
+    fn nse_quick_fix_qualified_callee_keeps_package() {
+        // For a `pkg::verb(...)` call the suggested directive must carry the
+        // qualifier — an unqualified `# raven: nse verb` would not match the
+        // qualified call, so the fix would be a no-op.
+        let src = "mypkg::my_verb(masked)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "masked");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        assert_eq!(fix.text, "# raven: nse mypkg::my_verb(CAPTURED_FORMAL)\n");
+    }
+
+    /// Issue #460 (Codex review): applying the unknown-formal quick-fix verbatim
+    /// must NOT suppress every argument. The `CAPTURED_FORMAL` placeholder parses
+    /// as a per-formal directive matching no real argument (a no-op), so the
+    /// genuinely-undefined positional argument keeps reporting until the user
+    /// fills in the real formal — unlike a `<formal>` placeholder, which parses to
+    /// a blanket whole-call directive.
+    #[test]
+    fn nse_quick_fix_placeholder_is_a_no_op_when_applied_verbatim() {
+        let src = "f <- function(a) a\nf(undef)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undef");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        // The inserted directive must parse as a per-formal directive matching the
+        // (nonexistent) placeholder formal — NOT a blanket whole-call directive
+        // that would suppress every argument if the user applied the fix verbatim.
+        let meta = crate::cross_file::extract_metadata(fix.text.trim_start());
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            crate::cross_file::types::NseScope::Formals(vec!["CAPTURED_FORMAL".to_string()]),
+            "placeholder must parse as a (no-op) per-formal directive, not whole-call"
+        );
+    }
+
+    #[test]
+    fn nse_quick_fix_qualified_base_export_filtered_by_bare_suffix() {
+        // A qualified `base::paste(...)` is filtered via the bare suffix, just
+        // like the bare `paste(...)` builtin.
+        let src = "base::paste(undefined_x)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undefined_x");
+        let base: std::collections::HashSet<String> =
+            std::iter::once("paste".to_string()).collect();
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
     }
 }
 
@@ -57124,6 +60304,28 @@ mod dollar_member_completion_tests {
                 assert_eq!(edit.new_text, "beta");
             }
             other => panic!("expected text edit for beta completion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dollar_member_completion_inserts_non_ascii_member_bare() {
+        // A non-ASCII but syntactic member name (`données`) is a valid R name in
+        // a UTF-8 locale, so it must be inserted WITHOUT backticks. Guards the
+        // Unicode-aware `is_syntactic_r_name` at the completion consumer (the old
+        // ASCII-only predicate would have wrongly wrapped it).
+        let items = completion_items("foo <- list(données = 1)\nfoo$|");
+        let item = items
+            .iter()
+            .find(|item| item.label == "données")
+            .expect("données member");
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.new_text, "données");
+            }
+            other => panic!(
+                "expected bare insert text for non-ASCII member, got {:?}",
+                other
+            ),
         }
     }
 
@@ -59615,5 +62817,410 @@ mod issue_149_utf16_handlers {
             .unwrap();
         let parsed: Vec<String> = serde_json::from_str(&decoded).unwrap();
         assert_eq!(parsed, vec!["`weird name`".to_string(), "pkg".to_string()]);
+    }
+}
+
+/// Issue #459 (Task 4): redundant backtick-quoting of a *syntactic* name must
+/// not break go-to-definition or find-references, while a genuinely
+/// non-syntactic backtick name (whose backticks are required) stays navigable.
+///
+/// Seam-A storage (scope / goto / find-refs) keeps definition names bare, so a
+/// use-site `` `my_func` `` must drop its redundant backticks (unconditional
+/// `unquote_backtick_name`) to hit the bare key. find-references canonicalizes
+/// BOTH equality operands so a bare `my_func` and a backticked `` `my_func` ``
+/// are unioned into one reference set.
+#[cfg(test)]
+mod issue_459_backtick_navigation_tests {
+    use super::{goto_definition, references};
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
+
+    fn create_state() -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state
+    }
+
+    fn add_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        state
+            .documents
+            .insert(uri.clone(), Document::new(content, None));
+        uri
+    }
+
+    fn scalar(result: Option<GotoDefinitionResponse>) -> tower_lsp::lsp_types::Location {
+        match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar location, got {other:?}"),
+        }
+    }
+
+    fn ref_lines(refs: &[tower_lsp::lsp_types::Location]) -> Vec<u32> {
+        let mut lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Goto-definition from a redundantly backtick-quoted *syntactic* call
+    /// `` `my_func`() `` lands on the bare `my_func` definition. The definition
+    /// is stored bare (Seam-A), so the use-site key must drop the redundant
+    /// backticks to match.
+    #[test]
+    fn goto_from_backtick_quoted_syntactic_name_lands_on_definition() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+    }
+
+    /// Find-references unions bare and backticked occurrences of a syntactic
+    /// name: querying from the backticked use returns the bare definition, the
+    /// bare call, and the backticked call.
+    #[test]
+    fn references_union_bare_and_backticked_syntactic_occurrences() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\nmy_func()\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on the backticked occurrence (line 2).
+        let refs = references(&state, &uri, Position::new(2, 3)).expect("references Some");
+        assert_eq!(
+            ref_lines(&refs),
+            vec![0, 1, 2],
+            "all three occurrences are references"
+        );
+    }
+
+    /// Symmetry: querying from a *bare* occurrence must also surface the
+    /// backticked one.
+    #[test]
+    fn references_from_bare_includes_backticked_syntactic_occurrence() {
+        let mut state = create_state();
+        let code = "my_func <- function() 1\nmy_func()\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let refs = references(&state, &uri, Position::new(1, 0)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1, 2]);
+    }
+
+    /// A genuinely non-syntactic backtick local (`` `my fn` ``) remains
+    /// navigable: goto from a backticked use lands on the backticked
+    /// definition. Seam-A unconditional unquote handles this; canonicalization
+    /// must not strip the *required* backticks and break the lookup.
+    #[test]
+    fn goto_from_nonsyntactic_backtick_local_still_navigable() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() 1\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Find-references on a non-syntactic backtick local returns both
+    /// occurrences (definition + use); only backticked spellings exist.
+    #[test]
+    fn references_nonsyntactic_backtick_local() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() 1\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let refs = references(&state, &uri, Position::new(1, 3)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1]);
+    }
+
+    /// Goto from a use of a backtick-quoted zeallot destructuring target
+    /// highlights its FULL source token (`` `my var` ``), not the bare inner
+    /// name. `defined_column` anchors at the opening backtick, so the highlight
+    /// end must be derived from the real token width — matching the parameter /
+    /// for-loop sibling sites — rather than `defined_column + utf16_len(bare)`,
+    /// which would under-cover the 8-column token by 2 (issue #459 / I-B2).
+    #[test]
+    fn goto_from_backtick_destructuring_target_highlights_full_token() {
+        let mut state = create_state();
+        let code = "c(`my var`, y) %<-% list(1, 2)\n`my var`\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my var` `` on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 2,
+            "highlight starts at the opening backtick"
+        );
+        assert_eq!(
+            l.range.end.character, 10,
+            "highlight ends one past the closing backtick (full 8-col token), \
+             not the 6-col bare name"
+        );
+    }
+
+    /// Goto from a backtick-quoted symbol declared via `# raven: func` lands on
+    /// the directive line (the directive-declared go-to-definition path keys on
+    /// the canonical bare name).
+    #[test]
+    fn goto_from_backtick_quoted_directive_declared_func() {
+        let mut state = create_state();
+        let code = "# raven: func my_func(x)\nresult <- `my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 1 (after `result <- `).
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 13)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "directive is on line 0");
+    }
+
+    /// Issue #459: goto from a redundantly backtick-quoted *syntactic* use
+    /// `` `my_func`() `` of a symbol declared via directives at TWO different
+    /// lines navigates to the MIN declaration line. This pins the directive-seam
+    /// (Seam B) canonicalization in the `declared_variables`/`declared_functions`
+    /// goto loops, which compare `canonical_use_name(&decl.name)` against
+    /// `canonical_use_name(name)`.
+    ///
+    /// It is arranged to FAIL under a raw `decl.name == name` revert: the
+    /// declarations store the *bare* `my_func` (a syntactic name), but the use
+    /// site `name` is the raw, still-backticked `` `my_func` ``. A raw `==`
+    /// therefore matches NEITHER loop, leaving `first_line == None`, so goto
+    /// falls back to `symbol.defined_line`. The in-scope declared symbol is the
+    /// LAST declaration before the use (later declarations overwrite earlier in
+    /// the position-aware timeline), i.e. line 1 — NOT the min (line 0). So a
+    /// raw-`==` revert would navigate to line 1; only the canonical comparison
+    /// reaches the correct min line 0.
+    #[test]
+    fn goto_from_backtick_quoted_multi_declared_lands_on_min_line() {
+        let mut state = create_state();
+        // `my_func` declared twice via directives: a `var` on line 0 and a
+        // `func` on line 1. The use on line 2 is redundantly backtick-quoted.
+        let code = "# raven: var my_func\n# raven: func my_func(x)\nresult <- `my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside `` `my_func` `` on line 2 (after `result <- `, which is
+        // 10 chars, so the backtick is at column 10 and the name follows).
+        let l = scalar(goto_definition(&state, &uri, Position::new(2, 13)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(
+            l.range.start.line, 0,
+            "must navigate to the MIN declaration line (the `var` on line 0), \
+             not the in-scope symbol's last-declaration fallback (line 1)"
+        );
+    }
+
+    /// Hover on a redundantly backtick-quoted syntactic call resolves to the
+    /// bare definition (the hover symbol lookup strips backticks unconditionally,
+    /// consistent with go-to-definition).
+    #[tokio::test]
+    async fn hover_on_backtick_quoted_syntactic_call_resolves() {
+        let mut state = create_state();
+        let code = "my_func <- function(x) x\n`my_func`(1)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let result = super::hover(&state, &uri, Position::new(1, 3)).await;
+        assert!(
+            result.is_some(),
+            "hover on a backtick-quoted syntactic call must resolve to the bare definition"
+        );
+    }
+
+    /// Issue #459 regression: the cross-file goto FALLBACKS must mirror the
+    /// primary scope lookup's try-RAW-then-unquote order. A directive-declared
+    /// NON-syntactic symbol is keyed in `exported_interface` WRAPPED (via
+    /// `callee_name_for_match`), so a `` `my fn`() `` use reaches it only via
+    /// the raw `name`; resolving on the bare `scope_key` alone misses it. The
+    /// using file has NO `source()` link to the defining file, so the in-scope
+    /// primary lookup misses and resolution falls through to the
+    /// `exported_interface` arm under test (here via the workspace index).
+    #[test]
+    fn goto_backtick_resolves_via_exported_interface_fallback_without_source_link() {
+        use crate::workspace_index::IndexEntry;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let mut state = create_state();
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let lib_uri = Url::parse("file:///workspace/lib.R").unwrap();
+
+        // No `source("lib.R")`: the using file is unrelated to the defining
+        // file, so the only path to lib.R is the workspace `exported_interface`
+        // fallback, not the in-scope primary lookup.
+        let main_code = "`my_func`()\n`my fn`()\n";
+        // lib.R: a bare regular def (`my_func`, stored bare) and a
+        // directive-declared NON-syntactic func (`my fn`, stored backtick-
+        // WRAPPED in `exported_interface`).
+        let lib_code = "my_func <- function() 1\n# raven: func \"my fn\"(x)\n";
+
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(main_code, None));
+
+        let lib_doc = Document::new_with_uri(lib_code, None, &lib_uri);
+        let lib_metadata = Arc::new(crate::cross_file::extract_metadata(lib_code));
+        let lib_artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &lib_uri,
+            lib_doc.tree.as_ref().expect("lib.R parses"),
+            lib_code,
+            Some(&lib_metadata),
+        ));
+        let entry = IndexEntry {
+            contents: lib_doc.contents.clone(),
+            tree: lib_doc.tree.clone(),
+            loaded_packages: lib_doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: lib_code.len() as u64,
+                content_hash: None,
+            },
+            metadata: lib_metadata,
+            artifacts: lib_artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+
+        // Bare syntactic `my_func`: hits `exported_interface` via the unquoted
+        // key (works pre-fix), proving the fallback path is actually reached.
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(l.uri, lib_uri, "`my_func` resolves to lib.R");
+
+        // Non-syntactic `my fn`: `exported_interface` stores it WRAPPED, so only
+        // the raw-`name` lookup hits — the regression site.
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(1, 3)));
+        assert_eq!(
+            l.uri, lib_uri,
+            "`my fn` resolves to lib.R via the WRAPPED exported_interface key"
+        );
+    }
+
+    /// Issue #459 regression companion: the legacy tree-text fallback
+    /// (`find_definition_in_tree`) matches RAW tree text, so a non-syntactic
+    /// assignment def has a backticked LHS (`` `my fn` <- ... ``). A `` `my fn`()
+    /// `` use must therefore be searched RAW first; passing only the bare
+    /// `scope_key` misses the backticked LHS. The using file is unrelated to the
+    /// defining file (no `source()`), so the in-scope primary lookup misses and
+    /// resolution falls through to the tree-text fallback.
+    #[test]
+    fn goto_backtick_nonsyntactic_resolves_via_tree_text_fallback() {
+        let mut state = create_state();
+        // Both files are plain open documents; no `source()` edge between them.
+        let main_uri = add_doc(&mut state, "file:///b.R", "`my fn`()\n");
+        let _lib_uri = add_doc(&mut state, "file:///a.R", "`my fn` <- function() 1\n");
+
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(
+            l.uri.as_str(),
+            "file:///a.R",
+            "`my fn` resolves to a.R via the RAW tree-text fallback"
+        );
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Issue #459 regression: the SECOND (unquoted) walk in the legacy
+    /// tree-text fallback. A redundantly backtick-quoted *syntactic* use
+    /// `` `my_func`() `` of a BARE regular definition `my_func <- function() 1`
+    /// is reachable ONLY through `find_definition_in_tree`'s `scope_key`
+    /// fallback: the def's LHS is the bare identifier `my_func`, but the
+    /// use-site `name` is the still-backticked raw `` `my_func` ``. The first
+    /// walk searches RAW and misses the bare LHS; only the second walk on the
+    /// unquoted `scope_key` (`my_func`) matches.
+    ///
+    /// The defining file is added via the legacy `add_doc` harness (writes only
+    /// `state.documents`, not the workspace index / `document_store`) and has NO
+    /// `source()` link to the using file. So the in-scope primary
+    /// `scope.symbols` lookup misses, BOTH `exported_interface` arms miss (the
+    /// def was never indexed), and resolution falls through to the legacy
+    /// tree-text fallback — where the syntactic name lands on the second walk.
+    ///
+    /// It BITES: reverting `find_definition_try_both` to a raw-only single walk
+    /// (`find_definition_in_tree(root, name, text)` with no `scope_key`
+    /// fallback) leaves the backticked `name` missing the bare LHS, so goto
+    /// returns `None` and `scalar(..)` panics.
+    #[test]
+    fn goto_backtick_syntactic_resolves_via_tree_text_fallback() {
+        let mut state = create_state();
+        // Both files are plain open documents; no `source()` edge between them.
+        let main_uri = add_doc(&mut state, "file:///b.R", "`my_func`()\n");
+        let _lib_uri = add_doc(&mut state, "file:///a.R", "my_func <- function() 1\n");
+
+        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
+        assert_eq!(
+            l.uri.as_str(),
+            "file:///a.R",
+            "`my_func` resolves to a.R via the unquoted `scope_key` tree-text walk"
+        );
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Issue #459 (I-B2): go-to-definition on a NON-syntactic backtick-quoted
+    /// local `` `my fn` <- function() {} `` (used as `` `my fn`() ``) must
+    /// highlight the FULL source token of the definition — from the opening
+    /// backtick through one past the closing backtick (a 7-column span), not
+    /// just the bare inner name. Scope storage keeps the name bare (`my fn`, 5
+    /// cols) while `defined_column` points at the opening backtick, so the old
+    /// `defined_column + utf16_len(name)` end column covered only 5 of the 7
+    /// source columns (`` `my f ``). `scoped_symbol_range` now carries the
+    /// definition token's true end column.
+    #[test]
+    fn goto_backtick_nonsyntactic_def_highlights_full_token() {
+        let mut state = create_state();
+        let code = "`my fn` <- function() {}\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside the backticked use on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 0,
+            "highlight starts at the opening backtick"
+        );
+        assert_eq!(
+            l.range.end.character, 7,
+            "highlight ends one past the closing backtick (full 7-col `` `my fn` `` token)"
+        );
+    }
+
+    /// Issue #459 (I-B2) regression guard for the common SYNTACTIC case: a bare
+    /// definition `my_func <- function() {}` used through redundant backticks
+    /// (`` `my_func`() ``) must keep highlighting exactly the 7-column bare
+    /// definition token — the fix must not over- or under-size the common case.
+    /// Here the stored name (`my_func`, 7 cols) and the definition token span
+    /// agree, so both the old and the new end column are 7; this pins that they
+    /// stay equal.
+    #[test]
+    fn goto_backtick_redundant_on_syntactic_def_highlights_full_bare_token() {
+        let mut state = create_state();
+        let code = "my_func <- function() {}\n`my_func`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(l.range.start.character, 0);
+        assert_eq!(
+            l.range.end.character, 7,
+            "bare `my_func` definition token is 7 cols"
+        );
+    }
+
+    /// Issue #459 (I-B2 / TC3): the RIGHT-assignment definition path. A
+    /// NON-syntactic backtick-quoted name defined via `-> `my fn`` (used as
+    /// `` `my fn`() ``) must highlight the FULL source token of the definition
+    /// — from the opening backtick through one past the closing backtick (a
+    /// 7-column span). The `->` branch (scope.rs) sets `defined_end_column` from
+    /// the RHS name token's true end; both existing range tests use `<-`, so
+    /// this is the only coverage of the `->` highlight width.
+    #[test]
+    fn goto_backtick_nonsyntactic_right_assignment_def_highlights_full_token() {
+        let mut state = create_state();
+        let code = "(function() {}) -> `my fn`\n`my fn`()\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor inside the backticked use on line 1.
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 3)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "definition is on line 0");
+        assert_eq!(
+            l.range.start.character, 19,
+            "highlight starts at the opening backtick of the `-> ` name"
+        );
+        assert_eq!(
+            l.range.end.character, 26,
+            "highlight ends one past the closing backtick (full 7-col `` `my fn` `` token)"
+        );
     }
 }

@@ -66,12 +66,58 @@ impl LineSuppression {
 /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeclaredSymbol {
-    /// The symbol name (e.g., "myvar", "my.func")
+    /// The symbol name in CALL-SITE form (e.g. `myvar`, `my.func`). A
+    /// non-syntactic name is stored backtick-wrapped (`` `my fn` `` for
+    /// `# raven: func "my fn"`) so it matches the usage's `node_text`; a
+    /// `pkg::` qualifier on a `# raven: func` is kept as `pkg::name`. See
+    /// `callee_name_for_match` in `cross_file::directive`.
     pub name: String,
     /// 0-based line number where the directive appears
     pub line: u32,
     /// true for `# raven: func`, false for `# raven: var`
     pub is_function: bool,
+    /// For `# raven: func name(a, b, c)`, the declared ordered formal names.
+    /// `None` when no parameter list was written (and always `None` for
+    /// variables). `Some(vec)` carries the declared formal order, used as an
+    /// authoritative source for NSE positional argument matching.
+    #[serde(default)]
+    pub formals: Option<Vec<String>>,
+}
+
+/// The argument-evaluation scope a `# raven: nse` directive declares for a
+/// callee. `WholeCall` (no parentheses) means every argument is NSE; `Formals`
+/// names the captured/data-masked formals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NseScope {
+    /// `# raven: nse my_func` (or empty parens `my_func()`) — suppress
+    /// undefined-variable in every argument.
+    WholeCall,
+    /// `# raven: nse my_func(x, y)` — suppress only arguments bound to these
+    /// formals. Never empty: empty parens parse as [`NseScope::WholeCall`].
+    Formals(Vec<String>),
+}
+
+/// A user-declared non-standard-evaluation contract from a `# raven: nse`
+/// directive (`@lsp-nse` is a permanent alias that parses identically).
+///
+/// Position-aware: applies only to calls on a line strictly after `line`. The
+/// callee is matched per the resolution model in `resolve_call_arg_policy`:
+/// an unqualified declaration matches unqualified calls; a qualified
+/// declaration matches `package::name` calls and unqualified `name` calls when
+/// `package` is in scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NseDeclaration {
+    /// Bare callee name (the `name` of a `package::name`, or the whole name) in
+    /// CALL-SITE form: a non-syntactic name is stored backtick-wrapped
+    /// (`` `my fn` `` for `# raven: nse "my fn"`) so it matches the call's
+    /// `node_text`. See `callee_name_for_match` in `cross_file::directive`.
+    pub name: String,
+    /// Package qualifier when written `package::name`, else `None`.
+    pub package: Option<String>,
+    /// Declared NSE scope (whole-call or named formals).
+    pub scope: NseScope,
+    /// 0-based line of the directive comment. Applies to calls on lines `> line`.
+    pub line: u32,
 }
 
 /// An inclusive line range suppressed by a `# raven: ignore-start` …
@@ -177,6 +223,9 @@ pub struct CrossFileMetadata {
     /// Functions declared via `# raven: func` directives
     #[serde(default)]
     pub declared_functions: Vec<DeclaredSymbol>,
+    /// NSE contracts declared via `# raven: nse` directives.
+    #[serde(default)]
+    pub nse_declarations: Vec<NseDeclaration>,
 }
 
 /// A backward directive declaring this file is sourced by another

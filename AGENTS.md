@@ -75,6 +75,11 @@ Each item below either spans multiple systems or is a discipline that applies in
   - For AST-detected `source()` calls AND forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no `# raven: cd` is explicitly or inheritedly in effect. Forward directives are path-resolution equivalent to `source()` calls and must resolve identically (path resolution only — `# raven: run`/`# raven: include` are not execution-time equivalents of `source()`).
   - Must hold uniformly across dependency-graph resolution, scope resolution, missing-file diagnostics, file-path go-to-definition, and path completion. Never apply to backward directives.
 
+- **Cross-file `# raven: nse` / `# raven: func` propagation**
+  - `# raven: nse` declarations (and the `# raven: func` formal order they consume) propagate over the source graph using the **revalidation-consistent set** `S(Q) = ancestors(Q) ∪ descendants(ancestors(Q) ∪ {Q})`, computed over the snapshot's trimmed neighborhood subgraph (`collect_cross_file_nse` in `handlers.rs`). This is the directed inverse of `compute_affected_dependents_after_edit`, so collection and revalidation stay consistent.
+  - Foreign (propagated) declarations are file-level and resolve at a precedence tier **below** own directives, local definitions, and the built-in policy tables, but above the resolvable-standard-eval classification. Propagation reuses graph edges only — it never resolves paths itself.
+  - `compute_interface_hash` must include `nse_declarations` (with line) and `DeclaredSymbol.formals` so a directive/formal edit in any connected file revalidates dependents.
+
 - **Diagnostics publishing monotonicity**
   - Diagnostics publish monotonically by document version. Dependency-triggered revalidation may republish at the same version via the force-republish mechanism, but never older.
   - Production commit paths MUST use `CrossFileDiagnosticsGate::try_consume_publish` (atomic). The `can_publish` + `record_publish` pair is racy and is for advisory pre-flight checks and tests only — see the gate's own doc comments for the TOCTOU details.

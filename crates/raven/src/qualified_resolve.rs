@@ -580,7 +580,6 @@ fn collect_qualified_member_candidates_with_cancel(
     if cancel.is_cancelled() {
         return None;
     }
-    let lhs_name = path.head.as_str();
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
     let scope = crate::handlers::get_cross_file_scope_with_cache(
@@ -595,7 +594,45 @@ fn collect_qualified_member_candidates_with_cancel(
     if cancel.is_cancelled() {
         return None;
     }
-    let symbol = scope.symbols.get(lhs_name)?;
+
+    // Issue #459 (Seam-A try-both discipline): assignment-defined heads are
+    // keyed BARE in scope — `assignment_identifier_name` (scope.rs) strips
+    // surrounding backticks UNCONDITIONALLY, syntactic or not — while a
+    // directive-declared head can be stored wrapped. So resolve the head key
+    // with the same idiom the sibling Seam-A consumers use (goto ~handlers.rs,
+    // hover, parameter_resolver): try the RAW spelling first (hits a
+    // directive-wrapped head), then fall back to the unconditionally-unquoted
+    // bare form (hits the bare-stored assignment-defined head — covering BOTH a
+    // redundantly-quoted *syntactic* head `` `foo`$bar `` AND a genuinely
+    // non-syntactic one `` `my obj`$bar ``). `canonical_use_name` is WRONG here:
+    // it keeps backticks on non-syntactic names and would miss the bare key.
+    // The resolved key is then threaded through the rest of the resolver as the
+    // LOOKUP KEY: constructor ascent and member-spine matching compare against
+    // `path.head`, which the member assignments / constructor literals defining
+    // the head are written against in bare form. Only the head key is
+    // normalized; segment names and `rhs_name` are untouched.
+    let raw_head = path.head.as_str();
+    let bare_head = crate::handlers::unquote_backtick_name(raw_head).unwrap_or(raw_head);
+    // Single lookup: try the RAW spelling first (hits a directive-wrapped head),
+    // then fall back to the unconditionally-unquoted bare form — recovering both
+    // the resolved key and the symbol in one probe rather than a separate
+    // `contains_key` + `get` of the same key.
+    let (resolved_head, symbol) = if let Some(sym) = scope.symbols.get(raw_head) {
+        (raw_head, sym)
+    } else {
+        (bare_head, scope.symbols.get(bare_head)?)
+    };
+    let canonical_path;
+    let path = if resolved_head != path.head.as_str() {
+        canonical_path = QualifiedPath {
+            head: resolved_head.to_string(),
+            segments: path.segments.clone(),
+        };
+        &canonical_path
+    } else {
+        path
+    };
+    let lhs_name = path.head.as_str();
 
     if symbol.source_uri.as_str().starts_with("package:") {
         return None;
@@ -1779,13 +1816,24 @@ fn named_arg_constructor_value<'a>(args: Node<'a>, text: &str, name: &str) -> Op
     None
 }
 
+/// Ascend from `start` to the nearest enclosing assignment whose target
+/// identifier names `lhs_name`. Comparison follows the Seam-A discipline:
+/// `lhs_name` is the BARE scope key (`assignment_identifier_name` strips
+/// backticks unconditionally), so the source target is unquoted unconditionally
+/// before comparison — a definition written backticked (`` `my obj` <- … `` for
+/// a non-syntactic name, or a redundantly-quoted `` `foo` <- … ``) matches the
+/// bare key just as a plainly-written `foo <- …` does.
 fn ascend_to_assignment_for<'a>(start: Node<'a>, text: &str, lhs_name: &str) -> Option<Node<'a>> {
     let mut current = start;
     loop {
         if current.kind() == "binary_operator"
             && let Some(target) = assignment_target(current, text)
             && target.kind() == "identifier"
-            && node_text(target, text) == lhs_name
+            && {
+                let target_text = node_text(target, text);
+                crate::handlers::unquote_backtick_name(target_text).unwrap_or(target_text)
+                    == lhs_name
+            }
         {
             return Some(current);
         }
@@ -2484,6 +2532,44 @@ alpha@beta$
         assert_eq!(l.range.start.line, 0);
         // `bar = 1` lives at col 12 of `foo <- list(bar = 1, baz = 2)`
         assert_eq!(l.range.start.character, 12);
+    }
+
+    /// Issue #459: a redundantly backtick-quoted *syntactic* path head
+    /// (`` `foo`$bar ``) must still resolve. The head is keyed bare in scope
+    /// (Seam-A storage), so the qualified resolver canonicalizes the head
+    /// LOOKUP KEY before `scope.symbols.get`.
+    #[test]
+    fn dollar_rhs_backtick_quoted_syntactic_head_resolves() {
+        let mut state = fresh_state();
+        let code = "foo <- list(bar = 1, baz = 2)\nuse(`foo`$bar)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // line 1: `use(`foo`$bar)` — `bar` starts at col 10.
+        let pos = Position::new(1, 11);
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(l.range.start.character, 12);
+    }
+
+    /// Issue #459 (Seam-A correctness): a *non-syntactic* assignment-defined
+    /// head used through `$` (`` `my obj` <- list(bar = 1) `` then
+    /// `` `my obj`$bar ``) must resolve. `assignment_identifier_name` stores the
+    /// head bare (backticks stripped unconditionally), so the qualified
+    /// resolver must look the head up via the Seam-A try-both idiom over the RAW
+    /// head — `canonical_use_name` would keep the backticks on a non-syntactic
+    /// name and miss the bare key.
+    #[test]
+    fn dollar_rhs_backtick_quoted_nonsyntactic_head_resolves() {
+        let mut state = fresh_state();
+        let code = "`my obj` <- list(bar = 1, baz = 2)\nuse(`my obj`$bar)\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // line 0: "`my obj` <- list(" — `bar` starts at col 17.
+        // line 1: "use(`my obj`$bar)" — `bar` starts at col 13.
+        let pos = Position::new(1, 14);
+        let l = loc(goto_definition(&state, &uri, pos));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0);
+        assert_eq!(l.range.start.character, 17);
     }
 
     /// Cmd-click on the RHS of `$` in `foo$bar` finds the member-assignment

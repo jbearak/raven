@@ -2297,6 +2297,7 @@ impl LanguageServer for Backend {
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
@@ -5676,6 +5677,155 @@ impl LanguageServer for Backend {
             &params.text_document_position.text_document.uri,
             params.text_document_position.position,
         ))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        // Honor the client's code-action kind filter. This handler only produces
+        // `QUICKFIX` actions (the `# raven: nse` quick-fix), so a request that
+        // restricts kinds to a non-empty set QUICKFIX does not satisfy (e.g. a
+        // refactor- or source-only request) gets no work done. A filter kind
+        // matches when it equals `quickfix` or is a parent of it; an EMPTY filter
+        // list is treated as "no restriction" (offer the quick-fix) so a
+        // degenerate request never silently hides a fix the client wanted.
+        let quickfix = CodeActionKind::QUICKFIX;
+        if let Some(only) = &params.context.only
+            && !only.is_empty()
+            && !only.iter().any(|k| {
+                let (k, qf) = (k.as_str(), quickfix.as_str());
+                k.is_empty() || qf == k || qf.starts_with(&format!("{k}."))
+            })
+        {
+            return Ok(None);
+        }
+        let state = self.state.read().await;
+        let Some(doc) = state.get_document(&uri) else {
+            return Ok(None);
+        };
+        let Some(tree) = doc.tree.as_ref() else {
+            return Ok(None);
+        };
+        let text = doc.analysis_text();
+        let root = tree.root_node();
+        // Filter base-package callees out of quick-fixes, matching the
+        // undefined-variable hint (only meaningful once the library is loaded).
+        let base_exports = state
+            .package_library_ready
+            .then(|| state.package_library.base_exports().as_ref());
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        // Several undefined identifiers in one call's positional argument list
+        // (e.g. `f(undef_a, undef_b)`) resolve to the same quick-fix — identical
+        // insert line and directive text — so dedupe to avoid duplicate
+        // lightbulb entries. Two calls on different lines keep distinct insert
+        // lines and so are not collapsed. The map value is the index of the
+        // already-emitted action for that edit, so a collapsed diagnostic can be
+        // appended to that action's `diagnostics` list (per LSP, a code action's
+        // `diagnostics` enumerates every diagnostic it resolves; listing only the
+        // first would let clients hide or mis-group the fix for the others).
+        let mut seen: std::collections::HashMap<(u32, String), usize> =
+            std::collections::HashMap::new();
+        // The `# raven: nse` declarations governing this document, so the
+        // quick-fix can be skipped when a directive already governs the call —
+        // mirroring `nse_hint_for_usage`'s suppression so the message hint and
+        // the lightbulb action stay in lockstep. Read from the SAME cached,
+        // masked-correct metadata the diagnostic path used (`get_enriched_metadata`
+        // — the `directive_nse` map feeding the hint is built from it), rather
+        // than re-parsing, so the two cannot diverge. Only fetched when an
+        // undefined diagnostic is actually present.
+        let is_undefined = |d: &Diagnostic| {
+            matches!(&d.code, Some(NumberOrString::String(c))
+                if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
+        };
+        // Own (current-file) `# raven: nse` declarations governing this document
+        // (`file_level = false`). Foreign cross-file declarations (issue #460) are
+        // intentionally NOT collected here: doing so would require building a full
+        // `DiagnosticsSnapshot` (tree clone + metadata deep-clone + neighborhood
+        // BFS) on every code-action request, an expensive UI-path cost for a
+        // presentation-only suppression. The only case foreign awareness would add
+        // is a foreign PER-FORMAL directive whose surviving arg is uncaptured;
+        // there the quick-fix may offer a (harmless, valid) local re-declaration.
+        // The inline hint path stays foreign-aware via the diagnostic snapshot it
+        // already holds (see `nse_hint_for_usage`).
+        let nse_decls: Vec<crate::cross_file::types::NseDeclaration> =
+            if params.context.diagnostics.iter().any(&is_undefined) {
+                state
+                    .get_enriched_metadata(&uri)
+                    .map(|m| m.nse_declarations.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        for diag in &params.context.diagnostics {
+            if !is_undefined(diag) {
+                continue;
+            }
+            // Resolve the exact node the diagnostic points at, so the quick-fix
+            // targets the right call even when the same name recurs on a line
+            // (and so multi-byte characters before it don't skew the column).
+            // Use the full diagnostic span (start..end), not a zero-length point,
+            // so resolution is robust at node boundaries.
+            let start = handlers::lsp_position_to_ts_point(&text, diag.range.start);
+            let end = handlers::lsp_position_to_ts_point(&text, diag.range.end);
+            let Some(usage_node) = root.descendant_for_point_range(start, end) else {
+                continue;
+            };
+            if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {
+                // Skip when a directive already governs this call: the user has
+                // declared NSE for the callee, so offering to (re)declare it
+                // would insert a conflicting directive.
+                let (call_pkg, bare) = handlers::split_callee_qualifier(&fix.callee);
+                // Stored directive names are canonical (a redundantly backticked
+                // syntactic name is bare), so canonicalize the call's bare name
+                // before comparing — else `` `my_func`(...) `` would miss a
+                // governing `# raven: nse my_func(...)` and offer a redundant
+                // quick-fix (issue #460 Codex P3).
+                let bare = crate::r_names::canonical_use_name(bare);
+                if handlers::nse_directive_governs(
+                    nse_decls
+                        .iter()
+                        .filter(|d| d.name == bare)
+                        .map(|d| (d.package.as_deref(), d.line, false)),
+                    call_pkg,
+                    fix.insert_line,
+                ) {
+                    continue;
+                }
+                let key = (fix.insert_line, fix.text.clone());
+                if let Some(&existing_idx) = seen.get(&key) {
+                    // Same edit already queued by an earlier diagnostic — record
+                    // that this diagnostic is also resolved by that action rather
+                    // than emitting a duplicate lightbulb.
+                    if let CodeActionOrCommand::CodeAction(action) = &mut actions[existing_idx] {
+                        action
+                            .diagnostics
+                            .get_or_insert_with(Vec::new)
+                            .push(diag.clone());
+                    }
+                    continue;
+                }
+                let edit = TextEdit {
+                    range: Range {
+                        start: Position::new(fix.insert_line, 0),
+                        end: Position::new(fix.insert_line, 0),
+                    },
+                    new_text: fix.text,
+                };
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                seen.insert(key, actions.len());
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: fix.title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+        Ok(Some(actions))
     }
 
     /// Handles on-type formatting requests triggered by newline characters.
@@ -12100,6 +12250,388 @@ lineLength = 200
             edits.is_none() || edits.as_ref().is_some_and(|e| e.is_empty()),
             "on_type_formatting must be inert on a prose line, got {:?}",
             edits
+        );
+    }
+
+    /// Issue #455: two undefined positional arguments in one call resolve to the
+    /// same NSE quick-fix (identical insert line and directive text); the
+    /// code-action handler must offer it once, not once per diagnostic. The
+    /// diagnostics are synthesized so the test targets the handler's dedup,
+    /// not the upstream diagnostic-production pipeline.
+    #[tokio::test]
+    async fn code_action_dedupes_identical_nse_quick_fixes() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // `my_fn(undef_a, undef_b)` on line 1: `undef_a` at cols 6-13,
+        // `undef_b` at cols 15-22. Both are positional args of the local
+        // (non-builtin) `my_fn`, so each maps to `# raven: nse my_fn(<formal>)`.
+        let content = "my_fn <- function(a, b) a\nmy_fn(undef_a, undef_b)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = |start_char: u32, end_char: u32| Diagnostic {
+            range: Range {
+                start: Position::new(1, start_char),
+                end: Position::new(1, end_char),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef(6, 13), undef(15, 22)],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .expect("some actions");
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 1,
+            "duplicate NSE quick-fixes must be deduped: {actions:?}"
+        );
+        // The single deduped action must list BOTH diagnostics it resolves (per
+        // LSP, `diagnostics` enumerates every diagnostic a code action addresses).
+        let merged = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse") => {
+                    Some(ca.diagnostics.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .expect("nse action present");
+        assert_eq!(
+            merged.len(),
+            2,
+            "deduped action must list both resolved diagnostics: {merged:?}"
+        );
+    }
+
+    /// Issue #455: when a `# raven: nse` directive already governs the call, the
+    /// code-action must NOT offer a redundant "Declare NSE" quick-fix (it would
+    /// insert a conflicting directive) — mirroring the message-hint suppression.
+    #[tokio::test]
+    async fn code_action_skips_quick_fix_when_directive_governs() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Line 0: def; line 1: directive; line 2: call. `p1` (the non-captured
+        // first positional) at cols 8-10 of line 2.
+        let content = "my_func <- function(x, y) x\n# raven: nse my_func(y)\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_p1 = Diagnostic {
+            range: Range {
+                start: Position::new(2, 8),
+                end: Position::new(2, 10),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_p1],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "no quick-fix when a directive already governs the call: {actions:?}"
+        );
+    }
+
+    /// Issue #460 (Codex P3): a redundantly backticked call `` `my_func`(...) ``
+    /// must be recognized as governed by the canonical `# raven: nse my_func(...)`
+    /// directive, so no redundant quick-fix is offered (the governance lookup
+    /// canonicalizes the callee before comparing).
+    #[tokio::test]
+    async fn code_action_skips_quick_fix_for_backticked_governed_call() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Line 0: def; line 1: directive (canonical `my_func`); line 2: call with
+        // redundant backticks. `` `my_func` `` is 9 chars, `(` at col 9, so the
+        // non-captured first positional `p1` is at cols 10-12 of line 2.
+        let content =
+            "my_func <- function(x, y) x\n# raven: nse my_func(y)\n`my_func`(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_p1 = Diagnostic {
+            range: Range {
+                start: Position::new(2, 10),
+                end: Position::new(2, 12),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_p1],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "no quick-fix when a canonical directive governs a backticked call: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_offers_quick_fix_when_directive_is_after_call() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Call on line 1, directive on line 2 (AFTER the call). The backend
+        // governs-check is position-gated (`line < call_line`), so the later
+        // directive must NOT suppress the quick-fix for the earlier call — the
+        // code-action counterpart of `nse_hint_fires_when_directive_is_after_the_call`.
+        // `masked` (the would-be-captured arg) is at cols 12-18 of line 1.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n# raven: nse my_func(y)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_masked = Diagnostic {
+            range: Range {
+                start: Position::new(1, 12),
+                end: Position::new(1, 18),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_masked],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert!(
+            nse_actions >= 1,
+            "a directive after the call must not suppress the quick-fix: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_skips_non_undefined_diagnostic() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // The `is_undefined` filter: a diagnostic whose code is NOT
+        // UNDEFINED_VARIABLE must yield no NSE quick-fix even when it sits on an
+        // eligible call argument. The positive control (same range, UNDEFINED
+        // code) DOES yield the fix, so the zero below is the filter at work, not
+        // an ineligible setup.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let nse_action_count = |code: &'static str| {
+            let svc = &svc;
+            let uri = uri.clone();
+            async move {
+                let diag = Diagnostic {
+                    range: Range {
+                        start: Position::new(1, 8),
+                        end: Position::new(1, 10),
+                    },
+                    code: Some(NumberOrString::String(code.to_string())),
+                    message: "diag".to_string(),
+                    ..Default::default()
+                };
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    range: Range::default(),
+                    context: CodeActionContext {
+                        diagnostics: vec![diag],
+                        only: None,
+                        trigger_kind: None,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                svc.inner()
+                    .code_action(params)
+                    .await
+                    .expect("code_action ok")
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|a| {
+                        matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+                    })
+                    .count()
+            }
+        };
+
+        assert!(
+            nse_action_count(crate::diagnostic_code::UNDEFINED_VARIABLE).await >= 1,
+            "positive control: an undefined-variable diagnostic yields the NSE quick-fix"
+        );
+        assert_eq!(
+            nse_action_count("some-other-lint").await,
+            0,
+            "no NSE quick-fix for a non-undefined diagnostic (is_undefined filter)"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_respects_only_kind_filter() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionKind, CodeActionParams, Diagnostic, PartialResultParams,
+            Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // A request restricted to REFACTOR must not return the QUICKFIX NSE
+        // action even when an eligible undefined-variable diagnostic is present.
+        // The same diagnostic with no filter DOES yield the quick-fix, so the
+        // zero-count below is the filter at work, not a setup that produced
+        // nothing to filter.
+        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = Diagnostic {
+            range: Range {
+                start: Position::new(1, 8),
+                end: Position::new(1, 10),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let nse_action_count = |only: Option<Vec<CodeActionKind>>| {
+            let svc = &svc;
+            let uri = uri.clone();
+            let undef = undef.clone();
+            async move {
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    range: Range::default(),
+                    context: CodeActionContext {
+                        diagnostics: vec![undef],
+                        only,
+                        trigger_kind: None,
+                    },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                };
+                svc.inner()
+                    .code_action(params)
+                    .await
+                    .expect("code_action ok")
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|a| {
+                        matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+                    })
+                    .count()
+            }
+        };
+
+        assert!(
+            nse_action_count(None).await >= 1,
+            "without a kind filter the diagnostic yields the NSE quick-fix"
+        );
+        assert!(
+            nse_action_count(Some(vec![])).await >= 1,
+            "an empty `only` list is treated as no restriction, so the fix is offered"
+        );
+        assert_eq!(
+            nse_action_count(Some(vec![CodeActionKind::REFACTOR])).await,
+            0,
+            "a refactor-only request must not return the QUICKFIX NSE action"
         );
     }
 
