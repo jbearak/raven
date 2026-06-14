@@ -5721,8 +5721,16 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     // `max_by_key(line)`). Collapsing to one entry per bare name guarantees that
     // lookup never compares `line` across files, and a parens-less `# raven: func`
     // can never shadow a formal-bearing one for the same name.
+    //
+    // `func_ambiguous` mirrors the own-file `FormalOrderTracker` discipline across
+    // files: when connected files declare *conflicting* formal orders for the same
+    // bare name, there is no authoritative order, so picking one arbitrarily could
+    // suppress the wrong positional and hide a real undefined variable. Such names
+    // are dropped entirely, leaving the directive to fall back to safe
+    // named-argument-only matching.
     let mut func_chosen: BTreeMap<String, (Url, crate::cross_file::types::DeclaredSymbol)> =
         BTreeMap::new();
+    let mut func_ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in &members {
         let Some(meta) = snapshot.metadata_map.get(m) else {
             continue;
@@ -5742,7 +5750,17 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
                 continue;
             }
             let bare = d.name.rsplit_once("::").map_or(d.name.as_str(), |(_, n)| n);
+            if func_ambiguous.contains(bare) {
+                continue;
+            }
             match func_chosen.get(bare) {
+                // Conflicting formal order anywhere in the connected set → drop.
+                Some((_, existing)) if existing.formals != d.formals => {
+                    func_ambiguous.insert(bare.to_string());
+                    func_chosen.remove(bare);
+                }
+                // Same order already chosen from an earlier (smaller-URI) file, or
+                // an earlier line in this file — keep it.
                 Some((u, _)) if u != m => {}
                 Some((_, existing)) if existing.line >= d.line => {}
                 _ => {
@@ -57984,6 +58002,34 @@ my_func <- function(a = default_value) {
         assert!(
             !msgs.iter().any(|m| m.contains("undefined_expr")),
             "expr-bound arg must be suppressed — formals-bearing func must win; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (review round 2): when connected files declare CONFLICTING formal
+    // orders for the same callee, there is no authoritative order, so a propagated
+    // per-formal directive must fall back to named-only matching rather than risk
+    // suppressing the wrong positional (which could hide a real undefined).
+    #[test]
+    fn conflicting_cross_file_func_orders_fall_back_to_named_only() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: func myverb(data, expr)\n"),
+                ("b.R", "# raven: func myverb(expr, data)\n"),
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\n# raven: nse: myverb(expr)\nmyverb(undefined_pos1, undefined_pos2)\n",
+                ),
+            ],
+            "main.R",
+        );
+        // Named-only fallback: neither positional argument is suppressed.
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_pos1")),
+            "first positional must stay reported under ambiguous order; got {msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_pos2")),
+            "second positional must stay reported under ambiguous order; got {msgs:?}"
         );
     }
 

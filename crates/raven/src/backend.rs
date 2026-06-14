@@ -5741,17 +5741,11 @@ impl LanguageServer for Backend {
         // there the quick-fix may offer a (harmless, valid) local re-declaration.
         // The inline hint path stays foreign-aware via the diagnostic snapshot it
         // already holds (see `nse_hint_for_usage`).
-        let nse_decls: Vec<(crate::cross_file::types::NseDeclaration, bool)> =
+        let nse_decls: Vec<crate::cross_file::types::NseDeclaration> =
             if params.context.diagnostics.iter().any(&is_undefined) {
                 state
                     .get_enriched_metadata(&uri)
-                    .map(|m| {
-                        m.nse_declarations
-                            .iter()
-                            .cloned()
-                            .map(|d| (d, false))
-                            .collect()
-                    })
+                    .map(|m| m.nse_declarations.clone())
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -5778,8 +5772,8 @@ impl LanguageServer for Backend {
                 if handlers::nse_directive_governs(
                     nse_decls
                         .iter()
-                        .filter(|(d, _)| d.name == bare)
-                        .map(|(d, file_level)| (d.package.as_deref(), d.line, *file_level)),
+                        .filter(|d| d.name == bare)
+                        .map(|d| (d.package.as_deref(), d.line, false)),
                     call_pkg,
                     fix.insert_line,
                 ) {
