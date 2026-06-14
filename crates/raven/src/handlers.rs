@@ -5678,6 +5678,16 @@ struct CrossFileNse {
 /// from `metadata_map`; a member absent from it (an unresolved / missing-file
 /// node) simply contributes nothing — it has no declarations.
 ///
+/// Because the trimmed subgraph is the bounded (`max_chain_depth` /
+/// `max_transitive_dependents_visited`) neighborhood, propagation is likewise
+/// bounded: a declaration on an `S(uri)` member beyond the neighborhood bound
+/// (a source chain longer than the depth limit in an up-then-down shape) is not
+/// collected here even though editing it may revalidate `uri` over the full
+/// graph. This is the SAFE direction — `S_trimmed ⊆ S_full`, so it can only
+/// *miss* a suppression (leaving a real diagnostic), never add a wrong one — and
+/// matches the existing scope/in-play depth-bound behavior (default depth 20, so
+/// the bound never bites for the issue's required topologies).
+///
 /// Declarations are collapsed deterministically: members are visited in
 /// sorted-URI order, the first (smallest URI) file to set a key wins, and within
 /// one file the highest-line declaration wins (mirroring the within-file
@@ -5709,8 +5719,16 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     members.sort();
     members.dedup();
 
-    // Smallest-URI file wins per key (members ascending); within a file the
-    // highest-line declaration wins.
+    // Per `(name, package)`: within a file the highest-line declaration wins
+    // (file-level intent); across files the smallest-URI declaration wins —
+    // EXCEPT that a narrower per-formal scope always beats a broader whole-call,
+    // even from a larger-URI file. NSE scope (unlike a `# raven: func` formal
+    // order) has a well-defined "less suppressive" choice, so on a cross-file
+    // whole-call-vs-per-formal conflict we keep the per-formal rather than risk a
+    // broad propagated whole-call masking an argument a connected file's narrower
+    // directive would keep checked. (Two differing per-formal scopes still resolve
+    // by smallest URI — both are explicit user captures.)
+    use crate::cross_file::types::NseScope;
     let mut nse_chosen: BTreeMap<
         (String, Option<String>),
         (Url, crate::cross_file::types::NseDeclaration),
@@ -5738,10 +5756,25 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
         for d in &meta.nse_declarations {
             let key = (d.name.clone(), d.package.clone());
             match nse_chosen.get(&key) {
-                Some((u, _)) if u != m => {}
-                Some((_, existing)) if existing.line >= d.line => {}
-                _ => {
+                None => {
                     nse_chosen.insert(key, (m.clone(), d.clone()));
+                }
+                // Same file: latest line wins (file-level latest-wins).
+                Some((u, existing)) if u == m => {
+                    if d.line > existing.line {
+                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                    }
+                }
+                // Earlier (smaller-URI) file already chose: switch only if the new
+                // declaration is strictly LESS suppressive (per-formal beats the
+                // existing whole-call), so a broad propagated whole-call cannot
+                // mask args a narrower directive keeps checked.
+                Some((_, existing)) => {
+                    if matches!(existing.scope, NseScope::WholeCall)
+                        && matches!(d.scope, NseScope::Formals(_))
+                    {
+                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                    }
                 }
             }
         }
@@ -13099,6 +13132,16 @@ impl<'a> NseAnalysis<'a> {
         // early return, so gating on both lets a no-directive file — or one
         // analyzed with call-argument checking off — skip the per-definition
         // formal-name walk on the hot path.
+        //
+        // Issue #460: this gate is deliberately NOT widened to include
+        // `foreign_nse_declarations`. The tracker only guards the "borrow a local
+        // `name <- function(...)` order" branch of `to_policy`, and that branch is
+        // unreachable for a FOREIGN per-formal directive: a foreign directive
+        // resolves at tier 3.6 of `resolve_call_arg_policy`, which is reached only
+        // when no local definition of the callee exists (a local def resolves at
+        // step 1, before 3.6) — i.e. exactly when the local-order borrow would NOT
+        // fire. So a foreign-only file never consults this tracker, and enabling it
+        // there would only add the per-definition walk with no observable effect.
         let mut formal_order = FormalOrderTracker {
             enabled: call_args_enabled && !nse_declarations.is_empty(),
             ..FormalOrderTracker::default()
@@ -58030,6 +58073,33 @@ my_func <- function(a = default_value) {
         assert!(
             msgs.iter().any(|m| m.contains("undefined_pos2")),
             "second positional must stay reported under ambiguous order; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (review round 2): when connected files declare conflicting NSE
+    // SCOPES for one callee (whole-call vs per-formal), the narrower per-formal
+    // must win — even from a larger-URI file — so a broad propagated whole-call
+    // cannot mask an argument the per-formal directive keeps checked.
+    #[test]
+    fn nse_conflict_prefers_per_formal_over_whole_call() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\n"),    // whole-call, smaller URI
+                ("b.R", "# raven: nse: nrow(x)\n"), // per-formal, larger URI
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\nnrow(x = masked_x, other = real_other)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_other")),
+            "non-captured arg must stay reported (per-formal beats whole-call); got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("masked_x")),
+            "the x-captured named arg must be suppressed; got {msgs:?}"
         );
     }
 
