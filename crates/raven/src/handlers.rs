@@ -5655,6 +5655,93 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     packages
 }
 
+/// Foreign `# raven: nse` / `# raven: func` declarations propagated to `uri` from
+/// the files connected to it through the source graph (issue #460).
+struct CrossFileNse {
+    /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
+    nse: Vec<crate::cross_file::types::NseDeclaration>,
+    /// Foreign `# raven: func` declarations, collapsed to at most one per `name`
+    /// (so the name+package-keyed `declared_function_formals`, which breaks ties
+    /// by `max_by_key(line)`, never compares lines across files).
+    funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
+}
+
+/// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
+///
+/// The propagation set is `S(uri) = ancestors ∪ descendants(ancestors ∪ {uri})`,
+/// computed over the snapshot's TRIMMED neighborhood subgraph
+/// (`snapshot.cross_file_graph`). This is the directed inverse of
+/// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]:
+/// for any `D ∈ S(uri)`, editing `D` already revalidates `uri`, so collection and
+/// revalidation stay consistent. Computing over the trimmed subgraph (rather than
+/// the full graph) restricts members to the neighborhood, so every member is read
+/// from `metadata_map`; a member absent from it (an unresolved / missing-file
+/// node) simply contributes nothing — it has no declarations.
+///
+/// Declarations are collapsed deterministically: members are visited in
+/// sorted-URI order, the first (smallest URI) file to set a key wins, and within
+/// one file the highest-line declaration wins (mirroring the within-file
+/// latest-wins rule, since a foreign file has no call site). This yields at most
+/// one foreign declaration per `(name, package)` (NSE) / `name` (func).
+fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
+    use std::collections::BTreeMap;
+
+    let graph = snapshot.cross_file_graph.as_ref();
+    let max_depth = snapshot.cross_file_config.max_chain_depth;
+    let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
+
+    let ancestors = graph.get_transitive_dependents(uri, max_depth, max_visited);
+    let mut roots: Vec<Url> = ancestors.clone();
+    roots.push(uri.clone());
+    let descendants =
+        graph.get_transitive_dependencies_multi_root(roots.iter(), max_depth, max_visited);
+
+    let mut members: Vec<Url> = ancestors
+        .into_iter()
+        .chain(descendants)
+        .filter(|u| u != uri)
+        .collect();
+    members.sort();
+    members.dedup();
+
+    // Smallest-URI file wins per key (members ascending); within a file the
+    // highest-line declaration wins.
+    let mut nse_chosen: BTreeMap<
+        (String, Option<String>),
+        (Url, crate::cross_file::types::NseDeclaration),
+    > = BTreeMap::new();
+    let mut func_chosen: BTreeMap<String, (Url, crate::cross_file::types::DeclaredSymbol)> =
+        BTreeMap::new();
+    for m in &members {
+        let Some(meta) = snapshot.metadata_map.get(m) else {
+            continue;
+        };
+        for d in &meta.nse_declarations {
+            let key = (d.name.clone(), d.package.clone());
+            match nse_chosen.get(&key) {
+                Some((u, _)) if u != m => {}
+                Some((_, existing)) if existing.line >= d.line => {}
+                _ => {
+                    nse_chosen.insert(key, (m.clone(), d.clone()));
+                }
+            }
+        }
+        for d in &meta.declared_functions {
+            match func_chosen.get(&d.name) {
+                Some((u, _)) if u != m => {}
+                Some((_, existing)) if existing.line >= d.line => {}
+                _ => {
+                    func_chosen.insert(d.name.clone(), (m.clone(), d.clone()));
+                }
+            }
+        }
+    }
+    CrossFileNse {
+        nse: nse_chosen.into_values().map(|(_, d)| d).collect(),
+        funcs: func_chosen.into_values().map(|(_, d)| d).collect(),
+    }
+}
+
 /// Issue #431: the name of the package under development, but only when the
 /// queried file (`uri`) belongs to that package's own tree (R/, tests,
 /// vignettes, man/rmd — anything [`crate::package_state::is_package_workspace_r_file`]
@@ -5709,6 +5796,7 @@ fn collect_undefined_variables_from_snapshot(
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
     let in_play_packages = collect_in_play_packages(snapshot, uri);
+    let cross_file_nse = collect_cross_file_nse(snapshot, uri);
     let nse_analysis = NseAnalysis::build(
         node,
         text,
@@ -5724,8 +5812,8 @@ fn collect_undefined_variables_from_snapshot(
         Some(snapshot.base_exports.as_ref()),
         &snapshot.directive_meta.nse_declarations,
         &snapshot.directive_meta.declared_functions,
-        &[],
-        &[],
+        &cross_file_nse.nse,
+        &cross_file_nse.funcs,
     );
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
@@ -57622,6 +57710,270 @@ my_func <- function(a = default_value) {
         assert!(
             used.iter().any(|n| n == "undefined_expr"),
             "local def resolves at step 1; foreign tier 3.6 must not fire; got {used:?}"
+        );
+    }
+
+    // Issue #460 cross-file integration harness: insert each `(name, code)` under
+    // workspace root `file:///w/`, wire the dependency graph (open_document does
+    // NOT — only `update_file` creates edges), then run the full `diagnostics`
+    // entry point on `query` and return the diagnostic messages. The undefined
+    // message is `"Undefined variable: <name>"`.
+    fn cross_file_diag_messages(files: &[(&str, &str)], query: &str) -> Vec<String> {
+        let ws = Url::parse("file:///w/").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        // Auto + sourced_by-empty + scan-incomplete defers undefined-variable
+        // diagnostics; mark scan complete so the collector runs.
+        state.workspace_scan_complete = true;
+        for (name, code) in files {
+            let uri = ws.join(name).unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            let meta = crate::cross_file::extract_metadata(code);
+            state
+                .cross_file_graph
+                .update_file(&uri, &meta, Some(&ws), |_| None);
+        }
+        let q = ws.join(query).unwrap();
+        super::diagnostics(&state, &q, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    // B1: an NSE directive in a sourced PARENT suppresses the child call.
+    #[test]
+    fn nse_directive_propagates_from_sourced_parent_to_child() {
+        // Control: child alone (no directive reachable) → nrow's arg is reported.
+        let control = cross_file_diag_messages(&[("child.R", "nrow(undefined_var)\n")], "child.R");
+        assert!(
+            control.iter().any(|m| m.contains("undefined_var")),
+            "baseline: nrow's arg must be checked; got {control:?}"
+        );
+        let msgs = cross_file_diag_messages(
+            &[
+                ("parent.R", "# raven: nse: nrow\n"),
+                ("child.R", "source(\"parent.R\")\nnrow(undefined_var)\n"),
+            ],
+            "child.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "NSE directive in a sourced parent must suppress the child call; got {msgs:?}"
+        );
+    }
+
+    // B2: an NSE directive in a sourced CHILD suppresses the parent call.
+    #[test]
+    fn nse_directive_propagates_from_sourced_child_to_parent() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("parent.R", "source(\"child.R\")\nnrow(undefined_var)\n"),
+                ("child.R", "# raven: nse: nrow\n"),
+            ],
+            "parent.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "NSE directive in a sourced child must suppress the parent call; got {msgs:?}"
+        );
+    }
+
+    // B3: transitive over two source edges, in both directions.
+    #[test]
+    fn nse_directive_propagates_transitively_two_edges() {
+        // a.R -> b.R -> c.R; directive in a.R governs the call in c.R.
+        let down = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\nsource(\"b.R\")\n"),
+                ("b.R", "source(\"c.R\")\n"),
+                ("c.R", "nrow(undefined_var)\n"),
+            ],
+            "c.R",
+        );
+        assert!(
+            !down.iter().any(|m| m.contains("undefined_var")),
+            "directive two edges up must suppress; got {down:?}"
+        );
+        // Mirror: directive in c.R governs the call in a.R.
+        let up = cross_file_diag_messages(
+            &[
+                ("a.R", "source(\"b.R\")\nnrow(undefined_var)\n"),
+                ("b.R", "source(\"c.R\")\n"),
+                ("c.R", "# raven: nse: nrow\n"),
+            ],
+            "a.R",
+        );
+        assert!(
+            !up.iter().any(|m| m.contains("undefined_var")),
+            "directive two edges down must suppress; got {up:?}"
+        );
+    }
+
+    // B4: a directive in a shared sourced helper reaches every file that sources it.
+    #[test]
+    fn nse_directive_propagates_from_shared_sourced_helper() {
+        let files = &[
+            ("h.R", "# raven: nse: nrow\n"),
+            ("a.R", "source(\"h.R\")\nnrow(undefined_var)\n"),
+            ("b.R", "source(\"h.R\")\nnrow(undefined_var)\n"),
+        ];
+        for q in ["a.R", "b.R"] {
+            let msgs = cross_file_diag_messages(files, q);
+            assert!(
+                !msgs.iter().any(|m| m.contains("undefined_var")),
+                "shared helper's directive must suppress in {q}; got {msgs:?}"
+            );
+        }
+    }
+
+    // B4b: sibling via shared parent. main sources setup then analysis; the
+    // directive in setup governs the call in analysis (setup ∈ descendants(main),
+    // main ∈ ancestors(analysis), so setup ∈ S(analysis)).
+    #[test]
+    fn nse_directive_propagates_to_sibling_via_shared_parent() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("main.R", "source(\"setup.R\")\nsource(\"analysis.R\")\n"),
+                ("setup.R", "# raven: nse: nrow\n"),
+                ("analysis.R", "nrow(undefined_var)\n"),
+            ],
+            "analysis.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_var")),
+            "sibling via shared parent must inherit the directive; got {msgs:?}"
+        );
+    }
+
+    // B5: unconnected files do NOT share directives (the diagnostic is reported).
+    #[test]
+    fn nse_directive_does_not_propagate_to_unconnected_file() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: nse: nrow\n"),
+                ("b.R", "nrow(undefined_var)\n"),
+            ],
+            "b.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("undefined_var")),
+            "unconnected file must NOT inherit the directive; got {msgs:?}"
+        );
+    }
+
+    // B6: per-formal propagation. A foreign `# raven: func` (in a connected file)
+    // supplies positional order to a propagated per-formal directive; only the
+    // captured arg is suppressed, the other stays reported.
+    #[test]
+    fn nse_per_formal_propagates_with_cross_file_func_order() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("helper.R", "# raven: func myverb(data, expr)\n"),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed; got {msgs:?}"
+        );
+    }
+
+    // B7b: cross-file ordering — the `# raven: func` lives in a connected file and
+    // is declared regardless of order relative to the `# raven: nse` directive.
+    #[test]
+    fn nse_per_formal_propagation_is_order_independent() {
+        // func order supplied by a sourced CHILD; nse + call in the parent, with
+        // the call BEFORE nothing-else — order of files/lines must not matter.
+        let msgs = cross_file_diag_messages(
+            &[
+                (
+                    "main.R",
+                    "# raven: nse: myverb(expr)\nsource(\"order.R\")\nmyverb(real_df, undefined_expr)\n",
+                ),
+                ("order.R", "# raven: func myverb(data, expr)\n"),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound arg must stay reported regardless of order; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound arg must be suppressed regardless of order; got {msgs:?}"
+        );
+    }
+
+    // B8: revalidation — editing a connected file's directive updates the
+    // dependent's diagnostics (a fresh `diagnostics` call re-collects foreign NSE).
+    #[test]
+    fn nse_directive_change_revalidates_dependent() {
+        let ws = Url::parse("file:///w/").unwrap();
+        let parent = ws.join("parent.R").unwrap();
+        let child = ws.join("child.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        state.workspace_scan_complete = true;
+
+        let parent_code = "source(\"child.R\")\nnrow(undefined_var)\n";
+        let child_before = "# raven: nse: other\n"; // does not govern nrow
+        state
+            .documents
+            .insert(parent.clone(), Document::new(parent_code, None));
+        state
+            .documents
+            .insert(child.clone(), Document::new(child_before, None));
+        state.cross_file_graph.update_file(
+            &parent,
+            &crate::cross_file::extract_metadata(parent_code),
+            Some(&ws),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &child,
+            &crate::cross_file::extract_metadata(child_before),
+            Some(&ws),
+            |_| None,
+        );
+
+        let before: Vec<String> = super::diagnostics(&state, &parent, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            before.iter().any(|m| m.contains("undefined_var")),
+            "before the edit, the unrelated directive must not suppress nrow; got {before:?}"
+        );
+
+        // Edit the child so its directive now governs `nrow`.
+        let child_after = "# raven: nse: nrow\n";
+        state
+            .documents
+            .insert(child.clone(), Document::new(child_after, None));
+        state.cross_file_graph.update_file(
+            &child,
+            &crate::cross_file::extract_metadata(child_after),
+            Some(&ws),
+            |_| None,
+        );
+
+        let after: Vec<String> = super::diagnostics(&state, &parent, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !after.iter().any(|m| m.contains("undefined_var")),
+            "after the edit, the child's directive must suppress the parent call; got {after:?}"
         );
     }
 
