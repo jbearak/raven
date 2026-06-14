@@ -157,3 +157,196 @@ mod tests {
         assert_eq!(canonical_use_name("`a\\b`"), "`a\\b`");
     }
 }
+
+/// Cross-seam invariant tests for the two backtick normalizers and the directive
+/// re-quote inverse (issue #462).
+///
+/// Backtick normalization is split across three functions by deliberate design,
+/// keyed to two storage conventions (the "Seams A/B/C" contract documented on
+/// [`canonical_use_name`] above):
+///
+/// - Seam A — [`crate::handlers::unquote_backtick_name`]: an **unconditional**
+///   strip, used for **bare-keyed** stores (the scope symbol table,
+///   go-to-definition, find-references definitions). Every definition is stored
+///   bare, so a backticked use recovers the bare key by stripping unconditionally.
+/// - Seams B/C — [`canonical_use_name`]: a **conditional** strip (only when the
+///   inner name is syntactic), used for **call-site-keyed** stores (directive
+///   `DeclaredSymbol`/`NseDeclaration` names, completion insert text). A genuinely
+///   non-syntactic name keeps its required backticks so it stays distinct.
+/// - The directive-storage inverse —
+///   [`crate::cross_file::directive::callee_name_for_match`]: the conditional
+///   **re-quote** that puts a directive-declared bare name back into the spelling
+///   a call site uses.
+///
+/// The hazard these tests guard against is "wrong normalizer at a new call site":
+/// routing a name through the unconditional strip where the conditional one is
+/// required (or vice-versa) silently breaks resolution **only** for genuinely
+/// non-syntactic names — the esoteric case least likely to be exercised by hand.
+/// The properties below pin the equivalences and, crucially, the one divergence
+/// that makes the two normalizers non-interchangeable, so a future unification or
+/// mis-routed call site fails a test instead of shipping a latent bug.
+///
+/// The imports of `unquote_backtick_name` (from `handlers`) and
+/// `callee_name_for_match` (from `cross_file::directive`) are test-only: they do
+/// not change the runtime module layering, under which `r_names` depends on
+/// neither. This module is the single place that exercises all three seams
+/// together, so it lives beside the contract they implement.
+#[cfg(test)]
+mod seam_invariants {
+    use super::{canonical_use_name, is_syntactic_r_name};
+    use crate::cross_file::directive::callee_name_for_match;
+    use crate::handlers::unquote_backtick_name;
+    use proptest::prelude::*;
+
+    /// Wrap a bare name in backticks — the only legal source spelling of a
+    /// non-syntactic name, and a redundant-but-legal spelling of a syntactic one.
+    fn quoted(name: &str) -> String {
+        format!("`{name}`")
+    }
+
+    // ── Example-based: the exact names the issue calls out ──────────────────
+
+    /// Seam A: every backticked use recovers its bare key, syntactic or not —
+    /// the mechanism by which a bare definition and a backticked use resolve to
+    /// the same scope-table / goto / find-references symbol (issue bullet 1).
+    #[test]
+    fn unconditional_strip_recovers_bare_key_for_every_name() {
+        for n in ["foo", "my_func", "données", "my fn", "if", ".2way", "TRUE"] {
+            assert_eq!(
+                unquote_backtick_name(&quoted(n)),
+                Some(n),
+                "Seam A must strip backticks unconditionally so `{n}` keys the bare store"
+            );
+        }
+    }
+
+    /// Seams B/C: a non-syntactic name is NEVER reduced to a bare key on the
+    /// call-site path, so `` `my fn` `` and the bare `myfn` cannot collide
+    /// (issue bullet 2).
+    #[test]
+    fn nonsyntactic_name_never_collapses_to_a_bare_key() {
+        for n in ["my fn", "if", ".2way", "TRUE", "a:b"] {
+            assert!(
+                !is_syntactic_r_name(n),
+                "test fixture `{n}` must be non-syntactic"
+            );
+            let q = quoted(n);
+            let canon = canonical_use_name(&q);
+            assert!(
+                canon.starts_with('`') && canon.ends_with('`'),
+                "non-syntactic `{n}` must keep its backticks on the call-site seam, got {canon:?}"
+            );
+        }
+        // The concrete collision the design exists to prevent: the non-syntactic
+        // `my fn` and the syntactic `myfn` must not share a key.
+        assert_ne!(
+            canonical_use_name(&quoted("my fn")),
+            canonical_use_name(&quoted("myfn")),
+            "`my fn` and `myfn` must never share a call-site key"
+        );
+    }
+
+    /// The directive round-trip (issue bullet 3): a callee declared bare in a
+    /// directive is stored via `callee_name_for_match`, and the canonicalized
+    /// call-site spelling must recover that exact stored key — for syntactic and
+    /// non-syntactic names alike.
+    #[test]
+    fn directive_callee_round_trips_through_canonical_use_name() {
+        for n in ["my_func", "données", "my fn", "if", ".2way"] {
+            let stored = callee_name_for_match(n);
+            assert_eq!(
+                canonical_use_name(&quoted(n)),
+                stored,
+                "backticked call site `{n}` must match the directive-stored key"
+            );
+            if is_syntactic_r_name(n) {
+                // A syntactic name is also legal bare at the call site, and is
+                // stored bare — both spellings must reach the same key.
+                assert_eq!(canonical_use_name(n), stored);
+                assert_eq!(stored, n);
+            }
+        }
+    }
+
+    /// The reason there are two normalizers: on a non-syntactic name the
+    /// unconditional strip (bare) and the conditional strip (kept-quoted) MUST
+    /// disagree. If a refactor ever made them interchangeable this fails,
+    /// flagging that a call site could now be routed through either silently.
+    #[test]
+    fn the_two_normalizers_diverge_on_nonsyntactic_names() {
+        for n in ["my fn", "if", ".2way", "TRUE"] {
+            let q = quoted(n);
+            assert_ne!(
+                Some(canonical_use_name(&q)),
+                unquote_backtick_name(&q),
+                "Seam A (bare) and Seams B/C (quoted) must differ on non-syntactic `{n}`"
+            );
+        }
+    }
+
+    // ── Property-based: the same invariants over generated names ─────────────
+
+    /// A syntactic R name: lowercase to dodge reserved words, filtered through
+    /// the real predicate so the strategy and the code under test never drift.
+    fn syntactic_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9._]{0,6}".prop_filter("syntactic", |s| is_syntactic_r_name(s))
+    }
+
+    /// A non-syntactic but backtick-legal R name (no inner backtick, non-empty):
+    /// names with spaces/operators, leading digits, leading-dot digits, and
+    /// reserved words.
+    fn nonsyntactic_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-z]+ [a-z]+",     // embedded space
+            "[0-9][a-z0-9]*",    // leading digit
+            r"\.[0-9][a-z0-9]*", // leading-dot digit, e.g. .2way
+            "[a-z]+:[a-z]+",     // embedded operator char
+            Just("if".to_string()),
+            Just("function".to_string()),
+            Just("TRUE".to_string()),
+        ]
+        .prop_filter("non-syntactic and backtick-free", |s| {
+            !s.is_empty() && !s.contains('`') && !is_syntactic_r_name(s)
+        })
+    }
+
+    proptest! {
+        /// Seam A over all names: the unconditional strip recovers the bare key.
+        #[test]
+        fn prop_unconditional_strip_recovers_bare_key(
+            n in prop_oneof![syntactic_name(), nonsyntactic_name()]
+        ) {
+            let q = quoted(&n);
+            prop_assert_eq!(unquote_backtick_name(&q), Some(n.as_str()));
+        }
+
+        /// On a syntactic name the two normalizers AGREE: both strip the
+        /// redundant backticks to the same bare spelling.
+        #[test]
+        fn prop_normalizers_agree_on_syntactic_names(n in syntactic_name()) {
+            let q = quoted(&n);
+            prop_assert_eq!(canonical_use_name(&q), n.as_str());
+            prop_assert_eq!(unquote_backtick_name(&q), Some(n.as_str()));
+        }
+
+        /// On a non-syntactic name the two normalizers DIVERGE, and the
+        /// conditional one never yields a bare key (no collision possible).
+        #[test]
+        fn prop_normalizers_diverge_on_nonsyntactic_names(n in nonsyntactic_name()) {
+            let q = quoted(&n);
+            let canon = canonical_use_name(&q);
+            prop_assert_eq!(canon, q.as_str());
+            prop_assert_ne!(Some(canon), unquote_backtick_name(&q));
+        }
+
+        /// Directive round-trip over all names: the backticked call-site spelling
+        /// canonicalizes to exactly the directive-stored key.
+        #[test]
+        fn prop_directive_callee_round_trips(
+            n in prop_oneof![syntactic_name(), nonsyntactic_name()]
+        ) {
+            let q = quoted(&n);
+            prop_assert_eq!(canonical_use_name(&q), callee_name_for_match(&n));
+        }
+    }
+}
