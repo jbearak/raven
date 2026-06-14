@@ -284,6 +284,16 @@ pub(crate) const BACKWARD_DIRECTIVE_KEYWORDS: &str = "sourced-by|run-by|included
 /// under `raven:`).
 pub(crate) const DIRECTIVE_PREFIX: &str = r"(?:@lsp-|raven:\s*)";
 
+/// Shared callee-name capture for the `# raven: func` and `# raven: nse`
+/// directives: double-quoted (group 1), single-quoted (group 2), or an unquoted
+/// bare / single-`pkg::name` qualifier (group 3). Held as one constant so both
+/// directives accept exactly the same name shape — their doc comments assert this
+/// parity, and the formal-order pairing in `declared_name_matches` relies on it.
+/// (The `var` directive deliberately uses a laxer `(\S+)` unquoted form and does
+/// NOT share this; see its regex below.)
+const CALLEE_NAME_CAPTURE: &str =
+    r#"(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))"#;
+
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -397,7 +407,9 @@ fn patterns() -> &'static DirectivePatterns {
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))(?:\s*\(([^)]*)\))?"#,
+                    r"(?:declare-function|declare-func|function|func)\s*:?\s*",
+                    CALLEE_NAME_CAPTURE,
+                    r"(?:\s*\(([^)]*)\))?",
                 ]
                 .concat(),
             ).unwrap(),
@@ -424,7 +436,9 @@ fn patterns() -> &'static DirectivePatterns {
                 &[
                     r"^\s*#\s*",
                     DIRECTIVE_PREFIX,
-                    r#"nse(?:\s+|\s*:\s*)(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))\s*(?:\(([^)]*)\))?\s*(?:#.*)?$"#,
+                    r"nse(?:\s+|\s*:\s*)",
+                    CALLEE_NAME_CAPTURE,
+                    r"\s*(?:\(([^)]*)\))?\s*(?:#.*)?$",
                 ]
                 .concat(),
             ).unwrap(),

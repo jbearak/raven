@@ -12896,11 +12896,14 @@ impl<'a> NseAnalysis<'a> {
         // last-binding-wins, so a later redefinition with permuted parameters
         // would otherwise lend its order to an earlier call's positional NSE
         // matching and invert which slot is suppressed (hiding a real undefined
-        // variable). Enabled only when the file declares `# raven: nse`
-        // directives — the only consumer of the result — so a no-directive file
-        // skips the per-definition formal-name walk on the hot path.
+        // variable). Enabled only when the result will actually be consulted:
+        // the directive-policy build that reads it (below) both requires
+        // `# raven: nse` directives AND is skipped by the `!call_args_enabled`
+        // early return, so gating on both lets a no-directive file — or one
+        // analyzed with call-argument checking off — skip the per-definition
+        // formal-name walk on the hot path.
         let mut formal_order = FormalOrderTracker {
-            enabled: !nse_declarations.is_empty(),
+            enabled: call_args_enabled && !nse_declarations.is_empty(),
             ..FormalOrderTracker::default()
         };
         collect_nse_facts(
