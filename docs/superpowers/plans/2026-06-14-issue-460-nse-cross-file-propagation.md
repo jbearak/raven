@@ -30,7 +30,7 @@
 - **Modify** `crates/raven/src/cross_file/scope.rs` — `compute_interface_hash` signature + body (nse + formals); both call sites. (Task 1)
 - **Modify** `crates/raven/src/handlers.rs` —
   - `DirectiveNsePolicy.file_level` field. (Task 2)
-  - `NseAnalysis::build` foreign params, translation, formal-order helper, `FormalOrderTracker` gate. (Tasks 2–4)
+  - `NseAnalysis::build` foreign params, translation, own-first formal-order helper. (Tasks 2–4)
   - `own_directive_nse_policy` / `foreign_directive_nse_policy` split + tier-3.6 wiring in `resolve_call_arg_policy`. (Task 3)
   - `collect_cross_file_nse` collector + wire into the `NseAnalysis::build` call at `handlers.rs:5712`. (Task 5)
   - `nse_directive_governs` file-level handling + `nse_hint_for_usage`. (Task 6)
@@ -56,11 +56,11 @@ fn interface_hash_changes_when_nse_directive_added() {
     let a = "library(arm)\nlmer(x)\n";
     let b = "library(arm)\n# raven: nse: lmer\nlmer(x)\n";
     let ha = compute_artifacts_with_metadata(
-        &test_uri(), &parse(a), a,
+        &test_uri(), &parse_r(a), a,
         Some(&crate::cross_file::extract_metadata(a)),
     ).interface_hash;
     let hb = compute_artifacts_with_metadata(
-        &test_uri(), &parse(b), b,
+        &test_uri(), &parse_r(b), b,
         Some(&crate::cross_file::extract_metadata(b)),
     ).interface_hash;
     assert_ne!(ha, hb, "adding a # raven: nse directive must change interface_hash");
@@ -73,10 +73,10 @@ fn interface_hash_changes_when_nse_directive_reordered() {
     let a = "# raven: nse f(x)\n# raven: nse f(y)\nf(1)\n";
     let b = "# raven: nse f(y)\n# raven: nse f(x)\nf(1)\n";
     let ha = compute_artifacts_with_metadata(
-        &test_uri(), &parse(a), a, Some(&crate::cross_file::extract_metadata(a)),
+        &test_uri(), &parse_r(a), a, Some(&crate::cross_file::extract_metadata(a)),
     ).interface_hash;
     let hb = compute_artifacts_with_metadata(
-        &test_uri(), &parse(b), b, Some(&crate::cross_file::extract_metadata(b)),
+        &test_uri(), &parse_r(b), b, Some(&crate::cross_file::extract_metadata(b)),
     ).interface_hash;
     assert_ne!(ha, hb, "reordering same-callee NSE directives must change interface_hash");
 }
@@ -86,16 +86,16 @@ fn interface_hash_changes_when_func_formals_reordered() {
     let a = "# raven: func g(a, b)\n";
     let b = "# raven: func g(b, a)\n";
     let ha = compute_artifacts_with_metadata(
-        &test_uri(), &parse(a), a, Some(&crate::cross_file::extract_metadata(a)),
+        &test_uri(), &parse_r(a), a, Some(&crate::cross_file::extract_metadata(a)),
     ).interface_hash;
     let hb = compute_artifacts_with_metadata(
-        &test_uri(), &parse(b), b, Some(&crate::cross_file::extract_metadata(b)),
+        &test_uri(), &parse_r(b), b, Some(&crate::cross_file::extract_metadata(b)),
     ).interface_hash;
     assert_ne!(ha, hb, "reordering # raven: func formals must change interface_hash");
 }
 ```
 
-Use the existing test-module helpers for parsing (`test_uri()`, and the `parse`/tree helper already used by neighboring `interface_hash_*` tests — match their exact spelling; several use `tree_sitter` directly via a local helper). If `compute_artifacts_with_metadata` is not in scope in the test module, call it via its module path as the neighboring tests do.
+Use the existing scope.rs test-module helpers: `parse_r(code) -> Tree` (~scope.rs:7520) and `test_uri()` (~7523). `compute_artifacts_with_metadata` is at scope.rs:1377 and `extract_metadata` at `cross_file/mod.rs:63` (the tests use `crate::cross_file::extract_metadata`). Confirm the exact names with `rg -n "fn parse_r|fn test_uri" crates/raven/src/cross_file/scope.rs` before writing.
 
 - [ ] **Step 2: Run tests, verify they FAIL** (hashes equal today).
 
@@ -251,10 +251,12 @@ fn build(
 });
 ```
 
-- [ ] **Step 4: Update all call sites to pass `&[], &[]`** for the two new params (compile-only; no behavior change yet):
-  - Production: `handlers.rs:5712` — append `&[], &[],` after `&snapshot.directive_meta.declared_functions,`.
-  - `#[cfg(test)]` `collect_usages_with_context` build (~15342) — append `&[], &[],`.
-  - Any other `NseAnalysis::build(` call (the test at ~21456 and ~21653/21695 paths) — append `&[], &[],`. Find them all with `rg -n "NseAnalysis::build" crates/raven/src/handlers.rs`.
+- [ ] **Step 4: Update ALL `NseAnalysis::build` call sites to pass `&[], &[]`** for the two new params (compile-only; no behavior change yet). `rg -n "NseAnalysis::build" crates/raven/src` is authoritative; at the time of writing there are **nine** call sites, all in `handlers.rs`:
+  - `:5712` (production undefined-variable collector — the one Task 5 later replaces with the real foreign data).
+  - `:15342` (`#[cfg(test)]` `collect_usages_with_context`).
+  - `:21456`, `:21468`, `:21644`, `:21686`, `:21882`, `:21936`, `:22265` (test call sites).
+
+  Append `&[], &[],` after the `declared_functions` argument at each. Verify the count with `rg -c "NseAnalysis::build" crates/raven/src/handlers.rs` and that the crate compiles.
 
 - [ ] **Step 5: Run the build, verify it compiles and existing NSE tests still pass.**
 
@@ -394,7 +396,7 @@ Refactor the existing own loop body (~13113-13206) to call `directive_arg_policy
 ```rust
 for decl in foreign_nse_declarations {
     let policy = directive_arg_policy(
-        decl, declared_functions, foreign_nse_funcs_ref, &local_function_defs, &formal_order, text,
+        decl, declared_functions, foreign_funcs, &local_function_defs, &formal_order, text,
     );
     directive_nse.entry(decl.name.clone()).or_default().push(DirectiveNsePolicy {
         line: 0,
@@ -409,7 +411,7 @@ for entries in directive_nse.values_mut() {
 }
 ```
 
-(`foreign_nse_funcs_ref` = the `foreign_funcs` param; name it consistently.)
+(`foreign_funcs` is the new `build` parameter from Task 2.)
 
 - [ ] **Step 4: Split `directive_nse_policy` into own/foreign lookups.**
 
@@ -488,65 +490,90 @@ git commit -m "feat(nse): translate + resolve foreign directives at tier 3.6 (#4
 
 ---
 
-## Task 4: `FormalOrderTracker` enablement + foreign formal-order coverage
+## Task 4: Foreign per-formal order via `# raven: func`; local-def precedence
+
+**Design note — `FormalOrderTracker` does NOT need widening.** Codex round-2
+finding #6 proposed enabling the tracker when foreign declarations exist. On
+analysis this is unnecessary: the tracker is consulted ONLY in
+`directive_arg_policy`'s "borrow a local `name <- function(...)` definition's
+formal order" branch, and that branch is unreachable for a *foreign* directive.
+A foreign directive resolves at tier 3.6, which is reached only when the callee
+has no local definition (a local def resolves at **step 1**, before tier 3.6 —
+see Task 3 Step 5). So a foreign directive never borrows a local def's order;
+its order comes from foreign `# raven: func` or the named-only fallback. Leave
+the gate `call_args_enabled && !nse_declarations.is_empty()` UNCHANGED. The
+two tests below pin both halves of this reasoning.
 
 **Files:**
-- Modify: `crates/raven/src/handlers.rs` (`FormalOrderTracker` gate ~12968; its doc ~13313)
-- Test: handlers.rs test module
+- Test only: `crates/raven/src/handlers.rs` test module (no production change)
 
-- [ ] **Step 1: Write a failing test** that a foreign per-formal directive borrows the current file's local definition for positional order.
+- [ ] **Step 1: Write the foreign-`# raven: func` order test.**
 
 ```rust
 #[test]
-fn foreign_per_formal_borrows_local_definition_order() {
-    // Local def gives order (a, b); foreign `# raven: nse f(b)` must suppress
-    // only the b-bound positional, leaving a reported.
-    let code = "f <- function(a, b) a\nf(real_a, undefined_b)\n";
+fn foreign_per_formal_uses_foreign_func_order() {
+    // No local def of `myverb`; a foreign `# raven: func myverb(data, expr)`
+    // supplies positional order to a foreign `# raven: nse myverb(expr)`, so only
+    // the expr-bound positional is suppressed.
+    let code = "myverb(real_df, undefined_expr)\n";
     let (_t, root) = parse_root(code);
-    let foreign = vec![crate::cross_file::types::NseDeclaration {
-        name: "f".into(), package: None,
-        scope: crate::cross_file::types::NseScope::Formals(vec!["b".into()]), line: 0,
+    let foreign_nse = vec![crate::cross_file::types::NseDeclaration {
+        name: "myverb".into(), package: None,
+        scope: crate::cross_file::types::NseScope::Formals(vec!["expr".into()]), line: 0,
+    }];
+    let foreign_funcs = vec![crate::cross_file::types::DeclaredSymbol {
+        name: "myverb".into(), line: 0, is_function: true,
+        formals: Some(vec!["data".into(), "expr".into()]),
     }];
     let analysis = NseAnalysis::build(
         root, code, true, true, vec![], None, None, None,
-        &[], &[], &foreign, &[],
+        &[], &[], &foreign_nse, &foreign_funcs,
     );
     let mut used = Vec::new();
     collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    assert!(used.iter().any(|(n, _)| n == "real_a"), "a-bound arg must stay reported");
-    assert!(!used.iter().any(|(n, _)| n == "undefined_b"), "b-bound arg must be suppressed");
+    assert!(used.iter().any(|(n, _)| n == "real_df"), "data-bound positional stays reported");
+    assert!(!used.iter().any(|(n, _)| n == "undefined_expr"), "expr-bound positional suppressed");
 }
 ```
 
-- [ ] **Step 2: Run, verify FAIL** (tracker disabled → `is_ambiguous` path may misbehave, or the order is not consulted).
+(Confirm `DeclaredSymbol`'s exact fields with `rg -n "pub struct DeclaredSymbol" -A8 crates/raven/src/cross_file/types.rs` — it is `name`, `line`, `is_function`, `formals: Option<Vec<String>>`; the literal must set all four.)
 
-Run: `cargo test -p raven --lib foreign_per_formal_borrows -- --nocapture`
-Expected: FAIL or incorrect mask.
-
-- [ ] **Step 3: Widen the `FormalOrderTracker` gate** (~12968):
+- [ ] **Step 2: Write the local-definition-precedence test** (per-formal analog of Task 3's whole-call shadow test).
 
 ```rust
-let mut formal_order = FormalOrderTracker {
-    enabled: call_args_enabled
-        && (!nse_declarations.is_empty() || !foreign_nse_declarations.is_empty()),
-    ..FormalOrderTracker::default()
-};
+#[test]
+fn foreign_directive_yields_to_local_definition() {
+    // A local standard-eval `myverb` resolves at step 1, before tier 3.6, so the
+    // foreign directive never fires and the positional stays reported.
+    let code = "myverb <- function(data, expr) data\nmyverb(a, undefined_expr)\n";
+    let (_t, root) = parse_root(code);
+    let foreign_nse = vec![crate::cross_file::types::NseDeclaration {
+        name: "myverb".into(), package: None,
+        scope: crate::cross_file::types::NseScope::Formals(vec!["expr".into()]), line: 0,
+    }];
+    let analysis = NseAnalysis::build(
+        root, code, true, true, vec![], None, None, None,
+        &[], &[], &foreign_nse, &[],
+    );
+    let mut used = Vec::new();
+    collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
+    assert!(used.iter().any(|(n, _)| n == "undefined_expr"),
+        "local def resolves at step 1; foreign tier 3.6 must not fire");
+}
 ```
 
-Update its doc comment (~13313-13320) to note foreign declarations also enable it (a foreign per-formal directive may borrow the current file's local definition for formal order).
+- [ ] **Step 3: Run both, verify PASS** (Task 3's wiring already makes them pass).
 
-- [ ] **Step 4: Run, verify PASS.**
-
-Run: `cargo test -p raven --lib foreign_per_formal_borrows`
+Run: `cargo test -p raven --lib foreign_per_formal_uses_foreign_func_order foreign_directive_yields_to_local_definition -- --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: fmt + clippy + commit.**
+- [ ] **Step 4: fmt + clippy + commit.**
 
 ```bash
 cargo fmt --all
 cargo clippy -p raven --all-targets --features test-support -- -D warnings
 git add crates/raven/src/handlers.rs
-git commit -m "fix(nse): enable FormalOrderTracker for foreign directives (#460)"
+git commit -m "test(nse): foreign per-formal order via # raven: func; local-def precedence (#460)"
 ```
 
 ---
@@ -641,56 +668,55 @@ let nse_analysis = NseAnalysis::build(
 );
 ```
 
-- [ ] **Step 3: Write a first cross-file integration test (B1 — ancestor declares, descendant calls).**
+- [ ] **Step 3: Establish the canonical cross-file test harness (CRITICAL — used by Tasks 5 & 7).**
 
-Model on `test_sysdata_symbol_suppresses_undefined_in_r_source` (~28999). Open two files so the dependency graph is populated; `child.R` sources `parent.R`; the directive is in `parent.R`.
-
-```rust
-#[tokio::test]
-async fn nse_directive_propagates_from_sourced_parent_to_child() {
-    use crate::state::{Document, WorldState};
-    let mut state = WorldState::new();
-    state.workspace_scan_complete = true;
-    let parent = Url::parse("file:///w/parent.R").unwrap();
-    let child = Url::parse("file:///w/child.R").unwrap();
-    state.open_document(parent.clone(), "library(arm)\n# raven: nse: lmer\n".into(), None);
-    state.open_document(child.clone(), "source(\"parent.R\")\nlmer(undefined_var)\n".into(), None);
-
-    let diags = undefined_diags_for(&state, &child); // small test helper, below
-    assert!(!diags.iter().any(|m| m.contains("undefined_var")),
-        "NSE directive in a sourced parent must suppress the child call. got: {diags:?}");
-}
-```
-
-Add a test helper in the module if one does not exist:
+`open_document`/`documents.insert` do **NOT** populate the dependency graph; tests must call `cross_file_graph.update_file(...)` per file (see the existing cross-file revalidation test at `handlers.rs:~52466-52505`). And the existing top-level `diagnostics(&state, &uri, &DiagCancelToken::never()) -> Vec<Diagnostic>` function is the right way to get diagnostics (it builds the snapshot and runs all collectors), so there is **no need** for a bespoke `undefined_diags_for` helper. Add a tiny helper that wires both files and returns messages:
 
 ```rust
 #[cfg(test)]
-fn undefined_diags_for(state: &crate::state::WorldState, uri: &Url) -> Vec<String> {
-    let doc = state.get_document(uri).unwrap();
-    let tree = doc.tree.clone().unwrap();
-    let text = doc.analysis_text();
-    let mut diags = Vec::new();
-    let snapshot = DiagnosticsSnapshot::build(state, uri).expect("snapshot");
-    collect_undefined_variables_from_snapshot(
-        &snapshot, uri, tree.root_node(), &text,
-        DiagnosticSeverity::WARNING, &mut diags_vec_adapter(&mut diags),
-        &mut std::collections::HashMap::new(), &DiagCancelToken::never(), None,
-    );
-    diags
+fn diag_messages_for(files: &[(&str, &str)], query: &str) -> Vec<String> {
+    use crate::state::{Document, WorldState};
+    let ws = Url::parse("file:///w/").unwrap();
+    let mut state = WorldState::new();
+    state.workspace_folders.push(ws.clone());
+    state.workspace_scan_complete = true; // else undefined-var diagnostics defer
+    for (name, code) in files {
+        let uri = ws.join(name).unwrap();
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        let meta = crate::cross_file::extract_metadata(code);
+        state.cross_file_graph.update_file(&uri, &meta, Some(&ws), |_| None);
+    }
+    let q = ws.join(query).unwrap();
+    diagnostics(&state, &q, &DiagCancelToken::never())
+        .into_iter().map(|d| d.message).collect()
 }
 ```
 
-Note: `collect_undefined_variables_from_snapshot` pushes `Diagnostic`s; adapt by collecting into a `Vec<Diagnostic>` then mapping `.message`. (Match the exact shape used by existing snapshot tests — see ~29045; do not invent `diags_vec_adapter`, just collect `Vec<Diagnostic>` and map messages.)
+(Confirm `diagnostics`'s exact signature with `rg -n "pub(crate) fn diagnostics|fn diagnostics\(" crates/raven/src/handlers.rs`; the cross-file test at ~52483 calls `diagnostics(&state, &b_url, &DiagCancelToken::never())`. The undefined-variable message format is `"Undefined variable: <name>"`.)
 
-Verify the graph is actually built by `open_document` for these URIs; if `open_document` does not populate `cross_file_graph` in the unit-test path, follow the setup used by `test_completion_transitive_chain_*` (handlers.rs ~48076) which wires multi-file graphs for tests.
+- [ ] **Step 4: Write B1 (ancestor declares, descendant calls) using the harness.**
 
-- [ ] **Step 4: Run, verify FAIL then implement-already-done → PASS.**
+```rust
+#[test]
+fn nse_directive_propagates_from_sourced_parent_to_child() {
+    let msgs = diag_messages_for(
+        &[
+            ("parent.R", "library(arm)\n# raven: nse: lmer\n"),
+            ("child.R", "source(\"parent.R\")\nlmer(undefined_var)\n"),
+        ],
+        "child.R",
+    );
+    assert!(!msgs.iter().any(|m| m.contains("undefined_var")),
+        "NSE directive in a sourced parent must suppress the child call. got: {msgs:?}");
+}
+```
+
+- [ ] **Step 5: Run, verify PASS.**
 
 Run: `cargo test -p raven --lib nse_directive_propagates_from_sourced_parent_to_child -- --nocapture`
-Expected: PASS (collector + Task 3 wiring make it pass). If it FAILS because the graph isn't populated in the test, fix the test setup (graph wiring), not the production code.
+Expected: PASS (collector + Task 3 wiring). If it FAILS because the graph isn't wired, fix the harness (`update_file`), not the production code. Sanity-check that a `source("parent.R")` edge resolves under workspace root `file:///w/` — the directive/AST `source()` uses `from_metadata` + workspace fallback, so a sibling-relative path resolves; if resolution is the issue, use an explicit `# raven: source: parent.R` in `child.R`.
 
-- [ ] **Step 5: fmt + clippy + commit.**
+- [ ] **Step 6: fmt + clippy + commit.**
 
 ```bash
 cargo fmt --all
@@ -758,35 +784,44 @@ if analysis.directive_nse.get(bare).is_some_and(|entries| {
 }
 ```
 
-- [ ] **Step 4: Update the backend code-action** (`backend.rs` ~5734) to feed own+foreign governance. The backend has `state` (graph + metadata) access. Build a snapshot and reuse the same collector so the governance set matches diagnostics:
+- [ ] **Step 4: Update the backend code-action** (`backend.rs` ~5734) to feed own+foreign governance. **CRITICAL: keep the existing `d.name == bare` callee-name filter** — the current code (`backend.rs:~5764`) filters `nse_decls.iter().filter(|d| d.name == bare)` before calling `nse_directive_governs`; dropping it would let an unrelated callee's directive suppress this quick-fix. So the governing set must retain each declaration's NAME. Build a combined `Vec<NseDeclaration>` (own + foreign) once when an undefined diagnostic is present, and filter by name inside the per-diagnostic loop exactly as today:
 
 ```rust
 // Own + foreign governing declarations, so the lightbulb stays in lockstep with
-// the foreign-aware hint (issue #460). Only when an undefined diagnostic exists.
-let governing: Vec<(Option<String>, u32, bool)> = if params.context.diagnostics.iter().any(&is_undefined) {
-    let mut v: Vec<_> = state.get_enriched_metadata(&uri)
-        .map(|m| m.nse_declarations.iter().map(|d| (d.package.clone(), d.line, false)).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if let Some(snapshot) = handlers::DiagnosticsSnapshot::build(state, &uri) {
-        let foreign = handlers::collect_cross_file_nse(&snapshot, &uri);
-        v.extend(foreign.nse.iter().map(|d| (d.package.clone(), 0, true)));
-    }
-    v
-} else { Vec::new() };
+// the foreign-aware hint (issue #460). `false`/`true` is the file_level flag.
+// Build once (only when an undefined diagnostic exists); keep full NseDeclarations
+// so the per-diagnostic loop can still filter by `d.name == bare`.
+let governing: Vec<(crate::cross_file::types::NseDeclaration, bool)> =
+    if params.context.diagnostics.iter().any(&is_undefined) {
+        let mut v: Vec<_> = state
+            .get_enriched_metadata(&uri)
+            .map(|m| m.nse_declarations.iter().cloned().map(|d| (d, false)).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(snapshot) = handlers::DiagnosticsSnapshot::build(state, &uri) {
+            let foreign = handlers::collect_cross_file_nse(&snapshot, &uri);
+            v.extend(foreign.nse.into_iter().map(|d| (d, true)));
+        }
+        v
+    } else {
+        Vec::new()
+    };
 ```
 
-Then the governance check (~5762) becomes:
+Then the existing governance check (`backend.rs:~5762`, the `if nse_directive_governs(... d.name == bare ...)` block) becomes — preserving the name filter and passing the `file_level` flag to the new 3-tuple signature:
 
 ```rust
 if handlers::nse_directive_governs(
-    governing.iter().filter(|(_, _, _)| true)
-        .filter_map(|(p, l, f)| Some((p.as_deref(), *l, *f)))
-        .filter(|_| true),
-    call_pkg, fix.insert_line,
-) { continue; }
+    governing.iter()
+        .filter(|(d, _)| d.name == bare)
+        .map(|(d, file_level)| (d.package.as_deref(), d.line, *file_level)),
+    call_pkg,
+    fix.insert_line,
+) {
+    continue;
+}
 ```
 
-(Simplify the closure plumbing to match the final `nse_directive_governs` signature; the key requirement: pass own entries with `file_level=false` and foreign entries with `file_level=true`, filtered to `d.name == bare`.) Make `collect_cross_file_nse`, `CrossFileNse`, and `DiagnosticsSnapshot` reachable from backend (they are `pub(crate)` / in `handlers`); add `pub(crate)` where needed. If threading the snapshot here proves too costly, the documented fallback (spec §4.7) is acceptable: keep own-only governance and accept a harmless redundant local suggestion — in that case, skip the foreign part and leave a `// #460: foreign governance is best-effort` note.
+Make `collect_cross_file_nse`, `CrossFileNse`, and `DiagnosticsSnapshot` reachable from `backend.rs` (they live in `handlers`; mark `pub(crate)` as needed — `DiagnosticsSnapshot` and its `build` are already `pub(crate)`). `DiagnosticsSnapshot::build` is already called from `backend.rs`/`handlers` synchronous paths, so calling it here in `code_action` is acceptable. **Fallback (spec §4.7):** if threading the snapshot here is undesirable, keep own-only governance (drop the foreign `extend`) and leave a `// #460: foreign code-action governance is best-effort` note — re-declaring a local `# raven: nse` is harmless, never conflicting.
 
 - [ ] **Step 5: Run, verify PASS** (hint test + existing hint/code-action tests).
 
@@ -806,7 +841,7 @@ git commit -m "fix(nse): make hint + code-action governance foreign-aware (#460)
 
 ## Task 7: Behavior-matrix integration tests (B2–B8)
 
-Add the remaining matrix rows (B1 landed in Task 5). All follow the Task-5 harness (`open_document` for each file, `undefined_diags_for(&state, &uri)`).
+Add the remaining matrix rows (B1 landed in Task 5). All use the `diag_messages_for(&[(name, code), …], query)` harness from Task 5 Step 3 (`documents.insert` + `cross_file_graph.update_file` per file, then the existing `diagnostics(...)` entry point). The undefined-variable message is `"Undefined variable: <name>"`.
 
 **Files:**
 - Test: `crates/raven/src/handlers.rs` test module
@@ -814,33 +849,36 @@ Add the remaining matrix rows (B1 landed in Task 5). All follow the Task-5 harne
 - [ ] **Step 1: B2 — descendant declares, ancestor calls.**
 
 ```rust
-#[tokio::test]
-async fn nse_directive_propagates_from_sourced_child_to_parent() {
-    use crate::state::{WorldState};
-    let mut state = WorldState::new();
-    state.workspace_scan_complete = true;
-    let parent = Url::parse("file:///w/parent.R").unwrap();
-    let child = Url::parse("file:///w/child.R").unwrap();
-    state.open_document(parent.clone(), "source(\"child.R\")\nlmer(undefined_var)\n".into(), None);
-    state.open_document(child.clone(), "library(arm)\n# raven: nse: lmer\n".into(), None);
-    let diags = undefined_diags_for(&state, &parent);
-    assert!(!diags.iter().any(|m| m.contains("undefined_var")), "got: {diags:?}");
+#[test]
+fn nse_directive_propagates_from_sourced_child_to_parent() {
+    let msgs = diag_messages_for(
+        &[
+            ("parent.R", "source(\"child.R\")\nlmer(undefined_var)\n"),
+            ("child.R", "library(arm)\n# raven: nse: lmer\n"),
+        ],
+        "parent.R",
+    );
+    assert!(!msgs.iter().any(|m| m.contains("undefined_var")), "got: {msgs:?}");
 }
 ```
 
-- [ ] **Step 2: B3 — transitive (≥2 edges), both directions.** Chain `a.R → b.R → c.R`; directive in `a.R`, call in `c.R`; and a mirror with directive in `c.R`, call in `a.R`. Assert suppression in each.
+- [ ] **Step 2: B3 — transitive (≥2 edges), both directions.** Chain `a.R` sources `b.R` sources `c.R`. Test 1: directive in `a.R`, call in `c.R` (query `c.R`). Test 2 (mirror): directive in `c.R`, call in `a.R` (query `a.R`). Assert no `undefined_var` message in each.
 
-- [ ] **Step 3: B4 — shared sourced helper.** `a.R` and `b.R` both `source("h.R")`; `# raven: nse: lmer` in `h.R`; `lmer(undefined_var)` in both `a.R` and `b.R`; assert suppressed in both.
+- [ ] **Step 3: B4 — shared sourced helper.** `a.R` and `b.R` each `source("h.R")`; `# raven: nse: lmer` in `h.R`; `lmer(undefined_var)` in both `a.R` and `b.R`. Two queries (`a.R`, `b.R`); assert suppressed in both.
 
-- [ ] **Step 4: B4b — sibling via shared parent.** `main.R` sources `setup.R` then `analysis.R`; `# raven: nse: lmer` in `setup.R`; `lmer(undefined_var)` in `analysis.R`; assert suppressed in `analysis.R`.
+- [ ] **Step 4: B4b — sibling via shared parent.** `main.R` = `source("setup.R")\nsource("analysis.R")\n`; `setup.R` = `library(arm)\n# raven: nse: lmer\n`; `analysis.R` = `lmer(undefined_var)\n`. Query `analysis.R`; assert suppressed (setup ∈ descendants(main), main ∈ ancestors(analysis), so setup ∈ S(analysis)).
 
-- [ ] **Step 5: B5 — negative (unconnected).** Two files with no `source()` relationship; directive in one; `lmer(undefined_var)` in the other; assert the diagnostic IS reported (`assert!(diags.iter().any(...))`).
+- [ ] **Step 5: B5 — negative (unconnected).** `a.R` = `# raven: nse: lmer\n`; `b.R` = `lmer(undefined_var)\n`; no `source()` between them. Query `b.R`; assert the diagnostic IS reported: `assert!(msgs.iter().any(|m| m.contains("undefined_var")))`.
 
-- [ ] **Step 6: B6 — per-formal cross-file.** `helper.R` has `# raven: func myverb(data, expr)`; `main.R` sources `helper.R`, has `# raven: nse: myverb(expr)` and `myverb(real_df, undefined_expr)`; assert `real_df` reported, `undefined_expr` suppressed.
+- [ ] **Step 6: B6 — per-formal cross-file.** `helper.R` = `# raven: func myverb(data, expr)\n`; `main.R` = `source("helper.R")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n`. Query `main.R`; assert `Undefined variable: real_df` IS present and `Undefined variable: undefined_expr` is NOT.
 
-- [ ] **Step 7: B7b — cross-file ordering.** Same as B6 but place `library()`/`# raven: func` after the `# raven: nse` line and in a different connected file order; assert suppression unchanged. (B7a within-file ordering is already covered by #455 tests; add one explicit within-file regression if missing.)
+- [ ] **Step 7: B7b — cross-file ordering.** Variant of B6 with the `# raven: func` in a connected file and the `library()` placed after the `# raven: nse` line; assert suppression unchanged. (B7a within-file ordering is already covered by #455 tests; add one explicit within-file regression only if `rg -n "before or after" crates/raven/src/handlers.rs` shows none exists.)
 
-- [ ] **Step 8: B8 — revalidation.** Open `parent.R` (calls `lmer(undefined_var)`, sources `child.R`) and `child.R` (no directive). Assert the diagnostic IS reported. Then `state.open_document(child, "# raven: nse: lmer\n", ...)` (simulating an edit) and re-run `undefined_diags_for(&state, &parent)`; assert the diagnostic is now suppressed — proving the interface-hash change (Task 1) makes the parent recompute. (If the unit-test path does not auto-revalidate, assert the lower-level invariant: `compute_artifacts` interface_hash for `child.R` differs before/after the edit — i.e. Task 1's guarantee — and that a fresh snapshot for `parent.R` suppresses.)
+- [ ] **Step 8: B8 — revalidation.** This needs the mutate-then-rediagnose pattern (see `handlers.rs:~52466-52505`), so write it as a `#[test]` building `WorldState` directly rather than via `diag_messages_for`:
+  1. Insert `parent.R` = `source("child.R")\nlmer(undefined_var)\n` and `child.R` = `library(arm)\n` (no directive); `update_file` both.
+  2. `diagnostics(&state, &parent, &DiagCancelToken::never())` → assert `Undefined variable: undefined_var` IS present.
+  3. Edit child: `state.documents.insert(child.clone(), Document::new("library(arm)\n# raven: nse: lmer\n", None))` then `state.cross_file_graph.update_file(&child, &extract_metadata(new_child), Some(&ws), |_| None)`.
+  4. `diagnostics(&state, &parent, ...)` again → assert the diagnostic is now SUPPRESSED. (`diagnostics` rebuilds the snapshot, re-collecting foreign NSE — this proves end-to-end suppression-after-edit. Task 1's hash test separately proves dependents are *triggered* in the production incremental path.)
 
 - [ ] **Step 9: Run all matrix tests.**
 
@@ -893,5 +931,5 @@ git commit -m "docs(nse): document cross-file # raven: nse propagation (#460)"
 ## Self-review notes (spec coverage)
 
 - B1–B8/B4b → Tasks 5, 7. Gaps A/B revalidation → Task 1 + Task 7 Step 8.
-- Foreign tier 3.6 (OD5) → Task 3 Step 5. Own-first formal order (findings #3/#7) → Task 3 Step 3 + Task 4. FormalOrderTracker (#6) → Task 4. Hint/code-action (#7/#10) → Task 6. Determinism/collapse (#2, OD3) → Task 5. Snapshot-bounds (round-2 BLOCKER) → Task 5 collector computes over `snapshot.cross_file_graph` and skips absent members.
+- Foreign tier 3.6 (OD5) → Task 3 Step 5. Own-first formal order (findings #3/#7) → Task 3 Step 3 + Task 4. FormalOrderTracker (round-2 #6) → analyzed in Task 4 as a no-op (foreign tier is shadowed by local defs; gate unchanged), pinned by the Task 4 precedence test. Hint/code-action (#7/#10) → Task 6 (backend keeps the `d.name == bare` filter). Determinism/collapse (#2, OD3) → Task 5. Snapshot-bounds (round-2 BLOCKER) → Task 5 collector computes over `snapshot.cross_file_graph` and skips members absent from `metadata_map`.
 - L1 (no cross-file real-def formal order) — intentionally not implemented; documented (Task 8) and asserted indirectly by B6 using `# raven: func`.
