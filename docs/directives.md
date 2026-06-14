@@ -241,6 +241,46 @@ Installed-package functions expose only export names (not formals) to the
 synchronous diagnostic pass, so positional matching for an installed-package
 callee also requires a paired `# raven: func` with formals.
 
+#### `# raven: nse` propagates across the source graph
+
+A `# raven: nse` declaration governs matching call sites in **every file
+connected to it through the resolved `source()` graph** — not just the file that
+physically contains it. So you can declare a helper's NSE contract next to its
+`library()` call, its definition, or in a sourced setup file, and it suppresses
+the corresponding false positives wherever the helper is called. Propagation
+works in both directions and transitively:
+
+```r
+# setup.R
+library(arm)
+# raven: nse: lmer
+
+# analysis.R
+source("setup.R")
+lmer(undefined_var)   # `undefined_var` suppressed — lmer is declared NSE in setup.R
+```
+
+Cross-file propagation is intentionally **coarse and file-level**: a propagated
+declaration ignores its original line in the other file and governs the whole
+connected file. Within the file that *physically contains* the directive, the
+usual position-aware, latest-wins behavior still applies, and an own directive
+takes precedence over one propagated from a connected file. A directive
+propagated from another file is consulted *below* the precise built-in policy
+tables, so it never coarsens a known verb (e.g. `dplyr::filter`) — it governs
+callees that would otherwise be checked as standard-eval (like `lmer`). Two
+unconnected files never share NSE directives. The context an NSE directive needs
+to resolve — the `library()` call, a `# raven: func` formal-order declaration —
+may live in any connected file and may appear before or after the directive.
+
+Propagation reuses the same dependency graph as cross-file scope analysis, so it
+honors the `# raven: cd` and workspace-root path-resolution rules and the
+`max_chain_depth` limit, and editing a directive in any connected file
+revalidates the dependents that rely on it. A propagated **per-formal** directive
+needs the callee's formal order from a `# raven: func` declaration (or a local
+definition in the *calling* file); a real `function(...)` definition that lives
+only in a *different* file does not supply cross-file positional order, so such a
+case falls back to named-argument-only matching.
+
 ### Position-Aware Behavior
 
 Declared symbols are available starting from the next line (line N+1):
