@@ -1301,6 +1301,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &top_level,
         &loaded_packages,
         &[],
+        &[],
         &removal_refs,
         &data_loads,
     );
@@ -1602,10 +1603,14 @@ pub fn compute_artifacts_with_metadata(
     // function-local rename never invalidates dependents that source this file.
     let top_level = top_level_interface(&artifacts);
     let data_loads = extract_top_level_data_loads(&artifacts.timeline);
+    let nse_decls: &[super::types::NseDeclaration] = metadata
+        .map(|m| m.nse_declarations.as_slice())
+        .unwrap_or(&[]);
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
         &declared_symbols,
+        nse_decls,
         &removal_refs,
         &data_loads,
     );
@@ -4163,6 +4168,7 @@ fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
+    nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
 ) -> u64 {
@@ -4195,6 +4201,33 @@ fn compute_interface_hash(
         decl.name.hash(&mut hasher);
         decl.is_function.hash(&mut hasher);
         decl.line.hash(&mut hasher);
+        // Issue #460 Gap B: a `# raven: func` declaration's formal ORDER feeds
+        // cross-file NSE positional matching in dependents, so a formal-list
+        // change must invalidate them even when name/is_function/line are equal.
+        decl.formals.hash(&mut hasher);
+    }
+
+    // Include `# raven: nse` declarations (issue #460 Gap A). These govern
+    // undefined-variable suppression in every connected file in the source
+    // graph, so adding / removing / reshaping / reordering one must invalidate
+    // dependents. `line` is included because file-level cross-file propagation
+    // keeps the highest-line declaration per callee, so a pure reorder changes
+    // the propagated winner. `NseDeclaration`/`NseScope` are not `Hash`-derived,
+    // so the scope is hashed by discriminant + formals (mirroring the
+    // field-by-field approach used for declared symbols above).
+    let mut sorted_nse: Vec<_> = nse_declarations.iter().collect();
+    sorted_nse.sort_by_key(|d| (&d.name, &d.package, d.line));
+    for decl in sorted_nse {
+        decl.name.hash(&mut hasher);
+        decl.package.hash(&mut hasher);
+        decl.line.hash(&mut hasher);
+        match &decl.scope {
+            super::types::NseScope::WholeCall => 0u8.hash(&mut hasher),
+            super::types::NseScope::Formals(formals) => {
+                1u8.hash(&mut hasher);
+                formals.hash(&mut hasher);
+            }
+        }
     }
 
     // Include top-level rm()/remove() events (sorted for determinism).
@@ -7569,6 +7602,93 @@ mod tests {
         assert_ne!(
             ha, hb,
             "renaming a top-level export must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap A: a `# raven: nse` directive participates in cross-file
+    /// suppression, so adding one must change the interface hash (else dependents
+    /// that propagate it would never be revalidated).
+    #[test]
+    fn interface_hash_changes_when_nse_directive_added() {
+        let a = "nrow(x)\n";
+        let b = "# raven: nse: nrow\nnrow(x)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "adding a # raven: nse directive must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap A: two declarations for the same callee; swapping their
+    /// lines changes which is "last" under file-level cross-file collapse, so
+    /// dependents must be revalidated — hence `line` is part of the NSE hash.
+    #[test]
+    fn interface_hash_changes_when_nse_directive_reordered() {
+        let a = "# raven: nse f(x)\n# raven: nse f(y)\nf(1)\n";
+        let b = "# raven: nse f(y)\n# raven: nse f(x)\nf(1)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "reordering same-callee NSE directives must change interface_hash"
+        );
+    }
+
+    /// Issue #460 Gap B: a `# raven: func` declaration's formal ORDER feeds
+    /// cross-file NSE positional matching, so reordering its formals must change
+    /// the interface hash even though name/is_function/line are unchanged.
+    #[test]
+    fn interface_hash_changes_when_func_formals_reordered() {
+        let a = "# raven: func g(a, b)\n";
+        let b = "# raven: func g(b, a)\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "reordering # raven: func formals must change interface_hash"
         );
     }
 
