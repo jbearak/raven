@@ -19,9 +19,19 @@
 3. **Collapse foreign declarations** to one per `(name, package)`: iterate members in sorted-URI order, first (smallest URI) file to set a key wins; within the same file, the highest-line declaration wins. Same collapse for foreign `# raven: func` (by `name`), so the existing `declared_function_formals` (which does `max_by_key(line)`) is safe on the single-per-key foreign list (no cross-file line comparison).
 4. **Precedence ladder** (`resolve_call_arg_policy`): own-exact → local defs → local aliases → own-qualified → built-in tables → **FOREIGN (tier 3.6)** → resolvable-std-eval → Shiny → unresolved⇒suppress. Namespace-qualified branch: own-qualified → tables → **FOREIGN** → Standard.
 5. **Formal-order resolution** (own-first): own `# raven: func` → own local def (bare, non-ambiguous) → foreign `# raven: func` → named-only.
-6. **`FormalOrderTracker` enabled** when `call_args_enabled && (own_nse non-empty || foreign_nse non-empty)`.
+6. **`FormalOrderTracker` gate is UNCHANGED** (`call_args_enabled && !nse_declarations.is_empty()`). See Task 4 for why widening is unnecessary (a foreign directive never borrows a local def's order — tier 3.6 is shadowed by step-1 local defs).
 7. **Revalidation:** add `nse_declarations` (name+package+scope+**line**) and `DeclaredSymbol.formals` to `compute_interface_hash`.
 8. **Hint + code-action governance** treat file-level foreign entries as governing regardless of line.
+
+---
+
+## Testing discipline — avoid vacuous suppression (CRITICAL)
+
+In the test harness there is **no `package_library`**, so a callee that is unknown to `is_builtin`/`base_exports` (e.g. `lmer`, `myverb`) is **unresolved → tier 6 `WholeCall` → all its args suppressed for free**, with or without a directive. Using such a callee for a *whole-call* propagation test is **vacuous** (it passes even if propagation is broken) and makes the negative test (B5) *fail* (the arg is suppressed regardless). Discipline:
+
+- **Whole-call tests (B1–B4b, B5, B8):** use a **builtin** callee that resolves to `Standard` in tests and is NOT in any NSE table — `nrow` (verified `is_builtin`, not NSE-tabled; `nrow(undefined_var)` reports `undefined_var` by default, as in `test_sysdata_symbol_suppresses_undefined_in_r_source`). Then: no directive → `nrow(undefined_var)` reports; foreign `# raven: nse: nrow` → tier 3.6 (before step 4) suppresses. The difference is attributable to propagation. No `library(...)` needed.
+- **Per-formal tests (B6, Task 4):** an unresolved callee (e.g. `myverb`) is fine because the discriminator is that an **uncaptured** positional stays **reported** — which only happens if the per-formal directive fired (a bare unresolved callee would `WholeCall`-suppress *everything*, including the uncaptured arg). Assert the uncaptured arg IS reported.
+- Every suppression test must have a paired/within-test control proving the arg is reported absent the directive, so suppression is never vacuous.
 
 ---
 
@@ -285,66 +295,80 @@ Make foreign declarations actually suppress at the right precedence. Test by pas
 - [ ] **Step 1: Write failing tests** that build an `NseAnalysis` with foreign declarations and assert suppression precedence.
 
 ```rust
-#[test]
-fn foreign_whole_call_directive_suppresses_unknown_callee() {
-    let code = "lmer(undefined_var)\n";
-    let (tree, root) = parse_root(code); // local helper: parse + root_node
-    let foreign = vec![crate::cross_file::types::NseDeclaration {
-        name: "lmer".into(), package: None,
-        scope: crate::cross_file::types::NseScope::WholeCall, line: 999,
-    }];
+```rust
+// Local test helper used by Tasks 3-4. Parses `code`, builds an NseAnalysis with
+// the four declaration slices, runs the collector, returns the used-identifier
+// names. Parser setup mirrors `test_sysdata_symbol_suppresses_undefined_in_r_source`
+// (~handlers.rs:29040). `tree` is kept alive on the stack (root borrows it).
+fn build_used(
+    code: &str,
+    own_nse: &[crate::cross_file::types::NseDeclaration],
+    own_funcs: &[crate::cross_file::types::DeclaredSymbol],
+    foreign_nse: &[crate::cross_file::types::NseDeclaration],
+    foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
+) -> Vec<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(code, None).unwrap();
+    let root = tree.root_node();
     let analysis = NseAnalysis::build(
         root, code, true, true, vec![], None, None, None,
-        &[], &[], &foreign, &[],
+        own_nse, own_funcs, foreign_nse, foreign_funcs,
     );
     let mut used = Vec::new();
     collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    assert!(!used.iter().any(|(n, _)| n == "undefined_var"),
+    used.into_iter().map(|(n, _)| n).collect()
+}
+
+#[test]
+fn foreign_whole_call_directive_suppresses_builtin_callee() {
+    // `nrow` is is_builtin → resolves to Standard (step 4) in the test harness,
+    // so its arg is checked by DEFAULT. That makes the suppression below
+    // attributable to the foreign directive, not to free tier-6 suppression.
+    let code = "nrow(undefined_var)\n";
+    let foreign = vec![crate::cross_file::types::NseDeclaration {
+        name: "nrow".into(), package: None,
+        scope: crate::cross_file::types::NseScope::WholeCall, line: 0,
+    }];
+    // Control: no foreign directive → arg is reported (proves non-vacuous).
+    assert!(build_used(code, &[], &[], &[], &[]).iter().any(|n| n == "undefined_var"),
+        "baseline: nrow's arg must be checked without a directive");
+    // With a foreign whole-call directive → suppressed at tier 3.6.
+    assert!(!build_used(code, &[], &[], &foreign, &[]).iter().any(|n| n == "undefined_var"),
         "a foreign whole-call NSE directive must suppress the arg");
 }
 
 #[test]
 fn foreign_directive_does_not_override_local_definition() {
-    // A local standard-eval `lmer` must NOT be suppressed by a foreign directive.
-    let code = "lmer <- function(x) x + 1\nlmer(undefined_var)\n";
-    let (_t, root) = parse_root(code);
+    // A local standard-eval `nrow` (step 1) shadows the foreign directive (3.6).
+    let code = "nrow <- function(x) x + 1\nnrow(undefined_var)\n";
     let foreign = vec![crate::cross_file::types::NseDeclaration {
-        name: "lmer".into(), package: None,
+        name: "nrow".into(), package: None,
         scope: crate::cross_file::types::NseScope::WholeCall, line: 0,
     }];
-    let analysis = NseAnalysis::build(
-        root, code, true, true, vec![], None, None, None,
-        &[], &[], &foreign, &[],
-    );
-    let mut used = Vec::new();
-    collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    assert!(used.iter().any(|(n, _)| n == "undefined_var"),
+    assert!(build_used(code, &[], &[], &foreign, &[]).iter().any(|n| n == "undefined_var"),
         "foreign directive must not suppress a locally-defined standard-eval callee");
 }
 
 #[test]
 fn own_directive_beats_foreign_for_same_callee() {
-    // Own per-formal f(x) at line 0 should win over a foreign whole-call f.
-    let code = "# raven: nse f(x)\nf(captured_x = a, b)\n";
-    let (_t, root) = parse_root(code);
-    let own = crate::cross_file::extract_metadata(code).nse_declarations;
+    // Own per-formal nrow(x) wins over a foreign whole-call nrow. With order
+    // resolved by the own # raven: func, only the x-bound arg is suppressed;
+    // the data-bound arg stays reported — proving own beat foreign (which would
+    // have whole-call-suppressed BOTH).
+    let code = "# raven: func nrow(data, x)\n# raven: nse nrow(x)\nnrow(real_df, masked_col)\n";
+    let meta = crate::cross_file::extract_metadata(code);
     let foreign = vec![crate::cross_file::types::NseDeclaration {
-        name: "f".into(), package: None,
+        name: "nrow".into(), package: None,
         scope: crate::cross_file::types::NseScope::WholeCall, line: 0,
     }];
-    let analysis = NseAnalysis::build(
-        root, code, true, true, vec![], None, None, None,
-        &own, &[], &foreign, &[],
-    );
-    let mut used = Vec::new();
-    collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    // Own f(x) suppresses only the x-bound arg; `b` (positional, uncaptured) stays.
-    assert!(used.iter().any(|(n, _)| n == "b"),
-        "own per-formal directive must win over foreign whole-call (b stays reported)");
+    let used = build_used(code, &meta.nse_declarations, &meta.declared_functions, &foreign, &[]);
+    assert!(used.iter().any(|n| n == "real_df"),
+        "own per-formal directive must win over foreign whole-call (data arg stays reported)");
+    assert!(!used.iter().any(|n| n == "masked_col"),
+        "own per-formal directive suppresses the x-bound arg");
 }
 ```
-
-If a `parse_root` helper does not already exist in the test module, add a tiny one mirroring the parser setup used in `test_sysdata_symbol_suppresses_undefined_in_r_source` (handlers.rs ~29040).
 
 - [ ] **Step 2: Run tests, verify FAIL** (foreign declarations are ignored today).
 
@@ -514,9 +538,10 @@ two tests below pin both halves of this reasoning.
 fn foreign_per_formal_uses_foreign_func_order() {
     // No local def of `myverb`; a foreign `# raven: func myverb(data, expr)`
     // supplies positional order to a foreign `# raven: nse myverb(expr)`, so only
-    // the expr-bound positional is suppressed.
+    // the expr-bound positional is suppressed. `real_df` (data-bound, uncaptured)
+    // stays reported — which a bare unresolved callee would NOT (it would
+    // whole-call-suppress everything), so this assertion is non-vacuous.
     let code = "myverb(real_df, undefined_expr)\n";
-    let (_t, root) = parse_root(code);
     let foreign_nse = vec![crate::cross_file::types::NseDeclaration {
         name: "myverb".into(), package: None,
         scope: crate::cross_file::types::NseScope::Formals(vec!["expr".into()]), line: 0,
@@ -525,14 +550,9 @@ fn foreign_per_formal_uses_foreign_func_order() {
         name: "myverb".into(), line: 0, is_function: true,
         formals: Some(vec!["data".into(), "expr".into()]),
     }];
-    let analysis = NseAnalysis::build(
-        root, code, true, true, vec![], None, None, None,
-        &[], &[], &foreign_nse, &foreign_funcs,
-    );
-    let mut used = Vec::new();
-    collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    assert!(used.iter().any(|(n, _)| n == "real_df"), "data-bound positional stays reported");
-    assert!(!used.iter().any(|(n, _)| n == "undefined_expr"), "expr-bound positional suppressed");
+    let used = build_used(code, &[], &[], &foreign_nse, &foreign_funcs);
+    assert!(used.iter().any(|n| n == "real_df"), "data-bound positional stays reported");
+    assert!(!used.iter().any(|n| n == "undefined_expr"), "expr-bound positional suppressed");
 }
 ```
 
@@ -546,18 +566,12 @@ fn foreign_directive_yields_to_local_definition() {
     // A local standard-eval `myverb` resolves at step 1, before tier 3.6, so the
     // foreign directive never fires and the positional stays reported.
     let code = "myverb <- function(data, expr) data\nmyverb(a, undefined_expr)\n";
-    let (_t, root) = parse_root(code);
     let foreign_nse = vec![crate::cross_file::types::NseDeclaration {
         name: "myverb".into(), package: None,
         scope: crate::cross_file::types::NseScope::Formals(vec!["expr".into()]), line: 0,
     }];
-    let analysis = NseAnalysis::build(
-        root, code, true, true, vec![], None, None, None,
-        &[], &[], &foreign_nse, &[],
-    );
-    let mut used = Vec::new();
-    collect_usages_with_analysis(root, code, &analysis, &UsageContext::default(), &mut used);
-    assert!(used.iter().any(|(n, _)| n == "undefined_expr"),
+    let used = build_used(code, &[], &[], &foreign_nse, &[]);
+    assert!(used.iter().any(|n| n == "undefined_expr"),
         "local def resolves at step 1; foreign tier 3.6 must not fire");
 }
 ```
@@ -694,15 +708,26 @@ fn diag_messages_for(files: &[(&str, &str)], query: &str) -> Vec<String> {
 
 (Confirm `diagnostics`'s exact signature with `rg -n "pub(crate) fn diagnostics|fn diagnostics\(" crates/raven/src/handlers.rs`; the cross-file test at ~52483 calls `diagnostics(&state, &b_url, &DiagCancelToken::never())`. The undefined-variable message format is `"Undefined variable: <name>"`.)
 
-- [ ] **Step 4: Write B1 (ancestor declares, descendant calls) using the harness.**
+- [ ] **Step 4: Write B1 (ancestor declares, descendant calls) + its control, using the harness.**
+
+Uses the builtin callee `nrow` (Testing discipline) so the suppression is attributable to propagation, not free tier-6 suppression.
 
 ```rust
 #[test]
 fn nse_directive_propagates_from_sourced_parent_to_child() {
+    // Control: child alone (no directive reachable) → nrow's arg is reported.
+    let control = diag_messages_for(
+        &[("child.R", "nrow(undefined_var)\n")],
+        "child.R",
+    );
+    assert!(control.iter().any(|m| m.contains("undefined_var")),
+        "baseline: nrow's arg must be checked. got: {control:?}");
+
+    // Directive in the sourced parent must suppress the child call.
     let msgs = diag_messages_for(
         &[
-            ("parent.R", "library(arm)\n# raven: nse: lmer\n"),
-            ("child.R", "source(\"parent.R\")\nlmer(undefined_var)\n"),
+            ("parent.R", "# raven: nse: nrow\n"),
+            ("child.R", "source(\"parent.R\")\nnrow(undefined_var)\n"),
         ],
         "child.R",
     );
@@ -714,7 +739,7 @@ fn nse_directive_propagates_from_sourced_parent_to_child() {
 - [ ] **Step 5: Run, verify PASS.**
 
 Run: `cargo test -p raven --lib nse_directive_propagates_from_sourced_parent_to_child -- --nocapture`
-Expected: PASS (collector + Task 3 wiring). If it FAILS because the graph isn't wired, fix the harness (`update_file`), not the production code. Sanity-check that a `source("parent.R")` edge resolves under workspace root `file:///w/` — the directive/AST `source()` uses `from_metadata` + workspace fallback, so a sibling-relative path resolves; if resolution is the issue, use an explicit `# raven: source: parent.R` in `child.R`.
+Expected: PASS (collector + Task 3 wiring). The control half also guards against a FALSE PASS from a missing `source()` edge: if the edge never formed, the second assertion's `nrow(undefined_var)` would still be *reported* (like the control), failing the test. If the edge is the problem, verify `source("parent.R")` resolves under workspace root `file:///w/` (it uses `from_metadata` + workspace fallback); if needed, use an explicit `# raven: source: parent.R` in `child.R`.
 
 - [ ] **Step 6: fmt + clippy + commit.**
 
@@ -739,21 +764,26 @@ git commit -m "feat(nse): collect + propagate cross-file NSE/func declarations (
 ```rust
 #[test]
 fn hint_suppressed_when_foreign_directive_governs() {
-    let code = "f(captured = a, undefined_b)\n";
-    let (_t, root) = parse_root(code);
+    // `nrow` is a builtin so the call is eligible for the hint; a governing
+    // foreign per-formal directive must make the hint step aside.
+    let code = "nrow(captured = a, undefined_b)\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(code, None).unwrap();
+    let root = tree.root_node();
     let foreign = vec![crate::cross_file::types::NseDeclaration {
-        name: "f".into(), package: None,
+        name: "nrow".into(), package: None,
         scope: crate::cross_file::types::NseScope::Formals(vec!["captured".into()]), line: 0,
     }];
     let analysis = NseAnalysis::build(root, code, true, true, vec![], None, None, None, &[], &[], &foreign, &[]);
-    // The `undefined_b` usage node — find it, then assert no hint is offered.
-    let usage = find_identifier(root, code, "undefined_b");
+    // Locate the `undefined_b` identifier node (walk descendants; match node text).
+    let usage = find_identifier_node(root, code, "undefined_b").expect("node");
     assert!(nse_hint_for_usage(usage, code, &analysis).is_none(),
         "a governing foreign directive must suppress the add-# raven: nse hint");
 }
 ```
 
-(`find_identifier` — small descend helper; if absent, locate via `descendant_for_point_range` like the backend does.)
+Add `find_identifier_node(root, text, name) -> Option<Node>` to the test module if absent: a recursive descent returning the first `identifier` node whose `node_text(n, text) == name`. (Mirror any existing descend helper; otherwise a short manual walk.)
 
 - [ ] **Step 2: Run, verify FAIL** (foreign entry has `line: 0`; `nse_directive_governs`'s `line < call_line` may pass by accident or the entries shape differs — make the behavior explicit rather than accidental).
 
@@ -846,6 +876,8 @@ Add the remaining matrix rows (B1 landed in Task 5). All use the `diag_messages_
 **Files:**
 - Test: `crates/raven/src/handlers.rs` test module
 
+All rows use the builtin callee `nrow` for whole-call cases (Testing discipline); `myverb` only where a per-formal `uncaptured-arg-reported` discriminator is used (B6).
+
 - [ ] **Step 1: B2 — descendant declares, ancestor calls.**
 
 ```rust
@@ -853,8 +885,8 @@ Add the remaining matrix rows (B1 landed in Task 5). All use the `diag_messages_
 fn nse_directive_propagates_from_sourced_child_to_parent() {
     let msgs = diag_messages_for(
         &[
-            ("parent.R", "source(\"child.R\")\nlmer(undefined_var)\n"),
-            ("child.R", "library(arm)\n# raven: nse: lmer\n"),
+            ("parent.R", "source(\"child.R\")\nnrow(undefined_var)\n"),
+            ("child.R", "# raven: nse: nrow\n"),
         ],
         "parent.R",
     );
@@ -862,22 +894,22 @@ fn nse_directive_propagates_from_sourced_child_to_parent() {
 }
 ```
 
-- [ ] **Step 2: B3 — transitive (≥2 edges), both directions.** Chain `a.R` sources `b.R` sources `c.R`. Test 1: directive in `a.R`, call in `c.R` (query `c.R`). Test 2 (mirror): directive in `c.R`, call in `a.R` (query `a.R`). Assert no `undefined_var` message in each.
+- [ ] **Step 2: B3 — transitive (≥2 edges), both directions.** Chain `a.R` sources `b.R` sources `c.R`. Test 1: `# raven: nse: nrow` in `a.R`, `nrow(undefined_var)` in `c.R` (query `c.R`). Test 2 (mirror): directive in `c.R`, call in `a.R` (query `a.R`). Assert no `undefined_var` message in each.
 
-- [ ] **Step 3: B4 — shared sourced helper.** `a.R` and `b.R` each `source("h.R")`; `# raven: nse: lmer` in `h.R`; `lmer(undefined_var)` in both `a.R` and `b.R`. Two queries (`a.R`, `b.R`); assert suppressed in both.
+- [ ] **Step 3: B4 — shared sourced helper.** `a.R` and `b.R` each `source("h.R")`; `# raven: nse: nrow` in `h.R`; `nrow(undefined_var)` in both `a.R` and `b.R`. Two queries (`a.R`, `b.R`); assert suppressed in both.
 
-- [ ] **Step 4: B4b — sibling via shared parent.** `main.R` = `source("setup.R")\nsource("analysis.R")\n`; `setup.R` = `library(arm)\n# raven: nse: lmer\n`; `analysis.R` = `lmer(undefined_var)\n`. Query `analysis.R`; assert suppressed (setup ∈ descendants(main), main ∈ ancestors(analysis), so setup ∈ S(analysis)).
+- [ ] **Step 4: B4b — sibling via shared parent.** `main.R` = `source("setup.R")\nsource("analysis.R")\n`; `setup.R` = `# raven: nse: nrow\n`; `analysis.R` = `nrow(undefined_var)\n`. Query `analysis.R`; assert suppressed (setup ∈ descendants(main), main ∈ ancestors(analysis), so setup ∈ S(analysis)).
 
-- [ ] **Step 5: B5 — negative (unconnected).** `a.R` = `# raven: nse: lmer\n`; `b.R` = `lmer(undefined_var)\n`; no `source()` between them. Query `b.R`; assert the diagnostic IS reported: `assert!(msgs.iter().any(|m| m.contains("undefined_var")))`.
+- [ ] **Step 5: B5 — negative (unconnected).** `a.R` = `# raven: nse: nrow\n`; `b.R` = `nrow(undefined_var)\n`; no `source()` between them. Query `b.R`; assert the diagnostic IS reported: `assert!(msgs.iter().any(|m| m.contains("undefined_var")))`. (Uses `nrow` so the baseline reports — with an unresolved callee this would suppress for free and the assertion could never hold.)
 
 - [ ] **Step 6: B6 — per-formal cross-file.** `helper.R` = `# raven: func myverb(data, expr)\n`; `main.R` = `source("helper.R")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n`. Query `main.R`; assert `Undefined variable: real_df` IS present and `Undefined variable: undefined_expr` is NOT.
 
 - [ ] **Step 7: B7b — cross-file ordering.** Variant of B6 with the `# raven: func` in a connected file and the `library()` placed after the `# raven: nse` line; assert suppression unchanged. (B7a within-file ordering is already covered by #455 tests; add one explicit within-file regression only if `rg -n "before or after" crates/raven/src/handlers.rs` shows none exists.)
 
 - [ ] **Step 8: B8 — revalidation.** This needs the mutate-then-rediagnose pattern (see `handlers.rs:~52466-52505`), so write it as a `#[test]` building `WorldState` directly rather than via `diag_messages_for`:
-  1. Insert `parent.R` = `source("child.R")\nlmer(undefined_var)\n` and `child.R` = `library(arm)\n` (no directive); `update_file` both.
-  2. `diagnostics(&state, &parent, &DiagCancelToken::never())` → assert `Undefined variable: undefined_var` IS present.
-  3. Edit child: `state.documents.insert(child.clone(), Document::new("library(arm)\n# raven: nse: lmer\n", None))` then `state.cross_file_graph.update_file(&child, &extract_metadata(new_child), Some(&ws), |_| None)`.
+  1. Insert `parent.R` = `source("child.R")\nnrow(undefined_var)\n` and `child.R` = `# raven: nse: other\n` (a directive that does NOT govern `nrow`); `update_file` both.
+  2. `diagnostics(&state, &parent, &DiagCancelToken::never())` → assert `Undefined variable: undefined_var` IS present (nrow is a builtin → checked; the unrelated directive does not suppress it).
+  3. Edit child: `let new_child = "# raven: nse: nrow\n"; state.documents.insert(child.clone(), Document::new(new_child, None));` then `state.cross_file_graph.update_file(&child, &crate::cross_file::extract_metadata(new_child), Some(&ws), |_| None);`.
   4. `diagnostics(&state, &parent, ...)` again → assert the diagnostic is now SUPPRESSED. (`diagnostics` rebuilds the snapshot, re-collecting foreign NSE — this proves end-to-end suppression-after-edit. Task 1's hash test separately proves dependents are *triggered* in the production incremental path.)
 
 - [ ] **Step 9: Run all matrix tests.**
