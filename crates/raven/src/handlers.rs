@@ -5775,11 +5775,25 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
                 }
             }
         }
+        // Within a file, keep only the LATEST (highest-line) formals-bearing
+        // declaration per full callee name (`pkg::name` is distinct from bare
+        // `name`), mirroring the own-file latest-wins rule — so an obsolete
+        // earlier `# raven: func` line does not make `unanimous_declared_formals`
+        // see a same-file old/new pair as a cross-file conflict. Cross-file
+        // conflicts between the per-file winners are still resolved there.
+        let mut latest: BTreeMap<&str, &crate::cross_file::types::DeclaredSymbol> = BTreeMap::new();
         for d in &meta.declared_functions {
-            if d.formals.is_some() {
-                funcs.push(d.clone());
+            if d.formals.is_none() {
+                continue;
+            }
+            match latest.get(d.name.as_str()) {
+                Some(prev) if prev.line >= d.line => {}
+                _ => {
+                    latest.insert(d.name.as_str(), d);
+                }
             }
         }
+        funcs.extend(latest.into_values().cloned());
     }
     CrossFileNse {
         nse: nse_chosen.into_values().map(|(_, d)| d).collect(),
@@ -14966,15 +14980,23 @@ pub(crate) fn nse_quick_fix_edit(
     // keys on the source callee text. Build the body once so the inserted text
     // and the action title can't spell the directive differently.
     let dir = callee_directive_form(&callee);
+    // Placeholder formal name for the unknown-formal (positional) case. It MUST be
+    // a syntactic R name (issue #460 Codex review): a literal `<formal>` is not a
+    // valid formal, so `split_formal_list` drops it and the directive parses as a
+    // blanket `WholeCall` — applying the fix verbatim would then suppress EVERY
+    // argument of the callee. `CAPTURED_FORMAL` instead parses as a per-formal
+    // directive that matches no real argument, so an unedited fix is a harmless
+    // no-op (the undefined arg keeps reporting) until the user fills in the name.
+    const FORMAL_PLACEHOLDER: &str = "CAPTURED_FORMAL";
     let payload = match &formal {
         Some(f) => format!("{dir}({f})"),
-        None => format!("{dir}(<formal>)"),
+        None => format!("{dir}({FORMAL_PLACEHOLDER})"),
     };
     let mut title = format!("Declare NSE: # raven: nse {payload}");
     if formal.is_none() {
-        title.push_str(
-            " (replace <formal> with the captured parameter; pair with `# raven: func` for positional matching)",
-        );
+        title.push_str(&format!(
+            " (replace {FORMAL_PLACEHOLDER} with the captured parameter; pair with `# raven: func` for positional matching)",
+        ));
     }
     Some(NseQuickFix {
         insert_line,
@@ -58235,6 +58257,34 @@ my_func <- function(a = default_value) {
         );
     }
 
+    // Issue #460 (Codex review): when a connected file has MORE THAN ONE
+    // `# raven: func` for the same callee, the LATEST (highest-line) declaration
+    // wins — an obsolete earlier line must not make the propagated order ambiguous.
+    #[test]
+    fn foreign_func_latest_declaration_wins_within_file() {
+        let msgs = cross_file_diag_messages(
+            &[
+                (
+                    "helper.R",
+                    "# raven: func myverb(wrong1, wrong2)\n# raven: func myverb(data, expr)\n",
+                ),
+                (
+                    "main.R",
+                    "source(\"helper.R\")\n# raven: nse: myverb(expr)\nmyverb(real_df, undefined_expr)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound positional stays reported under the latest order; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "expr-bound positional must be suppressed via the LATEST func order; got {msgs:?}"
+        );
+    }
+
     // Issue #460 (review round 2): when connected files declare conflicting NSE
     // SCOPES for one callee (whole-call vs per-formal), the narrower per-formal
     // must win — even from a larger-URI file — so a broad propagated whole-call
@@ -59593,7 +59643,7 @@ my_func <- function(a = default_value) {
         let node = first_ident(tree.root_node(), src, "x");
         let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
         assert_eq!(fix.insert_line, 1);
-        assert_eq!(fix.text, "  # raven: nse my_filter(<formal>)\n");
+        assert_eq!(fix.text, "  # raven: nse my_filter(CAPTURED_FORMAL)\n");
         assert!(fix.title.contains("# raven: nse"));
     }
 
@@ -59656,7 +59706,31 @@ my_func <- function(a = default_value) {
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "masked");
         let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
-        assert_eq!(fix.text, "# raven: nse mypkg::my_verb(<formal>)\n");
+        assert_eq!(fix.text, "# raven: nse mypkg::my_verb(CAPTURED_FORMAL)\n");
+    }
+
+    /// Issue #460 (Codex review): applying the unknown-formal quick-fix verbatim
+    /// must NOT suppress every argument. The `CAPTURED_FORMAL` placeholder parses
+    /// as a per-formal directive matching no real argument (a no-op), so the
+    /// genuinely-undefined positional argument keeps reporting until the user
+    /// fills in the real formal — unlike a `<formal>` placeholder, which parses to
+    /// a blanket whole-call directive.
+    #[test]
+    fn nse_quick_fix_placeholder_is_a_no_op_when_applied_verbatim() {
+        let src = "f <- function(a) a\nf(undef)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undef");
+        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        // The inserted directive must parse as a per-formal directive matching the
+        // (nonexistent) placeholder formal — NOT a blanket whole-call directive
+        // that would suppress every argument if the user applied the fix verbatim.
+        let meta = crate::cross_file::extract_metadata(fix.text.trim_start());
+        assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            crate::cross_file::types::NseScope::Formals(vec!["CAPTURED_FORMAL".to_string()]),
+            "placeholder must parse as a (no-op) per-formal directive, not whole-call"
+        );
     }
 
     #[test]
