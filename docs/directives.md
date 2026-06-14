@@ -276,10 +276,12 @@ Propagation reuses the same dependency graph as cross-file scope analysis, so it
 honors the `# raven: cd` and workspace-root path-resolution rules and the
 `max_chain_depth` limit, and editing a directive in any connected file
 revalidates the dependents that rely on it. A propagated **per-formal** directive
-needs the callee's formal order from a `# raven: func` declaration (or a local
-definition in the *calling* file); a real `function(...)` definition that lives
-only in a *different* file does not supply cross-file positional order, so such a
-case falls back to named-argument-only matching.
+needs the callee's formal order from a `# raven: func` declaration in some
+connected file; without one it falls back to named-argument-only matching. A
+local `name <- function(...)` definition does **not** supply that order — a local
+binding *shadows* the propagated directive entirely (R would call the local
+value, so the local definition's own inferred policy applies instead), exactly as
+a local binding overrides a qualified `# raven: nse pkg::name`.
 
 ### Position-Aware Behavior
 
