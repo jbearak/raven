@@ -267,7 +267,7 @@ fn is_well_formed_callee_name(name: &str) -> bool {
 /// rule the completion path uses to decide member-insert quoting, NOT the
 /// laxer [`is_formal_name`] (which accepts `...` and leading-dot digits because
 /// it only filters bogus tokens out of a mis-segmented default list).
-fn callee_name_for_match(name: &str) -> String {
+pub(crate) fn callee_name_for_match(name: &str) -> String {
     if crate::r_names::is_syntactic_r_name(name) {
         name.to_string()
     } else {
