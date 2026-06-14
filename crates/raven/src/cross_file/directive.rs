@@ -329,6 +329,21 @@ pub(crate) const DIRECTIVE_PREFIX: &str = r"(?:@lsp-|raven:\s*)";
 const CALLEE_NAME_CAPTURE: &str =
     r#"(?:"([^"]+)"|'([^']+)'|([\p{Alphabetic}\p{N}._]+(?:::[\p{Alphabetic}\p{N}._]+)?))"#;
 
+/// Shared OPTIONAL formal-list capture for the `# raven: func` and `# raven: nse`
+/// directives — the parenthesized `(formals…)` that may follow the callee name
+/// (capture group 4 holds the body). Held as one constant so both directives
+/// accept the same shape.
+///
+/// The body allows ONE level of nested parentheses (`(?:[^()]|\([^()]*\))*`) so a
+/// default that itself contains a `)` — most commonly a comma-bearing default
+/// like `x = c(1, 2)` — does not truncate the list at the inner paren and
+/// silently drop the formals after it (issue #460 review). `split_formal_list`
+/// then still reduces each entry to its formal name and drops the now-balanced
+/// default fragment. Deeper nesting (`x = c(f(1), 2)`) remains out of scope: the
+/// optional group simply fails to match, so the directive records no formals
+/// (named-only) rather than a truncated prefix.
+const FORMAL_LIST_CAPTURE: &str = r"(?:\s*\(((?:[^()]|\([^()]*\))*)\))?";
+
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -444,7 +459,7 @@ fn patterns() -> &'static DirectivePatterns {
                     DIRECTIVE_PREFIX,
                     r"(?:declare-function|declare-func|function|func)\s*:?\s*",
                     CALLEE_NAME_CAPTURE,
-                    r"(?:\s*\(([^)]*)\))?",
+                    FORMAL_LIST_CAPTURE,
                 ]
                 .concat(),
             ).unwrap(),
@@ -473,7 +488,8 @@ fn patterns() -> &'static DirectivePatterns {
                     DIRECTIVE_PREFIX,
                     r"nse(?:\s+|\s*:\s*)",
                     CALLEE_NAME_CAPTURE,
-                    r"\s*(?:\(([^)]*)\))?\s*(?:#.*)?$",
+                    FORMAL_LIST_CAPTURE,
+                    r"\s*(?:#.*)?$",
                 ]
                 .concat(),
             ).unwrap(),
@@ -2553,6 +2569,30 @@ x <- undefined"#;
         assert_eq!(
             meta.nse_declarations[0].scope,
             NseScope::Formals(vec!["x".to_string()])
+        );
+    }
+
+    #[test]
+    fn func_formals_with_comma_bearing_default_are_not_truncated() {
+        // A default containing a `)` (e.g. `c(1, 2)`) must not truncate the formal
+        // list at the inner paren and drop the formals after it (issue #460
+        // review); both `data` and `expr` must be captured.
+        let meta = parse_directives("# raven: func f(data = c(1, 2), expr)\n");
+        assert_eq!(meta.declared_functions.len(), 1, "{meta:?}");
+        assert_eq!(
+            meta.declared_functions[0].formals,
+            Some(vec!["data".to_string(), "expr".to_string()])
+        );
+    }
+
+    #[test]
+    fn nse_formals_with_comma_bearing_default_parse() {
+        use crate::cross_file::types::NseScope;
+        let meta = parse_directives("# raven: nse f(data = c(1, 2), expr)\n");
+        assert_eq!(meta.nse_declarations.len(), 1, "{meta:?}");
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["data".to_string(), "expr".to_string()])
         );
     }
 
