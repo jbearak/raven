@@ -228,6 +228,24 @@ pub struct CrossFileMetadata {
     pub nse_declarations: Vec<NseDeclaration>,
 }
 
+impl CrossFileMetadata {
+    /// True if this file carries any cross-file NSE/func directive material —
+    /// a non-empty `nse_declarations` OR a non-empty `declared_functions`.
+    ///
+    /// This is the per-file half of the short-circuit guarding
+    /// `collect_cross_file_nse` (in `crate::handlers`): that collector reads ONLY
+    /// these two fields (it walks the revalidation-consistent set and, for each
+    /// member, consults `member.nse_declarations` and `member.declared_functions`).
+    /// So if no metadata entry the collector could read returns `true` here, the
+    /// collected result is necessarily `{ nse: [], funcs: [] }` — which is why
+    /// `DiagnosticsSnapshot::build` ORs this predicate across the neighborhood
+    /// `metadata_map` (the exact set the collector reads) into the
+    /// `any_nse_or_func_directives` signal that drives the skip.
+    pub fn has_nse_or_func_directives(&self) -> bool {
+        !self.nse_declarations.is_empty() || !self.declared_functions.is_empty()
+    }
+}
+
 /// A backward directive declaring this file is sourced by another
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackwardDirective {

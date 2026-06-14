@@ -116,6 +116,26 @@ pub(crate) struct DiagnosticsSnapshot {
     pub package_library_ready: bool,
     pub workspace_scan_complete: bool,
 
+    /// Short-circuit signal for cross-file NSE/func collection: `true` iff some
+    /// metadata entry this query could read — this file's own `directive_meta`
+    /// OR any neighbor in `metadata_map` — carries a `# raven: nse` /
+    /// `# raven: func` directive. Computed during the (already O(neighborhood))
+    /// `metadata_map` assembly in [`DiagnosticsSnapshot::build`], so it adds no
+    /// new asymptotic cost.
+    ///
+    /// When `false`, [`collect_cross_file_nse`] returns empty WITHOUT the two
+    /// graph traversals, neighborhood sort/dedup, and per-member metadata scans.
+    /// Soundness: that collector reads ONLY members of the revalidation-
+    /// consistent set `S(uri)`, every one of which is a neighbor present in
+    /// `metadata_map` (the set is computed over the trimmed neighborhood
+    /// subgraph). So if no entry in `metadata_map` is directive-bearing, the
+    /// collected result is necessarily `{ nse: [], funcs: [] }` — this signal is
+    /// read from the exact same data, via the exact same content provider, that
+    /// the collector would consult. (The OR with `directive_meta` is for Q's own
+    /// entry, which the masked Rmd path may enrich after the map is built; it is
+    /// belt-and-suspenders and never wrongly skips.)
+    pub any_nse_or_func_directives: bool,
+
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
     pub metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
@@ -233,11 +253,24 @@ impl DiagnosticsSnapshot {
         let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
         let mut metadata_map = HashMap::new();
+        // Short-circuit signal for `collect_cross_file_nse`: does ANY metadata
+        // entry the collector could read carry a `# raven: nse` / `# raven: func`
+        // directive? `collect_cross_file_nse` reads only members of the
+        // revalidation-consistent set, every one of which is in this
+        // `metadata_map` (the set is computed over the trimmed neighborhood
+        // subgraph, so all members are neighbors). So scanning these entries —
+        // the exact data the collector consults, via the same content provider —
+        // is a sound and tight signal: when none is directive-bearing, the
+        // collected result is provably `{ nse: [], funcs: [] }` for this query.
+        // Computed in this already-O(neighborhood) loop, so it adds no new
+        // asymptotic cost (just a `bool` OR per entry already being inserted).
+        let mut any_nse_or_func_directives = directive_meta.has_nse_or_func_directives();
         for neighbor_uri in &payload.neighborhood {
             if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
                 artifacts_map.insert(neighbor_uri.clone(), artifacts);
             }
             if let Some(metadata) = content_provider.get_metadata(neighbor_uri) {
+                any_nse_or_func_directives |= metadata.has_nse_or_func_directives();
                 metadata_map.insert(neighbor_uri.clone(), metadata);
             }
         }
@@ -346,6 +379,7 @@ impl DiagnosticsSnapshot {
             base_exports,
             package_library_ready: state.package_library_ready,
             workspace_scan_complete: state.workspace_scan_complete,
+            any_nse_or_func_directives,
             artifacts_map,
             metadata_map,
             cycle_detection,
@@ -5890,9 +5924,21 @@ fn collect_undefined_variables_from_snapshot(
     // argument checking is on: with it off, `NseAnalysis::build` returns before
     // it ever translates directives, so the declarations (and the two graph
     // traversals + metadata clones that gather them) would be pure waste.
+    //
+    // Inner guard (`any_nse_or_func_directives`): even with call-argument
+    // checking ON, when NO metadata entry this query could read carries a
+    // `# raven: nse` / `# raven: func` directive (the overwhelmingly common
+    // case), `collect_cross_file_nse` is provably empty — it reads only
+    // `nse_declarations` / `declared_functions` off consistent-set members, all
+    // of which are neighbors in `metadata_map`, the exact set this signal scans.
+    // So skip the two graph traversals, the neighborhood sort/dedup, and the
+    // per-member scans entirely and return empty directly. This is exactly
+    // behavior-preserving: the gated-out branch and the full computation both
+    // yield `{ nse: [], funcs: [] }` here.
     let cross_file_nse = if snapshot
         .cross_file_config
         .undefined_variable_in_call_arguments
+        && snapshot.any_nse_or_func_directives
     {
         collect_cross_file_nse(snapshot, uri)
     } else {
@@ -58026,6 +58072,145 @@ my_func <- function(a = default_value) {
             .into_iter()
             .map(|d| d.message)
             .collect()
+    }
+
+    // Same workspace setup as `cross_file_diag_messages`, but returns the
+    // `(WorldState, workspace_root)` so a test can build a `DiagnosticsSnapshot`
+    // and inspect the `any_nse_or_func_directives` short-circuit signal directly.
+    fn cross_file_state(files: &[(&str, &str)]) -> (WorldState, Url) {
+        let ws = Url::parse("file:///w/").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        state.workspace_scan_complete = true;
+        for (name, code) in files {
+            let uri = ws.join(name).unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            let meta = crate::cross_file::extract_metadata(code);
+            state
+                .cross_file_graph
+                .update_file(&uri, &meta, Some(&ws), |_| None);
+        }
+        (state, ws)
+    }
+
+    // The short-circuit signal is OFF when no file in the (neighborhood) metadata
+    // carries an nse/func directive, and the NSE collection is provably empty.
+    #[test]
+    fn nse_short_circuit_signal_false_without_directives() {
+        let (state, ws) = cross_file_state(&[
+            ("main.R", "source(\"helper.R\")\nnrow(undefined_var)\n"),
+            ("helper.R", "x <- 1\n"),
+        ]);
+        let q = ws.join("main.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(
+            !snapshot.any_nse_or_func_directives,
+            "no nse/func directive anywhere ⟹ signal must be false"
+        );
+        // The skip path is exactly what the guard takes: with the signal false,
+        // the full computation is provably empty. Assert it directly so the skip
+        // is behavior-preserving (skipped branch == computed branch here).
+        let collected = super::collect_cross_file_nse(&snapshot, &q);
+        assert!(
+            collected.nse.is_empty() && collected.funcs.is_empty(),
+            "with no directive anywhere, collect_cross_file_nse is empty; got \
+             {} nse / {} funcs",
+            collected.nse.len(),
+            collected.funcs.len(),
+        );
+    }
+
+    // Adding an `# raven: nse` directive in a CONNECTED file flips the signal ON.
+    #[test]
+    fn nse_short_circuit_signal_true_with_nse_directive() {
+        let (state, ws) = cross_file_state(&[
+            ("main.R", "source(\"helper.R\")\nnrow(undefined_var)\n"),
+            ("helper.R", "# raven: nse: nrow\n"),
+        ]);
+        let q = ws.join("main.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(
+            snapshot.any_nse_or_func_directives,
+            "an nse directive in a connected file ⟹ signal must be true"
+        );
+    }
+
+    // A `# raven: func` directive (no nse) also flips the signal ON, since
+    // `collect_cross_file_nse` consumes `declared_functions` too.
+    #[test]
+    fn nse_short_circuit_signal_true_with_func_directive() {
+        let (state, ws) = cross_file_state(&[
+            (
+                "main.R",
+                "source(\"helper.R\")\nmyverb(real_df, undefined_expr)\n",
+            ),
+            ("helper.R", "# raven: func myverb(data, expr)\n"),
+        ]);
+        let q = ws.join("main.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(
+            snapshot.any_nse_or_func_directives,
+            "a func directive in a connected file ⟹ signal must be true"
+        );
+    }
+
+    // Toggle: present → edited away ⟹ the signal goes back to false. This proves
+    // the signal is not stale/monotonic — it tracks the current directive set.
+    #[test]
+    fn nse_short_circuit_signal_false_again_after_directive_removed() {
+        // With the directive present, the signal is true.
+        let (state_with, ws) = cross_file_state(&[
+            ("main.R", "source(\"helper.R\")\nnrow(undefined_var)\n"),
+            ("helper.R", "# raven: nse: nrow\n"),
+        ]);
+        let q = ws.join("main.R").unwrap();
+        let snap_with = DiagnosticsSnapshot::build(&state_with, &q).expect("snapshot built");
+        assert!(
+            snap_with.any_nse_or_func_directives,
+            "directive present ⟹ true"
+        );
+
+        // Re-build the workspace with the directive edited away: signal false.
+        let (state_without, ws2) = cross_file_state(&[
+            ("main.R", "source(\"helper.R\")\nnrow(undefined_var)\n"),
+            ("helper.R", "x <- 1\n"),
+        ]);
+        let q2 = ws2.join("main.R").unwrap();
+        let snap_without = DiagnosticsSnapshot::build(&state_without, &q2).expect("snapshot built");
+        assert!(
+            !snap_without.any_nse_or_func_directives,
+            "directive removed ⟹ signal back to false"
+        );
+    }
+
+    // An nse directive in an UNCONNECTED file (not in the query's neighborhood)
+    // leaves this query's signal false — and the result is still correct, because
+    // an unconnected file is never read by `collect_cross_file_nse` anyway. The
+    // unconnected file's OWN query, however, sees the directive (signal true). The
+    // companion `nse_directive_does_not_propagate_to_unconnected_file` test
+    // confirms the diagnostic behavior is unchanged across this boundary.
+    #[test]
+    fn nse_short_circuit_signal_scoped_to_neighborhood() {
+        let (state, ws) = cross_file_state(&[
+            ("a.R", "# raven: nse: nrow\n"),
+            ("b.R", "nrow(undefined_var)\n"),
+        ]);
+        // b.R does not source a.R, so a.R is outside b.R's neighborhood.
+        let qb = ws.join("b.R").unwrap();
+        let snap_b = DiagnosticsSnapshot::build(&state, &qb).expect("snapshot built");
+        assert!(
+            !snap_b.any_nse_or_func_directives,
+            "directive in an unconnected file is not in this query's neighborhood"
+        );
+        // a.R's own query sees its own directive.
+        let qa = ws.join("a.R").unwrap();
+        let snap_a = DiagnosticsSnapshot::build(&state, &qa).expect("snapshot built");
+        assert!(
+            snap_a.any_nse_or_func_directives,
+            "the file carrying the directive sees it in its own neighborhood"
+        );
     }
 
     // B1: an NSE directive in a sourced PARENT suppresses the child call.
