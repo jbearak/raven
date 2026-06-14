@@ -5724,6 +5724,8 @@ fn collect_undefined_variables_from_snapshot(
         Some(snapshot.base_exports.as_ref()),
         &snapshot.directive_meta.nse_declarations,
         &snapshot.directive_meta.declared_functions,
+        &[],
+        &[],
     );
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
@@ -12795,9 +12797,16 @@ fn namespace_parts<'t>(node: Node<'t>, text: &'t str) -> Option<(&'t str, &'t st
 /// directive line (for position gating) and the optional package qualifier
 /// (for qualified/unqualified call matching).
 struct DirectiveNsePolicy {
+    /// 0-based directive line for own (current-file) entries; ignored (set to 0)
+    /// for file-level foreign entries. See `file_level`.
     line: u32,
     package: Option<String>,
     policy: crate::nse::ArgPolicy,
+    /// True for a declaration propagated from another file in the source graph
+    /// (issue #460). A foreign entry governs the whole file and is never
+    /// position-gated by `line`; it is consulted at a lower precedence tier than
+    /// own directives, local definitions, and the built-in policy tables.
+    file_level: bool,
 }
 
 /// How a call site is qualified, for matching it against `# raven: nse`
@@ -12943,6 +12952,8 @@ impl<'a> NseAnalysis<'a> {
         base_exports: Option<&'a HashSet<String>>,
         nse_declarations: &[crate::cross_file::types::NseDeclaration],
         declared_functions: &[crate::cross_file::types::DeclaredSymbol],
+        foreign_nse_declarations: &[crate::cross_file::types::NseDeclaration],
+        foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
@@ -13110,16 +13121,21 @@ impl<'a> NseAnalysis<'a> {
         // the policies are never consulted, so the work is skipped via the
         // `!call_args_enabled` early return above.
         let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
-        for decl in nse_declarations {
+        // Translate one declaration into an `ArgPolicy`. Formal order (for
+        // positional per-formal matching) resolves OWN-first — own `# raven: func`,
+        // then a visible local `name <- function(...)` (bare names only,
+        // non-ambiguous), then a FOREIGN `# raven: func` propagated from a
+        // connected file (issue #460) — and finally named-only. Foreign order is
+        // consulted last and `foreign_funcs` is pre-collapsed to one entry per
+        // name (see `collect_cross_file_nse`), so `declared_function_formals`'
+        // `max_by_key(line)` never compares lines across files. Shared by the
+        // own- and foreign-declaration loops below so both honor identical
+        // shaping (the `...`-boundary handling for captured-but-unordered names).
+        let to_policy = |decl: &crate::cross_file::types::NseDeclaration| -> crate::nse::ArgPolicy {
             use crate::cross_file::types::NseScope;
-            let policy = match &decl.scope {
+            match &decl.scope {
                 NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
                 NseScope::Formals(listed) => {
-                    // A literal `...` in the list (`# raven: nse f(...)`) declares
-                    // that arguments absorbed by `...` are captured, rather than
-                    // naming a formal called "...". Split it out so it sets
-                    // `captured_dots` instead of being matched as a formal name
-                    // (which never suppresses anything).
                     let captured_dots = listed.iter().any(|c| c == "...");
                     let captured: Vec<String> = listed
                         .iter()
@@ -13132,23 +13148,14 @@ impl<'a> NseAnalysis<'a> {
                         decl.package.as_deref(),
                     )
                     .or_else(|| {
-                        // Only a *bare* `# raven: nse name` may borrow a visible
-                        // local `name <- function(...)`'s signature. A qualified
-                        // `# raven: nse pkg::name` must NOT: `local_function_defs`
-                        // is keyed by bare name, so an unrelated local `name`
-                        // that merely shares the suffix would supply the wrong
-                        // formal order and invert which positionals are
-                        // suppressed. With no matching `# raven: func`, a
-                        // qualified declaration falls through to the named-only
-                        // `None` arm below.
+                        // Only a *bare* `# raven: nse name` may borrow a
+                        // visible local `name <- function(...)` signature.
+                        // A qualified `pkg::name` must not (local defs are
+                        // keyed by bare name). A name redefined under
+                        // conflicting orders is ambiguous → fall through.
                         if decl.package.is_some() {
                             return None;
                         }
-                        // A name redefined under conflicting formal orders has no
-                        // single authoritative order to borrow (last-binding-wins
-                        // would lend a later redefinition's permuted order to an
-                        // earlier call and hide a real undefined variable). Fall
-                        // through to the safe named-only `None` arm.
                         if formal_order.is_ambiguous(&decl.name) {
                             return None;
                         }
@@ -13156,17 +13163,22 @@ impl<'a> NseAnalysis<'a> {
                             .get(&decl.name)
                             .map(|def| function_formal_names(*def, text))
                             .filter(|f| !f.is_empty())
+                    })
+                    // Issue #460: a foreign `# raven: func` from a connected
+                    // file supplies order when no own context does.
+                    .or_else(|| {
+                        declared_function_formals(
+                            foreign_funcs,
+                            &decl.name,
+                            decl.package.as_deref(),
+                        )
                     });
                     match order {
                         Some(mut formals) => {
-                            // Captured names absent from the resolved formal
-                            // order (an incomplete `# raven: func` list, or a
-                            // name only ever passed by keyword) may be matched by
-                            // NAME but must never bind a positional slot —
-                            // otherwise a positional argument beyond the real
-                            // arity would bind the synthetic formal and be
-                            // wrongly suppressed. Place them after a `...`
-                            // boundary so the positional pass stops before them.
+                            // Captured names absent from the resolved order may be
+                            // matched by NAME but must never bind a positional slot;
+                            // place them after a `...` boundary so the positional
+                            // pass stops before them.
                             let missing: Vec<String> = captured
                                 .iter()
                                 .filter(|c| !formals.contains(*c))
@@ -13195,29 +13207,50 @@ impl<'a> NseAnalysis<'a> {
                         }
                     }
                 }
-            };
+            }
+        };
+        // Own (current-file) declarations: position-gated, latest-wins.
+        for decl in nse_declarations {
             directive_nse
                 .entry(decl.name.clone())
                 .or_default()
                 .push(DirectiveNsePolicy {
                     line: decl.line,
                     package: decl.package.clone(),
-                    policy,
+                    policy: to_policy(decl),
+                    file_level: false,
                 });
         }
+        // Foreign declarations propagated from connected files (issue #460):
+        // file-level (no line gate), one per (name, package) after the collector's
+        // collapse. `line` is set to 0 (unused for file-level entries).
+        for decl in foreign_nse_declarations {
+            directive_nse
+                .entry(decl.name.clone())
+                .or_default()
+                .push(DirectiveNsePolicy {
+                    line: 0,
+                    package: decl.package.clone(),
+                    policy: to_policy(decl),
+                    file_level: true,
+                });
+        }
+        // Sort own entries by line (latest-wins via reverse scan); file-level
+        // foreign entries sort after own ones so the own-first lookup tier finds
+        // a position-applicable own directive before any foreign fallback.
         for entries in directive_nse.values_mut() {
-            entries.sort_by_key(|e| e.line);
+            entries.sort_by_key(|e| (e.file_level, e.line));
         }
         analysis.directive_nse = directive_nse;
 
         analysis
     }
 
-    /// The most recent `# raven: nse` policy applicable to a call to `name`
-    /// (optionally qualified `qualifier::name`) at `call_line`, per the
-    /// resolution model. Position-gated to declarations strictly before
-    /// `call_line`.
-    fn directive_nse_policy(
+    /// The most recent OWN (current-file) `# raven: nse` policy applicable to a
+    /// call to `name` (optionally qualified) at `call_line`. Position-gated to
+    /// own declarations strictly before `call_line`; file-level foreign entries
+    /// are skipped here and handled by [`Self::foreign_directive_nse_policy`].
+    fn own_directive_nse_policy(
         &self,
         name: &str,
         qualifier: CallQualifier,
@@ -13228,7 +13261,8 @@ impl<'a> NseAnalysis<'a> {
             .iter()
             .rev()
             .find(|e| {
-                e.line < call_line
+                !e.file_level
+                    && e.line < call_line
                     && match (&e.package, &qualifier) {
                         // An unqualified directive matches only the BareExact
                         // pass (the authoritative override); never a qualified
@@ -13238,6 +13272,35 @@ impl<'a> NseAnalysis<'a> {
                         // A qualified directive matches a same-package qualified
                         // call, or a bare call whose package is in play — but
                         // the latter only on the BareInPlayQualified pass.
+                        (Some(p), CallQualifier::Qualified(q)) => p == q,
+                        (Some(p), CallQualifier::BareInPlayQualified) => {
+                            self.in_play_packages.iter().any(|ip| ip == p)
+                        }
+                        (Some(_), CallQualifier::BareExact) => false,
+                    }
+            })
+            .map(|e| e.policy.clone())
+    }
+
+    /// A FOREIGN (propagated from a connected file) `# raven: nse` policy
+    /// applicable to a call to `name` (issue #460). File-level: not gated by any
+    /// line. The collector emits at most one foreign entry per `(name, package)`,
+    /// so the first match in deterministic order is the resolution. Consulted at
+    /// a lower precedence tier than own directives, local definitions, and the
+    /// built-in policy tables (see [`resolve_call_arg_policy`]).
+    fn foreign_directive_nse_policy(
+        &self,
+        name: &str,
+        qualifier: CallQualifier,
+    ) -> Option<crate::nse::ArgPolicy> {
+        let entries = self.directive_nse.get(name)?;
+        entries
+            .iter()
+            .find(|e| {
+                e.file_level
+                    && match (&e.package, &qualifier) {
+                        (None, CallQualifier::BareExact) => true,
+                        (None, _) => false,
                         (Some(p), CallQualifier::Qualified(q)) => p == q,
                         (Some(p), CallQualifier::BareInPlayQualified) => {
                             self.in_play_packages.iter().any(|ip| ip == p)
@@ -14736,16 +14799,28 @@ fn resolve_call_arg_policy(
     // Namespace-qualified `pkg::name` resolves purely from syntax.
     if func.kind() == "namespace_operator" {
         let call_line = call_node.start_position().row as u32;
-        if let Some((pkg, n)) = namespace_parts(func, text)
-            && let Some(p) = analysis.directive_nse_policy(
-                crate::r_names::canonical_use_name(n),
-                CallQualifier::Qualified(pkg),
-                call_line,
-            )
-        {
-            return p;
+        if let Some((pkg, n)) = namespace_parts(func, text) {
+            let n = crate::r_names::canonical_use_name(n);
+            // Own qualified directive is the authoritative override.
+            if let Some(p) =
+                analysis.own_directive_nse_policy(n, CallQualifier::Qualified(pkg), call_line)
+            {
+                return p;
+            }
+            // Precise built-in policy table next.
+            if let Some(p) = table_verb_policy(func, text, analysis) {
+                return p;
+            }
+            // Issue #460: a foreign qualified directive (file-level) is consulted
+            // below the table so it cannot clobber a precise built-in policy.
+            if let Some(p) = analysis.foreign_directive_nse_policy(n, CallQualifier::Qualified(pkg))
+            {
+                return p;
+            }
+            // A qualified call with no NSE policy is a resolved standard-eval call.
+            return ArgPolicy::Standard;
         }
-        // A qualified call with no NSE policy is a resolved standard-eval call.
+        // Malformed `pkg::name`: fall back as before.
         return table_verb_policy(func, text, analysis).unwrap_or(ArgPolicy::Standard);
     }
 
@@ -14767,7 +14842,9 @@ fn resolve_call_arg_policy(
     //    it names the binding itself, so it beats even a local definition.
     //    Position-gated to calls after the directive line.
     let call_line = call_node.start_position().row as u32;
-    if let Some(policy) = analysis.directive_nse_policy(name, CallQualifier::BareExact, call_line) {
+    if let Some(policy) =
+        analysis.own_directive_nse_policy(name, CallQualifier::BareExact, call_line)
+    {
         return policy;
     }
 
@@ -14800,13 +14877,26 @@ fn resolve_call_arg_policy(
     //     local value, not `pkg::name`, when one exists. It still overrides the
     //     built-in policy tables below, so it is consulted before them.
     if let Some(policy) =
-        analysis.directive_nse_policy(name, CallQualifier::BareInPlayQualified, call_line)
+        analysis.own_directive_nse_policy(name, CallQualifier::BareInPlayQualified, call_line)
     {
         return policy;
     }
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
     // owner resolution).
     if let Some(policy) = table_verb_policy(func, text, analysis) {
+        return policy;
+    }
+    // 3.6 (issue #460). A file-level `# raven: nse` directive propagated from a
+    // connected file governs this callee — consulted BELOW own directives, local
+    // definitions/aliases, and the precise built-in tables, but ABOVE the step-4
+    // resolvable-standard-eval classification so a user can suppress a
+    // loaded-package export (e.g. `lmer`) they declared NSE in another file.
+    if let Some(policy) = analysis.foreign_directive_nse_policy(name, CallQualifier::BareExact) {
+        return policy;
+    }
+    if let Some(policy) =
+        analysis.foreign_directive_nse_policy(name, CallQualifier::BareInPlayQualified)
+    {
         return policy;
     }
     // 4. Resolvable standard-eval: builtin, base export, or a confirmed in-play
@@ -15348,6 +15438,8 @@ fn collect_usages_with_context<'a>(
         None,
         None,
         None,
+        &[],
+        &[],
         &[],
         &[],
     );
@@ -21452,8 +21544,20 @@ mod tests {
         used: &mut Vec<(String, Node<'a>)>,
     ) {
         let in_play: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
-        let analysis =
-            NseAnalysis::build(root, text, true, true, in_play, None, None, None, &[], &[]);
+        let analysis = NseAnalysis::build(
+            root,
+            text,
+            true,
+            true,
+            in_play,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
 
@@ -21474,6 +21578,8 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            &[],
             &[],
             &[],
         );
@@ -21652,6 +21758,8 @@ mod tests {
             None,
             &meta.nse_declarations,
             &meta.declared_functions,
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21694,6 +21802,8 @@ mod tests {
             None,
             &meta.nse_declarations,
             &meta.declared_functions,
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21890,6 +22000,8 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -21942,6 +22054,8 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
             &[],
             &[],
         );
@@ -22271,6 +22385,8 @@ mod tests {
             None,
             None,
             Some(&base_exports),
+            &[],
+            &[],
             &[],
             &[],
         );
@@ -57339,6 +57455,174 @@ my_func <- function(a = default_value) {
             None,
         );
         diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    // Issue #460: build an NseAnalysis with explicit own/foreign declaration
+    // slices (bypassing the cross-file collector) and return the used-identifier
+    // names the collector did NOT suppress. Lets the foreign-propagation
+    // resolution be unit-tested without wiring a dependency graph.
+    fn build_used(
+        code: &str,
+        own_nse: &[crate::cross_file::types::NseDeclaration],
+        own_funcs: &[crate::cross_file::types::DeclaredSymbol],
+        foreign_nse: &[crate::cross_file::types::NseDeclaration],
+        foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
+    ) -> Vec<String> {
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            own_nse,
+            own_funcs,
+            foreign_nse,
+            foreign_funcs,
+        );
+        let mut used = Vec::new();
+        super::collect_usages_with_analysis(
+            root,
+            code,
+            &analysis,
+            &super::UsageContext::default(),
+            &mut used,
+        );
+        used.into_iter().map(|(n, _)| n).collect()
+    }
+
+    // Issue #460: a foreign whole-call directive suppresses a builtin callee's
+    // args. `nrow` is is_builtin → resolves to Standard (step 4) in the test
+    // harness, so its arg is checked by DEFAULT — making the suppression
+    // attributable to the directive, not to free tier-6 WholeCall suppression.
+    #[test]
+    fn foreign_whole_call_directive_suppresses_builtin_callee() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow(undefined_var)\n";
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        assert!(
+            build_used(code, &[], &[], &[], &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "baseline: nrow's arg must be checked without a directive"
+        );
+        assert!(
+            !build_used(code, &[], &[], &foreign, &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "a foreign whole-call NSE directive must suppress the arg"
+        );
+    }
+
+    // Issue #460: a local standard-eval definition (step 1) shadows the foreign
+    // directive (tier 3.6), so the arg stays reported.
+    #[test]
+    fn foreign_directive_does_not_override_local_definition() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow <- function(x) x + 1\nnrow(undefined_var)\n";
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        assert!(
+            build_used(code, &[], &[], &foreign, &[])
+                .iter()
+                .any(|n| n == "undefined_var"),
+            "foreign directive must not suppress a locally-defined standard-eval callee"
+        );
+    }
+
+    // Issue #460: an own per-formal directive wins over a foreign whole-call for
+    // the same callee. Own f(x) (order from the own # raven: func) suppresses only
+    // the x-bound arg; the data-bound arg stays reported — a foreign whole-call
+    // would have suppressed BOTH.
+    #[test]
+    fn own_directive_beats_foreign_for_same_callee() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "# raven: func nrow(data, x)\n# raven: nse nrow(x)\nnrow(real_df, masked_col)\n";
+        let meta = crate::cross_file::extract_metadata(code);
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        let used = build_used(
+            code,
+            &meta.nse_declarations,
+            &meta.declared_functions,
+            &foreign,
+            &[],
+        );
+        assert!(
+            used.iter().any(|n| n == "real_df"),
+            "own per-formal directive must win over foreign whole-call (data arg stays reported); got {used:?}"
+        );
+        assert!(
+            !used.iter().any(|n| n == "masked_col"),
+            "own per-formal directive suppresses the x-bound arg; got {used:?}"
+        );
+    }
+
+    // Issue #460: a foreign `# raven: func` supplies positional order to a foreign
+    // per-formal directive when there is no local def. Only the expr-bound
+    // positional is suppressed; the uncaptured `real_df` stays reported (a bare
+    // unresolved callee would WholeCall-suppress everything, so this is non-vacuous).
+    #[test]
+    fn foreign_per_formal_uses_foreign_func_order() {
+        use crate::cross_file::types::{DeclaredSymbol, NseDeclaration, NseScope};
+        let code = "myverb(real_df, undefined_expr)\n";
+        let foreign_nse = vec![NseDeclaration {
+            name: "myverb".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["expr".into()]),
+            line: 0,
+        }];
+        let foreign_funcs = vec![DeclaredSymbol {
+            name: "myverb".into(),
+            line: 0,
+            is_function: true,
+            formals: Some(vec!["data".into(), "expr".into()]),
+        }];
+        let used = build_used(code, &[], &[], &foreign_nse, &foreign_funcs);
+        assert!(
+            used.iter().any(|n| n == "real_df"),
+            "data-bound positional stays reported; got {used:?}"
+        );
+        assert!(
+            !used.iter().any(|n| n == "undefined_expr"),
+            "expr-bound positional suppressed; got {used:?}"
+        );
+    }
+
+    // Issue #460: a local standard-eval `myverb` (step 1) shadows the foreign
+    // per-formal directive (tier 3.6), so the positional stays reported.
+    #[test]
+    fn foreign_per_formal_yields_to_local_definition() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "myverb <- function(data, expr) data\nmyverb(a, undefined_expr)\n";
+        let foreign_nse = vec![NseDeclaration {
+            name: "myverb".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["expr".into()]),
+            line: 0,
+        }];
+        let used = build_used(code, &[], &[], &foreign_nse, &[]);
+        assert!(
+            used.iter().any(|n| n == "undefined_expr"),
+            "local def resolves at step 1; foreign tier 3.6 must not fire; got {used:?}"
+        );
     }
 
     // Issue #455: `# raven: nse` declarations override the inferred NSE policy
