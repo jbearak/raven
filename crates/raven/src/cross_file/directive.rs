@@ -319,8 +319,15 @@ pub(crate) const DIRECTIVE_PREFIX: &str = r"(?:@lsp-|raven:\s*)";
 /// parity, and the formal-order pairing in `declared_name_matches` relies on it.
 /// (The `var` directive deliberately uses a laxer `(\S+)` unquoted form and does
 /// NOT share this; see its regex below.)
+///
+/// The unquoted class is Unicode-aware (`\p{Alphabetic}`/`\p{N}`, mirroring the
+/// `is_alphabetic()`/`is_alphanumeric()` predicates in [`is_formal_name`] and
+/// `crate::r_names::is_syntactic_r_name`), so a valid non-ASCII R identifier such
+/// as `données` can be declared unquoted — `# raven: nse données(x)` — without an
+/// ASCII-only capture truncating it (issue #460 Codex review). Quoting still works
+/// for genuinely non-syntactic names.
 const CALLEE_NAME_CAPTURE: &str =
-    r#"(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._]+(?:::[A-Za-z0-9._]+)?))"#;
+    r#"(?:"([^"]+)"|'([^']+)'|([\p{Alphabetic}\p{N}._]+(?:::[\p{Alphabetic}\p{N}._]+)?))"#;
 
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
@@ -2514,6 +2521,26 @@ x <- undefined"#;
         // blank slot that rejects the whole list — so the valid `x` is still kept.
         let meta = parse_directives("# raven: nse my_func(x, 2)\n");
         assert_eq!(meta.nse_declarations.len(), 1);
+        assert_eq!(
+            meta.nse_declarations[0].scope,
+            NseScope::Formals(vec!["x".to_string()])
+        );
+    }
+
+    #[test]
+    fn nse_and_func_accept_unquoted_unicode_callee() {
+        use crate::cross_file::types::NseScope;
+        // A valid non-ASCII R identifier (e.g. `données`) must parse unquoted, not
+        // be truncated by an ASCII-only capture (issue #460 Codex review).
+        let meta = parse_directives("# raven: func données(x, y)\n# raven: nse données(x)\n");
+        assert_eq!(meta.declared_functions.len(), 1, "func: {meta:?}");
+        assert_eq!(meta.declared_functions[0].name, "données");
+        assert_eq!(
+            meta.declared_functions[0].formals,
+            Some(vec!["x".to_string(), "y".to_string()])
+        );
+        assert_eq!(meta.nse_declarations.len(), 1, "nse: {meta:?}");
+        assert_eq!(meta.nse_declarations[0].name, "données");
         assert_eq!(
             meta.nse_declarations[0].scope,
             NseScope::Formals(vec!["x".to_string()])
