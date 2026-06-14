@@ -1,20 +1,27 @@
 # Issue #460 — Cross-file propagation of `# raven: nse` directives (design spec)
 
-**Status:** v2 — revised after adversarial review (codex round 1)
+**Status:** v3 — revised after adversarial review (codex rounds 1 & 2)
 **Issue:** #460 "Make `# raven: nse` directives propagate across source graphs"
 **Builds on:** #455 (user-declared `# raven: nse` call policies), branch `issue455`
 
 > **Changelog v1 → v2 (codex round 1):** replaced the narrow two-pass
 > (ancestor+descendant) propagation with the **revalidation-consistent set**
-> (§4.1, resolves the sibling-via-shared-parent BLOCKER); foreign declarations
-> now collapse per-file by within-file latest-wins before cross-file merge
+> (§4.1); foreign declarations collapse per-file by within-file latest-wins
 > (§4.4); formal order resolves **own-first**, never by cross-file raw line
-> (§4.5); foreign directives are consulted **after** local function definitions
-> (§4.3 precedence ladder); `FormalOrderTracker` enablement widened (§4.6); NSE
-> interface hash now **includes line** (§6, OD2 resolved); hint/quick-fix
-> governance handles file-level foreign entries (§4.7); B7 contradiction fixed
-> and L1 clarified (§5, §8); wording tightened (D6 within-file; "bounded
-> neighborhood").
+> (§4.5); `FormalOrderTracker` enablement widened (§4.6); NSE interface hash
+> **includes line** (§6); hint governance handles file-level foreign entries
+> (§4.7); B7 contradiction fixed and L1 clarified.
+>
+> **Changelog v2 → v3 (codex round 2):** compute `S(Q)` over the snapshot's
+> **trimmed neighborhood subgraph** so collection never references a file absent
+> from `metadata_map` (closes the snapshot-bounds BLOCKER; §4.1) — propagation is
+> bounded by `max_chain_depth` (default **20**, so siblings/transitive cases are
+> always covered; the residual is a bounded *missed* suppression, never a wrong
+> one). Resolved OD5: the foreign tier sits **after built-in tables, before the
+> step-4 resolvable-standard-eval classification** (§4.3) — required so a
+> directive can suppress a loaded-package export like `lmer` (which resolves at
+> step 4) while still deferring to precise built-in policies. Code-action
+> governance (`backend.rs`) aligned with the foreign-aware hint (§4.7).
 
 ---
 
@@ -139,13 +146,19 @@ the current file's call lines; the issue permits coarse, file-level
 propagation). A declaration physically in the current file keeps the existing
 position-gated, latest-wins behavior.
 
-**D3 — Precedence: own beats foreign; foreign sits below local definitions.**
-At a call site: own exact directive (authoritative, position-gated) → local
-function definitions → local aliases → own qualified directive → **foreign
-directives (file-level)** → built-in tables → … (full ladder in §4.3). Placing
-foreign *below* local definitions prevents a connected file's
-`# raven: nse f` from suppressing a locally-defined standard-eval `f`
-(false-negative fix from review finding #4).
+**D3 — Precedence: own beats foreign; foreign sits below local definitions and
+below built-in tables.** At a call site: own exact directive (authoritative,
+position-gated) → local function definitions → local aliases → own qualified
+directive → built-in/package tables → **foreign directives (file-level)** →
+resolvable-standard-eval classification → … (full ladder in §4.3). Placing
+foreign *below* local definitions prevents a connected file's `# raven: nse f`
+from suppressing a locally-defined standard-eval `f` (review finding #4).
+Placing it *below* built-in tables (OD5 resolved) preserves the precise,
+verified data-mask policies for known verbs (e.g. `dplyr::filter`) while still
+letting a directive override the step-4 *resolvable-standard-eval* classification
+— which is exactly what the issue's examples require, since `lmer` is a
+loaded-package export that resolves to `Standard` at step 4
+(`handlers.rs:14814-14822`) and must be suppressible by a propagated directive.
 
 **D4 — Determinism.** Each foreign file's declarations are first collapsed by
 the within-file latest-wins rule (highest line per `callee+qualifier` wins,
@@ -195,19 +208,37 @@ behavior is unchanged.
 ### 4.1 Collecting foreign facts — the set `S(Q)`
 
 ```
-ancestors      = graph.get_transitive_dependents(Q, max_depth, max_visited)
+g              = snapshot.cross_file_graph   // the TRIMMED neighborhood subgraph
+ancestors      = g.get_transitive_dependents(Q, max_depth, max_visited)
 roots          = ancestors ∪ {Q}
-descendants    = graph.get_transitive_dependencies_multi_root(roots, max_depth, max_visited)
+descendants    = g.get_transitive_dependencies_multi_root(roots, max_depth, max_visited)
 S(Q)           = (ancestors ∪ descendants) \ {Q}
 ```
 
 Both helpers already exist (`dependency.rs:1163`, `:1258`) and are the same ones
-`compute_affected_dependents_after_edit` uses, guaranteeing the collection set
-and the revalidation set are mutually consistent. For each `uri ∈ S(Q)`, read
-`snapshot.metadata_map.get(uri)` (the bounded neighborhood snapshot); a member
-absent from the snapshot (deep-truncation past `max_depth`/`max_visited`) simply
-does not contribute — the same bound behavior already accepted for in-play and
-scope. Collect, into deterministic (sorted-URI) order:
+`compute_affected_dependents_after_edit` uses, so `S(Q)` is the directed inverse
+of the revalidation relation: for any `D ∈ S(Q)`, editing `D` revalidates `Q`.
+
+**Why compute over the trimmed subgraph, not the full graph
+(codex round 2 fix):** `snapshot.metadata_map` holds the *undirected* bounded
+neighborhood (`cached_neighborhood_subgraph`, `handlers.rs:223`), which can be
+narrower than a directed `S(Q)` computed on the full graph — a deep up-then-down
+chain could name a file the snapshot never precollected, leaving its metadata
+unreadable. Computing `S(Q)` over `snapshot.cross_file_graph` (the trimmed
+neighborhood subgraph, `handlers.rs:110-113`) restricts `S(Q)` to nodes that are
+provably present in `metadata_map`, so every collected member is readable and
+no full-graph traversal or snapshot-precollection change is needed.
+
+**Bound (OD4).** Propagation is therefore limited to `max_chain_depth` (default
+**20**) undirected hops. Every required behavior (B1–B4b) is within undirected
+distance 2, so the bound never bites for them. A directive on an `S(Q)` member
+beyond the neighborhood bound (a source chain deeper than 20 hops in an
+up-then-down shape) silently does not propagate — a *bounded missed
+suppression* (the real diagnostic still shows), never a wrong suppression, and
+identical in spirit to the existing scope/in-play depth bounds.
+
+For each `uri ∈ S(Q)`, read `snapshot.metadata_map.get(uri)`. Collect, into
+deterministic (sorted-URI) order:
 
 - `foreign_nse: Vec<(Url, NseDeclaration)>` — every member's
   `metadata.nse_declarations`.
@@ -229,15 +260,26 @@ foreign data from §4.1.
 
 ### 4.3 Resolution precedence ladder (`resolve_call_arg_policy`)
 
+Bare-identifier callee branch (`handlers.rs:14752-14839`):
+
 ```
 0.  own exact unqualified directive       (position-gated, latest-wins)   [unchanged]
 1.  local function definitions             (current file)                  [unchanged]
 1b. local non-literal aliases                                              [unchanged]
 1c. own qualified directive                (BareInPlayQualified, gated)    [unchanged]
-1d. FOREIGN directives (file-level):       exact-unqualified, then
+2.  built-in / package tables              (table_verb_policy)             [unchanged]
+3.6 FOREIGN directives (file-level):       exact-unqualified, then
     qualified-when-in-play                 (deterministic, §4.4)           [NEW]
-2.  built-in / package tables                                              [unchanged]
-…   (resolvable std-eval, Shiny, unresolved ⇒ suppress)                    [unchanged]
+4.  resolvable standard-eval               (builtin/base/loaded export)    [unchanged]
+5.  Shiny deferred helper                                                  [unchanged]
+6.  unresolved ⇒ suppress (WholeCall)                                      [unchanged]
+```
+
+Namespace-qualified callee branch (`handlers.rs:14737-14750`), foreign inserted
+to keep the same below-tables ordering for `pkg::name` calls:
+
+```
+own qualified directive  →  table_verb_policy  →  FOREIGN qualified directive [NEW]  →  Standard
 ```
 
 `directive_nse_policy` splits into:
@@ -246,12 +288,13 @@ foreign data from §4.1.
 - `foreign_directive_nse_policy(name, call_qualifier_info)` — file-level entries
   only; tries exact-unqualified, then qualified-when-`pkg`-in-play; no line gate.
 
-Putting foreign at 1d (below local defs/aliases/own-qualified, above tables)
-keeps every own resolution authoritative, prevents foreign over-ride of a local
-standard-eval definition, and still lets a connected file's directive govern a
-callee that has no local binding (the issue's examples). Over-riding a *built-in
-table* policy with a coarser foreign whole-call directive is intended coarseness
-(Risks).
+Putting foreign at tier 3.6 (below local defs/aliases/own-qualified **and** below
+built-in tables, above the step-4 resolvable-standard-eval classification) keeps
+every own resolution and every precise built-in policy authoritative, prevents
+foreign override of a local standard-eval definition, and still lets a connected
+file's directive govern a callee that resolves to standard-eval at step 4 — the
+issue's examples (`lmer` is a loaded-package export resolved at step 4). Because
+`lmer` has no built-in table policy, tier 2 returns `None` and tier 3.6 fires.
 
 ### 4.4 Foreign NSE collapse + conflict order
 
@@ -292,16 +335,26 @@ for formal order (§4.5) and must still see ambiguous local redefinitions
 
 ### 4.7 Hint / quick-fix governance
 
-`nse_hint_for_usage` (`handlers.rs:14553`) consults `nse_directive_governs`
-(`handlers.rs:14497`) over `directive_nse` entries `(package, line)`, line-gated
-and package-exact. Extend the governance check to treat `file_level` foreign
-entries as governing **regardless of line** (package-exact still), so the
-discoverability hint correctly steps aside when a connected file already
-declares NSE for the callee — instead of relying on a fabricated line passing or
-failing the `< call_line` gate. The quick-fix continues to insert a *local*
-directive (still valid). Behavior is otherwise unchanged; the existing
-"omit `BareInPlayQualified`, err toward showing the hint" safety note still
-holds.
+Two governance touch points must agree so the inline hint and the lightbulb
+quick-fix stay in lockstep (they already do for own directives):
+
+- **Hint** — `nse_hint_for_usage` (`handlers.rs:14553`) → `nse_directive_governs`
+  (`handlers.rs:14497`) over `analysis.directive_nse`.
+- **Code action** — the backend quick-fix (`backend.rs:~5734`) currently calls
+  `nse_directive_governs` over only the *current file's*
+  `state.get_enriched_metadata(uri).nse_declarations` (review finding #7).
+
+Extend `nse_directive_governs` to treat `file_level` foreign entries as
+governing **regardless of line** (package-exact still), so the hint steps aside
+when a connected file already declares NSE for the callee — instead of relying
+on a fabricated line passing/failing the `< call_line` gate. For the code-action,
+feed it the **foreign** governing set too: the backend has graph + metadata
+access, so it computes the same `S(uri)` foreign declarations (§4.1) and passes
+own+foreign entries to the shared check. If that proves too costly on the
+code-action path, the documented fallback is a *harmless* redundant suggestion
+(re-declaring `# raven: nse` locally is valid, never conflicting). Either way the
+quick-fix still inserts a *local* directive. The existing "omit
+`BareInPlayQualified`, err toward showing the hint" safety note still holds.
 
 ---
 
@@ -354,6 +407,11 @@ reachability changes are covered without new work.
   - `nse_directive_governs` / `nse_hint_for_usage` — file-level foreign handling
     (§4.7).
   - Unit/integration tests for B1–B8.
+- `crates/raven/src/backend.rs`
+  - Code-action quick-fix governance (`backend.rs:~5734`) — pass own+foreign
+    governing entries to the shared `nse_directive_governs` so the lightbulb
+    stays in lockstep with the foreign-aware hint (§4.7). Acceptable documented
+    fallback: harmless redundant local suggestion if foreign set is not threaded.
 - `crates/raven/src/cross_file/scope.rs`
   - `compute_interface_hash` — add `nse_declarations` param (incl. line) + hash
     `formals`; update both call sites; hash-change unit tests (Gaps A and B).
@@ -395,15 +453,18 @@ No new LSP settings, no syntax changes, no built-in policy-table changes.
 - **OD3 — foreign conflict order.** Conflicting shapes for the same callee across
   connected files resolve by smallest origin URI (after per-file latest-wins
   collapse). Acceptable, or prefer most/least suppressive?
-- **OD4 — bounds.** `S(Q)` honors `max_chain_depth` /
-  `max_transitive_dependents_visited`; a directive past the bound silently does
-  not propagate (and the connected file is likewise not revalidated — bounds are
-  consistent on both sides). Acceptable (matches package/scope behavior).
-- **OD5 — foreign vs. built-in tables.** Foreign directives sit *above* built-in
-  table policies (tier 1d < 2), so a coarse foreign `# raven: nse filter`
-  whole-call overrides dplyr's precise data-mask policy in connected files.
-  Consistent with own-directive precedence and blessed coarseness — or should
-  foreign directives sit *below* tables to preserve precise built-in behavior?
+- **OD4 — bounds (resolved: accept).** `S(Q)` is computed over the trimmed
+  neighborhood subgraph, bounded by `max_chain_depth` (default 20). Required
+  behaviors are within distance 2, so the bound is academic; deep up-then-down
+  chains past the bound yield a bounded *missed* suppression (never wrong),
+  matching package/scope behavior.
+- **OD5 — foreign vs. built-in tables (resolved: below tables).** Foreign
+  directives sit at tier 3.6 (below built-in tables, above step-4
+  resolvable-standard-eval), so precise built-in policies (e.g. `dplyr::filter`)
+  are preserved and a coarse foreign whole-call cannot clobber them, while a
+  directive can still suppress a step-4-resolvable export like `lmer` (the
+  issue's examples). This is the unique placement that satisfies the issue
+  without over-suppressing known verbs.
 
 ---
 
@@ -412,13 +473,14 @@ No new LSP settings, no syntax changes, no built-in policy-table changes.
 - **Performance:** one extra directed traversal (one `get_transitive_dependents`
   + one multi-root `get_transitive_dependencies`) per diagnostic pass, over the
   already-snapshotted graph, bounded by existing limits. No new locking.
-- **Over-suppression:** foreign whole-call directives are file-level and (OD5)
-  above tables, so a connected file's broad `# raven: nse f` suppresses all args
-  of every `f` call in `Q`. Intended coarse behavior; user story 5 (real
-  undefined vars *outside* NSE-captured args keep reporting) is preserved because
-  suppression stays scoped to the named callee's arguments — never the whole
-  file — and foreign sits below local definitions (D3) so a local standard-eval
-  `f` is never wrongly suppressed.
+- **Over-suppression:** foreign whole-call directives are file-level, so a
+  connected file's broad `# raven: nse f` suppresses all args of every `f` call
+  in `Q`. Intended coarse behavior; user story 5 (real undefined vars *outside*
+  NSE-captured args keep reporting) is preserved because suppression stays scoped
+  to the named callee's arguments — never the whole file — foreign sits below
+  local definitions (so a local standard-eval `f` is never wrongly suppressed)
+  **and** below built-in tables (so a known verb keeps its precise per-arg policy
+  instead of being coarsely whole-call-suppressed).
 - **`in_play` asymmetry:** the bare-call match of a foreign `pkg::name` directive
   depends on `pkg` being in the (narrower) in-play set; a directive sourced only
   from a sibling whose `library()` is not in-play won't match bare calls. Rare;
