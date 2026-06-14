@@ -13230,12 +13230,14 @@ impl<'a> NseAnalysis<'a> {
 /// Bundles the working `first_seen` map with the resulting `ambiguous` set so the
 /// invariant (compare every definition against the FIRST-seen order; a differing
 /// one marks the name ambiguous) lives in one place, and carries an `enabled`
-/// flag: the result is consulted ONLY when the file declares `# raven: nse`
-/// directives, so for the common no-directive file [`observe`](Self::observe) is a
-/// no-op that skips the per-definition formal-name walk on the hot diagnostics
-/// path. `first_seen` persists across alias / non-callable rebindings (which
-/// evict `local_function_defs`), so a `def → rebind → permuted-def` sequence is
-/// still detected.
+/// flag: the result is consulted only by the `directive_nse` build, which both
+/// requires `# raven: nse` directives AND is skipped when call-argument checking
+/// is off. So `enabled` is set to `call_args_enabled && !nse_declarations.is_empty()`
+/// and, when false, [`observe`](Self::observe) is a no-op that skips the
+/// per-definition formal-name walk on the hot diagnostics path. `first_seen`
+/// persists across alias / non-callable rebindings (which evict
+/// `local_function_defs`), so a `def → rebind → permuted-def` sequence is still
+/// detected.
 #[derive(Default)]
 struct FormalOrderTracker {
     enabled: bool,

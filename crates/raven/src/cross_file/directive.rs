@@ -194,6 +194,18 @@ fn split_formal_list(body: &str) -> Option<Vec<String>> {
 /// `c(1`, etc.) instead of treating them as formals. Letters/digits are tested
 /// with the Unicode predicates (not the ASCII-only variants) so a legitimate
 /// non-ASCII R identifier such as `données` is kept in a UTF-8 locale.
+///
+/// This is intentionally laxer than [`crate::r_names::is_syntactic_r_name`]: it
+/// accepts `...` and a leading-dot-digit (`.2way`) and skips the reserved-word
+/// check, because its only job is to drop junk tokens, not to decide quoting.
+/// One consequence: a captured/formal name that is NOT a syntactic R name (a
+/// leading-dot-digit like `.2way`, or a reserved word) is stored verbatim and is
+/// therefore matched only POSITIONALLY — at a call site such an argument's NAME
+/// carries backticks (`` `.2way` = x ``), which this bare token never equals, so
+/// a NAMED such argument is not suppressed. This is a rare, hand-written-directive
+/// edge and errs toward over-flagging (never hiding a real undefined variable);
+/// the directive grammar has no way to quote a formal name, so positional
+/// matching or the whole-call form is the supported route for such callees.
 fn is_formal_name(s: &str) -> bool {
     if s == "..." {
         return true;
