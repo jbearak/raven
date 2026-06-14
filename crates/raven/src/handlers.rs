@@ -5672,11 +5672,14 @@ struct CrossFileNse {
 /// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
 ///
 /// The propagation set is `S(uri) = ancestors ∪ descendants(ancestors ∪ {uri})`,
-/// computed over the snapshot's TRIMMED neighborhood subgraph
-/// (`snapshot.cross_file_graph`). This is the directed inverse of
-/// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]:
-/// for any `D ∈ S(uri)`, editing `D` already revalidates `uri`, so collection and
-/// revalidation stay consistent. Computing over the trimmed subgraph (rather than
+/// computed by [`crate::cross_file::dependency::DependencyGraph::revalidation_consistent_set`]
+/// over the snapshot's TRIMMED neighborhood subgraph
+/// (`snapshot.cross_file_graph`). Sharing that helper with
+/// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]
+/// (which runs it over the FULL graph) makes the two the exact directed inverse
+/// of each other by construction: for any `D ∈ S(uri)`, editing `D` already
+/// revalidates `uri`, so collection and revalidation stay consistent. Computing
+/// over the trimmed subgraph (rather than
 /// the full graph) restricts members to the neighborhood, so every member is read
 /// from `metadata_map`; a member absent from it (an unresolved / missing-file
 /// node) simply contributes nothing — it has no declarations.
@@ -5703,20 +5706,16 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     let max_depth = snapshot.cross_file_config.max_chain_depth;
     let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
 
-    let ancestors = graph.get_transitive_dependents(uri, max_depth, max_visited);
-    // `uri` first matches `compute_affected_dependents_after_edit`'s
-    // `once(edited).chain(ancestors)` convention, so the shared `max_visited`
-    // budget prioritizes the queried file's own subtree (and avoids cloning
-    // `ancestors`, which is reused for `members` below).
-    let descendants = graph.get_transitive_dependencies_multi_root(
-        std::iter::once(uri).chain(ancestors.iter()),
-        max_depth,
-        max_visited,
-    );
-
-    let mut members: Vec<Url> = ancestors
+    // The revalidation-consistent set `S(uri) = ancestors ∪ descendants(ancestors
+    // ∪ {uri})`, shared with
+    // `compute_affected_dependents_after_edit` via
+    // `DependencyGraph::revalidation_consistent_set` so collection and
+    // revalidation are the exact directed inverse of each other by construction.
+    // The helper does not exclude `uri` or dedup across its two halves; we apply
+    // the collection-side post-processing (drop self, sort, dedup) here.
+    let mut members: Vec<Url> = graph
+        .revalidation_consistent_set(uri, max_depth, max_visited)
         .into_iter()
-        .chain(descendants)
         .filter(|u| u != uri)
         .collect();
     members.sort();

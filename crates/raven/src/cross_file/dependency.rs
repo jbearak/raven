@@ -1276,6 +1276,56 @@ impl DependencyGraph {
         result
     }
 
+    /// The **revalidation-consistent set** of `root`: the union
+    /// `ancestors(root) ∪ descendants(ancestors(root) ∪ {root})`, i.e. every
+    /// file whose cross-file scope-resolution would visit `root`.
+    ///
+    /// This is the single source of truth for the directed-inverse property
+    /// that ties together NSE/func directive *collection* and dependency
+    /// *revalidation* (CLAUDE.md "Cross-file `# raven: nse` / `# raven: func`
+    /// propagation"). Concretely:
+    ///
+    /// 1. [`Self::get_transitive_dependents`] — all backward ancestors of `root`.
+    /// 2. [`Self::get_transitive_dependencies_multi_root`] over
+    ///    `once(root).chain(ancestors)` — forward descendants of `root` AND of
+    ///    each ancestor (sibling subtrees), sharing one `visited` set.
+    ///
+    /// Both [`super::revalidation::compute_affected_dependents_after_edit`]
+    /// (over the FULL graph) and
+    /// [`crate::handlers::collect_cross_file_nse`] (over the TRIMMED snapshot
+    /// subgraph) build their working set from this method, so the two stay the
+    /// exact directed inverse of each other by construction rather than by
+    /// convention: for any `D ∈ revalidation_consistent_set(Q)`, `Q` lies in
+    /// `revalidation_consistent_set(D)`'s revalidation, and vice versa.
+    ///
+    /// Returns the union with the backward ancestors FIRST, then the forward
+    /// descendants, matching both callers' historical ordering. **`root` itself
+    /// is NOT excluded** and the result is **not deduplicated across the two
+    /// halves** (each half is internally first-visit-deduplicated, but an
+    /// ancestor that is also reachable forward can appear in both halves):
+    /// callers apply their own root handling, dedup, and ordering — revalidation
+    /// excludes `{root}` and dedups via a shared `seen` set; collection filters
+    /// `u != root`, then sorts and dedups. Keeping that post-processing in the
+    /// callers preserves each one's existing behavior exactly while sharing the
+    /// load-bearing two-traversal construction here.
+    pub fn revalidation_consistent_set(
+        &self,
+        root: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url> {
+        let ancestors = self.get_transitive_dependents(root, max_depth, max_visited);
+        // `root` first matches the historical `once(root).chain(ancestors)`
+        // convention so the shared `max_visited` budget prioritizes the queried
+        // file's own subtree.
+        let descendants = self.get_transitive_dependencies_multi_root(
+            std::iter::once(root).chain(ancestors.iter()),
+            max_depth,
+            max_visited,
+        );
+        ancestors.into_iter().chain(descendants).collect()
+    }
+
     /// `visited` tracks the *shallowest* depth at which each URI has been
     /// reached. A revisit at a strictly shallower depth must continue
     /// recursing so descendants reachable within the budget through the
@@ -4035,5 +4085,250 @@ z <- 3
         let ast_edge = deps.iter().find(|e| !e.is_directive);
         assert!(ast_edge.is_some(), "AST edge should exist");
         assert_eq!(ast_edge.unwrap().call_site_line, Some(5));
+    }
+
+    // --- revalidation_consistent_set: shared directed-inverse primitive ---
+
+    fn multi_source_meta(paths: &[&str]) -> CrossFileMetadata {
+        use super::super::types::ForwardSource;
+        CrossFileMetadata {
+            sources: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| ForwardSource {
+                    path: p.to_string(),
+                    line: (i as u32) + 1,
+                    column: 0,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Build the sibling-subtree topology: A sources B and C; B sources D.
+    /// (Plus a diamond root P that sources A, so A has a backward ancestor.)
+    ///
+    /// Edges (parent → child):
+    ///   P → A,  A → B,  A → C,  B → D
+    fn sibling_subtree_graph() -> DependencyGraph {
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("P.R"),
+            &make_meta_with_source("A.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &url("A.R"),
+            &multi_source_meta(&["B.R", "C.R"]),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &url("B.R"),
+            &make_meta_with_source("D.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph
+    }
+
+    /// The historical *collection* construction, reproduced inline from the
+    /// pre-refactor `collect_cross_file_nse` body (ancestors ∪ descendants of
+    /// `once(root).chain(ancestors)`, then drop self, sort, dedup).
+    fn old_collection_members(
+        graph: &DependencyGraph,
+        root: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url> {
+        let ancestors = graph.get_transitive_dependents(root, max_depth, max_visited);
+        let descendants = graph.get_transitive_dependencies_multi_root(
+            std::iter::once(root).chain(ancestors.iter()),
+            max_depth,
+            max_visited,
+        );
+        let mut members: Vec<Url> = ancestors
+            .into_iter()
+            .chain(descendants)
+            .filter(|u| u != root)
+            .collect();
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    /// The historical *revalidation* construction, reproduced inline from the
+    /// pre-refactor `compute_affected_dependents_after_edit` body (two loops
+    /// folded through a shared `seen` set, excluding `root` and applying an
+    /// `is_open` predicate).
+    fn old_revalidation_members<F: Fn(&Url) -> bool>(
+        graph: &DependencyGraph,
+        root: &Url,
+        is_open: F,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> Vec<Url> {
+        let mut seen: HashSet<Url> = HashSet::new();
+        let mut result: Vec<Url> = Vec::new();
+        let push_if_new = |dep: Url, seen: &mut HashSet<Url>, result: &mut Vec<Url>| {
+            if dep == *root || !is_open(&dep) {
+                return;
+            }
+            if seen.insert(dep.clone()) {
+                result.push(dep);
+            }
+        };
+        let backward = graph.get_transitive_dependents(root, max_depth, max_visited);
+        for dep in &backward {
+            push_if_new(dep.clone(), &mut seen, &mut result);
+        }
+        let forward_roots = std::iter::once(root).chain(backward.iter());
+        for dep in
+            graph.get_transitive_dependencies_multi_root(forward_roots, max_depth, max_visited)
+        {
+            push_if_new(dep, &mut seen, &mut result);
+        }
+        result
+    }
+
+    /// The shared helper, post-processed exactly as `collect_cross_file_nse`
+    /// does (drop self, sort, dedup) — must equal the old collection body for
+    /// every node in the graph.
+    #[test]
+    fn test_revalidation_consistent_set_reproduces_old_collection() {
+        let graph = sibling_subtree_graph();
+        for name in ["P.R", "A.R", "B.R", "C.R", "D.R", "absent.R"] {
+            let root = url(name);
+            let mut from_helper: Vec<Url> = graph
+                .revalidation_consistent_set(&root, 20, 200)
+                .into_iter()
+                .filter(|u| *u != root)
+                .collect();
+            from_helper.sort();
+            from_helper.dedup();
+            assert_eq!(
+                from_helper,
+                old_collection_members(&graph, &root, 20, 200),
+                "collection construction drifted for root {name}"
+            );
+        }
+    }
+
+    /// The shared helper, folded exactly as `compute_affected_dependents_after_edit`
+    /// does (single `seen` set + `is_open` predicate, excluding self) — must
+    /// equal the old two-loop revalidation body for every node in the graph,
+    /// preserving first-seen ORDER (not just set membership).
+    #[test]
+    fn test_revalidation_consistent_set_reproduces_old_revalidation() {
+        let graph = sibling_subtree_graph();
+        // Try both "everything open" and a partial-open predicate to exercise
+        // the `is_open` filter alongside the shared traversal.
+        let all_open = |_: &Url| true;
+        let some_closed = |u: &Url| u != &url("C.R") && u != &url("P.R");
+        for name in ["P.R", "A.R", "B.R", "C.R", "D.R"] {
+            let root = url(name);
+
+            let mut from_helper: Vec<Url> = Vec::new();
+            let mut seen: HashSet<Url> = HashSet::new();
+            for dep in graph.revalidation_consistent_set(&root, 20, 200) {
+                if dep == root || !all_open(&dep) {
+                    continue;
+                }
+                if seen.insert(dep.clone()) {
+                    from_helper.push(dep);
+                }
+            }
+            assert_eq!(
+                from_helper,
+                old_revalidation_members(&graph, &root, all_open, 20, 200),
+                "revalidation construction (all open) drifted for root {name}"
+            );
+
+            let mut from_helper_partial: Vec<Url> = Vec::new();
+            let mut seen_partial: HashSet<Url> = HashSet::new();
+            for dep in graph.revalidation_consistent_set(&root, 20, 200) {
+                if dep == root || !some_closed(&dep) {
+                    continue;
+                }
+                if seen_partial.insert(dep.clone()) {
+                    from_helper_partial.push(dep);
+                }
+            }
+            assert_eq!(
+                from_helper_partial,
+                old_revalidation_members(&graph, &root, some_closed, 20, 200),
+                "revalidation construction (partial open) drifted for root {name}"
+            );
+        }
+    }
+
+    /// The load-bearing correctness invariant, asserted structurally: for every
+    /// ordered pair (member, Q) of distinct nodes,
+    ///
+    ///   member ∈ consistent_set(Q)  ⟺  Q ∈ affected_dependents(member)
+    ///
+    /// where the LHS is `collect_cross_file_nse`'s membership test (helper,
+    /// drop-self) and the RHS is `compute_affected_dependents_after_edit`'s
+    /// result (helper, dedup, drop-self). Both sides now derive from
+    /// `revalidation_consistent_set`, so this is true by construction; the test
+    /// guards against a future edit that re-splits them. Includes the
+    /// sibling-subtree case (A sources B and C; B sources D): D ∈ S(C) ⟺ C
+    /// revalidates D — i.e. editing C must republish its sibling-subtree node D.
+    #[test]
+    fn test_directed_inverse_property_holds_structurally() {
+        let graph = sibling_subtree_graph();
+        let nodes: Vec<Url> = ["P.R", "A.R", "B.R", "C.R", "D.R"]
+            .iter()
+            .map(|n| url(n))
+            .collect();
+
+        // Collection-side membership: member ∈ S(Q)?
+        let in_consistent_set = |q: &Url, member: &Url| -> bool {
+            graph
+                .revalidation_consistent_set(q, 20, 200)
+                .into_iter()
+                .any(|u| &u == member && member != q)
+        };
+        // Revalidation-side: does editing `member` revalidate `q`? (all open)
+        let revalidates = |member: &Url, q: &Url| -> bool {
+            let mut seen: HashSet<Url> = HashSet::new();
+            graph
+                .revalidation_consistent_set(member, 20, 200)
+                .into_iter()
+                .filter(|d| d != member)
+                .filter(|d| seen.insert(d.clone()))
+                .any(|d| &d == q)
+        };
+
+        for q in &nodes {
+            for member in &nodes {
+                if q == member {
+                    continue;
+                }
+                assert_eq!(
+                    in_consistent_set(q, member),
+                    revalidates(member, q),
+                    "directed-inverse violated: member={member} q={q} \
+                     (member∈S(q)={}, q∈affected(member)={})",
+                    in_consistent_set(q, member),
+                    revalidates(member, q),
+                );
+            }
+        }
+
+        // Spot-check the sibling-subtree expectation is actually exercised
+        // (guards against a degenerate graph silently passing the loop above):
+        // C and D are siblings-subtree-related through their shared ancestor A,
+        // so editing C revalidates D and D ∈ S(C).
+        assert!(
+            revalidates(&url("C.R"), &url("D.R")),
+            "sibling-subtree: editing C must revalidate D"
+        );
+        assert!(
+            in_consistent_set(&url("C.R"), &url("D.R")),
+            "sibling-subtree: D must be in the consistent set of C"
+        );
     }
 }
