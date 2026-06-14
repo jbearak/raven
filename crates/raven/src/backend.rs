@@ -5774,6 +5774,12 @@ impl LanguageServer for Backend {
                 // declared NSE for the callee, so offering to (re)declare it
                 // would insert a conflicting directive.
                 let (call_pkg, bare) = handlers::split_callee_qualifier(&fix.callee);
+                // Stored directive names are canonical (a redundantly backticked
+                // syntactic name is bare), so canonicalize the call's bare name
+                // before comparing — else `` `my_func`(...) `` would miss a
+                // governing `# raven: nse my_func(...)` and offer a redundant
+                // quick-fix (issue #460 Codex P3).
+                let bare = crate::r_names::canonical_use_name(bare);
                 if handlers::nse_directive_governs(
                     nse_decls
                         .iter()
@@ -12376,6 +12382,65 @@ lineLength = 200
         assert_eq!(
             nse_actions, 0,
             "no quick-fix when a directive already governs the call: {actions:?}"
+        );
+    }
+
+    /// Issue #460 (Codex P3): a redundantly backticked call `` `my_func`(...) ``
+    /// must be recognized as governed by the canonical `# raven: nse my_func(...)`
+    /// directive, so no redundant quick-fix is offered (the governance lookup
+    /// canonicalizes the callee before comparing).
+    #[tokio::test]
+    async fn code_action_skips_quick_fix_for_backticked_governed_call() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Line 0: def; line 1: directive (canonical `my_func`); line 2: call with
+        // redundant backticks. `` `my_func` `` is 9 chars, `(` at col 9, so the
+        // non-captured first positional `p1` is at cols 10-12 of line 2.
+        let content =
+            "my_func <- function(x, y) x\n# raven: nse my_func(y)\n`my_func`(p1, masked)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef_p1 = Diagnostic {
+            range: Range {
+                start: Position::new(2, 10),
+                end: Position::new(2, 12),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef_p1],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "no quick-fix when a canonical directive governs a backticked call: {actions:?}"
         );
     }
 

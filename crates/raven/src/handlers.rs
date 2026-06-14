@@ -5660,9 +5660,12 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
 struct CrossFileNse {
     /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
     nse: Vec<crate::cross_file::types::NseDeclaration>,
-    /// Foreign `# raven: func` declarations, collapsed to at most one per bare
-    /// name (so `declared_function_formals`, which matches by bare name and
-    /// breaks ties by `max_by_key(line)`, never compares lines across files).
+    /// Every formals-bearing foreign `# raven: func` declaration (package
+    /// qualifier retained). Conflict resolution is deferred to
+    /// [`unanimous_declared_formals`], which matches by name+package and accepts
+    /// an order only when all matching declarations agree — so distinct qualified
+    /// functions sharing a bare name keep their own orders and `line` is never
+    /// compared across files.
     funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
 }
 
@@ -5733,22 +5736,16 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
         (String, Option<String>),
         (Url, crate::cross_file::types::NseDeclaration),
     > = BTreeMap::new();
-    // Keyed by the BARE callee name (any `pkg::` stripped) and limited to
-    // declarations that carry formals — exactly what `declared_function_formals`
-    // consumes (it matches by bare name with lenient package, then
-    // `max_by_key(line)`). Collapsing to one entry per bare name guarantees that
-    // lookup never compares `line` across files, and a parens-less `# raven: func`
-    // can never shadow a formal-bearing one for the same name.
-    //
-    // `func_ambiguous` mirrors the own-file `FormalOrderTracker` discipline across
-    // files: when connected files declare *conflicting* formal orders for the same
-    // bare name, there is no authoritative order, so picking one arbitrarily could
-    // suppress the wrong positional and hide a real undefined variable. Such names
-    // are dropped entirely, leaving the directive to fall back to safe
-    // named-argument-only matching.
-    let mut func_chosen: BTreeMap<String, (Url, crate::cross_file::types::DeclaredSymbol)> =
-        BTreeMap::new();
-    let mut func_ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // All formals-bearing foreign `# raven: func` declarations, kept verbatim
+    // (package qualifier and all). Conflict resolution is deferred to
+    // `unanimous_declared_formals`, which matches by name+package via
+    // `declared_name_matches` and accepts an order only when every matching
+    // declaration agrees — so distinct qualified functions sharing a bare name
+    // (`pkgA::f` vs `pkgB::f`) keep their own orders (issue #460 review: a
+    // bare-name collapse here wrongly conflated them), genuinely-conflicting
+    // same-name+package orders fall back to safe named-only matching, and `line`
+    // is never compared across files.
+    let mut funcs: Vec<crate::cross_file::types::DeclaredSymbol> = Vec::new();
     for m in &members {
         let Some(meta) = snapshot.metadata_map.get(m) else {
             continue;
@@ -5779,33 +5776,47 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
             }
         }
         for d in &meta.declared_functions {
-            if d.formals.is_none() {
-                continue;
-            }
-            let bare = d.name.rsplit_once("::").map_or(d.name.as_str(), |(_, n)| n);
-            if func_ambiguous.contains(bare) {
-                continue;
-            }
-            match func_chosen.get(bare) {
-                // Conflicting formal order anywhere in the connected set → drop.
-                Some((_, existing)) if existing.formals != d.formals => {
-                    func_ambiguous.insert(bare.to_string());
-                    func_chosen.remove(bare);
-                }
-                // Same order already chosen from an earlier (smaller-URI) file, or
-                // an earlier line in this file — keep it.
-                Some((u, _)) if u != m => {}
-                Some((_, existing)) if existing.line >= d.line => {}
-                _ => {
-                    func_chosen.insert(bare.to_string(), (m.clone(), d.clone()));
-                }
+            if d.formals.is_some() {
+                funcs.push(d.clone());
             }
         }
     }
     CrossFileNse {
         nse: nse_chosen.into_values().map(|(_, d)| d).collect(),
-        funcs: func_chosen.into_values().map(|(_, d)| d).collect(),
+        funcs,
     }
+}
+
+/// The formal order a set of `# raven: func` declarations supplies for a
+/// per-formal NSE directive on `(name, package)`, resolved by UNANIMITY: every
+/// declaration matching via [`declared_name_matches`] must agree on the formal
+/// list, else `None` (the directive then falls back to safe named-only
+/// matching). Used for FOREIGN declarations collected across the source graph,
+/// where `line` is not comparable between files — so `declared_function_formals`'
+/// `max_by_key(line)` tie-break cannot apply. A bare-name query matching two
+/// distinct qualified functions with differing orders is correctly ambiguous; a
+/// package-qualified query only matches a same-package (or unqualified)
+/// declaration, so `pkgA::f` and `pkgB::f` never collide (issue #460).
+fn unanimous_declared_formals(
+    declared: &[crate::cross_file::types::DeclaredSymbol],
+    name: &str,
+    package: Option<&str>,
+) -> Option<Vec<String>> {
+    let mut chosen: Option<&Vec<String>> = None;
+    for d in declared {
+        let Some(formals) = d.formals.as_ref() else {
+            continue;
+        };
+        if !declared_name_matches(&d.name, name, package) {
+            continue;
+        }
+        match chosen {
+            None => chosen = Some(formals),
+            Some(prev) if prev == formals => {}
+            Some(_) => return None, // conflicting orders → ambiguous
+        }
+    }
+    chosen.cloned()
 }
 
 /// Issue #431: the name of the package under development, but only when the
@@ -13306,11 +13317,12 @@ impl<'a> NseAnalysis<'a> {
         // then a visible local `name <- function(...)` (bare names only,
         // non-ambiguous), then a FOREIGN `# raven: func` propagated from a
         // connected file (issue #460) — and finally named-only. Foreign order is
-        // consulted last and `foreign_funcs` is pre-collapsed to one entry per
-        // name (see `collect_cross_file_nse`), so `declared_function_formals`'
-        // `max_by_key(line)` never compares lines across files. Shared by the
-        // own- and foreign-declaration loops below so both honor identical
-        // shaping (the `...`-boundary handling for captured-but-unordered names).
+        // consulted last via `unanimous_declared_formals`, which resolves by
+        // name+package agreement (not `max_by_key(line)`, since cross-file lines
+        // are not comparable) — so distinct qualified functions sharing a bare
+        // name keep their own orders. Shared by the own- and foreign-declaration
+        // loops below so both honor identical shaping (the `...`-boundary handling
+        // for captured-but-unordered names).
         let to_policy = |decl: &crate::cross_file::types::NseDeclaration| -> crate::nse::ArgPolicy {
             use crate::cross_file::types::NseScope;
             match &decl.scope {
@@ -13345,9 +13357,10 @@ impl<'a> NseAnalysis<'a> {
                             .filter(|f| !f.is_empty())
                     })
                     // Issue #460: a foreign `# raven: func` from a connected
-                    // file supplies order when no own context does.
+                    // file supplies order when no own context does, resolved by
+                    // unanimity (no cross-file line comparison).
                     .or_else(|| {
-                        declared_function_formals(
+                        unanimous_declared_formals(
                             foreign_funcs,
                             &decl.name,
                             decl.package.as_deref(),
@@ -14803,6 +14816,12 @@ fn nse_hint_for_usage<'t>(
     // directive written after the call suppress it for an earlier call.
     let call_line = call.start_position().row as u32;
     let (call_pkg, bare) = split_callee_qualifier(&callee);
+    // `directive_nse` is keyed by the CANONICAL callee name (a redundantly
+    // backticked syntactic name is stored bare), so canonicalize the call's bare
+    // name before the governance lookup — otherwise `` `my_func`(...) `` (raw
+    // `` `my_func` ``) would miss a governing `# raven: nse my_func(...)` and the
+    // hint would be shown spuriously (issue #460 Codex P3).
+    let bare = crate::r_names::canonical_use_name(bare);
     if analysis.directive_nse.get(bare).is_some_and(|entries| {
         nse_directive_governs(
             entries
@@ -57856,6 +57875,57 @@ my_func <- function(a = default_value) {
         );
     }
 
+    // Issue #460 (Codex P3): a redundantly backticked syntactic call
+    // `` `my_func`(...) `` must be recognized as governed by `# raven: nse my_func`
+    // — the governance lookup canonicalizes the callee, so the misleading
+    // "declare NSE" hint on a surviving (non-captured) argument is suppressed.
+    #[test]
+    fn hint_suppressed_for_backticked_call_governed_by_canonical_directive() {
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        // Own directive keyed canonically as `my_func`; the call spells the callee
+        // with redundant backticks. `other = undefined_other` is the non-captured
+        // (surviving) argument.
+        let code = "# raven: nse my_func(x)\n`my_func`(x = captured, other = undefined_other)\n";
+        let own = crate::cross_file::extract_metadata(code).nse_declarations;
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &own,
+            &[],
+            &[],
+            &[],
+        );
+        let usage = find_ident(root, code, "undefined_other").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a governing `# raven: nse my_func` must suppress the hint for a `\
+             `my_func`(...)` call despite the redundant backticks"
+        );
+    }
+
     // Issue #460 cross-file integration harness: insert each `(name, code)` under
     // workspace root `file:///w/`, wire the dependency graph (open_document does
     // NOT — only `update_file` creates edges), then run the full `diagnostics`
@@ -58087,6 +58157,29 @@ my_func <- function(a = default_value) {
         assert!(
             msgs.iter().any(|m| m.contains("undefined_pos2")),
             "second positional must stay reported under ambiguous order; got {msgs:?}"
+        );
+    }
+
+    // Issue #460 (Codex P2): two connected files declaring formals for DIFFERENT
+    // qualified functions that share a bare name (`pkgA::f` vs `pkgB::f`) must NOT
+    // collide — each keeps its own order, so a propagated per-formal directive for
+    // one of them still suppresses its captured positional.
+    #[test]
+    fn distinct_qualified_funcs_sharing_bare_name_keep_their_orders() {
+        let msgs = cross_file_diag_messages(
+            &[
+                ("a.R", "# raven: func pkgA::f(a)\n"),
+                ("b.R", "# raven: func pkgB::f(b)\n"),
+                (
+                    "main.R",
+                    "source(\"a.R\")\nsource(\"b.R\")\n# raven: nse: pkgA::f(a)\npkgA::f(undefined_cap)\n",
+                ),
+            ],
+            "main.R",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_cap")),
+            "pkgA::f's captured positional must be suppressed (pkgB::f must not make it ambiguous); got {msgs:?}"
         );
     }
 
