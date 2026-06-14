@@ -14407,15 +14407,27 @@ pub(crate) fn split_callee_qualifier(callee: &str) -> (Option<&str>, &str) {
 /// becomes the double-quoted form (`"my fn"`) so a suggested directive parses.
 /// Internal lookup keys keep the raw (backtick) form — only user-facing
 /// suggestions are converted.
+///
+/// When the bare name is non-syntactic AND there is a package qualifier, the
+/// WHOLE `pkg::name` goes inside the quotes (`"pkg::my fn"`), NOT `pkg::"my fn"`:
+/// the directive grammar has no `pkg::"..."` form, so `pkg::"my fn"` would fail
+/// to parse and the suggestion would silently never govern. The parser re-splits
+/// the quoted `pkg::name` on `::` back into qualifier + name, so `"pkg::my fn"`
+/// round-trips to `package=pkg, name=` `` `my fn` `` `` and governs the call.
 fn callee_directive_form(callee: &str) -> String {
     let (pkg, bare) = split_callee_qualifier(callee);
-    let bare = match unquote_backtick_name(bare) {
-        Some(inner) => format!("\"{inner}\""),
-        None => bare.to_string(),
-    };
-    match pkg {
-        Some(p) => format!("{p}::{bare}"),
-        None => bare,
+    match unquote_backtick_name(bare) {
+        // Non-syntactic bare name: must be quoted. With a qualifier, quote the
+        // whole `pkg::name`; without, just the name.
+        Some(inner) => match pkg {
+            Some(p) => format!("\"{p}::{inner}\""),
+            None => format!("\"{inner}\""),
+        },
+        // Syntactic bare name: emit verbatim (bare or `pkg::name`).
+        None => match pkg {
+            Some(p) => format!("{p}::{bare}"),
+            None => bare.to_string(),
+        },
     }
 }
 
@@ -57608,6 +57620,38 @@ my_func <- function(a = default_value) {
         assert!(
             !d.contains("# raven: func `my data fn`"),
             "suggestion must not emit the raw backtick callee form: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_suggestion_quotes_whole_qualified_nonsyntactic_callee() {
+        // For a namespace-qualified NON-SYNTACTIC callee (`` pkg::`my fn`(...) ``)
+        // the suggested directive must quote the WHOLE `pkg::name` (`"pkg::my fn"`),
+        // NOT the unparseable `pkg::"my fn"` (the grammar has no `pkg::"..."` form,
+        // so that spelling would silently never govern). Guards the qualified
+        // branch of `callee_directive_form`.
+        let diags = collect_undefined_messages("pkg::`my fn`(undef_arg)\n");
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg reported");
+        assert!(
+            d.contains("\"pkg::my fn\""),
+            "suggestion must quote the whole qualified non-syntactic callee: {d}"
+        );
+        assert!(
+            !d.contains("pkg::\"my fn\""),
+            "must not emit the unparseable pkg::\"...\" form: {d}"
+        );
+
+        // The suggested quoted form must actually parse AND govern the call: the
+        // captured named arg `a` is suppressed when the directive is applied.
+        let governed = collect_undefined_messages(
+            "# raven: nse \"pkg::my fn\"(a)\npkg::`my fn`(a = masked)\n",
+        );
+        assert!(
+            !governed.iter().any(|m| m.contains("masked")),
+            "the suggested `\"pkg::my fn\"` form must govern the qualified call; got {governed:?}"
         );
     }
 
