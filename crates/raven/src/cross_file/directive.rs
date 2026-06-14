@@ -878,20 +878,31 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                     Some((p, n)) => (Some(p.to_string()), callee_name_for_match(n)),
                     None => (None, callee_name_for_match(&raw)),
                 };
-                // No parentheses (`nse f`) and empty parentheses (`nse f()`)
-                // both mean whole-call NSE — `f()` lists zero captured formals,
-                // which is most naturally read as "same as no parens" rather
-                // than a silent no-op. A non-empty list is per-formal.
-                let scope = match caps.get(4).and_then(|b| split_formal_list(b.as_str())) {
-                    Some(formals) => NseScope::Formals(formals),
-                    None => NseScope::WholeCall,
+                // No parentheses (`nse f`) and EMPTY parentheses (`nse f()`) both
+                // mean whole-call NSE — `f()` lists zero captured formals, read as
+                // "same as no parens" rather than a silent no-op; both are
+                // deliberate, well-formed forms. A non-empty list is per-formal.
+                //
+                // A non-empty but MALFORMED list (a blank slot like `f(x,,y)`, or
+                // no syntactic formal names at all) makes `split_formal_list`
+                // return `None`: DROP the whole directive rather than broadening
+                // it to whole-call. A typo'd capture list must not silently
+                // suppress every argument and hide real undefined-variable findings
+                // (issue #460 review) — dropping it leaves the callee checked
+                // normally so the user notices and corrects the directive.
+                let scope = match caps.get(4).map(|b| b.as_str()) {
+                    None => Some(NseScope::WholeCall),
+                    Some(body) if body.trim().is_empty() => Some(NseScope::WholeCall),
+                    Some(body) => split_formal_list(body).map(NseScope::Formals),
                 };
-                meta.nse_declarations.push(NseDeclaration {
-                    name,
-                    package,
-                    scope,
-                    line: line_num,
-                });
+                if let Some(scope) = scope {
+                    meta.nse_declarations.push(NseDeclaration {
+                        name,
+                        package,
+                        scope,
+                        line: line_num,
+                    });
+                }
             }
             continue;
         }
@@ -2488,18 +2499,16 @@ x <- undefined"#;
     }
 
     #[test]
-    fn nse_blank_formal_slot_is_not_a_partial_policy() {
-        use crate::cross_file::types::NseScope;
-        // A blank slot (double comma / trailing comma) is malformed: it must NOT
-        // become an authoritative partial per-formal policy (which could suppress
-        // the wrong argument positions). It falls back to whole-call instead.
+    fn nse_blank_formal_slot_is_dropped_not_broadened() {
+        // A blank slot (double comma / trailing comma) is malformed: the directive
+        // must NOT become a partial per-formal policy (wrong positions) NOR a
+        // whole-call policy (would hide real undefined-variable findings). It is
+        // dropped entirely, leaving the callee checked normally (issue #460 review).
         for line in ["# raven: nse my_func(x,,y)", "# raven: nse my_func(a,)"] {
             let meta = parse_directives(&format!("{line}\n"));
-            assert_eq!(meta.nse_declarations.len(), 1, "case: {line}");
-            assert_eq!(
-                meta.nse_declarations[0].scope,
-                NseScope::WholeCall,
-                "case: {line}"
+            assert!(
+                meta.nse_declarations.is_empty(),
+                "malformed parenthesized nse must be dropped, not broadened; case: {line}: {meta:?}"
             );
         }
     }

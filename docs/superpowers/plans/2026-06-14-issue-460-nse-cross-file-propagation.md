@@ -295,7 +295,6 @@ Make foreign declarations actually suppress at the right precedence. Test by pas
 - [ ] **Step 1: Write failing tests** that build an `NseAnalysis` with foreign declarations and assert suppression precedence.
 
 ```rust
-```rust
 // Local test helper used by Tasks 3-4. Parses `code`, builds an NseAnalysis with
 // the four declaration slices, runs the collector, returns the used-identifier
 // names. Parser setup mirrors `test_sysdata_symbol_suppresses_undefined_in_r_source`

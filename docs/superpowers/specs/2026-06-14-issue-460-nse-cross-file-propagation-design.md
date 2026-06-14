@@ -207,7 +207,7 @@ behavior is unchanged.
 
 ### 4.1 Collecting foreign facts — the set `S(Q)`
 
-```
+```text
 g              = snapshot.cross_file_graph   // the TRIMMED neighborhood subgraph
 ancestors      = g.get_transitive_dependents(Q, max_depth, max_visited)
 roots          = ancestors ∪ {Q}
@@ -271,7 +271,7 @@ foreign data from §4.1.
 
 Bare-identifier callee branch (`handlers.rs:14752-14839`):
 
-```
+```text
 0.  own exact unqualified directive       (position-gated, latest-wins)   [unchanged]
 1.  local function definitions             (current file)                  [unchanged]
 1b. local non-literal aliases                                              [unchanged]
@@ -287,7 +287,7 @@ Bare-identifier callee branch (`handlers.rs:14752-14839`):
 Namespace-qualified callee branch (`handlers.rs:14737-14750`), foreign inserted
 to keep the same below-tables ordering for `pkg::name` calls:
 
-```
+```text
 own qualified directive  →  table_verb_policy  →  FOREIGN qualified directive [NEW]  →  Standard
 ```
 
@@ -321,7 +321,7 @@ For both own and foreign per-formal directives, resolve the callee's formal
 order — the order is **call-site-relative**, so the current file's signature
 info is most authoritative:
 
-```
+```text
 own  `# raven: func`        (declared_function_formals over OWN funcs; max-line within own file)
   else own local `name <- function(...)`   (bare names only; skip if FormalOrderTracker ambiguous)
   else foreign `# raven: func`  (deterministic: smallest origin URI; within that file, max-line)
@@ -392,8 +392,10 @@ In `compute_interface_hash` (`scope.rs:4162`):
    (OD2 **resolved**): under file-level collapse the highest-line declaration per
    callee wins (§4.4), so a pure line-move that changes which declaration is
    "last" must invalidate dependents — a set-only hash would miss it
-   (review finding #9). Sort declarations by `(name, package, line, scope)` for
-   deterministic hashing.
+   (review finding #9). Sort declarations by `(name, package, line)` before
+   hashing for determinism; `line` is unique per declaration (one directive per
+   comment line), so that key is already total and `scope` need not participate
+   in the sort (it is still hashed per element).
 2. **Add `formals` to the declared-symbol hashing.** In the existing loop
    (`scope.rs:4194-4198`), also hash `decl.formals` (closes Gap B).
 
