@@ -5657,13 +5657,13 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
 
 /// Foreign `# raven: nse` / `# raven: func` declarations propagated to `uri` from
 /// the files connected to it through the source graph (issue #460).
-struct CrossFileNse {
+pub(crate) struct CrossFileNse {
     /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
-    nse: Vec<crate::cross_file::types::NseDeclaration>,
+    pub(crate) nse: Vec<crate::cross_file::types::NseDeclaration>,
     /// Foreign `# raven: func` declarations, collapsed to at most one per `name`
     /// (so the name+package-keyed `declared_function_formals`, which breaks ties
     /// by `max_by_key(line)`, never compares lines across files).
-    funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
+    pub(crate) funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
 }
 
 /// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
@@ -5683,7 +5683,7 @@ struct CrossFileNse {
 /// one file the highest-line declaration wins (mirroring the within-file
 /// latest-wins rule, since a foreign file has no call site). This yields at most
 /// one foreign declaration per `(name, package)` (NSE) / `name` (func).
-fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
+pub(crate) fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
     use std::collections::BTreeMap;
 
     let graph = snapshot.cross_file_graph.as_ref();
@@ -14646,13 +14646,18 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
 /// which is the safe direction (the suggestion to extend coverage is harmless
 /// guidance, whereas a wrongly-hidden hint loses discoverability).
 pub(crate) fn nse_directive_governs<'a>(
-    entries: impl IntoIterator<Item = (Option<&'a str>, u32)>,
+    entries: impl IntoIterator<Item = (Option<&'a str>, u32, bool)>,
     call_pkg: Option<&str>,
     call_line: u32,
 ) -> bool {
+    // Each entry is `(package, line, file_level)`. An own (current-file) directive
+    // governs only when declared before the call line; a file-level FOREIGN
+    // directive propagated from a connected file (issue #460) governs the whole
+    // file, so its line is ignored. Package match stays exact either way (a
+    // bare directive matches a bare call, `pkg::name` matches `pkg::name`).
     entries
         .into_iter()
-        .any(|(pkg, line)| line < call_line && pkg == call_pkg)
+        .any(|(pkg, line, file_level)| pkg == call_pkg && (file_level || line < call_line))
 }
 
 /// Split a callee name (`name` or `pkg::name`) into `(package, bare name)`.
@@ -14718,7 +14723,9 @@ fn nse_hint_for_usage<'t>(
     let (call_pkg, bare) = split_callee_qualifier(&callee);
     if analysis.directive_nse.get(bare).is_some_and(|entries| {
         nse_directive_governs(
-            entries.iter().map(|e| (e.package.as_deref(), e.line)),
+            entries
+                .iter()
+                .map(|e| (e.package.as_deref(), e.line, e.file_level)),
             call_pkg,
             call_line,
         )
@@ -57710,6 +57717,60 @@ my_func <- function(a = default_value) {
         assert!(
             used.iter().any(|n| n == "undefined_expr"),
             "local def resolves at step 1; foreign tier 3.6 must not fire; got {used:?}"
+        );
+    }
+
+    // Issue #460: the discoverability hint steps aside when a FOREIGN per-formal
+    // directive already governs the callee (file-level, line ignored). Without
+    // foreign-awareness, `nse_directive_governs` would mis-handle the fabricated
+    // line-0 of a file-level entry.
+    #[test]
+    fn hint_suppressed_when_foreign_directive_governs() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+        let code = "nrow(captured = a, undefined_b)\n";
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let foreign = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::Formals(vec!["captured".into()]),
+            line: 0,
+        }];
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &foreign,
+            &[],
+        );
+        // Locate the `undefined_b` identifier node.
+        fn find_ident<'t>(
+            node: tree_sitter::Node<'t>,
+            text: &str,
+            name: &str,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if node.kind() == "identifier" && super::node_text(node, text) == name {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(found) = find_ident(child, text, name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let usage = find_ident(root, code, "undefined_b").expect("usage node");
+        assert!(
+            super::nse_hint_for_usage(usage, code, &analysis).is_none(),
+            "a governing foreign directive must suppress the add-# raven: nse hint"
         );
     }
 

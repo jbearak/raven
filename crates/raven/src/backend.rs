@@ -5731,14 +5731,31 @@ impl LanguageServer for Backend {
             matches!(&d.code, Some(NumberOrString::String(c))
                 if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
         };
-        let nse_decls = if params.context.diagnostics.iter().any(&is_undefined) {
-            state
-                .get_enriched_metadata(&uri)
-                .map(|m| m.nse_declarations.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // Each entry is `(declaration, file_level)`: own (current-file)
+        // declarations are `false`; foreign declarations propagated from connected
+        // files (issue #460) are `true` and govern regardless of line. Built once
+        // per request, only when an undefined diagnostic is present, so the
+        // lightbulb steps aside in lockstep with the foreign-aware hint.
+        let nse_decls: Vec<(crate::cross_file::types::NseDeclaration, bool)> =
+            if params.context.diagnostics.iter().any(&is_undefined) {
+                let mut v: Vec<_> = state
+                    .get_enriched_metadata(&uri)
+                    .map(|m| {
+                        m.nse_declarations
+                            .iter()
+                            .cloned()
+                            .map(|d| (d, false))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(snapshot) = handlers::DiagnosticsSnapshot::build(&state, &uri) {
+                    let foreign = handlers::collect_cross_file_nse(&snapshot, &uri);
+                    v.extend(foreign.nse.into_iter().map(|d| (d, true)));
+                }
+                v
+            } else {
+                Vec::new()
+            };
         for diag in &params.context.diagnostics {
             if !is_undefined(diag) {
                 continue;
@@ -5761,8 +5778,8 @@ impl LanguageServer for Backend {
                 if handlers::nse_directive_governs(
                     nse_decls
                         .iter()
-                        .filter(|d| d.name == bare)
-                        .map(|d| (d.package.as_deref(), d.line)),
+                        .filter(|(d, _)| d.name == bare)
+                        .map(|(d, file_level)| (d.package.as_deref(), d.line, *file_level)),
                     call_pkg,
                     fix.insert_line,
                 ) {
