@@ -31,7 +31,7 @@ files = ["tests/**/*.R"]
 lineLength = 120
 
 [crossFile]
-# tighter than the default of 20
+# tighter than the default of 64
 maxChainDepth = 10
 
 [packages]

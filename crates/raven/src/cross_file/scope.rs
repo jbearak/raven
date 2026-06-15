@@ -6731,9 +6731,12 @@ where
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
-        // Per-stream forward-child memo (issue #472). Created before the prefix
-        // pre-computation so the queried URI's backward-walk forward-source
-        // expansions populate the same memo the forward sweep later reads.
+        // Per-stream forward-child memo (issue #472), shared across the forward
+        // sweep's `resolve_source_contribution` calls. The prefix
+        // pre-computation below deliberately does NOT use this memo —
+        // `compute_or_get_cached_prefix` resolves prefixes at a canonical
+        // depth-0 origin and uses its own ephemeral memo to avoid polluting this
+        // actual-depth one (see its doc comment).
         let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
 
         // Pre-compute both prefix slots through the shared cache.
