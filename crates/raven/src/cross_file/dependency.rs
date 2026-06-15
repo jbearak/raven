@@ -551,6 +551,12 @@ pub struct DependencyGraph {
     visited_budget_truncations: std::sync::atomic::AtomicU64,
     /// Counter of traversals truncated by max-depth limits.
     depth_truncations: std::sync::atomic::AtomicU64,
+    /// Memoized "does this graph contain any source cycle" answer, tagged with
+    /// the `edge_revision` it was computed at. Consumed by the forward-child
+    /// scope memo (issue #472), which must disable itself on cyclic graphs
+    /// because a child's resolved scope is only a pure function of its key when
+    /// no cycle is reachable from it. Recomputed on edge-revision change.
+    any_cycle_cache: std::sync::RwLock<Option<(u64, bool)>>,
 }
 
 impl Default for DependencyGraph {
@@ -571,6 +577,7 @@ impl Default for DependencyGraph {
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
+            any_cycle_cache: std::sync::RwLock::new(None),
         }
     }
 }
@@ -597,6 +604,7 @@ impl Clone for DependencyGraph {
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
+            any_cycle_cache: std::sync::RwLock::new(None),
         }
     }
 }
@@ -1034,6 +1042,7 @@ impl DependencyGraph {
             subgraph_cache_hits: std::sync::atomic::AtomicU64::new(0),
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
+            any_cycle_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -1635,6 +1644,85 @@ impl DependencyGraph {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether this graph contains **any** `source()` cycle.
+    ///
+    /// Used by the forward-child scope memo (issue #472): a child file's
+    /// resolved scope is only a pure function of its memo key
+    /// `(child_uri, path_fp, pkg_fp)` when no cycle is reachable from it. A
+    /// cycle anywhere in the child's neighborhood (including its *backward*
+    /// parent walk) makes parts of the scope (e.g. the visited-order `chain`,
+    /// and potentially the parent-prefix symbol set) depend on traversal state,
+    /// so the memo must disable itself on cyclic graphs. Computing this once
+    /// (cached by `edge_revision`) lets the resolver gate cheaply.
+    ///
+    /// Iterative 3-color DFS over forward edges; `O(V + E)` on a miss, `O(1)`
+    /// on a hit.
+    pub fn contains_cycle(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let revision = self.edge_revision.load(Ordering::Acquire);
+        if let Ok(guard) = self.any_cycle_cache.read()
+            && let Some((cached_rev, cached)) = *guard
+            && cached_rev == revision
+        {
+            return cached;
+        }
+
+        // 3-color DFS: White (unseen), Gray (on stack), Black (done). A forward
+        // edge into a Gray node is a back-edge → cycle.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            Gray,
+            Black,
+        }
+        let mut color: HashMap<&Url, Color> = HashMap::new();
+        let mut found = false;
+        // Rooting over `self.forward.keys()` is complete: every node on a cycle
+        // has an outgoing edge that continues the cycle, so it appears as a
+        // `forward` key. `update_file` records both `source()` and
+        // backward-directive edges in `forward` (see
+        // `test_backward_directive_creates_edge`), so no cycle-capable node is
+        // reachable only through the `backward` map.
+        // Stack frames: (node, index-of-next-child-to-visit).
+        'outer: for root in self.forward.keys() {
+            if color.contains_key(root) {
+                continue;
+            }
+            let mut stack: Vec<(&Url, usize)> = vec![(root, 0)];
+            color.insert(root, Color::Gray);
+            while let Some(&(node, idx)) = stack.last() {
+                let next = self.forward.get(node).and_then(|e| e.get(idx));
+                match next {
+                    Some(edge) => {
+                        if let Some(top) = stack.last_mut() {
+                            top.1 += 1;
+                        }
+                        let to = &edge.to;
+                        match color.get(to) {
+                            Some(Color::Gray) => {
+                                found = true;
+                                break 'outer;
+                            }
+                            Some(Color::Black) => {}
+                            None => {
+                                color.insert(to, Color::Gray);
+                                stack.push((to, 0));
+                            }
+                        }
+                    }
+                    None => {
+                        color.insert(node, Color::Black);
+                        stack.pop();
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut guard) = self.any_cycle_cache.write() {
+            *guard = Some((revision, found));
+        }
+        found
+    }
+
     /// Return the `(neighborhood, subgraph)` pair for `uri`, sharing the
     /// computation across callers via a graph-edge-revisioned cache.
     ///
@@ -1823,20 +1911,23 @@ mod tests {
         Url::from_file_path(temp_dir.path().join(file)).unwrap()
     }
 
+    fn make_source(path: &str, line: u32) -> super::super::types::ForwardSource {
+        super::super::types::ForwardSource {
+            path: path.to_string(),
+            line,
+            column: 0,
+            is_directive: false,
+            local: false,
+            chdir: false,
+            is_sys_source: false,
+            sys_source_global_env: true,
+            ..Default::default()
+        }
+    }
+
     fn make_meta_with_source(path: &str, line: u32) -> CrossFileMetadata {
-        use super::super::types::ForwardSource;
         CrossFileMetadata {
-            sources: vec![ForwardSource {
-                path: path.to_string(),
-                line,
-                column: 0,
-                is_directive: false,
-                local: false,
-                chdir: false,
-                is_sys_source: false,
-                sys_source_global_env: true,
-                ..Default::default()
-            }],
+            sources: vec![make_source(path, line)],
             ..Default::default()
         }
     }
@@ -2658,6 +2749,84 @@ mod tests {
 
         assert!(graph.detect_cycle(&a).is_none());
         assert!(graph.detect_cycle(&b).is_none());
+    }
+
+    #[test]
+    fn test_contains_cycle_acyclic_and_cyclic() {
+        // Acyclic chain a -> b -> c: no cycle.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let c = url("c.R");
+        graph.update_file(
+            &a,
+            &make_meta_with_source("b.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &b,
+            &make_meta_with_source("c.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(!graph.contains_cycle(), "a -> b -> c is acyclic");
+
+        // Close the cycle c -> a. The edge_revision bump must invalidate the
+        // cached `false` answer.
+        graph.update_file(
+            &c,
+            &make_meta_with_source("a.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(
+            graph.contains_cycle(),
+            "adding c -> a must flip the cached contains_cycle answer"
+        );
+    }
+
+    #[test]
+    fn test_contains_cycle_self_loop() {
+        // A file that sources itself is a 1-node cycle.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        graph.update_file(
+            &a,
+            &make_meta_with_source("a.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(graph.contains_cycle(), "self-source is a cycle");
+    }
+
+    #[test]
+    fn test_contains_cycle_diamond_is_acyclic() {
+        // Diamond a -> b, a -> c, b -> d, c -> d: shared descendant, no cycle.
+        // Guards against a naive visited-set check mistaking a re-reached node
+        // for a back-edge.
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+        let c = url("c.R");
+        let meta_a = CrossFileMetadata {
+            sources: vec![make_source("b.R", 1), make_source("c.R", 2)],
+            ..Default::default()
+        };
+        graph.update_file(&a, &meta_a, Some(&workspace_root()), |_| None);
+        graph.update_file(
+            &b,
+            &make_meta_with_source("d.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &c,
+            &make_meta_with_source("d.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(!graph.contains_cycle(), "diamond DAG is acyclic");
     }
 
     #[test]

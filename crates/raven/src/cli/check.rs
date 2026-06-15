@@ -401,6 +401,18 @@ pub async fn run(args: CheckArgs) -> i32 {
         );
     }
 
+    // Surface cross-file traversal-budget exhaustion (issue #473). The owned
+    // `state.cross_file_graph` accumulates these counters across every target's
+    // diagnostic pass (neighborhood collection records on the full graph), so
+    // reading them after the loop reflects the whole run. When a budget is hit
+    // the resolver silently stops following `source()` edges, so some
+    // "Undefined variable" warnings above may be false positives — say so, on
+    // stderr, so CI output is not misleading. The editor surfaces the same via
+    // a throttled `window/showMessage`; `raven check` had no equivalent.
+    if let Some(note) = format_traversal_budget_note(&state) {
+        eprintln!("{note}");
+    }
+
     // Operator error takes priority over a threshold breach: a half-read run
     // shouldn't masquerade as a clean (or merely failing) lint result.
     if operator_error {
@@ -844,6 +856,47 @@ fn format_missing_export_metadata_warning(
     }
 }
 
+/// Build the cross-file traversal-budget note for `raven check`, or `None` if
+/// no traversal was truncated (issue #473).
+///
+/// Two independent budgets can truncate cross-file analysis: the visited-node
+/// budget (`maxTransitiveDependentsVisited`), recorded by the neighborhood walk
+/// on the full graph; and the chain-depth limit (`maxChainDepth`) on the
+/// bidirectional neighborhood walk (resolver-level depth exceedances also
+/// surface per-site as `depth_exceeded` diagnostics). Either truncation can drop
+/// `source()` edges, so dropped symbols may appear as false-positive
+/// `undefined-variable` warnings. The note tells the user which budget to raise
+/// so a budget-induced drop is distinguishable from a genuine undefined variable
+/// in CI.
+fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<String> {
+    let visited_trunc = state.cross_file_graph.visited_budget_truncations();
+    let depth_trunc = state.cross_file_graph.depth_truncations();
+    if visited_trunc == 0 && depth_trunc == 0 {
+        return None;
+    }
+    let mut lines = Vec::new();
+    if visited_trunc > 0 {
+        let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+        lines.push(format!(
+            "raven check: a bounded cross-file neighborhood traversal was truncated \
+             (maxTransitiveDependentsVisited = {max_visited}); some source() edges were \
+             not followed, so some \"Undefined variable\" warnings above may be false \
+             positives. Raise `crossFile.maxTransitiveDependentsVisited` in raven.toml to \
+             analyze more files."
+        ));
+    }
+    if depth_trunc > 0 {
+        let max_chain_depth = state.cross_file_config.max_chain_depth;
+        lines.push(format!(
+            "raven check: a cross-file traversal hit the depth limit \
+             (maxChainDepth = {max_chain_depth}); some deeply-nested source() edges were \
+             not followed. Raise `crossFile.maxChainDepth` in raven.toml to analyze deeper \
+             dependency chains."
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 /// Run the full diagnostic pipeline for one already-opened document. Returns an
 /// empty vec when the snapshot can't be built (parse failure or document not
 /// open). A malformed file is not an operator error here — its reportable
@@ -948,6 +1001,42 @@ mod tests {
 
         let default = parse_args(std::iter::empty()).unwrap();
         assert!(!default.report_uninstalled);
+    }
+
+    #[test]
+    fn traversal_budget_note_none_when_no_truncation() {
+        let state = crate::state::WorldState::new();
+        assert!(super::format_traversal_budget_note(&state).is_none());
+    }
+
+    #[test]
+    fn traversal_budget_note_fires_on_visited_truncation() {
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use url::Url;
+
+        let mut state = crate::state::WorldState::new();
+        state.cross_file_config.max_transitive_dependents_visited = 1;
+        let root = Url::parse("file:///p").unwrap();
+        let a = Url::parse("file:///p/a.R").unwrap();
+        let meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "b.R".to_string(),
+                line: 1,
+                column: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state
+            .cross_file_graph
+            .update_file(&a, &meta, Some(&root), |_| None);
+        // A budget of 1 with an a -> b edge truncates the neighborhood walk.
+        let _ = state.cross_file_graph.collect_neighborhood(&a, 64, 1);
+
+        let note = super::format_traversal_budget_note(&state)
+            .expect("a truncated traversal must produce a note");
+        assert!(note.contains("maxTransitiveDependentsVisited = 1"));
+        assert!(note.contains("may be false"));
     }
 
     #[test]

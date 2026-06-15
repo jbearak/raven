@@ -612,6 +612,15 @@ impl Default for WorldState {
 }
 
 impl WorldState {
+    /// Absolute ceiling on the multi-seed neighborhood-traversal budget,
+    /// independent of the configured `max_transitive_dependents_visited`. Both
+    /// multi-seed walks (`build_package_scope_snapshot` and
+    /// `recompute_open_neighborhood_pins`) scale the budget by open-doc count
+    /// and cap it here, so the raised #473 default (50_000) cannot drive a walk
+    /// to millions of nodes when many files are open. Far above any real
+    /// workspace's file count, so it never trims coverage in practice.
+    const MULTI_SEED_VISITED_CEILING: usize = 200_000;
+
     /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
     ///
     /// The returned state is populated with:
@@ -760,9 +769,22 @@ impl WorldState {
         // Scale the shared visited budget with seed count so workspaces with many
         // open files retain coverage equivalent to the old per-seed loop, capped to
         // bound lock-hold time when the user has hundreds of files open.
+        //
+        // Two ceilings apply, whichever is smaller. The relative one
+        // (`max_visited * 50`) caps the per-seed-count scaling. The absolute one
+        // (`MULTI_SEED_VISITED_CEILING`) bounds total nodes regardless of the
+        // configured budget, so the raised default of
+        // `max_transitive_dependents_visited` (issue #473 lifted it from 2_000 to
+        // 50_000) cannot push the multi-seed walk to 2.5M nodes — an unnecessary
+        // latency/memory cliff. At the new default the absolute ceiling binds once
+        // `docs.len() >= 4`; 200_000 still far exceeds any real workspace's file
+        // count (the neighborhood is naturally bounded by it), so it never trims
+        // coverage in practice. The same ceiling guards
+        // `recompute_open_neighborhood_pins`, the other multi-seed walk.
         let effective_max_visited = max_visited
             .saturating_mul(docs.len().max(1))
-            .min(max_visited.saturating_mul(50));
+            .min(max_visited.saturating_mul(50))
+            .min(Self::MULTI_SEED_VISITED_CEILING);
 
         let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
             docs.iter().map(|(uri, _)| uri.clone()),
@@ -825,11 +847,14 @@ impl WorldState {
 
         let max_depth = self.cross_file_config.max_chain_depth;
         let max_visited = self.cross_file_config.max_transitive_dependents_visited;
-        // Same scaling as build_package_scope_snapshot: bound lock-hold time
-        // while preserving coverage equivalent to the per-seed loop.
+        // Same scaling AND absolute ceiling as build_package_scope_snapshot:
+        // bound lock-hold time while preserving per-seed coverage. The absolute
+        // ceiling matters with the raised default (issue #473): 50 open files at
+        // the 50_000 default would otherwise allow a 2.5M-node walk.
         let effective_max_visited = max_visited
             .saturating_mul(open_uris.len().max(1))
-            .min(max_visited.saturating_mul(50));
+            .min(max_visited.saturating_mul(50))
+            .min(Self::MULTI_SEED_VISITED_CEILING);
 
         let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
             open_uris.iter().cloned(),

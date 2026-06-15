@@ -248,6 +248,20 @@ The `raven.crossFile.backwardDependencies` setting controls how Raven discovers 
 
 See [Configuration](configuration.md) for the setting.
 
+### Traversal budgets in large workspaces
+
+Cross-file resolution walks the `source()` dependency graph under two safety budgets that bound analysis cost on pathologically dense graphs:
+
+- **`raven.crossFile.maxTransitiveDependentsVisited`** (default `50000`) — the maximum number of files visited while building a file's dependency neighborhood.
+- **`raven.crossFile.maxChainDepth`** (default `64`) — the maximum traversal depth.
+
+The defaults are sized so realistic workspaces never reach them (the neighborhood is naturally bounded by the workspace's file count). If a workspace is large and dense enough to exhaust a budget, Raven stops following some `source()` edges, and the symbols those files define can surface as **false-positive `undefined-variable` warnings**. When that happens:
+
+- In the editor, Raven shows a throttled warning naming the setting to raise.
+- `raven check` prints a one-line note to stderr (so budget-induced drops are distinguishable from genuine undefined variables in CI).
+
+Raise the relevant setting in `raven.toml` to analyze more of the graph. See [Configuration](configuration.md).
+
 ### Path Resolution
 
 When Raven resolves a relative path to another file, the base directory depends on where the path came from:
