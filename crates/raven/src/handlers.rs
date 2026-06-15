@@ -15084,7 +15084,7 @@ fn resolve_call_arg_policy(
             }
             // Precise built-in policy table next.
             if let Some(p) = table_verb_policy(func, text, analysis) {
-                return p;
+                return upgrade_plyr_ply_dots(call_node, n, text, analysis, p);
             }
             // Issue #460: a foreign qualified directive (file-level) is consulted
             // below the table so it cannot clobber a precise built-in policy.
@@ -15159,7 +15159,7 @@ fn resolve_call_arg_policy(
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
     // owner resolution).
     if let Some(policy) = table_verb_policy(func, text, analysis) {
-        return policy;
+        return upgrade_plyr_ply_dots(call_node, name, text, analysis, policy);
     }
     // 3.6 (issue #460). A file-level `# raven: nse` directive propagated from a
     // connected file governs this callee — consulted BELOW own directives, local
@@ -15202,6 +15202,130 @@ fn resolve_call_arg_policy(
     }
     // 6. Unresolved: suppress arguments.
     ArgPolicy::WholeCall
+}
+
+/// Issue #467: plyr's `*ply` split-apply verbs forward their `...` to `.fun`
+/// (plyr calls `.fun(piece, ...)` per slice). When `.fun` resolves to a
+/// data-masking verb (its policy captures its dots), those forwarded `...` are
+/// evaluated in each slice's data mask, so the `*ply` call's dots-bound
+/// arguments are columns, not free variables — and must be suppressed. This
+/// upgrades the base `*ply` policy (which captures nothing — see the `*ply` arm
+/// of [`crate::nse::package_policy`]) to `captured_dots: true` in exactly that
+/// case; otherwise it returns the base policy unchanged, leaving the `...`
+/// checked so a genuine typo with an ordinary `.fun` is still flagged.
+///
+/// Gated to the recognized `*ply` callees ([`crate::nse::is_plyr_split_apply_verb`])
+/// so it never touches another package's `PerFormal` policy. `.fun` is located
+/// by R's named-then-positional matching (reusing [`crate::nse::suppressed_arguments`]
+/// so it cannot drift from the call-site rules) and resolved shadow-aware. This
+/// is inherently a call-site decision (it depends on `.fun`, an argument), so it
+/// lives here rather than in the pure `package_policy` table.
+fn upgrade_plyr_ply_dots<'tree>(
+    call_node: Node<'tree>,
+    name: &str,
+    text: &str,
+    analysis: &NseAnalysis,
+    policy: crate::nse::ArgPolicy,
+) -> crate::nse::ArgPolicy {
+    use crate::nse::ArgPolicy;
+    if !crate::nse::is_plyr_split_apply_verb(name) {
+        return policy;
+    }
+    let ArgPolicy::PerFormal {
+        formals, captured, ..
+    } = &policy
+    else {
+        return policy;
+    };
+    let Some(args) = call_node.child_by_field_name("arguments") else {
+        return policy;
+    };
+    // Locate the `.fun` argument by the verb's own formal order. A pipe supplies
+    // the leading `.data`, shifting positional matching, so thread `pipe_fed`.
+    let pipe_fed = call_is_pipe_fed(call_node, text);
+    let probe = ArgPolicy::PerFormal {
+        formals: formals.clone(),
+        captured: vec![".fun".to_string()],
+        captured_dots: false,
+    };
+    let mut cursor = args.walk();
+    let arg_nodes: Vec<Node<'tree>> = args
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "argument")
+        .collect();
+    let labels: Vec<Option<&str>> = arg_nodes
+        .iter()
+        .map(|a| a.child_by_field_name("name").map(|n| node_text(n, text)))
+        .collect();
+    let mask = crate::nse::suppressed_arguments(&probe, &labels, pipe_fed);
+    let Some(fun_value) = arg_nodes
+        .iter()
+        .zip(&mask)
+        .find(|&(_, &suppressed)| suppressed)
+        .and_then(|(arg, _)| arg.child_by_field_name("value"))
+    else {
+        // `.fun` not supplied at this call site (defaults to NULL): no forwarding.
+        return policy;
+    };
+    if fun_resolves_to_data_masking_verb(fun_value, text, analysis) {
+        ArgPolicy::PerFormal {
+            formals: formals.clone(),
+            captured: captured.clone(),
+            captured_dots: true,
+        }
+    } else {
+        policy
+    }
+}
+
+/// Whether a plyr `*ply` `.fun` argument value resolves to a verb whose NSE
+/// policy data-masks its `...` (`captured_dots: true`) — the condition under
+/// which the forwarded `*ply` `...` are columns. Resolved shadow-aware to match
+/// R's dispatch: a local definition or alias for an identifier `.fun` beats the
+/// package verb; an opaque local binding (e.g. an enclosing formal) shadows the
+/// package verb but its policy is unknown, so it is treated as not-data-masking
+/// (the safe direction — leaves `...` checked, never hides a bug). With no local
+/// binding it is resolved one level deep through the built-in tables
+/// ([`table_verb_policy`]) — the same one-level discipline as the wrapper-dots
+/// inference ([`body_forwards_dots_to_covered_verb`]). Non-identifier `.fun`
+/// values (anonymous functions, strings, computed calls) are not data-masking.
+fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnalysis) -> bool {
+    use crate::nse::ArgPolicy;
+    let policy = match value.kind() {
+        "identifier" => {
+            let key = crate::r_names::canonical_use_name(node_text(value, text));
+            if let Some(local) = analysis.local_function_policies.get(key) {
+                local.clone()
+            } else if let Some(alias) = analysis.local_callee_aliases.get(key) {
+                match alias {
+                    LocalCalleeAlias::Qualified { package, name } => {
+                        crate::nse::package_policy(package, name).unwrap_or(ArgPolicy::Standard)
+                    }
+                    // Opaque callable whose policy we cannot prove.
+                    LocalCalleeAlias::Unknown => return false,
+                }
+            } else if analysis.local_callee_shadows.contains(key) {
+                return false;
+            } else {
+                match table_verb_policy(value, text, analysis) {
+                    Some(p) => p,
+                    None => return false,
+                }
+            }
+        }
+        "namespace_operator" => match table_verb_policy(value, text, analysis) {
+            Some(p) => p,
+            None => return false,
+        },
+        _ => return false,
+    };
+    matches!(
+        policy,
+        ArgPolicy::PerFormal {
+            captured_dots: true,
+            ..
+        }
+    )
 }
 
 /// Resolve a `subset` (`[`) / `subset2` (`[[`) node's index policy (issue #398
@@ -25825,19 +25949,21 @@ clean_data <- function(x) {
     }
 
     /// Issue: plyr's `.()` quoting helper. With plyr loaded, `ddply` resolves
-    /// as a no-policy export (standard-eval) and descends into its arguments;
-    /// the nested `.(iso, yearY)` call must suppress the quoted column names.
-    /// Before `package_policy("plyr", ".")` existed, `.` also resolved as a
-    /// no-policy export and was treated as standard-eval, so `iso`/`yearY` were
-    /// flagged as undefined (false positives). A synthetic package keeps the
-    /// test immune to package-database contents.
+    /// to its base per-formal policy (issue #467) — behaviorally standard-eval
+    /// at this call site, since `.fun` is `function(x) x` (not a data-masking
+    /// verb, so the `...` are not suppressed) — and descends into its
+    /// arguments; the nested `.(iso, yearY)` call must suppress the quoted
+    /// column names. Before `package_policy("plyr", ".")` existed, `.` resolved
+    /// as a no-policy export and was treated as standard-eval, so `iso`/`yearY`
+    /// were flagged as undefined (false positives). A synthetic package keeps
+    /// the test immune to package-database contents.
     ///
     /// The data-frame argument is itself an *undefined* symbol whose flag is
-    /// asserted: this pins the scoping boundary. `ddply` stays standard-eval
-    /// (deliberately unmodeled), so it must still descend into and check its
-    /// non-`.()` arguments — only the nested `.()` call suppresses. A
-    /// regression that wrongly gave `ddply` a `WholeCall` policy (over-
-    /// suppressing every argument) would hide this flag and fail the test.
+    /// asserted: this pins the scoping boundary. `ddply`'s base policy captures
+    /// nothing here, so it must still descend into and check its non-`.()`
+    /// arguments — only the nested `.()` call suppresses. A regression that
+    /// wrongly gave `ddply` a `WholeCall` policy (over-suppressing every
+    /// argument) would hide this flag and fail the test.
     #[tokio::test]
     async fn nse_plyr_dot_quotes_columns_in_ddply_end_to_end() {
         use crate::package_library::PackageInfo;
@@ -25906,14 +26032,310 @@ clean_data <- function(x) {
                 .any(|m| m.contains("Undefined variable: yearY")),
             "`.(.., yearY)` must suppress the quoted column `yearY`; messages: {messages:?}"
         );
-        // Scoping boundary: `ddply` stays standard-eval and must still check
-        // its data-frame argument, so the undefined `undefined_df_arg` IS
-        // flagged. This fails if `ddply` were wrongly given a WholeCall policy.
+        // Scoping boundary: `ddply`'s base policy still checks its data-frame
+        // argument, so the undefined `undefined_df_arg` IS flagged. This fails
+        // if `ddply` were wrongly given a WholeCall policy.
         assert!(
             messages
                 .iter()
                 .any(|m| m.contains("Undefined variable: undefined_df_arg")),
             "`ddply`'s data argument must stay checked (standard-eval); messages: {messages:?}"
+        );
+    }
+
+    /// Collect undefined-variable diagnostic messages for `code` against a
+    /// synthetic `plyr` package exporting `exports`, mirroring the harness of
+    /// `nse_plyr_dot_quotes_columns_in_ddply_end_to_end`. Shared by the issue
+    /// #467 `*ply` data-mask tests below; a synthetic package keeps them immune
+    /// to package-database contents.
+    #[cfg(test)]
+    async fn plyr_undefined_messages(code: &str, exports: &[&str]) -> Vec<String> {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let export_set: std::collections::HashSet<String> =
+            exports.iter().map(|e| (*e).to_string()).collect();
+        state
+            .package_library
+            .insert_package(PackageInfo::new("plyr".to_string(), export_set))
+            .await;
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        diagnostics.iter().map(|d| d.message.clone()).collect()
+    }
+
+    /// Issue #467: in `ddply(df, .(year), summarise, n = length(unique(team)))`
+    /// plyr forwards the `...` to `summarise`, which evaluates them in each
+    /// slice's data mask — so `team` is a column, not a free variable. Because
+    /// `summarise` resolves to a dots-capturing (data-masking) policy, the
+    /// `*ply` `...` are suppressed. The `.data` argument stays checked (the
+    /// scoping boundary), and `.(year)`'s column is suppressed by `.()` (#466).
+    #[tokio::test]
+    async fn nse_plyr_ddply_summarise_forwards_data_masked_dots_end_to_end() {
+        let code = "library(plyr)\n\
+                    out <- ddply(undefined_df_arg, .(year), summarise, n = length(unique(team)))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: team")),
+            "`summarise` data-masks the forwarded `...`, so `team` must not be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: year")),
+            "`.(year)` must suppress the quoted column `year`; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_df_arg")),
+            "`ddply`'s `.data` argument must stay checked; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467, the complementary shape: with an ordinary `.fun` (`nrow`, not
+    /// a data-masking verb) the forwarded `...` are NOT data-masked, so a
+    /// genuine typo among them must still be flagged. A blanket `...`
+    /// suppression on `ddply` would wrongly hide this.
+    #[tokio::test]
+    async fn nse_plyr_ddply_ordinary_fun_keeps_dots_checked_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .(year), nrow, extra = undefined_typo)\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_typo")),
+            "an ordinary `.fun` leaves the forwarded `...` checked, so the typo must be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: `transform` is base R's data-masking verb — it resolves via
+    /// `base_policy` (not the plyr table), exercising the policy-driven `.fun`
+    /// detection through a different resolution path than `plyr::summarise`.
+    #[tokio::test]
+    async fn nse_plyr_ddply_transform_forwards_data_masked_dots_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .(year), transform, doubled = raw_col * 2)\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: raw_col")),
+            "`transform` data-masks the forwarded `...`, so `raw_col` must not be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: `llply(.data, .fun, ...)` puts `.fun` at the 2nd position
+    /// (vs `ddply`'s 3rd) — pins that the forwarded-dots upgrade locates `.fun`
+    /// by each verb's own formal order, not a fixed position.
+    #[tokio::test]
+    async fn nse_plyr_llply_summarise_locates_fun_at_second_position_end_to_end() {
+        let code = "library(plyr)\n\
+                    llply(undefined_input, summarise, total = sum(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &["llply", "summarise"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "`summarise` as `llply`'s 2nd-position `.fun` must data-mask the `...`; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_input")),
+            "`llply`'s `.data` must stay checked; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: a locally-defined `summarise` shadows the plyr verb, so plyr
+    /// would call the local function (which does not data-mask). The forwarded
+    /// `...` must stay checked, so a typo is still flagged — the upgrade honors
+    /// local shadowing rather than blindly trusting the bare `.fun` name.
+    #[tokio::test]
+    async fn nse_plyr_ddply_locally_shadowed_fun_keeps_dots_checked_end_to_end() {
+        let code = "library(plyr)\n\
+                    summarise <- function(x) nrow(x)\n\
+                    ddply(some_df, .(year), summarise, undefined_typo)\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_typo")),
+            "a locally-shadowed `.fun` does not data-mask, so the typo must be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: a pipe supplies `.data` implicitly, shifting `.fun` one
+    /// position left. `some_df %>% ddply(.(g), summarise, n = mean(value_col))`
+    /// must still locate `.fun` (via the threaded `pipe_fed`) and data-mask the
+    /// forwarded `...`.
+    #[tokio::test]
+    async fn nse_plyr_ddply_pipe_fed_locates_fun_end_to_end() {
+        let code = "library(plyr)\n\
+                    some_df %>% ddply(.(g), summarise, n = mean(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "a piped `.fun` (summarise) must still data-mask the forwarded `...`; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: a namespace-qualified data-masking `.fun` (`plyr::summarise`)
+    /// resolves through the qualified arm of `fun_resolves_to_data_masking_verb`
+    /// and still suppresses the forwarded `...`.
+    #[tokio::test]
+    async fn nse_plyr_ddply_qualified_fun_forwards_data_masked_dots_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .(year), plyr::summarise, n = length(unique(team)))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: team")),
+            "`plyr::summarise` as `.fun` must data-mask the forwarded `...`; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: the post-`...` control formals in `plyr_split_apply_formals`
+    /// are load-bearing. Even when `.fun` is data-masking (so `captured_dots`
+    /// is upgraded to true), a NAMED control argument such as `.drop = bad_typo`
+    /// matches its enumerated formal and stays CHECKED — it is not absorbed by
+    /// `...`. Dropping the control formals from the list would silently suppress
+    /// it, hiding a real undefined-variable bug. (A bare identifier is a
+    /// contrived `.drop` value, but a logical literal would not surface a
+    /// diagnostic; the point is to exercise the formal-vs-dots mask.) The
+    /// genuinely data-masked `n = mean(value_col)` stays suppressed, proving the
+    /// upgrade did fire — so this isolates the control-formal exemption.
+    #[tokio::test]
+    async fn nse_plyr_ddply_named_control_formal_stays_checked_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .(g), summarise, .drop = bad_typo, n = mean(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: bad_typo")),
+            "a named control formal (`.drop`) stays checked even when `.fun` data-masks; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "the genuinely data-masked `...` column must still be suppressed (proves the upgrade fired); messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: `.fun` supplied BY NAME (`.fun = summarise`) is located via
+    /// the named-matching pass of `per_formal_mask` and its value extracted from
+    /// a named-argument node — a distinct path from the positional `.fun` the
+    /// other tests exercise.
+    #[tokio::test]
+    async fn nse_plyr_ddply_named_fun_argument_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .variables = .(g), .fun = summarise, n = mean(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "a named `.fun = summarise` must still be located and data-mask the `...`; messages: {messages:?}"
         );
     }
 

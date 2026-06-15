@@ -35,8 +35,10 @@
 //! target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes`
 //! step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`),
 //! `tidytext`/`modelr`/`drake` column- and target-name captures, rlang capture
-//! helpers, the plyr `.()` quoting helper, and a few established DSLs); it is
-//! intentionally extensible rather
+//! helpers, the plyr `.()` quoting helper and `*ply` split-apply verbs (whose
+//! `...` are suppressed only when `.fun` is a data-masking verb — see
+//! `is_plyr_split_apply_verb` and the call-site upgrade in `handlers.rs`), and a
+//! few established DSLs); it is intentionally extensible rather
 //! than exhaustive. A handful of large, uniform export families
 //! (`recipes::step_*`, `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name
 //! prefix rather than enumerated, since every member shares one empirically
@@ -404,17 +406,218 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             // re-evaluated later in the split-apply data mask (the
             // `.variables` of `ddply`/`dlply`/`daply`/...), never a free
             // reference. It is the plyr analog of `rlang::quos` / base
-            // `alist`, so suppress the whole call. The split-apply verbs
-            // themselves (`ddply`, `llply`, ...) are deliberately NOT
-            // modeled: they stay standard-eval, descending into their
-            // arguments, and the nested `.()` call suppresses the quoted
-            // columns on its own. Verified against plyr 1.8.9 + R 4.6.0.
+            // `alist`, so suppress the whole call. Verified against plyr 1.8.9.
             "." => ArgPolicy::WholeCall,
-            _ => return None,
+            // plyr's own data-masking verbs evaluate their `...` in a per-group
+            // data mask (formals `.data, ...`), like the dplyr verbs of the same
+            // name (`summarize` is an identical alias of `summarise`). Modeled so
+            // both direct calls (`summarise(df, x = mean(y))`) AND use as a
+            // split-apply `.fun` resolve to a dots-capturing policy. Verified
+            // against plyr 1.8.9 + R 4.6.0.
+            "summarise" | "summarize" | "mutate" => {
+                ArgPolicy::per_formal(&[".data", "..."], &[], true)
+            }
+            // The `*ply` split-apply verbs (issue #467) forward their `...` to
+            // `.fun` — plyr calls `.fun(piece, ...)` per slice. The BASE policy
+            // captures nothing (`.data`/`.variables`/`.margins`/`.fun` and the
+            // `...` all checked, behaviorally Standard); it carries the
+            // empirically verified formal order only so the call site can locate
+            // `.fun` and `...`. `handlers.rs` upgrades `captured_dots` to true at
+            // a call site when `.fun` resolves to a data-masking verb (the only
+            // case in which the forwarded `...` are columns). For `d*ply`,
+            // `.variables` is typically a `.()` call whose quoted columns the
+            // `WholeCall` arm above already suppresses (#466).
+            _ => match plyr_split_apply_formals(name) {
+                Some(formals) => ArgPolicy::per_formal(formals, &[], false),
+                None => return None,
+            },
         },
         _ => return None,
     };
     Some(policy)
+}
+
+/// The empirically verified formal order of each plyr `*ply` split-apply verb
+/// (the `a*`/`d*`/`l*`/`m*` families), or `None` for any other name. The
+/// `r*ply` family (`raply`/`rdply`/`rlply`/`r_ply`) is intentionally absent: it
+/// takes `.n, .expr` rather than `.fun`, so the `.fun`-forwarding model does not
+/// apply and it stays standard-eval. This is the single source of truth for
+/// [`is_plyr_split_apply_verb`] and the `*ply` arm of [`package_policy`], so the
+/// recognition predicate and the formal order it consumes cannot drift. The
+/// post-`...` control formals are listed so a named control argument
+/// (`.drop = FALSE`, `.parallel = TRUE`) matches its formal and is not absorbed
+/// as a captured dot when `.fun` is data-masking. Verified vs plyr 1.8.9 + R 4.6.0.
+fn plyr_split_apply_formals(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        // a*ply: `(.data, .margins, .fun, ...)` — `.fun` is the 3rd formal.
+        "aaply" => &[
+            ".data",
+            ".margins",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".drop",
+            ".parallel",
+            ".paropts",
+        ],
+        "adply" => &[
+            ".data",
+            ".margins",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".parallel",
+            ".paropts",
+            ".id",
+        ],
+        "alply" => &[
+            ".data",
+            ".margins",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".parallel",
+            ".paropts",
+            ".dims",
+        ],
+        "a_ply" => &[
+            ".data",
+            ".margins",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".print",
+            ".parallel",
+            ".paropts",
+        ],
+        // d*ply: `(.data, .variables, .fun, ...)` — `.fun` is the 3rd formal.
+        "daply" => &[
+            ".data",
+            ".variables",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".drop_i",
+            ".drop_o",
+            ".parallel",
+            ".paropts",
+        ],
+        "ddply" | "dlply" => &[
+            ".data",
+            ".variables",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".drop",
+            ".parallel",
+            ".paropts",
+        ],
+        "d_ply" => &[
+            ".data",
+            ".variables",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".drop",
+            ".print",
+            ".parallel",
+            ".paropts",
+        ],
+        // l*ply: `(.data, .fun, ...)` — `.fun` is the 2nd formal.
+        "laply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".drop",
+            ".parallel",
+            ".paropts",
+        ],
+        "ldply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".parallel",
+            ".paropts",
+            ".id",
+        ],
+        "llply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".parallel",
+            ".paropts",
+        ],
+        "l_ply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".progress",
+            ".inform",
+            ".print",
+            ".parallel",
+            ".paropts",
+        ],
+        // m*ply: `(.data, .fun, ...)` — `.fun` is the 2nd formal.
+        "maply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".drop",
+            ".parallel",
+            ".paropts",
+        ],
+        "mdply" | "mlply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".parallel",
+            ".paropts",
+        ],
+        "m_ply" => &[
+            ".data",
+            ".fun",
+            "...",
+            ".expand",
+            ".progress",
+            ".inform",
+            ".print",
+            ".parallel",
+            ".paropts",
+        ],
+        _ => return None,
+    })
+}
+
+/// True when `name` is one of plyr's 16 `*ply` split-apply verbs that forward
+/// their `...` to `.fun` (the `a*`/`d*`/`l*`/`m*` families). See
+/// [`plyr_split_apply_formals`] for the excluded `r*ply` family and the
+/// empirical-verification note. Consumed by `handlers.rs` to gate the
+/// call-site `captured_dots` upgrade to plyr `*ply` callees only.
+pub(crate) fn is_plyr_split_apply_verb(name: &str) -> bool {
+    plyr_split_apply_formals(name).is_some()
 }
 
 fn dplyr_policy(name: &str) -> Option<ArgPolicy> {
@@ -2166,9 +2369,15 @@ mod tests {
             ("drake", "readd", PerFormal),
             ("drake", "loadd", None),
             // plyr `.()` is a plural quoting helper -> whole-call capture; the
-            // *ply verbs are deliberately not modeled (standard-eval).
+            // *ply verbs (issue #467) carry a base per-formal policy whose
+            // `...`-suppression is decided per call site by `.fun`.
             ("plyr", ".", WholeCall),
-            ("plyr", "ddply", None),
+            ("plyr", "ddply", PerFormal),
+            ("plyr", "llply", PerFormal),
+            ("plyr", "summarise", PerFormal),
+            ("plyr", "mutate", PerFormal),
+            // r*ply takes `.n, .expr` (no `.fun`) -> deliberately unmodeled.
+            ("plyr", "rdply", None),
             // Unknown package -> always None.
             ("nonesuch", "filter", None),
         ];
@@ -2185,16 +2394,134 @@ mod tests {
     /// .env) structure(as.list(match.call()[-1]), ...)`), so it is a plural
     /// quoting helper like `rlang::quos` / base `alist` — every argument is a
     /// captured variable name, never a free reference. Modeled as `WholeCall`
-    /// so `ddply(df, .(iso, year), f)` does not flag `iso`/`year`. The plyr
-    /// `*ply` verbs themselves stay standard-eval (no policy): they descend
-    /// into their arguments, and the nested `.()` call suppresses the quoted
-    /// columns on its own.
+    /// so `ddply(df, .(iso, year), f)` does not flag `iso`/`year`. (The plyr
+    /// `*ply` verbs now carry a base per-formal policy of their own — issue
+    /// #467 — whose `...`-suppression is decided per call site by `.fun`;
+    /// independently of that, the nested `.()` call suppresses its own quoted
+    /// columns.)
     #[test]
     fn plyr_dot_is_whole_call_quoting_helper() {
         assert_eq!(package_policy("plyr", "."), Some(ArgPolicy::WholeCall));
-        // The split-apply verbs are intentionally unmodeled.
-        assert!(package_policy("plyr", "ddply").is_none());
-        assert!(package_policy("plyr", "llply").is_none());
+        // The `*ply` verbs are now modeled (issue #467) with a base per-formal
+        // policy; their `...`-suppression is decided per call site by `.fun`.
+        assert!(matches!(
+            package_policy("plyr", "ddply"),
+            Some(ArgPolicy::PerFormal { .. })
+        ));
+        assert!(matches!(
+            package_policy("plyr", "llply"),
+            Some(ArgPolicy::PerFormal { .. })
+        ));
+    }
+
+    /// plyr's `summarise`/`summarize`/`mutate` evaluate their `...` in a data
+    /// mask (formals `.data, ...`), so they capture their dots like the dplyr
+    /// verbs of the same name. Modeled so both direct calls
+    /// (`summarise(df, x = mean(y))`) and use as a split-apply `.fun` resolve
+    /// correctly. `summarize` is an identical alias of `summarise`. Verified
+    /// against plyr 1.8.9 + R 4.6.0.
+    #[test]
+    fn plyr_data_masking_verbs_capture_dots() {
+        for name in ["summarise", "summarize", "mutate"] {
+            match package_policy("plyr", name) {
+                Some(ArgPolicy::PerFormal { captured_dots, .. }) => {
+                    assert!(captured_dots, "plyr::{name} must capture its dots");
+                }
+                other => panic!("plyr::{name} should be PerFormal, got {other:?}"),
+            }
+        }
+    }
+
+    /// The 16 plyr `*ply` split-apply verbs (the `a*`/`d*`/`l*`/`m*` families;
+    /// the `r*ply` family takes `.n, .expr` rather than `.fun` and is excluded)
+    /// are modeled with a base per-formal policy that captures nothing: `.data`,
+    /// `.variables`/`.margins`, and `.fun` stay checked, and the trailing `...`
+    /// stay checked unless the call-site `.fun` resolves to a data-masking verb
+    /// (the upgrade in `handlers.rs`). The formals carry `.fun` and `...`.
+    /// Verified against plyr 1.8.9 + R 4.6.0.
+    #[test]
+    fn plyr_split_apply_verbs_base_policy() {
+        for name in [
+            "aaply", "adply", "alply", "a_ply", "daply", "ddply", "dlply", "d_ply", "laply",
+            "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
+        ] {
+            match package_policy("plyr", name) {
+                Some(ArgPolicy::PerFormal {
+                    formals,
+                    captured,
+                    captured_dots,
+                }) => {
+                    assert!(
+                        captured.is_empty(),
+                        "{name}: base policy captures nothing, got {captured:?}"
+                    );
+                    assert!(!captured_dots, "{name}: base policy must not capture dots");
+                    assert!(
+                        formals.iter().any(|f| f == ".fun"),
+                        "{name}: formals must include .fun, got {formals:?}"
+                    );
+                    assert!(
+                        formals.iter().any(|f| f == "..."),
+                        "{name}: formals must include ..., got {formals:?}"
+                    );
+                }
+                other => panic!("plyr::{name} should be PerFormal, got {other:?}"),
+            }
+        }
+    }
+
+    /// `.fun`'s positional index per family, pinning the empirically verified
+    /// signatures: `a*ply`/`d*ply` are `(.data, .margins|.variables, .fun, ...)`
+    /// (index 2); `l*ply`/`m*ply` are `(.data, .fun, ...)` (index 1).
+    #[test]
+    fn plyr_split_apply_fun_formal_position() {
+        let fun_index = |verb: &str| match package_policy("plyr", verb) {
+            Some(ArgPolicy::PerFormal { formals, .. }) => formals.iter().position(|f| f == ".fun"),
+            _ => None,
+        };
+        for v in [
+            "aaply", "adply", "alply", "a_ply", "daply", "ddply", "dlply", "d_ply",
+        ] {
+            assert_eq!(fun_index(v), Some(2), "{v}: .fun at index 2");
+        }
+        for v in [
+            "laply", "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
+        ] {
+            assert_eq!(fun_index(v), Some(1), "{v}: .fun at index 1");
+        }
+    }
+
+    /// `is_plyr_split_apply_verb` recognizes exactly the 16 `*ply` verbs that
+    /// forward `...` to a `.fun` — never the `r*ply` family (no `.fun`), the
+    /// `.()` quoting helper, or the data-masking verbs themselves.
+    #[test]
+    fn is_plyr_split_apply_verb_recognition() {
+        for name in [
+            "aaply", "adply", "alply", "a_ply", "daply", "ddply", "dlply", "d_ply", "laply",
+            "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
+        ] {
+            assert!(
+                is_plyr_split_apply_verb(name),
+                "{name} should be a split-apply verb"
+            );
+        }
+        for name in [
+            "raply",
+            "rdply",
+            "rlply",
+            "r_ply",
+            ".",
+            "summarise",
+            "mutate",
+            "ddplyr",
+            "ply",
+            "",
+        ] {
+            assert!(
+                !is_plyr_split_apply_verb(name),
+                "{name:?} must not be a split-apply verb"
+            );
+        }
     }
 
     // --- §5 attached-package sweep: gt / gtsummary / recipes / dbplyr -----
