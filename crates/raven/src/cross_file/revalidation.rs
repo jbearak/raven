@@ -465,31 +465,43 @@ pub fn invalidate_children_on_parent_wd_change(
 /// edit of `edited_uri`.
 ///
 /// The cross-file scope of any document depends on its parents, its
-/// children, AND its siblings under shared ancestors. Three traversals
-/// together cover every file whose scope-resolution would visit
-/// `edited_uri`:
+/// children, AND its siblings under shared ancestors. The working set is the
+/// **revalidation-consistent set** of `edited_uri`
+/// ([`DependencyGraph::revalidation_consistent_set`]), which performs the two
+/// traversals that together cover every file whose scope-resolution would
+/// visit `edited_uri`:
 ///
 /// 1. **Backward** (`get_transitive_dependents`): every parent that sources
 ///    `edited_uri` directly or transitively consumes its exported
 ///    interface, so their cycle/symbol diagnostics may change.
-/// 2. **Forward** (`get_transitive_dependencies`): every child sourced by
-///    `edited_uri` inherits the parent's scope at the `source()` call site,
-///    so a change to `edited_uri` flips descendants' undefined-variable
-///    diagnostics.
-/// 3. **Sibling subtrees**: for every backward ancestor `A`, walk forward
-///    from `A` to capture `A`'s OTHER descendants — siblings of
-///    `edited_uri` under a shared parent (and their subtrees). Example:
-///    `parent.R` sources `child.R` and then sources `grandchild.R`; the
-///    grandchild's scope at its source() call site includes the child's
-///    exports because `parent.R`'s scope at that point already consumed
-///    them. Editing the child must republish the grandchild even though
-///    they are not directly connected in the graph.
+/// 2. **Forward** (`get_transitive_dependencies_multi_root` over `edited_uri`
+///    plus its backward ancestors): every child sourced by `edited_uri`
+///    inherits the parent's scope at the `source()` call site, so a change to
+///    `edited_uri` flips descendants' undefined-variable diagnostics; and for
+///    every backward ancestor `A`, the same forward walk captures `A`'s OTHER
+///    descendants — siblings of `edited_uri` under a shared parent (and their
+///    subtrees). Example: `parent.R` sources `child.R` and then sources
+///    `grandchild.R`; the grandchild's scope at its source() call site
+///    includes the child's exports because `parent.R`'s scope at that point
+///    already consumed them. Editing the child must republish the grandchild
+///    even though they are not directly connected in the graph.
+///
+/// Sharing [`DependencyGraph::revalidation_consistent_set`] with
+/// [`crate::handlers::collect_cross_file_nse`] gives this function and NSE/func
+/// collection the **identical traversal shape**, so they can no longer drift in
+/// edge-selection logic. The full directed-inverse equivalence additionally
+/// relies on both callers passing matching `max_depth` / `max_visited` budgets
+/// and on the deliberate graph asymmetry — revalidation here runs over the FULL
+/// graph, collection over the TRIMMED subgraph. That asymmetry is safe-direction
+/// (`S_trimmed ⊆ S_full`): collection can only omit a foreign suppression, never
+/// drop a needed revalidation. See the helper's doc and CLAUDE.md "Cross-file
+/// `# raven: nse` / `# raven: func` propagation".
 ///
 /// Returns deduplicated URIs filtered through `is_open`; never includes
 /// `edited_uri` itself. Returns an empty vec if neither `interface_changed`
-/// nor `edges_changed`. The traversals share a single `seen` set so each
-/// URI walks at most once even when multiple paths reach it (e.g. diamond
-/// topologies).
+/// nor `edges_changed`. The two halves of the consistent set are folded
+/// through a single `seen` set here so each URI is emitted at most once even
+/// when multiple paths reach it (e.g. diamond topologies).
 ///
 /// `is_open` is a predicate, not a `&HashSet<Url>`, so callers can reuse
 /// their existing `HashMap<Url, Document>` directly (`|u| state.documents.contains_key(u)`)
@@ -522,19 +534,18 @@ where
             }
         };
 
-    // (1) Backward ancestors of edited_uri.
-    let backward = graph.get_transitive_dependents(edited_uri, max_depth, max_visited);
-    for dep in &backward {
-        push_if_new(dep.clone(), &mut seen, &mut result);
-    }
-
-    // (2 + 3) Forward descendants of edited_uri AND of each backward
-    //         ancestor (sibling subtrees), in a single traversal that shares
-    //         a `visited` set so overlapping subtrees aren't re-walked once
-    //         per ancestor. This is `O(union of all forward subtrees)`
-    //         rather than `O(|ancestors| * subtree)`.
-    let forward_roots = std::iter::once(edited_uri).chain(backward.iter());
-    for dep in graph.get_transitive_dependencies_multi_root(forward_roots, max_depth, max_visited) {
+    // (1) Backward ancestors of edited_uri, then (2 + 3) forward descendants of
+    //     edited_uri AND of each backward ancestor (sibling subtrees). This is
+    //     the revalidation-consistent set — the directed inverse of the
+    //     NSE/func collection set in `collect_cross_file_nse`. Both build their
+    //     working set from `DependencyGraph::revalidation_consistent_set`, so the
+    //     two share the identical traversal shape (full equivalence also needs
+    //     matching budgets + the safe trimmed-vs-full graph asymmetry — see the
+    //     helper's doc). The helper returns ancestors
+    //     first then descendants and does NOT exclude `edited_uri`; `push_if_new`
+    //     dedups via the shared `seen` set and drops `edited_uri` / unopened
+    //     files, matching the historical two-loop behavior exactly.
+    for dep in graph.revalidation_consistent_set(edited_uri, max_depth, max_visited) {
         push_if_new(dep, &mut seen, &mut result);
     }
 
