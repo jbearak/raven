@@ -20072,37 +20072,53 @@ pub fn goto_definition_with_cancel(
             return None;
         }
 
-        // Handle declared symbols (from `# raven: var` or `# raven: func` directives)
-        // For declared symbols, navigate to the directive line (column 0)
-        // If symbol is declared multiple times, use the first declaration by line number
+        // Handle declared symbols (from `# raven: var` / `# raven: func`
+        // directives, or from an `exists("name")` call).
+        // For a directive-declared symbol, navigate to the directive line
+        // (column 0); if declared multiple times, use the first declaration.
+        // For an `exists()`-derived symbol, navigate to the `exists()` call line.
         // Validates: Requirements 8.1, 8.2
         if symbol.is_declared {
             // Get metadata for the symbol's source file to find the first declaration
             if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
-                // Find all declarations of this symbol name (both variables and
-                // functions). This is the DIRECTIVE seam (Seam B, #459):
-                // declarations store the call-site form (bare for a syntactic
-                // name, backtick-wrapped for a non-syntactic one), so match on
-                // `canonical_use_name` of BOTH operands — a redundantly-quoted
-                // `` `my_func` `` use canonicalizes to the bare declared key,
-                // while a required `` `my fn` `` keeps its backticks to match the
-                // wrapped declared key.
+                // Find all directive declarations of this symbol name (both
+                // variables and functions). This is the DIRECTIVE seam (Seam B,
+                // #459): declarations store the call-site form (bare for a
+                // syntactic name, backtick-wrapped for a non-syntactic one), so
+                // match on `canonical_use_name` of BOTH operands — a
+                // redundantly-quoted `` `my_func` `` use canonicalizes to the
+                // bare declared key, while a required `` `my fn` `` keeps its
+                // backticks to match the wrapped declared key.
                 let canonical_name = crate::r_names::canonical_use_name(name);
                 let mut first_line: Option<u32> = None;
+                // Whether the RESOLVED symbol is itself a directive (its line is
+                // a directive line). An `exists()`-derived symbol's line is the
+                // call site, never a directive line — so when a same-name
+                // directive exists *elsewhere* (e.g. after the use, not visible
+                // here), we must NOT redirect to it; navigate to the resolved
+                // `exists()` declaration instead.
+                let mut symbol_line_is_directive = false;
 
-                for decl in &metadata.declared_variables {
+                for decl in metadata
+                    .declared_variables
+                    .iter()
+                    .chain(metadata.declared_functions.iter())
+                {
                     if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
                         first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
-                    }
-                }
-                for decl in &metadata.declared_functions {
-                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
-                        first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
+                        if decl.line == symbol.defined_line {
+                            symbol_line_is_directive = true;
+                        }
                     }
                 }
 
-                // Use the first declaration line, or fall back to symbol's defined_line
-                let definition_line = first_line.unwrap_or(symbol.defined_line);
+                // Directive-derived → first directive line; otherwise (the
+                // resolved symbol came from `exists()`) → its own call line.
+                let definition_line = if symbol_line_is_directive {
+                    first_line.unwrap_or(symbol.defined_line)
+                } else {
+                    symbol.defined_line
+                };
 
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
@@ -53947,12 +53963,14 @@ myvar
         );
     }
 
-    /// The idiomatic guard `if (!exists("apple")) apple <- ...` followed by a
-    /// later use of `apple` must not flag the later use.
+    /// A guard `if (!exists("apple")) stop(...)` followed by a use of `apple`
+    /// must not flag the use. `apple` is NEVER assigned here, so suppression
+    /// depends solely on the `exists("apple")` declaration — removing the
+    /// feature makes this test fail (it does not lean on a real binding).
     #[test]
     fn test_exists_guard_suppresses_later_use() {
         let mut state = create_test_state();
-        let code = "if (!exists(\"apple\")) {\n  apple <- 1\n}\nprint(apple)\n";
+        let code = "if (!exists(\"apple\")) stop(\"missing\")\nprint(apple)\n";
         let uri = add_document(&mut state, "file:///test.R", code);
         let tree = parse_r_code(code);
         let root = tree.root_node();
@@ -63573,6 +63591,24 @@ mod issue_459_backtick_navigation_tests {
         assert_eq!(
             l.range.start.line, 0,
             "should navigate to the exists() call on line 0"
+        );
+    }
+
+    /// Go-to-definition on an `exists()`-derived symbol must navigate to the
+    /// `exists()` call, NOT to a same-name `# raven: var` directive that appears
+    /// later (and is not even visible at the use). The resolved symbol came from
+    /// `exists()`, so its own line wins over the unrelated directive.
+    #[test]
+    fn goto_on_exists_symbol_ignores_later_same_name_directive() {
+        let mut state = create_state();
+        // Line 0: exists() decl; line 1: use; line 2: a later directive.
+        let code = "exists(\"apple\")\napple\n# raven: var apple\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 2)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(
+            l.range.start.line, 0,
+            "should navigate to the exists() call (line 0), not the later directive (line 2)"
         );
     }
 

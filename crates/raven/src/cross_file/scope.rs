@@ -1380,6 +1380,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // function-local rename never invalidates dependents that source this file.
     let top_level = top_level_interface(&artifacts);
     let data_loads = extract_top_level_data_loads(&artifacts.timeline);
+    let declarations = extract_top_level_declarations(&artifacts.timeline);
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
@@ -1387,6 +1388,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &[],
         &removal_refs,
         &data_loads,
+        &declarations,
     );
 
     artifacts
@@ -1661,6 +1663,7 @@ pub fn compute_artifacts_with_metadata(
     let nse_decls: &[super::types::NseDeclaration] = metadata
         .map(|m| m.nse_declarations.as_slice())
         .unwrap_or(&[]);
+    let declarations = extract_top_level_declarations(&artifacts.timeline);
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
@@ -1668,6 +1671,7 @@ pub fn compute_artifacts_with_metadata(
         nse_decls,
         &removal_refs,
         &data_loads,
+        &declarations,
     );
 
     artifacts
@@ -4187,6 +4191,29 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
     out
 }
 
+/// Extract declaration `(name, line)` pairs from a finalized timeline.
+///
+/// `ScopeEvent::Declaration` events — from `# raven: var` / `# raven: func`
+/// directives AND `exists("name")` calls — are always file-level, so every one
+/// is returned. Feeding them to [`compute_interface_hash`] makes cross-file
+/// revalidation fire when a declaration is added / removed / moved EVEN WHEN a
+/// real definition shadows it in `exported_interface` (so the declaration would
+/// not otherwise alter the hashed interface). This closes the gap for `exists()`
+/// declarations specifically: unlike directives — which the hash already covers
+/// via its `declared_symbols` argument — `exists()`-derived declarations have no
+/// `DeclaredSymbol` entry, so without this they would be hashed only when they
+/// win the exported interface. Directive declarations are re-covered here too;
+/// the small redundancy is harmless (the digest is opaque).
+fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32)> {
+    let mut out = Vec::new();
+    for event in timeline {
+        if let ScopeEvent::Declaration { symbol, line, .. } = event {
+            out.push((symbol.name.clone(), *line));
+        }
+    }
+    out
+}
+
 /// Compute a deterministic hash of the exported interface and loaded packages.
 ///
 /// Symbols are incorporated deterministically by sorting the interface keys before hashing each
@@ -4218,7 +4245,9 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 /// # Returns
 ///
 /// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
-/// `top_level_removals`, and `data_loads`.
+/// `top_level_removals`, `data_loads`, and `declarations` (the
+/// `(name, line)` pairs of all timeline `Declaration` events — see
+/// [`extract_top_level_declarations`]).
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
@@ -4226,6 +4255,7 @@ fn compute_interface_hash(
     nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
+    declarations: &[(Arc<str>, u32)],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -4305,6 +4335,18 @@ fn compute_interface_hash(
     for DataCallInfo { stems, package } in sorted_data_loads {
         stems.hash(&mut hasher);
         package.hash(&mut hasher);
+    }
+
+    // Include declaration `(name, line)` pairs (sorted for determinism). This
+    // covers `exists()`-derived declarations — which have no `DeclaredSymbol`
+    // entry above — so adding / removing / moving one revalidates dependents
+    // even when a real definition shadows it in `interface`. See
+    // [`extract_top_level_declarations`]. Sorted by (line, name) like removals.
+    let mut sorted_declarations: Vec<&(Arc<str>, u32)> = declarations.iter().collect();
+    sorted_declarations.sort_by_key(|(name, line)| (*line, name.clone()));
+    for (name, line) in sorted_declarations {
+        name.hash(&mut hasher);
+        line.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -8271,6 +8313,27 @@ mod tests {
         assert_ne!(
             artifacts1.interface_hash, artifacts2.interface_hash,
             "interface_hash must reflect rm() line because it determines which sourced files see the symbol"
+        );
+    }
+
+    #[test]
+    fn test_interface_hash_changes_when_exists_added_despite_real_def() {
+        // An `exists("x")` declaration shadowed by a later real `x <- 1` does
+        // not change the exported interface (the real def wins), but it DOES
+        // change what a backward-edge dependent sees at the `exists()` line.
+        // Both files export the same `x`; only the presence of the `exists()`
+        // declaration differs, so interface_hash must still change — otherwise
+        // adding/removing the `exists()` would leave dependents stale.
+        let code1 = "# no exists\nx <- 1\nsource(\"child.R\")";
+        let code2 = "exists(\"x\")\nx <- 1\nsource(\"child.R\")";
+        let tree1 = parse_r(code1);
+        let tree2 = parse_r(code2);
+        let artifacts1 = compute_artifacts(&test_uri(), &tree1, code1);
+        let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
+
+        assert_ne!(
+            artifacts1.interface_hash, artifacts2.interface_hash,
+            "interface_hash must change when an exists() declaration is added, even when a real def shadows it"
         );
     }
 
