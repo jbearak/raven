@@ -18975,57 +18975,69 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             let display_line = symbol.defined_line + 1;
 
             // Distinguish a genuine directive declaration from one synthesized
-            // by an `exists("name")` call. Search the source file's metadata for
-            // a matching directive, capturing BOTH its line and which kind it is
-            // (`# raven: var` vs `# raven: func`) — the directive's keyword must
-            // reflect the directive that actually exists, not the kind of the
-            // resolved symbol (a later `exists()` var can outrank a `# raven:
-            // func` of the same name). The directive's OWN line is reported
-            // (mirrors go-to-definition); `symbol.defined_line` may point at a
-            // later `exists()` call. If metadata is present but has no matching
-            // directive, the symbol came from `exists()`. If metadata is
-            // unavailable, fall back to the directive label keyed on the
-            // symbol's kind rather than fabricating an `exists()` attribution
-            // for a possibly-real directive. The parser does not retain whether
-            // the user wrote `# raven:` or the `@lsp-` alias, so the canonical
-            // `# raven:` spelling is always surfaced.
+            // by an `exists("name")` call, using the SAME rule as
+            // go-to-definition so the two never disagree: the resolved symbol is
+            // directive-derived iff its own line (`symbol.defined_line`) is a
+            // matching-directive line. An `exists()`-derived symbol's line is the
+            // call site, never a directive line — so a same-name directive
+            // located elsewhere (e.g. one shadowed by, or appearing after, the
+            // resolved `exists()` declaration) is correctly NOT attributed.
+            //
+            // When directive-derived, report the FIRST declaration line (mirrors
+            // go-to-definition) with that directive's keyword (`# raven: var` vs
+            // `# raven: func`). When the symbol came from `exists()`, attribute
+            // it to the call. If metadata is unavailable, fall back to the
+            // directive label keyed on the symbol's kind rather than fabricating
+            // an `exists()` attribution for a possibly-real directive. The parser
+            // does not retain whether the user wrote `# raven:` or the `@lsp-`
+            // alias, so the canonical `# raven:` spelling is always surfaced.
             let canonical = crate::r_names::canonical_use_name(&symbol.name);
             let metadata = state.content_provider().get_metadata(&symbol.source_uri);
-            let directive = metadata.as_ref().and_then(|m| {
-                let vars = m
-                    .declared_variables
-                    .iter()
-                    .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
-                    .map(|d| (d.line, "# raven: var"));
-                let funcs = m
-                    .declared_functions
-                    .iter()
-                    .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
-                    .map(|d| (d.line, "# raven: func"));
-                vars.chain(funcs).min_by_key(|(line, _)| *line)
-            });
+            let directives: Vec<(u32, &str)> = metadata
+                .as_ref()
+                .map(|m| {
+                    m.declared_variables
+                        .iter()
+                        .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
+                        .map(|d| (d.line, "# raven: var"))
+                        .chain(
+                            m.declared_functions
+                                .iter()
+                                .filter(|d| {
+                                    crate::r_names::canonical_use_name(&d.name) == canonical
+                                })
+                                .map(|d| (d.line, "# raven: func")),
+                        )
+                        .collect()
+                })
+                .unwrap_or_default();
+            let symbol_is_directive = directives
+                .iter()
+                .any(|(line, _)| *line == symbol.defined_line);
 
-            let attribution = match directive {
-                Some((line, directive_type)) => {
-                    format!(
-                        "Declared via {} directive at line {}",
-                        directive_type,
-                        line + 1
-                    )
-                }
-                None if metadata.is_some() => {
-                    format!("Declared by an `exists()` call at line {}", display_line)
-                }
-                None => {
-                    let directive_type = match symbol.kind {
-                        crate::cross_file::SymbolKind::Function => "# raven: func",
-                        _ => "# raven: var",
-                    };
-                    format!(
-                        "Declared via {} directive at line {}",
-                        directive_type, display_line
-                    )
-                }
+            let attribution = if symbol_is_directive {
+                // First declaration (min line) + its keyword — matches goto.
+                let (line, directive_type) = directives
+                    .iter()
+                    .min_by_key(|(line, _)| *line)
+                    .copied()
+                    .unwrap();
+                format!(
+                    "Declared via {} directive at line {}",
+                    directive_type,
+                    line + 1
+                )
+            } else if metadata.is_some() {
+                format!("Declared by an `exists()` call at line {}", display_line)
+            } else {
+                let directive_type = match symbol.kind {
+                    crate::cross_file::SymbolKind::Function => "# raven: func",
+                    _ => "# raven: var",
+                };
+                format!(
+                    "Declared via {} directive at line {}",
+                    directive_type, display_line
+                )
             };
 
             let mut value = format!("```r\n{} ({})\n```\n\n{}", name, kind_str, attribution);
@@ -63641,40 +63653,41 @@ mod issue_459_backtick_navigation_tests {
         );
     }
 
-    /// When a name is declared BOTH by a `# raven: var` directive and a later
-    /// `exists()` call, hover reports the directive at the DIRECTIVE's line, not
-    /// the (later) exists() call line that wins the in-scope symbol.
+    /// When a name is declared by a `# raven: var` directive AND a later
+    /// `exists()` call (which wins the in-scope symbol), hover attributes to the
+    /// resolved declaration — the `exists()` call — NOT the shadowed directive.
+    /// This keeps hover consistent with go-to-definition (both key off the
+    /// resolved symbol's own line).
     #[tokio::test]
-    async fn hover_prefers_directive_attribution_and_line_over_exists() {
+    async fn hover_attributes_to_exists_not_shadowed_directive() {
         let mut state = create_state();
-        // Line 0: directive; line 2: exists() for the same name; line 3: use.
-        let code = "# raven: var apple\n\nexists(\"apple\")\napple\n";
+        // Line 0: directive; line 1: exists() for the same name (wins); line 2: use.
+        let code = "# raven: var apple\nexists(\"apple\")\napple\n";
         let uri = add_doc(&mut state, "file:///t.R", code);
-        let result = super::hover(&state, &uri, Position::new(3, 2)).await;
+        let result = super::hover(&state, &uri, Position::new(2, 2)).await;
         let hover = result.expect("hover should resolve apple");
         let text = match hover.contents {
             tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
             other => panic!("expected markup hover, got {other:?}"),
         };
         assert!(
-            text.contains("Declared via # raven: var directive at line 1"),
-            "should attribute to the directive at its own line (1), not the exists() call; got: {text}"
+            text.contains("Declared by an `exists()` call at line 2"),
+            "should attribute to the resolved exists() call (line 2), not the shadowed directive; got: {text}"
         );
         assert!(
-            !text.contains("exists("),
-            "must not attribute a genuine directive to exists(); got: {text}"
+            !text.contains("directive"),
+            "must not attribute the resolved exists() symbol to a directive; got: {text}"
         );
     }
 
-    /// When a name is declared by `# raven: func` AND a later `exists()` call
-    /// (whose Variable declaration wins the in-scope symbol), hover must report
-    /// the directive's actual keyword (`# raven: func`), not `# raven: var`
-    /// keyed off the resolved symbol's kind.
+    /// When the resolved declaration IS a directive (`# raven: func` here wins
+    /// over an earlier `exists()`), hover reports the directive's keyword and
+    /// its line — consistent with go-to-definition.
     #[tokio::test]
-    async fn hover_uses_matched_directive_keyword_not_symbol_kind() {
+    async fn hover_directive_derived_symbol_reports_directive_keyword() {
         let mut state = create_state();
-        // Line 0: func directive; line 1: exists() var for the same name; line 2: use.
-        let code = "# raven: func foo\nexists(\"foo\")\nfoo\n";
+        // Line 0: exists() var; line 1: func directive (wins); line 2: use.
+        let code = "exists(\"foo\")\n# raven: func foo\nfoo()\n";
         let uri = add_doc(&mut state, "file:///t.R", code);
         let result = super::hover(&state, &uri, Position::new(2, 1)).await;
         let hover = result.expect("hover should resolve foo");
@@ -63683,7 +63696,7 @@ mod issue_459_backtick_navigation_tests {
             other => panic!("expected markup hover, got {other:?}"),
         };
         assert!(
-            text.contains("Declared via # raven: func directive at line 1"),
+            text.contains("Declared via # raven: func directive at line 2"),
             "should report the func directive keyword and its line; got: {text}"
         );
     }

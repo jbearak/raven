@@ -4343,7 +4343,7 @@ fn compute_interface_hash(
     // even when a real definition shadows it in `interface`. See
     // [`extract_top_level_declarations`]. Sorted by (line, name) like removals.
     let mut sorted_declarations: Vec<&(Arc<str>, u32)> = declarations.iter().collect();
-    sorted_declarations.sort_by_key(|(name, line)| (*line, name.clone()));
+    sorted_declarations.sort_by_key(|(name, line)| (*line, name));
     for (name, line) in sorted_declarations {
         name.hash(&mut hasher);
         line.hash(&mut hasher);
