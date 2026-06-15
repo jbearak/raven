@@ -4886,7 +4886,19 @@ where
             hoist_globals,
             backward_dep_mode,
             is_cancelled,
-            false,
+            // Isolate this parent frame's own forward source() visits from its
+            // own backward (parent) walk. A parent like `data.R` resolved here
+            // runs both STEP 1 (its grandparent walk) and STEP 2 (its own
+            // `source()` children). Without isolation, the grandparent walk can
+            // expand one of `data.R`'s children — a sibling sourced earlier,
+            // e.g. `covariates.R` — into the shared `visited` map at the EOF
+            // sentinel, after which `data.R`'s own STEP 2 source of that child
+            // hits the revisit guard and returns an empty scope, silently
+            // dropping its definitions from the prefix. Passing `true` makes
+            // STEP 2 here use a pre-STEP-1 `visited` snapshot, exactly as the
+            // queried file's own forward sources do. Regression:
+            // `sibling_source_symbol_visible_through_shared_hub_parent_walk`.
+            true,
             None,
             None,
             // Parent-prefix walk does not expand `data()` aliases (issue #429):
@@ -5192,9 +5204,17 @@ where
     // `source()`s the queried file, and that wrapper also sources the queried
     // file's children). Real forward execution must treat only true ancestors
     // (this snapshot) as already-visited, mirroring `ScopeStream`'s fresh
-    // per-source `visited` in the diagnostic path. Only the isolated
-    // (real-execution) branch needs this; parent-prefix discovery keeps the
-    // shared map.
+    // per-source `visited` in the diagnostic path.
+    //
+    // `parent_prefix_at` recurses with this flag set too (it used to pass
+    // `false`): every parent frame runs both a backward (parent) walk and its
+    // own forward source() resolution, so each parent frame's forward sources
+    // need the same isolation from its own parent walk that the queried file
+    // gets. Without it, a sibling sourced earlier by a shared parent could be
+    // expanded by that parent's grandparent walk and then dropped from the
+    // parent's own STEP 2 by the revisit guard. The backward walk itself still
+    // shares the live `visited` for cycle pruning — only STEP 2's forward
+    // children are isolated.
     let forward_visited_base = if isolate_forward_source_visits {
         Some(visited.clone())
     } else {
@@ -15427,6 +15447,129 @@ x <- 1"#;
         assert!(
             scope.loaded_packages.contains("ggplot2"),
             "Parent should have ggplot2 from child (package propagation via loaded_packages)"
+        );
+    }
+
+    /// Regression: a symbol defined in an earlier-sourced sibling must stay
+    /// visible in a later-sourced sibling even when a *hub* file, shared by the
+    /// queried file's grandparent and another script, makes the parent prefix's
+    /// backward walk reach the parent again at the EOF sentinel.
+    ///
+    /// Core graph: `data.r` sources `covariates.r` (defines `ww.covars`) then
+    /// `indices.r` (uses `ww.covars`). The bug needs a deep parent walk: a
+    /// shared hub (`functions.r`) is sourced by both `main.r` (which sources the
+    /// hub *then* `data.r`) and `D.r` (which sources `data.r` *then* the hub).
+    /// When `indices.r`'s parent prefix queries `data.r`, that frame's backward
+    /// walk runs `main.r → functions.r → {functions.r's dependents} → D.r`,
+    /// whose own forward sweep re-enters `data.r` at EOF and expands
+    /// `covariates.r` into the shared `visited` map. `data.r`'s own STEP 2
+    /// forward-source of `covariates.r` then hits the revisit guard and returns
+    /// an empty scope, dropping `ww.covars`. Each parent frame's forward sources
+    /// must be isolated from that frame's own backward walk, exactly like the
+    /// queried file's are. See the `isolate_forward_source_visits = true`
+    /// argument in `parent_prefix_at`'s recursive call.
+    #[test]
+    fn sibling_source_symbol_visible_through_shared_hub_parent_walk() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let main_uri = Url::parse("file:///project/main.r").unwrap();
+        let d_uri = Url::parse("file:///project/scripts/D.r").unwrap();
+        let functions_uri = Url::parse("file:///project/scripts/functions.r").unwrap();
+        let data_uri = Url::parse("file:///project/scripts/data.r").unwrap();
+        let covariates_uri = Url::parse("file:///project/scripts/data/covariates.r").unwrap();
+        let indices_uri = Url::parse("file:///project/scripts/data/indices.r").unwrap();
+
+        // Source paths are written relative to each sourcing file's directory so
+        // the graph edges resolve directly (this helper's `update_file` does not
+        // apply the workspace-root fallback). The orderings matter: `main.r`
+        // sources the hub before `data.r`; `D.r` sources `data.r` before the hub.
+        let main_code = "source(\"scripts/functions.r\")\nsource(\"scripts/data.r\")\n";
+        let d_code = "source(\"data.r\")\nsource(\"functions.r\")\n";
+        let functions_code = "helper <- function() 1\n";
+        let data_code = "source(\"data/covariates.r\")\nsource(\"data/indices.r\")\n";
+        let covariates_code = "ww.covars <- data.frame(year = 2024)\n";
+        let indices_code = "y <- ww.covars$year\n";
+
+        let files: [(&Url, &str); 6] = [
+            (&main_uri, main_code),
+            (&d_uri, d_code),
+            (&functions_uri, functions_code),
+            (&data_uri, data_code),
+            (&covariates_uri, covariates_code),
+            (&indices_uri, indices_code),
+        ];
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in files {
+            let tree = parse_r(code);
+            artifacts.insert(
+                (*uri).clone(),
+                Arc::new(compute_artifacts(uri, &tree, code)),
+            );
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&workspace_root), |_| None);
+            metas.insert((*uri).clone(), meta);
+        }
+
+        // Sanity: the edges that make this a regression must actually exist.
+        assert_eq!(
+            graph.get_dependents(&indices_uri).len(),
+            1,
+            "indices.r should have data.r as its sole parent"
+        );
+        assert_eq!(
+            graph.get_dependents(&data_uri).len(),
+            2,
+            "data.r should be sourced by both main.r and D.r"
+        );
+
+        let artifacts_for_closure = artifacts.clone();
+        let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            artifacts_for_closure.get(uri).cloned()
+        };
+        let metas_for_closure = metas.clone();
+        let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            metas_for_closure.get(uri).cloned()
+        };
+
+        // Query indices.r at the top-level use of `ww.covars` via the cached
+        // path — the one the diagnostic snapshot uses. It seeds
+        // `visited[indices.r] = (MAX, MAX)` for the prefix computation, which is
+        // what let the deep parent walk contaminate `visited[covariates.r]`.
+        // `hoist_globals = true` with a top-level position resolves the
+        // `inside = false` prefix slot the undefined-variable check consumes.
+        let base_exports = HashSet::new();
+        let mut prefix_cache = ParentPrefixCache::new();
+        let scope = scope_at_position_with_graph_cached(
+            &indices_uri,
+            0,
+            5,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &mut prefix_cache,
+            None,
+            None,
+        );
+
+        assert!(
+            scope.symbols.contains_key("ww.covars"),
+            "ww.covars (defined in earlier-sourced sibling covariates.r) must be \
+             visible in indices.r; got symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 
