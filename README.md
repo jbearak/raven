@@ -1,6 +1,6 @@
 # Raven
 
-Raven is a static R language server that resolves what's in scope at each line — catching undefined and used-before-defined variables even in a single script, and across files by following `source()` chains — without running your code. The same scope model drives the rest of its code intelligence — completions, go-to-definition, find-references, hover — so each reflects what's reachable at your cursor, not just what exists somewhere in the project. It also diagnoses syntax errors, and can optionally check code style and formatting.
+Raven is a static analyzer for R that resolves what's in scope at each line — catching undefined and used-before-defined variables even in a single script, and across files by following `source()` chains — without running your code. The same scope model drives the rest of its code intelligence — completions, go-to-definition, find-references, hover — so each reflects what's reachable at your cursor, not just what exists somewhere in the project. It also diagnoses syntax errors, and can optionally check code style and formatting.
 
 Raven is fast and runs all of this in realtime in your editor, with diagnostics updating instantly as you type. It also fills a gap at the other end of the workflow: automated checks in pull requests — running `raven check` flags undefined variables and other errors before code merges, the kind of automated review that's table stakes for other languages but has long been missing for R.
 
@@ -14,7 +14,7 @@ Raven is fully open source ([GPL-3.0](LICENSE)) and editor-agnostic: it speaks t
 
 > **Quick Start:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r), or download from the [releases page](https://github.com/jbearak/raven/releases). See [Installation](#installation) for details.
 
-Raven's sister project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
+Raven's sibling project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
 
 ## Features
 
