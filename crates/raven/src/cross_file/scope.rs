@@ -6750,7 +6750,6 @@ where
             backward_dep_mode,
             is_cancelled,
             prefix_cache,
-            &forward_child_memo,
         );
         let prefix_in_function = if hoist_globals {
             compute_or_get_cached_prefix(
@@ -6766,7 +6765,6 @@ where
                 backward_dep_mode,
                 is_cancelled,
                 prefix_cache,
-                &forward_child_memo,
             )
         } else {
             prefix_top.clone()
@@ -7667,7 +7665,6 @@ where
             self.backward_dep_mode,
             self.is_cancelled,
             self.prefix_cache,
-            &self.forward_child_memo,
         );
 
         // Run STEP 2 for the child at EOF, supplying the cached prefix.
@@ -7915,7 +7912,6 @@ fn compute_or_get_cached_prefix<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
-    forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> Arc<ParentPrefix>
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7927,6 +7923,17 @@ where
             return arc.clone();
         }
     }
+    // The prefix is computed at a canonical `current_depth = 0` origin (it is
+    // depth-invariant and cached as such in `ParentPrefixCache`). Its internal
+    // forward-child resolutions therefore use depth-0-origin depths, which do
+    // NOT match the actual depth a streaming forward sweep reaches the same
+    // child at. Give them a FRESH, ephemeral forward-child memo so they cannot
+    // pollute the caller's actual-depth memo — otherwise a child's prefix
+    // forward-children (resolved here at the artificial origin) could be
+    // reused by the real sweep and perturb depth-dependent bookkeeping
+    // (`depth_exceeded`, `chain`) under a small `maxChainDepth`. The backward
+    // walk's own dedup is already handled by `ParentPrefixCache`.
+    let prefix_forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
     // Compute outside the borrow so `parent_prefix_at`'s recursive
     // `scope_at_position_with_graph_recursive` call doesn't transitively
     // try to re-enter the cache.
@@ -7954,7 +7961,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
-        forward_child_memo,
+        &prefix_forward_child_memo,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();
@@ -16001,15 +16008,48 @@ x <- 1"#;
             )
         };
 
+        // Resolve a file's EOF scope through the `ScopeStream` path — the
+        // production undefined-variable path, where the forward-child memo is a
+        // per-stream field shared between the prefix pre-computation and the
+        // forward sweep.
+        let resolve_stream = |uri: &Url| {
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(workspace_root),
+                max_depth,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(u32::MAX, u32::MAX);
+            stream.snapshot()
+        };
+
         for (uri, _) in files {
             FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(true));
             let off = resolve(uri);
+            let off_stream = resolve_stream(uri);
             FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(false));
             let on = resolve(uri);
+            let on_stream = resolve_stream(uri);
             assert_eq!(
                 canonical_scope(&off),
                 canonical_scope(&on),
-                "forward-child memo changed the resolved scope for {uri} (max_depth={max_depth})"
+                "forward-child memo changed the recursive resolved scope for {uri} (max_depth={max_depth})"
+            );
+            assert_eq!(
+                canonical_scope(&off_stream),
+                canonical_scope(&on_stream),
+                "forward-child memo changed the ScopeStream resolved scope for {uri} (max_depth={max_depth})"
             );
         }
     }
