@@ -730,6 +730,11 @@ fn try_parse_exists_call(node: Node, content: &str) -> Option<ExistsCall> {
     let value_node = named_arg_value(&args_node, content, "x")
         .or_else(|| first_positional_arg_value(args_node))?;
     let name = extract_string_literal(value_node, content)?;
+    // `exists("")` names nothing usable; declare nothing (the `# raven: var`
+    // directive likewise skips an empty name).
+    if name.is_empty() {
+        return None;
+    }
 
     Some(ExistsCall {
         name,
@@ -2189,9 +2194,21 @@ source("b.R")"#;
     }
 
     #[test]
-    fn test_exists_non_syntactic_name_backtick_wrapped() {
-        // `exists("my var")` must store the call-site form `` `my var` `` so it
-        // matches a `` `my var` `` use, mirroring `# raven: var`.
+    fn test_exists_empty_string_skipped() {
+        // `exists("")` names nothing usable — declare nothing (parity with the
+        // `# raven: var` directive, which also skips an empty name).
+        let code = r#"exists("")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_non_syntactic_name_extracted_raw() {
+        // The detector returns the RAW string contents (`my var`); call-site
+        // backtick-wrapping (`` `my var` ``) happens later, during declared-symbol
+        // synthesis in `scope.rs` (via `callee_name_for_match`), so it matches a
+        // `` `my var` `` use.
         let code = r#"exists("my var")"#;
         let tree = parse_r(code);
         let calls = detect_exists_calls(&tree, code);
