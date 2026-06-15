@@ -20522,15 +20522,30 @@ fn find_references_in_tree(
     uri: &Url,
     locations: &mut Vec<Location>,
 ) {
+    // The match target is request-constant, so canonicalize it ONCE here rather
+    // than at every identifier node in the recursive walk (the per-node side
+    // still canonicalizes — each node's text differs).
+    let canonical_name = crate::r_names::canonical_use_name(name);
+    find_references_in_subtree(node, canonical_name, text, uri, locations);
+}
+
+fn find_references_in_subtree(
+    node: Node,
+    canonical_name: &str,
+    text: &str,
+    uri: &Url,
+    locations: &mut Vec<Location>,
+) {
     // Issue #459: union bare and backticked occurrences. Canonicalize BOTH
     // equality operands so a redundantly-quoted syntactic `` `my_func` `` and a
     // bare `my_func` resolve to one reference set, while a genuinely
     // non-syntactic name (`` `my fn` ``) keeps its required backticks and only
     // matches other backticked spellings. The pushed range is still the raw
     // node span (backticks included) — only the match KEY is canonicalized.
+    // The target operand is pre-canonicalized by the `find_references_in_tree`
+    // entry point.
     if node.kind() == "identifier"
-        && crate::r_names::canonical_use_name(node_text(node, text))
-            == crate::r_names::canonical_use_name(name)
+        && crate::r_names::canonical_use_name(node_text(node, text)) == canonical_name
     {
         let start_pos = node.start_position();
         let end_pos = node.end_position();
@@ -20545,7 +20560,7 @@ fn find_references_in_tree(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        find_references_in_tree(child, name, text, uri, locations);
+        find_references_in_subtree(child, canonical_name, text, uri, locations);
     }
 }
 

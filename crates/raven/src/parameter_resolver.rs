@@ -589,7 +589,9 @@ fn find_function_definition_before_position<'a>(
     position: tower_lsp::lsp_types::Position,
 ) -> Option<Node<'a>> {
     let mut best: Option<Node<'a>> = None;
-    find_func_def_recursive(root, function_name, text, position, &mut best);
+    // Canonicalize the request-constant target once, not per node in the walk.
+    let canonical_function_name = crate::r_names::canonical_use_name(function_name);
+    find_func_def_recursive(root, canonical_function_name, text, position, &mut best);
     best
 }
 
@@ -603,7 +605,7 @@ fn find_function_definition_before_position<'a>(
 /// its required backticks and still matches.
 fn find_func_def_recursive<'a>(
     node: Node<'a>,
-    function_name: &str,
+    canonical_function_name: &str,
     text: &str,
     position: tower_lsp::lsp_types::Position,
     best: &mut Option<Node<'a>>,
@@ -627,7 +629,7 @@ fn find_func_def_recursive<'a>(
             if matches!(op_text, "<-" | "=" | "<<-")
                 && lhs.kind() == "identifier"
                 && crate::r_names::canonical_use_name(node_text(lhs, text))
-                    == crate::r_names::canonical_use_name(function_name)
+                    == canonical_function_name
                 && rhs.kind() == "function_definition"
             {
                 // Left-assignment: `name <- function(...)`, name on the LHS.
@@ -649,7 +651,7 @@ fn find_func_def_recursive<'a>(
             } else if matches!(op_text, "->" | "->>")
                 && rhs.kind() == "identifier"
                 && crate::r_names::canonical_use_name(node_text(rhs, text))
-                    == crate::r_names::canonical_use_name(function_name)
+                    == canonical_function_name
                 && let Some(func) = crate::cross_file::scope::unwrap_function_definition(lhs)
             {
                 // Right-assignment: `(function(...)) -> name`, the mirror of the
@@ -677,7 +679,7 @@ fn find_func_def_recursive<'a>(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        find_func_def_recursive(child, function_name, text, position, best);
+        find_func_def_recursive(child, canonical_function_name, text, position, best);
     }
 }
 
@@ -698,13 +700,21 @@ fn find_function_definition_at_line<'a>(
     target_line: u32,
 ) -> Option<Node<'a>> {
     let mut result: Option<Node<'a>> = None;
-    find_func_def_at_line_recursive(root, function_name, text, target_line, &mut result);
+    // Canonicalize the request-constant target once, not per node in the walk.
+    let canonical_function_name = crate::r_names::canonical_use_name(function_name);
+    find_func_def_at_line_recursive(
+        root,
+        canonical_function_name,
+        text,
+        target_line,
+        &mut result,
+    );
     result
 }
 
 fn find_func_def_at_line_recursive<'a>(
     node: Node<'a>,
-    function_name: &str,
+    canonical_function_name: &str,
     text: &str,
     target_line: u32,
     result: &mut Option<Node<'a>>,
@@ -731,7 +741,7 @@ fn find_func_def_at_line_recursive<'a>(
             if matches!(op_text, "<-" | "=" | "<<-")
                 && lhs.kind() == "identifier"
                 && crate::r_names::canonical_use_name(node_text(lhs, text))
-                    == crate::r_names::canonical_use_name(function_name)
+                    == canonical_function_name
                 && rhs.kind() == "function_definition"
                 && lhs.start_position().row as u32 == target_line
             {
@@ -740,7 +750,7 @@ fn find_func_def_at_line_recursive<'a>(
             } else if matches!(op_text, "->" | "->>")
                 && rhs.kind() == "identifier"
                 && crate::r_names::canonical_use_name(node_text(rhs, text))
-                    == crate::r_names::canonical_use_name(function_name)
+                    == canonical_function_name
                 && rhs.start_position().row as u32 == target_line
                 && let Some(func) = crate::cross_file::scope::unwrap_function_definition(lhs)
             {
@@ -754,7 +764,7 @@ fn find_func_def_at_line_recursive<'a>(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        find_func_def_at_line_recursive(child, function_name, text, target_line, result);
+        find_func_def_at_line_recursive(child, canonical_function_name, text, target_line, result);
     }
 }
 
