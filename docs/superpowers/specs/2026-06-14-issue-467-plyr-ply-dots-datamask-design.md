@@ -1,6 +1,6 @@
 # Issue #467 — plyr `*ply` verbs: data-masked `...` forwarded to `summarise`/`mutate`/`transform` (design spec)
 
-**Status:** v2 — reconciled with the implementation after the review passes (§3.2 helper signature/return and the `suppressed_arguments`-vs-`call_argument_suppression` choice; §5 test list expanded to match the shipped tests). The on-function doc comments in the code are authoritative.
+**Status:** v3 — post-merge Codex adversarial review (follow-up PR). **v3 changes:** (1) **exclude the `m*ply` family** — it wraps `.fun` in `splat()`, so its `...` are spread as ordinary args, never data-masked; modeling it was a false negative (§2, §4). (2) Apply the `.fun`-conditional dots upgrade in the **qualified-alias path** of `resolve_call_arg_policy`, so `my_ddply <- plyr::ddply` behaves like the direct call (§4). (3) Document two **pre-existing** limitations now inherited by `.fun` resolution: function-scoped shadowing of a verb name, and exact-only argument-name matching (§4). v2 reconciled §3.2/§5 with the shipped code. The on-function doc comments in the code are authoritative.
 **Issue:** #467 "NSE: model plyr *ply verbs' data-masked `...` forwarded to summarise/mutate/transform"
 **Builds on:** #466 (`plyr::.()` modeled as a `WholeCall` quoting helper), branch `issue467`
 **Verified against:** plyr 1.8.9 + R 4.6.0
@@ -42,8 +42,15 @@ Formal orders, grouped by leading shape:
 | `a*ply` | `aaply` `adply` `alply` `a_ply` | `.data, .margins, .fun, ...` | 3rd |
 | `d*ply` | `daply` `ddply` `dlply` `d_ply` | `.data, .variables, .fun, ...` | 3rd |
 | `l*ply` | `laply` `ldply` `llply` `l_ply` | `.data, .fun, ...` | 2nd |
-| `m*ply` | `maply` `mdply` `mlply` `m_ply` | `.data, .fun, ...` | 2nd |
+| `m*ply` | `maply` `mdply` `mlply` `m_ply` | `.data, .fun, ...` | — (excluded, see v3) |
 | `r*ply` | `raply` `rdply` `rlply` `r_ply` | `.n, .expr, .progress, ...` | — (excluded) |
+
+> **v3 correction:** `m*ply` is **excluded**. It wraps `.fun` in `splat()`
+> (`f <- splat(.fun)`; `do.call(.fun, c(as.list(row), list(...)))`), so the call's
+> `...` are spread as ordinary arguments, NOT forwarded into `.fun`'s data mask —
+> `mdply(df, summarise, z = sum(x))` errors `object 'x' not found` (verified, plyr
+> 1.8.9). Only `a*`/`d*`/`l*ply` (12 verbs) forward `.fun(piece, ...)` and
+> data-mask. See the `m*ply` note in `plyr_split_apply_formals`.
 
 Post-`...` control formals differ per verb (`.progress`, `.inform`, `.drop`,
 `.parallel`, `.paropts`, `.expand`, `.id`, `.print`, `.drop_i`, `.drop_o`,
@@ -71,8 +78,9 @@ named/positional formal but not `...` (e.g. base `subset`) is *under*-suppressed
 `summarise`/`summarize`/`mutate`/`transform`, plus `filter`/`with`/etc. when those
 are the `.fun` — is exactly the set whose forwarded dots are genuinely data-masked.
 
-**Family scope — all 16** (`a*ply`/`d*ply`/`l*ply`/`m*ply`), excluding `r*ply`.
-Uniform mechanism, no confusing gaps.
+**Family scope — 12** (`a*ply`/`d*ply`/`l*ply`); `r*ply` (no `.fun`) and `m*ply`
+(splats `.fun` — v3) are excluded. (Originally scoped as "all 16"; the `m*ply`
+exclusion was a v3 correction from the Codex adversarial review — see §2.)
 
 **Architecture — hybrid (mirrors the existing wrapper-dots upgrade at
 `handlers.rs` ~13301).** A static base policy in `package_policy` plus a
@@ -85,8 +93,8 @@ call-site `captured_dots` upgrade in `resolve_call_arg_policy`:
    - (Side benefit: fixes direct `summarise(df, x = mean(y))` false positives in
      plyr-only files, where `summarise` previously resolved as a no-policy export →
      `Standard`.)
-2. Add the 16 `*ply` verbs → a **base** `PerFormal` carrying the empirically
-   verified formal order, `captured: []`, `captured_dots: false`. With nothing
+2. Add the 12 `*ply` verbs (`a*`/`d*`/`l*`) → a **base** `PerFormal` carrying the
+   empirically verified formal order, `captured: []`, `captured_dots: false`. With nothing
    captured this is behaviorally identical to `Standard` (every arg checked) —
    the base policy exists only to (a) supply the formal order so the call-site
    step can locate `.fun`/`...` by R's matching rules, and (b) mark the call as a
@@ -151,16 +159,29 @@ of the existing `table_verb_policy` result.
   passed when `.fun` is data-masking may have their value suppressed if not listed
   among the verb's formals; the per-verb formal lists include the control formals
   to avoid this for the common cases.
-- `r*ply` stays unmodeled (no `.fun`).
+- `r*ply` (no `.fun`) and `m*ply` (splats `.fun` — v3) stay unmodeled; their `...`
+  are always checked.
+- **Function-scoped shadowing (pre-existing class).** `.fun` resolution — like
+  direct-callee resolution in `resolve_call_arg_policy` — only consults
+  **top-level** local bindings (`collect_nse_facts` skips in-function assignments
+  and formals). A binding that shadows a data-masking verb name *inside an
+  enclosing function* — `f <- function(summarise) ddply(df, .(g), summarise, …)` —
+  is invisible, so that `.fun` is wrongly treated as the package verb and its
+  `...` suppressed (a false negative). A real fix needs function-scoped binding
+  tracking across the whole NSE machinery, not just this path.
+- **Exact-only argument-name matching (pre-existing class).** `.fun` is located by
+  exact name; R's unambiguous partial matching (`.f = summarise` → `.fun`) is not
+  honored, so a partially-named `.fun` is not located and the `...` stay checked
+  (safe direction — a possible false positive). Shared by every per-formal policy.
 
 ## 5. Testing
 
 Unit (`nse.rs`):
 - `package_policy("plyr", "summarise"|"summarize"|"mutate")` → `PerFormal`,
   `captured_dots: true`.
-- Each of the 16 `*ply` verbs → `PerFormal`, `captured: []`, `captured_dots: false`,
-  with `.fun` and `...` in the formals at the verified positions.
-- `is_plyr_split_apply_verb` true for the 16, false for `r*ply` and `.`.
+- Each of the 12 `*ply` verbs (`a*`/`d*`/`l*`) → `PerFormal`, `captured: []`,
+  `captured_dots: false`, with `.fun` and `...` in the formals at the verified positions.
+- `is_plyr_split_apply_verb` true for the 12, false for `r*ply`, `m*ply`, and `.`.
 - Update the #466 table-shape assertions (`("plyr","ddply",None)` → `PerFormal`;
   `plyr_dot_is_whole_call_quoting_helper`'s `ddply`/`llply` `is_none()` lines).
 
@@ -185,6 +206,10 @@ End-to-end (`handlers.rs`, mirroring the #466 synthetic-package harness):
   is suppressed.
 - `.fun` supplied by name (`ddply(df, .variables = .(g), .fun = summarise, …)`) —
   exercises the named-matching pass.
+- **(v3)** `mdply(df, summarise, n = undefined_typo)` — `undefined_typo` IS flagged
+  (m*ply splats `.fun`, so its `...` are not data-masked).
+- **(v3)** `my_ddply <- plyr::ddply; my_ddply(df, .(year), summarise, n = length(unique(team)))`
+  — `team` NOT flagged (the qualified-alias path applies the upgrade).
 
 ## 6. Docs
 

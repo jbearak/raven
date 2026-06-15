@@ -438,10 +438,13 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
 }
 
 /// The empirically verified formal order of each plyr `*ply` split-apply verb
-/// (the `a*`/`d*`/`l*`/`m*` families), or `None` for any other name. The
-/// `r*ply` family (`raply`/`rdply`/`rlply`/`r_ply`) is intentionally absent: it
-/// takes `.n, .expr` rather than `.fun`, so the `.fun`-forwarding model does not
-/// apply and it stays standard-eval. This is the single source of truth for
+/// that forwards `...` directly into `.fun(piece, ...)` — the `a*`/`d*`/`l*`
+/// families (12 verbs) — or `None` for any other name. Two families are
+/// intentionally absent: `r*ply` (`raply`/`rdply`/`rlply`/`r_ply`) takes
+/// `.n, .expr` rather than `.fun`; and `m*ply` (`maply`/`mdply`/`mlply`/`m_ply`)
+/// wraps `.fun` in `splat()`, spreading its `...` as ordinary arguments rather
+/// than into `.fun`'s data mask (see the `m*ply` note at the end of the match).
+/// Both stay standard-eval. This is the single source of truth for
 /// [`is_plyr_split_apply_verb`] and the `*ply` arm of [`package_policy`], so the
 /// recognition predicate and the formal order it consumes cannot drift. The
 /// post-`...` control formals are listed so a named control argument
@@ -574,48 +577,25 @@ fn plyr_split_apply_formals(name: &str) -> Option<&'static [&'static str]> {
             ".parallel",
             ".paropts",
         ],
-        // m*ply: `(.data, .fun, ...)` — `.fun` is the 2nd formal.
-        "maply" => &[
-            ".data",
-            ".fun",
-            "...",
-            ".expand",
-            ".progress",
-            ".inform",
-            ".drop",
-            ".parallel",
-            ".paropts",
-        ],
-        "mdply" | "mlply" => &[
-            ".data",
-            ".fun",
-            "...",
-            ".expand",
-            ".progress",
-            ".inform",
-            ".parallel",
-            ".paropts",
-        ],
-        "m_ply" => &[
-            ".data",
-            ".fun",
-            "...",
-            ".expand",
-            ".progress",
-            ".inform",
-            ".print",
-            ".parallel",
-            ".paropts",
-        ],
+        // The `m*ply` family (`maply`/`mdply`/`mlply`/`m_ply`) is deliberately
+        // ABSENT: it wraps `.fun` in `splat()` (`f <- splat(.fun)`), calling
+        // `do.call(.fun, c(as.list(row), list(...)))` per row, so the m*ply
+        // call's `...` are spread as ordinary arguments — NOT forwarded into
+        // `.fun`'s per-group data mask the way `a*`/`d*`/`l*ply` forward
+        // `.fun(piece, ...)`. Empirically (plyr 1.8.9 + R 4.6.0)
+        // `mdply(df, summarise, z = sum(x))` errors "object 'x' not found",
+        // confirming `x` is not a visible column. Modeling m*ply would suppress
+        // genuine free-variable references in those `...` (a false negative), so
+        // it stays standard-eval — same exclusion rationale as `r*ply`.
         _ => return None,
     })
 }
 
-/// True when `name` is one of plyr's 16 `*ply` split-apply verbs that forward
-/// their `...` to `.fun` (the `a*`/`d*`/`l*`/`m*` families). See
-/// [`plyr_split_apply_formals`] for the excluded `r*ply` family and the
-/// empirical-verification note. Consumed by `handlers.rs` to gate the
-/// call-site `captured_dots` upgrade to plyr `*ply` callees only.
+/// True when `name` is one of plyr's 12 `*ply` split-apply verbs that forward
+/// their `...` directly into `.fun(piece, ...)` (the `a*`/`d*`/`l*` families).
+/// See [`plyr_split_apply_formals`] for the excluded `r*ply` and `m*ply`
+/// families and the empirical-verification note. Consumed by `handlers.rs` to
+/// gate the call-site `captured_dots` upgrade to plyr `*ply` callees only.
 pub(crate) fn is_plyr_split_apply_verb(name: &str) -> bool {
     plyr_split_apply_formals(name).is_some()
 }
@@ -2432,9 +2412,10 @@ mod tests {
         }
     }
 
-    /// The 16 plyr `*ply` split-apply verbs (the `a*`/`d*`/`l*`/`m*` families;
-    /// the `r*ply` family takes `.n, .expr` rather than `.fun` and is excluded)
-    /// are modeled with a base per-formal policy that captures nothing: `.data`,
+    /// The 12 plyr `*ply` split-apply verbs that forward `...` into
+    /// `.fun(piece, ...)` (the `a*`/`d*`/`l*` families; `r*ply` takes
+    /// `.n, .expr` and `m*ply` splats `.fun`, so both are excluded) are modeled
+    /// with a base per-formal policy that captures nothing: `.data`,
     /// `.variables`/`.margins`, and `.fun` stay checked, and the trailing `...`
     /// stay checked unless the call-site `.fun` resolves to a data-masking verb
     /// (the upgrade in `handlers.rs`). The formals carry `.fun` and `...`.
@@ -2443,7 +2424,7 @@ mod tests {
     fn plyr_split_apply_verbs_base_policy() {
         for name in [
             "aaply", "adply", "alply", "a_ply", "daply", "ddply", "dlply", "d_ply", "laply",
-            "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
+            "ldply", "llply", "l_ply",
         ] {
             match package_policy("plyr", name) {
                 Some(ArgPolicy::PerFormal {
@@ -2472,7 +2453,8 @@ mod tests {
 
     /// `.fun`'s positional index per family, pinning the empirically verified
     /// signatures: `a*ply`/`d*ply` are `(.data, .margins|.variables, .fun, ...)`
-    /// (index 2); `l*ply`/`m*ply` are `(.data, .fun, ...)` (index 1).
+    /// (index 2); `l*ply` is `(.data, .fun, ...)` (index 1). `m*ply` is excluded
+    /// (splat — see `is_plyr_split_apply_verb_recognition`).
     #[test]
     fn plyr_split_apply_fun_formal_position() {
         let fun_index = |verb: &str| match package_policy("plyr", verb) {
@@ -2484,21 +2466,22 @@ mod tests {
         ] {
             assert_eq!(fun_index(v), Some(2), "{v}: .fun at index 2");
         }
-        for v in [
-            "laply", "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
-        ] {
+        for v in ["laply", "ldply", "llply", "l_ply"] {
             assert_eq!(fun_index(v), Some(1), "{v}: .fun at index 1");
         }
     }
 
-    /// `is_plyr_split_apply_verb` recognizes exactly the 16 `*ply` verbs that
-    /// forward `...` to a `.fun` — never the `r*ply` family (no `.fun`), the
-    /// `.()` quoting helper, or the data-masking verbs themselves.
+    /// `is_plyr_split_apply_verb` recognizes exactly the 12 `*ply` verbs that
+    /// forward `...` directly into `.fun(piece, ...)` (the `a*`/`d*`/`l*`
+    /// families) — never the `r*ply` family (no `.fun`), never the `m*ply`
+    /// family (which wraps `.fun` in `splat()`, so its `...` are spread as
+    /// ordinary args, not data-masked — verified against plyr 1.8.9), and never
+    /// the `.()` quoting helper or the data-masking verbs themselves.
     #[test]
     fn is_plyr_split_apply_verb_recognition() {
         for name in [
             "aaply", "adply", "alply", "a_ply", "daply", "ddply", "dlply", "d_ply", "laply",
-            "ldply", "llply", "l_ply", "maply", "mdply", "mlply", "m_ply",
+            "ldply", "llply", "l_ply",
         ] {
             assert!(
                 is_plyr_split_apply_verb(name),
@@ -2506,10 +2489,17 @@ mod tests {
             );
         }
         for name in [
+            // m*ply splats `.fun` -> `...` are not data-masked (issue #467 f/u).
+            "maply",
+            "mdply",
+            "mlply",
+            "m_ply",
+            // r*ply takes `.n, .expr` (no `.fun`).
             "raply",
             "rdply",
             "rlply",
             "r_ply",
+            // Not split-apply verbs at all.
             ".",
             "summarise",
             "mutate",

@@ -15137,11 +15137,18 @@ fn resolve_call_arg_policy(
             // Resolve the qualified target's verb policy: a target with no
             // table policy (e.g. `stats::filter`) is standard-eval, so its
             // arguments are checked, while `dplyr::filter` keeps its data-mask
-            // policy.
+            // policy. Apply the plyr `*ply` `.fun`-conditional dots upgrade here
+            // too (issue #467 follow-up), so an aliased split-apply verb
+            // (`my_ddply <- plyr::ddply`) suppresses a data-masked `.fun`'s `...`
+            // identically to the direct call — keyed on the RESOLVED target name.
             LocalCalleeAlias::Qualified {
                 package,
                 name: target,
-            } => crate::nse::package_policy(package, target).unwrap_or(ArgPolicy::Standard),
+            } => {
+                let policy =
+                    crate::nse::package_policy(package, target).unwrap_or(ArgPolicy::Standard);
+                upgrade_plyr_ply_dots(call_node, target, text, analysis, policy)
+            }
             // An opaque callable whose policy we cannot prove: suppress
             // conservatively rather than inherit any package verb's policy.
             LocalCalleeAlias::Unknown => ArgPolicy::WholeCall,
@@ -15220,6 +15227,14 @@ fn resolve_call_arg_policy(
 /// so it cannot drift from the call-site rules) and resolved shadow-aware. This
 /// is inherently a call-site decision (it depends on `.fun`, an argument), so it
 /// lives here rather than in the pure `package_policy` table.
+///
+/// KNOWN LIMITATION (shared with all per-formal NSE matching): `.fun` is matched
+/// by EXACT argument name, but R also resolves unambiguous partial names before
+/// `...` — so `ddply(df, .(g), .f = summarise, …)` (where `.f` partial-matches
+/// `.fun`) is not located, the upgrade does not fire, and the `...` stay checked.
+/// This is the safe direction (over-checking, a possible false positive — never a
+/// hidden bug); a fix would have to teach `suppressed_arguments` partial matching
+/// for every policy, not just this one.
 fn upgrade_plyr_ply_dots<'tree>(
     call_node: Node<'tree>,
     name: &str,
@@ -15281,14 +15296,24 @@ fn upgrade_plyr_ply_dots<'tree>(
 /// Whether a plyr `*ply` `.fun` argument value resolves to a verb whose NSE
 /// policy data-masks its `...` (`captured_dots: true`) — the condition under
 /// which the forwarded `*ply` `...` are columns. Resolved shadow-aware to match
-/// R's dispatch: a local definition or alias for an identifier `.fun` beats the
-/// package verb; an opaque local binding (e.g. an enclosing formal) shadows the
-/// package verb but its policy is unknown, so it is treated as not-data-masking
-/// (the safe direction — leaves `...` checked, never hides a bug). With no local
-/// binding it is resolved one level deep through the built-in tables
-/// ([`table_verb_policy`]) — the same one-level discipline as the wrapper-dots
-/// inference ([`body_forwards_dots_to_covered_verb`]). Non-identifier `.fun`
-/// values (anonymous functions, strings, computed calls) are not data-masking.
+/// R's dispatch: a **top-level** local definition or alias for an identifier
+/// `.fun` beats the package verb; a top-level opaque callee binding (in
+/// `local_callee_shadows`) is treated as not-data-masking (the safe direction —
+/// leaves `...` checked, never hides a bug). With no such local binding it is
+/// resolved one level deep through the built-in tables ([`table_verb_policy`]) —
+/// the same one-level discipline as the wrapper-dots inference
+/// ([`body_forwards_dots_to_covered_verb`]). Non-identifier `.fun` values
+/// (anonymous functions, strings, computed calls) are not data-masking.
+///
+/// KNOWN LIMITATION (pre-existing, shared with direct-callee resolution in
+/// [`resolve_call_arg_policy`]): only **top-level** bindings are tracked —
+/// `collect_nse_facts` skips in-function assignments and formals (see its doc).
+/// A binding that shadows a data-masking verb name *inside an enclosing
+/// function* — e.g. `f <- function(summarise) ddply(df, .(g), summarise, ...)` —
+/// is invisible here, so that `.fun` is wrongly resolved to the package verb and
+/// its `...` suppressed (a false negative). Fixing it would require
+/// function-scoped binding tracking across the whole NSE machinery, not just
+/// this `.fun` path.
 fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnalysis) -> bool {
     use crate::nse::ArgPolicy;
     let policy = match value.kind() {
@@ -26336,6 +26361,61 @@ clean_data <- function(x) {
                 .iter()
                 .any(|m| m.contains("Undefined variable: value_col")),
             "a named `.fun = summarise` must still be located and data-mask the `...`; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467 follow-up (Codex review): the `m*ply` family wraps `.fun` in
+    /// `splat()` — `mdply(.data, .fun, ...)` calls `do.call(splat(.fun),
+    /// c(row_values, list(...)))`, so the m*ply call's `...` are spread as
+    /// ORDINARY arguments, never forwarded into `.fun`'s per-group data mask.
+    /// Verified against plyr 1.8.9: `mdply(df, summarise, z = sum(x))` errors
+    /// with "object 'x' not found" because `x` is not a visible column. So the
+    /// `m*ply` verbs must NOT get the data-mask upgrade — their `...` stay
+    /// checked even with a data-masking `.fun`, so a typo is still flagged.
+    #[tokio::test]
+    async fn nse_plyr_mdply_splat_fun_keeps_dots_checked_end_to_end() {
+        let code = "library(plyr)\n\
+                    mdply(some_df, summarise, n = undefined_typo)\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &["mdply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_typo")),
+            "`mdply` splats `.fun`, so its `...` are NOT data-masked and the typo must be flagged; messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467 follow-up (Codex review): a local qualified alias of a `*ply`
+    /// verb (`my_ddply <- plyr::ddply`) resolves through the alias path of
+    /// `resolve_call_arg_policy`, which must apply the same `.fun`-conditional
+    /// dots upgrade — otherwise `my_ddply(df, .(g), summarise, …)` would keep a
+    /// data-masked column checked while the identical direct `ddply(...)` call
+    /// suppresses it.
+    #[tokio::test]
+    async fn nse_plyr_qualified_alias_applies_dots_upgrade_end_to_end() {
+        let code = "library(plyr)\n\
+                    my_ddply <- plyr::ddply\n\
+                    my_ddply(some_df, .(year), summarise, n = length(unique(team)))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: team")),
+            "an aliased `*ply` (`my_ddply <- plyr::ddply`) must apply the data-mask upgrade; messages: {messages:?}"
         );
     }
 
