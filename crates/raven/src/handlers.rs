@@ -18736,33 +18736,6 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
     format!("**[`{label_package}::{label_topic}`](command:raven.openHelpPanel?{arg_encoded})**\n\n")
 }
 
-/// Provide hover information for the symbol at a given text document position.
-///
-/// Tries, in order (see `docs/hover.md` for the user-facing contract):
-/// 1. Namespace qualifier `pkg::name`: the member side resolves the qualified help topic; the package side (`pkg`) shows the package's `DESCRIPTION` `Title`/`Description` (#382 step 1).
-/// 2. Structural labels — *resolve where possible, otherwise suppress* (#382 steps 2-4, layered on top of `is_structural_label`): a named-argument label → a user function's exact formal; a parameter name at a definition site → its `@param` roxygen; an `obj$name`/`obj@slot` member → its local definition (via `qualified_resolve`). A label that resolves to none of these falls through to the `is_structural_label` backstop and produces nothing — **resolve-or-suppress, never resolve-or-attribute**, so the #379 `from {base}` misattribution cannot recur.
-/// 3. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
-/// 4. Package exports discovered from the combined package scope, returning a signature and package attribution.
-/// 5. Cached R help text or a one-time lookup of R help for builtins and other symbols.
-///
-/// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use tower_lsp::lsp_types::Position;
-/// # use url::Url;
-/// # use raven::state::WorldState;
-/// # use raven::handlers::hover;
-/// # async fn example() {
-/// # let state: WorldState = todo!();
-/// # let uri: Url = todo!();
-/// // Assuming `state` is available and `uri` refers to an open R document:
-/// let pos = Position::new(10, 4);
-/// let _ = hover(&state, &uri, pos).await;
-/// # }
-/// ```
-///
 /// First matching `# raven:` directive declaration for a declared symbol whose
 /// resolved definition is at `defined_line`. Shared by hover and
 /// go-to-definition so the two never disagree about a declared symbol's origin.
@@ -18817,6 +18790,33 @@ fn resolve_directive_origin(
     matches().min_by_key(|(line, _)| *line)
 }
 
+/// Provide hover information for the symbol at a given text document position.
+///
+/// Tries, in order (see `docs/hover.md` for the user-facing contract):
+/// 1. Namespace qualifier `pkg::name`: the member side resolves the qualified help topic; the package side (`pkg`) shows the package's `DESCRIPTION` `Title`/`Description` (#382 step 1).
+/// 2. Structural labels — *resolve where possible, otherwise suppress* (#382 steps 2-4, layered on top of `is_structural_label`): a named-argument label → a user function's exact formal; a parameter name at a definition site → its `@param` roxygen; an `obj$name`/`obj@slot` member → its local definition (via `qualified_resolve`). A label that resolves to none of these falls through to the `is_structural_label` backstop and produces nothing — **resolve-or-suppress, never resolve-or-attribute**, so the #379 `from {base}` misattribution cannot recur.
+/// 3. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
+/// 4. Package exports discovered from the combined package scope, returning a signature and package attribution.
+/// 5. Cached R help text or a one-time lookup of R help for builtins and other symbols.
+///
+/// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use tower_lsp::lsp_types::Position;
+/// # use url::Url;
+/// # use raven::state::WorldState;
+/// # use raven::handlers::hover;
+/// # async fn example() {
+/// # let state: WorldState = todo!();
+/// # let uri: Url = todo!();
+/// // Assuming `state` is available and `uri` refers to an open R document:
+/// let pos = Position::new(10, 4);
+/// let _ = hover(&state, &uri, pos).await;
+/// # }
+/// ```
+///
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
