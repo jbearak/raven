@@ -494,6 +494,82 @@ fn bench_interval_tree_queries(c: &mut Criterion) {
 //   - Querying transitive dependents
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Benchmark: forward-child memoization (issue #472)
+//
+// Builds a dense, hub-heavy workspace — the shape that regressed after #471's
+// forward-source isolation: a `hub.R` that `source()`s N children, a
+// `bootstrap.R` that sources the hub, and M leaves that source the bootstrap.
+// Querying the hub at EOF exercises BOTH the backward parent walk (the hub has
+// many parents: bootstrap + every leaf) and the forward re-resolution of its N
+// children — exactly the path the per-query forward-child memo deduplicates.
+// ---------------------------------------------------------------------------
+
+/// Write a dense hub workspace to a fresh temp dir: `hub.R` sources
+/// `child_0..N`, each child defines a function and loads a package;
+/// `bootstrap.R` sources the hub; `leaf_0..M` source the bootstrap.
+fn create_hub_workspace(n_children: usize, n_leaves: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create temp workspace");
+    let root = dir.path();
+
+    let mut hub = String::new();
+    for i in 0..n_children {
+        hub.push_str(&format!("source(\"child_{i}.R\")\n"));
+        let child = format!("library(pkg{i})\nhub_fn_{i} <- function() {i}\n");
+        std::fs::write(root.join(format!("child_{i}.R")), child).unwrap();
+    }
+    std::fs::write(root.join("hub.R"), hub).unwrap();
+    std::fs::write(root.join("bootstrap.R"), "source(\"hub.R\")\n").unwrap();
+    for l in 0..n_leaves {
+        std::fs::write(
+            root.join(format!("leaf_{l}.R")),
+            "source(\"bootstrap.R\")\n",
+        )
+        .unwrap();
+    }
+    dir
+}
+
+fn bench_forward_child_memo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cross_file_forward_child_memo");
+    group.sample_size(20);
+
+    let cases: &[(&str, usize, usize)] = &[("hub_30x20", 30, 20), ("hub_60x40", 60, 40)];
+
+    for (label, n_children, n_leaves) in cases {
+        let workspace = create_hub_workspace(*n_children, *n_leaves);
+        let workspace_path = workspace.path();
+        let folder_url = Url::from_file_path(workspace_path).unwrap();
+        let (artifacts_map, metadata_map) = precompute_artifacts(workspace_path);
+        let graph = build_dependency_graph(&metadata_map, Some(&folder_url));
+        let hub_uri = Url::from_file_path(workspace_path.join("hub.R")).unwrap();
+        let base_exports: HashSet<String> = HashSet::new();
+
+        group.bench_with_input(BenchmarkId::new("query_hub_eof", *label), label, |b, _| {
+            b.iter(|| {
+                black_box(raven::cross_file::scope_at_position_with_graph(
+                    black_box(&hub_uri),
+                    u32::MAX,
+                    u32::MAX,
+                    &|u| artifacts_map.get(u).cloned(),
+                    &|u| metadata_map.get(u).cloned(),
+                    &graph,
+                    Some(&folder_url),
+                    black_box(64),
+                    &base_exports,
+                    true,
+                    raven::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    None,
+                    None,
+                ))
+            })
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_dependency_graph(c: &mut Criterion) {
     let mut group = c.benchmark_group("cross_file_dependency_graph");
     group.sample_size(20);
@@ -574,5 +650,6 @@ criterion_group!(
     bench_dependency_graph,
     bench_scope_hotspots,
     bench_interval_tree_queries,
+    bench_forward_child_memo,
 );
 criterion_main!(benches);

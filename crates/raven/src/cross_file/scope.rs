@@ -950,6 +950,157 @@ fn merge_child_source_packages(
     }
 }
 
+/// Per-query memo of forward-sourced child EOF scopes (issue #472).
+///
+/// After #471 isolated each forward `source()` branch from the backward
+/// (parent-prefix) walk's `visited` map, a child file the backward walk already
+/// resolved gets re-resolved when reached again as a forward source — a ~7%
+/// regression on `raven check` of dense, hub-heavy workspaces. A forward
+/// `source()` always resolves its child at EOF `(MAX, MAX)`, and the child's
+/// resolved scope is a deterministic function of `(child_uri, path context,
+/// attached package set)` *as long as the child is not part of a source cycle*
+/// (a cyclic child's scope additionally depends on which ancestors were already
+/// visited — see the revisit guard in `scope_at_position_with_graph_recursive`).
+/// This memo caches that scope so each distinct `(child, context, packages)` is
+/// resolved once per top-level query.
+///
+/// Lifetime discipline mirrors [`ParentPrefixCache`]: one instance per
+/// top-level scope query (or per [`ScopeStream`]); **never** shared across
+/// queries — the value depends on per-query inputs (the `DataAliasProvider`
+/// identity, `hoist_globals`, `max_depth`, `backward_dep_mode`) that the key
+/// does not encode.
+#[derive(Debug, Default)]
+pub(crate) struct ForwardChildMemo {
+    entries: HashMap<ForwardChildKey, Arc<ScopeAtPosition>>,
+}
+
+/// Key for [`ForwardChildMemo`]. Captures every caller-varying input that
+/// changes a forward child's EOF scope, so a hit is byte-for-byte identical to
+/// a fresh resolution:
+/// - `child_uri`
+/// - `path_fp`: hash of the child's effective [`PathContext`] (file_path,
+///   working_directory, inherited_working_directory, workspace_root), which
+///   governs how the child resolves *its own* `source()` paths (and whether the
+///   workspace-root fallback applies). The whole `PathContext` is hashed, not
+///   just the effective dir, so two parents with the same effective directory
+///   but different explicit-vs-inherited working dirs do not collide.
+/// - `pkg_fp`: order-independent hash of the attached package set passed into
+///   the child. The set feeds bare `data(stem)` symbol binding and
+///   `package_origins` attribution, so it is a real input to the child's scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ForwardChildKey {
+    child_uri: Url,
+    path_fp: u64,
+    pkg_fp: u64,
+}
+
+/// Hash a child's `PathContext` (or its absence) into a `path_fp`.
+fn path_context_fingerprint(ctx: Option<&super::path_resolve::PathContext>) -> u64 {
+    let mut h = DefaultHasher::new();
+    match ctx {
+        None => 0u8.hash(&mut h),
+        Some(c) => {
+            1u8.hash(&mut h);
+            c.file_path.hash(&mut h);
+            c.working_directory.hash(&mut h);
+            c.inherited_working_directory.hash(&mut h);
+            c.workspace_root.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Order-independent fingerprint of an attached package set: XOR of per-element
+/// hashes, so iteration order (HashSet) does not affect the key.
+fn package_set_fingerprint(pkgs: &HashSet<String>) -> u64 {
+    let mut acc = 0u64;
+    for p in pkgs {
+        let mut h = DefaultHasher::new();
+        p.hash(&mut h);
+        acc ^= h.finish();
+    }
+    acc
+}
+
+// Test-only switch (the master equivalence gate flips this) to force every
+// forward-child resolution to recompute, so memoized and non-memoized results
+// can be compared. Always `false` in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static FORWARD_CHILD_MEMO_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn forward_child_memo_disabled() -> bool {
+    FORWARD_CHILD_MEMO_DISABLED.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn forward_child_memo_disabled() -> bool {
+    false
+}
+
+// Test-only counter of *actual* (non-memoized) forward-child resolutions, so a
+// test can prove the memo deduplicates re-resolution rather than relying on
+// flaky wall-clock timing.
+#[cfg(test)]
+thread_local! {
+    static FORWARD_CHILD_COMPUTE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_forward_child_compute_count() {
+    FORWARD_CHILD_COMPUTE_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn bump_forward_child_compute_count() {}
+
+/// Resolve a forward-sourced child's EOF scope, consulting [`ForwardChildMemo`].
+///
+/// `compute` is the closure that performs the actual (expensive) recursive
+/// resolution on a miss. Memoization is skipped — `compute` is run directly and
+/// nothing is cached — when the graph contains **any** source cycle
+/// (`graph.contains_cycle()`). A cycle reachable from the child (including
+/// through its *backward* parent walk) makes parts of the resolved scope depend
+/// on traversal/`visited` state, so the scope is no longer a pure function of
+/// the key. Checking "the child itself is in a cycle" is insufficient: an
+/// acyclic child whose ancestors form a cycle (e.g. a shared file sourced by
+/// both legs of an `a ↔ b` cycle) is also visited-dependent. Cycles are rare;
+/// disabling the memo wholesale on cyclic graphs keeps the common acyclic case
+/// (the `worldwide` repo) fully memoized. On a hit the cached scope is cloned
+/// (cheap relative to re-resolution — see the issue's lazy-clone finding).
+fn resolve_forward_child_memoized(
+    memo: &std::cell::RefCell<ForwardChildMemo>,
+    graph: &super::dependency::DependencyGraph,
+    child_uri: &Url,
+    path_fp: u64,
+    packages_for_child: &HashSet<String>,
+    compute: impl FnOnce() -> ScopeAtPosition,
+) -> ScopeAtPosition {
+    // A cycle anywhere in the graph makes child scopes visited-dependent.
+    if forward_child_memo_disabled() || graph.contains_cycle() {
+        bump_forward_child_compute_count();
+        return compute();
+    }
+    let key = ForwardChildKey {
+        child_uri: child_uri.clone(),
+        path_fp,
+        pkg_fp: package_set_fingerprint(packages_for_child),
+    };
+    if let Some(arc) = memo.borrow().entries.get(&key) {
+        return (**arc).clone();
+    }
+    bump_forward_child_compute_count();
+    let computed = compute();
+    memo.borrow_mut()
+        .entries
+        .insert(key, Arc::new(computed.clone()));
+    computed
+}
+
 /// Determine whether a `source()` call should use local scoping rules.
 ///
 /// The function returns `true` when the `ForwardSource` explicitly requests local
@@ -4492,6 +4643,7 @@ where
         .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
 
     let empty_packages = HashSet::new();
+    let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
     scope_at_position_with_graph_recursive(
         uri,
         line,
@@ -4513,6 +4665,7 @@ where
         None,
         package_contribution,
         data_alias_provider,
+        &forward_child_memo,
     )
 }
 
@@ -4597,6 +4750,10 @@ where
         None => false,
     };
 
+    // Per-query forward-child memo (issue #472), shared by the prefix
+    // computation (STEP 1) and the recursive STEP 2 below.
+    let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+
     // Cache lookup. On hit, we share the Arc with the caller. On miss, we
     // compute the prefix (mirroring STEP 1's visited[uri] = (line, col)
     // semantics) and insert into the cache.
@@ -4630,6 +4787,7 @@ where
                 hoist_globals,
                 backward_dep_mode,
                 is_cancelled,
+                &forward_child_memo,
             );
             let arc = Arc::new(computed);
             prefix_cache
@@ -4671,6 +4829,7 @@ where
         Some(&prefix_arc),
         package_contribution,
         data_alias_provider,
+        &forward_child_memo,
     )
 }
 
@@ -4731,6 +4890,10 @@ fn parent_prefix_at<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    // Threaded into each parent's recursive resolution so the backward walk's
+    // forward-source expansions share the same forward-child memo as STEP 2
+    // (issue #472).
+    forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> ParentPrefix
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4909,6 +5072,7 @@ where
             // scope for the issue's single-file acceptance criteria; the
             // literal-stem `Def` fallback still flows through the prefix.
             None,
+            forward_child_memo,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -5119,6 +5283,11 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // receive it — that prefix is cached provider-independently, so it always
     // passes `None`. `None` disables expansion (literal-stem `Def` fallback).
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    // Per-query memo of forward-sourced child EOF scopes (issue #472). Threaded
+    // through STEP 1's parent walk and STEP 2's forward children so each
+    // distinct `(child, path context, package set)` is resolved once per
+    // top-level query. See [`ForwardChildMemo`].
+    forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -5287,6 +5456,7 @@ where
                     hoist_globals,
                     backward_dep_mode,
                     is_cancelled,
+                    forward_child_memo,
                 );
 
                 // Merge by move (no extra clones) — `entry().or_insert` for
@@ -5513,27 +5683,42 @@ where
                             let mut child_visited = forward_visited_base
                                 .clone()
                                 .unwrap_or_else(|| visited.clone());
-                            scope_at_position_with_graph_recursive(
-                                &child_uri,
-                                u32::MAX, // Include all symbols from sourced file
-                                u32::MAX,
-                                get_artifacts,
-                                get_metadata,
+                            // Memoize the child's EOF scope per (child, path
+                            // context, package set), skipping cyclic children
+                            // (issue #472). `path_fp` is computed before the
+                            // closure moves `child_ctx`.
+                            let path_fp = path_context_fingerprint(child_ctx.as_ref());
+                            resolve_forward_child_memoized(
+                                forward_child_memo,
                                 graph,
-                                workspace_root,
-                                child_ctx,
-                                max_depth,
-                                current_depth + 1,
-                                &mut child_visited,
-                                packages_for_child, // Pass inherited packages to child
-                                base_exports,
-                                hoist_globals,
-                                backward_dep_mode,
-                                is_cancelled,
-                                true,
-                                None,
-                                None,
-                                data_alias_provider,
+                                &child_uri,
+                                path_fp,
+                                packages_for_child,
+                                || {
+                                    scope_at_position_with_graph_recursive(
+                                        &child_uri,
+                                        u32::MAX, // Include all symbols from sourced file
+                                        u32::MAX,
+                                        get_artifacts,
+                                        get_metadata,
+                                        graph,
+                                        workspace_root,
+                                        child_ctx,
+                                        max_depth,
+                                        current_depth + 1,
+                                        &mut child_visited,
+                                        packages_for_child, // Pass inherited packages to child
+                                        base_exports,
+                                        hoist_globals,
+                                        backward_dep_mode,
+                                        is_cancelled,
+                                        true,
+                                        None,
+                                        None,
+                                        data_alias_provider,
+                                        forward_child_memo,
+                                    )
+                                },
                             )
                         } else {
                             scope_at_position_with_graph_recursive(
@@ -5557,6 +5742,7 @@ where
                                 None,
                                 None,
                                 data_alias_provider,
+                                forward_child_memo,
                             )
                         };
                         extend_visible_positions(
@@ -6424,6 +6610,16 @@ where
     /// fallback stays). Mirrors the recursive resolver's `data_alias_provider`
     /// so the two paths agree on what a `data()` call makes visible.
     data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+
+    /// Per-stream memo of forward-sourced child EOF scopes (issue #472). Shared
+    /// across all `resolve_source_contribution` calls and threaded into each
+    /// child's recursive resolution, so a child reached by multiple `source()`
+    /// call sites (or transitively via several paths) is resolved once per
+    /// stream. Distinct from `source_contributions` (which caches post-leak,
+    /// caller-specific contributions keyed by call-site); this memo sits one
+    /// level below, keyed by `(child_uri, path_fp, pkg_fp)`. See
+    /// [`ForwardChildMemo`].
+    forward_child_memo: std::cell::RefCell<ForwardChildMemo>,
 }
 
 impl<'a, F, G> ScopeStream<'a, F, G>
@@ -6456,6 +6652,11 @@ where
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
+        // Per-stream forward-child memo (issue #472). Created before the prefix
+        // pre-computation so the queried URI's backward-walk forward-source
+        // expansions populate the same memo the forward sweep later reads.
+        let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+
         // Pre-compute both prefix slots through the shared cache.
         let prefix_top = compute_or_get_cached_prefix(
             queried_uri,
@@ -6470,6 +6671,7 @@ where
             backward_dep_mode,
             is_cancelled,
             prefix_cache,
+            &forward_child_memo,
         );
         let prefix_in_function = if hoist_globals {
             compute_or_get_cached_prefix(
@@ -6485,6 +6687,7 @@ where
                 backward_dep_mode,
                 is_cancelled,
                 prefix_cache,
+                &forward_child_memo,
             )
         } else {
             prefix_top.clone()
@@ -6545,6 +6748,7 @@ where
             package_contribution,
             contribution_symbol_names,
             data_alias_provider,
+            forward_child_memo,
         })
     }
 
@@ -7384,6 +7588,7 @@ where
             self.backward_dep_mode,
             self.is_cancelled,
             self.prefix_cache,
+            &self.forward_child_memo,
         );
 
         // Run STEP 2 for the child at EOF, supplying the cached prefix.
@@ -7404,27 +7609,40 @@ where
         let mut visited = HashMap::new();
         visited.insert(self.queried_uri.clone(), (u32::MAX, u32::MAX));
         let empty_packages = HashSet::new();
-        let child_scope = scope_at_position_with_graph_recursive(
-            &child_uri,
-            u32::MAX,
-            u32::MAX,
-            self.get_artifacts,
-            self.get_metadata,
+        // Memoize the child's EOF scope (issue #472), skipping cyclic children.
+        // `path_fp` is computed before the closure moves `child_ctx`.
+        let path_fp = path_context_fingerprint(child_ctx.as_ref());
+        let child_scope = resolve_forward_child_memoized(
+            &self.forward_child_memo,
             self.graph,
-            self.workspace_root,
-            child_ctx,
-            self.max_depth,
-            1, // current_depth — child is depth 1 of the queried URI
-            &mut visited,
+            &child_uri,
+            path_fp,
             &empty_packages,
-            self.base_exports,
-            self.hoist_globals,
-            self.backward_dep_mode,
-            self.is_cancelled,
-            true,
-            Some(&child_prefix),
-            None,
-            self.data_alias_provider,
+            || {
+                scope_at_position_with_graph_recursive(
+                    &child_uri,
+                    u32::MAX,
+                    u32::MAX,
+                    self.get_artifacts,
+                    self.get_metadata,
+                    self.graph,
+                    self.workspace_root,
+                    child_ctx,
+                    self.max_depth,
+                    1, // current_depth — child is depth 1 of the queried URI
+                    &mut visited,
+                    &empty_packages,
+                    self.base_exports,
+                    self.hoist_globals,
+                    self.backward_dep_mode,
+                    self.is_cancelled,
+                    true,
+                    Some(&child_prefix),
+                    None,
+                    self.data_alias_provider,
+                    &self.forward_child_memo,
+                )
+            },
         );
 
         // Forward-source leak rule (same-file + parent-prefix-only) lives in
@@ -7610,6 +7828,7 @@ fn compute_or_get_cached_prefix<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
+    forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> Arc<ParentPrefix>
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7648,6 +7867,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        forward_child_memo,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();
@@ -15571,6 +15791,316 @@ x <- 1"#;
              visible in indices.r; got symbols: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
         );
+    }
+
+    // ====================================================================
+    // Issue #472 — forward-child memoization equivalence gate.
+    //
+    // The master correctness gate: for a battery of workspaces, resolving
+    // every file's EOF scope with the forward-child memo ENABLED must be
+    // byte-identical to resolving it DISABLED. This directly exercises the
+    // package-set (`pkg_fp`), path-context (`path_fp`), and source-cycle
+    // (`detect_cycle` exclusion) concerns Codex raised.
+    // ====================================================================
+
+    /// Canonical, order-independent string form of a resolved scope, covering
+    /// every field that memoization could perturb.
+    #[cfg(test)]
+    fn canonical_scope(scope: &ScopeAtPosition) -> String {
+        let mut symbols: Vec<String> = scope
+            .symbols
+            .iter()
+            .map(|(n, s)| {
+                format!(
+                    "{n}|{:?}|{}|{}:{}|decl={}",
+                    s.kind, s.source_uri, s.defined_line, s.defined_column, s.is_declared
+                )
+            })
+            .collect();
+        symbols.sort();
+        let mut loaded: Vec<&String> = scope.loaded_packages.iter().collect();
+        loaded.sort();
+        let mut inherited: Vec<&String> = scope.inherited_packages.iter().collect();
+        inherited.sort();
+        let mut origins: Vec<String> = scope
+            .package_origins
+            .iter()
+            .map(|(p, set)| {
+                let mut us: Vec<String> = set.iter().map(|u| u.to_string()).collect();
+                us.sort();
+                format!("{p}=>[{}]", us.join(","))
+            })
+            .collect();
+        origins.sort();
+        let mut depth: Vec<String> = scope
+            .depth_exceeded
+            .iter()
+            .map(|(u, l, c)| format!("{u}:{l}:{c}"))
+            .collect();
+        depth.sort();
+        let mut chain: Vec<String> = scope.chain.iter().map(|u| u.to_string()).collect();
+        chain.sort();
+        let mut prefix_names: Vec<String> = scope
+            .parent_prefix_symbol_names
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        prefix_names.sort();
+        let mut vis: Vec<String> = scope
+            .visible_positions
+            .iter()
+            .map(|(u, (l, c))| format!("{u}:{l}:{c}"))
+            .collect();
+        vis.sort();
+        format!(
+            "SYM[{}]\nLOADED[{loaded:?}]\nINH[{inherited:?}]\nORIG[{}]\nDEPTH[{}]\nCHAIN[{}]\nPFX[{}]\nVIS[{}]",
+            symbols.join(";"),
+            origins.join(";"),
+            depth.join(";"),
+            chain.join(";"),
+            prefix_names.join(";"),
+            vis.join(";"),
+        )
+    }
+
+    /// Build a graph + artifact/metadata closures from `(uri, code)` files,
+    /// then assert that resolving every file's EOF scope is identical with the
+    /// forward-child memo enabled vs disabled.
+    #[cfg(test)]
+    fn assert_memo_equivalence(workspace_root: &Url, files: &[(Url, &str)]) {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(workspace_root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+
+        let get_artifacts =
+            |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(uri).cloned() };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> { metas.get(uri).cloned() };
+        let base_exports = HashSet::new();
+
+        let resolve = |uri: &Url| {
+            scope_at_position_with_graph(
+                uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(workspace_root),
+                64,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        for (uri, _) in files {
+            FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(true));
+            let off = resolve(uri);
+            FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(false));
+            let on = resolve(uri);
+            assert_eq!(
+                canonical_scope(&off),
+                canonical_scope(&on),
+                "forward-child memo changed the resolved scope for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn memo_equiv_dense_hub_shared_children() {
+        // A hub sources many children; a bootstrap sources the hub; many leaves
+        // source the bootstrap. Children are reached via many paths → many memo
+        // hits. Each child defines a symbol and loads a package.
+        let root = Url::parse("file:///project").unwrap();
+        let mut files: Vec<(Url, String)> = Vec::new();
+        let n = 12;
+        let mut hub_code = String::new();
+        for i in 0..n {
+            hub_code.push_str(&format!("source(\"child_{i}.r\")\n"));
+            files.push((
+                Url::parse(&format!("file:///project/child_{i}.r")).unwrap(),
+                format!("library(pkg{i})\ngetSym_{i} <- function() {i}\n"),
+            ));
+        }
+        files.push((Url::parse("file:///project/functions.r").unwrap(), hub_code));
+        files.push((
+            Url::parse("file:///project/bootstrap.r").unwrap(),
+            "source(\"functions.r\")\n".to_string(),
+        ));
+        for l in 0..5 {
+            files.push((
+                Url::parse(&format!("file:///project/leaf_{l}.r")).unwrap(),
+                "source(\"bootstrap.r\")\n".to_string(),
+            ));
+        }
+        let borrowed: Vec<(Url, &str)> =
+            files.iter().map(|(u, c)| (u.clone(), c.as_str())).collect();
+        assert_memo_equivalence(&root, &borrowed);
+    }
+
+    #[test]
+    fn memo_dedups_forward_child_resolutions() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        // `hub.r` sources N children. `q.r` (queried) sources the hub. `q.r`
+        // has K parents that each source the hub *before* sourcing `q.r`, so
+        // STEP 1's backward walk expands the hub's children at EOF, and STEP 2
+        // of `q.r` re-resolves them (the #471 regression). The memo must
+        // collapse the STEP-2 re-resolution to cache hits.
+        let root = Url::parse("file:///project").unwrap();
+        let n = 10usize;
+        let k = 6usize;
+        let mut files: Vec<(Url, String)> = Vec::new();
+        let mut hub_code = String::new();
+        for i in 0..n {
+            hub_code.push_str(&format!("source(\"child_{i}.r\")\n"));
+            files.push((
+                Url::parse(&format!("file:///project/child_{i}.r")).unwrap(),
+                format!("c_sym_{i} <- {i}\n"),
+            ));
+        }
+        files.push((Url::parse("file:///project/hub.r").unwrap(), hub_code));
+        files.push((
+            Url::parse("file:///project/q.r").unwrap(),
+            "source(\"hub.r\")\n".to_string(),
+        ));
+        for j in 0..k {
+            files.push((
+                Url::parse(&format!("file:///project/p_{j}.r")).unwrap(),
+                // hub BEFORE q, so at q's call site the hub is already expanded.
+                "source(\"hub.r\")\nsource(\"q.r\")\n".to_string(),
+            ));
+        }
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in &files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metas.get(uri).cloned();
+        let base_exports = HashSet::new();
+        let q_uri = Url::parse("file:///project/q.r").unwrap();
+
+        let resolve_and_count = |disabled: bool| -> u64 {
+            FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(disabled));
+            FORWARD_CHILD_COMPUTE_COUNT.with(|c| c.set(0));
+            let _ = scope_at_position_with_graph(
+                &q_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                64,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            let count = FORWARD_CHILD_COMPUTE_COUNT.with(|c| c.get());
+            FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(false));
+            count
+        };
+
+        let off = resolve_and_count(true);
+        let on = resolve_and_count(false);
+
+        // With the memo on, each distinct forward-sourced file (the hub + its N
+        // children) is resolved at most once.
+        assert!(
+            on <= (n + 1) as u64,
+            "memo should resolve each forward child at most once: on={on}, n+1={}",
+            n + 1
+        );
+        // Without it, STEP 2 re-resolves the hub + children that STEP 1's
+        // backward walk already expanded.
+        assert!(
+            off > on,
+            "expected the un-memoized path to re-resolve more often: off={off}, on={on}"
+        );
+    }
+
+    #[test]
+    fn memo_equiv_source_cycle() {
+        // A ↔ B source cycle plus a child sourced by both. Cyclic files are
+        // excluded from the memo; equivalence must still hold and not loop.
+        let root = Url::parse("file:///project").unwrap();
+        let files: Vec<(Url, &str)> = vec![
+            (
+                Url::parse("file:///project/a.r").unwrap(),
+                "source(\"b.r\")\nsource(\"shared.r\")\na_sym <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/b.r").unwrap(),
+                "source(\"a.r\")\nsource(\"shared.r\")\nb_sym <- 2\n",
+            ),
+            (
+                Url::parse("file:///project/shared.r").unwrap(),
+                "shared_sym <- 3\n",
+            ),
+        ];
+        assert_memo_equivalence(&root, &files);
+    }
+
+    #[test]
+    fn memo_equiv_cd_divergence() {
+        // The same-named child is sourced by two parents under different
+        // `# raven: cd` working directories, so each parent's child resolves a
+        // different `helper.r`. `path_fp` must keep the two from colliding.
+        let root = Url::parse("file:///project").unwrap();
+        let files: Vec<(Url, &str)> = vec![
+            (
+                Url::parse("file:///project/p1.r").unwrap(),
+                "# raven: cd dirA\nsource(\"sub.r\")\n",
+            ),
+            (
+                Url::parse("file:///project/p2.r").unwrap(),
+                "# raven: cd dirB\nsource(\"sub.r\")\n",
+            ),
+            (
+                Url::parse("file:///project/sub.r").unwrap(),
+                "source(\"helper.r\")\n",
+            ),
+            (
+                Url::parse("file:///project/dirA/helper.r").unwrap(),
+                "helperA <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/dirB/helper.r").unwrap(),
+                "helperB <- 2\n",
+            ),
+        ];
+        assert_memo_equivalence(&root, &files);
     }
 
     #[test]

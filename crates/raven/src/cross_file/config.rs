@@ -42,7 +42,10 @@ pub struct CrossFileConfig {
     pub max_backward_depth: usize,
     /// Maximum depth for forward source() traversal
     pub max_forward_depth: usize,
-    /// Maximum total chain depth
+    /// Maximum total chain depth. Also bounds the *bidirectional* neighborhood
+    /// BFS depth, which can exceed a linear source chain (up to ancestors, back
+    /// down through siblings). Default 64 — high enough that realistic graphs
+    /// never truncate, while still bounding pathological ones (issue #473).
     pub max_chain_depth: usize,
     /// Default call site assumption when not specified
     pub assume_call_site: CallSiteDefault,
@@ -136,7 +139,14 @@ pub struct CrossFileConfig {
     /// Controls whether the LSP auto-detects parent files from forward source() calls
     /// in other workspace files, or requires explicit `# raven: sourced-by` directives.
     pub backward_dependencies: BackwardDependencyMode,
-    /// Maximum nodes visited during transitive dependent search (caps DFS in dense graphs).
+    /// Maximum nodes visited during transitive dependent / neighborhood search
+    /// (caps traversal in dense graphs). When exceeded, the resolver silently
+    /// stops following `source()` edges, surfacing dropped symbols as
+    /// false-positive `undefined-variable`. Default 50_000 — far above any real
+    /// R workspace (the neighborhood is naturally bounded by file count) while
+    /// still bounding a runaway graph (issue #473). `raven check` surfaces a
+    /// note when this budget is hit so drops are distinguishable from genuine
+    /// undefined variables.
     pub max_transitive_dependents_visited: usize,
     /// Package mode: auto (detect DESCRIPTION), enabled (always), disabled (never).
     pub package_mode: PackageMode,
@@ -157,9 +167,10 @@ pub enum PackageMode {
 impl Default for CrossFileConfig {
     /// Creates a CrossFileConfig populated with sensible defaults used by the cross-file awareness subsystem.
     ///
-    /// The defaults enable workspace indexing, on-demand indexing, package awareness, and conservative traversal limits
-    /// (backward/forward depth: 10, chain depth: 20). Diagnostic severities and debounce/revalidation limits are
-    /// initialized to typical values for editor integrations.
+    /// The defaults enable workspace indexing, on-demand indexing, package awareness, and traversal limits
+    /// sized so that realistic workspaces never hit them while a high finite ceiling still bounds pathological
+    /// graphs (backward/forward depth: 10, chain depth: 64, transitive-dependents budget: 50_000 — see issue #473).
+    /// Diagnostic severities and debounce/revalidation limits are initialized to typical values for editor integrations.
     ///
     /// # Examples
     ///
@@ -168,9 +179,10 @@ impl Default for CrossFileConfig {
     ///
     /// let cfg = CrossFileConfig::default();
     /// assert!(cfg.index_workspace);
-    /// assert_eq!(cfg.max_chain_depth, 20);
+    /// assert_eq!(cfg.max_chain_depth, 64);
     /// assert_eq!(cfg.max_backward_depth, 10);
     /// assert_eq!(cfg.max_forward_depth, 10);
+    /// assert_eq!(cfg.max_transitive_dependents_visited, 50_000);
     /// assert!(cfg.on_demand_indexing_enabled);
     /// assert!(cfg.packages_enabled);
     /// ```
@@ -179,7 +191,7 @@ impl Default for CrossFileConfig {
             diagnostics_enabled: true,
             max_backward_depth: 10,
             max_forward_depth: 10,
-            max_chain_depth: 20,
+            max_chain_depth: 64,
             assume_call_site: CallSiteDefault::End,
             index_workspace: true,
             max_revalidations_per_trigger: 10,
@@ -209,7 +221,7 @@ impl Default for CrossFileConfig {
             cache_workspace_index_max_entries: 5000,
             hoist_globals_in_functions: true,
             backward_dependencies: BackwardDependencyMode::Auto,
-            max_transitive_dependents_visited: 2000,
+            max_transitive_dependents_visited: 50_000,
             package_mode: PackageMode::Auto,
         }
     }
@@ -238,7 +250,7 @@ mod tests {
         let config = CrossFileConfig::default();
         assert_eq!(config.max_backward_depth, 10);
         assert_eq!(config.max_forward_depth, 10);
-        assert_eq!(config.max_chain_depth, 20);
+        assert_eq!(config.max_chain_depth, 64);
         assert_eq!(config.assume_call_site, CallSiteDefault::End);
         assert!(config.index_workspace);
         assert_eq!(config.max_revalidations_per_trigger, 10);
@@ -270,7 +282,7 @@ mod tests {
         assert!(config.hoist_globals_in_functions);
         // Backward dependencies default
         assert_eq!(config.backward_dependencies, BackwardDependencyMode::Auto);
-        assert_eq!(config.max_transitive_dependents_visited, 2000);
+        assert_eq!(config.max_transitive_dependents_visited, 50_000);
         // Libpath watcher defaults — keep in sync with parse_cross_file_config
         // (which clamps debounce to [100, 5000]) and the VS Code extension's
         // initializationOptions.

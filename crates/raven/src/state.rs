@@ -760,9 +760,20 @@ impl WorldState {
         // Scale the shared visited budget with seed count so workspaces with many
         // open files retain coverage equivalent to the old per-seed loop, capped to
         // bound lock-hold time when the user has hundreds of files open.
+        //
+        // Two ceilings apply. The relative one (`max_visited * 50`) preserves the
+        // pre-existing per-seed-equivalent scaling. The absolute one
+        // (`MULTI_SEED_VISITED_CEILING`) decouples this multi-seed path from the
+        // raised default of `max_transitive_dependents_visited` (issue #473 lifted
+        // it from 2_000 to 50_000): without it the relative ceiling would reach
+        // 2.5M, an unnecessary latency/memory cliff on a pathologically large
+        // workspace. Real workspaces are far smaller than either ceiling, so this
+        // never bites them.
+        const MULTI_SEED_VISITED_CEILING: usize = 200_000;
         let effective_max_visited = max_visited
             .saturating_mul(docs.len().max(1))
-            .min(max_visited.saturating_mul(50));
+            .min(max_visited.saturating_mul(50))
+            .min(MULTI_SEED_VISITED_CEILING);
 
         let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
             docs.iter().map(|(uri, _)| uri.clone()),
