@@ -1411,6 +1411,211 @@ mod tests {
         assert_eq!(run_blocking(base_args(tmp.path())), EXIT_OK);
     }
 
+    /// Issue #476 (bug B): on a case-insensitive filesystem (macOS/Windows) a
+    /// `source("child.r")` whose on-disk entry is `child.R` must still resolve the
+    /// child's symbols — the resolved edge target URI is case-corrected to match
+    /// the workspace-index key. Gated on actual FS case-insensitivity so it is a
+    /// no-op (and not a false failure) on case-sensitive filesystems, where the
+    /// two names are genuinely different files.
+    #[test]
+    fn case_mismatched_source_resolves_on_case_insensitive_fs_476() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "helper <- function() 1\n").unwrap();
+        // Detect case-insensitivity: can we open the upper-case file via a
+        // lower-case name?
+        let case_insensitive = std::fs::metadata(tmp.path().join("child.r")).is_ok();
+        if !case_insensitive {
+            return; // case-sensitive FS: `child.r` is genuinely missing — skip.
+        }
+        fs::write(tmp.path().join("main.r"), "source(\"child.r\")\nhelper()\n").unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![tmp.path().join("main.r")];
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: helper"),
+            "source(\"child.r\") must resolve on-disk child.R on a case-insensitive FS \
+             (issue #476). Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #476 (bug B, converse): case-correction must NOT invent a resolution.
+    /// On a case-SENSITIVE filesystem, `source("child.r")` when only `child.R`
+    /// exists is a genuine missing file, so `helper` stays undefined. (The
+    /// `canonical.exists()` guard means `canonicalize_case_below` never runs here.)
+    /// Gated to case-sensitive filesystems; a no-op on macOS/Windows where the
+    /// previous test covers the fold.
+    #[test]
+    fn case_mismatched_source_stays_undefined_on_case_sensitive_fs_476() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "helper <- function() 1\n").unwrap();
+        let case_insensitive = std::fs::metadata(tmp.path().join("child.r")).is_ok();
+        if case_insensitive {
+            return; // case-insensitive FS: child.r aliases child.R — covered elsewhere.
+        }
+        fs::write(tmp.path().join("main.r"), "source(\"child.r\")\nhelper()\n").unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![tmp.path().join("main.r")];
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: helper"),
+            "on a case-sensitive FS, source(\"child.r\") (only child.R exists) must NOT \
+             resolve — case-correction only ever maps to a real on-disk entry. \
+             Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #476 (bug A): the WHOLE diagnostic pipeline must be deterministic, not
+    /// just the graph-build order. Runs `collect_diagnostics_blocking` twice over a
+    /// hub-and-spoke workspace (each run does an independent rayon scan + graph
+    /// build + scope resolution) and asserts byte-identical diagnostic sets — so a
+    /// future order-sensitivity introduced downstream of the graph sort (e.g. a
+    /// HashMap in scope merging) is caught, not only backward-edge ordering.
+    #[test]
+    fn whole_pipeline_diagnostics_are_deterministic_476() {
+        let tmp = TempDir::new().unwrap();
+        // A shared helper hub plus several files that source it and a sibling that
+        // (deliberately) references an undefined symbol, to give the run a stable
+        // non-empty diagnostic set whose ordering/content could otherwise drift.
+        fs::write(tmp.path().join("hub.r"), "shared <- function() 1\n").unwrap();
+        for p in ["zeta.r", "alpha.r", "mike.r", "bravo.r"] {
+            fs::write(
+                tmp.path().join(p),
+                "source(\"hub.r\")\nshared()\nnot_defined_here\n",
+            )
+            .unwrap();
+        }
+
+        let collect = || -> Vec<String> {
+            let args = base_args(tmp.path());
+            let mut v: Vec<String> = collect_diagnostics_blocking(&args)
+                .into_iter()
+                .map(|(p, d)| {
+                    format!(
+                        "{}:{}:{}",
+                        p.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                        d.range.start.line,
+                        d.message
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        let first = collect();
+        let second = collect();
+        assert_eq!(
+            first, second,
+            "whole-pipeline diagnostics must be identical run-to-run (issue #476 bug A)"
+        );
+        // Sanity: `shared` resolves (no false positive) while the genuine undefined
+        // is reported — so the determinism assertion is over a meaningful set.
+        assert!(
+            !first
+                .iter()
+                .any(|d| d.contains("Undefined variable: shared")),
+            "shared() should resolve via the hub. Got: {first:?}"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|d| d.contains("Undefined variable: not_defined_here")),
+            "the genuine undefined should be reported. Got: {first:?}"
+        );
+    }
+
+    /// Issue #476 (bug C): a heavily-sourced hub's parent-prefix over-approximates
+    /// the union over ALL its callers, so a symbol the hub itself produces via a
+    /// forward `source()` can ALSO land in the hub's parent prefix. The
+    /// identical-binding no-op then left that name flagged parent-prefix-only and
+    /// the leak filter dropped it when the hub was itself forward-sourced. This
+    /// reproduces the `getArray` miniature: `caller` defines `helper` then sources
+    /// `hub`; `hub` forward-sources `defs` (which also defines `helper`); `user`
+    /// sources `hub` and must see `helper`.
+    #[test]
+    fn hub_forward_sourced_symbol_resolves_when_also_in_parent_prefix_476() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("defs.r"), "helper <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("hub.r"), "source(\"defs.r\")\n").unwrap();
+        // A caller that sources `defs.r` itself BEFORE sourcing the hub. This seeds
+        // `helper` into the hub's over-approximated parent prefix with the SAME
+        // binding (`source_uri = defs.r`, same position) the hub's own forward
+        // source produces — so the identical-binding no-op fires and (pre-fix)
+        // leaves `helper` marked parent-prefix-only. This is the exact stale-marker
+        // path the fix targets; a caller that defined its OWN `helper` would carry a
+        // different `source_uri`, take the non-identical merge branch (which already
+        // clears the marker), and resolve even without the fix.
+        fs::write(
+            tmp.path().join("caller.r"),
+            "source(\"defs.r\")\nsource(\"hub.r\")\n",
+        )
+        .unwrap();
+        // The file under test sources the hub and uses helper.
+        fs::write(tmp.path().join("user.r"), "source(\"hub.r\")\nhelper()\n").unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![tmp.path().join("user.r")];
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: helper"),
+            "a hub's genuinely forward-sourced symbol must resolve even when it also \
+             appears in the hub's parent prefix (issue #476). Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #476 (bug D): a TOP-LEVEL `source(child, local = TRUE)` evaluates the
+    /// child in the caller's environment (`.GlobalEnv` at top level, R `?source`),
+    /// so the child sees the parent's prior top-level bindings — including regular
+    /// (non-declared) symbols. This reproduces the `getPhrase` miniature: `parent`
+    /// sources `defs` (defining `helper`) then sources `use` with `local = TRUE`;
+    /// `use` must see `helper`.
+    #[test]
+    fn top_level_local_true_child_inherits_parent_regular_symbols_476() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("defs.r"), "helper <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("use.r"), "helper()\n").unwrap();
+        fs::write(
+            tmp.path().join("parent.r"),
+            "source(\"defs.r\")\nsource(\"use.r\", local = TRUE)\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![tmp.path().join("use.r")];
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            !diags
+                .iter()
+                .any(|(_, d)| d.message == "Undefined variable: helper"),
+            "a top-level source(local = TRUE) child must inherit the parent's prior \
+             regular symbols (issue #476). Diagnostics: {:?}",
+            diags
+                .iter()
+                .map(|(_, d)| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Run `raven check` and capture the diagnostics it would compute, without
     /// the process-global stdout capture the renderer uses. Mirrors `run`'s
     /// indexing + report loop so a test can assert on the exact `(path,

@@ -37,7 +37,15 @@ fn r_identifier() -> impl Strategy<Value = String> {
 
 /// Generate a valid R file path component (no special chars that break parsing)
 fn path_component() -> impl Strategy<Value = String> {
-    "[a-zA-Z][a-zA-Z0-9_]{0,10}"
+    // Lower-case alpha only. Several property tests materialize real files from
+    // these names and compare the resulting `Url`s; on a case-insensitive
+    // filesystem (macOS/Windows) two names differing only in case are the SAME
+    // file, and cross-file path resolution correctly case-folds the resolved URI
+    // to the on-disk entry (issue #476). Generating distinct *strings* that alias
+    // as files would make those tests assert an impossible distinctness. Keeping
+    // the alphabet single-case makes string-distinct ⟹ file-distinct on every
+    // platform without weakening the structural properties under test.
+    "[a-z][a-z0-9_]{0,10}"
 }
 
 /// Generate a valid relative R file path
@@ -21263,13 +21271,21 @@ proptest! {
 
     /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
     ///
-    /// When a source() call uses `local=TRUE`, the declared symbols from the parent
-    /// SHALL still be visible in the child file. Declarations describe symbol existence,
-    /// not export behavior.
+    /// Even in the FUNCTION-SCOPED `local=TRUE` case — where regular top-level
+    /// symbols are NOT inherited by the child (the child binds to a function frame,
+    /// not `.GlobalEnv`) — declared symbols (`# raven: var` / `# raven: func`) STILL
+    /// flow to the child, because declarations describe symbol *existence*, not the
+    /// runtime environment. This is the declared-only branch the issue #476 fix
+    /// deliberately preserves; top-level `local=TRUE` (which now inherits regular
+    /// symbols too) is covered by
+    /// `prop_cross_file_declaration_vs_regular_symbol_with_top_level_local_true` and
+    /// the unit test `test_cross_file_declared_symbols_inherited_with_local_true`.
     ///
-    /// **Validates: Requirements 9.4**
+    /// Like the function-scoped unit test, this is a **preservation guard** (it
+    /// passes under the pre-#476 code too — declared symbols always flowed); the
+    /// top-level tests named above are the ones that fail without the fix.
     #[test]
-    fn prop_cross_file_declaration_inheritance_with_local_true(
+    fn prop_cross_file_declaration_inheritance_with_function_scoped_local_true(
         symbol_name in r_symbol_name(),
         is_function in proptest::bool::ANY,
     ) {
@@ -21282,13 +21298,14 @@ proptest! {
         let child_uri = make_url("child");
         let workspace_root = Url::parse("file:///").unwrap();
 
-        // Parent code: declaration at line 0, source() with local=TRUE at line 1
+        // Parent code: declaration at line 0, function-scoped source(local=TRUE).
         let directive = if is_function {
             format!("# @lsp-func {}", symbol_name)
         } else {
             format!("# @lsp-var {}", symbol_name)
         };
-        let parent_code = format!("{}\nsource(\"child.R\", local = TRUE)", directive);
+        let parent_code =
+            format!("{}\nf <- function() {{\n  source(\"child.R\", local = TRUE)\n}}", directive);
         let parent_tree = parse_r_tree(&parent_code);
         let parent_metadata = parse_directives(&parent_code);
         let parent_artifacts = compute_artifacts_with_metadata(
@@ -21307,13 +21324,11 @@ proptest! {
         let parent_meta_for_graph = CrossFileMetadata {
             sources: vec![ForwardSource {
                 path: "child.R".to_string(),
-                line: 1,
-                column: 0,
+                line: 2, // inside f()'s body
+                column: 2,
                 is_directive: false,
-                local: true,  // local=TRUE
-                chdir: false,
-                is_sys_source: false,
-                sys_source_global_env: true,
+                local: true,             // local=TRUE
+                is_function_scoped: true, // inside a function → declared-only policy
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -21346,23 +21361,28 @@ proptest! {
             None,
         );
 
-        // Child should have inherited the declared symbol even with local=TRUE (Requirement 9.4)
+        // The declared symbol flows to the child even though the source is
+        // function-scoped local=TRUE (declared symbols describe existence, so they
+        // are inherited regardless of the runtime environment).
         prop_assert!(
             scope.symbols.contains_key(symbol_name.as_str()),
-            "Declared symbol '{}' should be available in child file even with local=TRUE (Requirement 9.4). Parent code:\n{}",
+            "Declared symbol '{}' should be available in the child file even with a \
+             function-scoped local=TRUE source. Parent code:\n{}",
             symbol_name, parent_code
         );
     }
 
     /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
     ///
-    /// When a source() call uses `local=TRUE`, regular (non-declared) symbols from the
-    /// parent SHALL NOT be visible in the child file, but declared symbols SHALL be.
-    /// This tests the distinction between declared and regular symbols.
+    /// When a TOP-LEVEL source() call uses `local=TRUE`, the child evaluates in the
+    /// caller's environment, which at top level is `.GlobalEnv` (R `?source`). So
+    /// BOTH declared and regular symbols from the parent are visible in the child —
+    /// identical to local=FALSE. (Only a `local=TRUE` call inside a function binds
+    /// the child to a non-global frame; that case keeps declared-only.)
     ///
-    /// **Validates: Requirements 9.4**
+    /// **Validates: issue #476 (corrects the former declared-only Requirement 9.4)**
     #[test]
-    fn prop_cross_file_declaration_vs_regular_symbol_with_local_true(
+    fn prop_cross_file_declaration_vs_regular_symbol_with_top_level_local_true(
         declared_symbol in r_symbol_name(),
         regular_symbol in r_symbol_name(),
         is_function in proptest::bool::ANY,
@@ -21444,17 +21464,18 @@ proptest! {
             None,
         );
 
-        // Declared symbol should be available (Requirement 9.4)
+        // Declared symbol should be available
         prop_assert!(
             scope.symbols.contains_key(declared_symbol.as_str()),
-            "Declared symbol '{}' should be available in child file with local=TRUE (Requirement 9.4). Parent code:\n{}",
+            "Declared symbol '{}' should be available in child file with local=TRUE. Parent code:\n{}",
             declared_symbol, parent_code
         );
 
-        // Regular symbol should NOT be available (local=TRUE blocks regular symbols)
+        // Regular symbol SHOULD be available: a top-level local=TRUE evaluates in
+        // .GlobalEnv, so the parent's prior regular bindings are visible (issue #476)
         prop_assert!(
-            !scope.symbols.contains_key(regular_symbol.as_str()),
-            "Regular symbol '{}' should NOT be available in child file with local=TRUE. Parent code:\n{}",
+            scope.symbols.contains_key(regular_symbol.as_str()),
+            "Regular symbol '{}' SHOULD be available in child file with a top-level local=TRUE (issue #476). Parent code:\n{}",
             regular_symbol, parent_code
         );
     }

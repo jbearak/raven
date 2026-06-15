@@ -1094,6 +1094,16 @@ impl WorldState {
         for (uri, entry) in self.workspace_index_new.iter() {
             entries.push((uri.clone(), entry.metadata.clone()));
         }
+        // Determinism (issue #476): `update_file` appends each file's incoming
+        // edges to `backward[child]` in call order, and scope resolution's
+        // parent-prefix walk follows that `Vec` order. The iteration order above
+        // ultimately derives from the rayon parallel workspace scan
+        // (HashMap -> LruCache insertion order) and is NOT stable run-to-run, so
+        // feeding `update_file` in it made `raven check` drop a *different*
+        // subset of symbols each run (709/711/680 on worldwide). Sort by URI so
+        // the graph — and therefore every downstream diagnostic — is byte-stable.
+        // URIs are unique, so a stable sort buys nothing; use the faster unstable.
+        entries.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
         // Destructure self to split borrows: cross_file_graph (mutable) and
         // workspace_index_new (shared) can coexist without pre-cloning all contents.
