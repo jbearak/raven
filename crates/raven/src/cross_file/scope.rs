@@ -998,11 +998,20 @@ pub(crate) struct ForwardChildMemo {
 /// - `pkg_fp`: order-independent hash of the attached package set passed into
 ///   the child. The set feeds bare `data(stem)` symbol binding and
 ///   `package_origins` attribution, so it is a real input to the child's scope.
+/// - `provider_fp`: identity of the `DataAliasProvider` in effect (its pointer
+///   address, or 0 for `None`). Within ONE query two provider states coexist:
+///   the backward parent walk resolves children with `None` (the prefix is
+///   cached provider-independently), while the forward path uses the real
+///   provider. A `data()`-using child reachable both ways would otherwise
+///   collide on one key and serve the `None` (alias-free) scope to the forward
+///   caller, dropping dataset symbols. The per-query memo never outlives the
+///   query, so a raw address is a sound, stable identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardChildKey {
     child_uri: Url,
     path_fp: u64,
     pkg_fp: u64,
+    provider_fp: usize,
 }
 
 /// Hash a child's `PathContext` (or its absence) into a `path_fp`.
@@ -1086,19 +1095,26 @@ fn bump_forward_child_compute_count() {}
 /// (the `worldwide` repo) fully memoized. On a hit the cached scope is cloned
 /// (cheap relative to re-resolution — see the issue's lazy-clone finding).
 ///
+/// `provider_fp` is the `DataAliasProvider` identity (see [`ForwardChildKey`]);
+/// it keeps the backward walk's `None`-provider children from colliding with
+/// the forward path's real-provider children.
+///
 /// `child_depth` is the `current_depth` the child is resolved at. Because the
 /// child's scope can be truncated by `max_depth`, only depth-truncation-free
 /// scopes are cached and a cached entry is reused only for reaches at depth
 /// `<= child_depth` (see [`ForwardChildMemo`]); a deeper reach recomputes,
 /// keeping the memo byte-equivalent to the un-memoized resolver even under a
-/// small `maxChainDepth`.
+/// small `maxChainDepth`. A scope produced under cancellation is never cached.
+#[allow(clippy::too_many_arguments)]
 fn resolve_forward_child_memoized(
     memo: &std::cell::RefCell<ForwardChildMemo>,
     graph: &super::dependency::DependencyGraph,
     child_uri: &Url,
     path_fp: u64,
+    provider_fp: usize,
     child_depth: usize,
     packages_for_child: &HashSet<String>,
+    is_cancelled: &dyn Fn() -> bool,
     compute: impl FnOnce() -> ScopeAtPosition,
 ) -> ScopeAtPosition {
     // A cycle anywhere in the graph makes child scopes visited-dependent.
@@ -1110,6 +1126,7 @@ fn resolve_forward_child_memoized(
         child_uri: child_uri.clone(),
         path_fp,
         pkg_fp: package_set_fingerprint(packages_for_child),
+        provider_fp,
     };
     // Reuse only a stored scope whose compute-depth is at least this reach's
     // depth (the stored scope is truncation-free, so a shallower-or-equal reach
@@ -1125,6 +1142,12 @@ fn resolve_forward_child_memoized(
     }
     bump_forward_child_compute_count();
     let computed = compute();
+    // Never cache a scope produced by a cancelled (hence partial) resolution: it
+    // can have an empty `depth_exceeded` yet be incomplete, which would fail the
+    // "empty depth_exceeded ⟹ fully resolved" invariant the reuse rule relies on.
+    if is_cancelled() {
+        return computed;
+    }
     // Cache only depth-truncation-free scopes (depth-independent for any
     // shallower reach); keep the deepest compute-depth seen to maximize reuse.
     if computed.depth_exceeded.is_empty() {
@@ -5731,13 +5754,17 @@ where
                             // (issue #472). `path_fp` is computed before the
                             // closure moves `child_ctx`.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
+                            let provider_fp = data_alias_provider
+                                .map_or(0, |p| p as *const DataAliasProvider as usize);
                             resolve_forward_child_memoized(
                                 forward_child_memo,
                                 graph,
                                 &child_uri,
                                 path_fp,
+                                provider_fp,
                                 current_depth + 1,
                                 packages_for_child,
+                                is_cancelled,
                                 || {
                                     scope_at_position_with_graph_recursive(
                                         &child_uri,
@@ -7656,6 +7683,9 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
+        let provider_fp = self
+            .data_alias_provider
+            .map_or(0, |p| p as *const DataAliasProvider as usize);
         // The streaming path resolves forward children of the queried URI at
         // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
@@ -7663,8 +7693,10 @@ where
             self.graph,
             &child_uri,
             path_fp,
+            provider_fp,
             1,
             &empty_packages,
+            self.is_cancelled,
             || {
                 scope_at_position_with_graph_recursive(
                     &child_uri,
@@ -16142,6 +16174,87 @@ x <- 1"#;
         assert!(
             off > on,
             "expected the un-memoized path to re-resolve more often: off={off}, on={on}"
+        );
+    }
+
+    #[test]
+    fn memo_keys_on_data_alias_provider() {
+        // Regression: the memo key must include the DataAliasProvider identity.
+        // `x.r` does `library(survey); data(api)`, which (with a provider)
+        // binds the dataset objects apiclus1/apistrat. `q.r` (queried) sources
+        // x.r — forward path, real provider. `p.r` sources x.r BEFORE q.r, so
+        // STEP 1's backward walk (q -> p) resolves x.r with provider=None and
+        // would, without the provider in the key, cache an alias-free x.r scope
+        // that the forward path then reuses, dropping apiclus1/apistrat.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        // `survey` is provided via the provider's base_packages (not a
+        // `library()` call in x.r), so x.r loads no package and nothing
+        // propagates back to p/q. That keeps `pkg_fp` and `path_fp` identical
+        // between the backward (p->x, provider=None) and forward (q->x,
+        // provider=Some) resolutions, so `provider_fp` is the ONLY thing
+        // separating their memo keys — exactly the collision under test.
+        let root = Url::parse("file:///project").unwrap();
+        let files: [(Url, &str); 3] = [
+            (
+                Url::parse("file:///project/x.r").unwrap(),
+                "data(api)\nx_sym <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/q.r").unwrap(),
+                "source(\"x.r\")\n",
+            ),
+            (
+                Url::parse("file:///project/p.r").unwrap(),
+                "source(\"x.r\")\nsource(\"q.r\")\n",
+            ),
+        ];
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in &files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+        let get_artifacts = |u: &Url| artifacts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let base_exports = HashSet::new();
+        let base_packages: HashSet<String> = ["survey".to_string()].into_iter().collect();
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+        let q = Url::parse("file:///project/q.r").unwrap();
+        let scope = scope_at_position_with_graph(
+            &q,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            64,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        assert!(
+            scope.symbols.contains_key("apiclus1") && scope.symbols.contains_key("apistrat"),
+            "data(api) aliases from forward-sourced x.r must reach q.r; the memo must \
+             not serve the backward walk's provider-less x.r scope. got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 
