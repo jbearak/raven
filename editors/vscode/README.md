@@ -62,7 +62,7 @@ For a deeper comparison see [docs/comparison.md](https://github.com/jbearak/rave
 
 ## More Information
 
-See the [main repository](https://github.com/jbearak/raven) for full documentation including cross-file directives, editor integrations, and comparison with other R tools.
+See the [main repository](https://github.com/jbearak/raven) for full documentation, including running the same analysis in CI with [`raven check`](https://github.com/jbearak/raven/blob/main/docs/cli.md), cross-file directives, editor integrations, and comparison with other R tools.
 
 If you work with Stata, see Raven's sibling project, [Sight](https://github.com/jbearak/sight), a Stata language server with the same cross-file awareness model.
 

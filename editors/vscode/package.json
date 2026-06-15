@@ -4,8 +4,12 @@
   "description": "R language server with cross-file awareness, diagnostics, completion, and navigation. Also provides lightweight support for Stan and JAGS/BUGS (syntax highlighting, completions, navigation, outline).",
   "keywords": [
     "R",
+    "language server",
+    "lsp",
+    "static analysis",
+    "linter",
+    "diagnostics",
     "Rmarkdown",
-    "Quarto",
     "Stan",
     "JAGS",
     "BUGS"

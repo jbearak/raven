@@ -7,7 +7,7 @@ Raven needs a performance testing infrastructure that detects regressions, valid
 This spec draws on analysis of four LSP codebases:
 
 - **rust-analyzer** — the gold standard: real-world benchmarks on actual codebases, an `analysis-stats` CLI, a CI metrics workflow on every push to master, hierarchical profiling, and multi-metric tracking (time, memory, CPU instructions).
-- **Sight** (Raven's sister Stata LSP) — time-budget regression tests with specific thresholds, CI-adapted thresholds (3× relaxed), cache-effectiveness benchmarks, and algorithm-comparison benchmarks.
+- **Sight** (Raven's sibling Stata LSP) — time-budget regression tests with specific thresholds, CI-adapted thresholds (3× relaxed), cache-effectiveness benchmarks, and algorithm-comparison benchmarks.
 - **pyright** — a cautionary example: no benchmarks, no profiling, no performance CI despite being a widely-used LSP.
 
 The goal is a layered system: (1) real Criterion benchmarks that exercise actual code paths, (2) in-tree time-budget tests that fail on regression, (3) a CI workflow that runs benchmarks and detects regressions, and (4) a lightweight analysis command for ad-hoc profiling.
