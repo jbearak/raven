@@ -137,6 +137,8 @@ Declaration directives work in any R file, whether or not it participates in cro
 # @lsp-var myvar                  # alias (every synonym also has an @lsp- form)
 ```
 
+Raven also treats an `exists("myvar")` call as an automatic `# raven: var myvar` — a probe like `if (!exists("myvar")) myvar <- default` declares `myvar` from that line onward without any directive. See [Undefined Variables](diagnostics.md#undefined-variables) for the exact rules (string-literal name; next-line visibility).
+
 ### Function Declarations
 
 ```r

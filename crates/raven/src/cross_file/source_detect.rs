@@ -34,6 +34,26 @@ pub struct RmCall {
     pub symbols: Vec<String>,
 }
 
+/// Detected `exists("name")` call with the statically-extracted name.
+///
+/// An `exists("name")` call is a runtime existence probe, but a user who writes
+/// it is asserting that `name` is a binding they know about. Raven therefore
+/// treats it as a variable declaration equivalent to `# raven: var name` (see
+/// `compute_artifacts*` in `scope.rs`, which turns each into a
+/// `ScopeEvent::Declaration`). Only string-literal names are captured — a
+/// non-literal first argument (`exists(varname)`, `exists(paste0(...))`) is not
+/// statically determinable and is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistsCall {
+    /// The raw symbol name (string-literal contents, without quotes). The
+    /// caller re-applies call-site canonicalization (backtick-wrapping a
+    /// non-syntactic name) when synthesizing the declared symbol, mirroring the
+    /// `# raven: var` path.
+    pub name: String,
+    /// 0-based line of the `exists()` call.
+    pub line: u32,
+}
+
 /// Detected library/require/loadNamespace call
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryCall {
@@ -662,6 +682,75 @@ fn extract_list_value_symbols(value_node: Node, content: &str) -> Vec<String> {
             vec![]
         }
     }
+}
+
+/// Detect `exists("name")` calls in R code.
+///
+/// Returns one [`ExistsCall`] per `exists(...)` call whose name argument is a
+/// string literal (`exists("x")`, `exists('x')`, or `exists(x = "x")`). Calls
+/// with a non-literal name (`exists(varname)`, `exists(paste0(...))`) or no
+/// argument are skipped — the name is not statically determinable. Only the
+/// bare `exists` callee is matched (not `pkg::exists`), matching the
+/// conservative shape of [`detect_rm_calls`].
+pub fn detect_exists_calls(tree: &Tree, content: &str) -> Vec<ExistsCall> {
+    let mut calls = Vec::new();
+    visit_node_for_exists(tree.root_node(), content, &mut calls);
+    calls
+}
+
+fn visit_node_for_exists(node: Node, content: &str, calls: &mut Vec<ExistsCall>) {
+    if node.kind() == "identifier" {
+        return;
+    }
+    if node.kind() == "call"
+        && let Some(call) = try_parse_exists_call(node, content)
+    {
+        calls.push(call);
+    }
+    for child in node.children(&mut node.walk()) {
+        visit_node_for_exists(child, content, calls);
+    }
+}
+
+fn try_parse_exists_call(node: Node, content: &str) -> Option<ExistsCall> {
+    let func_node = node.child_by_field_name("function")?;
+    // Bare `exists` only — a `pkg::exists` callee is a `namespace_operator`
+    // node, and `file.exists` is a different identifier, so both are excluded.
+    if func_node.kind() != "identifier" || node_text(func_node, content) != "exists" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.has_error() {
+        return None;
+    }
+
+    // The name lives in the `x` formal: a named `x = "..."` argument, else the
+    // first positional argument.
+    let value_node = named_arg_value(&args_node, content, "x")
+        .or_else(|| first_positional_arg_value(args_node))?;
+    let name = extract_string_literal(value_node, content)?;
+
+    Some(ExistsCall {
+        name,
+        line: node.start_position().row as u32,
+    })
+}
+
+/// The value node of the named argument `arg_name`, if present.
+fn named_arg_value<'t>(args_node: &Node<'t>, content: &str, arg_name: &str) -> Option<Node<'t>> {
+    let mut cursor = args_node.walk();
+    args_node.children(&mut cursor).find_map(|child| {
+        if child.kind() != "argument" {
+            return None;
+        }
+        let name = child.child_by_field_name("name")?;
+        if node_text(name, content) == arg_name {
+            child.child_by_field_name("value")
+        } else {
+            None
+        }
+    })
 }
 
 /// Check if a call node is a c() call (character vector constructor).
@@ -2019,6 +2108,115 @@ source("b.R")"#;
         let rm_calls = detect_rm_calls(&tree, code);
         assert_eq!(rm_calls.len(), 1);
         assert_eq!(rm_calls[0].symbols, vec!["x", "y"]);
+    }
+
+    // ------------------------------------------------------------------
+    // detect_exists_calls: `exists("name")` declares `name` (parity with
+    // `# raven: var name`).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_exists_double_quoted_name() {
+        let code = r#"exists("apple")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apple");
+        assert_eq!(calls[0].line, 0);
+    }
+
+    #[test]
+    fn test_exists_single_quoted_name() {
+        let code = "exists('apple')";
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apple");
+    }
+
+    #[test]
+    fn test_exists_negated_guard() {
+        // The idiomatic `if (!exists("x")) x <- ...` guard.
+        let code = "if (!exists(\"apple\")) apple <- 1";
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apple");
+    }
+
+    #[test]
+    fn test_exists_named_x_argument() {
+        let code = r#"exists(x = "apple")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apple");
+    }
+
+    #[test]
+    fn test_exists_extra_args_still_declares() {
+        // `where=`/`inherits=` do not change that the user named `apple`.
+        let code = r#"exists("apple", inherits = FALSE)"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "apple");
+    }
+
+    #[test]
+    fn test_exists_non_literal_argument_skipped() {
+        // A variable name (not a string literal) is not statically determinable.
+        let code = "exists(varname)";
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_computed_argument_skipped() {
+        let code = r#"exists(paste0("ap", "ple"))"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_empty_call_skipped() {
+        let code = "exists()";
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_non_syntactic_name_backtick_wrapped() {
+        // `exists("my var")` must store the call-site form `` `my var` `` so it
+        // matches a `` `my var` `` use, mirroring `# raven: var`.
+        let code = r#"exists("my var")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "my var");
+    }
+
+    #[test]
+    fn test_exists_multiple_calls() {
+        let code = "exists(\"a\")\nexists(\"b\")";
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[0].line, 0);
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(calls[1].line, 1);
+    }
+
+    #[test]
+    fn test_non_exists_call_ignored() {
+        let code = r#"file.exists("apple")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
     }
 
     #[test]

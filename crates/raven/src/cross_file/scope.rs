@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
-use super::source_detect::{detect_library_calls, detect_rm_calls, detect_source_calls};
+use super::source_detect::{
+    detect_exists_calls, detect_library_calls, detect_rm_calls, detect_source_calls,
+};
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
 // ============================================================================
@@ -1148,6 +1150,78 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
     }
 }
 
+/// Build a `ScopeEvent::Declaration` for a declared symbol (`# raven: var` /
+/// `# raven: func` directives and `exists()` declarations all share this shape).
+///
+/// The binding becomes visible from the line *after* `line` — the `u32::MAX`
+/// end-of-line sentinel column — so a use before the declaration is still
+/// flagged. `name` must already be in its call-site form (a non-syntactic name
+/// backtick-wrapped via [`callee_name_for_match`](super::directive::callee_name_for_match)),
+/// matching how the use site is keyed. Centralizing the `ScopedSymbol`/event
+/// construction here keeps the declaration model identical across every source
+/// of declared symbols.
+fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> ScopeEvent {
+    let symbol = ScopedSymbol {
+        name: Arc::from(name),
+        kind,
+        source_uri: uri.clone(),
+        defined_line: line,
+        defined_column: 0,
+        defined_end_column: crate::utf16::utf16_len(name),
+        signature: None,
+        is_declared: true,
+    };
+    ScopeEvent::Declaration {
+        line,
+        column: u32::MAX,
+        symbol,
+    }
+}
+
+/// Push a `ScopeEvent::Declaration` for every `exists("name")` call, treating
+/// each as equivalent to a `# raven: var name` directive: a user who probes
+/// `exists("name")` is asserting that `name` is a binding they know about.
+///
+/// Like the directive, the declaration is file-level (it carries no function
+/// scope, so an `exists()` inside a function body still declares the name for
+/// the whole file) and becomes visible from the line *after* the call. See
+/// [`declared_symbol_event`] for the shared symbol shape.
+///
+/// Shared by both [`compute_artifacts`] and [`compute_artifacts_with_metadata`]
+/// so the two paths cannot drift in how `exists()` declarations are modeled.
+fn push_exists_declarations(artifacts: &mut ScopeArtifacts, uri: &Url, tree: &Tree, content: &str) {
+    for call in detect_exists_calls(tree, content) {
+        let name = super::directive::callee_name_for_match(&call.name);
+        artifacts.timeline.push(declared_symbol_event(
+            uri,
+            &name,
+            SymbolKind::Variable,
+            call.line,
+        ));
+    }
+}
+
+/// Fold every `ScopeEvent::Declaration` in the (already effect-position-sorted)
+/// timeline into `exported_interface`. A real (non-declared) definition is never
+/// downgraded by a declaration; among declared symbols, the later one wins
+/// (timeline order). Shared by both build paths so directive (`# raven: var` /
+/// `# raven: func`) and `exists()` declarations export identically.
+fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
+    for event in &artifacts.timeline {
+        if let ScopeEvent::Declaration { symbol, .. } = event {
+            artifacts
+                .exported_interface
+                .entry(symbol.name.clone())
+                .and_modify(|existing| {
+                    if existing.is_declared {
+                        *existing = symbol.clone();
+                    }
+                })
+                .or_insert_with(|| symbol.clone());
+        }
+    }
+}
+
 /// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
 ///
 /// The returned ScopeArtifacts contains a document-ordered timeline of scope events (definitions,
@@ -1205,6 +1279,10 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             function_scope: None,
         });
     }
+
+    // Collect `exists("name")` calls and add Declaration events (treated as
+    // `# raven: var name`). See `push_exists_declarations`.
+    push_exists_declarations(&mut artifacts, uri, tree, content);
 
     // Collect library()/require()/loadNamespace() calls for later processing.
     // We need to wait until the function scope tree is built to determine function_scope.
@@ -1269,6 +1347,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 
     // Re-sort timeline to include PackageLoad events in effect-position order.
     artifacts.timeline.sort_by_key(event_effect_position);
+
+    // Fold `exists()` Declaration events into the exported interface so a file's
+    // `exists("name")` declares `name` to files that source it (parity with
+    // `# raven: var`). No directive declarations exist on this path.
+    fold_declarations_into_exported_interface(&mut artifacts);
 
     // Extract package names from PackageLoad events for interface hash computation
     // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
@@ -1431,50 +1514,25 @@ pub fn compute_artifacts_with_metadata(
             }
         }
 
-        // Add Declaration events from `# raven: var` directives
-        // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
-        // Also add to exported_interface (later declarations will overwrite earlier ones)
+        // Add Declaration events from `# raven: var` / `# raven: func`
+        // directives. Each becomes available from the line after the directive
+        // (the `u32::MAX` sentinel) and is folded into `exported_interface`
+        // later, in timeline order, by `fold_declarations_into_exported_interface`.
         for decl in &meta.declared_variables {
-            let symbol = ScopedSymbol {
-                name: Arc::from(decl.name.as_str()),
-                kind: SymbolKind::Variable,
-                source_uri: uri.clone(),
-                defined_line: decl.line,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
-                signature: None,
-                is_declared: true,
-            };
-            artifacts.timeline.push(ScopeEvent::Declaration {
-                line: decl.line,
-                column: u32::MAX,
-                symbol: symbol.clone(),
-            });
-            // Add to exported interface - later declarations will overwrite earlier ones
-            // This is handled by processing declarations in timeline order after sorting
+            artifacts.timeline.push(declared_symbol_event(
+                uri,
+                &decl.name,
+                SymbolKind::Variable,
+                decl.line,
+            ));
         }
-
-        // Add Declaration events from `# raven: func` directives
-        // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
-        // Also add to exported_interface (later declarations will overwrite earlier ones)
         for decl in &meta.declared_functions {
-            let symbol = ScopedSymbol {
-                name: Arc::from(decl.name.as_str()),
-                kind: SymbolKind::Function,
-                source_uri: uri.clone(),
-                defined_line: decl.line,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(decl.name.as_str()),
-                signature: None,
-                is_declared: true,
-            };
-            artifacts.timeline.push(ScopeEvent::Declaration {
-                line: decl.line,
-                column: u32::MAX,
-                symbol: symbol.clone(),
-            });
-            // Add to exported interface - later declarations will overwrite earlier ones
-            // This is handled by processing declarations in timeline order after sorting
+            artifacts.timeline.push(declared_symbol_event(
+                uri,
+                &decl.name,
+                SymbolKind::Function,
+                decl.line,
+            ));
         }
     }
 
@@ -1488,6 +1546,13 @@ pub fn compute_artifacts_with_metadata(
             function_scope: None,
         });
     }
+
+    // Collect `exists("name")` calls and add Declaration events (treated as
+    // `# raven: var name`; like a directive declaration, an `exists()` decl is
+    // resolved positionally against other declarations — later-in-timeline
+    // wins — and never downgrades a real definition). See
+    // `push_exists_declarations`.
+    push_exists_declarations(&mut artifacts, uri, tree, content);
 
     // Collect library()/require()/loadNamespace() calls for later processing.
     let library_calls = detect_library_calls(tree, content);
@@ -1549,22 +1614,12 @@ pub fn compute_artifacts_with_metadata(
     // Re-sort timeline (now includes PackageLoad events) by effect position.
     artifacts.timeline.sort_by_key(event_effect_position);
 
-    // Add declared symbols to exported interface in timeline order
-    // Only insert if no real (non-declared) definition exists, so that real definitions
-    // are never downgraded by later declarations. Among declared symbols, later ones win.
-    for event in &artifacts.timeline {
-        if let ScopeEvent::Declaration { symbol, .. } = event {
-            artifacts
-                .exported_interface
-                .entry(symbol.name.clone())
-                .and_modify(|existing| {
-                    if existing.is_declared {
-                        *existing = symbol.clone();
-                    }
-                })
-                .or_insert_with(|| symbol.clone());
-        }
-    }
+    // Add declared symbols (`# raven: var` / `# raven: func` directives and
+    // `exists()` declarations) to the exported interface in timeline order.
+    // Only insert if no real (non-declared) definition exists, so that real
+    // definitions are never downgraded by later declarations. Among declared
+    // symbols, later ones win.
+    fold_declarations_into_exported_interface(&mut artifacts);
 
     // Extract package names from PackageLoad events for interface hash computation
     let loaded_packages: Vec<String> = artifacts

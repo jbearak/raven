@@ -18962,7 +18962,8 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             symbol.is_declared
         );
 
-        // Handle declared symbols (from `# raven: var` or `# raven: func` directives)
+        // Handle declared symbols (from `# raven: var` / `# raven: func`
+        // directives, or from an `exists("name")` call).
         // Validates: Requirements 7.1, 7.2, 7.3
         if symbol.is_declared {
             let kind_str = match symbol.kind {
@@ -18970,21 +18971,64 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 crate::cross_file::SymbolKind::Variable => "declared variable",
                 _ => "declared symbol",
             };
-            // Always render the canonical `# raven:` directive form here. The
-            // parser accepts both `# raven: func`/`var` and the `@lsp-` alias but
-            // does not retain which prefix the user typed, so we surface the
-            // canonical spelling regardless of input prefix.
-            let directive_type = match symbol.kind {
-                crate::cross_file::SymbolKind::Function => "# raven: func",
-                _ => "# raven: var",
-            };
             // Convert 0-based line to 1-based for display
             let display_line = symbol.defined_line + 1;
 
-            let mut value = format!(
-                "```r\n{} ({})\n```\n\nDeclared via {} directive at line {}",
-                name, kind_str, directive_type, display_line
-            );
+            // Distinguish a genuine directive declaration from one synthesized
+            // by an `exists("name")` call. Search the source file's metadata for
+            // a matching directive, capturing BOTH its line and which kind it is
+            // (`# raven: var` vs `# raven: func`) — the directive's keyword must
+            // reflect the directive that actually exists, not the kind of the
+            // resolved symbol (a later `exists()` var can outrank a `# raven:
+            // func` of the same name). The directive's OWN line is reported
+            // (mirrors go-to-definition); `symbol.defined_line` may point at a
+            // later `exists()` call. If metadata is present but has no matching
+            // directive, the symbol came from `exists()`. If metadata is
+            // unavailable, fall back to the directive label keyed on the
+            // symbol's kind rather than fabricating an `exists()` attribution
+            // for a possibly-real directive. The parser does not retain whether
+            // the user wrote `# raven:` or the `@lsp-` alias, so the canonical
+            // `# raven:` spelling is always surfaced.
+            let canonical = crate::r_names::canonical_use_name(&symbol.name);
+            let metadata = state.content_provider().get_metadata(&symbol.source_uri);
+            let directive = metadata.as_ref().and_then(|m| {
+                let vars = m
+                    .declared_variables
+                    .iter()
+                    .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
+                    .map(|d| (d.line, "# raven: var"));
+                let funcs = m
+                    .declared_functions
+                    .iter()
+                    .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
+                    .map(|d| (d.line, "# raven: func"));
+                vars.chain(funcs).min_by_key(|(line, _)| *line)
+            });
+
+            let attribution = match directive {
+                Some((line, directive_type)) => {
+                    format!(
+                        "Declared via {} directive at line {}",
+                        directive_type,
+                        line + 1
+                    )
+                }
+                None if metadata.is_some() => {
+                    format!("Declared by an `exists()` call at line {}", display_line)
+                }
+                None => {
+                    let directive_type = match symbol.kind {
+                        crate::cross_file::SymbolKind::Function => "# raven: func",
+                        _ => "# raven: var",
+                    };
+                    format!(
+                        "Declared via {} directive at line {}",
+                        directive_type, display_line
+                    )
+                }
+            };
+
+            let mut value = format!("```r\n{} ({})\n```\n\n{}", name, kind_str, attribution);
             if symbol.source_uri != *uri {
                 let workspace_root = state.workspace_folders.first();
                 let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
@@ -53870,6 +53914,204 @@ myvar
         );
     }
 
+    /// An `exists("apple")` call declares `apple` (parity with `# raven: var apple`):
+    /// a use of `apple` after the call must not be flagged as undefined.
+    #[test]
+    fn test_exists_call_suppresses_undefined_diagnostic() {
+        let mut state = create_test_state();
+        let code = "exists(\"apple\")\napple\n";
+        // Line 0: exists("apple") (declaration); line 1: apple (usage) — not flagged.
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "exists(\"apple\") should suppress undefined diagnostic for apple; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The idiomatic guard `if (!exists("apple")) apple <- ...` followed by a
+    /// later use of `apple` must not flag the later use.
+    #[test]
+    fn test_exists_guard_suppresses_later_use() {
+        let mut state = create_test_state();
+        let code = "if (!exists(\"apple\")) {\n  apple <- 1\n}\nprint(apple)\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: apple"),
+            "exists() guard should suppress later use of apple; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Single-quoted name form: `exists('apple')` declares `apple`.
+    #[test]
+    fn test_exists_single_quoted_suppresses_undefined_diagnostic() {
+        let mut state = create_test_state();
+        let code = "exists('apple')\napple\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            0,
+            "exists('apple') should suppress undefined diagnostic for apple; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A use of `apple` BEFORE the `exists("apple")` call is still flagged —
+    /// `exists()` grants next-line visibility, exactly like `# raven: var`.
+    #[test]
+    fn test_exists_usage_before_call_emits_diagnostic() {
+        let mut state = create_test_state();
+        let code = "apple\nexists(\"apple\")\n";
+        // Line 0: apple (usage) — flagged; line 1: exists("apple") (declaration).
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: apple" && d.range.start.line == 0),
+            "use before exists() must still be flagged; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// An `exists("apple")` call inside a function body declares `apple` at file
+    /// level (parity with `# raven: var`, whose declarations are file-level), so
+    /// a later top-level use of `apple` is not flagged.
+    #[test]
+    fn test_exists_in_function_body_declares_file_level() {
+        let mut state = create_test_state();
+        let code = "f <- function() exists(\"apple\")\napple\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: apple"),
+            "exists() in a function body declares apple file-level; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `exists(varname)` with a non-literal argument declares nothing — a later
+    /// use of `apple` is still flagged.
+    #[test]
+    fn test_exists_non_literal_argument_does_not_suppress() {
+        let mut state = create_test_state();
+        let code = "exists(some_var)\napple\n";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+
+        let mut diagnostics = Vec::new();
+        let __snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &__snapshot,
+            &uri,
+            root,
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Undefined variable: apple"),
+            "exists(some_var) must not declare apple; got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_declared_function_suppresses_undefined_diagnostic() {
         // Requirement 5.2: WHEN a function is declared via directive and called after the directive line,
@@ -63315,6 +63557,98 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             result.is_some(),
             "hover on a backtick-quoted syntactic call must resolve to the bare definition"
+        );
+    }
+
+    /// Go-to-definition on a variable declared only by an `exists("name")` call
+    /// navigates to the `exists()` call line.
+    #[test]
+    fn goto_on_exists_declared_variable_lands_on_exists_call() {
+        let mut state = create_state();
+        let code = "exists(\"apple\")\napple\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on `apple` (line 1).
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 2)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(
+            l.range.start.line, 0,
+            "should navigate to the exists() call on line 0"
+        );
+    }
+
+    /// Hover on a variable declared only by an `exists("name")` call must NOT
+    /// claim a `# raven: var` directive (there is none) — it reports that the
+    /// name was declared by the `exists()` call.
+    #[tokio::test]
+    async fn hover_on_exists_declared_variable_does_not_claim_directive() {
+        let mut state = create_state();
+        let code = "exists(\"apple\")\napple\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on `apple` (line 1).
+        let result = super::hover(&state, &uri, Position::new(1, 2)).await;
+        let hover = result.expect("hover should resolve the exists()-declared variable");
+        let text = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            text.contains("declared variable"),
+            "should label it a declared variable; got: {text}"
+        );
+        assert!(
+            !text.contains("# raven: var"),
+            "must not claim a # raven: var directive that does not exist; got: {text}"
+        );
+        assert!(
+            text.contains("exists("),
+            "should attribute the declaration to the exists() call; got: {text}"
+        );
+    }
+
+    /// When a name is declared BOTH by a `# raven: var` directive and a later
+    /// `exists()` call, hover reports the directive at the DIRECTIVE's line, not
+    /// the (later) exists() call line that wins the in-scope symbol.
+    #[tokio::test]
+    async fn hover_prefers_directive_attribution_and_line_over_exists() {
+        let mut state = create_state();
+        // Line 0: directive; line 2: exists() for the same name; line 3: use.
+        let code = "# raven: var apple\n\nexists(\"apple\")\napple\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let result = super::hover(&state, &uri, Position::new(3, 2)).await;
+        let hover = result.expect("hover should resolve apple");
+        let text = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            text.contains("Declared via # raven: var directive at line 1"),
+            "should attribute to the directive at its own line (1), not the exists() call; got: {text}"
+        );
+        assert!(
+            !text.contains("exists("),
+            "must not attribute a genuine directive to exists(); got: {text}"
+        );
+    }
+
+    /// When a name is declared by `# raven: func` AND a later `exists()` call
+    /// (whose Variable declaration wins the in-scope symbol), hover must report
+    /// the directive's actual keyword (`# raven: func`), not `# raven: var`
+    /// keyed off the resolved symbol's kind.
+    #[tokio::test]
+    async fn hover_uses_matched_directive_keyword_not_symbol_kind() {
+        let mut state = create_state();
+        // Line 0: func directive; line 1: exists() var for the same name; line 2: use.
+        let code = "# raven: func foo\nexists(\"foo\")\nfoo\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let result = super::hover(&state, &uri, Position::new(2, 1)).await;
+        let hover = result.expect("hover should resolve foo");
+        let text = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            text.contains("Declared via # raven: func directive at line 1"),
+            "should report the func directive keyword and its line; got: {text}"
         );
     }
 
