@@ -25824,6 +25824,99 @@ clean_data <- function(x) {
         );
     }
 
+    /// Issue: plyr's `.()` quoting helper. With plyr loaded, `ddply` resolves
+    /// as a no-policy export (standard-eval) and descends into its arguments;
+    /// the nested `.(iso, yearY)` call must suppress the quoted column names.
+    /// Before `package_policy("plyr", ".")` existed, `.` also resolved as a
+    /// no-policy export and was treated as standard-eval, so `iso`/`yearY` were
+    /// flagged as undefined (false positives). A synthetic package keeps the
+    /// test immune to package-database contents.
+    ///
+    /// The data-frame argument is itself an *undefined* symbol whose flag is
+    /// asserted: this pins the scoping boundary. `ddply` stays standard-eval
+    /// (deliberately unmodeled), so it must still descend into and check its
+    /// non-`.()` arguments — only the nested `.()` call suppresses. A
+    /// regression that wrongly gave `ddply` a `WholeCall` policy (over-
+    /// suppressing every argument) would hide this flag and fail the test.
+    #[tokio::test]
+    async fn nse_plyr_dot_quotes_columns_in_ddply_end_to_end() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        let mut exports = std::collections::HashSet::new();
+        exports.insert(".".to_string());
+        exports.insert("ddply".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("plyr".to_string(), exports))
+            .await;
+
+        let code = "library(plyr)\n\
+                    abortions <- ddply(undefined_df_arg, .(iso, yearY), function(x) x)\n\
+                    totally_undefined_baseline\n";
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+        let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+        // Baseline proves the collector ran (otherwise the test is vacuous).
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline undefined symbol must be flagged; messages: {messages:?}"
+        );
+        // The columns quoted by `.()` must NOT be flagged.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: iso")),
+            "`.(iso, ...)` must suppress the quoted column `iso`; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: yearY")),
+            "`.(.., yearY)` must suppress the quoted column `yearY`; messages: {messages:?}"
+        );
+        // Scoping boundary: `ddply` stays standard-eval and must still check
+        // its data-frame argument, so the undefined `undefined_df_arg` IS
+        // flagged. This fails if `ddply` were wrongly given a WholeCall policy.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: undefined_df_arg")),
+            "`ddply`'s data argument must stay checked (standard-eval); messages: {messages:?}"
+        );
+    }
+
     /// Regression: tree-sitter-r parses `return` as a plain identifier (not a
     /// keyword node), so `return(x)` is an ordinary `call`. The
     /// undefined-variable collector must not flag `return`, because it is a

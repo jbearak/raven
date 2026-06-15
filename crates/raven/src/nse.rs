@@ -35,7 +35,8 @@
 //! target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes`
 //! step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`),
 //! `tidytext`/`modelr`/`drake` column- and target-name captures, rlang capture
-//! helpers, and a few established DSLs); it is intentionally extensible rather
+//! helpers, the plyr `.()` quoting helper, and a few established DSLs); it is
+//! intentionally extensible rather
 //! than exhaustive. A handful of large, uniform export families
 //! (`recipes::step_*`, `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name
 //! prefix rather than enumerated, since every member shares one empirically
@@ -394,6 +395,21 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
                 &["target"],
                 false,
             ),
+            _ => return None,
+        },
+        "plyr" => match name {
+            // `.()` quotes every argument unevaluated — its body is
+            // `structure(as.list(match.call()[-1]), env = .env, class =
+            // "quoted")`, so each positional is a bare column name to be
+            // re-evaluated later in the split-apply data mask (the
+            // `.variables` of `ddply`/`dlply`/`daply`/...), never a free
+            // reference. It is the plyr analog of `rlang::quos` / base
+            // `alist`, so suppress the whole call. The split-apply verbs
+            // themselves (`ddply`, `llply`, ...) are deliberately NOT
+            // modeled: they stay standard-eval, descending into their
+            // arguments, and the nested `.()` call suppresses the quoted
+            // columns on its own. Verified against plyr 1.8.9 + R 4.6.0.
+            "." => ArgPolicy::WholeCall,
             _ => return None,
         },
         _ => return None,
@@ -2149,6 +2165,10 @@ mod tests {
             ("modelr", "add_predictions", None),
             ("drake", "readd", PerFormal),
             ("drake", "loadd", None),
+            // plyr `.()` is a plural quoting helper -> whole-call capture; the
+            // *ply verbs are deliberately not modeled (standard-eval).
+            ("plyr", ".", WholeCall),
+            ("plyr", "ddply", None),
             // Unknown package -> always None.
             ("nonesuch", "filter", None),
         ];
@@ -2159,6 +2179,22 @@ mod tests {
                 "package_policy({pkg:?}, {name:?})"
             );
         }
+    }
+
+    /// plyr's `.()` quotes every argument unevaluated (`. <- function(...,
+    /// .env) structure(as.list(match.call()[-1]), ...)`), so it is a plural
+    /// quoting helper like `rlang::quos` / base `alist` — every argument is a
+    /// captured variable name, never a free reference. Modeled as `WholeCall`
+    /// so `ddply(df, .(iso, year), f)` does not flag `iso`/`year`. The plyr
+    /// `*ply` verbs themselves stay standard-eval (no policy): they descend
+    /// into their arguments, and the nested `.()` call suppresses the quoted
+    /// columns on its own.
+    #[test]
+    fn plyr_dot_is_whole_call_quoting_helper() {
+        assert_eq!(package_policy("plyr", "."), Some(ArgPolicy::WholeCall));
+        // The split-apply verbs are intentionally unmodeled.
+        assert!(package_policy("plyr", "ddply").is_none());
+        assert!(package_policy("plyr", "llply").is_none());
     }
 
     // --- §5 attached-package sweep: gt / gtsummary / recipes / dbplyr -----
