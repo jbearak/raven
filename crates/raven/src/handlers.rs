@@ -18770,12 +18770,20 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 /// Returns `Some((first_line, keyword))` ONLY when `defined_line` is the line of
 /// a matching directive — i.e. the resolved symbol is directive-derived, not
 /// `exists()`-derived (an `exists()` declaration's line is the call site, never
-/// a directive line). `first_line` is the lowest matching directive line (the
-/// "first declaration", which go-to-definition navigates to) and `keyword` is
-/// that first declaration's canonical `# raven: var` / `# raven: func` form.
-/// Returns `None` for an `exists()`-derived symbol or when `metadata` is absent;
-/// callers then use `symbol.defined_line` (the `exists()` call, or the symbol's
-/// own location).
+/// a directive line). `first_line` is the lowest matching directive line across
+/// BOTH `# raven: var` and `# raven: func` declarations (the "first
+/// declaration", which go-to-definition navigates to), and `keyword` is that
+/// first declaration's canonical `# raven: var` / `# raven: func` form. Returns
+/// `None` for an `exists()`-derived symbol or when `metadata` is absent; callers
+/// then use `symbol.defined_line` (the `exists()` call, or the symbol's own
+/// location).
+///
+/// Both surfaces consume this, so hover and goto always agree on the reported
+/// line; hover additionally derives its kind label from the returned `keyword`,
+/// so its header, keyword, and line all describe the same first declaration —
+/// even in the pathological case where one name carries both a `# raven: var`
+/// and a `# raven: func` directive (goto navigates to the lowest line; hover
+/// describes that declaration).
 ///
 /// Names are matched on [`crate::r_names::canonical_use_name`] of both the query
 /// and the stored declaration (Seam B, #459): a directive stores the call-site
@@ -19012,11 +19020,6 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // directives, or from an `exists("name")` call).
         // Validates: Requirements 7.1, 7.2, 7.3
         if symbol.is_declared {
-            let kind_str = match symbol.kind {
-                crate::cross_file::SymbolKind::Function => "declared function",
-                crate::cross_file::SymbolKind::Variable => "declared variable",
-                _ => "declared symbol",
-            };
             // Convert 0-based line to 1-based for display
             let display_line = symbol.defined_line + 1;
 
@@ -19024,36 +19027,53 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             // by an `exists("name")` call, via the shared `resolve_directive_origin`
             // so hover and go-to-definition never disagree: the resolved symbol
             // is directive-derived iff its own line is a matching-directive line.
-            // When directive-derived, report the FIRST declaration line and its
-            // keyword. When the symbol came from `exists()`, attribute it to the
-            // call. If metadata is unavailable, fall back to a directive label
-            // keyed on the symbol's kind rather than fabricating an `exists()`
-            // attribution for a possibly-real directive. The parser does not
-            // retain whether the user wrote `# raven:` or the `@lsp-` alias, so
-            // the canonical `# raven:` spelling is always surfaced.
+            // When directive-derived, describe the FIRST declaration — its line,
+            // its keyword, AND its kind label all come from that one declaration,
+            // so they cannot contradict each other. When the symbol came from
+            // `exists()`, attribute it to the call (always a variable). If
+            // metadata is unavailable, fall back to a directive label keyed on
+            // the symbol's kind rather than fabricating an `exists()` attribution
+            // for a possibly-real directive. The parser does not retain whether
+            // the user wrote `# raven:` or the `@lsp-` alias, so the canonical
+            // `# raven:` spelling is always surfaced.
             let metadata = state.content_provider().get_metadata(&symbol.source_uri);
             let origin =
                 resolve_directive_origin(metadata.as_deref(), &symbol.name, symbol.defined_line);
 
-            let attribution = match origin {
-                Some((line, directive_type)) => {
+            let kind_label = |is_function: bool| {
+                if is_function {
+                    "declared function"
+                } else {
+                    "declared variable"
+                }
+            };
+            let (kind_str, attribution) = match origin {
+                Some((line, directive_type)) => (
+                    kind_label(directive_type == "# raven: func"),
                     format!(
                         "Declared via {} directive at line {}",
                         directive_type,
                         line + 1
-                    )
-                }
-                None if metadata.is_some() => {
-                    format!("Declared by an `exists()` call at line {}", display_line)
-                }
+                    ),
+                ),
+                None if metadata.is_some() => (
+                    "declared variable",
+                    format!("Declared by an `exists()` call at line {}", display_line),
+                ),
                 None => {
-                    let directive_type = match symbol.kind {
-                        crate::cross_file::SymbolKind::Function => "# raven: func",
-                        _ => "# raven: var",
+                    let is_function =
+                        matches!(symbol.kind, crate::cross_file::SymbolKind::Function);
+                    let directive_type = if is_function {
+                        "# raven: func"
+                    } else {
+                        "# raven: var"
                     };
-                    format!(
-                        "Declared via {} directive at line {}",
-                        directive_type, display_line
+                    (
+                        kind_label(is_function),
+                        format!(
+                            "Declared via {} directive at line {}",
+                            directive_type, display_line
+                        ),
                     )
                 }
             };
@@ -48426,7 +48446,8 @@ result <- myfunc(42)"#;
     #[test]
     fn test_goto_definition_declared_symbol_first_declaration() {
         // Test that when a symbol is declared multiple times, go-to-definition
-        // navigates to the first declaration by line number
+        // navigates to the first declaration by line number (across both
+        // `# raven: var` and `# raven: func`).
         // Validates: Requirement 11.3 (conflicting declarations)
         use crate::cross_file::directive::parse_directives;
         use crate::handlers::goto_definition;
@@ -63651,6 +63672,39 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             !text.contains("directive"),
             "must not attribute the resolved exists() symbol to a directive; got: {text}"
+        );
+    }
+
+    /// When a name carries BOTH a `# raven: func` and a `# raven: var` directive,
+    /// hover and go-to-definition both describe/navigate to the FIRST declaration
+    /// (lowest line, across kinds), and hover's header, keyword, and line all
+    /// describe that one declaration — so they never contradict each other.
+    #[tokio::test]
+    async fn hover_and_goto_agree_for_multi_kind_declared_symbol() {
+        let mut state = create_state();
+        // Line 0: func directive (first); line 2: var directive; line 3: use.
+        let code = "# raven: func foo\n\n# raven: var foo\nfoo\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let result = super::hover(&state, &uri, Position::new(3, 1)).await;
+        let hover = result.expect("hover should resolve foo");
+        let text = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        // Header and keyword both describe the first declaration (the func on
+        // line 0); they agree with each other and with goto's target line.
+        assert!(
+            text.contains("foo (declared function)"),
+            "header should describe the first declaration (function); got: {text}"
+        );
+        assert!(
+            text.contains("Declared via # raven: func directive at line 1"),
+            "keyword and line must describe the first declaration (func, line 1); got: {text}"
+        );
+        let l = scalar(goto_definition(&state, &uri, Position::new(3, 1)));
+        assert_eq!(
+            l.range.start.line, 0,
+            "goto should land on the first declaration (line 0), matching hover"
         );
     }
 
