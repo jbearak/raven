@@ -2394,10 +2394,11 @@ mod tests {
     /// .env) structure(as.list(match.call()[-1]), ...)`), so it is a plural
     /// quoting helper like `rlang::quos` / base `alist` — every argument is a
     /// captured variable name, never a free reference. Modeled as `WholeCall`
-    /// so `ddply(df, .(iso, year), f)` does not flag `iso`/`year`. The plyr
-    /// `*ply` verbs themselves stay standard-eval (no policy): they descend
-    /// into their arguments, and the nested `.()` call suppresses the quoted
-    /// columns on its own.
+    /// so `ddply(df, .(iso, year), f)` does not flag `iso`/`year`. (The plyr
+    /// `*ply` verbs now carry a base per-formal policy of their own — issue
+    /// #467 — whose `...`-suppression is decided per call site by `.fun`;
+    /// independently of that, the nested `.()` call suppresses its own quoted
+    /// columns.)
     #[test]
     fn plyr_dot_is_whole_call_quoting_helper() {
         assert_eq!(package_policy("plyr", "."), Some(ArgPolicy::WholeCall));

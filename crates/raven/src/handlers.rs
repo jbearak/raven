@@ -25949,19 +25949,21 @@ clean_data <- function(x) {
     }
 
     /// Issue: plyr's `.()` quoting helper. With plyr loaded, `ddply` resolves
-    /// as a no-policy export (standard-eval) and descends into its arguments;
-    /// the nested `.(iso, yearY)` call must suppress the quoted column names.
-    /// Before `package_policy("plyr", ".")` existed, `.` also resolved as a
-    /// no-policy export and was treated as standard-eval, so `iso`/`yearY` were
-    /// flagged as undefined (false positives). A synthetic package keeps the
-    /// test immune to package-database contents.
+    /// to its base per-formal policy (issue #467) — behaviorally standard-eval
+    /// at this call site, since `.fun` is `function(x) x` (not a data-masking
+    /// verb, so the `...` are not suppressed) — and descends into its
+    /// arguments; the nested `.(iso, yearY)` call must suppress the quoted
+    /// column names. Before `package_policy("plyr", ".")` existed, `.` resolved
+    /// as a no-policy export and was treated as standard-eval, so `iso`/`yearY`
+    /// were flagged as undefined (false positives). A synthetic package keeps
+    /// the test immune to package-database contents.
     ///
     /// The data-frame argument is itself an *undefined* symbol whose flag is
-    /// asserted: this pins the scoping boundary. `ddply` stays standard-eval
-    /// (deliberately unmodeled), so it must still descend into and check its
-    /// non-`.()` arguments — only the nested `.()` call suppresses. A
-    /// regression that wrongly gave `ddply` a `WholeCall` policy (over-
-    /// suppressing every argument) would hide this flag and fail the test.
+    /// asserted: this pins the scoping boundary. `ddply`'s base policy captures
+    /// nothing here, so it must still descend into and check its non-`.()`
+    /// arguments — only the nested `.()` call suppresses. A regression that
+    /// wrongly gave `ddply` a `WholeCall` policy (over-suppressing every
+    /// argument) would hide this flag and fail the test.
     #[tokio::test]
     async fn nse_plyr_dot_quotes_columns_in_ddply_end_to_end() {
         use crate::package_library::PackageInfo;
@@ -26030,9 +26032,9 @@ clean_data <- function(x) {
                 .any(|m| m.contains("Undefined variable: yearY")),
             "`.(.., yearY)` must suppress the quoted column `yearY`; messages: {messages:?}"
         );
-        // Scoping boundary: `ddply` stays standard-eval and must still check
-        // its data-frame argument, so the undefined `undefined_df_arg` IS
-        // flagged. This fails if `ddply` were wrongly given a WholeCall policy.
+        // Scoping boundary: `ddply`'s base policy still checks its data-frame
+        // argument, so the undefined `undefined_df_arg` IS flagged. This fails
+        // if `ddply` were wrongly given a WholeCall policy.
         assert!(
             messages
                 .iter()
