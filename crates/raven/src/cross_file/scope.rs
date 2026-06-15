@@ -5065,29 +5065,52 @@ where
     }
 
     for edge in parent_edges {
-        // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
-        // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
-        // Regular symbols are not inherited when local=TRUE
+        // Get call site position for filtering
+        let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
+        let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
+
+        // Resolve the parent's metadata once: it drives both the local-scoping
+        // policy below and the parent `PathContext` further down.
+        let parent_meta = get_metadata(&edge.from);
+
+        // Determine if this local-scoped edge applies the declared-only inheritance
+        // policy. `local = TRUE` / `sys.source(local = an env)` evaluate the child
+        // in the *caller's* environment (R `?source`): at top level that env is
+        // `.GlobalEnv`, so the child sees ALL of the parent's prior top-level
+        // bindings — identical to `local = FALSE` for backward inheritance. Only a
+        // `local = TRUE` call sited *inside a function* binds the child to a
+        // function frame whose locals must not be modeled as global inheritance.
+        //
+        // Issue #476: the old logic treated every `local = TRUE` edge as
+        // declared-only, dropping regular top-level symbols (e.g. a hub that
+        // `source()`s helpers and then `source("report.R", local = TRUE)` — the
+        // report could not see the helpers). We now restrict the declared-only
+        // policy to function-scoped local calls, matching R's environment rules.
         let is_local_scoped = if edge.local {
-            true
+            // Top-level local=TRUE inherits like local=FALSE; only a function-scoped
+            // local source binds to a non-global frame (declared-only).
+            parent_meta.as_ref().is_some_and(|meta| {
+                meta.sources.iter().any(|s| {
+                    s.line == call_site_line
+                        && s.column == call_site_col
+                        && s.local == edge.local
+                        && s.is_sys_source == edge.is_sys_source
+                        && s.is_function_scoped
+                })
+            })
         } else if edge.is_sys_source {
             // For sys.source, check if it's targeting global env
-            if let Some(meta) = get_metadata(&edge.from) {
-                !meta.sources.iter().any(|s| {
-                    s.is_sys_source
-                        && s.sys_source_global_env
-                        && s.line == edge.call_site_line.unwrap_or(u32::MAX)
-                })
+            if let Some(meta) = parent_meta.as_ref() {
+                !meta
+                    .sources
+                    .iter()
+                    .any(|s| s.is_sys_source && s.sys_source_global_env && s.line == call_site_line)
             } else {
                 true // Assume non-global if no metadata
             }
         } else {
             false
         };
-
-        // Get call site position for filtering
-        let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
-        let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
 
         // Check if we would exceed max depth
         if current_depth + 1 >= max_depth {
@@ -5097,8 +5120,7 @@ where
             continue;
         }
 
-        // Build PathContext for parent
-        let parent_meta = get_metadata(&edge.from);
+        // Build PathContext for parent (reusing the metadata fetched above).
         let parent_ctx = parent_meta
             .as_ref()
             .and_then(|m| {
@@ -5167,8 +5189,11 @@ where
         );
 
         // Merge parent symbols (they are available at the START of this file)
-        // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
-        // (declarations describe symbol existence, not export behavior)
+        // For function-scoped local edges only (`is_local_scoped`), inherit just
+        // declared symbols — the child binds to a function frame, not the parent's
+        // globals (declarations describe symbol existence, not export behavior).
+        // Top-level local=TRUE inherits all symbols (see `is_local_scoped` above,
+        // issue #476).
         //
         // Filter out symbols whose `source_uri` is the current file: those
         // are *our own* bindings and their visibility at the query position
@@ -5591,6 +5616,16 @@ where
     // Second pass: process events and apply function scope filtering.
     // Use the def event's `visible_from` position so that the binding from
     // `x <- expr` is not in scope inside its own RHS.
+    //
+    // Names this file genuinely (re)binds by executing its own forward
+    // `source()` calls — i.e. symbols that pass the child leak filter below.
+    // Used after the loop to clear stale parent-prefix markers (issue #476): a
+    // hub file's parent-prefix over-approximates the union over ALL its callers,
+    // so a name the hub itself produces via a forward source can also appear in
+    // its parent prefix; the identical-binding no-op below would then leave it
+    // marked parent-prefix-only and the leak filter would wrongly drop it when
+    // the hub is itself forward-sourced. Recording it here lets us reconcile.
+    let mut forward_contributed: HashSet<Arc<str>> = HashSet::new();
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
@@ -5631,7 +5666,16 @@ where
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) && function_scope.is_none() {
-                        // local=TRUE at top-level doesn't contribute to global scope
+                        // FORWARD direction: a top-level local=TRUE source does not
+                        // contribute its child's symbols to THIS file's global scope
+                        // (the child's defs land in a local env, not the caller's).
+                        // This is deliberately asymmetric with the BACKWARD
+                        // parent-prefix rule in `parent_prefix_at` (issue #476),
+                        // which DOES let a top-level local=TRUE child inherit the
+                        // parent's prior globals — because `local=TRUE` evaluates the
+                        // child in the caller's env (`.GlobalEnv` at top level), so
+                        // the child sees the parent, but the parent does not gain the
+                        // child's new local bindings.
                         continue;
                     }
 
@@ -5867,6 +5911,19 @@ where
                             ) {
                                 continue;
                             }
+                            // This name is genuinely produced by executing this
+                            // file's forward source() (it passed the child leak
+                            // filter). Record it BEFORE the identical-binding
+                            // no-op so even an identical re-export clears the
+                            // stale parent-prefix marker after the loop (#476).
+                            // Only names currently marked parent-prefix-only can
+                            // be affected by the post-loop `retain`, so guard the
+                            // insert on membership — in the common case (the name
+                            // is not in the prefix) this skips the alloc/clone
+                            // entirely, keeping the hot forward path cheap.
+                            if scope.parent_prefix_symbol_names.contains(&name) {
+                                forward_contributed.insert(name.clone());
+                            }
                             // The identical-binding no-op and marker-override
                             // merge below stay recursive-only: they preserve
                             // this frame's `parent_prefix_symbol_names` marker,
@@ -6047,6 +6104,22 @@ where
                 }
             }
         }
+    }
+
+    // Reconcile stale parent-prefix markers (issue #476). A name this file
+    // genuinely (re)produces via its own forward source() is NOT
+    // parent-prefix-only, even if it ALSO appears in the over-approximated
+    // parent prefix (the union over all of this file's callers) with an
+    // identical binding that tripped the no-op above. Clearing it now — after
+    // all within-frame overrides have settled — keeps override semantics intact
+    // while ensuring the leak filter (shared by the recursive STEP 2 merge and
+    // `ScopeStream::resolve_source_contribution`) does not drop it when this
+    // file is itself forward-sourced by a parent. Must run before the final
+    // `return scope` so both fresh and memoized callers see the corrected set.
+    if !forward_contributed.is_empty() {
+        scope
+            .parent_prefix_symbol_names
+            .retain(|n| !forward_contributed.contains(n));
     }
 
     // Phase 5a: inject package-mode contribution at depth 0 only.
@@ -9620,9 +9693,13 @@ outside_var <- 2"#;
 
     #[test]
     fn test_cross_file_declared_symbols_inherited_with_local_true() {
-        // Requirement 9.4: Declared symbols from parent SHALL be visible in child file
-        // even when source() uses local=TRUE. Declarations describe symbol existence,
-        // not export behavior.
+        // Issue #476: a TOP-LEVEL source(local=TRUE) evaluates the child in
+        // `.GlobalEnv`, so BOTH the parent's declared symbols AND its regular
+        // top-level bindings are visible in the child — identical to local=FALSE.
+        // (The declared-only policy is retained only for function-scoped local=TRUE
+        // calls; see `test_auto_mode_function_scoped_local_true_does_not_inherit_parent_globals`.)
+        // This test asserts both: declared_var (always inherited) and regular_var
+        // (the load-bearing #476 behavior — would FAIL under the pre-fix code).
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
 
@@ -9714,8 +9791,11 @@ outside_var <- 2"#;
             }
         };
 
-        // In child file, declared_var should be available (Requirement 9.4)
-        // but regular_var should NOT be available (local=TRUE blocks regular symbols)
+        // In the child file, BOTH declared_var and regular_var should be available.
+        // Issue #476: a top-level source(local=TRUE) evaluates the child in
+        // .GlobalEnv, so the parent's prior top-level bindings (regular AND declared)
+        // are visible — identical to local=FALSE. (The declared-only policy is
+        // retained only for function-scoped local=TRUE calls.)
         let scope = scope_at_position_with_graph(
             &child_uri,
             10,
@@ -9735,11 +9815,17 @@ outside_var <- 2"#;
 
         assert!(
             scope.symbols.contains_key("declared_var"),
-            "declared_var should be available from parent even with local=TRUE (Requirement 9.4)"
+            "declared_var should be available from parent even with local=TRUE"
         );
+        // Issue #476: a TOP-LEVEL `source(local = TRUE)` evaluates the child in
+        // the caller's environment, which at top level is `.GlobalEnv` (R
+        // `?source`). The child therefore sees the parent's prior top-level
+        // bindings — regular AND declared — exactly like local=FALSE. (Only a
+        // `local = TRUE` call sited inside a function binds the child to a
+        // non-global frame; that case keeps the declared-only policy.)
         assert!(
-            !scope.symbols.contains_key("regular_var"),
-            "regular_var should NOT be available from parent with local=TRUE"
+            scope.symbols.contains_key("regular_var"),
+            "regular_var SHOULD be available from a top-level parent with local=TRUE (issue #476)"
         );
         assert!(
             scope.symbols.contains_key("child_var"),
@@ -21398,10 +21484,11 @@ y <- filter(df)"#;
             );
         }
 
-        /// Test: Auto mode with local=TRUE — parent sources child with local=TRUE,
-        /// child should NOT see parent's globals through that edge.
+        /// Test: Auto mode with a TOP-LEVEL local=TRUE — parent sources child with
+        /// local=TRUE at top level, so the child evaluates in `.GlobalEnv` and DOES
+        /// see the parent's prior globals through that edge (issue #476).
         #[test]
-        fn test_auto_mode_local_true_blocks_parent_scope() {
+        fn test_auto_mode_local_true_inherits_top_level_parent_scope() {
             use crate::cross_file::dependency::DependencyGraph;
             use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -21455,7 +21542,101 @@ y <- filter(df)"#;
                 }
             };
 
-            // In Auto mode, local=TRUE should block parent scope from child
+            // In Auto mode, a top-level local=TRUE child sees the parent's globals
+            // (R evaluates it in .GlobalEnv).
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                0,
+                0,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+
+            assert!(
+                scope.symbols.contains_key("parent_var"),
+                "With a top-level local=TRUE, child SHOULD see parent_var (issue #476). Got: {:?}",
+                scope.symbols.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Test: a FUNCTION-SCOPED local=TRUE keeps the declared-only policy — the
+        /// child evaluates in the function's call frame, NOT `.GlobalEnv`, so the
+        /// parent's top-level globals are not modeled as inherited.
+        ///
+        /// This is a **preservation guard**, not a regression gate for the issue
+        /// #476 fix: the pre-fix code blocked regular symbols for ALL local=TRUE, so
+        /// it would also pass here. The guard's job is to ensure the #476 fix didn't
+        /// *over-correct* — i.e. didn't make the function-scoped case inherit regular
+        /// globals too. The tests that fail under the pre-fix code are the top-level
+        /// ones (`test_auto_mode_local_true_inherits_top_level_parent_scope`,
+        /// `test_cross_file_declared_symbols_inherited_with_local_true`, and the
+        /// top-level property test).
+        #[test]
+        fn test_auto_mode_function_scoped_local_true_does_not_inherit_parent_globals() {
+            use crate::cross_file::dependency::DependencyGraph;
+            use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+            let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+            let child_uri = Url::parse("file:///project/child.R").unwrap();
+            let workspace_root = Url::parse("file:///project").unwrap();
+
+            // The source() call is inside a function body, so it is function-scoped.
+            let parent_code =
+                "parent_var <- 1\nf <- function() {\n  source(\"child.R\", local = TRUE)\n}";
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+            let child_code = "child_var <- 2";
+            let child_tree = parse_r(child_code);
+            let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+            let mut graph = DependencyGraph::new();
+            let parent_meta = CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 2,
+                    column: 2,
+                    is_directive: false,
+                    local: true,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                    is_function_scoped: true, // inside f()'s body
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let child_meta = CrossFileMetadata::default();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &parent_uri {
+                    Some(std::sync::Arc::new(parent_meta.clone()))
+                } else if uri == &child_uri {
+                    Some(std::sync::Arc::new(child_meta.clone()))
+                } else {
+                    None
+                }
+            };
+
             let scope = scope_at_position_with_graph(
                 &child_uri,
                 0,
@@ -21475,7 +21656,8 @@ y <- filter(df)"#;
 
             assert!(
                 !scope.symbols.contains_key("parent_var"),
-                "With local=TRUE, child should NOT see parent_var. Got: {:?}",
+                "A function-scoped local=TRUE child must NOT inherit the parent's \
+                 top-level globals (declared-only policy retained). Got: {:?}",
                 scope.symbols.keys().collect::<Vec<_>>()
             );
         }

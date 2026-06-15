@@ -11,6 +11,66 @@ mod workspace_scan_tests {
     // Use default max_chain_depth for tests
     const TEST_MAX_CHAIN_DEPTH: usize = 20;
 
+    /// Issue #476 (bug A): the dependency graph must be built in a deterministic
+    /// order. `build_dependency_graph_from_workspace` feeds files to
+    /// `update_file`, which appends each file's incoming edge to
+    /// `backward[child]`; if the feed order followed the non-deterministic
+    /// rayon-scan / HashMap / LRU iteration order, the backward-edge `Vec` order
+    /// — which scope resolution's parent-prefix walk follows — varied run to run,
+    /// so `raven check` dropped a different subset of symbols each run. The fix
+    /// sorts by URI before feeding `update_file`. This asserts the resulting
+    /// backward-edge order is the canonical (URI-sorted) order, independent of
+    /// scan order.
+    #[test]
+    fn test_dependency_graph_build_order_is_deterministic_476() {
+        let temp_dir = TempDir::new().unwrap();
+        // Several parents all source the same child. Names chosen so a plausible
+        // non-sorted processing order would NOT coincide with sorted order.
+        let child = "shared_child.r";
+        fs::write(temp_dir.path().join(child), "helper <- function() {}").unwrap();
+        for p in ["zeta.r", "alpha.r", "mike.r", "bravo.r"] {
+            fs::write(
+                temp_dir.path().join(p),
+                format!("source(\"{child}\")\nhelper()\n"),
+            )
+            .unwrap();
+        }
+
+        let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
+        let child_uri = Url::from_file_path(temp_dir.path().join(child)).unwrap();
+
+        // Build twice; the resulting backward-edge order must be byte-identical
+        // AND in URI-sorted order (the canonical, scan-order-independent result).
+        let order_of = |state: &WorldState| -> Vec<String> {
+            state
+                .cross_file_graph
+                .get_dependents(&child_uri)
+                .iter()
+                .map(|e| e.from.as_str().to_string())
+                .collect()
+        };
+
+        let build = || {
+            let (index, cfe, nie) =
+                scan_workspace(std::slice::from_ref(&workspace_url), TEST_MAX_CHAIN_DEPTH);
+            let mut state = WorldState::new();
+            state.workspace_folders = vec![workspace_url.clone()];
+            state.apply_workspace_index(index, cfe, nie);
+            state
+        };
+
+        let first = order_of(&build());
+        let second = order_of(&build());
+        assert_eq!(first, second, "graph build order must be deterministic");
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(
+            first, sorted,
+            "backward edges must be in canonical URI-sorted order, got {first:?}"
+        );
+        assert_eq!(first.len(), 4, "all four parents should be backward edges");
+    }
+
     #[test]
     fn test_scan_workspace_finds_uppercase_r_files() {
         let temp_dir = TempDir::new().unwrap();

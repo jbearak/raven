@@ -213,34 +213,50 @@ fn resolve_path_impl(
 
     // If path starts with /, it's explicitly workspace-root-relative
     if let Some(stripped) = path.strip_prefix('/') {
-        let workspace_root = context.workspace_root.as_ref();
-        if workspace_root.is_none() {
+        let Some(workspace_root) = context.workspace_root.as_ref() else {
             log::warn!(
                 "Failed to resolve workspace-root-relative path '{}': no workspace root available, base_dir='{}'",
                 path,
                 base_dir.display()
             );
             return None;
-        }
-        let resolved = workspace_root.unwrap().join(stripped);
-        return normalize_path(&resolved).or_else(|| {
-            log::warn!(
-                "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
-                path,
-                resolved.display(),
-                base_dir.display()
-            );
-            None
-        });
+        };
+        let resolved = workspace_root.join(stripped);
+        return match normalize_path(&resolved) {
+            // Case-correct below the workspace-root prefix when the file exists, so
+            // the edge target URI matches the index key on case-insensitive
+            // filesystems (issue #476). This also covers a workspace-package
+            // `system.file()` target, whose `/inst/...` path resolves here.
+            Some(canonical) if canonical.exists() => {
+                Some(canonicalize_case_below(workspace_root, &canonical))
+            }
+            // Missing file: return the lexical path for missing-file diagnostics.
+            Some(canonical) => Some(canonical),
+            None => {
+                log::warn!(
+                    "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
+                    path,
+                    resolved.display(),
+                    base_dir.display()
+                );
+                None
+            }
+        };
     }
 
-    // Try file-relative or working-directory-relative path first
-    let base = context.effective_working_directory();
+    // Try file-relative or working-directory-relative path first.
+    // Reuse `base_dir` (already the effective working directory) as the trusted
+    // prefix for case-correction below.
+    let base = base_dir;
     let resolved = base.join(path);
 
     if let Some(canonical) = normalize_path(&resolved) {
         // Check if the file exists
         if canonical.exists() {
+            // Correct component case to match the on-disk entry (issue #476) so
+            // the resulting URI equals the workspace index key on
+            // case-insensitive filesystems. `base` is the trusted prefix.
+            let canonical = canonicalize_case_below(&base, &canonical);
             log::trace!(
                 "Resolved path '{}' to canonical path: '{}'",
                 path,
@@ -267,6 +283,9 @@ fn resolve_path_impl(
             if let Some(workspace_canonical) = normalize_path(&workspace_resolved)
                 && workspace_canonical.exists()
             {
+                // Case-correct below the workspace-root prefix (issue #476).
+                let workspace_canonical =
+                    canonicalize_case_below(workspace_root, &workspace_canonical);
                 log::trace!(
                     "Resolved path '{}' via workspace-root fallback: '{}' (file-relative '{}' did not exist)",
                     path,
@@ -291,7 +310,7 @@ fn resolve_path_impl(
         "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
         path,
         resolved.display(),
-        base_dir.display()
+        base.display()
     );
     None
 }
@@ -356,6 +375,82 @@ pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<Pa
             None
         }
     }
+}
+
+/// Rewrite the casing of `full`'s path components *below* `base` to match the
+/// real on-disk directory entries, **without resolving symlinks**. Components of
+/// `base` are kept verbatim; only the suffix `full` adds beyond `base` is
+/// corrected, component by component, via `read_dir`.
+///
+/// This fixes the case-insensitive-filesystem mismatch behind issue #476: a
+/// `source("scripts/templates.r")` resolves (lexically) to `…/templates.r`,
+/// which `Path::exists()` accepts on macOS/Windows even though the directory
+/// entry is `templates.R`. The workspace index keys files under their
+/// directory-walk spelling (`…/templates.R`), so the verbatim-cased resolver
+/// path produced an edge target that never matched the index key, dropping every
+/// symbol the sourced file defined. Correcting case here — at the single
+/// resolution chokepoint — makes the edge target equal the index key uniformly
+/// across graph resolution, scope resolution, missing-file diagnostics,
+/// go-to-definition, and path completion.
+///
+/// Only components below `base` are touched because the index preserves the
+/// workspace-folder/file prefix spelling exactly as registered (it never
+/// symlink-canonicalizes it); `base` is derived from those same URIs, so it
+/// already carries the matching prefix. Rewriting the prefix to its on-disk
+/// casing could diverge from a differently-cased registered folder URI. This
+/// also bounds `read_dir` to the appended source-path depth (usually 1-3).
+///
+/// `std::fs::canonicalize` is deliberately avoided: it resolves symlinks, so on
+/// macOS a fixture under `$TMPDIR` (`/var/…` → `/private/var/…`) would resolve to
+/// a prefix the un-canonicalized index keys never use.
+///
+/// On a case-sensitive filesystem the exact-match branch always wins, so this is
+/// a no-op (and a genuinely absent `templates.r` next to an on-disk `templates.R`
+/// is left unresolved, as it should be).
+///
+/// If `full` does not start with `base` (unexpected), `full` is returned
+/// unchanged.
+fn canonicalize_case_below(base: &Path, full: &Path) -> PathBuf {
+    let Ok(suffix) = full.strip_prefix(base) else {
+        return full.to_path_buf();
+    };
+    let mut result = base.to_path_buf();
+    for component in suffix.components() {
+        match component {
+            std::path::Component::Normal(name) => match real_entry_name(&result, name) {
+                Some(real) => result.push(real),
+                None => result.push(name),
+            },
+            // Suffix is relative and normalized; non-Normal components are not
+            // expected, but pass them through defensively.
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+/// Return the real directory-entry name in `dir` matching `name`: an exact-case
+/// match if present (correct on case-sensitive filesystems where two casings can
+/// coexist), otherwise the first case-insensitive match. `None` if `dir` is
+/// unreadable or nothing matches.
+fn real_entry_name(dir: &Path, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut ci_match: Option<std::ffi::OsString> = None;
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        if entry_name == name {
+            return Some(entry_name);
+        }
+        if ci_match.is_none()
+            && entry_name
+                .to_str()
+                .zip(name.to_str())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            ci_match = Some(entry_name);
+        }
+    }
+    ci_match
 }
 
 /// Normalize a path by resolving . and .. components
@@ -443,9 +538,12 @@ pub fn resolve_system_file(
     if let (Some(ws_pkg), Some(ws_root)) = (workspace_package_name, workspace_root)
         && package == ws_pkg
     {
-        let candidate = ws_root.join("inst").join(&rel);
+        let inst_dir = ws_root.join("inst");
+        let candidate = inst_dir.join(&rel);
         if candidate.exists() {
-            return Some(candidate);
+            // Case-correct below the `inst/` prefix (issue #476) so the edge
+            // target matches the index key on case-insensitive filesystems.
+            return Some(canonicalize_case_below(&inst_dir, &candidate));
         }
         // Even if file doesn't exist yet, return the path so diagnostics
         // can report a missing file (consistent with resolve_path behavior).
@@ -456,7 +554,7 @@ pub fn resolve_system_file(
     for lib_path in lib_paths {
         let candidate = lib_path.join(package).join(&rel);
         if candidate.exists() {
-            return Some(candidate);
+            return Some(canonicalize_case_below(lib_path, &candidate));
         }
     }
 
@@ -562,6 +660,62 @@ pub fn path_to_uri(path: &Path) -> Option<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #476: case-correction of resolved source paths so the edge target URI
+    // matches the workspace-index key on case-insensitive filesystems.
+    #[test]
+    fn canonicalize_case_below_prefers_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Templates.R"), "").unwrap();
+        // An exact-case query must be returned verbatim, never folded to another
+        // entry — critical on case-sensitive filesystems where two casings coexist.
+        let full = dir.path().join("Templates.R");
+        let got = canonicalize_case_below(dir.path(), &full);
+        assert_eq!(got, full);
+    }
+
+    #[test]
+    fn canonicalize_case_below_folds_to_on_disk_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("templates.R"), "").unwrap();
+        // Query with the wrong case for the final component; the real entry name
+        // (`templates.R`) must be substituted so the URI matches the index key.
+        // (On a case-insensitive FS `templates.r` opens the same inode; on a
+        // case-sensitive FS there is no `templates.r`, so the case-insensitive
+        // fallback still resolves to the real entry — the function's job.)
+        let queried = dir.path().join("templates.r");
+        let got = canonicalize_case_below(dir.path(), &queried);
+        assert_eq!(got, dir.path().join("templates.R"));
+    }
+
+    #[test]
+    fn canonicalize_case_below_corrects_only_below_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("Child.R"), "").unwrap();
+        // base is the workspace/file prefix and is trusted verbatim; only the
+        // appended components are case-corrected.
+        let queried = dir.path().join("sub").join("child.r");
+        let got = canonicalize_case_below(dir.path(), &queried);
+        assert_eq!(got, dir.path().join("sub").join("Child.R"));
+    }
+
+    #[test]
+    fn canonicalize_case_below_keeps_missing_component_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on disk matches; the path is returned unchanged (it will be
+        // reported as a missing file downstream).
+        let queried = dir.path().join("nope.R");
+        let got = canonicalize_case_below(dir.path(), &queried);
+        assert_eq!(got, queried);
+    }
+
+    #[test]
+    fn canonicalize_case_below_passthrough_when_not_under_base() {
+        let base = PathBuf::from("/some/base");
+        let unrelated = PathBuf::from("/other/place/file.R");
+        assert_eq!(canonicalize_case_below(&base, &unrelated), unrelated);
+    }
 
     fn make_context(file: &str, workspace: Option<&str>) -> PathContext {
         PathContext {
