@@ -5746,13 +5746,13 @@ where
                             // `visited`), so cousin files that STEP 1's parent
                             // walk expanded do not falsely short-circuit this
                             // file's own forward source() targets.
-                            let mut child_visited = forward_visited_base
-                                .clone()
-                                .unwrap_or_else(|| visited.clone());
                             // Memoize the child's EOF scope per (child, path
                             // context, package set), skipping cyclic children
                             // (issue #472). `path_fp` is computed before the
-                            // closure moves `child_ctx`.
+                            // closure moves `child_ctx`. The `child_visited`
+                            // clone is built INSIDE the closure so a memo hit
+                            // (the common case in the dense graphs this targets)
+                            // pays nothing for it.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
                             let provider_fp = data_alias_provider
                                 .map_or(0, |p| p as *const DataAliasProvider as usize);
@@ -5766,6 +5766,14 @@ where
                                 packages_for_child,
                                 is_cancelled,
                                 || {
+                                    // Clone the ancestor snapshot taken before
+                                    // STEP 1 (not the live `visited`), so cousin
+                                    // files that STEP 1's parent walk expanded do
+                                    // not falsely short-circuit this file's own
+                                    // forward source() targets.
+                                    let mut child_visited = forward_visited_base
+                                        .clone()
+                                        .unwrap_or_else(|| visited.clone());
                                     scope_at_position_with_graph_recursive(
                                         &child_uri,
                                         u32::MAX, // Include all symbols from sourced file
