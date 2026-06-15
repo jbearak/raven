@@ -26277,6 +26277,66 @@ clean_data <- function(x) {
         );
     }
 
+    /// Issue #467: the post-`...` control formals in `plyr_split_apply_formals`
+    /// are load-bearing. Even when `.fun` is data-masking (so `captured_dots`
+    /// is upgraded to true), a NAMED control argument such as `.drop = bad_typo`
+    /// matches its enumerated formal and stays CHECKED — it is not absorbed by
+    /// `...`. Dropping the control formals from the list would silently suppress
+    /// it, hiding a real undefined-variable bug. (A bare identifier is a
+    /// contrived `.drop` value, but a logical literal would not surface a
+    /// diagnostic; the point is to exercise the formal-vs-dots mask.) The
+    /// genuinely data-masked `n = mean(value_col)` stays suppressed, proving the
+    /// upgrade did fire — so this isolates the control-formal exemption.
+    #[tokio::test]
+    async fn nse_plyr_ddply_named_control_formal_stays_checked_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .(g), summarise, .drop = bad_typo, n = mean(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: bad_typo")),
+            "a named control formal (`.drop`) stays checked even when `.fun` data-masks; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "the genuinely data-masked `...` column must still be suppressed (proves the upgrade fired); messages: {messages:?}"
+        );
+    }
+
+    /// Issue #467: `.fun` supplied BY NAME (`.fun = summarise`) is located via
+    /// the named-matching pass of `per_formal_mask` and its value extracted from
+    /// a named-argument node — a distinct path from the positional `.fun` the
+    /// other tests exercise.
+    #[tokio::test]
+    async fn nse_plyr_ddply_named_fun_argument_end_to_end() {
+        let code = "library(plyr)\n\
+                    ddply(some_df, .variables = .(g), .fun = summarise, n = mean(value_col))\n\
+                    totally_undefined_baseline\n";
+        let messages = plyr_undefined_messages(code, &[".", "ddply", "summarise", "some_df"]).await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+            "baseline must be flagged; messages: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: value_col")),
+            "a named `.fun = summarise` must still be located and data-mask the `...`; messages: {messages:?}"
+        );
+    }
+
     /// Regression: tree-sitter-r parses `return` as a plain identifier (not a
     /// keyword node), so `return(x)` is an ordinary `call`. The
     /// undefined-variable collector must not flag `return`, because it is a

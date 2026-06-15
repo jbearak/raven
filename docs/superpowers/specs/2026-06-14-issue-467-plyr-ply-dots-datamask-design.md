@@ -1,6 +1,6 @@
 # Issue #467 — plyr `*ply` verbs: data-masked `...` forwarded to `summarise`/`mutate`/`transform` (design spec)
 
-**Status:** v1
+**Status:** v2 — reconciled with the implementation after the review passes (§3.2 helper signature/return and the `suppressed_arguments`-vs-`call_argument_suppression` choice; §5 test list expanded to match the shipped tests). The on-function doc comments in the code are authoritative.
 **Issue:** #467 "NSE: model plyr *ply verbs' data-masked `...` forwarded to summarise/mutate/transform"
 **Builds on:** #466 (`plyr::.()` modeled as a `WholeCall` quoting helper), branch `issue467`
 **Verified against:** plyr 1.8.9 + R 4.6.0
@@ -98,16 +98,22 @@ call-site `captured_dots` upgrade in `resolve_call_arg_policy`:
 
 After a callee resolves to a `*ply` policy via `table_verb_policy` (both the
 namespace `plyr::ddply` branch and the bare-identifier branch), call a new helper
-`upgrade_plyr_ply_dots(call_node, func, text, analysis, &policy) -> Option<ArgPolicy>`:
+`upgrade_plyr_ply_dots(call_node, name, text, analysis, policy: ArgPolicy) -> ArgPolicy`
+(it returns the **base `policy` unchanged** when no upgrade applies, rather than an
+`Option`):
 
-1. Gate on `is_plyr_split_apply_verb(canonical_name)`.
+1. Gate on `is_plyr_split_apply_verb(name)`.
 2. Locate the argument bound to `.fun`. Reuse the existing matching by building a
    probe policy `PerFormal { formals: <ply formals>, captured: vec![".fun"], captured_dots: false }`,
-   running `call_argument_suppression(args, text, &probe, pipe_fed)`, and taking
-   the node whose mask bit is set. `pipe_fed = call_is_pipe_fed(call_node, text)`
-   so `baseball %>% ddply(.(g), summarise, …)` locates `.fun` correctly. This
-   cannot drift from R's named-then-positional matching because it is the same
-   primitive the suppression mask uses.
+   collecting the call's argument labels and running `crate::nse::suppressed_arguments(&probe, &labels, pipe_fed)`
+   directly (NOT the `call_argument_suppression` wrapper — that wrapper
+   force-suppresses any argument literally named `subset`, which would misidentify
+   `.fun` if a user passed a `subset =` argument that `*ply` forwards through
+   `...`), then taking the node whose mask bit is set.
+   `pipe_fed = call_is_pipe_fed(call_node, text)` so `baseball %>% ddply(.(g),
+   summarise, …)` locates `.fun` correctly. This cannot drift from R's
+   named-then-positional matching because it is the same primitive the suppression
+   mask uses.
 3. Resolve that `.fun` value node's verb policy **shadow-aware**:
    - identifier in `local_function_policies` → that policy (covers a local wrapper
      whose dots were upgraded to `captured_dots: true`);
@@ -117,8 +123,8 @@ namespace `plyr::ddply` branch and the bare-identifier branch), call a new helpe
      → not data-masking (safe direction);
    - otherwise → `table_verb_policy(value, text, analysis)`.
 4. If the resolved policy is `PerFormal { captured_dots: true, .. }`, return the
-   `*ply` policy with `captured_dots: true`; otherwise return `None` (leave the
-   base policy → `...` checked).
+   `*ply` policy with `captured_dots: true`; otherwise return the base `policy`
+   unchanged (leave the `...` checked).
 
 `.data`/`.variables`/`.margins`/`.fun` are never in `captured`, so they stay
 checked; for `d*ply` the `.variables` `.()` call suppresses its own quoted columns
@@ -162,13 +168,23 @@ End-to-end (`handlers.rs`, mirroring the #466 synthetic-package harness):
 - **Positive:** `ddply(df, .(year), summarise, nteams = length(unique(team)))` —
   `team` NOT flagged; an undefined `.data` arg IS flagged (scoping boundary);
   a `totally_undefined_baseline` IS flagged (collector-ran sentinel).
-- **Negative:** `ddply(df, .(g), head, undefined_typo)` (ordinary `.fun`) —
+- **Negative:** `ddply(df, .(g), nrow, extra = undefined_typo)` (ordinary `.fun`) —
   `undefined_typo` IS flagged.
-- `mutate` and `transform` as `.fun` (positive); an `l*ply`/`m*ply` shape
-  (`.fun` 2nd positional) to pin the differing formal position.
+- `transform` as `.fun` (positive) to exercise the base-table resolution path; an
+  `l*ply` shape (`.fun` 2nd positional) to pin the differing formal position.
+  (`mutate` shares the identical `package_policy` arm as `summarise` and is pinned
+  by the unit test, so a dedicated `mutate` end-to-end case is redundant.)
 - A locally-shadowed verb name as `.fun` (`summarise <- function(x) nrow(x)`;
   `ddply(df, .(g), summarise, undefined_typo)`) — `undefined_typo` IS flagged
   (shadow beats the package policy).
+- A pipe-fed call (`some_df %>% ddply(.(g), summarise, …)`) and a qualified
+  `plyr::summarise` `.fun` (positive).
+- A named control formal staying checked under a data-masking `.fun`
+  (`ddply(df, .(g), summarise, .drop = bad_typo, …)`) — `bad_typo` IS flagged
+  (the control-formal listing is load-bearing) while the data-masked `...` column
+  is suppressed.
+- `.fun` supplied by name (`ddply(df, .variables = .(g), .fun = summarise, …)`) —
+  exercises the named-matching pass.
 
 ## 6. Docs
 
