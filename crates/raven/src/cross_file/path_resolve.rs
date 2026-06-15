@@ -34,7 +34,7 @@ use tower_lsp::lsp_types::Url;
 use super::types::CrossFileMetadata;
 
 /// Context for path resolution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct PathContext {
     /// Path of the current file
     pub file_path: PathBuf,

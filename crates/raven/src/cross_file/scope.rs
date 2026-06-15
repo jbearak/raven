@@ -983,6 +983,12 @@ pub(crate) struct ForwardChildMemo {
     /// un-memoized resolver even when `maxChainDepth` is small enough to
     /// truncate (issue #472 / #473).
     entries: HashMap<ForwardChildKey, (Arc<ScopeAtPosition>, usize)>,
+    /// Cached "does the graph contain a source cycle" answer for this query.
+    /// The memo must disable itself on cyclic graphs; the answer is invariant
+    /// for the memo's lifetime, so it is computed once (via the graph's own
+    /// edge-revision-cached `contains_cycle`) and reused, avoiding a per-child
+    /// atomic load + `RwLock` read in dense graphs.
+    graph_has_cycle: std::cell::Cell<Option<bool>>,
 }
 
 /// Key for [`ForwardChildMemo`]. Captures every caller-varying input that
@@ -1014,33 +1020,42 @@ struct ForwardChildKey {
     provider_fp: usize,
 }
 
-/// Hash a child's `PathContext` (or its absence) into a `path_fp`.
+/// Hash a child's `PathContext` (or its absence) into a `path_fp`. Hashes the
+/// whole struct (it derives `Hash`), so adding a field to `PathContext`
+/// automatically extends the fingerprint — no field list to keep in lockstep.
 fn path_context_fingerprint(ctx: Option<&super::path_resolve::PathContext>) -> u64 {
     let mut h = DefaultHasher::new();
-    match ctx {
-        None => 0u8.hash(&mut h),
-        Some(c) => {
-            1u8.hash(&mut h);
-            c.file_path.hash(&mut h);
-            c.working_directory.hash(&mut h);
-            c.inherited_working_directory.hash(&mut h);
-            c.workspace_root.hash(&mut h);
-        }
-    }
+    ctx.hash(&mut h);
     h.finish()
+}
+
+/// Identity of the `DataAliasProvider` in effect, for [`ForwardChildKey`]: the
+/// provider's pointer address, or 0 for `None`. Sound because the per-query memo
+/// never outlives the query, within which a single provider instance exists.
+fn data_alias_provider_fp(provider: Option<&DataAliasProvider<'_>>) -> usize {
+    provider.map_or(0, |p| p as *const DataAliasProvider as usize)
 }
 
 /// Order-independent fingerprint of an attached package set. Sorts the names
 /// and hashes the sorted sequence (including its length), so iteration order
 /// (HashSet) does not affect the key while avoiding the cancellation collisions
 /// a plain XOR-of-hashes combiner would admit (e.g. distinct sets whose element
-/// hashes XOR-cancel, or empty vs. cancelling sets). Package sets are small, so
-/// the sort is negligible next to the resolution it guards.
+/// hashes XOR-cancel, or empty vs. cancelling sets). Fast-paths the empty and
+/// singleton sets that dominate real workspaces (no Vec/sort).
 fn package_set_fingerprint(pkgs: &HashSet<String>) -> u64 {
-    let mut names: Vec<&str> = pkgs.iter().map(String::as_str).collect();
-    names.sort_unstable();
     let mut h = DefaultHasher::new();
-    names.hash(&mut h);
+    match pkgs.len() {
+        0 => 0u8.hash(&mut h),
+        1 => {
+            1u8.hash(&mut h);
+            pkgs.iter().next().unwrap().hash(&mut h);
+        }
+        _ => {
+            let mut names: Vec<&str> = pkgs.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -1118,7 +1133,20 @@ fn resolve_forward_child_memoized(
     compute: impl FnOnce() -> ScopeAtPosition,
 ) -> ScopeAtPosition {
     // A cycle anywhere in the graph makes child scopes visited-dependent.
-    if forward_child_memo_disabled() || graph.contains_cycle() {
+    // `contains_cycle` is invariant for this query, so compute it once and
+    // cache it on the memo rather than re-locking the graph for every child.
+    let has_cycle = {
+        let m = memo.borrow();
+        match m.graph_has_cycle.get() {
+            Some(c) => c,
+            None => {
+                let c = graph.contains_cycle();
+                m.graph_has_cycle.set(Some(c));
+                c
+            }
+        }
+    };
+    if forward_child_memo_disabled() || has_cycle {
         bump_forward_child_compute_count();
         return compute();
     }
@@ -1151,18 +1179,15 @@ fn resolve_forward_child_memoized(
     // Cache only depth-truncation-free scopes (depth-independent for any
     // shallower reach); keep the deepest compute-depth seen to maximize reuse.
     if computed.depth_exceeded.is_empty() {
-        let mut memo_mut = memo.borrow_mut();
-        let slot = memo_mut.entries.entry(key);
-        match slot {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                if child_depth > e.get().1 {
-                    *e.get_mut() = (Arc::new(computed.clone()), child_depth);
+        memo.borrow_mut()
+            .entries
+            .entry(key)
+            .and_modify(|slot| {
+                if child_depth > slot.1 {
+                    *slot = (Arc::new(computed.clone()), child_depth);
                 }
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((Arc::new(computed.clone()), child_depth));
-            }
-        }
+            })
+            .or_insert_with(|| (Arc::new(computed.clone()), child_depth));
     }
     computed
 }
@@ -5754,8 +5779,7 @@ where
                             // (the common case in the dense graphs this targets)
                             // pays nothing for it.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = data_alias_provider
-                                .map_or(0, |p| p as *const DataAliasProvider as usize);
+                            let provider_fp = data_alias_provider_fp(data_alias_provider);
                             resolve_forward_child_memoized(
                                 forward_child_memo,
                                 graph,
@@ -7691,9 +7715,7 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
-        let provider_fp = self
-            .data_alias_provider
-            .map_or(0, |p| p as *const DataAliasProvider as usize);
+        let provider_fp = data_alias_provider_fp(self.data_alias_provider);
         // The streaming path resolves forward children of the queried URI at
         // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
