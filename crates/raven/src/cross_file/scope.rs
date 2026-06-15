@@ -971,7 +971,18 @@ fn merge_child_source_packages(
 /// does not encode.
 #[derive(Debug, Default)]
 pub(crate) struct ForwardChildMemo {
-    entries: HashMap<ForwardChildKey, Arc<ScopeAtPosition>>,
+    /// Value is `(scope, compute_depth)`. Only **depth-truncation-free** scopes
+    /// (empty `depth_exceeded`) are stored, and `compute_depth` records the
+    /// `current_depth` they were resolved at. A child's EOF scope is otherwise
+    /// independent of `current_depth` (the only depth effect is max-depth
+    /// truncation, and cycles — the other source of depth/visited dependence —
+    /// are excluded wholesale). A stored entry is therefore safe to reuse for
+    /// any reach at depth `<= compute_depth` (equal-or-larger budget yields the
+    /// identical full subtree); reuse at a deeper reach is refused because the
+    /// deeper reach might truncate. This keeps the memo byte-equivalent to the
+    /// un-memoized resolver even when `maxChainDepth` is small enough to
+    /// truncate (issue #472 / #473).
+    entries: HashMap<ForwardChildKey, (Arc<ScopeAtPosition>, usize)>,
 }
 
 /// Key for [`ForwardChildMemo`]. Captures every caller-varying input that
@@ -1010,16 +1021,18 @@ fn path_context_fingerprint(ctx: Option<&super::path_resolve::PathContext>) -> u
     h.finish()
 }
 
-/// Order-independent fingerprint of an attached package set: XOR of per-element
-/// hashes, so iteration order (HashSet) does not affect the key.
+/// Order-independent fingerprint of an attached package set. Sorts the names
+/// and hashes the sorted sequence (including its length), so iteration order
+/// (HashSet) does not affect the key while avoiding the cancellation collisions
+/// a plain XOR-of-hashes combiner would admit (e.g. distinct sets whose element
+/// hashes XOR-cancel, or empty vs. cancelling sets). Package sets are small, so
+/// the sort is negligible next to the resolution it guards.
 fn package_set_fingerprint(pkgs: &HashSet<String>) -> u64 {
-    let mut acc = 0u64;
-    for p in pkgs {
-        let mut h = DefaultHasher::new();
-        p.hash(&mut h);
-        acc ^= h.finish();
-    }
-    acc
+    let mut names: Vec<&str> = pkgs.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let mut h = DefaultHasher::new();
+    names.hash(&mut h);
+    h.finish()
 }
 
 // Test-only switch (the master equivalence gate flips this) to force every
@@ -1072,11 +1085,19 @@ fn bump_forward_child_compute_count() {}
 /// disabling the memo wholesale on cyclic graphs keeps the common acyclic case
 /// (the `worldwide` repo) fully memoized. On a hit the cached scope is cloned
 /// (cheap relative to re-resolution — see the issue's lazy-clone finding).
+///
+/// `child_depth` is the `current_depth` the child is resolved at. Because the
+/// child's scope can be truncated by `max_depth`, only depth-truncation-free
+/// scopes are cached and a cached entry is reused only for reaches at depth
+/// `<= child_depth` (see [`ForwardChildMemo`]); a deeper reach recomputes,
+/// keeping the memo byte-equivalent to the un-memoized resolver even under a
+/// small `maxChainDepth`.
 fn resolve_forward_child_memoized(
     memo: &std::cell::RefCell<ForwardChildMemo>,
     graph: &super::dependency::DependencyGraph,
     child_uri: &Url,
     path_fp: u64,
+    child_depth: usize,
     packages_for_child: &HashSet<String>,
     compute: impl FnOnce() -> ScopeAtPosition,
 ) -> ScopeAtPosition {
@@ -1090,14 +1111,36 @@ fn resolve_forward_child_memoized(
         path_fp,
         pkg_fp: package_set_fingerprint(packages_for_child),
     };
-    if let Some(arc) = memo.borrow().entries.get(&key) {
-        return (**arc).clone();
+    // Reuse only a stored scope whose compute-depth is at least this reach's
+    // depth (the stored scope is truncation-free, so a shallower-or-equal reach
+    // resolves the identical full subtree). Scope the borrow so it is released
+    // before `compute()` recurses (which re-borrows the memo).
+    {
+        let borrowed = memo.borrow();
+        if let Some((arc, compute_depth)) = borrowed.entries.get(&key)
+            && child_depth <= *compute_depth
+        {
+            return (**arc).clone();
+        }
     }
     bump_forward_child_compute_count();
     let computed = compute();
-    memo.borrow_mut()
-        .entries
-        .insert(key, Arc::new(computed.clone()));
+    // Cache only depth-truncation-free scopes (depth-independent for any
+    // shallower reach); keep the deepest compute-depth seen to maximize reuse.
+    if computed.depth_exceeded.is_empty() {
+        let mut memo_mut = memo.borrow_mut();
+        let slot = memo_mut.entries.entry(key);
+        match slot {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if child_depth > e.get().1 {
+                    *e.get_mut() = (Arc::new(computed.clone()), child_depth);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((Arc::new(computed.clone()), child_depth));
+            }
+        }
+    }
     computed
 }
 
@@ -5693,6 +5736,7 @@ where
                                 graph,
                                 &child_uri,
                                 path_fp,
+                                current_depth + 1,
                                 packages_for_child,
                                 || {
                                     scope_at_position_with_graph_recursive(
@@ -7612,11 +7656,14 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
+        // The streaming path resolves forward children of the queried URI at
+        // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
             &self.forward_child_memo,
             self.graph,
             &child_uri,
             path_fp,
+            1,
             &empty_packages,
             || {
                 scope_at_position_with_graph_recursive(
@@ -15865,9 +15912,13 @@ x <- 1"#;
 
     /// Build a graph + artifact/metadata closures from `(uri, code)` files,
     /// then assert that resolving every file's EOF scope is identical with the
-    /// forward-child memo enabled vs disabled.
+    /// forward-child memo enabled vs disabled, under the given `max_depth`.
     #[cfg(test)]
-    fn assert_memo_equivalence(workspace_root: &Url, files: &[(Url, &str)]) {
+    fn assert_memo_equivalence_with_depth(
+        workspace_root: &Url,
+        files: &[(Url, &str)],
+        max_depth: usize,
+    ) {
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::CrossFileMetadata;
 
@@ -15900,7 +15951,7 @@ x <- 1"#;
                 &get_metadata,
                 &graph,
                 Some(workspace_root),
-                64,
+                max_depth,
                 &base_exports,
                 true,
                 crate::cross_file::config::BackwardDependencyMode::Auto,
@@ -15918,8 +15969,52 @@ x <- 1"#;
             assert_eq!(
                 canonical_scope(&off),
                 canonical_scope(&on),
-                "forward-child memo changed the resolved scope for {uri}"
+                "forward-child memo changed the resolved scope for {uri} (max_depth={max_depth})"
             );
+        }
+    }
+
+    /// Equivalence at the production default depth.
+    #[cfg(test)]
+    fn assert_memo_equivalence(workspace_root: &Url, files: &[(Url, &str)]) {
+        assert_memo_equivalence_with_depth(workspace_root, files, 64);
+    }
+
+    #[test]
+    fn memo_equiv_depth_truncation_small_max_depth() {
+        // A child reached at two different depths within one query, with a
+        // chain long enough that a small max_depth truncates the deeper reach
+        // but not the shallower one. The memo must NOT serve a depth-truncated
+        // scope to a shallower reach (issue #472 / depth-key soundness).
+        // `q` sources `a` then `c` directly; `a` also sources `c`, so `c` is
+        // reached at depth 1 (q->c) and depth 2 (q->a->c). The c->d->e->f chain
+        // truncates differently at those depths under max_depth=4.
+        let root = Url::parse("file:///project").unwrap();
+        let files: Vec<(Url, &str)> = vec![
+            (
+                Url::parse("file:///project/q.r").unwrap(),
+                "source(\"a.r\")\nsource(\"c.r\")\n",
+            ),
+            (
+                Url::parse("file:///project/a.r").unwrap(),
+                "source(\"c.r\")\na_sym <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/c.r").unwrap(),
+                "source(\"d.r\")\nc_sym <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/d.r").unwrap(),
+                "source(\"e.r\")\nd_sym <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/e.r").unwrap(),
+                "source(\"f.r\")\ne_sym <- 1\n",
+            ),
+            (Url::parse("file:///project/f.r").unwrap(), "f_sym <- 1\n"),
+        ];
+        for depth in [3usize, 4, 5] {
+            assert_memo_equivalence_with_depth(&root, &files, depth);
         }
     }
 

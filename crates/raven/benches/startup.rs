@@ -131,10 +131,11 @@ fn bench_workspace_scan(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("scan", *label), &workspace, |b, ws| {
             let folder_url = Url::from_file_path(ws.path()).unwrap();
             let folder_urls = [folder_url];
+            let max_chain_depth = raven::cross_file::CrossFileConfig::default().max_chain_depth;
             b.iter(|| {
                 black_box(raven::state::scan_workspace(
                     black_box(&folder_urls),
-                    20, // default max_chain_depth
+                    max_chain_depth,
                 ))
             })
         });

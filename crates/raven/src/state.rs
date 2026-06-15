@@ -761,14 +761,16 @@ impl WorldState {
         // open files retain coverage equivalent to the old per-seed loop, capped to
         // bound lock-hold time when the user has hundreds of files open.
         //
-        // Two ceilings apply. The relative one (`max_visited * 50`) preserves the
-        // pre-existing per-seed-equivalent scaling. The absolute one
-        // (`MULTI_SEED_VISITED_CEILING`) decouples this multi-seed path from the
-        // raised default of `max_transitive_dependents_visited` (issue #473 lifted
-        // it from 2_000 to 50_000): without it the relative ceiling would reach
-        // 2.5M, an unnecessary latency/memory cliff on a pathologically large
-        // workspace. Real workspaces are far smaller than either ceiling, so this
-        // never bites them.
+        // Two ceilings apply, whichever is smaller. The relative one
+        // (`max_visited * 50`) caps the per-seed-count scaling. The absolute one
+        // (`MULTI_SEED_VISITED_CEILING`) bounds total nodes regardless of the
+        // configured budget, so the raised default of
+        // `max_transitive_dependents_visited` (issue #473 lifted it from 2_000 to
+        // 50_000) cannot push the multi-seed walk to 2.5M nodes — an unnecessary
+        // latency/memory cliff. At the new default the absolute ceiling binds once
+        // `docs.len() >= 4`; 200_000 still far exceeds any real workspace's file
+        // count (the neighborhood is naturally bounded by it), so it never trims
+        // coverage in practice.
         const MULTI_SEED_VISITED_CEILING: usize = 200_000;
         let effective_max_visited = max_visited
             .saturating_mul(docs.len().max(1))

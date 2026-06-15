@@ -1676,6 +1676,12 @@ impl DependencyGraph {
         }
         let mut color: HashMap<&Url, Color> = HashMap::new();
         let mut found = false;
+        // Rooting over `self.forward.keys()` is complete: every node on a cycle
+        // has an outgoing edge that continues the cycle, so it appears as a
+        // `forward` key. `update_file` records both `source()` and
+        // backward-directive edges in `forward` (see
+        // `test_backward_directive_creates_edge`), so no cycle-capable node is
+        // reachable only through the `backward` map.
         // Stack frames: (node, index-of-next-child-to-visit).
         'outer: for root in self.forward.keys() {
             if color.contains_key(root) {
