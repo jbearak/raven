@@ -730,9 +730,10 @@ fn try_parse_exists_call(node: Node, content: &str) -> Option<ExistsCall> {
     let value_node = named_arg_value(&args_node, content, "x")
         .or_else(|| first_positional_arg_value(args_node))?;
     let name = extract_string_literal(value_node, content)?;
-    // `exists("")` names nothing usable; declare nothing (the `# raven: var`
-    // directive likewise skips an empty name).
-    if name.is_empty() {
+    // `exists("")` / `exists("   ")` name nothing usable; declare nothing. This
+    // matches the `# raven: var` directive, which skips an empty-or-whitespace
+    // name (`name.trim().is_empty()` in `directive.rs`).
+    if name.trim().is_empty() {
         return None;
     }
 
@@ -2198,6 +2199,16 @@ source("b.R")"#;
         // `exists("")` names nothing usable — declare nothing (parity with the
         // `# raven: var` directive, which also skips an empty name).
         let code = r#"exists("")"#;
+        let tree = parse_r(code);
+        let calls = detect_exists_calls(&tree, code);
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[test]
+    fn test_exists_whitespace_string_skipped() {
+        // A whitespace-only name is also skipped, matching `# raven: var`'s
+        // `name.trim().is_empty()` rule.
+        let code = r#"exists("   ")"#;
         let tree = parse_r(code);
         let calls = detect_exists_calls(&tree, code);
         assert_eq!(calls.len(), 0);

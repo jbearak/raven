@@ -18763,6 +18763,52 @@ fn build_help_panel_link(topic: &str, package: &str) -> String {
 /// # }
 /// ```
 ///
+/// First matching `# raven:` directive declaration for a declared symbol whose
+/// resolved definition is at `defined_line`. Shared by hover and
+/// go-to-definition so the two never disagree about a declared symbol's origin.
+///
+/// Returns `Some((first_line, keyword))` ONLY when `defined_line` is the line of
+/// a matching directive — i.e. the resolved symbol is directive-derived, not
+/// `exists()`-derived (an `exists()` declaration's line is the call site, never
+/// a directive line). `first_line` is the lowest matching directive line (the
+/// "first declaration", which go-to-definition navigates to) and `keyword` is
+/// that first declaration's canonical `# raven: var` / `# raven: func` form.
+/// Returns `None` for an `exists()`-derived symbol or when `metadata` is absent;
+/// callers then use `symbol.defined_line` (the `exists()` call, or the symbol's
+/// own location).
+///
+/// Names are matched on [`crate::r_names::canonical_use_name`] of both the query
+/// and the stored declaration (Seam B, #459): a directive stores the call-site
+/// form (bare for a syntactic name, backtick-wrapped for a non-syntactic one).
+fn resolve_directive_origin(
+    metadata: Option<&crate::cross_file::CrossFileMetadata>,
+    name: &str,
+    defined_line: u32,
+) -> Option<(u32, &'static str)> {
+    let metadata = metadata?;
+    let canonical = crate::r_names::canonical_use_name(name);
+    let matches = || {
+        metadata
+            .declared_variables
+            .iter()
+            .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
+            .map(|d| (d.line, "# raven: var"))
+            .chain(
+                metadata
+                    .declared_functions
+                    .iter()
+                    .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
+                    .map(|d| (d.line, "# raven: func")),
+            )
+    };
+    // Directive-derived only if the RESOLVED declaration's own line is a
+    // matching directive line; otherwise the symbol came from `exists()`.
+    if !matches().any(|(line, _)| line == defined_line) {
+        return None;
+    }
+    matches().min_by_key(|(line, _)| *line)
+}
+
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
@@ -18975,69 +19021,41 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             let display_line = symbol.defined_line + 1;
 
             // Distinguish a genuine directive declaration from one synthesized
-            // by an `exists("name")` call, using the SAME rule as
-            // go-to-definition so the two never disagree: the resolved symbol is
-            // directive-derived iff its own line (`symbol.defined_line`) is a
-            // matching-directive line. An `exists()`-derived symbol's line is the
-            // call site, never a directive line — so a same-name directive
-            // located elsewhere (e.g. one shadowed by, or appearing after, the
-            // resolved `exists()` declaration) is correctly NOT attributed.
-            //
-            // When directive-derived, report the FIRST declaration line (mirrors
-            // go-to-definition) with that directive's keyword (`# raven: var` vs
-            // `# raven: func`). When the symbol came from `exists()`, attribute
-            // it to the call. If metadata is unavailable, fall back to the
-            // directive label keyed on the symbol's kind rather than fabricating
-            // an `exists()` attribution for a possibly-real directive. The parser
-            // does not retain whether the user wrote `# raven:` or the `@lsp-`
-            // alias, so the canonical `# raven:` spelling is always surfaced.
-            let canonical = crate::r_names::canonical_use_name(&symbol.name);
+            // by an `exists("name")` call, via the shared `resolve_directive_origin`
+            // so hover and go-to-definition never disagree: the resolved symbol
+            // is directive-derived iff its own line is a matching-directive line.
+            // When directive-derived, report the FIRST declaration line and its
+            // keyword. When the symbol came from `exists()`, attribute it to the
+            // call. If metadata is unavailable, fall back to a directive label
+            // keyed on the symbol's kind rather than fabricating an `exists()`
+            // attribution for a possibly-real directive. The parser does not
+            // retain whether the user wrote `# raven:` or the `@lsp-` alias, so
+            // the canonical `# raven:` spelling is always surfaced.
             let metadata = state.content_provider().get_metadata(&symbol.source_uri);
-            let directives: Vec<(u32, &str)> = metadata
-                .as_ref()
-                .map(|m| {
-                    m.declared_variables
-                        .iter()
-                        .filter(|d| crate::r_names::canonical_use_name(&d.name) == canonical)
-                        .map(|d| (d.line, "# raven: var"))
-                        .chain(
-                            m.declared_functions
-                                .iter()
-                                .filter(|d| {
-                                    crate::r_names::canonical_use_name(&d.name) == canonical
-                                })
-                                .map(|d| (d.line, "# raven: func")),
-                        )
-                        .collect()
-                })
-                .unwrap_or_default();
-            let symbol_is_directive = directives
-                .iter()
-                .any(|(line, _)| *line == symbol.defined_line);
+            let origin =
+                resolve_directive_origin(metadata.as_deref(), &symbol.name, symbol.defined_line);
 
-            let attribution = if symbol_is_directive {
-                // First declaration (min line) + its keyword — matches goto.
-                let (line, directive_type) = directives
-                    .iter()
-                    .min_by_key(|(line, _)| *line)
-                    .copied()
-                    .unwrap();
-                format!(
-                    "Declared via {} directive at line {}",
-                    directive_type,
-                    line + 1
-                )
-            } else if metadata.is_some() {
-                format!("Declared by an `exists()` call at line {}", display_line)
-            } else {
-                let directive_type = match symbol.kind {
-                    crate::cross_file::SymbolKind::Function => "# raven: func",
-                    _ => "# raven: var",
-                };
-                format!(
-                    "Declared via {} directive at line {}",
-                    directive_type, display_line
-                )
+            let attribution = match origin {
+                Some((line, directive_type)) => {
+                    format!(
+                        "Declared via {} directive at line {}",
+                        directive_type,
+                        line + 1
+                    )
+                }
+                None if metadata.is_some() => {
+                    format!("Declared by an `exists()` call at line {}", display_line)
+                }
+                None => {
+                    let directive_type = match symbol.kind {
+                        crate::cross_file::SymbolKind::Function => "# raven: func",
+                        _ => "# raven: var",
+                    };
+                    format!(
+                        "Declared via {} directive at line {}",
+                        directive_type, display_line
+                    )
+                }
             };
 
             let mut value = format!("```r\n{} ({})\n```\n\n{}", name, kind_str, attribution);
@@ -20085,68 +20103,24 @@ pub fn goto_definition_with_cancel(
         }
 
         // Handle declared symbols (from `# raven: var` / `# raven: func`
-        // directives, or from an `exists("name")` call).
-        // For a directive-declared symbol, navigate to the directive line
-        // (column 0); if declared multiple times, use the first declaration.
-        // For an `exists()`-derived symbol, navigate to the `exists()` call line.
+        // directives, or from an `exists("name")` call). For a directive-derived
+        // symbol, navigate to the first declaration line (column 0); for an
+        // `exists()`-derived symbol, navigate to the `exists()` call line. The
+        // directive-vs-exists classification is shared with hover via
+        // `resolve_directive_origin`, so the two surfaces never disagree.
         // Validates: Requirements 8.1, 8.2
         if symbol.is_declared {
-            // Get metadata for the symbol's source file to find the first declaration
-            if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
-                // Find all directive declarations of this symbol name (both
-                // variables and functions). This is the DIRECTIVE seam (Seam B,
-                // #459): declarations store the call-site form (bare for a
-                // syntactic name, backtick-wrapped for a non-syntactic one), so
-                // match on `canonical_use_name` of BOTH operands — a
-                // redundantly-quoted `` `my_func` `` use canonicalizes to the
-                // bare declared key, while a required `` `my fn` `` keeps its
-                // backticks to match the wrapped declared key.
-                let canonical_name = crate::r_names::canonical_use_name(name);
-                let mut first_line: Option<u32> = None;
-                // Whether the RESOLVED symbol is itself a directive (its line is
-                // a directive line). An `exists()`-derived symbol's line is the
-                // call site, never a directive line — so when a same-name
-                // directive exists *elsewhere* (e.g. after the use, not visible
-                // here), we must NOT redirect to it; navigate to the resolved
-                // `exists()` declaration instead.
-                let mut symbol_line_is_directive = false;
+            let metadata = content_provider.get_metadata(&symbol.source_uri);
+            let definition_line =
+                resolve_directive_origin(metadata.as_deref(), name, symbol.defined_line)
+                    .map(|(line, _)| line)
+                    .unwrap_or(symbol.defined_line);
 
-                for decl in metadata
-                    .declared_variables
-                    .iter()
-                    .chain(metadata.declared_functions.iter())
-                {
-                    if crate::r_names::canonical_use_name(&decl.name) == canonical_name {
-                        first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
-                        if decl.line == symbol.defined_line {
-                            symbol_line_is_directive = true;
-                        }
-                    }
-                }
-
-                // Directive-derived → first directive line; otherwise (the
-                // resolved symbol came from `exists()`) → its own call line.
-                let definition_line = if symbol_line_is_directive {
-                    first_line.unwrap_or(symbol.defined_line)
-                } else {
-                    symbol.defined_line
-                };
-
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: symbol.source_uri.clone(),
-                    range: Range {
-                        start: Position::new(definition_line, 0),
-                        end: Position::new(definition_line, 0),
-                    },
-                }));
-            }
-
-            // Fallback if metadata not available: use symbol's stored location
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: symbol.source_uri.clone(),
                 range: Range {
-                    start: Position::new(symbol.defined_line, 0),
-                    end: Position::new(symbol.defined_line, 0),
+                    start: Position::new(definition_line, 0),
+                    end: Position::new(definition_line, 0),
                 },
             }));
         }
