@@ -206,22 +206,21 @@ expose).
 
 The header directive `# raven: standalone` (see
 [directives](directives.md#standalone-module-directive)) opts a file out of that
-backward contribution. A standalone file is resolved **in isolation**: no
-backward parent-prefix walk and no caller-inherited packages / working directory
-/ data-alias provider. Its scope becomes a pure function of `(file, its own
-forward source() closure)`, independent of who sources it.
+backward contribution. **When computing the standalone file's own diagnostics**,
+Raven resolves it **in isolation**: no backward parent-prefix walk, so it does
+not inherit symbols, loaded packages, working directory, or data-alias provider
+from the files that source it. Its own scope is determined by the file itself
+plus its own forward `source()` closure — not by who sources it.
 
-The isolation is **asymmetric**. Nothing flows *in* from a caller, but the file
-still contributes *out*: its own definitions and its own `library()`-loaded
-packages still propagate to every caller through the normal additive forward
-merge. So a standalone setup file that loads shared packages still makes them
-available to its callers.
+The isolation is **asymmetric**. Nothing flows *in* from a caller into the
+file's own scope, but the file still contributes *out*: its own definitions and
+its own `library()`-loaded packages still propagate to every caller through the
+normal additive forward merge. So a standalone setup file that loads shared
+packages still makes them available to its callers.
 
-Because a standalone file's scope no longer depends on its callers, it can be
-resolved once and reused across all of them (and across keystrokes) — the basis
-for the caching of declared library hubs. The directive is the sound, opt-in
-form of that reuse: you assert the independence, so Raven never has to
-over-approximate it. If the assertion is wrong (the file truly needs a
+The directive is the sound, opt-in way to assert this independence, so Raven
+never has to over-approximate it. If the assertion is wrong (the file truly
+needs a
 caller-provided binding), the only consequence is a false-positive "undefined"
 *inside the standalone file* — a safe direction, never a missed bug in a caller.
 `# raven: nse` / `# raven: func` propagation over `source()` edges is unaffected

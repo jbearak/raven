@@ -309,128 +309,9 @@ pub async fn run(args: CheckArgs) -> i32 {
     // editor's post-scan prefetch (see [`prefetch_reported_packages`]).
     prefetch_reported_packages(&state, &targets).await;
 
-    let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
-    let mut reported_loaded_packages = std::collections::BTreeSet::new();
-
-    // Issue #479 WI3 — parallelize the CPU-bound diagnostic pass across files.
-    // The graph/index caches are `RwLock`/atomic and immutable after the scan,
-    // so per-file scope resolution is safe to run concurrently. The one hazard
-    // (Codex review) is that open documents outrank index content in the content
-    // provider, so sharing `state.documents` across workers would make each
-    // worker treat the others' targets as "open" and pull the wrong artifacts.
-    // We avoid that entirely: `state.documents` stays empty during the parallel
-    // region, and each worker passes a one-entry overlay holding only its target
-    // (see `compute_file_diagnostics_sync` /
-    // `DiagnosticsSnapshot::build_with_open_documents`). This reproduces the
-    // sequential "exactly one open target" semantics per task, so output is
-    // byte-identical. The async on-disk missing-file checks (cheap I/O) and the
-    // rare disk-fallback targets (not in the workspace index) are handled
-    // afterward on the async runtime.
-    use rayon::prelude::*;
-
-    struct SyncResult {
-        path: PathBuf,
-        uri: Url,
-        sync_diags: Vec<Diagnostic>,
-        directive_meta: crate::cross_file::CrossFileMetadata,
-        missing_file_severity: Option<DiagnosticSeverity>,
-        loaded_packages: Vec<String>,
-    }
-
-    // Phase 1 (parallel, CPU-bound): indexed targets only. A target that is not
-    // in the workspace index (disk-fallback) or whose path can't be a URL is
-    // skipped here and handled sequentially below.
-    let sync_results: Vec<SyncResult> = targets
-        .par_iter()
-        .filter_map(|path| {
-            let uri = Url::from_file_path(path).ok()?;
-            // Reuse the already-parsed `Document` from the scan (tree included),
-            // exactly as the sequential path did — no disk re-read / re-parse.
-            let doc = state.workspace_index.get(&uri).cloned()?;
-            let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
-            let mut open_documents = std::collections::HashMap::new();
-            open_documents.insert(uri.clone(), doc);
-            let (sync_diags, directive_meta, missing_file_severity) =
-                compute_file_diagnostics_sync(&state, &uri, &open_documents)?;
-            Some(SyncResult {
-                path: path.clone(),
-                uri,
-                sync_diags,
-                directive_meta,
-                missing_file_severity,
-                loaded_packages,
-            })
-        })
-        .collect();
-
-    // Phase 2 (async): finalize the parallel results with on-disk missing-file
-    // checks and collect their attached packages. Order is irrelevant — the
-    // whole `all_diags` set is sorted below.
-    for r in sync_results {
-        reported_loaded_packages.extend(r.loaded_packages);
-        let diags = finalize_file_diagnostics(
-            &state,
-            &r.uri,
-            r.sync_diags,
-            &r.directive_meta,
-            r.missing_file_severity,
-        )
-        .await;
-        for d in diags {
-            all_diags.push((r.path.clone(), d));
-        }
-    }
-
-    // Phase 3 (sequential): targets not handled in phase 1 — a bad URL, or a
-    // disk-fallback target the scan didn't index (e.g. a symlink-alias path, or
-    // an `.Rmd`/`.qmd` chunk file outside the R-only scan). Rare; the existing
-    // open → compute → close path (which uses `state.documents`) is preserved
-    // verbatim, so behavior for these is unchanged.
-    for path in &targets {
-        let Ok(uri) = Url::from_file_path(path) else {
-            eprintln!(
-                "raven check: cannot convert path to URL: {}",
-                path.display()
-            );
-            operator_error = true;
-            continue;
-        };
-        if state.workspace_index.contains_key(&uri) {
-            continue; // already handled in the parallel phase
-        }
-        let text = match crate::state::read_source(path) {
-            Ok(t) => t,
-            Err(crate::state::SourceReadError::Io(e)) => {
-                eprintln!("raven check: cannot read {}: {e}", path.display());
-                operator_error = true;
-                continue;
-            }
-            // A mis-encoded file is a property of the code, like a syntax
-            // error — not an operator error. Report it as a finding (see
-            // `encoding_diagnostic`) and keep going, so the exit code
-            // reflects findings rather than a half-read abort.
-            Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
-                all_diags.push((path.clone(), encoding_diagnostic(offset, byte)));
-                continue;
-            }
-        };
-        open_disk_fallback_target(&mut state, &uri, path, &text);
-        if let Some(doc) = state.documents.get(&uri) {
-            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
-        }
-        let diags = compute_file_diagnostics(&state, &uri).await;
-        state.close_document(&uri);
-        for d in diags {
-            all_diags.push((path.clone(), d));
-        }
-    }
-
-    // Deterministic output regardless of the scan's parallel HashMap order.
-    all_diags.sort_by(|(pa, da), (pb, db)| {
-        pa.cmp(pb)
-            .then(da.range.start.line.cmp(&db.range.start.line))
-            .then(da.range.start.character.cmp(&db.range.start.character))
-    });
+    let (all_diags, reported_loaded_packages, collect_operator_error) =
+        collect_target_diagnostics(&mut state, &targets).await;
+    operator_error |= collect_operator_error;
 
     let any_above_threshold = all_diags
         .iter()
@@ -1017,6 +898,147 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
         missing_file_severity,
     )
     .await
+}
+
+/// Compute the sorted `(path, Diagnostic)` set for every report target (issue
+/// #479 WI3). Returns the diagnostics, the union of attached loaded packages
+/// (for the missing-export-metadata warning), and whether any per-target
+/// operator error occurred (bad URL / unreadable disk-fallback target).
+///
+/// The CPU-bound diagnostic pass is parallelized across files: the graph/index
+/// caches are `RwLock`/atomic and immutable after the scan, so per-file scope
+/// resolution is safe to run concurrently. The one hazard (Codex review) is that
+/// open documents outrank index content in the content provider, so sharing
+/// `state.documents` across workers would make each worker treat the others'
+/// targets as "open" and pull the wrong artifacts. We avoid that entirely:
+/// `state.documents` stays empty during the parallel region, and each worker
+/// passes a one-entry overlay holding only its target (see
+/// `compute_file_diagnostics_sync` /
+/// `DiagnosticsSnapshot::build_with_open_documents`). This reproduces the
+/// sequential "exactly one open target" semantics per task, so output is
+/// byte-identical to a sequential run (asserted by
+/// `parallel_collection_matches_sequential`). The async on-disk missing-file
+/// checks (cheap I/O) and the rare disk-fallback targets (not in the workspace
+/// index) are handled afterward on the async runtime.
+async fn collect_target_diagnostics(
+    state: &mut crate::state::WorldState,
+    targets: &[PathBuf],
+) -> (
+    Vec<(PathBuf, Diagnostic)>,
+    std::collections::BTreeSet<String>,
+    bool,
+) {
+    use rayon::prelude::*;
+
+    struct SyncResult {
+        path: PathBuf,
+        uri: Url,
+        sync_diags: Vec<Diagnostic>,
+        directive_meta: crate::cross_file::CrossFileMetadata,
+        missing_file_severity: Option<DiagnosticSeverity>,
+        loaded_packages: Vec<String>,
+    }
+
+    let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
+    let mut reported_loaded_packages = std::collections::BTreeSet::new();
+    let mut operator_error = false;
+
+    // Phase 1 (parallel, CPU-bound): indexed targets only. A target that is not
+    // in the workspace index (disk-fallback) or whose path can't be a URL is
+    // skipped here and handled sequentially below.
+    let sync_results: Vec<SyncResult> = targets
+        .par_iter()
+        .filter_map(|path| {
+            let uri = Url::from_file_path(path).ok()?;
+            // Reuse the already-parsed `Document` from the scan (tree included),
+            // exactly as the sequential path did — no disk re-read / re-parse.
+            let doc = state.workspace_index.get(&uri).cloned()?;
+            let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
+            let mut open_documents = std::collections::HashMap::new();
+            open_documents.insert(uri.clone(), doc);
+            let (sync_diags, directive_meta, missing_file_severity) =
+                compute_file_diagnostics_sync(state, &uri, &open_documents)?;
+            Some(SyncResult {
+                path: path.clone(),
+                uri,
+                sync_diags,
+                directive_meta,
+                missing_file_severity,
+                loaded_packages,
+            })
+        })
+        .collect();
+
+    // Phase 2 (async): finalize the parallel results with on-disk missing-file
+    // checks and collect their attached packages. Order is irrelevant — the
+    // whole `all_diags` set is sorted below.
+    for r in sync_results {
+        reported_loaded_packages.extend(r.loaded_packages);
+        let diags = finalize_file_diagnostics(
+            state,
+            &r.uri,
+            r.sync_diags,
+            &r.directive_meta,
+            r.missing_file_severity,
+        )
+        .await;
+        for d in diags {
+            all_diags.push((r.path.clone(), d));
+        }
+    }
+
+    // Phase 3 (sequential): targets not handled in phase 1 — a bad URL, or a
+    // disk-fallback target the scan didn't index (e.g. a symlink-alias path, or
+    // an `.Rmd`/`.qmd` chunk file outside the R-only scan). Rare; the existing
+    // open → compute → close path (which uses `state.documents`) is preserved
+    // verbatim, so behavior for these is unchanged.
+    for path in targets {
+        let Ok(uri) = Url::from_file_path(path) else {
+            eprintln!(
+                "raven check: cannot convert path to URL: {}",
+                path.display()
+            );
+            operator_error = true;
+            continue;
+        };
+        if state.workspace_index.contains_key(&uri) {
+            continue; // already handled in the parallel phase
+        }
+        let text = match crate::state::read_source(path) {
+            Ok(t) => t,
+            Err(crate::state::SourceReadError::Io(e)) => {
+                eprintln!("raven check: cannot read {}: {e}", path.display());
+                operator_error = true;
+                continue;
+            }
+            // A mis-encoded file is a property of the code, like a syntax
+            // error — not an operator error. Report it as a finding (see
+            // `encoding_diagnostic`) and keep going, so the exit code
+            // reflects findings rather than a half-read abort.
+            Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
+                all_diags.push((path.clone(), encoding_diagnostic(offset, byte)));
+                continue;
+            }
+        };
+        open_disk_fallback_target(state, &uri, path, &text);
+        if let Some(doc) = state.documents.get(&uri) {
+            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
+        }
+        let diags = compute_file_diagnostics(state, &uri).await;
+        state.close_document(&uri);
+        for d in diags {
+            all_diags.push((path.clone(), d));
+        }
+    }
+
+    // Deterministic output regardless of the scan's parallel HashMap order.
+    all_diags.sort_by(|(pa, da), (pb, db)| {
+        pa.cmp(pb)
+            .then(da.range.start.line.cmp(&db.range.start.line))
+            .then(da.range.start.character.cmp(&db.range.start.character))
+    });
+
+    (all_diags, reported_loaded_packages, operator_error)
 }
 
 /// Resolve which files to report diagnostics for. Empty `paths` means every R
@@ -1752,6 +1774,80 @@ mod tests {
             }
             all
         })
+    }
+
+    /// Like `collect_diagnostics_blocking` but drives the REAL parallel
+    /// collection path (`collect_target_diagnostics`, the rayon phase `run`
+    /// uses), so a test can assert the parallel output equals the sequential
+    /// reference. Same setup as the sequential helper.
+    fn collect_diagnostics_parallel_blocking(args: &CheckArgs) -> Vec<(PathBuf, Diagnostic)> {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
+            let workspace_url = Url::from_file_path(&root).unwrap();
+            let mut state =
+                build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
+            if !args.report_uninstalled {
+                state.cross_file_config.packages_missing_package_severity = None;
+            }
+            maybe_init_r(&mut state, &root).await;
+            state.resolve_system_file_in_workspace();
+            maybe_load_sysdata_fallback(&mut state).await;
+            let mut operator_error = false;
+            let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+            prefetch_reported_packages(&state, &targets).await;
+            let (all, _packages, _oe) = collect_target_diagnostics(&mut state, &targets).await;
+            all
+        })
+    }
+
+    /// Issue #479 WI3: the parallel per-file collection must be byte-identical to
+    /// a sequential run. The fixture is a hub sourced by several spokes with
+    /// cross-file `source()` references, so neighbor artifacts are resolved —
+    /// exactly the data a cross-worker open-document leak would corrupt. The
+    /// sequential reference opens one doc at a time into `state.documents`; the
+    /// parallel path uses per-worker one-entry overlays.
+    #[test]
+    fn parallel_collection_matches_sequential() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("hub.r"), "shared <- function() 1\n").unwrap();
+        for p in ["a.r", "b.r", "c.r", "d.r"] {
+            fs::write(
+                tmp.path().join(p),
+                "source(\"hub.r\")\nshared()\nbad_symbol\n",
+            )
+            .unwrap();
+        }
+        let args = base_args(tmp.path());
+
+        let normalize = |mut v: Vec<(PathBuf, Diagnostic)>| {
+            v.sort_by(|(pa, da), (pb, db)| {
+                pa.cmp(pb)
+                    .then(da.range.start.line.cmp(&db.range.start.line))
+                    .then(da.range.start.character.cmp(&db.range.start.character))
+                    .then(da.message.cmp(&db.message))
+            });
+            v.into_iter()
+                .map(|(p, d)| (p, d.range.start.line, d.range.start.character, d.message))
+                .collect::<Vec<_>>()
+        };
+
+        let seq = normalize(collect_diagnostics_blocking(&args));
+        let par = normalize(collect_diagnostics_parallel_blocking(&args));
+        assert_eq!(
+            par, seq,
+            "parallel collection must be byte-identical to the sequential reference"
+        );
+        // Sanity: the fixture actually exercises cross-file resolution — each
+        // spoke flags `bad_symbol` (undefined), while `shared()` resolves through
+        // the sourced hub and is NOT flagged.
+        assert!(
+            seq.iter().any(|(_, _, _, m)| m.contains("bad_symbol")),
+            "fixture should produce undefined-variable diagnostics: {seq:?}"
+        );
+        assert!(
+            !seq.iter().any(|(_, _, _, m)| m.contains("shared")),
+            "shared() should resolve cross-file and not be flagged: {seq:?}"
+        );
     }
 
     #[test]

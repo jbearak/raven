@@ -2083,6 +2083,49 @@ mod tests {
         assert!(graph.prefix_memo_share_safe(&url("A.R"), 64, 200_000));
     }
 
+    /// Issue #479: pin the exact admit/reject boundary so an off-by-one in
+    /// `depth_cap = max_depth - 1` or the `depth >= depth_cap` comparison is
+    /// caught (the deep-chain test uses a generous margin and would not). With
+    /// `max_depth = 4`, `depth_cap = 3`: a neighborhood whose deepest node is at
+    /// BFS depth 2 (== depth_cap - 1) is the LAST admitted; depth 3 (== depth_cap)
+    /// is the FIRST rejected.
+    #[test]
+    fn prefix_memo_share_safe_pins_depth_boundary() {
+        let chain = |links: &[(&str, &str)]| {
+            let mut graph = DependencyGraph::new();
+            for (from, to) in links {
+                graph.update_file(
+                    &url(from),
+                    &make_meta_with_source(to, 1),
+                    Some(&workspace_root()),
+                    |_| None,
+                );
+            }
+            graph
+        };
+        // A->B->C : deepest BFS node C at depth 2 == depth_cap-1 → admitted.
+        let admitted = chain(&[("A.R", "B.R"), ("B.R", "C.R")]);
+        assert!(admitted.prefix_memo_share_safe(&url("A.R"), 4, 200_000));
+        // A->B->C->D : D at depth 3 == depth_cap → rejected.
+        let rejected = chain(&[("A.R", "B.R"), ("B.R", "C.R"), ("C.R", "D.R")]);
+        assert!(!rejected.prefix_memo_share_safe(&url("A.R"), 4, 200_000));
+    }
+
+    /// Issue #479: `max_depth < 2` has no headroom below the truncation limit,
+    /// so the gate must refuse outright (the early return).
+    #[test]
+    fn prefix_memo_share_safe_rejects_tiny_max_depth() {
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &make_meta_with_source("B.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(!graph.prefix_memo_share_safe(&url("A.R"), 0, 200_000));
+        assert!(!graph.prefix_memo_share_safe(&url("A.R"), 1, 200_000));
+    }
+
     #[test]
     fn test_add_and_get_dependencies() {
         let mut graph = DependencyGraph::new();

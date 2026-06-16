@@ -132,11 +132,13 @@ Place `# raven: standalone` in the **header** of a sourced *library* file to
 declare it self-contained. It takes no arguments and is **header-only** (it must
 appear before any code; a `standalone` token after code is ignored).
 
-A standalone file is resolved **in isolation** from the files that `source()` it:
+When computing a standalone file's **own** diagnostics, it is resolved **in
+isolation** from the files that `source()` it:
 
 - It does **not** inherit symbols, loaded packages, or working-directory context
-  from any caller — no backward parent-prefix walk. Its cross-file scope is a
-  pure function of the file itself and its own forward `source()` closure.
+  from any caller — no backward parent-prefix walk. Its own cross-file scope is
+  determined by the file itself and its own forward `source()` closure, not by
+  who sources it.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.

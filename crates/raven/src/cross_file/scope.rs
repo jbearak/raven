@@ -8265,6 +8265,37 @@ mod tests {
         );
     }
 
+    /// Issue #479: a `# raven: standalone` directive changes the inherited-package
+    /// set the file propagates to its other callers, so adding it must change
+    /// `interface_hash` (else dependents that source the file would not be
+    /// revalidated when the directive is toggled). Guards the `standalone.hash(...)`
+    /// line in `compute_interface_hash` against silent removal.
+    #[test]
+    fn interface_hash_changes_when_standalone_directive_added() {
+        let a = "f <- function() 1\n";
+        let b = "# raven: standalone\nf <- function() 1\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "adding a # raven: standalone directive must change interface_hash"
+        );
+    }
+
     /// Issue #460 Gap A: two declarations for the same callee; swapping their
     /// lines changes which is "last" under file-level cross-file collapse, so
     /// dependents must be revalidated — hence `line` is part of the NSE hash.
