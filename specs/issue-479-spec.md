@@ -302,6 +302,27 @@ scope work.
 > implementation; fall back to hashing source text if no stable per-file content
 > hash is available.
 
+**Why source-text and NOT `interface_hash` (decided).** `interface_hash` is
+unsound as a scope-value fingerprint today (it omits `ScopedSymbol.signature` —
+filed as **#482**), and even once fixed, keying the cache on it would
+**permanently couple** WI2b's soundness to "`interface_hash` captures everything
+observable in a resolved scope." A future observable field added to
+`ScopedSymbol` without extending its `Hash` impl would then silently serve stale
+cached scopes — a soundness landmine with no failing test. Source-text hashing
+is robust by construction (any byte change ⇒ miss). Its only cost is
+over-invalidating on comment/whitespace edits *inside* the closure (a rare case;
+the dominant cross-keystroke win is editing a *caller*, which is not in the
+closure and so is unaffected either way). **#482 is fixed separately** (it is a
+real revalidation gap) and is NOT a prerequisite for, nor relied on by, WI2b.
+
+**Additional key component — package/config generation (required).** A standalone
+callee's isolated scope also depends on `base_exports` / package-library state
+and config (`max_chain_depth`), which neither source-text nor `interface_hash`
+captures. The cache key MUST therefore also include a coarse generation counter
+bumped whenever the package library or relevant config changes (R re-init,
+`packages_*` settings, `maxChainDepth`). Key = `(C_uri, edge_revision,
+closure_source_fingerprint, package_config_generation)`.
+
 **Where the cache lives & lock discipline.** The per-snapshot `DependencyGraph`
 is cloned and resets its caches (`dependency.rs:585-610`), so a cross-snapshot
 cache must NOT live there. Store it as an `Arc<StandaloneScopeCache>` owned by
