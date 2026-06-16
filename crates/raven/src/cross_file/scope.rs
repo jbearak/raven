@@ -8272,7 +8272,11 @@ mod tests {
     /// line in `compute_interface_hash` against silent removal.
     #[test]
     fn interface_hash_changes_when_standalone_directive_added() {
-        let a = "f <- function() 1\n";
+        // Hold `f`'s line constant across both inputs (a plain comment vs the
+        // directive, both on line 0) so the ONLY difference is the `standalone`
+        // flag — otherwise `defined_line` (part of the symbol hash) would shift
+        // and the assertion would pass even if `standalone.hash(...)` were removed.
+        let a = "# not a directive\nf <- function() 1\n";
         let b = "# raven: standalone\nf <- function() 1\n";
         let ta = parse_r(a);
         let tb = parse_r(b);
