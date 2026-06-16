@@ -217,7 +217,7 @@ The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX,
 `ScopeArtifacts` includes an `interface_hash` used to avoid cascading revalidation when edits don’t change a file’s “exported interface”.
 
 The hash is deterministic and includes:
-- Exported symbols
+- Exported symbols — each hashed through `impl Hash for ScopedSymbol`, which covers that type's full identity field set (`name`, `kind`, `source_uri`, `defined_line`, `defined_column`, `signature`, `is_declared`) and deliberately excludes only `defined_end_column` (positional highlight metadata). `Hash` must mirror `PartialEq` field-for-field: a field present in one but not the other makes the hash blind to that kind of edit. The `signature` inclusion (issue #482) is what makes a formals-only edit (`f <- function(a)` → `f <- function(a, b)`) bust the hash and revalidate dependents; `scoped_symbol_hash_eq_field_parity` pins the two impls' field sets together.
 - Loaded packages (from `library()` / `require()` / `loadNamespace()`)
 - Declared symbols (from `# raven: var` / `# raven: func` directives)
 
