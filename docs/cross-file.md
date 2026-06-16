@@ -208,9 +208,9 @@ The header directive `# raven: standalone` (see
 [directives](directives.md#standalone-module-directive)) opts a file out of that
 backward contribution. **When computing the standalone file's own diagnostics**,
 Raven resolves it **in isolation**: no backward parent-prefix walk, so it does
-not inherit symbols, loaded packages, working directory, or data-alias provider
-from the files that source it. Its own scope is determined by the file itself
-plus its own forward `source()` closure — not by who sources it.
+not inherit symbols or loaded packages from the files that source it. Its own
+scope is determined by the file itself plus its own forward `source()` closure —
+not by who sources it.
 
 The isolation is **asymmetric**. Nothing flows *in* from a caller into the
 file's own scope, but the file still contributes *out*: its own definitions and

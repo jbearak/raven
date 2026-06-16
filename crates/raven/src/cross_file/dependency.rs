@@ -1626,9 +1626,17 @@ impl DependencyGraph {
     ///    EOF) ever share. This gate does NOT cover that mode.
     /// 2. **Truncation (visited context).** A memo hit short-circuits a walk that
     ///    would otherwise mark `visited`, perturbing a sibling path's truncation
-    ///    (`depth_exceeded`/`chain`). THIS gate covers it: disable sharing unless
-    ///    the whole bidirectional neighborhood sits at BFS depth `< max_depth -
-    ///    1`, so no resolution can reach `max_depth`.
+    ///    (`depth_exceeded`/`chain`). This gate bounds the part of that mode that
+    ///    can corrupt the **symbol set**: disable sharing unless the whole
+    ///    bidirectional neighborhood sits at BFS depth `< max_depth - 1`. The
+    ///    bound is SOUND for symbols regardless of the depth check's precision,
+    ///    because a truncating resolution carries a non-empty `depth_exceeded`
+    ///    and is therefore never written to the memo (the
+    ///    `computed.depth_exceeded.is_empty()` guard in
+    ///    `resolve_forward_child_memoized`), so the cache can never feed a
+    ///    truncated (wrong) symbol set to another prefix root. The
+    ///    `depth_exceeded`/`chain` channel itself has a bounded residual — see
+    ///    the NOTE below and issue #484.
     ///
     /// The BFS runs over the bidirectional source neighborhood (global
     /// `visited`, O(V+E)) bounded by `budget`; on exhaustion the method returns
@@ -1636,16 +1644,26 @@ impl DependencyGraph {
     /// Realistic global-scope hubs (default `maxChainDepth` 64, shallow chains)
     /// pass and get the full O(N²)→O(N) collapse.
     ///
-    /// NOTE on the depth check: BFS depth is the *shortest* bidirectional
-    /// distance, while the recursive resolver can in principle reach a node at a
-    /// greater `current_depth` via a longer path (its cloned-`visited`
-    /// isolation). The guard requires the neighborhood's BFS depth to stay
-    /// strictly below `max_depth - 1`, leaving headroom; combined with the
-    /// reality that realistic neighborhoods are far shallower than
-    /// `maxChainDepth`, this admits the global-scope hub case while gating off
-    /// any genuinely deep neighborhood (which could truncate). The equivalence
-    /// suite (`memo_equiv_*`, including the small-`max_depth` truncation case)
-    /// pins the behavior.
+    /// NOTE on the depth check (residual risk — issue #484): BFS depth is the
+    /// *shortest* bidirectional distance, while the resolver can reach a node at
+    /// a greater `current_depth` via a *longer* path (forward children resolve
+    /// with cloned `visited`, and the backward-then-forward walk can revisit).
+    /// So this gate can ADMIT a neighborhood that the resolver then truncates
+    /// via a longer path. The consequence is confined to the heuristic
+    /// `depth_exceeded`/`chain` channel: under such truncation, the shared
+    /// (visited-independent) memo can cause the advisory "Maximum chain depth
+    /// exceeded" diagnostic to be emitted on a file where the un-memoized
+    /// resolver would not, or vice versa. It can NEVER corrupt the symbol set
+    /// (see point 2 — truncated scopes are never cached). It only triggers when
+    /// a `source()` chain actually reaches `maxChainDepth`, which does not occur
+    /// at the default `maxChainDepth = 64` on realistic workspaces (worldwide
+    /// `raven check .` is byte-identical and deterministic). A fully sound depth
+    /// check is a longest-simple-path quantity (NP-hard in general, and a naive
+    /// search would disable sharing on the very star-hub topology this memo
+    /// speeds up), so the residual is accepted and tracked in #484 (proposed
+    /// fix: verify the advisory at emit time, off the hot path). The
+    /// `memo_equiv_*` suite pins the symbol-equivalence guarantee, including the
+    /// gate-admitted-with-truncation case (`memo_equiv_gate_admitted_with_truncation`).
     pub fn prefix_memo_share_safe(&self, from: &Url, max_depth: usize, budget: usize) -> bool {
         // Need at least one hop of headroom below the truncation limit.
         if max_depth < 2 {

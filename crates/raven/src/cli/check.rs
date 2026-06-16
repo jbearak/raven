@@ -920,6 +920,17 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
 /// `parallel_collection_matches_sequential`). The async on-disk missing-file
 /// checks (cheap I/O) and the rare disk-fallback targets (not in the workspace
 /// index) are handled afterward on the async runtime.
+///
+/// Blocking-in-async note: the phase-1 `par_iter().collect()` is a synchronous,
+/// CPU-bound rayon join that runs on rayon's own thread pool while blocking the
+/// calling tokio worker until it returns. We deliberately do NOT wrap it in
+/// `block_in_place`/`spawn_blocking`. `raven check`'s tokio runtime runs exactly
+/// one root future (`cli::check::run`, awaited inline from `#[tokio::main]`) with
+/// no sibling tasks competing for a worker in this region, so there is nothing
+/// for `block_in_place` to migrate — it would be a runtime no-op here while
+/// adding a panic-on-`current_thread`-runtime hazard. The process exits right
+/// after the report loop. If `raven check` ever gains concurrent tokio tasks
+/// around this call, revisit and wrap the rayon phase then.
 async fn collect_target_diagnostics(
     state: &mut crate::state::WorldState,
     targets: &[PathBuf],
@@ -1733,27 +1744,39 @@ mod tests {
         );
     }
 
+    /// Shared setup for the two diagnostics-collection test drivers below.
+    /// Mirrors `run`'s indexing + R-init + target-collection prelude and returns
+    /// the indexed `WorldState` and report targets. Factored out so the
+    /// sequential and parallel drivers resolve from byte-identical state — the
+    /// precondition that makes `parallel_collection_matches_sequential` a
+    /// like-for-like comparison (drift between two copied preludes would
+    /// silently weaken the equivalence assertion). R-independent: callers that
+    /// want package awareness configure `additionalLibraryPaths`.
+    async fn setup_check_state_and_targets(
+        args: &CheckArgs,
+    ) -> (crate::state::WorldState, Vec<PathBuf>) {
+        let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
+        let workspace_url = Url::from_file_path(&root).unwrap();
+        let mut state = build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
+        if !args.report_uninstalled {
+            state.cross_file_config.packages_missing_package_severity = None;
+        }
+        maybe_init_r(&mut state, &root).await;
+        state.resolve_system_file_in_workspace();
+        maybe_load_sysdata_fallback(&mut state).await;
+        let mut operator_error = false;
+        let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+        prefetch_reported_packages(&state, &targets).await;
+        (state, targets)
+    }
+
     /// Run `raven check` and capture the diagnostics it would compute, without
     /// the process-global stdout capture the renderer uses. Mirrors `run`'s
     /// indexing + report loop so a test can assert on the exact `(path,
     /// Diagnostic)` pairs (line/character) rather than just the exit code.
-    /// R-independent: callers that want package awareness configure
-    /// `additionalLibraryPaths`.
     fn collect_diagnostics_blocking(args: &CheckArgs) -> Vec<(PathBuf, Diagnostic)> {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
-            let workspace_url = Url::from_file_path(&root).unwrap();
-            let mut state =
-                build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
-            if !args.report_uninstalled {
-                state.cross_file_config.packages_missing_package_severity = None;
-            }
-            maybe_init_r(&mut state, &root).await;
-            state.resolve_system_file_in_workspace();
-            maybe_load_sysdata_fallback(&mut state).await;
-            let mut operator_error = false;
-            let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
-            prefetch_reported_packages(&state, &targets).await;
+            let (mut state, targets) = setup_check_state_and_targets(args).await;
             let mut all = Vec::new();
             for path in &targets {
                 let uri = Url::from_file_path(path).unwrap();
@@ -1779,22 +1802,11 @@ mod tests {
     /// Like `collect_diagnostics_blocking` but drives the REAL parallel
     /// collection path (`collect_target_diagnostics`, the rayon phase `run`
     /// uses), so a test can assert the parallel output equals the sequential
-    /// reference. Same setup as the sequential helper.
+    /// reference. Shares `setup_check_state_and_targets` with the sequential
+    /// driver so the two start from identical state.
     fn collect_diagnostics_parallel_blocking(args: &CheckArgs) -> Vec<(PathBuf, Diagnostic)> {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
-            let workspace_url = Url::from_file_path(&root).unwrap();
-            let mut state =
-                build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
-            if !args.report_uninstalled {
-                state.cross_file_config.packages_missing_package_severity = None;
-            }
-            maybe_init_r(&mut state, &root).await;
-            state.resolve_system_file_in_workspace();
-            maybe_load_sysdata_fallback(&mut state).await;
-            let mut operator_error = false;
-            let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
-            prefetch_reported_packages(&state, &targets).await;
+            let (mut state, targets) = setup_check_state_and_targets(args).await;
             let (all, _packages, _oe) = collect_target_diagnostics(&mut state, &targets).await;
             all
         })

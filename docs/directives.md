@@ -135,10 +135,9 @@ appear before any code; a `standalone` token after code is ignored).
 When computing a standalone file's **own** diagnostics, it is resolved **in
 isolation** from the files that `source()` it:
 
-- It does **not** inherit symbols, loaded packages, or working-directory context
-  from any caller — no backward parent-prefix walk. Its own cross-file scope is
-  determined by the file itself and its own forward `source()` closure, not by
-  who sources it.
+- It does **not** inherit symbols or loaded packages from any caller — no
+  backward parent-prefix walk. Its own cross-file scope is determined by the file
+  itself and its own forward `source()` closure, not by who sources it.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.

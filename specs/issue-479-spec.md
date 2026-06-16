@@ -51,16 +51,38 @@ tests green.**
 >    function-scoped declaration-inheritance divergence.
 > 2. **Truncation (visited context)** → **gate**
 >    `DependencyGraph::prefix_memo_share_safe`: a bidirectional BFS shares only
->    when the neighborhood is provably too shallow to reach `maxChainDepth`.
->    Fixes the small-`maxChainDepth` `depth_exceeded`/`chain` divergence.
+>    when the neighborhood is BFS-shallow relative to `maxChainDepth`. This
+>    SOUNDLY bounds the part of the mode that could corrupt the **symbol set**
+>    (truncated scopes are never cached, so a longer-path truncation the gate
+>    failed to exclude cannot feed a wrong symbol set to another prefix root). It
+>    leaves a **bounded residual on the heuristic `depth_exceeded`/`chain`
+>    advisory** — see "Residual risk" below and issue #484.
 >
 > When either condition is unmet the stream falls back to fresh-per-prefix
 > (pre-#479 behavior). Per the user's guidance, the deliberately-unoptimized case
 > is `source()`-inside-a-function (`local=TRUE`); the win targets global-scope
-> hubs. Residual risk (accepted): the analysis that these are the *only* two
+> hubs.
+>
+> **Residual risk (accepted; tracked in #484).** Two parts:
+> (a) The analysis that `query_inside_function` and truncation are the *only* two
 > unkeyed varying inputs within a `false`-context stream is backed by the full
-> test suite (5200 lib tests, incl. the #472 `memo_equiv_*` suite and the
+> test suite (5200+ lib tests, incl. the #472 `memo_equiv_*` suite and the
 > cross-file property tests) rather than a formal proof.
+> (b) The gate's depth check is BFS-*shortest*-path, while the resolver can reach
+> a node at a greater `current_depth` via a *longer* path and truncate there. So
+> sharing can be admitted for a neighborhood the resolver then truncates. This
+> can NEVER corrupt the symbol set (point above), but under such truncation the
+> shared, visited-independent memo can cause the advisory "Maximum chain depth
+> exceeded" diagnostic to be emitted on a file where the un-memoized resolver
+> would not (or vice versa). It only triggers when a `source()` chain actually
+> reaches `maxChainDepth`, so it does not occur at the default `maxChainDepth =
+> 64` on realistic workspaces (worldwide `raven check .` is byte-identical and
+> deterministic). A fully sound depth check is a longest-simple-path quantity
+> (NP-hard in general; a naive search would disable sharing on the star-hub
+> topology WI1 targets), so the residual is accepted and tracked in #484
+> (proposed fix: verify the advisory at emit time, off the hot path). Pinned by
+> `memo_equiv_gate_admitted_with_truncation` (symbol equivalence under a
+> gate-admitted-with-truncation graph).
 
 Original analysis (kept for context):
 
@@ -92,8 +114,12 @@ Crucially, that hazard is **prefix-memo ↔ stream-memo**, not **prefix ↔ pref
 *All* prefix computations within a snapshot share the same canonical depth-0
 origin, so a child resolved for one prefix slot is byte-identical to the same
 child resolved for another prefix slot. Sharing one memo **across all prefix
-computations** is therefore sound, provided it stays **separate** from the
-stream's actual-depth `forward_child_memo`.
+computations** is therefore sound for the **symbol set**, provided it stays
+**separate** from the stream's actual-depth `forward_child_memo`. (This original
+analysis understated one case: under a longer-path truncation the gate admits,
+the cross-prefix-root reuse can still diverge on the `depth_exceeded`/`chain`
+advisory — never on symbols. See the corrected "Residual risk" note above and
+issue #484.)
 
 The depth-reuse rule (`scope.rs:1159-1192`, reuse only when
 `child_depth <= compute_depth`, cache only `depth_exceeded.is_empty()` scopes)
@@ -196,6 +222,18 @@ caller-inherited packages/provider/cd for C). Knobs 2 and 3 are pre-existing
 properties of the additive forward merge, documented here so the contract is
 explicit.
 
+> **Design vs shipped.** This section describes knob 1 as fully *designed*. Knob
+> 1 has two halves: (a) the **backward-walk skip**, which drops the caller
+> **symbols and packages** C would inherit through its backward edges (the only
+> things the backward `ParentPrefix` carries); and (b) **caller-independent
+> forward resolution**, which would additionally drop the caller's
+> forward-threaded `DataAliasProvider` / working directory / packages when C is
+> resolved as a caller's forward child. Only half (a) shipped in WI2a; half (b)
+> — and thus the full "pure function of `(C, C's forward closure)`" property the
+> perf/caching argument relies on — is deferred to WI2b (#483). See the "Shipped
+> scope (WI2a)" note below. References to knob 1 in this design section describe
+> the intended whole.
+
 ### Why required (perf + correctness)
 
 - **Perf:** knob 1 makes C's EOF scope a **pure function of `(C, C's forward
@@ -242,6 +280,22 @@ packages/provider/cd (`scope.rs:5412,5715`) — so C's scope is byte-identical
 whether computed for C's own diagnostics or as A's forward child. This canonical
 resolution is the precondition that makes the WI2b cache key (C's URI alone)
 sound.
+
+> **Shipped scope (WI2a) — part 1 only; part 2 deferred to WI2b (#483).** Only
+> the **backward-walk skip** shipped: `parent_prefix_at` returns the empty
+> `ParentPrefix` for a standalone `uri` (`scope.rs:5023`), which isolates C's
+> *own* diagnostics from its callers' backward contribution. The **caller-
+> independent forward-child resolution** (dropping caller A's inherited
+> packages/provider/`cd` when resolving standalone C as A's forward child, the
+> "canonical inputs" paragraph above) did **not** ship — when C is sourced by A,
+> A's threaded packages/provider/cd still flow into C's forward resolution. That
+> part 2 is the precondition for the WI2b cache key and is deferred to WI2b
+> (#483) along with the cache itself. The two are decoupled deliberately: part 1
+> delivers the own-diagnostics isolation and the hub-perf win that WI2a targets,
+> while part 2 only matters once the cross-snapshot cache exists. User-facing
+> docs (`docs/directives.md`, `docs/cross-file.md`) describe **only** the
+> shipped part-1 semantics ("when computing a standalone file's *own*
+> diagnostics").
 
 This alone removes the ~84-caller backward union when computing `functions.r`'s
 own diagnostics and fixes the caller-union over-approximation class (#476
@@ -342,12 +396,16 @@ read locks `peek()` (no promotion), write locks `push()`.
 
 ### Interactions (resolved; Codex round 2 to stress-test)
 
-- **`# raven: cd`** — `standalone` only suppresses C's *backward* parent-prefix
-  walk and caller-inherited inputs; backward directives already ignore
-  `# raven: cd` (`PathContext::new`). C's own forward path resolution respects
-  C's own `# raven: cd` exactly as today. No change to path resolution. (Note
-  knob 1 explicitly drops the *caller's* inherited working directory for C — C
-  uses only its own.)
+- **`# raven: cd`** — `standalone` (knob 1, shipped) suppresses C's *backward*
+  parent-prefix walk, which drops the caller-inherited **symbols and packages**
+  (the only contributions the backward `ParentPrefix` carries). Backward
+  directives already ignore `# raven: cd` (`PathContext::new`), and the backward
+  walk never threads a caller working directory into C, so knob 1 has nothing
+  cd-related to drop. C's own forward path resolution respects C's own
+  `# raven: cd` exactly as today. No change to path resolution. (Dropping the
+  *caller's* forward-threaded working directory / provider when C is resolved as
+  a caller's forward child is the deferred part 2 / WI2b — see the "Shipped scope
+  (WI2a)" note.)
 - **`# raven: nse` / `# raven: func`** — NSE/func propagation is **graph-only**:
   `collect_cross_file_nse` walks the revalidation-consistent set `S(Q)` over the
   source graph and reads only `nse_declarations`/`declared_functions`, never
