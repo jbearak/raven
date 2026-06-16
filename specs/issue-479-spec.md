@@ -270,58 +270,56 @@ in `ForwardChildKey` (`path_fp`/`pkg_fp`/`provider_fp`, `scope.rs:1015`). So C's
 URI is a sufficient key *for the scope value* — provided invalidation correctly
 detects changes to C or its forward closure.
 
-**Invalidation — per-closure source-text fingerprint (chosen design).**
+**Invalidation — per-closure `interface_hash` fingerprint (chosen design).**
 
-Cache key = C's URI. Validity = `(edge_revision, closure_fingerprint)` where:
+Cache key = `(C_uri, edge_revision, closure_interface_fingerprint,
+package_config_generation)`:
 
 - `edge_revision` (`dependency.rs:535`) pins the **membership** of C's forward
   closure. It bumps on any structural edge change (`dependency.rs:959-983`),
-  including a closure member adding/retargeting a `source()`.
-- `closure_fingerprint` = a hash over the **source-text content hash** of every
-  file in `{C} ∪ forward_closure(C)`. Source-text hashing captures *everything*
-  observable in the resolved scope — symbol names, signatures, package loads,
-  `rm()`s — so it is sound where `interface_hash` is **not**
-  (`Hash for ScopedSymbol` omits `signature`, `scope.rs:619` vs `PartialEq` at
-  `scope.rs:614`; reusing `interface_hash` would serve stale hover/completion
-  after a formals-only edit).
+  including a closure member adding/retargeting a `source()` or moving a call
+  site.
+- `closure_interface_fingerprint` = a hash over the per-file `interface_hash` of
+  every file in `{C} ∪ forward_closure(C)` (all already computed and cached in
+  artifacts). C's isolated scope is the composition of the closure members'
+  *exported interfaces* in `source()` order, so `(edge_revision, Σ
+  interface_hash)` fully determines it.
+- `package_config_generation`: a coarse counter bumped whenever the package
+  library or relevant config changes (R re-init, `packages_*` settings,
+  `maxChainDepth`). C's isolated scope also depends on `base_exports` /
+  package-library state / config, which the other key components do not capture.
 
-Editing a **caller** of C changes the caller's content but the caller is **not**
-in C's forward closure, so the fingerprint is unchanged → cache hit → full
-cross-keystroke reuse while editing callers. Editing C or any closure member
-changes that member's content hash → fingerprint mismatch → recompute (and C's
-dependents revalidate through the existing `compute_interface_hash` path,
-unchanged). Validating the fingerprint is O(closure size) over per-file content
-hashes — cheap relative to full scope re-resolution. Closure *membership*
-itself is a cheap graph walk already cached by `edge_revision` (the
-`subgraph_cache`), so computing the fingerprint does not re-do the expensive
-scope work.
+**Why `interface_hash`, not source-text (decision revised after review).** The
+dominant IDE editing pattern on a hub workspace is editing a file *inside* the
+hub's closure (e.g. `functions.r`, which `bootstrap.r` sources). Computing
+diagnostics for that file resolves the standalone parent's isolated scope, so it
+consults this cache on **every keystroke**. A **source-text** fingerprint would
+miss on every comment / whitespace / function-body / local edit — i.e. most
+edits — recomputing the whole closure each keystroke and defeating the cache's
+purpose for the active file. `interface_hash` busts **only** when a closure
+member's *top-level exported interface* changes (add/rename/remove a top-level
+symbol, signature, or package load) — exactly when C's scope genuinely changed —
+so body/comment/local edits stay cache hits.
 
-> Implementation note: prefer an already-maintained per-file content hash /
-> document revision if one exists (e.g. `document_store` revision, workspace
-> index entry) over hashing source bytes afresh each lookup. Confirm during
-> implementation; fall back to hashing source text if no stable per-file content
-> hash is available.
+Editing a **caller** of C (not in C's closure) leaves the fingerprint unchanged
+either way → hit. Validating the fingerprint is O(closure size) over precomputed
+`u64`s. Closure *membership* is the cheap graph walk already cached by
+`edge_revision` (the `subgraph_cache`).
 
-**Why source-text and NOT `interface_hash` (decided).** `interface_hash` is
-unsound as a scope-value fingerprint today (it omits `ScopedSymbol.signature` —
-filed as **#482**), and even once fixed, keying the cache on it would
-**permanently couple** WI2b's soundness to "`interface_hash` captures everything
-observable in a resolved scope." A future observable field added to
-`ScopedSymbol` without extending its `Hash` impl would then silently serve stale
-cached scopes — a soundness landmine with no failing test. Source-text hashing
-is robust by construction (any byte change ⇒ miss). Its only cost is
-over-invalidating on comment/whitespace edits *inside* the closure (a rare case;
-the dominant cross-keystroke win is editing a *caller*, which is not in the
-closure and so is unaffected either way). **#482 is fixed separately** (it is a
-real revalidation gap) and is NOT a prerequisite for, nor relied on by, WI2b.
+**Soundness depends on `interface_hash` completeness — already a system
+invariant.** Dependent revalidation correctness (`compute_affected_dependents_
+after_edit`) already relies on `interface_hash` capturing every interface change,
+so keying the cache on it reuses an existing requirement rather than adding a
+new one. Two guards make this safe:
 
-**Additional key component — package/config generation (required).** A standalone
-callee's isolated scope also depends on `base_exports` / package-library state
-and config (`max_chain_depth`), which neither source-text nor `interface_hash`
-captures. The cache key MUST therefore also include a coarse generation counter
-bumped whenever the package library or relevant config changes (R re-init,
-`packages_*` settings, `maxChainDepth`). Key = `(C_uri, edge_revision,
-closure_source_fingerprint, package_config_generation)`.
+1. **#482 is a PREREQUISITE.** `Hash for ScopedSymbol` currently omits
+   `signature` (`scope.rs:619` vs `PartialEq` at `scope.rs:614`), so a
+   formals-only edit would not bust the fingerprint → stale cached signature.
+   The cache MUST NOT be keyed on `interface_hash` until #482 lands.
+2. **Add a `ScopedSymbol` `Hash`/`Eq` field-parity test** (mutate each field,
+   assert the hash changes — except the deliberately-excluded positional
+   `defined_end_column`, derived from name+column). This converts the
+   "future field omitted from `Hash`" landmine into a guarded invariant.
 
 **Where the cache lives & lock discipline.** The per-snapshot `DependencyGraph`
 is cloned and resets its caches (`dependency.rs:585-610`), so a cross-snapshot
@@ -335,9 +333,12 @@ read locks `peek()` (no promotion), write locks `push()`.
 
 > **Codex review targets (round 2):** (a) the canonical-input resolution in WI2a
 > — is there any other caller-varying input beyond packages/provider/cd that
-> feeds C's scope? (b) the source-text fingerprint (option 2) — is per-file
-> source hash sound and is the closure membership truly pinned by edge_revision?
-> (c) the `Arc`-handle-out lock discipline.
+> feeds C's scope (so URI is a sufficient cache key)? (b) is `interface_hash`
+> (post-#482) a *complete* fingerprint of a file's scope-contributing exported
+> interface — does C's isolated scope depend on anything in a closure member
+> beyond what `interface_hash` covers? — and is closure membership truly pinned
+> by `edge_revision`? (c) the `Arc`-handle-out lock discipline under concurrent
+> `did_change`.
 
 ### Interactions (resolved; Codex round 2 to stress-test)
 
@@ -385,10 +386,14 @@ read locks `peek()` (no promotion), write locks `push()`.
   loaded packages (proves caller-independent canonical resolution); (c) toggling
   `standalone` revalidates dependents (interface-hash wiring); (d) header-only
   gate: `# raven: standalone` after code is ignored; (e) `# raven: cd` / `nse` /
-  `local=TRUE` interaction tests; (f) WI2b cache: editing a caller leaves
-  C's `closure_fingerprint` unchanged → cache hit (assert no recompute); editing
-  C or a closure member changes the fingerprint → cache miss → recompute; and
-  packages C loads still propagate to the caller after a cache hit.
+  `local=TRUE` interaction tests; (f) WI2b cache: editing a caller, or a
+  comment / function-body / local binding *inside* a closure member, leaves C's
+  `closure_interface_fingerprint` unchanged → cache hit (assert no recompute);
+  changing a closure member's top-level interface (add/rename/remove a top-level
+  symbol, signature, or package load) → cache miss → recompute; package/config
+  generation bump → miss; and packages C loads still propagate to the caller
+  after a cache hit. (g) `ScopedSymbol` `Hash`/`Eq` field-parity test (#482
+  prerequisite).
 - On worldwide: add `# raven: standalone` to `scripts/functions.r` (and/or
   `bootstrap.r` per measurement), re-measure `functions.r` and `raven check .`,
   report deltas. Diagnostics byte-identical except in the directive-bearing file.
