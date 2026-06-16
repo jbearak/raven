@@ -1780,19 +1780,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // `# raven: var`). No directive declarations exist on this path.
     fold_declarations_into_exported_interface(&mut artifacts);
 
-    // Extract package names from PackageLoad events for interface hash computation
-    // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
-    let loaded_packages: Vec<String> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|event| {
-            if let ScopeEvent::PackageLoad { package, .. } = event {
-                Some(package.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Extract package loads (with position) from PackageLoad events for interface
+    // hash computation (Requirement 14.5: interface hash must include loaded
+    // packages for cache invalidation; position matters — see
+    // `extract_package_load_positions`).
+    let loaded_packages = extract_package_load_positions(&artifacts.timeline);
 
     // Compute interface hash including symbols, loaded packages, declared
     // symbols, and top-level rm() events (which affect cross-file scope at
@@ -2052,18 +2044,9 @@ pub fn compute_artifacts_with_metadata(
     // symbols, later ones win.
     fold_declarations_into_exported_interface(&mut artifacts);
 
-    // Extract package names from PackageLoad events for interface hash computation
-    let loaded_packages: Vec<String> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|event| {
-            if let ScopeEvent::PackageLoad { package, .. } = event {
-                Some(package.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Extract package loads (with position) from PackageLoad events for interface
+    // hash computation (see `extract_package_load_positions`).
+    let loaded_packages = extract_package_load_positions(&artifacts.timeline);
 
     // Collect declared symbols from metadata for interface hash computation
     // (Requirements 10.1-10.4: interface hash must include declared symbols for cache invalidation)
@@ -4674,14 +4657,37 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 ///
 /// # Returns
 ///
-/// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
-/// `top_level_removals`, `data_loads`, and `declarations` (the
-/// `(name, line)` pairs of all timeline `Declaration` events — see
-/// [`extract_top_level_declarations`]).
+/// `u64` hash of the provided `interface`, `package_loads` (each package name
+/// with its `(line, column)` — position matters for cross-file scope, see the
+/// hashing site), `declared_symbols`, `top_level_removals`, `data_loads`, and
+/// `declarations` (the `(name, line)` pairs of all timeline `Declaration`
+/// events — see [`extract_top_level_declarations`]).
+/// Extract `(package, line, column)` for every `PackageLoad` timeline event, for
+/// inclusion in [`compute_interface_hash`]. Position is preserved (unlike a bare
+/// name set) because a `library()`/`require()` load's contribution to a file
+/// that `source()`s this one is position-gated — see the package hashing site in
+/// `compute_interface_hash`. All loads are included (top-level and
+/// function-scoped); over-including a function-scoped load only widens
+/// invalidation, never admits a stale cache hit.
+fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<(String, u32, u32)> {
+    timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::PackageLoad {
+                package,
+                line,
+                column,
+                ..
+            } => Some((package.clone(), *line, *column)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
-    packages: &[String],
+    package_loads: &[(String, u32, u32)],
     declared_symbols: &[super::types::DeclaredSymbol],
     nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
@@ -4708,12 +4714,21 @@ fn compute_interface_hash(
         }
     }
 
-    // Include loaded packages in the hash (sorted for determinism)
-    // This ensures cache invalidation when packages change (Requirement 14.5)
-    let mut sorted_packages: Vec<_> = packages.iter().collect();
+    // Include loaded packages WITH their (line, column) positions, sorted for
+    // determinism (Requirement 14.5). Position is hashed — not just the package
+    // name set — because a `library()`/`require()` load contributes to a file
+    // that `source()`s this one only when it PRECEDES the `source()` call site
+    // (and to a backward-parent prefix evaluated at that site). So MOVING a
+    // `library()` across a `source()` changes the cross-file scope even though
+    // the package-name multiset is unchanged; omitting position let the
+    // persistent standalone-scope cache (#483) serve a stale isolated scope
+    // after such a move. Mirrors the `line` inclusion for declared symbols below.
+    let mut sorted_packages: Vec<_> = package_loads.iter().collect();
     sorted_packages.sort();
-    for package in sorted_packages {
+    for (package, line, column) in sorted_packages {
         package.hash(&mut hasher);
+        line.hash(&mut hasher);
+        column.hash(&mut hasher);
     }
 
     // Include declared symbols in the hash (sorted for determinism)
@@ -10464,6 +10479,83 @@ mod tests {
             pkgs(&sb_after),
             vec!["tidyr".to_string()],
             "post-edit scope must reflect the new library() in the member's backward parent"
+        );
+    }
+
+    /// Regression for the second cross-snapshot staleness bug found in WI2b
+    /// review (confirmed by Codex): a contributing file's package-load POSITION
+    /// affects the isolated scope (a `library()` contributes to a sourced child
+    /// only when it precedes the `source()` call), but `compute_interface_hash`
+    /// once hashed package NAMES without position. So MOVING `library(dplyr)`
+    /// from before to after `source("m.r")` — same package set, no source-edge
+    /// change, so neither the name hash nor `edge_revision` moved — left the
+    /// persistent cache serving a stale isolated scope (still carrying dplyr).
+    /// Fixed by hashing each package load's `(line, column)` in the interface
+    /// hash, which feeds the cache's `closure_interface_fingerprint`.
+    #[test]
+    fn standalone_cache_invalidates_on_library_move_across_source() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                // dplyr loaded BEFORE source(m): it contributes to m's prefix and
+                // so leaks into hub's isolated scope.
+                (
+                    a.clone(),
+                    "library(dplyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+                ),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        let cache = Arc::new(StandaloneScopeCache::new());
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&before), vec!["dplyr".to_string()]);
+
+        // MOVE library(dplyr) to AFTER both source() calls. Same package set, no
+        // symbols, source() edges unchanged. dplyr now loads after source(m), so
+        // it must NOT contribute to hub's isolated scope.
+        replace_artifacts(
+            &mut arts,
+            &a,
+            "source(\"hub.r\")\nsource(\"m.r\")\nlibrary(dplyr)\n",
+        );
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&after),
+            pkgs(&reference),
+            "stale HIT: cache served pre-move package set after a library() moved across a source()"
+        );
+        assert!(
+            pkgs(&after).is_empty(),
+            "after the move dplyr loads past source(m) and must not be in hub's scope, got {:?}",
+            pkgs(&after)
         );
     }
 
