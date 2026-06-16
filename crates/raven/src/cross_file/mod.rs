@@ -15,6 +15,7 @@ pub mod path_resolve;
 pub mod revalidation;
 pub mod scope;
 pub mod source_detect;
+pub mod standalone_cache;
 pub mod types;
 pub mod workspace_index;
 

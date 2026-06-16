@@ -1861,6 +1861,18 @@ impl DependencyGraph {
         payload
     }
 
+    /// Current global edge revision — a monotonic counter bumped on any
+    /// structural edge change (`update_file` reporting `edges_changed`,
+    /// `remove_file`). Used as the membership-pinning component of the
+    /// cross-snapshot `StandaloneScopeCache` key (issue #483): capture it from
+    /// the *real* `WorldState` graph (a cloned per-snapshot graph resets its own
+    /// counter to 0), so it changes whenever a `source()` edge is added,
+    /// retargeted, or moved anywhere in the workspace.
+    pub fn edge_revision(&self) -> u64 {
+        self.edge_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Number of `cached_neighborhood_subgraph` calls served from the cache.
     /// Exposed for tests; not used in production code.
     pub fn subgraph_cache_hits(&self) -> u64 {
