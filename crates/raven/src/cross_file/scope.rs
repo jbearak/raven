@@ -10482,6 +10482,80 @@ mod tests {
         );
     }
 
+    /// A `source()` REORDER inside a standalone callee changes its isolated
+    /// scope (first-source-wins decides which definition of a shared symbol
+    /// survives), and this is covered by `edge_revision` in the cache key — NOT
+    /// by the interface fingerprint, which does not hash `source()` call
+    /// positions. Reordering changes the edges' `call_site_line`, so the single
+    /// persistent graph's `update_file` bumps the global `edge_revision`,
+    /// changing the key. (Modeled with one graph + `update_file`, as in
+    /// production; building two independent graphs would reset the per-graph
+    /// counter and not exercise the monotonic global one.)
+    #[test]
+    fn standalone_cache_invalidates_on_source_reorder() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let bb = Url::parse("file:///proj/bb.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let caller = Url::parse("file:///proj/caller.r").unwrap();
+        // hub (standalone) sources a then bb; both define `x` -> order decides
+        // which source_uri wins.
+        let (mut arts, mut metas, mut graph) = build_cache_scenario(
+            &root,
+            &[
+                (a.clone(), "x <- 1\n"),
+                (bb.clone(), "x <- 2\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"a.r\")\nsource(\"bb.r\")\n",
+                ),
+                (caller.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev_a = graph.edge_revision();
+        let s1 = resolve_eof_cached(&caller, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        let x1 = s1.symbols.get("x").map(|s| s.source_uri.to_string());
+
+        // EDIT hub: reorder to source bb then a. Model a real edit: update BOTH
+        // artifacts and the SINGLE persistent graph (update_file bumps the global
+        // edge_revision because the source() call_site_lines change).
+        let new_hub = "# raven: standalone\nsource(\"bb.r\")\nsource(\"a.r\")\n";
+        replace_artifacts(&mut arts, &hub, new_hub);
+        let tree = parse_r(new_hub);
+        let new_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            new_hub,
+            Some(&tree),
+        ));
+        graph.update_file(&hub, &new_meta, Some(&root), |_| None);
+        metas.insert(hub.clone(), new_meta);
+        let rev_b = graph.edge_revision();
+
+        let s2 = resolve_eof_cached(&caller, &arts, &metas, &graph, &root, &cache, rev_b, 0);
+        let x2 = s2.symbols.get("x").map(|s| s.source_uri.to_string());
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let s2_ref = resolve_eof_cached(
+            &caller,
+            &arts,
+            &metas,
+            &graph,
+            &root,
+            &cache_fresh,
+            rev_b,
+            0,
+        );
+        let x2_ref = s2_ref.symbols.get("x").map(|s| s.source_uri.to_string());
+        eprintln!(
+            "rev_a={rev_a} rev_b={rev_b} x1={x1:?} x2(persistent)={x2:?} x2(fresh)={x2_ref:?}"
+        );
+        assert!(
+            rev_b > rev_a,
+            "reordering source() calls must bump edge_revision"
+        );
+        assert_eq!(x2, x2_ref, "STALE on source() reorder");
+    }
+
     /// Regression for the second cross-snapshot staleness bug found in WI2b
     /// review (confirmed by Codex): a contributing file's package-load POSITION
     /// affects the isolated scope (a `library()` contributes to a sourced child
