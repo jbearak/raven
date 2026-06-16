@@ -131,20 +131,29 @@ explicitly deferred).
 
 ### Semantics (three knobs — only knob 1 is a behavior change)
 
-1. **(LOAD-BEARING) The callee is resolved in isolation.** When computing scope
-   for a position *inside* a standalone file C, Raven does **not** walk backward
-   to the files that `source()` C (no STEP-1 parent-prefix walk), **and** does
-   **not** inherit any caller-provided inputs: caller packages
-   (`scope.rs:5412,5715`), the caller's `DataAliasProvider`, or the caller's
-   working directory. C's scope is computed from C's own definitions, C's own
-   loaded packages, C's own `# raven: cd`, and C's own forward closure — nothing
-   from any caller. This is what makes C's EOF scope a pure function of
-   `(C, C's forward closure)` and therefore caller-independent (the precondition
-   for both correctness and caching).
+1. **(LOAD-BEARING) The callee is resolved in isolation — asymmetrically.**
+   When computing scope for a position *inside* a standalone file C, Raven does
+   **not** walk backward to the files that `source()` C (no STEP-1 parent-prefix
+   walk), **and** does **not** inherit any caller-provided *inputs*: caller
+   packages (`scope.rs:5412,5715`), the caller's `DataAliasProvider`, or the
+   caller's working directory. C's scope is computed from C's own definitions,
+   C's own loaded packages, C's own `# raven: cd`, and C's own forward closure —
+   nothing flows **in** from any caller. This is what makes C's EOF scope a pure
+   function of `(C, C's forward closure)` and therefore caller-independent (the
+   precondition for both correctness and caching).
+
+   **Asymmetry — the OUTPUT direction is unchanged.** C still contributes its
+   own bindings AND its own loaded packages **out** to every caller via the
+   normal additive forward merge (`merge_child_source_packages`,
+   `scope.rs:5960`). A primary, intended use of `standalone` is a module that
+   `library()`-loads the packages its callers rely on: those package loads must
+   still propagate up to callers. Isolation drops caller→C inheritance; it does
+   NOT drop C→caller contribution. Both the symbols C defines and the packages C
+   loads remain part of C's cached isolated EOF scope and flow to callers.
 2. **It only ADDS to a caller's scope.** Already the default forward behavior
-   (the forward merge at `scope.rs:5905` only *inserts* the child's surviving
-   symbols). `standalone` does not change this. Recorded for completeness; no
-   code.
+   (the forward merge at `scope.rs:5905` / `scope.rs:5960` only *inserts* the
+   child's surviving symbols and *merges in* its packages). `standalone` does not
+   change this. Recorded for completeness; no code.
 3. **C's `rm()`/`remove()` effects do not propagate out to callers.** **Already
    guaranteed by the existing additive merge** — verified at `scope.rs:5905`,
    which iterates `child_scope.symbols` (C's EOF map, with C's own removals
@@ -232,32 +241,37 @@ in `ForwardChildKey` (`path_fp`/`pkg_fp`/`provider_fp`, `scope.rs:1015`). So C's
 URI is a sufficient key *for the scope value* — provided invalidation correctly
 detects changes to C or its forward closure.
 
-**Invalidation — staged, measure-driven:**
+**Invalidation — per-closure source-text fingerprint (chosen design).**
 
-1. **Start sound and simple: coarse content-edit generation bump.** Maintain one
-   global monotonic `content_generation` counter, bumped on every document
-   content change. Cache key = `(C_uri, edge_revision, content_generation)`.
-   This is **unconditionally sound** (any edit anywhere invalidates) and is the
-   exact mechanism the issue calls for. It delivers (a) and (b) fully — within
-   one snapshot/pass the generation is stable, so C is computed once and shared
-   ×84. For `raven check .` (c), the generation is stable for the whole run
-   (no edits mid-run), so C is computed once and reused by all 245 files. The
-   only thing it sacrifices: cross-*keystroke* reuse while editing an unrelated
-   file (the next snapshot recomputes C once — shared, not ×84).
-   **Do NOT reuse `interface_hash` as a scope-value fingerprint:**
-   `Hash for ScopedSymbol` omits `signature` (`scope.rs:619` vs `PartialEq` at
-   `scope.rs:614`), so a formals-only edit changes the scope without changing
-   `interface_hash` — unsound for hover/completion/signature consumers.
-2. **Tighten only if measurement demands it: per-closure source fingerprint.**
-   If after WI1 + WI2a + the coarse bump, editing a *caller* still leaves a
-   perceptible pause (re-resolving C once per keystroke), replace the
-   `content_generation` component with a fingerprint over the **source-text
-   content hash** of `{C} ∪ forward_closure(C)` (membership pinned by
-   `edge_revision`). Source-text hashing captures *everything* observable
-   (including signatures), so it is sound where `interface_hash` is not. Editing
-   a caller (not in C's closure) leaves the fingerprint unchanged → hit. This is
-   the only part that approaches #480's territory; gate it behind a measurement
-   that shows it is needed.
+Cache key = C's URI. Validity = `(edge_revision, closure_fingerprint)` where:
+
+- `edge_revision` (`dependency.rs:535`) pins the **membership** of C's forward
+  closure. It bumps on any structural edge change (`dependency.rs:959-983`),
+  including a closure member adding/retargeting a `source()`.
+- `closure_fingerprint` = a hash over the **source-text content hash** of every
+  file in `{C} ∪ forward_closure(C)`. Source-text hashing captures *everything*
+  observable in the resolved scope — symbol names, signatures, package loads,
+  `rm()`s — so it is sound where `interface_hash` is **not**
+  (`Hash for ScopedSymbol` omits `signature`, `scope.rs:619` vs `PartialEq` at
+  `scope.rs:614`; reusing `interface_hash` would serve stale hover/completion
+  after a formals-only edit).
+
+Editing a **caller** of C changes the caller's content but the caller is **not**
+in C's forward closure, so the fingerprint is unchanged → cache hit → full
+cross-keystroke reuse while editing callers. Editing C or any closure member
+changes that member's content hash → fingerprint mismatch → recompute (and C's
+dependents revalidate through the existing `compute_interface_hash` path,
+unchanged). Validating the fingerprint is O(closure size) over per-file content
+hashes — cheap relative to full scope re-resolution. Closure *membership*
+itself is a cheap graph walk already cached by `edge_revision` (the
+`subgraph_cache`), so computing the fingerprint does not re-do the expensive
+scope work.
+
+> Implementation note: prefer an already-maintained per-file content hash /
+> document revision if one exists (e.g. `document_store` revision, workspace
+> index entry) over hashing source bytes afresh each lookup. Confirm during
+> implementation; fall back to hashing source text if no stable per-file content
+> hash is available.
 
 **Where the cache lives & lock discipline.** The per-snapshot `DependencyGraph`
 is cloned and resets its caches (`dependency.rs:585-610`), so a cross-snapshot
@@ -321,10 +335,10 @@ read locks `peek()` (no promotion), write locks `push()`.
   loaded packages (proves caller-independent canonical resolution); (c) toggling
   `standalone` revalidates dependents (interface-hash wiring); (d) header-only
   gate: `# raven: standalone` after code is ignored; (e) `# raven: cd` / `nse` /
-  `local=TRUE` interaction tests; (f) WI2b cache: editing a caller does NOT
-  change C's cached isolated scope value (under option 2, a cache-hit; under the
-  coarse bump, a recompute that yields the identical value); editing C or a
-  closure member changes it.
+  `local=TRUE` interaction tests; (f) WI2b cache: editing a caller leaves
+  C's `closure_fingerprint` unchanged → cache hit (assert no recompute); editing
+  C or a closure member changes the fingerprint → cache miss → recompute; and
+  packages C loads still propagate to the caller after a cache hit.
 - On worldwide: add `# raven: standalone` to `scripts/functions.r` (and/or
   `bootstrap.r` per measurement), re-measure `functions.r` and `raven check .`,
   report deltas. Diagnostics byte-identical except in the directive-bearing file.
