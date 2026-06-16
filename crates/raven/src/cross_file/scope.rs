@@ -5806,49 +5806,86 @@ where
                             }
                         }
 
+                        // Issue #483 part 2: a `# raven: standalone` callee is
+                        // resolved with caller-independent inputs — empty
+                        // packages, no `data()` provider, and its OWN
+                        // PathContext (never the caller's inherited/chdir working
+                        // directory). This makes the callee's isolated scope a
+                        // pure function of `(C, C's forward closure)`, the
+                        // precondition that lets the WI2b cache key on C's URI
+                        // alone. Safe-direction and opt-in: at worst a false
+                        // "undefined" inside the standalone file's contribution.
+                        let child_is_standalone =
+                            get_metadata(&child_uri).is_some_and(|m| m.standalone);
+                        let child_provider = if child_is_standalone {
+                            None
+                        } else {
+                            data_alias_provider
+                        };
+                        let empty_packages_for_standalone = HashSet::new();
                         let owned_packages: HashSet<String>;
-                        let packages_for_child: &HashSet<String> =
-                            if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
-                                &scope.inherited_packages
-                            } else {
-                                owned_packages = scope
-                                    .inherited_packages
-                                    .iter()
-                                    .chain(extra_packages.iter())
-                                    .chain(scope.loaded_packages.iter())
-                                    .cloned()
-                                    .collect();
-                                &owned_packages
-                            };
+                        let packages_for_child: &HashSet<String> = if child_is_standalone {
+                            &empty_packages_for_standalone
+                        } else if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
+                            &scope.inherited_packages
+                        } else {
+                            owned_packages = scope
+                                .inherited_packages
+                                .iter()
+                                .chain(extra_packages.iter())
+                                .chain(scope.loaded_packages.iter())
+                                .cloned()
+                                .collect();
+                            &owned_packages
+                        };
 
-                        // Build child PathContext, respecting chdir flag
-                        let child_path = child_uri.to_file_path().ok();
-                        let child_ctx = child_path.as_ref().and_then(|cp| {
-                            let ctx = path_ctx.as_ref()?;
-                            // Get child's metadata for its own working directory directive
-                            let child_meta = get_metadata(&child_uri);
-                            if let Some(cm) = child_meta {
-                                // Child has its own metadata - use it, but inherit working dir if no explicit one
-                                let mut child_ctx =
+                        // Build child PathContext, respecting chdir flag. A
+                        // standalone callee (part 2) uses its OWN context,
+                        // ignoring the caller's chdir / inherited working dir.
+                        let child_ctx = if child_is_standalone {
+                            get_metadata(&child_uri)
+                                .and_then(|m| {
                                     super::path_resolve::PathContext::from_metadata(
                                         &child_uri,
-                                        &cm,
+                                        &m,
                                         workspace_root,
-                                    )?;
-                                if child_ctx.working_directory.is_none() {
-                                    // Inherit from parent based on chdir flag
-                                    child_ctx.inherited_working_directory = if source.chdir {
-                                        Some(cp.parent()?.to_path_buf())
-                                    } else {
-                                        Some(ctx.effective_working_directory())
-                                    };
+                                    )
+                                })
+                                .or_else(|| {
+                                    super::path_resolve::PathContext::new(
+                                        &child_uri,
+                                        workspace_root,
+                                    )
+                                })
+                        } else {
+                            let child_path = child_uri.to_file_path().ok();
+                            child_path.as_ref().and_then(|cp| {
+                                let ctx = path_ctx.as_ref()?;
+                                // Get child's metadata for its own working directory directive
+                                let child_meta = get_metadata(&child_uri);
+                                if let Some(cm) = child_meta {
+                                    // Child has its own metadata - use it, but inherit working dir if no explicit one
+                                    let mut child_ctx =
+                                        super::path_resolve::PathContext::from_metadata(
+                                            &child_uri,
+                                            &cm,
+                                            workspace_root,
+                                        )?;
+                                    if child_ctx.working_directory.is_none() {
+                                        // Inherit from parent based on chdir flag
+                                        child_ctx.inherited_working_directory = if source.chdir {
+                                            Some(cp.parent()?.to_path_buf())
+                                        } else {
+                                            Some(ctx.effective_working_directory())
+                                        };
+                                    }
+                                    Some(child_ctx)
+                                } else {
+                                    // No metadata for child - create context based on chdir
+                                    Some(ctx.child_context_for_source(cp, source.chdir))
                                 }
-                                Some(child_ctx)
-                            } else {
-                                // No metadata for child - create context based on chdir
-                                Some(ctx.child_context_for_source(cp, source.chdir))
-                            }
-                        });
+                            })
+                        };
 
                         // Early exit on cancellation before expensive recursive traversal
                         if is_cancelled() {
@@ -5874,7 +5911,7 @@ where
                             // (the common case in the dense graphs this targets)
                             // pays nothing for it.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = data_alias_provider_fp(data_alias_provider);
+                            let provider_fp = data_alias_provider_fp(child_provider);
                             resolve_forward_child_memoized(
                                 forward_child_memo,
                                 graph,
@@ -5913,7 +5950,7 @@ where
                                         true,
                                         None,
                                         None,
-                                        data_alias_provider,
+                                        child_provider,
                                         forward_child_memo,
                                     )
                                 },
@@ -5939,7 +5976,7 @@ where
                                 false,
                                 None,
                                 None,
-                                data_alias_provider,
+                                child_provider,
                                 forward_child_memo,
                             )
                         };
@@ -7838,30 +7875,56 @@ where
             return contrib;
         }
 
+        // Issue #483 part 2: a `# raven: standalone` callee is resolved with
+        // caller-independent inputs (no `data()` provider, its OWN PathContext).
+        // The packages set passed to a child here is already empty (the child's
+        // own parent walk handles its inheritance), so only the provider and
+        // context need the standalone substitution. See the recursive
+        // forward-source dispatch for the full rationale.
+        let child_is_standalone = (self.get_metadata)(&child_uri).is_some_and(|m| m.standalone);
+        let child_provider = if child_is_standalone {
+            None
+        } else {
+            self.data_alias_provider
+        };
+
         // Build child PathContext, respecting source.chdir. Mirrors the
-        // logic at `scope.rs:3554-3581`.
-        let child_path = child_uri.to_file_path().ok();
-        let child_ctx = child_path.as_ref().and_then(|cp| {
-            let ctx = self.path_ctx.as_ref()?;
-            let child_meta = (self.get_metadata)(&child_uri);
-            if let Some(cm) = child_meta {
-                let mut child_ctx = super::path_resolve::PathContext::from_metadata(
-                    &child_uri,
-                    &cm,
-                    self.workspace_root,
-                )?;
-                if child_ctx.working_directory.is_none() {
-                    child_ctx.inherited_working_directory = if source.chdir {
-                        Some(cp.parent()?.to_path_buf())
-                    } else {
-                        Some(ctx.effective_working_directory())
-                    };
+        // logic at `scope.rs:3554-3581`. A standalone callee uses its OWN
+        // context, ignoring the caller's chdir / inherited working directory.
+        let child_ctx = if child_is_standalone {
+            (self.get_metadata)(&child_uri)
+                .and_then(|m| {
+                    super::path_resolve::PathContext::from_metadata(
+                        &child_uri,
+                        &m,
+                        self.workspace_root,
+                    )
+                })
+                .or_else(|| super::path_resolve::PathContext::new(&child_uri, self.workspace_root))
+        } else {
+            let child_path = child_uri.to_file_path().ok();
+            child_path.as_ref().and_then(|cp| {
+                let ctx = self.path_ctx.as_ref()?;
+                let child_meta = (self.get_metadata)(&child_uri);
+                if let Some(cm) = child_meta {
+                    let mut child_ctx = super::path_resolve::PathContext::from_metadata(
+                        &child_uri,
+                        &cm,
+                        self.workspace_root,
+                    )?;
+                    if child_ctx.working_directory.is_none() {
+                        child_ctx.inherited_working_directory = if source.chdir {
+                            Some(cp.parent()?.to_path_buf())
+                        } else {
+                            Some(ctx.effective_working_directory())
+                        };
+                    }
+                    Some(child_ctx)
+                } else {
+                    Some(ctx.child_context_for_source(cp, source.chdir))
                 }
-                Some(child_ctx)
-            } else {
-                Some(ctx.child_context_for_source(cp, source.chdir))
-            }
-        });
+            })
+        };
 
         // Cancel-aware short-circuit before kicking off the child recursion.
         if (self.is_cancelled)() {
@@ -7908,7 +7971,7 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
-        let provider_fp = data_alias_provider_fp(self.data_alias_provider);
+        let provider_fp = data_alias_provider_fp(child_provider);
         // The streaming path resolves forward children of the queried URI at
         // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
@@ -7941,7 +8004,7 @@ where
                     true,
                     Some(&child_prefix),
                     None,
-                    self.data_alias_provider,
+                    child_provider,
                     &self.forward_child_memo,
                 )
             },
@@ -9710,6 +9773,82 @@ mod tests {
         assert!(
             resolve_parent(true).symbols.contains_key("child_sym"),
             "caller must still see a standalone callee's own definitions (knob 2)"
+        );
+    }
+
+    /// Issue #483 part 2: a `# raven: standalone` callee resolved as a forward
+    /// child is resolved with caller-independent inputs. In particular the
+    /// caller's `DataAliasProvider` is NOT threaded into a standalone child, so
+    /// the child's `data()` call is not expanded by the caller's provider —
+    /// making the child's scope a pure function of `(C, C's forward closure)`,
+    /// the precondition for keying the WI2b cache on C's URI alone. Knob 2 is
+    /// preserved: the caller still sees the child's own (non-provider)
+    /// definitions.
+    #[test]
+    fn standalone_forward_child_ignores_caller_data_alias_provider() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let root = Url::parse("file:///project").unwrap();
+        // x.r is the standalone callee: `data(api)` (would expand to
+        // apiclus1/apistrat under the provider) and defines x_sym.
+        let x_uri = Url::parse("file:///project/x.r").unwrap();
+        let x_code = "# raven: standalone\ndata(api)\nx_sym <- 1\n";
+        // q.r sources x.r (forward edge, resolved with the real provider).
+        let q_uri = Url::parse("file:///project/q.r").unwrap();
+        let q_code = "source(\"x.r\")\n";
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in [(&x_uri, x_code), (&q_uri, q_code)] {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+        let get_artifacts = |u: &Url| artifacts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let base_exports = HashSet::new();
+        let base_packages: HashSet<String> = ["survey".to_string()].into_iter().collect();
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+
+        let scope = scope_at_position_with_graph(
+            &q_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            64,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        // Knob 2: the caller still sees the standalone child's own definition.
+        assert!(
+            scope.symbols.contains_key("x_sym"),
+            "caller must still see a standalone child's own definition (knob 2)"
+        );
+        // Part 2: the caller's provider is NOT applied to the standalone child,
+        // so its `data(api)` is not expanded to dataset aliases.
+        assert!(
+            !scope.symbols.contains_key("apiclus1") && !scope.symbols.contains_key("apistrat"),
+            "standalone forward child must be resolved with NO caller DataAliasProvider \
+             (part 2); got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
         );
     }
 
