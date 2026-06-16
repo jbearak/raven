@@ -132,12 +132,15 @@ Place `# raven: standalone` in the **header** of a sourced *library* file to
 declare it self-contained. It takes no arguments and is **header-only** (it must
 appear before any code; a `standalone` token after code is ignored).
 
-When computing a standalone file's **own** diagnostics, it is resolved **in
-isolation** from the files that `source()` it:
+A standalone file is resolved **in isolation** from the files that `source()`
+it — both when computing its own diagnostics and when it is pulled in as another
+file's forward `source()` child:
 
-- It does **not** inherit symbols or loaded packages from any caller — no
-  backward parent-prefix walk. Its own cross-file scope is determined by the file
-  itself and its own forward `source()` closure, not by who sources it.
+- It does **not** inherit symbols, loaded packages, working directory, or
+  data-alias provider from any caller — no backward parent-prefix walk, and a
+  caller's forward resolution feeds it canonical, caller-independent inputs. Its
+  cross-file scope is a pure function of the file itself and its own forward
+  `source()` closure, not of who sources it.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.
@@ -147,8 +150,10 @@ isolation** from the files that `source()` it:
 **When to use it.** A self-contained helper/library file that is sourced by many
 others (a hub). Declaring it standalone both **prevents** caller-union
 over-approximation (one caller's bindings leaking into the file's analysis on
-behalf of another) and makes Raven much faster on hub-heavy workspaces, because
-the file's scope no longer depends on its callers.
+behalf of another) and makes Raven much faster on hub-heavy workspaces: because
+the file's scope no longer depends on its callers, Raven resolves it once and
+reuses that result across all of them, across edit-triggered revalidation, and
+across keystrokes (a persistent cache), instead of re-resolving it per caller.
 
 **Opt-in and safe-direction.** You vouch that the file is self-contained. If it
 actually relies on a binding a caller provides, the worst case is a

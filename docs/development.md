@@ -241,6 +241,14 @@ Default capacities are defined close to each cache:
 
 Cache sizes are configurable via VS Code settings and applied during initialization/config change.
 
+### Standalone isolated-scope cache (#483 / WI2b)
+
+`# raven: standalone` callees (see `docs/cross-file.md`) are resolved in isolation: no backward parent-prefix walk (WI2a) and — when resolved as a caller's forward `source()` child — canonical, caller-independent inputs (empty packages, no `data()` provider, the file's own `PathContext`; WI2b "part 2"). That makes a standalone file's depth-≥1 isolated EOF scope a pure function of the file and its own forward `source()` closure plus the traversal config, independent of who sources it, so it is cached **across snapshots** rather than per-query — collapsing the per-caller, ×N-revalidation-fan-out, and per-file-`raven check`-snapshot re-resolutions into one compute plus cheap `Arc` clones.
+
+- Module: `crates/raven/src/cross_file/standalone_cache.rs` (`StandaloneScopeCache`, `StandaloneScopeKey`, `StandaloneCacheCtx`). Owned by `WorldState` behind an `Arc` so the diagnostics snapshot clones the handle out from under the read lock and consults the cache with no `WorldState` guard held; default capacity is in that module.
+- Key = `(callee_uri, edge_revision, closure_interface_fingerprint, max_chain_depth, hoist_globals, backward_dep_mode, package_config_generation)`. `edge_revision` pins forward-closure membership and must be read from the **real** graph (a cloned per-snapshot `DependencyGraph` resets its own counter); `closure_interface_fingerprint` is an order-sensitive hash over the per-file `interface_hash` of `{C} ∪ forward_closure(C)`, so any closure member's interface edit misses (body/comment/local edits don't). `package_config_generation` (bumped on package-library re-init) is defense-in-depth.
+- Hook + soundness: consulted at one place — the top of `scope_at_position_with_graph_recursive`, gated on standalone + full EOF (`MAX,MAX`) + `current_depth >= 1` (the depth-0 own-root query injects `base_exports` and is excluded) + canonical inputs + acyclic graph + no closure member already in `visited` (a visited member would short-circuit its forward `source()` into a truncated, caller-path-dependent scope). Reuse mirrors `ForwardChildMemo`: store only truncation-free scopes, never under cancellation, and serve a stored `compute_depth` for a `reach_depth <= compute_depth` (keeping the deepest). A cache HIT is byte-identical to the un-memoized resolver; `RAVEN_DISABLE_STANDALONE_CACHE=1` forces every resolution to recompute so `raven check .` cache-on vs cache-off can be diffed (the #483 acceptance gate), and `raven check` logs hit/miss counts at `RUST_LOG=raven::cli=trace`.
+
 ### Real-time diagnostics & monotonic publishing
 
 Cross-file revalidation is debounced and cancelable.
