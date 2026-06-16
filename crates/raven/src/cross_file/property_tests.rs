@@ -21294,6 +21294,21 @@ proptest! {
         use super::dependency::DependencyGraph;
         use super::types::ForwardSource;
 
+        // The parent template hardcodes a scaffolding function `f <- function()`
+        // to site the function-scoped `local = TRUE` source. When the random
+        // `symbol_name` is also "f", the directive (`# @lsp-var f` / `# @lsp-func
+        // f`) collides with that real definition. Per
+        // `fold_declarations_into_exported_interface`, a real definition is never
+        // downgraded by a declaration, so the merged `f` symbol carries
+        // `is_declared = false` and is (correctly) dropped by the declared-only
+        // filter for function-scoped local=TRUE: `f` is no longer a *declared*
+        // symbol but a real top-level definition, which this test does not probe.
+        // Exclude the collision so the test exercises its intended scenario — an
+        // independent *declared* symbol flowing to the child. (Mirrors the
+        // `prop_assume!` guard in
+        // `prop_cross_file_declaration_vs_regular_symbol_with_top_level_local_true`.)
+        prop_assume!(symbol_name != "f");
+
         let parent_uri = make_url("parent");
         let child_uri = make_url("child");
         let workspace_root = Url::parse("file:///").unwrap();
