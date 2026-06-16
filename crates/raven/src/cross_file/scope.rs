@@ -4662,14 +4662,19 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 /// hashing site), `declared_symbols`, `top_level_removals`, `data_loads`, and
 /// `declarations` (the `(name, line)` pairs of all timeline `Declaration`
 /// events — see [`extract_top_level_declarations`]).
-/// Extract `(package, line, column)` for every `PackageLoad` timeline event, for
-/// inclusion in [`compute_interface_hash`]. Position is preserved (unlike a bare
-/// name set) because a `library()`/`require()` load's contribution to a file
-/// that `source()`s this one is position-gated — see the package hashing site in
-/// `compute_interface_hash`. All loads are included (top-level and
-/// function-scoped); over-including a function-scoped load only widens
-/// invalidation, never admits a stale cache hit.
-fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<(String, u32, u32)> {
+/// Extract `(package, line, column, function_scope)` for every `PackageLoad`
+/// timeline event, for inclusion in [`compute_interface_hash`]. Both position AND
+/// function scope are preserved (unlike a bare name set) because a
+/// `library()`/`require()` load's contribution to a file that `source()`s this
+/// one is gated on BOTH (it contributes only when it precedes the `source()` call
+/// AND its function scope is the same-or-ancestor of the call's) — see the
+/// package hashing site in `compute_interface_hash`. All loads are included
+/// (top-level and function-scoped); over-including only widens invalidation,
+/// never admits a stale cache hit (the WI2b standalone-scope cache, #483, relies
+/// on this completeness).
+type PackageLoadKey = (String, u32, u32, Option<FunctionScopeInterval>);
+
+fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<PackageLoadKey> {
     timeline
         .iter()
         .filter_map(|event| match event {
@@ -4677,8 +4682,8 @@ fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<(String, u32, 
                 package,
                 line,
                 column,
-                ..
-            } => Some((package.clone(), *line, *column)),
+                function_scope,
+            } => Some((package.clone(), *line, *column, *function_scope)),
             _ => None,
         })
         .collect()
@@ -4687,7 +4692,7 @@ fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<(String, u32, 
 #[allow(clippy::too_many_arguments)]
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
-    package_loads: &[(String, u32, u32)],
+    package_loads: &[PackageLoadKey],
     declared_symbols: &[super::types::DeclaredSymbol],
     nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
@@ -4714,21 +4719,26 @@ fn compute_interface_hash(
         }
     }
 
-    // Include loaded packages WITH their (line, column) positions, sorted for
-    // determinism (Requirement 14.5). Position is hashed — not just the package
-    // name set — because a `library()`/`require()` load contributes to a file
-    // that `source()`s this one only when it PRECEDES the `source()` call site
-    // (and to a backward-parent prefix evaluated at that site). So MOVING a
-    // `library()` across a `source()` changes the cross-file scope even though
-    // the package-name multiset is unchanged; omitting position let the
-    // persistent standalone-scope cache (#483) serve a stale isolated scope
-    // after such a move. Mirrors the `line` inclusion for declared symbols below.
+    // Include loaded packages WITH their (line, column) position AND function
+    // scope (Requirement 14.5). Neither the name set alone nor position alone is
+    // a complete change-detector: a `library()`/`require()` load contributes to a
+    // file that `source()`s this one only when it PRECEDES the `source()` call
+    // site (position) AND its function scope is the same-or-ancestor of the
+    // call's (scope). So MOVING a `library()` across a `source()`, or flipping it
+    // between top-level and function-scoped at a fixed position, changes the
+    // cross-file scope even though the package-name multiset is unchanged;
+    // omitting either let the persistent standalone-scope cache (#483) serve a
+    // stale isolated scope. Sort by the `(name, line, column)` prefix — unique
+    // per load — since `Option<FunctionScopeInterval>` is not `Ord`; the full
+    // four-tuple (incl. scope) is hashed. Mirrors the `line` inclusion for
+    // declared symbols below.
     let mut sorted_packages: Vec<_> = package_loads.iter().collect();
-    sorted_packages.sort();
-    for (package, line, column) in sorted_packages {
+    sorted_packages.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+    for (package, line, column, function_scope) in sorted_packages {
         package.hash(&mut hasher);
         line.hash(&mut hasher);
         column.hash(&mut hasher);
+        function_scope.hash(&mut hasher);
     }
 
     // Include declared symbols in the hash (sorted for determinism)
@@ -10479,6 +10489,81 @@ mod tests {
             pkgs(&sb_after),
             vec!["tidyr".to_string()],
             "post-edit scope must reflect the new library() in the member's backward parent"
+        );
+    }
+
+    /// Regression for the fourth WI2b staleness variant: a contributing file's
+    /// `library()`/`require()` FUNCTION SCOPE (not just its position) affects the
+    /// isolated scope — a function-scoped load contributes to a sourced child only
+    /// when the `source()` call shares or descends that scope. Flipping `a`'s load
+    /// from top-level to function-scoped at a FIXED `(line, column)` (wrapping it
+    /// in an IIFE) changes whether `pkg` reaches the standalone hub, while leaving
+    /// the package name+position, source() edges, and `edge_revision` unchanged.
+    /// Fixed by hashing each load's `function_scope` in `compute_interface_hash`.
+    #[test]
+    fn standalone_cache_invalidates_on_package_function_scope_flip() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                // library(pkg) at line 1, col 0, TOP-LEVEL: contributes to m's
+                // prefix at source(m) and so leaks into hub's isolated scope.
+                (
+                    a.clone(),
+                    "# pad\nlibrary(pkg)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+                ),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        let cache = Arc::new(StandaloneScopeCache::new());
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&before), vec!["pkg".to_string()]);
+
+        // Wrap the load in an IIFE so it becomes function-scoped, keeping the
+        // `library` token at the SAME (line 1, col 0) and the source() calls on
+        // the same lines (so edge_revision is unchanged). Now top-level source(m)
+        // is not in the load's scope -> pkg must NOT contribute.
+        replace_artifacts(
+            &mut arts,
+            &a,
+            "(function(){\nlibrary(pkg)})()\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+        );
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&after),
+            pkgs(&reference),
+            "stale HIT: cache served pre-flip package set after a library() became function-scoped"
+        );
+        assert!(
+            pkgs(&after).is_empty(),
+            "a function-scoped library() must not propagate to a top-level source(), got {:?}",
+            pkgs(&after)
         );
     }
 
