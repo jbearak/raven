@@ -1085,13 +1085,25 @@ fn forward_memo_graph_has_cycle(
 ///
 /// ## Returned member list
 ///
-/// The returned `Vec<Url>` is the **forward closure** only (not the full
-/// contributing set). The EOF hook uses it to gate on visited-contamination: if a
-/// forward-closure member is already in the resolver's `visited`, its forward
-/// `source()` would short-circuit and the resolved scope would be a *truncated*
-/// (caller-path-dependent) one that must never be cached. A backward parent being
-/// in `visited` does NOT truncate (its packages are still picked up), so the
-/// guard correctly excludes it.
+/// The returned `Vec<Url>` is the **full contributing set** (forward closure plus
+/// the backward parents of non-standalone members). The EOF hook uses it to gate
+/// on visited-contamination: if ANY contributing file is already in the resolver's
+/// `visited`, the resolved scope would be a *truncated*, caller-path-dependent one
+/// that must never be cached. Two truncation channels make this necessary:
+///   * a **forward-closure** member already visited → its forward `source()`
+///     short-circuits (the revisit guard returns an empty scope), dropping its
+///     whole subtree; and
+///   * a **backward parent** of a non-standalone member already visited → the
+///     same revisit guard zeroes the parent's recursive scope, so while the
+///     parent's OWN `library()` calls still propagate (read directly from its
+///     artifacts), the packages it *inherited* from its own parents and the ones
+///     *loaded* by its sourced siblings are silently dropped from the member's
+///     prefix — and therefore from the callee's scope.
+///
+/// Because whether a contributing file is visited is exactly the caller-path the
+/// URI-keyed cache assumes away, the guard MUST cover both channels; gating on the
+/// forward closure alone admitted a stale cross-reach HIT (regression
+/// `standalone_cache_skips_when_member_backward_parent_is_visited`).
 ///
 /// Both walks carry their own `seen` guard, so source cycles terminate (and the
 /// cache is only consulted on acyclic graphs anyway). A file with no artifacts
@@ -1111,33 +1123,15 @@ where
     if let Some((fp, members)) = memo.borrow().standalone_closures.get(uri) {
         return (*fp, Arc::clone(members));
     }
-    // (1) Forward source() closure, deterministic order (sorted neighbors) — the
-    // member list returned for the contamination guard.
-    let mut fwd_seen: HashSet<Url> = HashSet::new();
-    let mut order: Vec<Url> = Vec::new();
-    let mut queue: std::collections::VecDeque<Url> = std::collections::VecDeque::new();
-    fwd_seen.insert(uri.clone());
-    queue.push_back(uri.clone());
-    while let Some(current) = queue.pop_front() {
-        order.push(current.clone());
-        let mut children: Vec<Url> = graph
-            .get_dependencies(&current)
-            .iter()
-            .map(|edge| edge.to.clone())
-            .collect();
-        children.sort();
-        children.dedup();
-        for child in children {
-            if fwd_seen.insert(child.clone()) {
-                queue.push_back(child);
-            }
-        }
-    }
-
-    // (2) Full contributing set for the fingerprint: closure under forward edges
-    // from every file, and backward edges only from a non-standalone file (see
-    // the doc comment). Start from `uri` (standalone, so its own backward edges
-    // are never followed).
+    // Full contributing set: the closure under forward source edges from every
+    // file, and backward source edges only out of a non-standalone file (see the
+    // doc comment). Start from `uri` (standalone, so its own backward edges are
+    // never followed). This single set is BOTH hashed into the fingerprint AND
+    // returned as the contamination-guard member list — any contributing file
+    // being already `visited` yields a truncated, caller-path-dependent scope
+    // (a forward member's source short-circuits; a backward parent's inherited /
+    // sibling-loaded packages are dropped by the revisit guard), so the guard
+    // must cover the whole set, not just the forward closure.
     let mut contrib: HashSet<Url> = HashSet::new();
     let mut work: std::collections::VecDeque<Url> = std::collections::VecDeque::new();
     contrib.insert(uri.clone());
@@ -1179,7 +1173,7 @@ where
         }
     }
     let fp = hasher.finish();
-    let members = Arc::new(order);
+    let members = Arc::new(contrib_sorted);
     memo.borrow_mut()
         .standalone_closures
         .insert(uri.clone(), (fp, Arc::clone(&members)));
@@ -5787,9 +5781,18 @@ where
                     get_metadata,
                     forward_child_memo,
                 );
-                // Skip the cache if any closure member is already visited (the
-                // forward source of that member would short-circuit → truncated,
-                // non-cacheable scope).
+                // Skip the cache if any CONTRIBUTING file is already visited: a
+                // visited forward member's source() short-circuits, and a visited
+                // backward parent of a non-standalone member loses its inherited /
+                // sibling-loaded packages at the revisit guard. Either way the
+                // resolved scope is truncated and caller-path-dependent, so it must
+                // never be cached (`members` is the full contributing set).
+                //
+                // This is conservatively over-broad: in a dense graph the
+                // contributing set often intersects `visited` even when no
+                // package-dropping truncation actually happens, so some sound
+                // entries are skipped (a perf cost, never a correctness one). A
+                // precise, package-contribution-aware replacement is tracked in #488.
                 if members.iter().any(|m| visited.contains_key(m)) {
                     None
                 } else {
@@ -10419,9 +10422,14 @@ mod tests {
         let hub = Url::parse("file:///proj/hub.r").unwrap();
         let a = Url::parse("file:///proj/a.r").unwrap();
         let b = Url::parse("file:///proj/b.r").unwrap();
-        // Diamond: `a` loads dplyr, sources hub THEN m (so `a` is a backward
-        // parent of m, and dplyr is in scope at `a`'s source(m)). hub is
-        // standalone and sources m. `b` only sources hub. m is non-standalone.
+        let c = Url::parse("file:///proj/c.r").unwrap();
+        // `a` loads dplyr then sources m (so `a` is a backward parent of m, and
+        // dplyr is in scope at `a`'s source(m)). hub is standalone and sources m.
+        // Callers `b` and `c` source hub only. m is non-standalone. NB: the
+        // leaking parent `a` must NOT itself source hub — a caller that is also a
+        // contributing backward parent is on its own `visited` path, which the
+        // contamination guard now (correctly) refuses to cache; routing the leak
+        // through a non-caller `a` keeps the cross-caller reuse this test asserts.
         let (mut arts, metas, graph) = build_cache_scenario(
             &root,
             &[
@@ -10430,11 +10438,9 @@ mod tests {
                     hub.clone(),
                     "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
                 ),
-                (
-                    a.clone(),
-                    "library(dplyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
-                ),
+                (a.clone(), "library(dplyr)\nsource(\"m.r\")\n"),
                 (b.clone(), "source(\"hub.r\")\n"),
+                (c.clone(), "source(\"hub.r\")\n"),
             ],
         );
         let rev = graph.edge_revision();
@@ -10452,15 +10458,15 @@ mod tests {
             v
         }
 
-        // Populate the cache via caller `a`, then resolve via caller `b`: `b`
-        // must still HIT (the leaked package is caller-independent), proving the
+        // Populate the cache via caller `b`, then resolve via caller `c`: `c`
+        // must HIT (the leaked package is caller-independent), proving the
         // contributing-set fix did not break cross-caller reuse.
         let cache = Arc::new(StandaloneScopeCache::new());
-        let sa = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
         let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
-        assert_eq!(pkgs(&sa), vec!["dplyr".to_string()]);
+        let sc = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&sb), vec!["dplyr".to_string()]);
         assert_eq!(
-            pkgs(&sb),
+            pkgs(&sc),
             vec!["dplyr".to_string()],
             "second caller must see the same caller-independent scope"
         );
@@ -10469,26 +10475,110 @@ mod tests {
         // EDIT `a`: library(dplyr) -> library(tidyr). Only a library() call
         // changed, NOT a source() edge, so edge_revision is unchanged; `a` is a
         // backward parent of m, not a member of hub's forward closure.
-        replace_artifacts(
-            &mut arts,
-            &a,
-            "library(tidyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
-        );
+        replace_artifacts(&mut arts, &a, "library(tidyr)\nsource(\"m.r\")\n");
 
         // Same persistent cache: must NOT serve the stale dplyr scope.
-        let sb_after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let sc_after = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache, rev, 0);
         // Reference: a fresh cache reflects the edit.
         let cache_fresh = Arc::new(StandaloneScopeCache::new());
-        let sb_ref = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        let sc_ref = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
         assert_eq!(
-            pkgs(&sb_after),
-            pkgs(&sb_ref),
+            pkgs(&sc_after),
+            pkgs(&sc_ref),
             "stale HIT: persistent cache served pre-edit `a`'s package after `a` changed"
         );
         assert_eq!(
-            pkgs(&sb_after),
+            pkgs(&sc_after),
             vec!["tidyr".to_string()],
             "post-edit scope must reflect the new library() in the member's backward parent"
+        );
+    }
+
+    /// Regression for the visited-dependent backward-parent staleness found in
+    /// the WI2b adversarial review. A standalone callee C's isolated scope can
+    /// depend on whether a backward parent of one of its NON-standalone
+    /// forward-closure members is already in the resolver's `visited` map — and
+    /// `visited` is the caller's forward-path, which the URI-keyed cache assumes
+    /// away. That breaks caller-independence: two diagnostic roots in one session
+    /// compute the SAME key but DIFFERENT scopes, so the first reach's value is
+    /// served stale to the second.
+    ///
+    /// Diamond (all forward `source()` edges, acyclic): `gp` does
+    /// `library(dplyr)` then `source("p.r")`; `p` sources both `c` and `m`;
+    /// standalone `c` sources `m`; `a` sources `c`. `m`'s backward parents are
+    /// `{c, p}`, and `p` transitively INHERITS dplyr from `gp` (p loads nothing
+    /// itself). All four of `{c, m, p, gp}` are in C's contributing set.
+    ///
+    /// - Root `gp`: the path resolves `p` at EOF before reaching `c`, so when
+    ///   `m`'s backward walk re-reaches `p` the revisit guard returns an empty
+    ///   parent scope and `p`'s INHERITED dplyr is dropped — C's scope has NO
+    ///   dplyr. (`p`'s OWN `library()` calls would survive via the direct-artifact
+    ///   channel, but dplyr is inherited, not loaded by `p`.)
+    /// - Root `a`: `p` is not visited, the walk picks dplyr up — C has dplyr.
+    ///
+    /// Both reaches produce the identical cache key (same contributing-set
+    /// fingerprint over `{c, m, p, gp}`, same `edge_revision`, same config), so a
+    /// `gp`-warmed entry would be served stale to the `a` reach. Fixed by having
+    /// the contamination guard skip caching when ANY contributing-set member
+    /// (forward closure OR a backward parent of a non-standalone member) is in
+    /// `visited`, not just the forward closure.
+    #[test]
+    fn standalone_cache_skips_when_member_backward_parent_is_visited() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let gp = Url::parse("file:///proj/gp.r").unwrap();
+        let p = Url::parse("file:///proj/p.r").unwrap();
+        let c = Url::parse("file:///proj/c.r").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    c.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nc_fn <- function() 2\n",
+                ),
+                (p.clone(), "source(\"c.r\")\nsource(\"m.r\")\n"),
+                (gp.clone(), "library(dplyr)\nsource(\"p.r\")\n"),
+                (a.clone(), "source(\"c.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        // Warm the shared cache from root `gp`: the path visits `p` at EOF before
+        // reaching `c`, so c's resolved scope is the visited-TRUNCATED one (no
+        // dplyr — the inherited package is dropped at the revisit guard).
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let _ = resolve_eof_cached(&gp, &arts, &metas, &graph, &root, &cache, rev, 0);
+
+        // Resolve from root `a` on the SAME cache. A stale HIT would serve gp's
+        // truncated (no-dplyr) scope; the correct (cache-off) result has dplyr.
+        let sa = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let sa_ref = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&sa),
+            pkgs(&sa_ref),
+            "stale HIT: the gp-reach cached a visited-truncated scope and served it to the a-reach"
+        );
+        assert_eq!(
+            pkgs(&sa),
+            vec!["dplyr".to_string()],
+            "a's reach resolves c fresh (p not visited) and must see dplyr inherited via m's \
+             backward parent p"
         );
     }
 

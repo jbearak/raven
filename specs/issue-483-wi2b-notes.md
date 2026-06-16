@@ -134,3 +134,82 @@ part 2 may change that number — an allowed directive-scoped change to be
 characterized and justified against the 367 baseline. Cache-on must equal
 cache-off for the same build; the directive-free path stays byte-identical to
 pre-#479 main (361).
+
+## Soundness: why the key is a complete determinant of the cached scope
+
+A cache HIT must be byte-identical to the un-memoized resolution. The cached
+value is the standalone callee C's isolated EOF scope at depth ≥ 1, which is a
+function of exactly:
+
+1. **Each contributing file's interface**, folded into `closure_interface_fingerprint`:
+   - symbols (full identity + position + signature + formals, via `interface_hash`, post-#482),
+   - package loads as `(name, line, column, function_scope)` (a `library()` contributes
+     to a sourced child only when it *precedes* the `source()` and shares/descends its scope),
+   - `nse_declarations` and the `standalone` flag.
+2. **Source ordering and graph membership**, via `edge_revision` (full-edge equality
+   incl. `call_site_line`/`call_site_column`, so a `source()` reorder or retarget bumps it).
+3. **The contributing set itself** = forward `source()` closure of C, PLUS the backward
+   parents of any *non-standalone* closure member (transitively, never following a
+   standalone file's backward edges). A non-standalone member runs its own
+   `parent_prefix_at` walk, so its external parents leak packages into C's scope.
+4. **Traversal config**: `max_chain_depth`, `hoist_globals`, `backward_dep_mode`,
+   `package_config_generation`.
+
+Everything else is gated off on this path: `data_alias_provider` is `None`,
+`package_contribution` is `None`, `inherited_packages` is empty, `pre_computed_prefix`
+is empty, and `base_exports` is injected only at depth 0 (never on the depth-≥1 cached
+path). The graph is acyclic (cycle ⇒ visited-dependent ⇒ not cached).
+
+**Caller-independence is enforced, not assumed.** The cached scope must be the SAME
+regardless of which file sourced C; otherwise a URI-keyed cross-snapshot HIT is
+unsound. The one channel that can make resolution caller-dependent is the resolver's
+shared `visited` map (the caller's forward path): if a contributing file is already
+`visited`, the revisit guard truncates its contribution. The contamination guard at
+the EOF hook therefore refuses to cache whenever ANY member of the **full contributing
+set** (not just the forward closure) is in `visited` — covering both truncation
+channels: a visited forward member's `source()` short-circuits, and a visited backward
+parent of a non-standalone member loses the packages it *inherited* / had *loaded by
+siblings* (its own `library()` calls survive via the direct-artifact read, but the
+recursive `parent_scope` is zeroed).
+
+## Staleness fixes found in WI2b adversarial review (each reproduced with a failing test first)
+
+1. **Contributing-set fingerprint** (`353e819e`): a forward-only fingerprint missed an
+   edit to a member's *external* backward parent. Fix: fingerprint over the full
+   contributing set. Test `standalone_cache_invalidates_on_member_backward_parent_edit`.
+2. **Package-load position** (`7e648833`): hash `(line, column)`. Test
+   `standalone_cache_invalidates_on_library_move_across_source`.
+3. **Package-load function_scope** (`09f6d6f3`): hash `function_scope`. Test
+   `standalone_cache_invalidates_on_package_function_scope_flip`.
+4. **Visited backward-parent contamination guard** (this commit): the guard checked only
+   the forward closure, so a member's backward parent being on the caller's `visited`
+   path dropped its inherited/loaded packages — a caller-dependent scope cached and
+   served stale across diagnostic roots in one session. Fix: the guard checks the full
+   contributing set. Test `standalone_cache_skips_when_member_backward_parent_is_visited`.
+   This guard is **conservatively over-broad**: in a dense graph the contributing set
+   frequently intersects the caller's `visited` path even when no package-dropping
+   truncation actually occurs, so it skips some sound entries (worldwide A/B: cache hits
+   354/10 → 255/8, byte-identity preserved). A precise (package-contribution-aware or
+   post-hoc) replacement that recovers those hits is tracked in **#488**.
+
+## Refuted findings (documented to prevent re-flagging)
+
+- **`rm()` removal column not hashed** (Codex session `019ed1e4`): FALSE POSITIVE. `rm()`
+  removes a *symbol*, and symbols from a member's backward parent are leak-filtered at the
+  M→C merge (`child_source_symbol_is_leak`), so a removed symbol never reaches C's scope;
+  `rm()` cannot remove packages. `compute_interface_hash` is shared with revalidation, so
+  no removal-column plumbing was added.
+
+- **Callee `PathContext` not in the key** (Codex session `019ed229`): a non-bug, shadowed
+  by the dependency graph. The resolver resolves forward children from graph edges
+  (`scope.rs` STEP 2, "prefer pre-computed dependency graph edges") and only falls back to
+  `path_ctx`-based path resolution when the graph lacks an edge — but the graph builder
+  resolves every relative `source()` to an absolute target existence-independently, so an
+  edge is always present and the `path_ctx` fallback never fires. A standalone callee's
+  effective `path_ctx` is `PathContext::from_metadata(C)` (caller-independent: part 2 gives
+  it no inherited working directory), and any `# raven: cd` / workspace-root change that
+  *redirects* a `source()` retargets the edge and bumps `edge_revision`. So `path_ctx`
+  never independently changes the cached outcome; it is deliberately NOT in the key.
+  **Tripwire:** if the resolver is ever changed so the inline `path_ctx` fallback can be
+  authoritative over (or diverge from) the graph edges, the callee's `path_ctx` fingerprint
+  MUST be added to `StandaloneScopeKey` (mirroring `ForwardChildKey::path_fp`).

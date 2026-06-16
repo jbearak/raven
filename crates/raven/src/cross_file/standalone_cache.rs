@@ -45,6 +45,23 @@
 // the depth-0 `base_exports` injection, which only the own-root query receives,
 // never enters a cached scope).
 //
+// Caller-independence is enforced, not assumed. The only resolver input that can
+// make C's "isolated" scope depend on its caller is the shared `visited` map (the
+// caller's forward path): a contributing file already in `visited` is truncated by
+// the revisit guard. So the EOF hook refuses to cache when ANY member of the FULL
+// contributing set (forward closure PLUS backward parents of non-standalone
+// members) is in `visited` — see `standalone_closure_fingerprint_and_members` in
+// `scope.rs`, which returns that set and documents both truncation channels.
+//
+// What the key deliberately omits. The callee's effective `PathContext` is NOT in
+// the key: it is caller-independent (`PathContext::from_metadata(C)`, no inherited
+// working directory — part 2), the resolver resolves forward children from graph
+// edges (never the `path_ctx` fallback, which the always-present edges shadow), and
+// any `# raven: cd`/workspace change that redirects a `source()` bumps
+// `edge_revision`. (Tripwire: if the inline `path_ctx` fallback in `scope.rs` STEP 2
+// ever becomes authoritative over graph edges, add a `path_ctx` fingerprint to the
+// key, mirroring `ForwardChildKey::path_fp`.)
+//
 // Locking discipline. The cache is owned by `WorldState` behind an `Arc`. Per
 // CLAUDE.md, the diagnostics snapshot clones the `Arc` handle (and reads
 // `edge_revision` / `package_config_generation`) under the `WorldState` read
