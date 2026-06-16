@@ -30,10 +30,39 @@ review gate.
 
 ---
 
-## Work item 1 — Tier 1: share the prefix `ForwardChildMemo` within a snapshot
+## Work item 1 — Tier 1: share the prefix `ForwardChildMemo` within a stream
 
-**Status: validated in the #476 session (8.4× on `functions.r`, byte-identical).
-Low risk. Do this first — it proves memo-sharing is behavior-preserving.**
+**STATUS: IMPLEMENTED (commit `073d322c`). worldwide (release): `functions.r`
+3.54s → 1.60s; `raven check .` 25.6s → 21.45s; undefined-variable output
+byte-identical (361, diff empty). All #472 equivalence + the local=TRUE property
+tests green.**
+
+> **Design evolved during implementation.** The naive "share one prefix memo
+> across all prefix computations" is **unsound** — `ForwardChildMemo` is
+> documented "never shared across queries" because its value depends on
+> per-query inputs the key omits. Two such inputs vary within a stream and each
+> is handled separately (confirmed empirically; the simple hoist-into-cache
+> approach failed two equivalence/property tests):
+>
+> 1. **`query_inside_function` (local/sys.source scoping)** → **slot isolation**:
+>    the inside-function (`true`) prefix slot keeps its own fresh memo. Only the
+>    `false`-context computations (the `false` top slot + every per-child-source
+>    call, all of which query at EOF) share. Fixes the `local=TRUE`
+>    function-scoped declaration-inheritance divergence.
+> 2. **Truncation (visited context)** → **gate**
+>    `DependencyGraph::prefix_memo_share_safe`: a bidirectional BFS shares only
+>    when the neighborhood is provably too shallow to reach `maxChainDepth`.
+>    Fixes the small-`maxChainDepth` `depth_exceeded`/`chain` divergence.
+>
+> When either condition is unmet the stream falls back to fresh-per-prefix
+> (pre-#479 behavior). Per the user's guidance, the deliberately-unoptimized case
+> is `source()`-inside-a-function (`local=TRUE`); the win targets global-scope
+> hubs. Residual risk (accepted): the analysis that these are the *only* two
+> unkeyed varying inputs within a `false`-context stream is backed by the full
+> test suite (5200 lib tests, incl. the #472 `memo_equiv_*` suite and the
+> cross-file property tests) rather than a formal proof.
+
+Original analysis (kept for context):
 
 ### Root cause (re-verified against code)
 
