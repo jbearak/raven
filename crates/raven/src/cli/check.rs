@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tower_lsp::lsp_types::{Diagnostic, Url};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
@@ -312,6 +312,80 @@ pub async fn run(args: CheckArgs) -> i32 {
     let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
     let mut reported_loaded_packages = std::collections::BTreeSet::new();
 
+    // Issue #479 WI3 — parallelize the CPU-bound diagnostic pass across files.
+    // The graph/index caches are `RwLock`/atomic and immutable after the scan,
+    // so per-file scope resolution is safe to run concurrently. The one hazard
+    // (Codex review) is that open documents outrank index content in the content
+    // provider, so sharing `state.documents` across workers would make each
+    // worker treat the others' targets as "open" and pull the wrong artifacts.
+    // We avoid that entirely: `state.documents` stays empty during the parallel
+    // region, and each worker passes a one-entry overlay holding only its target
+    // (see `compute_file_diagnostics_sync` /
+    // `DiagnosticsSnapshot::build_with_open_documents`). This reproduces the
+    // sequential "exactly one open target" semantics per task, so output is
+    // byte-identical. The async on-disk missing-file checks (cheap I/O) and the
+    // rare disk-fallback targets (not in the workspace index) are handled
+    // afterward on the async runtime.
+    use rayon::prelude::*;
+
+    struct SyncResult {
+        path: PathBuf,
+        uri: Url,
+        sync_diags: Vec<Diagnostic>,
+        directive_meta: crate::cross_file::CrossFileMetadata,
+        missing_file_severity: Option<DiagnosticSeverity>,
+        loaded_packages: Vec<String>,
+    }
+
+    // Phase 1 (parallel, CPU-bound): indexed targets only. A target that is not
+    // in the workspace index (disk-fallback) or whose path can't be a URL is
+    // skipped here and handled sequentially below.
+    let sync_results: Vec<SyncResult> = targets
+        .par_iter()
+        .filter_map(|path| {
+            let uri = Url::from_file_path(path).ok()?;
+            // Reuse the already-parsed `Document` from the scan (tree included),
+            // exactly as the sequential path did — no disk re-read / re-parse.
+            let doc = state.workspace_index.get(&uri).cloned()?;
+            let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
+            let mut open_documents = std::collections::HashMap::new();
+            open_documents.insert(uri.clone(), doc);
+            let (sync_diags, directive_meta, missing_file_severity) =
+                compute_file_diagnostics_sync(&state, &uri, &open_documents)?;
+            Some(SyncResult {
+                path: path.clone(),
+                uri,
+                sync_diags,
+                directive_meta,
+                missing_file_severity,
+                loaded_packages,
+            })
+        })
+        .collect();
+
+    // Phase 2 (async): finalize the parallel results with on-disk missing-file
+    // checks and collect their attached packages. Order is irrelevant — the
+    // whole `all_diags` set is sorted below.
+    for r in sync_results {
+        reported_loaded_packages.extend(r.loaded_packages);
+        let diags = finalize_file_diagnostics(
+            &state,
+            &r.uri,
+            r.sync_diags,
+            &r.directive_meta,
+            r.missing_file_severity,
+        )
+        .await;
+        for d in diags {
+            all_diags.push((r.path.clone(), d));
+        }
+    }
+
+    // Phase 3 (sequential): targets not handled in phase 1 — a bad URL, or a
+    // disk-fallback target the scan didn't index (e.g. a symlink-alias path, or
+    // an `.Rmd`/`.qmd` chunk file outside the R-only scan). Rare; the existing
+    // open → compute → close path (which uses `state.documents`) is preserved
+    // verbatim, so behavior for these is unchanged.
     for path in &targets {
         let Ok(uri) = Url::from_file_path(path) else {
             eprintln!(
@@ -321,45 +395,26 @@ pub async fn run(args: CheckArgs) -> i32 {
             operator_error = true;
             continue;
         };
-        // `DiagnosticsSnapshot::build` reads the target from `state.documents`,
-        // which the workspace scan does NOT populate — it stores parsed
-        // `Document`s (tree included) in `state.workspace_index`. Reuse that
-        // already-parsed `Document` instead of re-reading the file from disk
-        // and re-parsing it: in the common "report the whole workspace" run
-        // that halves the tree-sitter work (parse once during the scan, not
-        // again here). Fall back to reading from disk only for a target the
-        // scan didn't index (e.g. a path the report walk reached through a
-        // different symlink alias, OR a chunk file — `.Rmd`/`.qmd` are
-        // deliberately outside the R-only workspace scan). Either way the
-        // document is removed afterwards to bound memory across a large report
-        // set; the clone keeps the index entry intact for other files'
-        // cross-file resolution.
-        if let Some(doc) = state.workspace_index.get(&uri).cloned() {
-            state.documents.insert(uri.clone(), doc);
-        } else {
-            let text = match crate::state::read_source(path) {
-                Ok(t) => t,
-                Err(crate::state::SourceReadError::Io(e)) => {
-                    eprintln!("raven check: cannot read {}: {e}", path.display());
-                    operator_error = true;
-                    continue;
-                }
-                // A mis-encoded file is a property of the code, like a syntax
-                // error — not an operator error. Report it as a finding (see
-                // `encoding_diagnostic`) and keep going, so the exit code
-                // reflects findings rather than a half-read abort.
-                Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
-                    all_diags.push((path.clone(), encoding_diagnostic(offset, byte)));
-                    continue;
-                }
-            };
-            open_disk_fallback_target(&mut state, &uri, path, &text);
+        if state.workspace_index.contains_key(&uri) {
+            continue; // already handled in the parallel phase
         }
-        // Both arms above leave the document in `state.documents`; collect its
-        // attached packages from the doc already in hand (free — the loop opens
-        // each target for diagnostics regardless). This intentionally also covers
-        // the disk-fallback arm, unlike the index-only up-front
-        // `prefetch_reported_packages` warm-up.
+        let text = match crate::state::read_source(path) {
+            Ok(t) => t,
+            Err(crate::state::SourceReadError::Io(e)) => {
+                eprintln!("raven check: cannot read {}: {e}", path.display());
+                operator_error = true;
+                continue;
+            }
+            // A mis-encoded file is a property of the code, like a syntax
+            // error — not an operator error. Report it as a finding (see
+            // `encoding_diagnostic`) and keep going, so the exit code
+            // reflects findings rather than a half-read abort.
+            Err(crate::state::SourceReadError::InvalidEncoding { offset, byte }) => {
+                all_diags.push((path.clone(), encoding_diagnostic(offset, byte)));
+                continue;
+            }
+        };
+        open_disk_fallback_target(&mut state, &uri, path, &text);
         if let Some(doc) = state.documents.get(&uri) {
             reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
         }
@@ -902,23 +957,63 @@ fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<Stri
 /// open). A malformed file is not an operator error here — its reportable
 /// syntax errors are surfaced like any other diagnostic when the tree still
 /// builds.
-async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -> Vec<Diagnostic> {
-    let Some(snapshot) = crate::handlers::DiagnosticsSnapshot::build(state, uri) else {
-        return Vec::new();
-    };
+/// The synchronous half of a file's diagnostics: build the snapshot and run the
+/// CPU-bound scope-resolution pass. Returns the pre-async findings plus the
+/// inputs the async missing-file pass needs (`directive_meta`, severity). Split
+/// out so `raven check` can run this — the expensive part — across files in
+/// parallel (issue #479 WI3), then do the cheap async filesystem checks
+/// afterward. `open_documents` is the worker's one-entry overlay (see
+/// [`crate::handlers::DiagnosticsSnapshot::build_with_open_documents`]).
+fn compute_file_diagnostics_sync(
+    state: &crate::state::WorldState,
+    uri: &Url,
+    open_documents: &std::collections::HashMap<Url, crate::state::Document>,
+) -> Option<(
+    Vec<Diagnostic>,
+    crate::cross_file::CrossFileMetadata,
+    Option<DiagnosticSeverity>,
+)> {
+    let snapshot = crate::handlers::DiagnosticsSnapshot::build_with_open_documents(
+        state,
+        uri,
+        open_documents,
+    )?;
     let cancel = crate::handlers::DiagCancelToken::never();
-    let Some(sync_diags) = crate::handlers::diagnostics_from_snapshot(&snapshot, uri, &cancel)
-    else {
-        return Vec::new();
-    };
-    // Replace the snapshot's cache-based missing-file checks with real on-disk
-    // existence checks — exactly what the LSP publish path does.
+    let sync_diags = crate::handlers::diagnostics_from_snapshot(&snapshot, uri, &cancel)?;
     let missing_file_severity = snapshot.cross_file_config.missing_file_severity;
+    Some((sync_diags, snapshot.directive_meta, missing_file_severity))
+}
+
+/// The async half: replace the snapshot's cache-based missing-file checks with
+/// real on-disk existence checks — exactly what the LSP publish path does.
+async fn finalize_file_diagnostics(
+    state: &crate::state::WorldState,
+    uri: &Url,
+    sync_diags: Vec<Diagnostic>,
+    directive_meta: &crate::cross_file::CrossFileMetadata,
+    missing_file_severity: Option<DiagnosticSeverity>,
+) -> Vec<Diagnostic> {
     crate::handlers::diagnostics_async_standalone(
         uri,
         sync_diags,
-        &snapshot.directive_meta,
+        directive_meta,
         state.workspace_folders.first(),
+        missing_file_severity,
+    )
+    .await
+}
+
+async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -> Vec<Diagnostic> {
+    let Some((sync_diags, directive_meta, missing_file_severity)) =
+        compute_file_diagnostics_sync(state, uri, &state.documents)
+    else {
+        return Vec::new();
+    };
+    finalize_file_diagnostics(
+        state,
+        uri,
+        sync_diags,
+        &directive_meta,
         missing_file_severity,
     )
     .await

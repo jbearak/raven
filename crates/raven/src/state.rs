@@ -742,11 +742,26 @@ impl WorldState {
     ///
     /// **Validates: Requirements 4.1, 13.1, 13.2**
     pub fn content_provider(&self) -> DefaultContentProvider<'_> {
+        self.content_provider_with_documents(&self.documents)
+    }
+
+    /// Like [`Self::content_provider`] but with an explicit open-documents map
+    /// instead of `self.documents`. Used by `raven check`'s parallel per-file
+    /// loop (issue #479 WI3): each rayon worker supplies a one-entry map holding
+    /// just its target, so exactly one document is "open" per task without
+    /// mutating the shared `self.documents` (open docs outrank index content, so
+    /// sharing one `documents` map across workers would make each worker treat
+    /// the others' targets as open and pull the wrong artifacts). Every other
+    /// field is shared by reference (immutable after the workspace scan).
+    pub fn content_provider_with_documents<'a>(
+        &'a self,
+        documents: &'a HashMap<Url, Document>,
+    ) -> DefaultContentProvider<'a> {
         DefaultContentProvider::with_legacy(
             &self.document_store,
             &self.workspace_index_new,
             &self.cross_file_file_cache,
-            &self.documents,
+            documents,
             &self.workspace_index,
             &self.cross_file_workspace_index,
         )
