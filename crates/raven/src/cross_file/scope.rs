@@ -963,18 +963,16 @@ fn merge_child_source_packages(
 /// resolved gets re-resolved when reached again as a forward source — a ~7%
 /// regression on `raven check` of dense, hub-heavy workspaces. A forward
 /// `source()` always resolves its child at EOF `(MAX, MAX)`, and the child's
-/// resolved scope is a deterministic function of `(child_uri, path context,
-/// attached package set)` *as long as the child is not part of a source cycle*
-/// (a cyclic child's scope additionally depends on which ancestors were already
-/// visited — see the revisit guard in `scope_at_position_with_graph_recursive`).
-/// This memo caches that scope so each distinct `(child, context, packages)` is
-/// resolved once per top-level query.
+/// resolved scope is a deterministic function of [`ForwardChildKey`] *as long
+/// as the child is not part of a source cycle* (a cyclic child's scope
+/// additionally depends on which ancestors were already visited — see the
+/// revisit guard in `scope_at_position_with_graph_recursive`). This memo caches
+/// that scope so each distinct key is resolved once per top-level query.
 ///
 /// Lifetime discipline mirrors [`ParentPrefixCache`]: one instance per
 /// top-level scope query (or per [`ScopeStream`]); **never** shared across
-/// queries — the value depends on per-query inputs (the `DataAliasProvider`
-/// identity, `hoist_globals`, `max_depth`, `backward_dep_mode`) that the key
-/// does not encode.
+/// queries — the value also depends on per-query settings (`hoist_globals`,
+/// `max_depth`, `backward_dep_mode`) that the key does not encode.
 #[derive(Debug, Default)]
 pub(crate) struct ForwardChildMemo {
     /// Value is `(scope, compute_depth)`. Only **depth-truncation-free** scopes
@@ -1018,12 +1016,18 @@ pub(crate) struct ForwardChildMemo {
 ///   collide on one key and serve the `None` (alias-free) scope to the forward
 ///   caller, dropping dataset symbols. The per-query memo never outlives the
 ///   query, so a raw address is a sound, stable identity.
+/// - `standalone_parent_filter_fp`: hash of the active standalone-closure
+///   parent filter. Inside a standalone callee's isolated forward closure,
+///   non-standalone members ignore backward parents outside that closure; that
+///   changes their EOF scope and must not collide with ordinary unfiltered
+///   forward-child memo entries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardChildKey {
     child_uri: Url,
     path_fp: u64,
     pkg_fp: u64,
     provider_fp: usize,
+    standalone_parent_filter_fp: u64,
 }
 
 /// Hash a child's `PathContext` (or its absence) into a `path_fp`. Hashes the
@@ -1063,6 +1067,370 @@ fn package_set_fingerprint(pkgs: &HashSet<String>) -> u64 {
         }
     }
     h.finish()
+}
+
+/// Order-independent fingerprint of the active standalone parent filter.
+///
+/// This is a per-query memo key component only. `None` and `Some(empty)` are
+/// deliberately distinct: `None` means ordinary scope resolution, while
+/// `Some(_)` means parent-prefix walks are being filtered for an isolated
+/// standalone closure.
+fn standalone_parent_filter_fingerprint(filter: Option<&HashSet<Url>>) -> u64 {
+    let Some(allowed) = filter else {
+        return 0;
+    };
+
+    let mut h = DefaultHasher::new();
+    1u8.hash(&mut h);
+    match allowed.len() {
+        0 => {
+            0usize.hash(&mut h);
+        }
+        1 => {
+            1usize.hash(&mut h);
+            allowed.iter().next().unwrap().hash(&mut h);
+        }
+        _ => {
+            let mut uris: Vec<&Url> = allowed.iter().collect();
+            uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+            uris.len().hash(&mut h);
+            for uri in uris {
+                uri.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+fn resolve_forward_source_child_uri(
+    graph: &super::dependency::DependencyGraph,
+    uri: &Url,
+    source: &ForwardSource,
+    src_line: u32,
+    src_col: u32,
+    path_ctx: Option<&super::path_resolve::PathContext>,
+    prefer_active_path_context: bool,
+) -> Option<Url> {
+    let resolve_from_active_context = || {
+        source.resolved_uri.clone().or_else(|| {
+            path_ctx.and_then(|ctx| {
+                let resolved = if prefer_active_path_context {
+                    super::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?
+                } else {
+                    super::path_resolve::resolve_path(&source.path, ctx)?
+                };
+                super::path_resolve::path_to_uri(&resolved)
+            })
+        })
+    };
+
+    if prefer_active_path_context {
+        return resolve_from_active_context();
+    }
+
+    graph
+        .get_dependencies(uri)
+        .iter()
+        .find(|edge| {
+            edge.call_site_line == Some(src_line) && edge.call_site_column == Some(src_col)
+        })
+        .map(|edge| edge.to.clone())
+        .or_else(resolve_from_active_context)
+}
+
+/// Default capacity for the cross-snapshot standalone isolated-scope cache.
+///
+/// The cache is keyed by a closure fingerprint, so stale entries naturally fall
+/// out via LRU after interface/config churn. Size it to cover large hub-style
+/// workspaces without making long-lived editor sessions retain unbounded scope
+/// maps.
+const STANDALONE_SCOPE_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StandaloneScopeKey {
+    callee_uri: Url,
+    edge_revision: u64,
+    path_context_fingerprint: u64,
+    closure_interface_fingerprint: u64,
+    package_config_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StandaloneScopeEntry {
+    scope: Arc<ScopeAtPosition>,
+    compute_depth: usize,
+}
+
+/// Cross-snapshot cache of a standalone callee's caller-independent EOF scope.
+///
+/// Reads use `peek()` under a read lock and writes use `push()` under a write
+/// lock, matching the repository-wide LRU locking discipline. Values are only
+/// stored when the resolved scope is depth-truncation-free; each entry records
+/// the depth at which it was computed so shallower-or-equal reaches can reuse
+/// it byte-identically while deeper reaches recompute.
+pub struct StandaloneScopeCache {
+    inner: std::sync::RwLock<lru::LruCache<StandaloneScopeKey, StandaloneScopeEntry>>,
+    package_config_generation: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    stores: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for StandaloneScopeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StandaloneScopeCache")
+            .field(
+                "package_config_generation",
+                &self.package_config_generation(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for StandaloneScopeCache {
+    fn default() -> Self {
+        Self::new(STANDALONE_SCOPE_CACHE_CAPACITY)
+    }
+}
+
+impl StandaloneScopeCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(lru::LruCache::new(super::cache::non_zero_or(
+                capacity,
+                STANDALONE_SCOPE_CACHE_CAPACITY,
+            ))),
+            package_config_generation: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            stores: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn package_config_generation(&self) -> u64 {
+        self.package_config_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bump the coarse package/config generation and clear old entries.
+    ///
+    /// The generation is part of every key, so clearing is not required for
+    /// correctness. It keeps memory bounded after package library or
+    /// scope-affecting config changes invalidate all prior isolated scopes.
+    pub fn bump_package_config_generation(&self) -> u64 {
+        let next = self
+            .package_config_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+        next
+    }
+
+    fn get(
+        &self,
+        key: &StandaloneScopeKey,
+        requested_depth: usize,
+    ) -> Option<Arc<ScopeAtPosition>> {
+        if standalone_scope_cache_disabled() {
+            return None;
+        }
+        if let Ok(guard) = self.inner.read()
+            && let Some(entry) = guard.peek(key)
+            && requested_depth <= entry.compute_depth
+        {
+            log::trace!(
+                "standalone_scope_cache hit uri={} requested_depth={} compute_depth={} symbols={} loaded_packages={} inherited_packages={} parent_prefix_symbols={} package_origins={}",
+                key.callee_uri,
+                requested_depth,
+                entry.compute_depth,
+                entry.scope.symbols.len(),
+                entry.scope.loaded_packages.len(),
+                entry.scope.inherited_packages.len(),
+                entry.scope.parent_prefix_symbol_names.len(),
+                entry.scope.package_origins.len()
+            );
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(Arc::clone(&entry.scope));
+        }
+        self.misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    fn insert(&self, key: StandaloneScopeKey, scope: ScopeAtPosition, compute_depth: usize) {
+        if standalone_scope_cache_disabled() || !scope.depth_exceeded.is_empty() {
+            return;
+        }
+        if !scope.chain.iter().any(|uri| uri == &key.callee_uri) {
+            log::trace!(
+                "standalone_scope_cache skip partial uri={} compute_depth={} symbols={} loaded_packages={} chain_len={}",
+                key.callee_uri,
+                compute_depth,
+                scope.symbols.len(),
+                scope.loaded_packages.len(),
+                scope.chain.len()
+            );
+            return;
+        }
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some(existing) = guard.peek(&key)
+                && existing.compute_depth >= compute_depth
+            {
+                return;
+            }
+            log::trace!(
+                "standalone_scope_cache store uri={} compute_depth={} symbols={} loaded_packages={} inherited_packages={} parent_prefix_symbols={} package_origins={}",
+                key.callee_uri,
+                compute_depth,
+                scope.symbols.len(),
+                scope.loaded_packages.len(),
+                scope.inherited_packages.len(),
+                scope.parent_prefix_symbol_names.len(),
+                scope.package_origins.len()
+            );
+            guard.push(
+                key,
+                StandaloneScopeEntry {
+                    scope: Arc::new(scope),
+                    compute_depth,
+                },
+            );
+            self.stores
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats_for_test(&self) -> (u64, u64, u64, usize, u64) {
+        let len = self.inner.read().map(|g| g.len()).unwrap_or(0);
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+            self.stores.load(std::sync::atomic::Ordering::Relaxed),
+            len,
+            self.package_config_generation(),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct StandaloneScopeCacheContext<'a> {
+    cache: &'a StandaloneScopeCache,
+    edge_revision: u64,
+    package_config_generation: u64,
+}
+
+impl<'a> StandaloneScopeCacheContext<'a> {
+    pub fn new(
+        cache: &'a StandaloneScopeCache,
+        edge_revision: u64,
+        package_config_generation: u64,
+    ) -> Self {
+        Self {
+            cache,
+            edge_revision,
+            package_config_generation,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STANDALONE_SCOPE_CACHE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_standalone_scope_cache_disabled_for_test<T>(f: impl FnOnce() -> T) -> T {
+    STANDALONE_SCOPE_CACHE_DISABLED.with(|cell| {
+        let prev = cell.replace(true);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+fn standalone_scope_cache_disabled() -> bool {
+    #[cfg(test)]
+    {
+        if STANDALONE_SCOPE_CACHE_DISABLED.with(|cell| cell.get()) {
+            return true;
+        }
+    }
+
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("RAVEN_STANDALONE_SCOPE_CACHE")
+            .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "disabled"))
+    })
+}
+
+struct StandaloneClosureFingerprint {
+    interface_fingerprint: u64,
+    resolved_members: Vec<Url>,
+    member_set: HashSet<Url>,
+}
+
+fn standalone_closure_interface_fingerprint<F>(
+    callee_uri: &Url,
+    graph: &super::dependency::DependencyGraph,
+    max_depth: usize,
+    callee_depth: usize,
+    get_artifacts: &F,
+) -> StandaloneClosureFingerprint
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+{
+    let mut seen = HashSet::new();
+    let mut stack = vec![(callee_uri.clone(), 0usize)];
+
+    while let Some((uri, depth_from_callee)) = stack.pop() {
+        if !seen.insert(uri.clone()) {
+            continue;
+        }
+
+        let current_depth = callee_depth.saturating_add(depth_from_callee);
+        if current_depth + 1 >= max_depth {
+            continue;
+        }
+
+        for edge in graph.get_dependencies(&uri) {
+            stack.push((edge.to.clone(), depth_from_callee + 1));
+        }
+    }
+
+    let mut members: Vec<Url> = seen.into_iter().collect();
+    members.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let member_set: HashSet<Url> = members.iter().cloned().collect();
+
+    let mut h = DefaultHasher::new();
+    members.len().hash(&mut h);
+    let mut resolved_members = Vec::new();
+    for uri in members {
+        uri.hash(&mut h);
+        match get_artifacts(&uri) {
+            Some(artifacts) => {
+                1u8.hash(&mut h);
+                artifacts.interface_hash.hash(&mut h);
+                resolved_members.push(uri);
+            }
+            None => {
+                0u8.hash(&mut h);
+            }
+        }
+    }
+    StandaloneClosureFingerprint {
+        interface_fingerprint: h.finish(),
+        resolved_members,
+        member_set,
+    }
+}
+
+fn scope_chain_covers_members(scope: &ScopeAtPosition, members: &[Url]) -> bool {
+    members
+        .iter()
+        .all(|member| scope.chain.iter().any(|uri| uri == member))
 }
 
 // Test-only switch (the master equivalence gate flips this) to force every
@@ -1133,6 +1501,7 @@ fn resolve_forward_child_memoized(
     child_uri: &Url,
     path_fp: u64,
     provider_fp: usize,
+    standalone_parent_filter: Option<&HashSet<Url>>,
     child_depth: usize,
     packages_for_child: &HashSet<String>,
     is_cancelled: &dyn Fn() -> bool,
@@ -1161,6 +1530,7 @@ fn resolve_forward_child_memoized(
         path_fp,
         pkg_fp: package_set_fingerprint(packages_for_child),
         provider_fp,
+        standalone_parent_filter_fp: standalone_parent_filter_fingerprint(standalone_parent_filter),
     };
     // Reuse only a stored scope whose compute-depth is at least this reach's
     // depth (the stored scope is truncation-free, so a shallower-or-equal reach
@@ -1196,6 +1566,145 @@ fn resolve_forward_child_memoized(
             .or_insert_with(|| (Arc::new(computed.clone()), child_depth));
     }
     computed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_forward_child_with_standalone_cache<F>(
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
+    child_is_standalone: bool,
+    active_standalone_parent_filter: Option<&HashSet<Url>>,
+    memo: &std::cell::RefCell<ForwardChildMemo>,
+    graph: &super::dependency::DependencyGraph,
+    child_uri: &Url,
+    path_fp: u64,
+    provider_fp: usize,
+    child_depth: usize,
+    packages_for_child: &HashSet<String>,
+    max_depth: usize,
+    get_artifacts: &F,
+    is_cancelled: &dyn Fn() -> bool,
+    compute: impl FnOnce(Option<&HashSet<Url>>) -> ScopeAtPosition,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+{
+    if !child_is_standalone {
+        return resolve_forward_child_memoized(
+            memo,
+            graph,
+            child_uri,
+            path_fp,
+            provider_fp,
+            active_standalone_parent_filter,
+            child_depth,
+            packages_for_child,
+            is_cancelled,
+            || compute(active_standalone_parent_filter),
+        );
+    }
+
+    let closure = standalone_closure_interface_fingerprint(
+        child_uri,
+        graph,
+        max_depth,
+        child_depth,
+        get_artifacts,
+    );
+    let standalone_parent_filter = Some(&closure.member_set);
+
+    // Match ForwardChildMemo's cycle safety boundary: in a cyclic graph, a
+    // child's scope can depend on traversal history, which is intentionally not
+    // part of the persistent key. Still apply the standalone closure parent
+    // filter so cache-on and cache-off builds resolve the same isolated scope.
+    let Some(cache_context) = standalone_cache_context else {
+        return resolve_forward_child_memoized(
+            memo,
+            graph,
+            child_uri,
+            path_fp,
+            provider_fp,
+            standalone_parent_filter,
+            child_depth,
+            packages_for_child,
+            is_cancelled,
+            || compute(standalone_parent_filter),
+        );
+    };
+    if graph.contains_cycle() {
+        return resolve_forward_child_memoized(
+            memo,
+            graph,
+            child_uri,
+            path_fp,
+            provider_fp,
+            standalone_parent_filter,
+            child_depth,
+            packages_for_child,
+            is_cancelled,
+            || compute(standalone_parent_filter),
+        );
+    }
+
+    let key = StandaloneScopeKey {
+        callee_uri: child_uri.clone(),
+        edge_revision: cache_context.edge_revision,
+        path_context_fingerprint: path_fp,
+        closure_interface_fingerprint: closure.interface_fingerprint,
+        package_config_generation: cache_context.package_config_generation,
+    };
+
+    if let Some(scope) = cache_context.cache.get(&key, child_depth) {
+        return (*scope).clone();
+    }
+
+    let computed = resolve_forward_child_memoized(
+        memo,
+        graph,
+        child_uri,
+        path_fp,
+        provider_fp,
+        standalone_parent_filter,
+        child_depth,
+        packages_for_child,
+        is_cancelled,
+        || compute(standalone_parent_filter),
+    );
+    if !is_cancelled() {
+        if scope_chain_covers_members(&computed, &closure.resolved_members) {
+            cache_context
+                .cache
+                .insert(key, computed.clone(), child_depth);
+        } else {
+            log::trace!(
+                "standalone_scope_cache skip incomplete-closure uri={} compute_depth={} chain_len={} closure_members={}",
+                child_uri,
+                child_depth,
+                computed.chain.len(),
+                closure.resolved_members.len()
+            );
+        }
+    }
+    computed
+}
+
+fn own_path_context_for_uri<G>(
+    uri: &Url,
+    get_metadata: &G,
+    workspace_root: Option<&Url>,
+) -> Option<super::path_resolve::PathContext>
+where
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    let own_metadata = get_metadata(uri).map(|metadata| {
+        let mut metadata = (*metadata).clone();
+        metadata.inherited_working_directory = None;
+        metadata
+    });
+
+    own_metadata
+        .as_ref()
+        .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
+        .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root))
 }
 
 /// Determine whether a `source()` call should use local scoping rules.
@@ -1408,8 +1917,8 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
 /// matching how the use site is keyed. Centralizing the `ScopedSymbol`/event
 /// construction here keeps the declaration model identical across every source
 /// of declared symbols.
-fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> ScopeEvent {
-    let symbol = ScopedSymbol {
+fn declared_scoped_symbol(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> ScopedSymbol {
+    ScopedSymbol {
         name: Arc::from(name),
         kind,
         source_uri: uri.clone(),
@@ -1418,7 +1927,11 @@ fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> 
         defined_end_column: crate::utf16::utf16_len(name),
         signature: None,
         is_declared: true,
-    };
+    }
+}
+
+fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> ScopeEvent {
+    let symbol = declared_scoped_symbol(uri, name, kind, line);
     ScopeEvent::Declaration {
         line,
         column: u32::MAX,
@@ -4743,6 +5256,51 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
+    scope_at_position_with_graph_with_standalone_cache(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        package_contribution,
+        data_alias_provider,
+        None,
+    )
+}
+
+/// Variant of [`scope_at_position_with_graph`] that can reuse persistent
+/// isolated EOF scopes for standalone forward children. Production callers
+/// should pass a context only after cloning the cache handle and graph/config
+/// revisions out of `WorldState` and releasing the `WorldState` lock.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_with_standalone_cache<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
     let mut visited = HashMap::new();
 
     // Build initial PathContext for the root file
@@ -4776,6 +5334,8 @@ where
         package_contribution,
         data_alias_provider,
         &forward_child_memo,
+        standalone_cache_context,
+        None,
     )
 }
 
@@ -4840,11 +5400,56 @@ pub fn scope_at_position_with_graph_cached<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &mut ParentPrefixCache,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    scope_at_position_with_graph_cached_with_standalone_cache(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+        data_alias_provider,
+        None,
+    )
+}
+
+/// Variant of [`scope_at_position_with_graph_cached`] that can reuse the
+/// persistent standalone isolated-scope cache for forward children.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_cached_with_standalone_cache<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &mut ParentPrefixCache,
     // Package-mode contribution. When `Some`, synthetic package-internal and
     // imported symbols are injected into the root-file scope (Phase 5a).
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
     // `data()` file-stem alias provider (issue #429); see [`DataAliasProvider`].
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4897,7 +5502,9 @@ where
                 hoist_globals,
                 backward_dep_mode,
                 is_cancelled,
+                None,
                 &forward_child_memo,
+                standalone_cache_context,
             );
             let arc = Arc::new(computed);
             prefix_cache
@@ -4940,6 +5547,8 @@ where
         package_contribution,
         data_alias_provider,
         &forward_child_memo,
+        standalone_cache_context,
+        None,
     )
 }
 
@@ -5000,10 +5609,12 @@ fn parent_prefix_at<F, G>(
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
+    standalone_parent_filter: Option<&HashSet<Url>>,
     // Threaded into each parent's recursive resolution so the backward walk's
     // forward-source expansions share the same forward-child memo as STEP 2
     // (issue #472).
     forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
 ) -> ParentPrefix
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -5011,34 +5622,23 @@ where
 {
     let mut prefix = ParentPrefix::default();
 
-    // Issue #479 — callee-side `# raven: standalone`. A standalone file's STEP-1
-    // backward parent-prefix walk is skipped entirely: this `parent_prefix_at`
-    // returns the empty prefix, so the file's backward contribution carries none
-    // of the caller symbols or packages it would otherwise inherit. (The
-    // backward `ParentPrefix` carries only symbols, packages, chain, and
-    // visible-position/depth data — never a provider or working directory; those
-    // are forward-threaded inputs, see the SCOPE note below.) Returning the empty
-    // prefix here is the single
-    // load-bearing switch (knob 1): it covers every entry point that computes a
-    // file's prefix (the streaming `compute_or_get_cached_prefix`, the cached
-    // `scope_at_position_with_graph_cached`, and the per-child-source call in
-    // `resolve_source_contribution`). The file's OWN definitions and forward
-    // closure are still resolved by STEP 2 and still flow forward to callers
-    // (the additive merge is unchanged), so a standalone library that
-    // `library()`-loads packages still contributes them upward.
+    // Issue #479/#483 — callee-side `# raven: standalone`. A standalone file's
+    // STEP-1 backward parent-prefix walk is skipped entirely: this
+    // `parent_prefix_at` returns the empty prefix, so the file's backward
+    // contribution carries none of the caller symbols or packages it would
+    // otherwise inherit. The forward-source paths below complete the isolation
+    // by resolving standalone children with caller-independent inputs: no
+    // inherited packages, no data-alias provider, and the child's own path
+    // context. Together those two gates make a standalone file's isolated scope
+    // a pure function of the file and its forward closure, which is required for
+    // the persistent standalone-scope cache.
     //
-    // SCOPE — backward walk only (shipped "part 1"). Skipping the backward walk
-    // is what isolates the file when computing its OWN diagnostics (queried as a
-    // root, its prefix is empty). It does NOT drop the inputs a caller threads
-    // *forward* into this file when this file is resolved as that caller's
-    // forward child: the forward-source path below still threads the caller's
-    // `inherited`/`loaded` packages into `packages_for_child`, the caller's
-    // working directory into `child_ctx`, and the caller's `data_alias_provider`
-    // — none gated by `standalone`. Making that forward resolution
-    // caller-independent ("part 2") is deferred to WI2b (#483). Opt-in and
-    // safe-direction: if the file actually relied on a caller-provided binding,
-    // the worst case is a false "undefined" INSIDE the file — never a hidden bug
-    // in a caller.
+    // The file's own definitions and forward closure are still resolved by STEP
+    // 2 and still flow forward to callers through the normal additive merge, so
+    // a standalone library that `library()`-loads packages still contributes
+    // them upward. Opt-in and safe-direction: if the file actually relies on a
+    // caller-provided binding, the worst case is a false "undefined" inside the
+    // standalone file, not a hidden bug in a caller.
     if get_metadata(uri).is_some_and(|m| m.standalone) {
         return prefix;
     }
@@ -5051,6 +5651,13 @@ where
     let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
     for edge in graph.get_dependents(uri) {
+        // Inside a standalone callee's isolated forward closure, shared members
+        // may still have ordinary backward edges from external callers. Those
+        // callers are not part of the isolated closure and must not shape the
+        // cached scope through this member's parent prefix.
+        if standalone_parent_filter.is_some_and(|allowed| !allowed.contains(&edge.from)) {
+            continue;
+        }
         let entry = parent_edge_indices.get(&edge.from).copied();
         match entry {
             Some(existing_index) => {
@@ -5237,6 +5844,8 @@ where
             // literal-stem `Def` fallback still flows through the prefix.
             None,
             forward_child_memo,
+            standalone_cache_context,
+            standalone_parent_filter,
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -5256,6 +5865,35 @@ where
         // "Undefined variable" diagnostics on self-referential assignments
         // like `xyz <- xyz`. Same-file symbols always re-enter via STEP 2's
         // visible_from-aware Def event, so filtering here is safe.
+        if is_local_scoped && let Some(meta) = parent_meta.as_ref() {
+            for decl in &meta.declared_variables {
+                prefix
+                    .symbols
+                    .entry(Arc::from(decl.name.as_str()))
+                    .or_insert_with(|| {
+                        declared_scoped_symbol(
+                            &edge.from,
+                            &decl.name,
+                            SymbolKind::Variable,
+                            decl.line,
+                        )
+                    });
+            }
+            for decl in &meta.declared_functions {
+                prefix
+                    .symbols
+                    .entry(Arc::from(decl.name.as_str()))
+                    .or_insert_with(|| {
+                        declared_scoped_symbol(
+                            &edge.from,
+                            &decl.name,
+                            SymbolKind::Function,
+                            decl.line,
+                        )
+                    });
+            }
+        }
+
         for (i, (name, symbol)) in parent_scope.symbols.into_iter().enumerate() {
             if i & 63 == 0 && is_cancelled() {
                 return prefix;
@@ -5455,6 +6093,15 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // distinct `(child, path context, package set)` is resolved once per
     // top-level query. See [`ForwardChildMemo`].
     forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
+    // Cross-snapshot cache for standalone forward children. `None` preserves
+    // pre-WI2b behavior for tests and callers that have not cloned the cache
+    // handle out of `WorldState`.
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
+    // When resolving a `# raven: standalone` callee's isolated forward closure,
+    // non-standalone members may still have ordinary backward edges. Restrict
+    // those parent-prefix walks to parents inside the same closure so the
+    // isolated scope is a pure function of the closure, not of external callers.
+    standalone_parent_filter: Option<&HashSet<Url>>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -5524,6 +6171,23 @@ where
         Some(a) => a,
         None => return scope,
     };
+    let root_standalone_closure =
+        if standalone_parent_filter.is_none() && get_metadata(uri).is_some_and(|m| m.standalone) {
+            Some(standalone_closure_interface_fingerprint(
+                uri,
+                graph,
+                max_depth,
+                current_depth,
+                get_artifacts,
+            ))
+        } else {
+            None
+        };
+    let standalone_parent_filter = standalone_parent_filter.or_else(|| {
+        root_standalone_closure
+            .as_ref()
+            .map(|closure| &closure.member_set)
+    });
 
     // Snapshot the ancestor-path `visited` BEFORE STEP 1's parent walk runs.
     //
@@ -5623,7 +6287,9 @@ where
                     hoist_globals,
                     backward_dep_mode,
                     is_cancelled,
+                    standalone_parent_filter,
                     forward_child_memo,
+                    standalone_cache_context,
                 );
 
                 // Merge by move (no extra clones) — `entry().or_insert` for
@@ -5730,29 +6396,22 @@ where
                         continue;
                     }
 
-                    // Resolve the child URI: prefer pre-computed dependency graph edges
-                    // (which use workspace-root fallback) over re-resolving the path
-                    // (which doesn't). This ensures paths like source("subdir/file.R")
-                    // that rely on workspace-root-relative resolution work correctly
-                    // in scope resolution, matching the dependency graph's behavior.
-                    let child_uri = graph
-                        .get_dependencies(uri)
-                        .iter()
-                        .find(|edge| {
-                            edge.call_site_line == Some(*src_line)
-                                && edge.call_site_column == Some(*src_col)
-                        })
-                        .map(|edge| edge.to.clone())
-                        .or_else(|| {
-                            // Fallback: use pre-resolved URI or resolve path directly
-                            source.resolved_uri.clone().or_else(|| {
-                                path_ctx.as_ref().and_then(|ctx| {
-                                    let resolved =
-                                        super::path_resolve::resolve_path(&source.path, ctx)?;
-                                    super::path_resolve::path_to_uri(&resolved)
-                                })
-                            })
-                        });
+                    // Resolve the child URI. Ordinary scope resolution prefers
+                    // dependency-graph edges, which were built with
+                    // workspace-root fallback. Inside a standalone callee's
+                    // isolated closure, re-resolve from the active path context:
+                    // globally indexed edges for non-standalone members may
+                    // have been built with an outside inherited working
+                    // directory, which must not shape the isolated scope.
+                    let child_uri = resolve_forward_source_child_uri(
+                        graph,
+                        uri,
+                        source,
+                        *src_line,
+                        *src_col,
+                        path_ctx.as_ref(),
+                        standalone_parent_filter.is_some(),
+                    );
 
                     if let Some(child_uri) = child_uri {
                         // Check if we would exceed max depth
@@ -5855,6 +6514,25 @@ where
                             return scope;
                         }
 
+                        let child_is_standalone =
+                            get_metadata(&child_uri).is_some_and(|m| m.standalone);
+                        let standalone_empty_packages = HashSet::new();
+                        let child_ctx_for_resolution = if child_is_standalone {
+                            own_path_context_for_uri(&child_uri, get_metadata, workspace_root)
+                        } else {
+                            child_ctx
+                        };
+                        let packages_for_resolution = if child_is_standalone {
+                            &standalone_empty_packages
+                        } else {
+                            packages_for_child
+                        };
+                        let data_alias_provider_for_resolution = if child_is_standalone {
+                            None
+                        } else {
+                            data_alias_provider
+                        };
+
                         let child_scope = if isolate_forward_source_visits {
                             // Keep the cycle guard path-local for real
                             // forward source execution. The current path's
@@ -5873,18 +6551,25 @@ where
                             // clone is built INSIDE the closure so a memo hit
                             // (the common case in the dense graphs this targets)
                             // pays nothing for it.
-                            let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = data_alias_provider_fp(data_alias_provider);
-                            resolve_forward_child_memoized(
+                            let path_fp =
+                                path_context_fingerprint(child_ctx_for_resolution.as_ref());
+                            let provider_fp =
+                                data_alias_provider_fp(data_alias_provider_for_resolution);
+                            resolve_forward_child_with_standalone_cache(
+                                standalone_cache_context,
+                                child_is_standalone,
+                                standalone_parent_filter,
                                 forward_child_memo,
                                 graph,
                                 &child_uri,
                                 path_fp,
                                 provider_fp,
                                 current_depth + 1,
-                                packages_for_child,
+                                packages_for_resolution,
+                                max_depth,
+                                get_artifacts,
                                 is_cancelled,
-                                || {
+                                |child_standalone_parent_filter| {
                                     // Clone the ancestor snapshot taken before
                                     // STEP 1 (not the live `visited`), so cousin
                                     // files that STEP 1's parent walk expanded do
@@ -5901,11 +6586,11 @@ where
                                         get_metadata,
                                         graph,
                                         workspace_root,
-                                        child_ctx,
+                                        child_ctx_for_resolution,
                                         max_depth,
                                         current_depth + 1,
                                         &mut child_visited,
-                                        packages_for_child, // Pass inherited packages to child
+                                        packages_for_resolution,
                                         base_exports,
                                         hoist_globals,
                                         backward_dep_mode,
@@ -5913,8 +6598,10 @@ where
                                         true,
                                         None,
                                         None,
-                                        data_alias_provider,
+                                        data_alias_provider_for_resolution,
                                         forward_child_memo,
+                                        standalone_cache_context,
+                                        child_standalone_parent_filter,
                                     )
                                 },
                             )
@@ -5927,11 +6614,11 @@ where
                                 get_metadata,
                                 graph,
                                 workspace_root,
-                                child_ctx,
+                                child_ctx_for_resolution,
                                 max_depth,
                                 current_depth + 1,
                                 visited,
-                                packages_for_child, // Pass inherited packages to child
+                                packages_for_resolution,
                                 base_exports,
                                 hoist_globals,
                                 backward_dep_mode,
@@ -5939,8 +6626,10 @@ where
                                 false,
                                 None,
                                 None,
-                                data_alias_provider,
+                                data_alias_provider_for_resolution,
                                 forward_child_memo,
+                                standalone_cache_context,
+                                standalone_parent_filter,
                             )
                         };
                         extend_visible_positions(
@@ -6844,7 +7533,7 @@ where
     /// call sites (or transitively via several paths) is resolved once per
     /// stream. Distinct from `source_contributions` (which caches post-leak,
     /// caller-specific contributions keyed by call-site); this memo sits one
-    /// level below, keyed by `(child_uri, path_fp, pkg_fp)`. See
+    /// level below, keyed by [`ForwardChildKey`]. See
     /// [`ForwardChildMemo`].
     forward_child_memo: std::cell::RefCell<ForwardChildMemo>,
 
@@ -6875,6 +7564,16 @@ where
     /// behavior exactly. The win is in the common global-scope hub (shallow
     /// chains), which the gate admits.
     prefix_forward_child_memo: Option<std::cell::RefCell<ForwardChildMemo>>,
+
+    /// Optional cross-snapshot standalone isolated-scope cache context,
+    /// captured by production snapshots after the `WorldState` lock is
+    /// released.
+    standalone_cache_context: Option<StandaloneScopeCacheContext<'a>>,
+
+    /// If the queried URI itself is `# raven: standalone`, its isolated
+    /// forward closure. Used to filter non-standalone members' backward
+    /// parents in the same way standalone forward-child resolution does.
+    standalone_root_closure: Option<StandaloneClosureFingerprint>,
 }
 
 /// Budget (edge relaxations / path steps) for the
@@ -6897,6 +7596,7 @@ where
     /// that `snapshot()` and `is_visible()` never have to materialize them
     /// on the hot path. With `hoist_globals=false` the `(uri, true)` slot
     /// is identical to `(uri, false)`, so we share the same `Arc`.
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queried_uri: &'a Url,
@@ -6912,6 +7612,43 @@ where
         prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
         data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+    ) -> Option<Self> {
+        Self::new_with_standalone_cache(
+            queried_uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            prefix_cache,
+            package_contribution,
+            data_alias_provider,
+            None,
+        )
+    }
+
+    /// Construct a new `ScopeStream`, optionally enabling the persistent
+    /// standalone isolated-scope cache for forward children.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_standalone_cache(
+        queried_uri: &'a Url,
+        get_artifacts: &'a F,
+        get_metadata: &'a G,
+        graph: &'a super::dependency::DependencyGraph,
+        workspace_root: Option<&'a Url>,
+        max_depth: usize,
+        base_exports: &'a HashSet<String>,
+        hoist_globals: bool,
+        backward_dep_mode: super::config::BackwardDependencyMode,
+        is_cancelled: &'a dyn Fn() -> bool,
+        prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+        package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+        data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+        standalone_cache_context: Option<StandaloneScopeCacheContext<'a>>,
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
@@ -7007,6 +7744,17 @@ where
                 super::path_resolve::PathContext::from_metadata(queried_uri, m, workspace_root)
             })
             .or_else(|| super::path_resolve::PathContext::new(queried_uri, workspace_root));
+        let standalone_root_closure = if meta.as_ref().is_some_and(|m| m.standalone) {
+            Some(standalone_closure_interface_fingerprint(
+                queried_uri,
+                graph,
+                max_depth,
+                0,
+                get_artifacts,
+            ))
+        } else {
+            None
+        };
 
         // Pre-compute the names the package contribution would inject for
         // `queried_uri`. Doing it once at construction keeps
@@ -7045,6 +7793,8 @@ where
             data_alias_provider,
             forward_child_memo,
             prefix_forward_child_memo,
+            standalone_cache_context,
+            standalone_root_closure,
         })
     }
 
@@ -7805,25 +8555,19 @@ where
     ) -> ChildSourceContribution {
         let mut contrib = ChildSourceContribution::default();
 
-        // Resolve the child URI: prefer the dependency graph edge (which
-        // honors workspace-root fallback). Fall back to direct path
-        // resolution from `path_ctx`.
-        let child_uri = self
-            .graph
-            .get_dependencies(self.queried_uri)
-            .iter()
-            .find(|edge| {
-                edge.call_site_line == Some(src_line) && edge.call_site_column == Some(src_col)
-            })
-            .map(|edge| edge.to.clone())
-            .or_else(|| {
-                source.resolved_uri.clone().or_else(|| {
-                    self.path_ctx.as_ref().and_then(|ctx| {
-                        let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
-                        super::path_resolve::path_to_uri(&resolved)
-                    })
-                })
-            });
+        let active_standalone_parent_filter = self
+            .standalone_root_closure
+            .as_ref()
+            .map(|closure| &closure.member_set);
+        let child_uri = resolve_forward_source_child_uri(
+            self.graph,
+            self.queried_uri,
+            source,
+            src_line,
+            src_col,
+            self.path_ctx.as_ref(),
+            active_standalone_parent_filter.is_some(),
+        );
         let Some(child_uri) = child_uri else {
             return contrib;
         };
@@ -7839,7 +8583,7 @@ where
         }
 
         // Build child PathContext, respecting source.chdir. Mirrors the
-        // logic at `scope.rs:3554-3581`.
+        // recursive resolver's `ScopeEvent::Source` branch.
         let child_path = child_uri.to_file_path().ok();
         let child_ctx = child_path.as_ref().and_then(|cp| {
             let ctx = self.path_ctx.as_ref()?;
@@ -7867,6 +8611,18 @@ where
         if (self.is_cancelled)() {
             return contrib;
         }
+
+        let child_is_standalone = (self.get_metadata)(&child_uri).is_some_and(|m| m.standalone);
+        let child_ctx_for_resolution = if child_is_standalone {
+            own_path_context_for_uri(&child_uri, self.get_metadata, self.workspace_root)
+        } else {
+            child_ctx
+        };
+        let data_alias_provider_for_resolution = if child_is_standalone {
+            None
+        } else {
+            self.data_alias_provider
+        };
 
         // Look up (or compute) the child's prefix at (uri, false). Child
         // queries always run at (MAX, MAX) which is full-EOF, so the
@@ -7907,11 +8663,14 @@ where
         let empty_packages = HashSet::new();
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
-        let path_fp = path_context_fingerprint(child_ctx.as_ref());
-        let provider_fp = data_alias_provider_fp(self.data_alias_provider);
+        let path_fp = path_context_fingerprint(child_ctx_for_resolution.as_ref());
+        let provider_fp = data_alias_provider_fp(data_alias_provider_for_resolution);
         // The streaming path resolves forward children of the queried URI at
         // `current_depth = 1` (the queried URI is depth 0).
-        let child_scope = resolve_forward_child_memoized(
+        let child_scope = resolve_forward_child_with_standalone_cache(
+            self.standalone_cache_context,
+            child_is_standalone,
+            active_standalone_parent_filter,
             &self.forward_child_memo,
             self.graph,
             &child_uri,
@@ -7919,8 +8678,10 @@ where
             provider_fp,
             1,
             &empty_packages,
+            self.max_depth,
+            self.get_artifacts,
             self.is_cancelled,
-            || {
+            |child_standalone_parent_filter| {
                 scope_at_position_with_graph_recursive(
                     &child_uri,
                     u32::MAX,
@@ -7929,7 +8690,7 @@ where
                     self.get_metadata,
                     self.graph,
                     self.workspace_root,
-                    child_ctx,
+                    child_ctx_for_resolution,
                     self.max_depth,
                     1, // current_depth — child is depth 1 of the queried URI
                     &mut visited,
@@ -7941,8 +8702,10 @@ where
                     true,
                     Some(&child_prefix),
                     None,
-                    self.data_alias_provider,
+                    data_alias_provider_for_resolution,
                     &self.forward_child_memo,
+                    self.standalone_cache_context,
+                    child_standalone_parent_filter,
                 )
             },
         );
@@ -8195,7 +8958,13 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
+        None,
         prefix_forward_child_memo,
+        // Prefix computation runs at a canonical depth-0 origin and can use
+        // shared per-stream memoization with the known #484 advisory residual.
+        // Keep it out of the cross-snapshot standalone cache; actual-depth
+        // forward-child resolution is the persistent-cache writer.
+        None,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();
@@ -9711,6 +10480,1055 @@ mod tests {
             resolve_parent(true).symbols.contains_key("child_sym"),
             "caller must still see a standalone callee's own definitions (knob 2)"
         );
+    }
+
+    #[test]
+    fn standalone_forward_child_drops_caller_packages_and_provider() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_a_uri = Url::parse("file:///project/a.R").unwrap();
+        let parent_b_uri = Url::parse("file:///project/b.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+
+        let parent_a_code = "library(pkgA)\nsource(\"child.R\")\n";
+        let parent_b_code = "library(pkgB)\nsource(\"child.R\")\n";
+        let child_code = "# raven: standalone\ndata(stem)\nchild_sym <- 1\n";
+
+        let parent_a_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let parent_b_meta = parent_a_meta.clone();
+        let standalone_child_meta = CrossFileMetadata {
+            standalone: true,
+            ..Default::default()
+        };
+        let non_standalone_child_meta = CrossFileMetadata::default();
+
+        let mut graph_a = DependencyGraph::new();
+        graph_a.update_file(&parent_a_uri, &parent_a_meta, Some(&workspace_root), |_| {
+            None
+        });
+        graph_a.update_file(
+            &child_uri,
+            &standalone_child_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+        let mut graph_b = DependencyGraph::new();
+        graph_b.update_file(&parent_b_uri, &parent_b_meta, Some(&workspace_root), |_| {
+            None
+        });
+        graph_b.update_file(
+            &child_uri,
+            &standalone_child_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+
+        let parent_a_artifacts = Arc::new(compute_artifacts(
+            &parent_a_uri,
+            &parse_r(parent_a_code),
+            parent_a_code,
+        ));
+        let parent_b_artifacts = Arc::new(compute_artifacts(
+            &parent_b_uri,
+            &parse_r(parent_b_code),
+            parent_b_code,
+        ));
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_a_uri {
+                Some(parent_a_artifacts.clone())
+            } else if uri == &parent_b_uri {
+                Some(parent_b_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let base_packages = HashSet::new();
+        let lookup = |pkg: &str, stem: &str| -> Vec<String> {
+            match (pkg, stem) {
+                ("pkgA", "stem") => vec!["from_a".to_string()],
+                ("pkgB", "stem") => vec!["from_b".to_string()],
+                _ => Vec::new(),
+            }
+        };
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+
+        let resolve_parent = |uri: &Url, graph: &DependencyGraph, child_meta: CrossFileMetadata| {
+            let child_meta = std::sync::Arc::new(child_meta);
+            let parent_a_meta = std::sync::Arc::new(parent_a_meta.clone());
+            let parent_b_meta = std::sync::Arc::new(parent_b_meta.clone());
+            let get_metadata = |target: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if target == &parent_a_uri {
+                    Some(parent_a_meta.clone())
+                } else if target == &parent_b_uri {
+                    Some(parent_b_meta.clone())
+                } else if target == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                uri,
+                2,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                Some(&provider),
+            )
+        };
+
+        let non_standalone_a =
+            resolve_parent(&parent_a_uri, &graph_a, non_standalone_child_meta.clone());
+        let non_standalone_b = resolve_parent(&parent_b_uri, &graph_b, non_standalone_child_meta);
+        assert!(non_standalone_a.symbols.contains_key("from_a"));
+        assert!(non_standalone_b.symbols.contains_key("from_b"));
+
+        let standalone_a = resolve_parent(&parent_a_uri, &graph_a, standalone_child_meta.clone());
+        let standalone_b = resolve_parent(&parent_b_uri, &graph_b, standalone_child_meta.clone());
+        assert!(standalone_a.symbols.contains_key("child_sym"));
+        assert!(standalone_b.symbols.contains_key("child_sym"));
+        assert!(
+            !standalone_a.symbols.contains_key("from_a")
+                && !standalone_a.symbols.contains_key("from_b")
+                && !standalone_b.symbols.contains_key("from_a")
+                && !standalone_b.symbols.contains_key("from_b"),
+            "standalone child must not bind data() aliases from caller package/provider inputs"
+        );
+
+        let standalone_child_meta = std::sync::Arc::new(standalone_child_meta);
+        let get_metadata = |target: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if target == &parent_a_uri {
+                Some(std::sync::Arc::new(parent_a_meta.clone()))
+            } else if target == &parent_b_uri {
+                Some(std::sync::Arc::new(parent_b_meta.clone()))
+            } else if target == &child_uri {
+                Some(standalone_child_meta.clone())
+            } else {
+                None
+            }
+        };
+        let empty_packages = HashSet::new();
+        let own = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph_a,
+            Some(&workspace_root),
+            64,
+            &empty_packages,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        let resolve_child_as_forward =
+            |parent_uri: &Url, graph: &DependencyGraph| -> ScopeAtPosition {
+                let mut visited = HashMap::new();
+                visited.insert(parent_uri.clone(), (u32::MAX, u32::MAX));
+                let child_ctx =
+                    own_path_context_for_uri(&child_uri, &get_metadata, Some(&workspace_root));
+                let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+                scope_at_position_with_graph_recursive(
+                    &child_uri,
+                    u32::MAX,
+                    u32::MAX,
+                    &get_artifacts,
+                    &get_metadata,
+                    graph,
+                    Some(&workspace_root),
+                    child_ctx,
+                    64,
+                    1,
+                    &mut visited,
+                    &empty_packages,
+                    &empty_packages,
+                    false,
+                    crate::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    true,
+                    None,
+                    None,
+                    None,
+                    &forward_child_memo,
+                    None,
+                    None,
+                )
+            };
+        let forward_a = resolve_child_as_forward(&parent_a_uri, &graph_a);
+        let forward_b = resolve_child_as_forward(&parent_b_uri, &graph_b);
+        assert_scope_eq(&own, &forward_a);
+        assert_scope_eq(&own, &forward_b);
+    }
+
+    #[test]
+    fn standalone_forward_child_uses_own_path_context_not_caller_cd() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/caller/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/lib/child.R").unwrap();
+        let caller_leaf_uri = Url::parse("file:///project/callerwd/leaf.R").unwrap();
+        let own_leaf_uri = Url::parse("file:///project/lib/leaf.R").unwrap();
+
+        let parent_code = "# raven: cd /callerwd\nsource(\"../lib/child.R\")\n";
+        let child_code = "source(\"leaf.R\")\nchild_sym <- 1\n";
+        let caller_leaf_code = "caller_leaf <- 1\n";
+        let own_leaf_code = "own_leaf <- 1\n";
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let non_standalone_child_meta = crate::cross_file::extract_metadata(child_code);
+        let standalone_child_meta = CrossFileMetadata {
+            standalone: true,
+            ..non_standalone_child_meta.clone()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        // Deliberately do not index the child's own source edge. This exercises
+        // the runtime fallback path that resolves the child source against the
+        // recursive PathContext, where caller `# raven: cd` used to leak.
+
+        let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+            Some(&parent_meta),
+        ));
+        let child_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+            Some(&non_standalone_child_meta),
+        ));
+        let caller_leaf_artifacts = Arc::new(compute_artifacts(
+            &caller_leaf_uri,
+            &parse_r(caller_leaf_code),
+            caller_leaf_code,
+        ));
+        let own_leaf_artifacts = Arc::new(compute_artifacts(
+            &own_leaf_uri,
+            &parse_r(own_leaf_code),
+            own_leaf_code,
+        ));
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else if uri == &caller_leaf_uri {
+                Some(caller_leaf_artifacts.clone())
+            } else if uri == &own_leaf_uri {
+                Some(own_leaf_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let resolve_parent = |child_meta: CrossFileMetadata| {
+            let parent_meta = std::sync::Arc::new(parent_meta.clone());
+            let child_meta = std::sync::Arc::new(child_meta);
+            let get_metadata = |target: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if target == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if target == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                &parent_uri,
+                2,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        let inherited_cd = resolve_parent(non_standalone_child_meta);
+        assert!(
+            inherited_cd.symbols.contains_key("caller_leaf"),
+            "non-standalone child should inherit the caller's working directory"
+        );
+        assert!(
+            !inherited_cd.symbols.contains_key("own_leaf"),
+            "fixture sanity: caller working directory points away from child dir"
+        );
+
+        let isolated_cd = resolve_parent(standalone_child_meta);
+        assert!(isolated_cd.symbols.contains_key("child_sym"));
+        assert!(
+            isolated_cd.symbols.contains_key("own_leaf"),
+            "standalone child must resolve its own source paths from its own path context"
+        );
+        assert!(
+            !isolated_cd.symbols.contains_key("caller_leaf"),
+            "standalone child must not inherit the caller's working directory"
+        );
+    }
+
+    #[test]
+    fn standalone_dependency_edges_ignore_inherited_working_directory() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let child_uri = Url::parse("file:///project/lib/child.R").unwrap();
+        let caller_leaf_uri = Url::parse("file:///project/callerwd/leaf.R").unwrap();
+        let own_leaf_uri = Url::parse("file:///project/lib/leaf.R").unwrap();
+
+        let source = ForwardSource {
+            path: "leaf.R".to_string(),
+            line: 0,
+            column: 0,
+            ..Default::default()
+        };
+        let inherited_meta = CrossFileMetadata {
+            sources: vec![source.clone()],
+            inherited_working_directory: Some("/project/callerwd".to_string()),
+            ..Default::default()
+        };
+        let standalone_meta = CrossFileMetadata {
+            standalone: true,
+            ..inherited_meta.clone()
+        };
+
+        let mut non_standalone_graph = DependencyGraph::new();
+        non_standalone_graph.update_file(
+            &child_uri,
+            &inherited_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+        assert!(
+            non_standalone_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to == caller_leaf_uri),
+            "fixture sanity: ordinary children use inherited working directory for source() edges"
+        );
+
+        let mut standalone_graph = DependencyGraph::new();
+        standalone_graph.update_file(&child_uri, &standalone_meta, Some(&workspace_root), |_| {
+            None
+        });
+        let deps = standalone_graph.get_dependencies(&child_uri);
+        assert!(
+            deps.iter().any(|edge| edge.to == own_leaf_uri),
+            "standalone source() edges must resolve from the file's own path context"
+        );
+        assert!(
+            !deps.iter().any(|edge| edge.to == caller_leaf_uri),
+            "standalone source() edges must ignore inherited caller working directory"
+        );
+    }
+
+    #[test]
+    fn standalone_root_filters_member_parents_and_member_source_edges_use_active_context() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let a = Url::parse("file:///project/a.R").unwrap();
+        let c = Url::parse("file:///project/c/c.R").unwrap();
+        let m = Url::parse("file:///project/m/m.R").unwrap();
+        let c_leaf = Url::parse("file:///project/c/leaf.R").unwrap();
+        let outside_leaf = Url::parse("file:///project/outside/leaf.R").unwrap();
+
+        let a_code = "library(dplyr)\nsource(\"m/m.R\")\n";
+        let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
+        let m_code = "source(\"leaf.R\")\nm_sym <- leaf_sym\n";
+        let c_leaf_code = "leaf_sym <- 1\n";
+        let outside_leaf_code = "outside_leaf <- 1\n";
+
+        let a_meta = crate::cross_file::extract_metadata(a_code);
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        let mut m_meta = crate::cross_file::extract_metadata(m_code);
+        m_meta.inherited_working_directory = Some("/project/outside".to_string());
+        let c_leaf_meta = CrossFileMetadata::default();
+        let outside_leaf_meta = CrossFileMetadata::default();
+
+        let mut metadata: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        for (uri, meta) in [
+            (a.clone(), a_meta),
+            (c.clone(), c_meta),
+            (m.clone(), m_meta),
+            (c_leaf.clone(), c_leaf_meta),
+            (outside_leaf.clone(), outside_leaf_meta),
+        ] {
+            metadata.insert(uri, Arc::new(meta));
+        }
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        for (uri, code) in [
+            (&a, a_code),
+            (&c, c_code),
+            (&m, m_code),
+            (&c_leaf, c_leaf_code),
+            (&outside_leaf, outside_leaf_code),
+        ] {
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    uri,
+                    &parse_r(code),
+                    code,
+                    Some(metadata[uri].as_ref()),
+                )),
+            );
+        }
+
+        let mut graph = DependencyGraph::new();
+        for uri in [&a, &c, &m, &c_leaf, &outside_leaf] {
+            graph.update_file(uri, &metadata[uri], Some(&workspace_root), |_| None);
+        }
+        assert!(
+            graph.get_dependents(&m).iter().any(|edge| edge.from == a),
+            "fixture sanity: m.R has an outside backward parent"
+        );
+        assert!(
+            graph
+                .get_dependencies(&m)
+                .iter()
+                .any(|edge| edge.to == outside_leaf),
+            "fixture sanity: global graph edge for m.R follows the outside inherited working directory"
+        );
+
+        let get_artifacts =
+            |target: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(target).cloned() };
+        let get_metadata = |target: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            metadata.get(target).cloned()
+        };
+        let cache = StandaloneScopeCache::new(16);
+        let context = StandaloneScopeCacheContext::new(
+            &cache,
+            graph.edge_revision(),
+            cache.package_config_generation(),
+        );
+        let scope = scope_at_position_with_graph_with_standalone_cache(
+            &c,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            64,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+            Some(context),
+        );
+
+        assert!(scope.symbols.contains_key("leaf_sym"));
+        assert!(
+            !scope.symbols.contains_key("outside_leaf"),
+            "member source() inside standalone closure must not follow globally indexed outside-WD edge"
+        );
+        assert!(
+            !scope.loaded_packages.contains("dplyr") && !scope.inherited_packages.contains("dplyr"),
+            "standalone root's member parent prefix must ignore outside parents"
+        );
+    }
+
+    fn assert_scope_eq(lhs: &ScopeAtPosition, rhs: &ScopeAtPosition) {
+        assert_eq!(lhs.symbols, rhs.symbols);
+        assert_eq!(lhs.chain, rhs.chain);
+        assert_eq!(
+            lhs.parent_prefix_symbol_names,
+            rhs.parent_prefix_symbol_names
+        );
+        assert_eq!(lhs.visible_positions, rhs.visible_positions);
+        assert_eq!(lhs.depth_exceeded, rhs.depth_exceeded);
+        assert_eq!(lhs.inherited_packages, rhs.inherited_packages);
+        assert_eq!(lhs.loaded_packages, rhs.loaded_packages);
+        assert_eq!(lhs.package_origins, rhs.package_origins);
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn standalone_cache_fixture(
+        child_code: &str,
+    ) -> (
+        Url,
+        Url,
+        Url,
+        Url,
+        crate::cross_file::dependency::DependencyGraph,
+        HashMap<Url, Arc<ScopeArtifacts>>,
+        HashMap<Url, std::sync::Arc<crate::cross_file::types::CrossFileMetadata>>,
+    ) {
+        standalone_cache_fixture_with_grandchild(child_code, "grand_sym <- 1\n")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn standalone_cache_fixture_with_grandchild(
+        child_code: &str,
+        grandchild_code: &str,
+    ) -> (
+        Url,
+        Url,
+        Url,
+        Url,
+        crate::cross_file::dependency::DependencyGraph,
+        HashMap<Url, Arc<ScopeArtifacts>>,
+        HashMap<Url, std::sync::Arc<crate::cross_file::types::CrossFileMetadata>>,
+    ) {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let grandchild_uri = Url::parse("file:///project/grandchild.R").unwrap();
+
+        let parent_code = "source(\"child.R\")\n";
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        let grandchild_meta = CrossFileMetadata::default();
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), |_| None);
+        graph.update_file(
+            &grandchild_uri,
+            &grandchild_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+
+        let mut artifacts = HashMap::new();
+        artifacts.insert(
+            parent_uri.clone(),
+            Arc::new(compute_artifacts_with_metadata(
+                &parent_uri,
+                &parse_r(parent_code),
+                parent_code,
+                Some(&parent_meta),
+            )),
+        );
+        artifacts.insert(
+            child_uri.clone(),
+            Arc::new(compute_artifacts_with_metadata(
+                &child_uri,
+                &parse_r(child_code),
+                child_code,
+                Some(&child_meta),
+            )),
+        );
+        artifacts.insert(
+            grandchild_uri.clone(),
+            Arc::new(compute_artifacts_with_metadata(
+                &grandchild_uri,
+                &parse_r(grandchild_code),
+                grandchild_code,
+                Some(&grandchild_meta),
+            )),
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert(parent_uri.clone(), std::sync::Arc::new(parent_meta));
+        metadata.insert(child_uri.clone(), std::sync::Arc::new(child_meta));
+        metadata.insert(grandchild_uri.clone(), std::sync::Arc::new(grandchild_meta));
+
+        (
+            workspace_root,
+            parent_uri,
+            child_uri,
+            grandchild_uri,
+            graph,
+            artifacts,
+            metadata,
+        )
+    }
+
+    fn resolve_parent_with_standalone_cache(
+        workspace_root: &Url,
+        parent_uri: &Url,
+        graph: &crate::cross_file::dependency::DependencyGraph,
+        artifacts: &HashMap<Url, Arc<ScopeArtifacts>>,
+        metadata: &HashMap<Url, std::sync::Arc<crate::cross_file::types::CrossFileMetadata>>,
+        cache: &StandaloneScopeCache,
+    ) -> ScopeAtPosition {
+        let get_artifacts =
+            |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(uri).cloned() };
+        let get_metadata = |uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > { metadata.get(uri).cloned() };
+        let context = StandaloneScopeCacheContext::new(
+            cache,
+            graph.edge_revision(),
+            cache.package_config_generation(),
+        );
+        scope_at_position_with_graph_with_standalone_cache(
+            parent_uri,
+            1,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            graph,
+            Some(workspace_root),
+            64,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+            Some(context),
+        )
+    }
+
+    #[test]
+    fn standalone_scope_cache_hits_on_same_interface_body_edit() {
+        let child_v1 =
+            "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() {\n  local <- 1\n}\n";
+        let child_v2 =
+            "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() {\n  local <- 2\n}\n";
+        let (root, parent, _child, _grandchild, graph, artifacts_v1, metadata_v1) =
+            standalone_cache_fixture(child_v1);
+        let (_, _, _, _, _, artifacts_v2, metadata_v2) = standalone_cache_fixture(child_v2);
+        assert_eq!(
+            artifacts_v1[&Url::parse("file:///project/child.R").unwrap()].interface_hash,
+            artifacts_v2[&Url::parse("file:///project/child.R").unwrap()].interface_hash,
+            "fixture sanity: function-body edit must leave interface hash unchanged"
+        );
+
+        let cache = StandaloneScopeCache::new(16);
+        let first = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v1,
+            &metadata_v1,
+            &cache,
+        );
+        let second = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v2,
+            &metadata_v2,
+            &cache,
+        );
+
+        assert!(first.symbols.contains_key("grand_sym"));
+        assert_scope_eq(&first, &second);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_hits_on_closure_member_body_edit() {
+        let child_code = "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() 1\n";
+        let grandchild_v1 = "grand_sym <- function() {\n  local <- 1\n}\n";
+        let grandchild_v2 = "grand_sym <- function() {\n  local <- 2\n}\n";
+        let (root, parent, _child, grandchild, graph, artifacts_v1, metadata_v1) =
+            standalone_cache_fixture_with_grandchild(child_code, grandchild_v1);
+        let (_, _, _, _, _, artifacts_v2, metadata_v2) =
+            standalone_cache_fixture_with_grandchild(child_code, grandchild_v2);
+        assert_eq!(
+            artifacts_v1[&grandchild].interface_hash, artifacts_v2[&grandchild].interface_hash,
+            "fixture sanity: closure-member body edit must leave interface hash unchanged"
+        );
+
+        let cache = StandaloneScopeCache::new(16);
+        let first = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v1,
+            &metadata_v1,
+            &cache,
+        );
+        let second = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v2,
+            &metadata_v2,
+            &cache,
+        );
+
+        assert_scope_eq(&first, &second);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_hits_on_caller_comment_edit() {
+        let child_code = "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() 1\n";
+        let (root, parent, _child, _grandchild, graph, artifacts_v1, metadata) =
+            standalone_cache_fixture(child_code);
+        let mut artifacts_v2 = artifacts_v1.clone();
+        let parent_v2 = "source(\"child.R\")\n# caller-only edit\n";
+        let parent_meta = metadata[&parent].clone();
+        artifacts_v2.insert(
+            parent.clone(),
+            Arc::new(compute_artifacts_with_metadata(
+                &parent,
+                &parse_r(parent_v2),
+                parent_v2,
+                Some(&parent_meta),
+            )),
+        );
+
+        let cache = StandaloneScopeCache::new(16);
+        let first = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v1,
+            &metadata,
+            &cache,
+        );
+        let second = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v2,
+            &metadata,
+            &cache,
+        );
+
+        assert_scope_eq(&first, &second);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_misses_on_interface_edit_and_generation_bump() {
+        let child_v1 = "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() 1\n";
+        let child_v2 =
+            "# raven: standalone\nsource(\"grandchild.R\")\nf <- function() 1\nnew_sym <- 2\n";
+        let (root, parent, _child, _grandchild, graph, artifacts_v1, metadata_v1) =
+            standalone_cache_fixture(child_v1);
+        let (_, _, _, _, _, artifacts_v2, metadata_v2) = standalone_cache_fixture(child_v2);
+        assert_ne!(
+            artifacts_v1[&Url::parse("file:///project/child.R").unwrap()].interface_hash,
+            artifacts_v2[&Url::parse("file:///project/child.R").unwrap()].interface_hash,
+            "fixture sanity: top-level interface edit must change interface hash"
+        );
+
+        let cache = StandaloneScopeCache::new(16);
+        let first = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v1,
+            &metadata_v1,
+            &cache,
+        );
+        let second = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v2,
+            &metadata_v2,
+            &cache,
+        );
+        assert!(!first.symbols.contains_key("new_sym"));
+        assert!(second.symbols.contains_key("new_sym"));
+        assert_eq!(cache.stats_for_test().0, 0, "interface edit must miss");
+        assert_eq!(cache.stats_for_test().1, 2, "two distinct fingerprints");
+
+        cache.bump_package_config_generation();
+        let _third = resolve_parent_with_standalone_cache(
+            &root,
+            &parent,
+            &graph,
+            &artifacts_v2,
+            &metadata_v2,
+            &cache,
+        );
+        let (hits, misses, stores, len, generation) = cache.stats_for_test();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 3);
+        assert_eq!(stores, 3);
+        assert_eq!(len, 1, "generation bump clears stale cache entries");
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn standalone_scope_cache_does_not_store_revisit_short_circuit_scope() {
+        let cache = StandaloneScopeCache::new(16);
+        let uri = Url::parse("file:///project/bootstrap.r").unwrap();
+        let key = StandaloneScopeKey {
+            callee_uri: uri.clone(),
+            edge_revision: 1,
+            path_context_fingerprint: 4,
+            closure_interface_fingerprint: 2,
+            package_config_generation: 3,
+        };
+
+        let valid_scope = ScopeAtPosition {
+            chain: vec![uri.clone()],
+            ..Default::default()
+        };
+        cache.insert(key.clone(), valid_scope, 1);
+
+        let revisit_short_circuit = ScopeAtPosition::default();
+        cache.insert(key.clone(), revisit_short_circuit, 3);
+
+        let hit = cache
+            .get(&key, 1)
+            .expect("valid entry must survive skipped partial overwrite");
+        assert_eq!(hit.chain, vec![uri]);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 0, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_requires_chain_to_cover_closure_members() {
+        let child = Url::parse("file:///project/bootstrap.r").unwrap();
+        let closure_member = Url::parse("file:///project/scripts/functions.r").unwrap();
+        let scope = ScopeAtPosition {
+            chain: vec![child.clone()],
+            ..Default::default()
+        };
+
+        assert!(!scope_chain_covers_members(
+            &scope,
+            &[child.clone(), closure_member.clone()]
+        ));
+
+        let complete_scope = ScopeAtPosition {
+            chain: vec![child.clone(), closure_member.clone()],
+            ..Default::default()
+        };
+        assert!(scope_chain_covers_members(
+            &complete_scope,
+            &[child, closure_member]
+        ));
+    }
+
+    #[test]
+    fn standalone_scope_cache_hit_is_byte_identical_to_uncached() {
+        let child_code =
+            "# raven: standalone\nlibrary(dplyr)\nsource(\"grandchild.R\")\nf <- function(x) x\n";
+        let (root, parent, _child, _grandchild, graph, artifacts, metadata) =
+            standalone_cache_fixture(child_code);
+        let cache = StandaloneScopeCache::new(16);
+
+        let _warm = resolve_parent_with_standalone_cache(
+            &root, &parent, &graph, &artifacts, &metadata, &cache,
+        );
+        let hit = resolve_parent_with_standalone_cache(
+            &root, &parent, &graph, &artifacts, &metadata, &cache,
+        );
+        let uncached = with_standalone_scope_cache_disabled_for_test(|| {
+            resolve_parent_with_standalone_cache(
+                &root, &parent, &graph, &artifacts, &metadata, &cache,
+            )
+        });
+
+        assert_scope_eq(&hit, &uncached);
+        assert!(
+            hit.loaded_packages.contains("dplyr"),
+            "packages loaded by a standalone callee must still propagate after a cache hit"
+        );
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_hits_through_scope_stream() {
+        let child_code = "# raven: standalone\nsource(\"grandchild.R\")\nf <- function(x) x\n";
+        let (root, parent, _child, _grandchild, graph, artifacts, metadata) =
+            standalone_cache_fixture(child_code);
+        let get_artifacts =
+            |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(uri).cloned() };
+        let get_metadata = |uri: &Url| -> Option<
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > { metadata.get(uri).cloned() };
+        let cache = StandaloneScopeCache::new(16);
+        let base_exports = HashSet::new();
+
+        let resolve_stream = || {
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let context = StandaloneScopeCacheContext::new(
+                &cache,
+                graph.edge_revision(),
+                cache.package_config_generation(),
+            );
+            let mut stream = ScopeStream::new_with_standalone_cache(
+                &parent,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                64,
+                &base_exports,
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+                Some(context),
+            )
+            .expect("parent artifacts should exist");
+            stream.advance_to(u32::MAX, u32::MAX);
+            stream.snapshot()
+        };
+
+        let first = resolve_stream();
+        let second = resolve_stream();
+
+        assert_scope_eq(&first, &second);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn standalone_scope_cache_filters_member_backward_parent_outside_closure() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let g = Url::parse("file:///project/g.R").unwrap();
+        let a = Url::parse("file:///project/a.R").unwrap();
+        let b = Url::parse("file:///project/b.R").unwrap();
+        let c = Url::parse("file:///project/c.R").unwrap();
+        let m = Url::parse("file:///project/m.R").unwrap();
+
+        let files = [
+            (g.clone(), "g_sym <- 1\n"),
+            (
+                a.clone(),
+                "source(\"g.R\")\nlibrary(dplyr)\nsource(\"m.R\")\nsource(\"c.R\")\n",
+            ),
+            (b.clone(), "source(\"c.R\")\n"),
+            (c.clone(), "# raven: standalone\nsource(\"m.R\")\n"),
+            (m.clone(), "m_sym <- g_sym\n"),
+        ];
+
+        let mut metadata: HashMap<
+            Url,
+            std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+        > = HashMap::new();
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        for (uri, code) in &files {
+            let meta = if *uri == g {
+                CrossFileMetadata::default()
+            } else {
+                crate::cross_file::extract_metadata(code)
+            };
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    uri,
+                    &parse_r(code),
+                    code,
+                    Some(&meta),
+                )),
+            );
+            metadata.insert(uri.clone(), Arc::new(meta));
+        }
+
+        let mut graph = DependencyGraph::new();
+        for (uri, _) in &files {
+            graph.update_file(uri, &metadata[uri], Some(&workspace_root), |_| None);
+        }
+        assert!(
+            graph.get_dependents(&m).iter().any(|edge| edge.from == a),
+            "fixture sanity: m.R has an external backward parent outside c.R's closure"
+        );
+
+        let resolve = |uri: &Url, cache: &StandaloneScopeCache| {
+            let get_artifacts =
+                |target: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(target).cloned() };
+            let get_metadata = |target: &Url| -> Option<
+                std::sync::Arc<crate::cross_file::types::CrossFileMetadata>,
+            > { metadata.get(target).cloned() };
+            let context = StandaloneScopeCacheContext::new(
+                cache,
+                graph.edge_revision(),
+                cache.package_config_generation(),
+            );
+            scope_at_position_with_graph_with_standalone_cache(
+                uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+                Some(context),
+            )
+        };
+
+        let cache = StandaloneScopeCache::new(16);
+        let warm_from_a = resolve(&a, &cache);
+        assert!(warm_from_a.symbols.contains_key("m_sym"));
+
+        let hit_from_b = resolve(&b, &cache);
+        let uncached_from_b = with_standalone_scope_cache_disabled_for_test(|| resolve(&b, &cache));
+
+        assert!(!hit_from_b.chain.iter().any(|uri| uri == &a || uri == &g));
+        assert!(
+            !hit_from_b.loaded_packages.contains("dplyr")
+                && !hit_from_b.inherited_packages.contains("dplyr"),
+            "filtered standalone closure member must not reuse an unfiltered forward-child memo entry"
+        );
+        assert_scope_eq(&hit_from_b, &uncached_from_b);
+        let (hits, misses, stores, len, _) = cache.stats_for_test();
+        assert_eq!((hits, misses, stores, len), (1, 1, 1, 1));
     }
 
     #[test]

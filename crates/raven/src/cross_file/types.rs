@@ -193,6 +193,7 @@ pub struct CrossFileMetadata {
     /// This is populated when a file has a backward directive (`# raven: sourced-by`, etc.)
     /// pointing to a parent file, and the parent has an effective working directory.
     /// Priority for path resolution: explicit working_directory > inherited > file's directory.
+    /// Ignored when `standalone` is true.
     pub inherited_working_directory: Option<String>,
     /// Lines with a line-scoped ignore (`# raven: ignore`, alias `@lsp-ignore`),
     /// 0-based, mapped to what each suppresses.
@@ -226,26 +227,17 @@ pub struct CrossFileMetadata {
     /// NSE contracts declared via `# raven: nse` directives.
     #[serde(default)]
     pub nse_declarations: Vec<NseDeclaration>,
-    /// Callee-side `# raven: standalone` directive (issue #479). When `true`,
-    /// this file is a self-contained "module": **when computing its own
-    /// diagnostics** its cross-file scope is resolved in ISOLATION from the files
-    /// that `source()` it — its backward parent-prefix walk is skipped, so it
-    /// inherits no symbols or packages from its callers (those are the only
-    /// caller contributions the backward walk carries; `DataAliasProvider` and
-    /// working directory are forward-threaded, not backward-inherited — see the
-    /// shipped-scope note below). It still contributes its own definitions AND its own
-    /// loaded packages forward to callers (the additive forward merge is
-    /// unchanged). Header-only (must appear before any code). Opt-in and
-    /// safe-direction: a mislabeled standalone file can at worst raise a false
-    /// "undefined" INSIDE itself, never hide a real bug in a caller. See
-    /// `docs/directives.md`.
-    ///
-    /// SHIPPED SCOPE: only this backward-walk skip ("part 1") shipped. The
-    /// caller-independent forward-child resolution ("part 2" — dropping a
-    /// caller's threaded packages/provider/cd when this file is resolved as that
-    /// caller's forward child) is deferred to WI2b (#483); until then, a caller
-    /// sourcing a standalone file still threads its own packages/provider/cd into
-    /// the child's forward resolution.
+    /// Callee-side `# raven: standalone` directive (issues #479/#483). When
+    /// `true`, this file is a self-contained module. Its own diagnostics skip
+    /// the backward parent-prefix walk, and callers that resolve it as a forward
+    /// child use caller-independent inputs: no caller packages, no caller
+    /// `DataAliasProvider`, and the file's own path context (explicit
+    /// `# raven: cd` or file-relative, never an inherited caller working
+    /// directory). It still contributes its own definitions and its own loaded
+    /// packages forward to callers through the normal additive merge.
+    /// Header-only (must appear before any code). Opt-in and safe-direction: a
+    /// mislabeled standalone file can at worst raise a false "undefined" inside
+    /// itself, never hide a real bug in a caller. See `docs/directives.md`.
     #[serde(default)]
     pub standalone: bool,
 }
@@ -406,6 +398,8 @@ pub use crate::utf16::byte_offset_to_utf16_column;
 /// Only sets `inherited_working_directory` when:
 /// - `sourced_by` is not empty (file has backward directives)
 /// - `working_directory` is None (no explicit `# raven: cd`)
+/// - `standalone` is false (`# raven: standalone` modules use their own path
+///   context and never inherit caller working directories)
 ///
 /// Uses `compute_inherited_working_directory` from dependency module.
 pub fn enrich_metadata_with_inherited_wd<F>(
@@ -417,6 +411,10 @@ pub fn enrich_metadata_with_inherited_wd<F>(
 ) where
     F: Fn(&Url) -> Option<std::sync::Arc<CrossFileMetadata>>,
 {
+    if meta.standalone {
+        meta.inherited_working_directory = None;
+        return;
+    }
     if meta.sourced_by.is_empty() || meta.working_directory.is_some() {
         return;
     }

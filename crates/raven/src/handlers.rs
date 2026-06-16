@@ -111,6 +111,11 @@ pub(crate) struct DiagnosticsSnapshot {
     /// Stored as `Arc` so concurrent fan-out revalidations share allocation
     /// instead of each cloning the trimmed graph from the cache payload.
     pub cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
+    /// Full-graph edge revision captured before trimming the snapshot graph.
+    /// The trimmed graph resets its internal revision to zero, so persistent
+    /// standalone scope cache keys use this full-graph value instead.
+    pub cross_file_edge_revision: u64,
+    pub standalone_scope_package_config_generation: u64,
     pub workspace_folders: Vec<Url>,
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
@@ -154,6 +159,7 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
+    pub standalone_scope_cache: std::sync::Arc<scope::StandaloneScopeCache>,
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
@@ -246,8 +252,13 @@ impl DiagnosticsSnapshot {
             crate::chunks::append_chunk_suppressions(&mut directive_meta, &doc.text());
         }
 
-        // Compute inherited working directory if needed
-        if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
+        // Compute inherited working directory if needed. Standalone modules
+        // are caller-independent and never inherit caller working directories.
+        if directive_meta.standalone {
+            directive_meta.inherited_working_directory = None;
+        } else if !directive_meta.sourced_by.is_empty()
+            && directive_meta.working_directory.is_none()
+        {
             let workspace_root = state.workspace_folders.first();
             directive_meta.inherited_working_directory = compute_inherited_working_directory(
                 uri,
@@ -327,6 +338,10 @@ impl DiagnosticsSnapshot {
         let subgraph_start = std::time::Instant::now();
         let trimmed_graph = payload.subgraph.clone();
         let subgraph_elapsed = subgraph_start.elapsed();
+        let cross_file_edge_revision = state.cross_file_graph.edge_revision();
+        let standalone_scope_cache = state.standalone_scope_cache.clone();
+        let standalone_scope_package_config_generation =
+            state.standalone_scope_package_config_generation();
 
         let total_elapsed = build_start.elapsed();
         log::trace!(
@@ -395,6 +410,8 @@ impl DiagnosticsSnapshot {
             cross_file_config: state.cross_file_config.clone(),
             lint_config,
             cross_file_graph: trimmed_graph,
+            cross_file_edge_revision,
+            standalone_scope_package_config_generation,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
             package_library_ready: state.package_library_ready,
@@ -405,6 +422,7 @@ impl DiagnosticsSnapshot {
             cycle_detection,
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
+            standalone_scope_cache,
             file_type: doc.file_type,
             rmd_declared_params,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
@@ -458,7 +476,12 @@ impl DiagnosticsSnapshot {
             });
 
         let mut cache = self.parent_prefix_cache.borrow_mut();
-        scope::scope_at_position_with_graph_cached(
+        let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
+            &self.standalone_scope_cache,
+            self.cross_file_edge_revision,
+            self.standalone_scope_package_config_generation,
+        );
+        scope::scope_at_position_with_graph_cached_with_standalone_cache(
             uri,
             line,
             column,
@@ -474,6 +497,7 @@ impl DiagnosticsSnapshot {
             &mut cache,
             Some(&self.scope_contribution),
             data_provider.as_ref(),
+            Some(standalone_cache_context),
         )
     }
 }
@@ -3534,7 +3558,13 @@ pub(crate) fn get_cross_file_scope_with_cache(
             base_packages: state.package_library.base_packages(),
         });
 
-    scope::scope_at_position_with_graph_cached(
+    let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
+        &state.standalone_scope_cache,
+        state.cross_file_graph.edge_revision(),
+        state.standalone_scope_package_config_generation(),
+    );
+
+    scope::scope_at_position_with_graph_cached_with_standalone_cache(
         uri,
         line,
         column,
@@ -3550,6 +3580,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         prefix_cache,
         package_contribution,
         data_provider.as_ref(),
+        Some(standalone_cache_context),
     )
 }
 
@@ -5344,7 +5375,12 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new(
+    let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
+        &snapshot.standalone_scope_cache,
+        snapshot.cross_file_edge_revision,
+        snapshot.standalone_scope_package_config_generation,
+    );
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -5358,6 +5394,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        Some(standalone_cache_context),
     );
 
     // Pre-compute the names of test-attached packages (testthat under
@@ -6171,7 +6208,12 @@ fn collect_undefined_variables_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new(
+    let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
+        &snapshot.standalone_scope_cache,
+        snapshot.cross_file_edge_revision,
+        snapshot.standalone_scope_package_config_generation,
+    );
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -6185,6 +6227,7 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        Some(standalone_cache_context),
     );
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.

@@ -662,8 +662,9 @@ impl DependencyGraph {
         // for path resolution.
         // This is because forward directives are semantically equivalent to source() calls
         // and describe runtime execution behavior where the working directory matters.
-        // Using PathContext::from_metadata() includes both explicit `# raven: cd` and inherited
-        // working directories in the path resolution context.
+        // Using PathContext::from_metadata() includes explicit `# raven: cd`
+        // and, for non-standalone files, inherited working directories in the
+        // path resolution context.
         // (Requirements 3.1, 3.2, 3.4)
         let path_ctx = match PathContext::from_metadata(uri, meta, workspace_root) {
             Some(ctx) => ctx,
@@ -1123,6 +1124,17 @@ impl DependencyGraph {
             .get(uri)
             .map(|edges| edges.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Monotonic revision bumped whenever dependency edges change.
+    ///
+    /// Consumers that cache results derived from source-graph membership should
+    /// include this in their key. Extracted subgraphs reset their internal
+    /// revision to zero, so snapshot builders must capture this from the full
+    /// `WorldState` graph before dropping the state lock.
+    pub fn edge_revision(&self) -> u64 {
+        self.edge_revision
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get edges where uri is the child (callee)

@@ -531,10 +531,10 @@ async fn maybe_init_r(
     // point of CI resolution without R. Dropping it here would send `raven
     // check` back to an empty library and lose the offline path.
     use crate::package_library::PackageLibraryStatus::*;
-    state.package_library_ready = outcome.consumer_ready();
+    let package_library_ready = outcome.consumer_ready();
     let status = outcome.status;
     let shipped_db_load = outcome.shipped_db_load;
-    state.package_library = outcome.library;
+    state.set_package_library(outcome.library, package_library_ready);
     match status {
         Ready | Disabled => {}
         RNotFound => eprintln!(

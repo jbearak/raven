@@ -75,6 +75,8 @@ fn lintr_auto_enable_allowed(raw_client: &serde_json::Value) -> bool {
 }
 
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
+    let old_cross_file_config = state.cross_file_config.clone();
+    let mut cross_file_config_updated = false;
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
 
@@ -82,15 +84,22 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         Ok(Some(cfg)) => {
             state.resize_caches(&cfg);
             state.cross_file_config = cfg;
+            cross_file_config_updated = true;
         }
         Ok(None) => {
             let cfg = crate::cross_file::CrossFileConfig::default();
             state.resize_caches(&cfg);
             state.cross_file_config = cfg;
+            cross_file_config_updated = true;
         }
         Err(err) => {
             log::warn!("recompute_parsed_configs: cross_file validation error: {err}");
         }
+    }
+    if cross_file_config_updated
+        && standalone_scope_cache_config_changed(&old_cross_file_config, &state.cross_file_config)
+    {
+        state.bump_standalone_scope_package_config_generation();
     }
     state.symbol_config = crate::backend::parse_symbol_config(&merged).unwrap_or_default();
     state.completion_config = crate::backend::parse_completion_config(&merged).unwrap_or_default();
@@ -129,6 +138,16 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         // since-removed root.
         state.lint_overrides = Vec::new();
     }
+}
+
+fn standalone_scope_cache_config_changed(
+    old: &crate::cross_file::CrossFileConfig,
+    new: &crate::cross_file::CrossFileConfig,
+) -> bool {
+    old.scope_settings_changed(new)
+        || old.packages_enabled != new.packages_enabled
+        || old.packages_r_path != new.packages_r_path
+        || old.packages_additional_library_paths != new.packages_additional_library_paths
 }
 
 #[cfg(test)]

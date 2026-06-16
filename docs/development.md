@@ -238,8 +238,28 @@ Default capacities are defined close to each cache:
 - `CrossFileFileCache` (content + existence): `crates/raven/src/cross_file/file_cache.rs`
 - `CrossFileWorkspaceIndex`: `crates/raven/src/cross_file/workspace_index.rs`
 - `WorkspaceIndex`: `crates/raven/src/workspace_index.rs`
+- `StandaloneScopeCache`: `crates/raven/src/cross_file/scope.rs`
 
-Cache sizes are configurable via VS Code settings and applied during initialization/config change.
+Most cache sizes are configurable via VS Code settings and applied during
+initialization/config change. `StandaloneScopeCache` is fixed-size today.
+
+`StandaloneScopeCache` is owned by `WorldState` as an `Arc`. Diagnostic and
+interactive callers clone that `Arc`, plus the current edge revision and package
+configuration generation, while holding the `WorldState` read lock and then drop
+the guard before resolving scope. The key is the standalone callee URI, graph
+edge revision, the callee's path-context fingerprint, a hash of the
+`interface_hash` values for the callee plus its forward closure, and the
+package/config generation. Hits therefore skip re-resolving a
+caller-independent isolated scope only when dependency membership, path
+resolution inputs, exported interfaces, package facts, and depth-sensitive
+config are unchanged.
+
+While computing a standalone callee's isolated scope, recursive parent-prefix
+walks for non-standalone members of the callee's forward closure are restricted
+to parents inside that same closure. That prevents a shared member's external
+caller from making the cached scope depend on the current `visited` chain. Any
+future input that can shape the isolated closure must also be reflected in
+`StandaloneScopeKey`.
 
 ### Real-time diagnostics & monotonic publishing
 

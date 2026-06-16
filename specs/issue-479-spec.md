@@ -278,18 +278,17 @@ caller A, resolve C with **canonical, caller-independent inputs** (empty/base
 package set, `None` provider, C's own `PathContext`) rather than A's inherited
 packages/provider/cd (`scope.rs:5412,5715`) — so C's scope is byte-identical
 whether computed for C's own diagnostics or as A's forward child. This canonical
-resolution is the precondition that makes the WI2b cache key (C's URI alone)
-sound.
+resolution is the precondition that makes the WI2b cache's callee identity
+caller-independent. The persistent key is intentionally broader than C's URI:
+URI, full-graph edge revision, path-context fingerprint, closure-interface
+fingerprint, and package/config generation.
 
-> **Shipped scope (WI2a) — part 1 only; part 2 deferred to WI2b (#483).** Only
-> the **backward-walk skip** shipped: `parent_prefix_at` returns the empty
-> `ParentPrefix` for a standalone `uri` (`scope.rs:5023`), which isolates C's
-> *own* diagnostics from its callers' backward contribution. The **caller-
-> independent forward-child resolution** (dropping caller A's inherited
-> packages/provider/`cd` when resolving standalone C as A's forward child, the
-> "canonical inputs" paragraph above) did **not** ship — when C is sourced by A,
-> A's threaded packages/provider/cd still flow into C's forward resolution. That
-> part 2 is the precondition for the WI2b cache key and is deferred to WI2b
+> **Current shipped scope (WI2b / #483).** The WI2a review found that only the
+> backward-walk skip had landed. WI2b completes part 2: standalone forward
+> children now receive caller-independent packages/provider/path context, and
+> non-standalone members of a standalone callee's forward closure ignore
+> backward parents outside that same closure. This is the directive-scoped
+> behavior change that makes the isolated scope cacheable across callers.
 > (#483) along with the cache itself. The two are decoupled deliberately: part 1
 > delivers the own-diagnostics isolation and the hub-perf win that WI2a targets,
 > while part 2 only matters once the cross-snapshot cache exists. User-facing
@@ -310,29 +309,42 @@ metadata-free hash path passes `false`; the metadata-aware path passes
 
 ### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — MEASURE-GATED
 
-Knob 1 (WI2a) makes C's isolated EOF scope a pure function of `(C, C's forward
-closure)`. WI2b caches that scope so it is computed once and reused (a) across
-all 84 callers within one diagnostic pass, (b) across the ×84 revalidation
-fan-out when the hub is edited, and (c) across the 245 separate per-file
-snapshots of `raven check .` (each caller's snapshot would otherwise re-resolve
-C). Within-pass reuse alone kills the IDE hub-edit pause; cross-snapshot reuse is
-what additionally speeds `raven check .` for the hub.
+Knob 1 (WI2a) makes C's direct caller inputs independent. WI2b caches C's
+isolated EOF scope when the whole forward closure is likewise caller-independent
+so it is computed once and reused (a) across all 84 callers within one
+diagnostic pass, (b) across the ×84 revalidation fan-out when the hub is edited,
+and (c) across the 245 separate per-file snapshots of `raven check .` (each
+caller snapshot would otherwise re-resolve C). Within-pass reuse alone kills the
+IDE hub-edit pause; cross-snapshot reuse is what additionally speeds
+`raven check .` for the hub.
+
+One implementation caveat found during WI2b review: a non-standalone file inside
+C's forward closure normally performs its own backward parent-prefix walk. If
+that member has a backward parent outside C's forward closure, the member prefix
+can depend on the current caller's `visited` chain. WI2b resolves C's isolated
+closure with those member parent-prefix walks restricted to parents inside the
+same closure, preserving cache-on == cache-off behavior while keeping the value
+cacheable.
 
 **Soundness of the cache key.** Because WI2a resolves C with caller-independent
 inputs, C's isolated scope does NOT depend on any of the caller-varying fields
 in `ForwardChildKey` (`path_fp`/`pkg_fp`/`provider_fp`, `scope.rs:1015`). So C's
-URI is a sufficient key *for the scope value* — provided invalidation correctly
-detects changes to C or its forward closure.
+URI plus C's path-context fingerprint are sufficient key inputs *for the scope
+value* — provided invalidation correctly detects changes to C or its forward
+closure.
 
 **Invalidation — per-closure `interface_hash` fingerprint (chosen design).**
 
-Cache key = `(C_uri, edge_revision, closure_interface_fingerprint,
-package_config_generation)`:
+Cache key = `(C_uri, edge_revision, path_context_fingerprint,
+closure_interface_fingerprint, package_config_generation)`:
 
 - `edge_revision` (`dependency.rs:535`) pins the **membership** of C's forward
   closure. It bumps on any structural edge change (`dependency.rs:959-983`),
   including a closure member adding/retargeting a `source()` or moving a call
   site.
+- `path_context_fingerprint` pins C's own forward path-resolution context,
+  including workspace-root fallback inputs when no explicit or inherited
+  working directory is in effect.
 - `closure_interface_fingerprint` = a hash over the per-file `interface_hash` of
   every file in `{C} ∪ forward_closure(C)` (all already computed and cached in
   artifacts). C's isolated scope is the composition of the closure members'
@@ -366,11 +378,10 @@ after_edit`) already relies on `interface_hash` capturing every interface change
 so keying the cache on it reuses an existing requirement rather than adding a
 new one. Two guards make this safe:
 
-1. **#482 is a PREREQUISITE.** `Hash for ScopedSymbol` currently omits
-   `signature` (`scope.rs:619` vs `PartialEq` at `scope.rs:614`), so a
-   formals-only edit would not bust the fingerprint → stale cached signature.
-   The cache MUST NOT be keyed on `interface_hash` until #482 lands.
-2. **Add a `ScopedSymbol` `Hash`/`Eq` field-parity test** (mutate each field,
+1. **#482 prerequisite is satisfied.** `Hash for ScopedSymbol` now includes
+   `signature`, so formals-only edits bust `interface_hash` and invalidate a
+   cached standalone scope.
+2. **Keep the `ScopedSymbol` `Hash`/`Eq` field-parity test** (mutate each field,
    assert the hash changes — except the deliberately-excluded positional
    `defined_end_column`, derived from name+column). This converts the
    "future field omitted from `Hash`" landmine into a guarded invariant.
@@ -396,16 +407,14 @@ read locks `peek()` (no promotion), write locks `push()`.
 
 ### Interactions (resolved; Codex round 2 to stress-test)
 
-- **`# raven: cd`** — `standalone` (knob 1, shipped) suppresses C's *backward*
-  parent-prefix walk, which drops the caller-inherited **symbols and packages**
-  (the only contributions the backward `ParentPrefix` carries). Backward
-  directives already ignore `# raven: cd` (`PathContext::new`), and the backward
-  walk never threads a caller working directory into C, so knob 1 has nothing
-  cd-related to drop. C's own forward path resolution respects C's own
-  `# raven: cd` exactly as today. No change to path resolution. (Dropping the
-  *caller's* forward-threaded working directory / provider when C is resolved as
-  a caller's forward child is the deferred part 2 / WI2b — see the "Shipped scope
-  (WI2a)" note.)
+- **`# raven: cd`** — `standalone` suppresses C's *backward* parent-prefix walk,
+  which drops the caller-inherited **symbols and packages** (the only
+  contributions the backward `ParentPrefix` carries). Standalone forward-child
+  resolution also drops caller-inherited working directory and uses C's own
+  path context. Backward directives already ignore `# raven: cd`
+  (`PathContext::new`). C's own forward path resolution respects C's own
+  `# raven: cd`; if absent, standalone C uses its file-relative/workspace-root
+  fallback context rather than an inherited caller working directory.
 - **`# raven: nse` / `# raven: func`** — NSE/func propagation is **graph-only**:
   `collect_cross_file_nse` walks the revalidation-consistent set `S(Q)` over the
   source graph and reads only `nse_declarations`/`declared_functions`, never

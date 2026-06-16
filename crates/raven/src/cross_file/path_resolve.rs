@@ -94,10 +94,13 @@ impl PathContext {
             ctx.working_directory = resolve_working_directory(wd_path, &ctx);
         }
 
-        // Apply inherited working directory if no explicit one.
+        // Apply inherited working directory if no explicit one. Standalone
+        // modules are caller-independent: they still honor their own explicit
+        // `# raven: cd`, but never inherit a caller working directory.
         // Inherited working directories are stored as absolute paths, so use directly
         // when absolute. Only resolve if relative (legacy/edge case).
         if ctx.working_directory.is_none()
+            && !metadata.standalone
             && let Some(ref inherited_wd) = metadata.inherited_working_directory
         {
             let inherited_path = PathBuf::from(inherited_wd);

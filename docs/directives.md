@@ -132,12 +132,17 @@ Place `# raven: standalone` in the **header** of a sourced *library* file to
 declare it self-contained. It takes no arguments and is **header-only** (it must
 appear before any code; a `standalone` token after code is ignored).
 
-When computing a standalone file's **own** diagnostics, it is resolved **in
-isolation** from the files that `source()` it:
+When computing a standalone file's **own** diagnostics, and when resolving that
+file as a sourced child of another file, it is resolved **in isolation** from
+the files that `source()` it:
 
 - It does **not** inherit symbols or loaded packages from any caller — no
-  backward parent-prefix walk. Its own cross-file scope is determined by the file
-  itself and its own forward `source()` closure, not by who sources it.
+  backward parent-prefix walk and no caller package set during forward-child
+  resolution. Its own cross-file scope is determined by the file itself and its
+  own forward `source()` closure, not by who sources it.
+- It uses its own path context when following its forward `source()` calls. A
+  caller's inherited `# raven: cd` does not change how the standalone file's
+  own forward paths resolve.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.
@@ -148,7 +153,12 @@ isolation** from the files that `source()` it:
 others (a hub). Declaring it standalone both **prevents** caller-union
 over-approximation (one caller's bindings leaking into the file's analysis on
 behalf of another) and makes Raven much faster on hub-heavy workspaces, because
-the file's scope no longer depends on its callers.
+Raven can reuse the file's isolated scope across callers and many edits that do
+not change the exported interface of the hub or any file in its forward closure.
+Reuse is conservative: dependency-edge changes anywhere in the workspace bump a
+global edge revision and force a recompute. If a non-standalone file in the
+hub's forward closure is also sourced from outside that closure, the outside
+parent is not allowed to shape the standalone hub's isolated scope.
 
 **Opt-in and safe-direction.** You vouch that the file is self-contained. If it
 actually relies on a binding a caller provides, the worst case is a
@@ -455,5 +465,3 @@ extend the unused-suppression sweep to **every** ignore directive
 Inside `.Rmd` / `.qmd` documents you can suppress a whole chunk with the knitr
 chunk option `raven.ignore` or the in-chunk `# raven: ignore-chunk` directive.
 See [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk).
-
-

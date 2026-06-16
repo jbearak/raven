@@ -1341,8 +1341,7 @@ impl Backend {
         let (committed, final_ready) = {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
-                state.package_library = library;
-                state.package_library_ready = ready;
+                state.set_package_library(library, ready);
                 (true, ready)
             } else {
                 log::trace!("PackageLibrary already initialized (race), keeping existing");
@@ -2621,8 +2620,7 @@ impl LanguageServer for Backend {
         let committed = {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
-                state.package_library = new_package_library;
-                state.package_library_ready = package_library_ready;
+                state.set_package_library(new_package_library, package_library_ready);
                 true
             } else {
                 log::info!(
@@ -2813,8 +2811,7 @@ impl LanguageServer for Backend {
                 let (new_lib, ready) = rebuild_package_library(&self.state).await;
                 {
                     let mut state = self.state.write().await;
-                    state.package_library = new_lib;
-                    state.package_library_ready = ready;
+                    state.set_package_library(new_lib, ready);
                     // Swapping the library may have changed `lib_paths`
                     // (renv switch, `.Rprofile` edit). Re-resolve
                     // `source(system.file(...))` edges against the new paths
@@ -6380,8 +6377,7 @@ impl Backend {
             // Replace under brief write lock.
             {
                 let mut state = self.state.write().await;
-                state.package_library = new_package_library;
-                state.package_library_ready = package_library_ready;
+                state.set_package_library(new_package_library, package_library_ready);
                 // The new library may carry different `lib_paths` (the user
                 // changed `raven.packages.additionalLibraryPaths`, or a
                 // raven.toml reload re-ran `.libPaths()`). Re-resolve
