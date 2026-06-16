@@ -9,9 +9,18 @@
 // resolved as a caller's forward child it now receives canonical,
 // caller-independent inputs — empty packages, no `data()` provider, its own
 // `PathContext` (part 2, this issue). So C's isolated EOF scope is a pure
-// function of `(C, C's forward closure)` plus the traversal config — it does
-// NOT depend on which file sourced C. That purity is what makes the scope
-// cacheable globally, keyed by C's URI rather than by per-caller inputs.
+// function of its **contributing set** plus the traversal config — and that set
+// does NOT depend on which file sourced C. The contributing set is the forward
+// `source()` closure of C, PLUS the backward parents of any non-standalone
+// closure member (a non-standalone member runs its own parent-prefix walk, so
+// e.g. a file that `library()`s a package and also `source()`s the member leaks
+// that package into C's scope), transitively. Crucially it never follows the
+// backward edges out of a standalone file (C's own callers are excluded by part
+// 1 / part 2), which is what keeps the set — and thus the scope — independent of
+// who sourced C, and so cacheable globally keyed by C's URI. The cache key's
+// `closure_interface_fingerprint` is hashed over this whole contributing set
+// (see `standalone_closure_fingerprint_and_members` in `scope.rs`), so an edit
+// to ANY contributing file invalidates the entry.
 //
 // What this buys. On a hub-heavy workspace (`~/repos/worldwide`, ~84 files
 // `source("bootstrap.r")`), resolving the standalone hub's isolated scope is

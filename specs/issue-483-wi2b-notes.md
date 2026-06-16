@@ -83,12 +83,24 @@ This makes a cache hit byte-identical to the un-memoized resolver under any
 - `edge_revision`: global value from `WorldState.cross_file_graph`, captured under
   the read lock and stored on the snapshot / threaded into the resolver.
 - `closure_interface_fingerprint`: order-sensitive hash over the per-file
-  `interface_hash` of `{C} ∪ forward_closure(C)`, walked over the resolver's
-  (trimmed-snapshot) graph via `get_dependencies`, with each member's
-  `interface_hash` read from `get_artifacts`. Computed lazily and memoized per
-  `C_uri` on the per-query `ForwardChildMemo` (constant within a query). Sound
-  because the cached value is a function of exactly these inputs in this snapshot;
-  a differently-trimmed snapshot yields a different fingerprint and safely misses.
+  `interface_hash` of C's **contributing set**, with each member's
+  `interface_hash` read from `get_artifacts`. The contributing set is NOT just
+  `{C} ∪ forward_closure(C)`: a non-standalone forward-closure member runs its
+  own backward parent-prefix walk, so the parents of such members (and their
+  forward sources), transitively, also feed C's isolated scope — e.g. a file `A`
+  that `library()`s a package and also `source()`s a member leaks that package
+  into C via the member's prefix. So the set is the closure under: forward
+  `source()` edges from every file, plus backward `source()` edges only out of a
+  **non-standalone** file (a standalone file's own backward walk is skipped, which
+  is exactly what keeps the set — and the key — independent of C's callers).
+  Walked over the resolver's (trimmed-snapshot) graph via `get_dependencies` /
+  `get_dependents`; computed lazily and memoized per `C_uri` on the per-query
+  `ForwardChildMemo` (constant within a query). Sound because the cached value is
+  a function of exactly the contributing set's interfaces in this snapshot.
+  (Found in WI2b review: a forward-only fingerprint admitted a stale cross-snapshot
+  HIT when a member's external backward parent was edited — its `library()` line
+  bumps neither `edge_revision` nor a forward-only fingerprint; regression test
+  `standalone_cache_invalidates_on_member_backward_parent_edit`.)
 - `package_config_generation`: a new coarse `u64` counter on `WorldState`, bumped
   on R/package-library re-init and on `packages_*` / `maxChainDepth` /
   `hoist_globals` / `backward_dependencies` / `base_exports` config changes — the

@@ -1046,48 +1046,77 @@ fn forward_memo_graph_has_cycle(
 }
 
 /// Compute (and memoize on the supplied `ForwardChildMemo`) the
-/// `closure_interface_fingerprint` and membership of `{uri} ∪
+/// `closure_interface_fingerprint` and the forward-closure membership `{uri} ∪
 /// forward_closure(uri)` for a standalone callee `uri` (issue #483).
 ///
+/// ## What the fingerprint must cover
+///
+/// A cache HIT must reproduce the un-memoized resolution byte-for-byte, so the
+/// fingerprint must change whenever ANY file whose content feeds the callee's
+/// isolated EOF scope changes. That set — the **contributing set** — is NOT just
+/// the forward `source()` closure of `uri`. When the callee sources a
+/// *non-standalone* member `M`, `M` runs its own STEP-1 backward parent walk
+/// (`parent_prefix_at`), so `M`'s backward parents (and their forward sources,
+/// transitively) also contribute (e.g. an `A` that does `library(pkg)` and also
+/// `source()`s `M` leaks `pkg` into the callee's scope via `M`'s prefix). Those
+/// files are caller-independent (the walk picks them up regardless of which file
+/// ultimately sourced the callee), but they lie OUTSIDE the forward closure, so
+/// neither `edge_revision` (no source edge changed when `A`'s `library()` line is
+/// edited) nor a forward-only fingerprint would catch an edit to them — a stale
+/// cross-snapshot HIT. So the contributing set is the closure under:
+///   * **forward** source edges from every file in the set (a file's sources
+///     always contribute), and
+///   * **backward** source edges only from a **non-standalone** file (its own
+///     parent walk contributes its parents; a standalone file's backward walk is
+///     skipped — WI2a part 1 / part 2 — which is exactly what keeps the key
+///     independent of the callee's own callers).
+///
 /// The fingerprint is an order-sensitive hash over the per-file `interface_hash`
-/// of every closure member, walked over the resolver's (per-snapshot, possibly
-/// trimmed) `graph` via `get_dependencies` and read from `get_artifacts`.
+/// of the contributing set (sorted for determinism), read from `get_artifacts`.
 /// Because `interface_hash` is a complete change-detector for a file's exported,
-/// scope-contributing interface (post-#482) and `edge_revision` pins closure
-/// membership, `(edge_revision, Σ interface_hash)` fully determines the callee's
-/// isolated EOF scope. A closure member's body/comment/local edit leaves its
-/// `interface_hash` unchanged → cache hit; a top-level interface edit changes it
-/// → cache miss → recompute.
+/// scope-contributing interface (post-#482) and `edge_revision` pins set
+/// membership, `(edge_revision, Σ interface_hash over the contributing set)`
+/// fully determines the callee's isolated EOF scope. A body/comment/local edit
+/// leaves a member's `interface_hash` unchanged → cache hit; a top-level
+/// interface edit anywhere in the contributing set changes it → miss → recompute.
+/// Following forward edges out of a backward parent (rather than only its
+/// pre-`source()` prefix) over-approximates safely — extra invalidation, never a
+/// stale hit.
 ///
-/// The returned member list is used by the EOF hook to gate the cache on
-/// visited-contamination: if any closure member is already in the resolver's
-/// `visited`, its forward `source()` would short-circuit and the resolved scope
-/// would be a *truncated* (caller-path-dependent) one — which must never be
-/// cached or served (the bug this guard fixes).
+/// ## Returned member list
 ///
-/// The walk is BFS over outgoing source edges with its own `seen` guard, so
-/// source cycles within the closure terminate (and the cache itself is only
-/// consulted on acyclic graphs). A member with no artifacts contributes its URI
-/// string to the hash but no interface bits (the absence is itself part of the
-/// key).
-fn standalone_closure_fingerprint_and_members<F>(
+/// The returned `Vec<Url>` is the **forward closure** only (not the full
+/// contributing set). The EOF hook uses it to gate on visited-contamination: if a
+/// forward-closure member is already in the resolver's `visited`, its forward
+/// `source()` would short-circuit and the resolved scope would be a *truncated*
+/// (caller-path-dependent) one that must never be cached. A backward parent being
+/// in `visited` does NOT truncate (its packages are still picked up), so the
+/// guard correctly excludes it.
+///
+/// Both walks carry their own `seen` guard, so source cycles terminate (and the
+/// cache is only consulted on acyclic graphs anyway). A file with no artifacts
+/// contributes its URI string to the hash but no interface bits (the absence is
+/// itself part of the key).
+fn standalone_closure_fingerprint_and_members<F, G>(
     uri: &Url,
     graph: &super::dependency::DependencyGraph,
     get_artifacts: &F,
+    get_metadata: &G,
     memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> (u64, Arc<Vec<Url>>)
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<Arc<super::types::CrossFileMetadata>>,
 {
     if let Some((fp, members)) = memo.borrow().standalone_closures.get(uri) {
         return (*fp, Arc::clone(members));
     }
-    // BFS the forward source() closure deterministically (sorted neighbors) so
-    // the fold order is stable across runs and snapshots.
-    let mut seen: HashSet<Url> = HashSet::new();
+    // (1) Forward source() closure, deterministic order (sorted neighbors) — the
+    // member list returned for the contamination guard.
+    let mut fwd_seen: HashSet<Url> = HashSet::new();
     let mut order: Vec<Url> = Vec::new();
     let mut queue: std::collections::VecDeque<Url> = std::collections::VecDeque::new();
-    seen.insert(uri.clone());
+    fwd_seen.insert(uri.clone());
     queue.push_back(uri.clone());
     while let Some(current) = queue.pop_front() {
         order.push(current.clone());
@@ -1099,17 +1128,47 @@ where
         children.sort();
         children.dedup();
         for child in children {
-            if seen.insert(child.clone()) {
+            if fwd_seen.insert(child.clone()) {
                 queue.push_back(child);
             }
         }
     }
+
+    // (2) Full contributing set for the fingerprint: closure under forward edges
+    // from every file, and backward edges only from a non-standalone file (see
+    // the doc comment). Start from `uri` (standalone, so its own backward edges
+    // are never followed).
+    let mut contrib: HashSet<Url> = HashSet::new();
+    let mut work: std::collections::VecDeque<Url> = std::collections::VecDeque::new();
+    contrib.insert(uri.clone());
+    work.push_back(uri.clone());
+    while let Some(f) = work.pop_front() {
+        for edge in graph.get_dependencies(&f) {
+            if contrib.insert(edge.to.clone()) {
+                work.push_back(edge.to.clone());
+            }
+        }
+        // A standalone file's own backward parent walk is skipped during
+        // resolution, so its parents never contribute — do not follow its
+        // backward edges (this is what keeps a hub's key caller-independent).
+        let is_standalone = get_metadata(&f).is_some_and(|m| m.standalone);
+        if !is_standalone {
+            for edge in graph.get_dependents(&f) {
+                if contrib.insert(edge.from.clone()) {
+                    work.push_back(edge.from.clone());
+                }
+            }
+        }
+    }
+    let mut contrib_sorted: Vec<Url> = contrib.into_iter().collect();
+    contrib_sorted.sort();
+
     let mut hasher = DefaultHasher::new();
-    order.len().hash(&mut hasher);
-    for member in &order {
+    contrib_sorted.len().hash(&mut hasher);
+    for member in &contrib_sorted {
         // The URI string anchors each member's contribution to its identity so
-        // that two closures with the same multiset of interface hashes but
-        // different membership cannot collide.
+        // that two sets with the same multiset of interface hashes but different
+        // membership cannot collide.
         member.as_str().hash(&mut hasher);
         match get_artifacts(member) {
             Some(arts) => {
@@ -5700,6 +5759,7 @@ where
                     uri,
                     graph,
                     get_artifacts,
+                    get_metadata,
                     forward_child_memo,
                 );
                 // Skip the cache if any closure member is already visited (the
@@ -10312,6 +10372,101 @@ mod tests {
         );
     }
 
+    /// Regression for the cross-snapshot staleness bug found in WI2b review.
+    ///
+    /// A standalone callee's isolated scope can depend on the backward parents of
+    /// its NON-standalone forward-closure members: when standalone `hub` sources
+    /// non-standalone `m`, `m`'s own `parent_prefix_at` walk pulls in `m`'s other
+    /// parent `a` (which does `library(dplyr)`), so `dplyr` leaks into `hub`'s
+    /// isolated scope. `a` lies OUTSIDE `hub`'s forward closure `{hub, m}`, so an
+    /// edit to `a`'s `library()` line bumps neither `edge_revision` (no source
+    /// edge changed) nor a forward-only fingerprint. The fingerprint must cover
+    /// the full contributing set (forward closure + backward parents of
+    /// non-standalone members), so that:
+    ///   (a) the entry is still reused across callers (`a`'s contribution is
+    ///       caller-independent — the same for any file that sources `hub`), and
+    ///   (b) editing `a` invalidates the entry (no stale HIT).
+    #[test]
+    fn standalone_cache_invalidates_on_member_backward_parent_edit() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        // Diamond: `a` loads dplyr, sources hub THEN m (so `a` is a backward
+        // parent of m, and dplyr is in scope at `a`'s source(m)). hub is
+        // standalone and sources m. `b` only sources hub. m is non-standalone.
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                (
+                    a.clone(),
+                    "library(dplyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+                ),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        // Populate the cache via caller `a`, then resolve via caller `b`: `b`
+        // must still HIT (the leaked package is caller-independent), proving the
+        // contributing-set fix did not break cross-caller reuse.
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let sa = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&sa), vec!["dplyr".to_string()]);
+        assert_eq!(
+            pkgs(&sb),
+            vec!["dplyr".to_string()],
+            "second caller must see the same caller-independent scope"
+        );
+        assert_eq!(cache.hits(), 1, "second caller must reuse the cached scope");
+
+        // EDIT `a`: library(dplyr) -> library(tidyr). Only a library() call
+        // changed, NOT a source() edge, so edge_revision is unchanged; `a` is a
+        // backward parent of m, not a member of hub's forward closure.
+        replace_artifacts(
+            &mut arts,
+            &a,
+            "library(tidyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+        );
+
+        // Same persistent cache: must NOT serve the stale dplyr scope.
+        let sb_after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        // Reference: a fresh cache reflects the edit.
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let sb_ref = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&sb_after),
+            pkgs(&sb_ref),
+            "stale HIT: persistent cache served pre-edit `a`'s package after `a` changed"
+        );
+        assert_eq!(
+            pkgs(&sb_after),
+            vec!["tidyr".to_string()],
+            "post-edit scope must reflect the new library() in the member's backward parent"
+        );
+    }
+
     #[test]
     fn standalone_cache_body_edit_to_closure_member_stays_hit() {
         use crate::cross_file::standalone_cache::StandaloneScopeCache;
@@ -10463,14 +10618,53 @@ mod tests {
         resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
         let cached = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
         assert!(cache.hits() >= 1, "b must hit hub's cached scope");
-        // The merged caller scope must be identical symbol-for-symbol.
-        let mut cached_syms: Vec<&str> = cached.symbols.keys().map(|k| k.as_ref()).collect();
-        let mut uncached_syms: Vec<&str> = uncached.symbols.keys().map(|k| k.as_ref()).collect();
-        cached_syms.sort_unstable();
-        uncached_syms.sort_unstable();
+        // The merged caller scope must match the uncached resolution across every
+        // scope-carrying field, not just the symbol key set — a HIT that diverged
+        // in package state (the failure mode found in WI2b review) or in a
+        // symbol's resolved identity must be caught here.
+        fn symbol_identities(s: &ScopeAtPosition) -> Vec<(String, String, u32, String)> {
+            let mut v: Vec<(String, String, u32, String)> = s
+                .symbols
+                .iter()
+                .map(|(name, sym)| {
+                    (
+                        name.to_string(),
+                        sym.source_uri.to_string(),
+                        sym.defined_line,
+                        format!("{:?}|{:?}", sym.kind, sym.signature),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        fn sorted(set: &HashSet<String>) -> Vec<String> {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort();
+            v
+        }
         assert_eq!(
-            cached_syms, uncached_syms,
-            "a cache HIT must yield the same symbol set as uncached resolution"
+            symbol_identities(&cached),
+            symbol_identities(&uncached),
+            "a cache HIT must yield the same symbols (name + source + line + kind/signature)"
+        );
+        assert_eq!(
+            sorted(&cached.inherited_packages),
+            sorted(&uncached.inherited_packages),
+            "inherited_packages must match uncached"
+        );
+        assert_eq!(
+            sorted(&cached.loaded_packages),
+            sorted(&uncached.loaded_packages),
+            "loaded_packages must match uncached"
+        );
+        let mut cached_po: Vec<String> = cached.package_origins.keys().cloned().collect();
+        let mut uncached_po: Vec<String> = uncached.package_origins.keys().cloned().collect();
+        cached_po.sort();
+        uncached_po.sort();
+        assert_eq!(
+            cached_po, uncached_po,
+            "package_origins must match uncached"
         );
     }
 
