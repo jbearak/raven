@@ -376,6 +376,20 @@ read locks `peek()` (no promotion), write locks `push()`.
 
 ## Work item 3 — Tier 2: parallelize the CLI per-file loop
 
+**STATUS: IMPLEMENTED (commit `82e2209d`). worldwide (release): `raven check .`
+21.45s → 3.83s (5.6×); byte-identical (361, diff empty) and deterministic across
+runs. Full arc vs pre-#479 main: 25.6s → 3.83s — single-digit for ALL repos,
+directive-free.**
+
+> Implemented as a sync/async split: the CPU-bound phase (snapshot build +
+> `diagnostics_from_snapshot`) runs across files via rayon; the cheap async
+> on-disk missing-file checks run afterward. Each worker passes a one-entry
+> open-documents overlay (`build_with_open_documents` /
+> `content_provider_with_documents`) so exactly one target is "open" per task and
+> `state.documents` is never shared/mutated — reproducing the sequential
+> semantics byte-for-byte. Disk-fallback / bad-URL targets stay on the sequential
+> path.
+
 **Independent of items 1–2. CLI-only (does not help the IDE, already async).**
 
 ### Design
