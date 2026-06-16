@@ -571,13 +571,18 @@ pub enum SymbolKind {
 
 /// A symbol with its definition location
 //
-// `PartialEq`/`Hash` are hand-written below and deliberately EXCLUDE
-// `defined_end_column` (it is positional metadata, not identity — two symbols
-// that differ only in their highlight width are the same binding for cache /
-// dedup purposes). They preserve the pre-existing field sets exactly:
-// `PartialEq` compares every other field (including `signature`); `Hash`
-// omits `signature`. That asymmetry is sound — equal values still hash equal —
-// and is intentionally left unchanged here.
+// `PartialEq`/`Hash` are hand-written below and share the SAME field set:
+// every field EXCEPT `defined_end_column`, which both deliberately EXCLUDE (it
+// is positional highlight metadata, not identity — two symbols that differ only
+// in their highlight width are the same binding for cache / dedup purposes).
+// `signature` is part of both (issue #482): it must be hashed so that
+// `compute_interface_hash` — which hashes a file's exported symbols through
+// this `Hash` impl — is sensitive to a formals-only edit
+// (`f <- function(a)` → `f <- function(a, b)`); otherwise dependents that
+// `source()` the file are not revalidated and cross-file
+// hover/completion/signature-help show a stale signature. The
+// `scoped_symbol_hash_eq_field_parity` test pins this field-set equality so the
+// two impls cannot silently desync.
 #[derive(Debug, Clone, Eq)]
 pub struct ScopedSymbol {
     pub name: Arc<str>,
@@ -623,6 +628,7 @@ impl Hash for ScopedSymbol {
         self.source_uri.hash(state);
         self.defined_line.hash(state);
         self.defined_column.hash(state);
+        self.signature.hash(state);
         self.is_declared.hash(state);
     }
 }
@@ -8261,6 +8267,196 @@ mod tests {
         assert_ne!(
             ha, hb,
             "renaming a top-level export must change interface_hash"
+        );
+    }
+
+    /// Issue #482: `Hash` and `PartialEq` for `ScopedSymbol` MUST cover the
+    /// same field set — every field except `defined_end_column` (positional
+    /// highlight metadata, deliberately excluded from BOTH). This pins that
+    /// parity: mutating any Eq-significant field flips both `==` and the hash;
+    /// mutating the excluded field flips neither. A future field added to one
+    /// impl but not the other trips this test, preventing the two from
+    /// silently desyncing (which is exactly how the pre-#482 `signature`
+    /// omission slipped in).
+    #[test]
+    fn scoped_symbol_hash_eq_field_parity() {
+        fn hash_of(s: &ScopedSymbol) -> u64 {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        }
+
+        let base = ScopedSymbol {
+            name: Arc::from("f"),
+            kind: SymbolKind::Function,
+            source_uri: test_uri(),
+            defined_line: 3,
+            defined_column: 0,
+            defined_end_column: 1,
+            signature: Some("f(a)".to_string()),
+            is_declared: false,
+        };
+
+        // Each entry mutates exactly one Eq-significant field. Both `!=` and
+        // the hash must change — proving the field is in BOTH impls.
+        let eq_significant: Vec<(&str, ScopedSymbol)> = vec![
+            (
+                "name",
+                ScopedSymbol {
+                    name: Arc::from("g"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "kind",
+                ScopedSymbol {
+                    kind: SymbolKind::Variable,
+                    ..base.clone()
+                },
+            ),
+            (
+                "source_uri",
+                ScopedSymbol {
+                    source_uri: Url::parse("file:///other.R").unwrap(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "defined_line",
+                ScopedSymbol {
+                    defined_line: 4,
+                    ..base.clone()
+                },
+            ),
+            (
+                "defined_column",
+                ScopedSymbol {
+                    defined_column: 1,
+                    ..base.clone()
+                },
+            ),
+            // The field this issue adds to `Hash`:
+            (
+                "signature",
+                ScopedSymbol {
+                    signature: Some("f(a, b)".to_string()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "is_declared",
+                ScopedSymbol {
+                    is_declared: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, mutated) in &eq_significant {
+            assert_ne!(
+                base, *mutated,
+                "mutating `{field}` must make symbols unequal"
+            );
+            assert_ne!(
+                hash_of(&base),
+                hash_of(mutated),
+                "mutating `{field}` must change the hash (Hash must track every Eq field)"
+            );
+        }
+
+        // `defined_end_column` is excluded from BOTH impls: mutating it changes
+        // neither equality nor the hash.
+        let end_col_only = ScopedSymbol {
+            defined_end_column: 99,
+            ..base.clone()
+        };
+        assert_eq!(
+            base, end_col_only,
+            "mutating `defined_end_column` must NOT affect equality"
+        );
+        assert_eq!(
+            hash_of(&base),
+            hash_of(&end_col_only),
+            "mutating `defined_end_column` must NOT affect the hash"
+        );
+    }
+
+    /// Issue #482: a formals-only edit to a top-level function
+    /// (`f <- function(a)` → `f <- function(a, b)`) changes the exported
+    /// signature, so it MUST change `interface_hash` — otherwise dependents
+    /// that source the file are not revalidated and cross-file
+    /// hover/completion/signature-help show a stale signature. Guards the
+    /// `self.signature.hash(...)` line in `impl Hash for ScopedSymbol`.
+    #[test]
+    fn interface_hash_changes_on_signature_only_edit() {
+        let a = "f <- function(a) a";
+        let b = "f <- function(a, b) a";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts(&test_uri(), &ta, a).interface_hash;
+        let hb = compute_artifacts(&test_uri(), &tb, b).interface_hash;
+        assert_ne!(
+            ha, hb,
+            "a signature-only edit to a top-level function must change interface_hash"
+        );
+    }
+
+    /// Issue #482, end-to-end at the revalidation level: a signature-only edit
+    /// to a sourced file changes its `interface_hash`, and
+    /// `compute_affected_dependents_after_edit` (which keys on whether the
+    /// interface changed) then includes the dependent that sources it. This is
+    /// the user-visible chain the fix repairs — stale cross-file signatures.
+    #[test]
+    fn signature_only_edit_revalidates_dependents() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::revalidation::compute_affected_dependents_after_edit;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let root = Url::parse("file:///proj").unwrap();
+        let child = Url::parse("file:///proj/child.R").unwrap();
+        let parent = Url::parse("file:///proj/parent.R").unwrap();
+
+        // The edit adds a formal to child's exported function (signature only).
+        let v1 = "f <- function(a) a";
+        let v2 = "f <- function(a, b) a";
+        let h1 = compute_artifacts(&child, &parse_r(v1), v1).interface_hash;
+        let h2 = compute_artifacts(&child, &parse_r(v2), v2).interface_hash;
+        assert_ne!(h1, h2, "a signature-only edit must change interface_hash");
+
+        // parent.R sources child.R.
+        let mut graph = DependencyGraph::new();
+        let meta_parent = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent, &meta_parent, Some(&root), |_| None);
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(parent.clone());
+        open.insert(child.clone());
+
+        let affected = compute_affected_dependents_after_edit(
+            &child,
+            h1 != h2, // interface_changed — derived from the real hashes
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
+        assert!(
+            affected.contains(&parent),
+            "a dependent that sources the edited file must be revalidated on a signature edit"
         );
     }
 
