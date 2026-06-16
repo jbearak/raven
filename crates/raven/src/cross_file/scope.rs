@@ -1631,6 +1631,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &removal_refs,
         &data_loads,
         &declarations,
+        // No metadata available in this path → cannot be standalone.
+        false,
     );
 
     artifacts
@@ -1914,6 +1916,7 @@ pub fn compute_artifacts_with_metadata(
         &removal_refs,
         &data_loads,
         &declarations,
+        metadata.is_some_and(|m| m.standalone),
     );
 
     artifacts
@@ -4490,6 +4493,7 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 /// `top_level_removals`, `data_loads`, and `declarations` (the
 /// `(name, line)` pairs of all timeline `Declaration` events — see
 /// [`extract_top_level_declarations`]).
+#[allow(clippy::too_many_arguments)]
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
@@ -4498,8 +4502,16 @@ fn compute_interface_hash(
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
     declarations: &[(Arc<str>, u32)],
+    standalone: bool,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
+
+    // Issue #479: a `# raven: standalone` callee no longer inherits packages
+    // from its callers, which changes the inherited-package set it propagates
+    // forward to OTHER callers (it removes the caller-union package leakage). So
+    // toggling the directive in any connected file must invalidate dependents —
+    // include it in the interface hash.
+    standalone.hash(&mut hasher);
 
     // Sort keys for deterministic hashing of symbols
     let mut keys: Vec<_> = interface.keys().collect();
@@ -4991,6 +5003,26 @@ where
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     let mut prefix = ParentPrefix::default();
+
+    // Issue #479 — callee-side `# raven: standalone`. A standalone file is
+    // resolved in ISOLATION from the files that source it: its STEP-1 backward
+    // parent-prefix walk is skipped entirely, so it inherits NO symbols, NO
+    // packages, and NO `DataAliasProvider`/working-directory context from any
+    // caller. Returning the empty prefix here is the single load-bearing switch
+    // (knob 1): it covers every entry point that computes a file's prefix (the
+    // streaming `compute_or_get_cached_prefix`, the cached
+    // `scope_at_position_with_graph_cached`, and the per-child-source call in
+    // `resolve_source_contribution`). The file's OWN definitions and forward
+    // closure are still resolved by STEP 2 and still flow forward to callers
+    // (the additive merge is unchanged), so a standalone library that
+    // `library()`-loads packages still contributes them upward. Caller-inherited
+    // packages specifically arrive via this backward walk, so skipping it is
+    // exactly what drops them. Opt-in and safe-direction: if the file actually
+    // relied on a caller-provided binding, the worst case is a false "undefined"
+    // INSIDE the file — never a hidden bug in a caller.
+    if get_metadata(uri).is_some_and(|m| m.standalone) {
+        return prefix;
+    }
 
     // Get edges where this file is the child (callee)
     //
@@ -9275,6 +9307,150 @@ mod tests {
         assert!(
             !scope.symbols.contains_key("y"),
             "Should NOT have 'y' - after call site"
+        );
+    }
+
+    /// Issue #479 knob 1: a `# raven: standalone` callee is resolved in
+    /// isolation — it does NOT inherit symbols from the files that source it.
+    /// Without the directive the callee sees the parent's pre-call bindings;
+    /// with it, the callee must not (a deliberately caller-relied binding becomes
+    /// undefined INSIDE the callee — the safe-direction trade-off). Knob 2: the
+    /// caller still sees the callee's own definitions regardless.
+    #[test]
+    fn standalone_callee_resolved_in_isolation() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // parent defines `parent_sym` (line 0), then sources child (line 1).
+        let parent_code = "parent_sym <- 1\nsource(\"child.R\")\n";
+        let parent_artifacts = compute_artifacts(&parent_uri, &parse_r(parent_code), parent_code);
+        // child references the parent-provided binding and defines its own.
+        let child_code = "child_sym <- parent_sym\n";
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), |_| {
+            None
+        });
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let resolve_child = |standalone: bool| {
+            let cu = child_uri.clone();
+            let pu = parent_uri.clone();
+            let child_metadata = std::sync::Arc::new(CrossFileMetadata {
+                standalone,
+                ..Default::default()
+            });
+            let parent_md = std::sync::Arc::new(parent_metadata.clone());
+            let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &cu {
+                    Some(child_metadata.clone())
+                } else if uri == &pu {
+                    Some(parent_md.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                &child_uri,
+                0,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        // Without standalone: the callee inherits the parent's pre-call binding.
+        let inherited = resolve_child(false);
+        assert!(
+            inherited.symbols.contains_key("parent_sym"),
+            "non-standalone callee should inherit `parent_sym` from its caller"
+        );
+
+        // With standalone (knob 1): the callee is isolated — no `parent_sym`.
+        let isolated = resolve_child(true);
+        assert!(
+            !isolated.symbols.contains_key("parent_sym"),
+            "standalone callee must NOT inherit caller bindings"
+        );
+        // The callee still defines its own symbol in both cases.
+        assert!(
+            isolated.symbols.contains_key("child_sym"),
+            "standalone callee keeps its own definitions"
+        );
+
+        // Knob 2: the caller still sees the callee's own definition regardless
+        // of the directive (the additive forward merge is unchanged).
+        let resolve_parent = |standalone: bool| {
+            let cu = child_uri.clone();
+            let pu = parent_uri.clone();
+            let child_metadata = std::sync::Arc::new(CrossFileMetadata {
+                standalone,
+                ..Default::default()
+            });
+            let parent_md = std::sync::Arc::new(parent_metadata.clone());
+            let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &cu {
+                    Some(child_metadata.clone())
+                } else if uri == &pu {
+                    Some(parent_md.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                &parent_uri,
+                2,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+        assert!(
+            resolve_parent(true).symbols.contains_key("child_sym"),
+            "caller must still see a standalone callee's own definitions (knob 2)"
         );
     }
 

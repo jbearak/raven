@@ -121,6 +121,47 @@ source("child.R")
 source("utils.R")  # Resolves to <workspace>/data/project/utils.R
 ```
 
+## Standalone Module Directive
+
+```r
+# raven: standalone
+# @lsp-standalone        # alias
+```
+
+Place `# raven: standalone` in the **header** of a sourced *library* file to
+declare it self-contained. It takes no arguments and is **header-only** (it must
+appear before any code; a `standalone` token after code is ignored).
+
+A standalone file is resolved **in isolation** from the files that `source()` it:
+
+- It does **not** inherit symbols, loaded packages, or working-directory context
+  from any caller — no backward parent-prefix walk. Its cross-file scope is a
+  pure function of the file itself and its own forward `source()` closure.
+- It **still contributes** its own definitions *and* its own `library()`-loaded
+  packages forward to callers (the normal additive `source()` merge is
+  unchanged). A module that loads the packages its callers rely on still works.
+- Its own `rm()`/`remove()` of its own symbols still affects what it exports
+  (unchanged); it never removes a caller's bindings.
+
+**When to use it.** A self-contained helper/library file that is sourced by many
+others (a hub). Declaring it standalone both **prevents** caller-union
+over-approximation (one caller's bindings leaking into the file's analysis on
+behalf of another) and makes Raven much faster on hub-heavy workspaces, because
+the file's scope no longer depends on its callers.
+
+**Opt-in and safe-direction.** You vouch that the file is self-contained. If it
+actually relies on a binding a caller provides, the worst case is a
+false-positive *“undefined variable”* **inside the standalone file itself** —
+never a hidden real bug in a caller. (Mark the *root* setup file that provides
+the shared environment as standalone, not a leaf that consumes it.)
+
+**Interactions.** `standalone` only suppresses the *caller→file* direction. It
+composes with `# raven: cd` (the file uses its own working directory),
+`# raven: nse` / `# raven: func` (directive propagation over `source()` edges is
+unaffected), package mode, and per-call `local = TRUE` / `sys.source()` (which
+govern how a *caller* sources the file, independent of the file's own
+isolation). See `docs/cross-file.md` for the resolution model.
+
 ## Declaration Directives
 
 Declare symbols created dynamically that the parser cannot detect. These suppress false-positive "undefined variable" diagnostics for symbols from `eval()`, `assign()`, `load()`, or external data loading.

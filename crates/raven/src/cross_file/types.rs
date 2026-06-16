@@ -226,6 +226,17 @@ pub struct CrossFileMetadata {
     /// NSE contracts declared via `# raven: nse` directives.
     #[serde(default)]
     pub nse_declarations: Vec<NseDeclaration>,
+    /// Callee-side `# raven: standalone` directive (issue #479). When `true`,
+    /// this file is a self-contained "module": its cross-file scope is resolved
+    /// in ISOLATION from the files that `source()` it — no backward parent-prefix
+    /// walk and no caller-inherited packages / `DataAliasProvider` / working
+    /// directory. It still contributes its own definitions AND its own loaded
+    /// packages forward to callers (the additive forward merge is unchanged).
+    /// Header-only (must appear before any code). Opt-in and safe-direction: a
+    /// mislabeled standalone file can at worst raise a false "undefined" INSIDE
+    /// itself, never hide a real bug in a caller. See `docs/directives.md`.
+    #[serde(default)]
+    pub standalone: bool,
 }
 
 impl CrossFileMetadata {
