@@ -6796,7 +6796,37 @@ where
     /// level below, keyed by `(child_uri, path_fp, pkg_fp)`. See
     /// [`ForwardChildMemo`].
     forward_child_memo: std::cell::RefCell<ForwardChildMemo>,
+
+    /// Shared forward-child memo for STEP-1 **prefix** computation (issue
+    /// #479), SEPARATE from the actual-depth `forward_child_memo` above. When
+    /// `Some`, it is threaded into every `compute_or_get_cached_prefix` call in
+    /// this stream (both top-level precomputes and the per-child-source calls
+    /// in `resolve_source_contribution`), so the hub closure is resolved once
+    /// per stream instead of once per prefix slot — collapsing the O(N²)
+    /// re-resolution on hub-heavy global-scope workspaces.
+    ///
+    /// `Some` ONLY when
+    /// [`super::dependency::DependencyGraph::prefix_memo_share_safe`] proves this
+    /// stream cannot hit max-depth truncation (the visited-context divergence
+    /// mode). The OTHER divergence mode — `query_inside_function`-dependent
+    /// `local`/`sys.source` scoping — is handled separately by **slot
+    /// isolation**: this shared memo is threaded into the `false` top slot and
+    /// every per-child-source call (all of which query at EOF), but the
+    /// `query_inside_function = true` slot always gets its own fresh memo (see
+    /// the `None` passed at its call site). When the gate returns `false`, this
+    /// is `None` and each prefix gets a fresh ephemeral memo — the pre-#479
+    /// behavior exactly. The win is in the common global-scope hub (shallow
+    /// chains), which the gate admits.
+    prefix_forward_child_memo: Option<std::cell::RefCell<ForwardChildMemo>>,
 }
+
+/// Budget (edge relaxations / path steps) for the
+/// [`super::dependency::DependencyGraph::prefix_memo_share_safe`] gate that
+/// decides whether a stream may share its prefix forward-child memo (issue
+/// #479). Large enough that realistic neighborhoods finish both gate probes
+/// well within it; a dense/deep graph that exhausts it conservatively disables
+/// sharing (sound, just no speedup).
+const PREFIX_MEMO_SHARE_PROBE_BUDGET: usize = 200_000;
 
 impl<'a, F, G> ScopeStream<'a, F, G>
 where
@@ -6832,9 +6862,23 @@ where
         // sweep's `resolve_source_contribution` calls. The prefix
         // pre-computation below deliberately does NOT use this memo —
         // `compute_or_get_cached_prefix` resolves prefixes at a canonical
-        // depth-0 origin and uses its own ephemeral memo to avoid polluting this
+        // depth-0 origin and uses a SEPARATE prefix memo (or, when sharing is
+        // gated off, its own ephemeral memo) to avoid polluting this
         // actual-depth one (see its doc comment).
         let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+
+        // Shared prefix forward-child memo (issue #479) — enabled only when the
+        // gate proves cross-prefix sharing is byte-identical for this stream
+        // (no local/sys.source edges, no possible truncation). `None`
+        // reproduces the pre-#479 behavior exactly (a fresh ephemeral memo per
+        // prefix computation).
+        let prefix_forward_child_memo =
+            if graph.prefix_memo_share_safe(queried_uri, max_depth, PREFIX_MEMO_SHARE_PROBE_BUDGET)
+            {
+                Some(std::cell::RefCell::new(ForwardChildMemo::default()))
+            } else {
+                None
+            };
 
         // Pre-compute both prefix slots through the shared cache.
         let prefix_top = compute_or_get_cached_prefix(
@@ -6850,6 +6894,7 @@ where
             backward_dep_mode,
             is_cancelled,
             prefix_cache,
+            prefix_forward_child_memo.as_ref(),
         );
         let prefix_in_function = if hoist_globals {
             compute_or_get_cached_prefix(
@@ -6865,6 +6910,16 @@ where
                 backward_dep_mode,
                 is_cancelled,
                 prefix_cache,
+                // SLOT ISOLATION (issue #479): the `query_inside_function = true`
+                // (hoisted, inside-a-function) prefix slot gets its OWN fresh
+                // memo — NEVER the shared one — because `local`/`sys.source`
+                // scoping is `query_inside_function`-dependent and the memo key
+                // omits that, so a `false`-context entry must not serve this
+                // `true`-context slot (and vice versa). Passing `None` forces a
+                // fresh ephemeral memo for this one slot; the expensive
+                // per-child-source calls all query at EOF (`false`) and keep
+                // sharing.
+                None,
             )
         } else {
             prefix_top.clone()
@@ -6926,6 +6981,7 @@ where
             contribution_symbol_names,
             data_alias_provider,
             forward_child_memo,
+            prefix_forward_child_memo,
         })
     }
 
@@ -7765,6 +7821,7 @@ where
             self.backward_dep_mode,
             self.is_cancelled,
             self.prefix_cache,
+            self.prefix_forward_child_memo.as_ref(),
         );
 
         // Run STEP 2 for the child at EOF, supplying the cached prefix.
@@ -8010,6 +8067,7 @@ fn compute_or_get_cached_prefix<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
+    shared_prefix_forward_child_memo: Option<&std::cell::RefCell<ForwardChildMemo>>,
 ) -> Arc<ParentPrefix>
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -8023,15 +8081,27 @@ where
     }
     // The prefix is computed at a canonical `current_depth = 0` origin (it is
     // depth-invariant and cached as such in `ParentPrefixCache`). Its internal
-    // forward-child resolutions therefore use depth-0-origin depths, which do
-    // NOT match the actual depth a streaming forward sweep reaches the same
-    // child at. Give them a FRESH, ephemeral forward-child memo so they cannot
-    // pollute the caller's actual-depth memo — otherwise a child's prefix
-    // forward-children (resolved here at the artificial origin) could be
-    // reused by the real sweep and perturb depth-dependent bookkeeping
-    // (`depth_exceeded`, `chain`) under a small `maxChainDepth`. The backward
-    // walk's own dedup is already handled by `ParentPrefixCache`.
-    let prefix_forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+    // forward-child resolutions use depth-0-origin depths, which do NOT match
+    // the actual depth a streaming forward sweep reaches the same child at, so
+    // the prefix memo is ALWAYS kept separate from the caller's actual-depth
+    // `forward_child_memo`.
+    //
+    // Issue #479: when `prefix_memo_share_safe` proved cross-prefix sharing is
+    // byte-identical for this stream, callers pass a shared memo reused across
+    // all of the stream's prefix computations, collapsing the O(N²) hub
+    // re-resolution. When `None` (sharing gated off, or non-stream callers), a
+    // FRESH ephemeral memo per call reproduces the pre-#479 behavior exactly —
+    // so context the key omits (`query_inside_function`/local scoping, visited
+    // under truncation) cannot leak across prefix roots. The backward walk's own
+    // dedup is handled by `ParentPrefixCache` in both cases.
+    let ephemeral_prefix_memo;
+    let prefix_forward_child_memo = match shared_prefix_forward_child_memo {
+        Some(memo) => memo,
+        None => {
+            ephemeral_prefix_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+            &ephemeral_prefix_memo
+        }
+    };
     // Compute outside the borrow so `parent_prefix_at`'s recursive
     // `scope_at_position_with_graph_recursive` call doesn't transitively
     // try to re-enter the cache.
@@ -8059,7 +8129,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
-        &prefix_forward_child_memo,
+        prefix_forward_child_memo,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();
