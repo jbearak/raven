@@ -1631,6 +1631,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &removal_refs,
         &data_loads,
         &declarations,
+        // No metadata available in this path → cannot be standalone.
+        false,
     );
 
     artifacts
@@ -1914,6 +1916,7 @@ pub fn compute_artifacts_with_metadata(
         &removal_refs,
         &data_loads,
         &declarations,
+        metadata.is_some_and(|m| m.standalone),
     );
 
     artifacts
@@ -4490,6 +4493,7 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 /// `top_level_removals`, `data_loads`, and `declarations` (the
 /// `(name, line)` pairs of all timeline `Declaration` events — see
 /// [`extract_top_level_declarations`]).
+#[allow(clippy::too_many_arguments)]
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
@@ -4498,8 +4502,17 @@ fn compute_interface_hash(
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
     declarations: &[(Arc<str>, u32)],
+    standalone: bool,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
+
+    // Issue #479: toggling a `# raven: standalone` directive changes the file's
+    // resolved cross-file scope — its backward parent-prefix walk is skipped, so
+    // its own scope (and thus the contribution it propagates forward to callers)
+    // no longer includes the symbols/packages it would otherwise inherit via its
+    // backward edges. Dependents must therefore revalidate when the directive is
+    // toggled in any connected file, so include it in the interface hash.
+    standalone.hash(&mut hasher);
 
     // Sort keys for deterministic hashing of symbols
     let mut keys: Vec<_> = interface.keys().collect();
@@ -4991,6 +5004,38 @@ where
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     let mut prefix = ParentPrefix::default();
+
+    // Issue #479 — callee-side `# raven: standalone`. A standalone file's STEP-1
+    // backward parent-prefix walk is skipped entirely: this `parent_prefix_at`
+    // returns the empty prefix, so the file's backward contribution carries none
+    // of the caller symbols or packages it would otherwise inherit. (The
+    // backward `ParentPrefix` carries only symbols, packages, chain, and
+    // visible-position/depth data — never a provider or working directory; those
+    // are forward-threaded inputs, see the SCOPE note below.) Returning the empty
+    // prefix here is the single
+    // load-bearing switch (knob 1): it covers every entry point that computes a
+    // file's prefix (the streaming `compute_or_get_cached_prefix`, the cached
+    // `scope_at_position_with_graph_cached`, and the per-child-source call in
+    // `resolve_source_contribution`). The file's OWN definitions and forward
+    // closure are still resolved by STEP 2 and still flow forward to callers
+    // (the additive merge is unchanged), so a standalone library that
+    // `library()`-loads packages still contributes them upward.
+    //
+    // SCOPE — backward walk only (shipped "part 1"). Skipping the backward walk
+    // is what isolates the file when computing its OWN diagnostics (queried as a
+    // root, its prefix is empty). It does NOT drop the inputs a caller threads
+    // *forward* into this file when this file is resolved as that caller's
+    // forward child: the forward-source path below still threads the caller's
+    // `inherited`/`loaded` packages into `packages_for_child`, the caller's
+    // working directory into `child_ctx`, and the caller's `data_alias_provider`
+    // — none gated by `standalone`. Making that forward resolution
+    // caller-independent ("part 2") is deferred to WI2b (#483). Opt-in and
+    // safe-direction: if the file actually relied on a caller-provided binding,
+    // the worst case is a false "undefined" INSIDE the file — never a hidden bug
+    // in a caller.
+    if get_metadata(uri).is_some_and(|m| m.standalone) {
+        return prefix;
+    }
 
     // Get edges where this file is the child (callee)
     //
@@ -6796,7 +6841,43 @@ where
     /// level below, keyed by `(child_uri, path_fp, pkg_fp)`. See
     /// [`ForwardChildMemo`].
     forward_child_memo: std::cell::RefCell<ForwardChildMemo>,
+
+    /// Shared forward-child memo for STEP-1 **prefix** computation (issue
+    /// #479), SEPARATE from the actual-depth `forward_child_memo` above. When
+    /// `Some`, it is threaded into every `compute_or_get_cached_prefix` call in
+    /// this stream (both top-level precomputes and the per-child-source calls
+    /// in `resolve_source_contribution`), so the hub closure is resolved once
+    /// per stream instead of once per prefix slot — collapsing the O(N²)
+    /// re-resolution on hub-heavy global-scope workspaces.
+    ///
+    /// `Some` ONLY when
+    /// [`super::dependency::DependencyGraph::prefix_memo_share_safe`] admits this
+    /// stream (a BFS-shortest-depth bound on the truncation/visited-context
+    /// divergence mode). That bound keeps the shared **symbol set** byte-identical
+    /// to the un-memoized resolver — truncated scopes are never cached, so a
+    /// longer-path truncation the gate failed to exclude cannot corrupt symbols.
+    /// It leaves a bounded residual on the heuristic `depth_exceeded`/`chain`
+    /// advisory under such truncation (issue #484); that channel only diverges
+    /// when a chain actually reaches `maxChainDepth`. The OTHER divergence mode —
+    /// `query_inside_function`-dependent
+    /// `local`/`sys.source` scoping — is handled separately by **slot
+    /// isolation**: this shared memo is threaded into the `false` top slot and
+    /// every per-child-source call (all of which query at EOF), but the
+    /// `query_inside_function = true` slot always gets its own fresh memo (see
+    /// the `None` passed at its call site). When the gate returns `false`, this
+    /// is `None` and each prefix gets a fresh ephemeral memo — the pre-#479
+    /// behavior exactly. The win is in the common global-scope hub (shallow
+    /// chains), which the gate admits.
+    prefix_forward_child_memo: Option<std::cell::RefCell<ForwardChildMemo>>,
 }
+
+/// Budget (edge relaxations / path steps) for the
+/// [`super::dependency::DependencyGraph::prefix_memo_share_safe`] gate that
+/// decides whether a stream may share its prefix forward-child memo (issue
+/// #479). Large enough that realistic neighborhoods finish both gate probes
+/// well within it; a dense/deep graph that exhausts it conservatively disables
+/// sharing (sound, just no speedup).
+const PREFIX_MEMO_SHARE_PROBE_BUDGET: usize = 200_000;
 
 impl<'a, F, G> ScopeStream<'a, F, G>
 where
@@ -6832,9 +6913,29 @@ where
         // sweep's `resolve_source_contribution` calls. The prefix
         // pre-computation below deliberately does NOT use this memo —
         // `compute_or_get_cached_prefix` resolves prefixes at a canonical
-        // depth-0 origin and uses its own ephemeral memo to avoid polluting this
+        // depth-0 origin and uses a SEPARATE prefix memo (or, when sharing is
+        // gated off, its own ephemeral memo) to avoid polluting this
         // actual-depth one (see its doc comment).
         let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+
+        // Shared prefix forward-child memo (issue #479). The gate
+        // (`prefix_memo_share_safe`) proves only the no-possible-truncation half
+        // (the neighborhood is BFS-shallow relative to `maxChainDepth`); the
+        // other divergence mode — `local`/`sys.source` scoping — is NOT checked
+        // by the gate but handled separately by slot isolation (the
+        // `query_inside_function = true` slot is passed `None` below). With both
+        // in place, cross-prefix sharing is byte-identical for the symbol set
+        // (see the field doc on `prefix_forward_child_memo` and #484 for the
+        // residual on the `depth_exceeded` advisory). `None` reproduces the
+        // pre-#479 behavior exactly (a fresh ephemeral memo per prefix
+        // computation).
+        let prefix_forward_child_memo =
+            if graph.prefix_memo_share_safe(queried_uri, max_depth, PREFIX_MEMO_SHARE_PROBE_BUDGET)
+            {
+                Some(std::cell::RefCell::new(ForwardChildMemo::default()))
+            } else {
+                None
+            };
 
         // Pre-compute both prefix slots through the shared cache.
         let prefix_top = compute_or_get_cached_prefix(
@@ -6850,6 +6951,7 @@ where
             backward_dep_mode,
             is_cancelled,
             prefix_cache,
+            prefix_forward_child_memo.as_ref(),
         );
         let prefix_in_function = if hoist_globals {
             compute_or_get_cached_prefix(
@@ -6865,6 +6967,16 @@ where
                 backward_dep_mode,
                 is_cancelled,
                 prefix_cache,
+                // SLOT ISOLATION (issue #479): the `query_inside_function = true`
+                // (hoisted, inside-a-function) prefix slot gets its OWN fresh
+                // memo — NEVER the shared one — because `local`/`sys.source`
+                // scoping is `query_inside_function`-dependent and the memo key
+                // omits that, so a `false`-context entry must not serve this
+                // `true`-context slot (and vice versa). Passing `None` forces a
+                // fresh ephemeral memo for this one slot; the expensive
+                // per-child-source calls all query at EOF (`false`) and keep
+                // sharing.
+                None,
             )
         } else {
             prefix_top.clone()
@@ -6926,6 +7038,7 @@ where
             contribution_symbol_names,
             data_alias_provider,
             forward_child_memo,
+            prefix_forward_child_memo,
         })
     }
 
@@ -7765,6 +7878,7 @@ where
             self.backward_dep_mode,
             self.is_cancelled,
             self.prefix_cache,
+            self.prefix_forward_child_memo.as_ref(),
         );
 
         // Run STEP 2 for the child at EOF, supplying the cached prefix.
@@ -8010,6 +8124,7 @@ fn compute_or_get_cached_prefix<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &std::cell::RefCell<ParentPrefixCache>,
+    shared_prefix_forward_child_memo: Option<&std::cell::RefCell<ForwardChildMemo>>,
 ) -> Arc<ParentPrefix>
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -8023,15 +8138,30 @@ where
     }
     // The prefix is computed at a canonical `current_depth = 0` origin (it is
     // depth-invariant and cached as such in `ParentPrefixCache`). Its internal
-    // forward-child resolutions therefore use depth-0-origin depths, which do
-    // NOT match the actual depth a streaming forward sweep reaches the same
-    // child at. Give them a FRESH, ephemeral forward-child memo so they cannot
-    // pollute the caller's actual-depth memo — otherwise a child's prefix
-    // forward-children (resolved here at the artificial origin) could be
-    // reused by the real sweep and perturb depth-dependent bookkeeping
-    // (`depth_exceeded`, `chain`) under a small `maxChainDepth`. The backward
-    // walk's own dedup is already handled by `ParentPrefixCache`.
-    let prefix_forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+    // forward-child resolutions use depth-0-origin depths, which do NOT match
+    // the actual depth a streaming forward sweep reaches the same child at, so
+    // the prefix memo is ALWAYS kept separate from the caller's actual-depth
+    // `forward_child_memo`.
+    //
+    // Issue #479: when the share gate (`prefix_memo_share_safe`) admitted this
+    // stream, callers pass a shared memo (`Some`) reused across all of the
+    // stream's prefix computations, collapsing the O(N²) hub re-resolution. The
+    // gate covers only the truncation mode; the `query_inside_function`/local
+    // mode is covered separately by slot isolation at the call site (the
+    // `query_inside_function = true` slot is passed `None`). When `None`
+    // (sharing gated off, the isolated `true` slot, or non-stream callers), a
+    // FRESH ephemeral memo per call reproduces the pre-#479 behavior exactly —
+    // so context the key omits (`query_inside_function`/local scoping, visited
+    // under truncation) cannot leak across prefix roots. The backward walk's own
+    // dedup is handled by `ParentPrefixCache` in both cases.
+    let ephemeral_prefix_memo;
+    let prefix_forward_child_memo = match shared_prefix_forward_child_memo {
+        Some(memo) => memo,
+        None => {
+            ephemeral_prefix_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+            &ephemeral_prefix_memo
+        }
+    };
     // Compute outside the borrow so `parent_prefix_at`'s recursive
     // `scope_at_position_with_graph_recursive` call doesn't transitively
     // try to re-enter the cache.
@@ -8059,7 +8189,7 @@ where
         hoist_globals,
         backward_dep_mode,
         is_cancelled,
-        &prefix_forward_child_memo,
+        prefix_forward_child_memo,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();
@@ -8160,6 +8290,41 @@ mod tests {
         assert_ne!(
             ha, hb,
             "adding a # raven: nse directive must change interface_hash"
+        );
+    }
+
+    /// Issue #479: a `# raven: standalone` directive changes the inherited-package
+    /// set the file propagates to its other callers, so adding it must change
+    /// `interface_hash` (else dependents that source the file would not be
+    /// revalidated when the directive is toggled). Guards the `standalone.hash(...)`
+    /// line in `compute_interface_hash` against silent removal.
+    #[test]
+    fn interface_hash_changes_when_standalone_directive_added() {
+        // Hold `f`'s line constant across both inputs (a plain comment vs the
+        // directive, both on line 0) so the ONLY difference is the `standalone`
+        // flag — otherwise `defined_line` (part of the symbol hash) would shift
+        // and the assertion would pass even if `standalone.hash(...)` were removed.
+        let a = "# not a directive\nf <- function() 1\n";
+        let b = "# raven: standalone\nf <- function() 1\n";
+        let ta = parse_r(a);
+        let tb = parse_r(b);
+        let ha = compute_artifacts_with_metadata(
+            &test_uri(),
+            &ta,
+            a,
+            Some(&crate::cross_file::extract_metadata(a)),
+        )
+        .interface_hash;
+        let hb = compute_artifacts_with_metadata(
+            &test_uri(),
+            &tb,
+            b,
+            Some(&crate::cross_file::extract_metadata(b)),
+        )
+        .interface_hash;
+        assert_ne!(
+            ha, hb,
+            "adding a # raven: standalone directive must change interface_hash"
         );
     }
 
@@ -9205,6 +9370,150 @@ mod tests {
         assert!(
             !scope.symbols.contains_key("y"),
             "Should NOT have 'y' - after call site"
+        );
+    }
+
+    /// Issue #479 knob 1: a `# raven: standalone` callee is resolved in
+    /// isolation — it does NOT inherit symbols from the files that source it.
+    /// Without the directive the callee sees the parent's pre-call bindings;
+    /// with it, the callee must not (a deliberately caller-relied binding becomes
+    /// undefined INSIDE the callee — the safe-direction trade-off). Knob 2: the
+    /// caller still sees the callee's own definitions regardless.
+    #[test]
+    fn standalone_callee_resolved_in_isolation() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // parent defines `parent_sym` (line 0), then sources child (line 1).
+        let parent_code = "parent_sym <- 1\nsource(\"child.R\")\n";
+        let parent_artifacts = compute_artifacts(&parent_uri, &parse_r(parent_code), parent_code);
+        // child references the parent-provided binding and defines its own.
+        let child_code = "child_sym <- parent_sym\n";
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), |_| {
+            None
+        });
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let resolve_child = |standalone: bool| {
+            let cu = child_uri.clone();
+            let pu = parent_uri.clone();
+            let child_metadata = std::sync::Arc::new(CrossFileMetadata {
+                standalone,
+                ..Default::default()
+            });
+            let parent_md = std::sync::Arc::new(parent_metadata.clone());
+            let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &cu {
+                    Some(child_metadata.clone())
+                } else if uri == &pu {
+                    Some(parent_md.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                &child_uri,
+                0,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        // Without standalone: the callee inherits the parent's pre-call binding.
+        let inherited = resolve_child(false);
+        assert!(
+            inherited.symbols.contains_key("parent_sym"),
+            "non-standalone callee should inherit `parent_sym` from its caller"
+        );
+
+        // With standalone (knob 1): the callee is isolated — no `parent_sym`.
+        let isolated = resolve_child(true);
+        assert!(
+            !isolated.symbols.contains_key("parent_sym"),
+            "standalone callee must NOT inherit caller bindings"
+        );
+        // The callee still defines its own symbol in both cases.
+        assert!(
+            isolated.symbols.contains_key("child_sym"),
+            "standalone callee keeps its own definitions"
+        );
+
+        // Knob 2: the caller still sees the callee's own definition regardless
+        // of the directive (the additive forward merge is unchanged).
+        let resolve_parent = |standalone: bool| {
+            let cu = child_uri.clone();
+            let pu = parent_uri.clone();
+            let child_metadata = std::sync::Arc::new(CrossFileMetadata {
+                standalone,
+                ..Default::default()
+            });
+            let parent_md = std::sync::Arc::new(parent_metadata.clone());
+            let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+                if uri == &cu {
+                    Some(child_metadata.clone())
+                } else if uri == &pu {
+                    Some(parent_md.clone())
+                } else {
+                    None
+                }
+            };
+            scope_at_position_with_graph(
+                &parent_uri,
+                2,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+        assert!(
+            resolve_parent(true).symbols.contains_key("child_sym"),
+            "caller must still see a standalone callee's own definitions (knob 2)"
         );
     }
 
@@ -16207,6 +16516,214 @@ x <- 1"#;
         for depth in [3usize, 4, 5] {
             assert_memo_equivalence_with_depth(&root, &files, depth);
         }
+    }
+
+    #[test]
+    fn memo_equiv_gate_admitted_with_truncation() {
+        // Issue #479 hardening — the one interaction no other `memo_equiv_*`
+        // test covers: the shared-prefix-memo gate (`prefix_memo_share_safe`)
+        // ADMITS sharing, yet the recursive resolver still TRUNCATES. The gate
+        // admits on *shortest-path* BFS depth, while the resolver (cloned
+        // `visited` per branch) can reach a node at a greater `current_depth`
+        // via a *longer simple path* and truncate there. `memo_equiv_dense_hub_*`
+        // admits but is too shallow to truncate; `memo_equiv_depth_truncation_*`
+        // truncates but is deep enough that the gate DISABLES sharing — neither
+        // hits both at once.
+        //
+        // Construction: hub `q` sources `a..e` directly (so every node sits at
+        // BFS depth 1 from `q` and the gate admits at small `max_depth`), AND
+        // `a -> b -> c -> d -> e` is chained, giving a length-5 simple path that
+        // truncates under a small `max_depth`. The shared-vs-unshared memo
+        // result must still be byte-identical: a truncated subtree carries a
+        // non-empty `depth_exceeded` and is therefore never written to the memo
+        // (`resolve_forward_child_memoized`), so a gate-admitted-but-truncating
+        // graph behaves exactly like the un-shared baseline.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let root = Url::parse("file:///project").unwrap();
+        let q = Url::parse("file:///project/q.r").unwrap();
+        let a = Url::parse("file:///project/a.r").unwrap();
+        let files: Vec<(Url, &str)> = vec![
+            (
+                q.clone(),
+                "source(\"a.r\")\nsource(\"b.r\")\nsource(\"c.r\")\nsource(\"d.r\")\nsource(\"e.r\")\n",
+            ),
+            (a.clone(), "source(\"b.r\")\nsym_a <- 1\n"),
+            (
+                Url::parse("file:///project/b.r").unwrap(),
+                "source(\"c.r\")\nsym_b <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/c.r").unwrap(),
+                "source(\"d.r\")\nsym_c <- 1\n",
+            ),
+            (
+                Url::parse("file:///project/d.r").unwrap(),
+                "source(\"e.r\")\nsym_d <- 1\n",
+            ),
+            (Url::parse("file:///project/e.r").unwrap(), "sym_e <- 1\n"),
+        ];
+
+        // Build the graph + artifacts/metas once (mirrors
+        // `assert_memo_equivalence_with_depth`'s internal construction) so the
+        // two non-vacuity checks below can probe the gate and the truncation
+        // directly.
+        let mut graph = DependencyGraph::new();
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        for (uri, code) in &files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+
+        // Non-vacuity 1 — the gate ADMITS sharing for `q` at these small depths
+        // (every node sits at BFS depth 1 from `q` via the direct edges), so the
+        // shared-prefix path is genuinely active in the equivalence check below.
+        for depth in [3usize, 4] {
+            assert!(
+                graph.prefix_memo_share_safe(&q, depth, PREFIX_MEMO_SHARE_PROBE_BUDGET),
+                "gate must ADMIT q at max_depth={depth} (all nodes at BFS depth 1)"
+            );
+        }
+
+        // Non-vacuity 2 — the resolver actually TRUNCATES the a->...->e chain
+        // under a small `max_depth`: resolving `a` at depth 4 drops the deepest
+        // chain symbol `sym_e`, while at depth 64 it is reached.
+        let get_artifacts =
+            |uri: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(uri).cloned() };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> { metas.get(uri).cloned() };
+        let base_exports = HashSet::new();
+        let resolve = |uri: &Url, depth: usize| {
+            scope_at_position_with_graph(
+                uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                depth,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+        assert!(
+            !canonical_scope(&resolve(&a, 4)).contains("sym_e|"),
+            "depth 4 must truncate the a->b->c->d->e chain before sym_e"
+        );
+        assert!(
+            canonical_scope(&resolve(&a, 64)).contains("sym_e|"),
+            "depth 64 must reach sym_e through the chain"
+        );
+
+        // The regression pin. Issue #479's shared-prefix memo guarantees the
+        // resolved **symbol set** is byte-identical whether sharing is enabled
+        // (gate-admitted, as proven above) or disabled — *even when the resolver
+        // truncates via a longer path the BFS-shortest gate failed to exclude*.
+        // This holds because a truncating resolution carries a non-empty
+        // `depth_exceeded` and is never written to the memo
+        // (`resolve_forward_child_memoized`'s cache guard), so the cache can
+        // never feed a truncated (wrong) symbol set to another prefix root. We
+        // compare the memo-enabled vs memo-disabled symbol set of every
+        // gate-admitted query on BOTH the recursive path and the `ScopeStream`
+        // path (where #479's shared prefix memo lives).
+        //
+        // We deliberately do NOT assert `depth_exceeded`/`chain` equality. Those
+        // are the heuristic "Maximum chain depth exceeded" advisory channel
+        // (`handlers.rs`, `exceeded_uri == uri`), and under a gate-admitted
+        // graph the resolver truncates anyway — the visited-independent shared
+        // memo can then emit/suppress that advisory on a file vs the un-memoized
+        // resolver. That is the accepted, documented residual of WI1's
+        // BFS-shortest gate (see `prefix_memo_share_safe`'s NOTE) and is tracked
+        // for a fix in issue #484. It is invisible at the default
+        // `maxChainDepth = 64` (no real chain is that deep) and never affects
+        // symbols — which is exactly what this test pins.
+        let project = |scope: &ScopeAtPosition| -> String {
+            let mut syms: Vec<String> = scope
+                .symbols
+                .iter()
+                .map(|(n, s)| {
+                    format!(
+                        "{n}|{:?}|{}|{}:{}|decl={}",
+                        s.kind, s.source_uri, s.defined_line, s.defined_column, s.is_declared
+                    )
+                })
+                .collect();
+            syms.sort();
+            format!("SYM[{}]", syms.join(";"))
+        };
+        let resolve_stream = |uri: &Url, depth: usize| {
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                depth,
+                &base_exports,
+                true,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .expect("stream construction must succeed");
+            stream.advance_to(u32::MAX, u32::MAX);
+            stream.snapshot()
+        };
+        // #479's shared prefix memo is active for a query ONLY when the gate
+        // admits it, so the loop gates each query dynamically and asserts only
+        // on admitted ones (that is the property #479 introduces; gate-rejected
+        // queries fall back to the pre-#479 fresh-ephemeral prefix memo, covered
+        // by the other `memo_equiv_*` tests). Admission here depends on
+        // `max_depth`: at `max_depth=3` (`depth_cap=2`) only `q` is admitted
+        // (every other file reaches `c`/`d`/`e` at BFS depth 2); at
+        // `max_depth=4` (`depth_cap=3`) the whole neighborhood is BFS-shallow
+        // enough that every file is admitted. `q` is admitted at both depths and
+        // its per-child-source prefix computations resolve the truncating chain
+        // through the shared memo, so the gate-admitted-with-truncation
+        // interaction is exercised regardless.
+        let mut asserted_any = false;
+        for depth in [3usize, 4] {
+            for (uri, _) in &files {
+                if !graph.prefix_memo_share_safe(uri, depth, PREFIX_MEMO_SHARE_PROBE_BUDGET) {
+                    continue;
+                }
+                asserted_any = true;
+                FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(true));
+                let off = project(&resolve(uri, depth));
+                let off_stream = project(&resolve_stream(uri, depth));
+                FORWARD_CHILD_MEMO_DISABLED.with(|c| c.set(false));
+                let on = project(&resolve(uri, depth));
+                let on_stream = project(&resolve_stream(uri, depth));
+                assert_eq!(
+                    off, on,
+                    "forward-child memo changed the recursive symbol set for {uri} (max_depth={depth})"
+                );
+                assert_eq!(
+                    off_stream, on_stream,
+                    "shared prefix memo changed the ScopeStream symbol set for {uri} (max_depth={depth})"
+                );
+            }
+        }
+        assert!(
+            asserted_any,
+            "fixture must exercise at least one gate-admitted query (else the test is vacuous)"
+        );
     }
 
     #[test]

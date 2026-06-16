@@ -194,6 +194,38 @@ See [Configuration](configuration.md) for watcher settings (`packages.watchLibra
 
 Propagation reuses the same dependency graph and path-resolution rules (`# raven: cd`, workspace-root fallback, `max_chain_depth`) as the scope and package facts above; backward directives participate as ordinary edges but gain no extra path fallback. The propagation set is the revalidation-consistent neighborhood — a file's ancestors plus the descendant subtrees of itself and its ancestors — so editing a `# raven: nse` (or a `# raven: func` whose formals feed cross-file positional matching) in any connected file revalidates the dependents that rely on it. Cross-file propagation is intentionally **coarse and file-level**: a propagated directive ignores its original line and governs the whole connected file, and it is consulted below the precise built-in NSE policy tables so it cannot coarsen a known verb. Two unconnected files never share NSE directives.
 
+## Standalone modules (`# raven: standalone`)
+
+By default a file's cross-file scope includes a **backward** contribution: the
+bindings visible at every `source()` call that pulls the file in. For a *hub* —
+one file sourced by many others — that means resolving the file's scope as the
+union over all its callers, which is both a performance cost (the hub's
+neighborhood is re-resolved per caller) and a source of over-approximation (one
+caller's bindings can mask a genuine "undefined" that another caller would
+expose).
+
+The header directive `# raven: standalone` (see
+[directives](directives.md#standalone-module-directive)) opts a file out of that
+backward contribution. **When computing the standalone file's own diagnostics**,
+Raven resolves it **in isolation**: no backward parent-prefix walk, so it does
+not inherit symbols or loaded packages from the files that source it. Its own
+scope is determined by the file itself plus its own forward `source()` closure —
+not by who sources it.
+
+The isolation is **asymmetric**. Nothing flows *in* from a caller into the
+file's own scope, but the file still contributes *out*: its own definitions and
+its own `library()`-loaded packages still propagate to every caller through the
+normal additive forward merge. So a standalone setup file that loads shared
+packages still makes them available to its callers.
+
+The directive is the sound, opt-in way to assert this independence, so Raven
+never has to over-approximate it. If the assertion is wrong (the file truly
+needs a
+caller-provided binding), the only consequence is a false-positive "undefined"
+*inside the standalone file* — a safe direction, never a missed bug in a caller.
+`# raven: nse` / `# raven: func` propagation over `source()` edges is unaffected
+(it is graph-level, not scope-level).
+
 ## Position-Aware Scope
 
 Symbols from sourced files are only available **after** the `source()` call:

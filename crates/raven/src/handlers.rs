@@ -188,8 +188,26 @@ pub(crate) struct DiagnosticsSnapshot {
 impl DiagnosticsSnapshot {
     /// Build a snapshot from WorldState under the read lock.
     pub fn build(state: &WorldState, uri: &Url) -> Option<Self> {
+        Self::build_with_open_documents(state, uri, &state.documents)
+    }
+
+    /// Like [`Self::build`] but with an explicit open-documents map instead of
+    /// `state.documents`. `raven check`'s parallel loop (issue #479 WI3) passes a
+    /// one-entry map holding just the worker's target, so exactly one document
+    /// is "open" per task without sharing/mutating `state.documents`. The LSP
+    /// path calls [`Self::build`], which forwards `&state.documents` and so is
+    /// behavior-identical. `get_enriched_metadata` is intentionally NOT
+    /// redirected: for an indexed target it resolves from the workspace index
+    /// (tier 2) before ever consulting `state.documents`, so both paths agree;
+    /// `raven check` keeps un-indexed disk-fallback targets on the sequential
+    /// path where the document still lives in `state.documents`.
+    pub fn build_with_open_documents(
+        state: &WorldState,
+        uri: &Url,
+        open_documents: &HashMap<Url, crate::state::Document>,
+    ) -> Option<Self> {
         let build_start = std::time::Instant::now();
-        let doc = state.get_document(uri)?;
+        let doc = open_documents.get(uri)?;
         let tree = doc.tree.as_ref()?.clone();
         // Analysis text (masked for Rmd/Quarto, raw otherwise). `tree` was
         // parsed from this exact text, so the two stay consistent and every
@@ -251,7 +269,7 @@ impl DiagnosticsSnapshot {
                 .cross_file_graph
                 .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
-        let content_provider = state.content_provider();
+        let content_provider = state.content_provider_with_documents(open_documents);
 
         let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
@@ -295,8 +313,7 @@ impl DiagnosticsSnapshot {
         let cycle_closing_snippet = cycle_detection.as_ref().and_then(|cycle| {
             let close = &cycle.closing_edge;
             close.call_site_line.and_then(|cl| {
-                let content = state
-                    .documents
+                let content = open_documents
                     .get(&close.from)
                     .map(|d| d.text())
                     .or_else(|| state.cross_file_file_cache.get(&close.from));

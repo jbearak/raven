@@ -226,6 +226,28 @@ pub struct CrossFileMetadata {
     /// NSE contracts declared via `# raven: nse` directives.
     #[serde(default)]
     pub nse_declarations: Vec<NseDeclaration>,
+    /// Callee-side `# raven: standalone` directive (issue #479). When `true`,
+    /// this file is a self-contained "module": **when computing its own
+    /// diagnostics** its cross-file scope is resolved in ISOLATION from the files
+    /// that `source()` it — its backward parent-prefix walk is skipped, so it
+    /// inherits no symbols or packages from its callers (those are the only
+    /// caller contributions the backward walk carries; `DataAliasProvider` and
+    /// working directory are forward-threaded, not backward-inherited — see the
+    /// shipped-scope note below). It still contributes its own definitions AND its own
+    /// loaded packages forward to callers (the additive forward merge is
+    /// unchanged). Header-only (must appear before any code). Opt-in and
+    /// safe-direction: a mislabeled standalone file can at worst raise a false
+    /// "undefined" INSIDE itself, never hide a real bug in a caller. See
+    /// `docs/directives.md`.
+    ///
+    /// SHIPPED SCOPE: only this backward-walk skip ("part 1") shipped. The
+    /// caller-independent forward-child resolution ("part 2" — dropping a
+    /// caller's threaded packages/provider/cd when this file is resolved as that
+    /// caller's forward child) is deferred to WI2b (#483); until then, a caller
+    /// sourcing a standalone file still threads its own packages/provider/cd into
+    /// the child's forward resolution.
+    #[serde(default)]
+    pub standalone: bool,
 }
 
 impl CrossFileMetadata {
