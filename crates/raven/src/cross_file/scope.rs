@@ -5737,16 +5737,20 @@ where
     // prefix). The own-root query (depth 0) is excluded because only it injects
     // `base_exports`, giving a different scope shape.
     //
-    // VISITED-CONTAMINATION GUARD (load-bearing). A standalone file resolved as
-    // a backward parent of one of its OWN closure members M (M is the query root
-    // / an ancestor, hence in `visited`) short-circuits its forward `source(M)`,
-    // producing a TRUNCATED scope that omits M's subtree. That truncated scope
-    // is caller-path-dependent and must never be cached or served to a clean
-    // forward-child reach (which needs the full closure). So the hook is skipped
-    // whenever any member of `{C} ∪ forward_closure(C)` is already in `visited`.
-    // A clean forward-child reach (caller A ∉ closure(C)) has no closure member
-    // in `visited`, resolves the full closure, and is cached. The contaminated
-    // case is also cheap to recompute (the big subtree is short-circuited).
+    // VISITED-CONTAMINATION GUARD (load-bearing). The cache assumes C's isolated
+    // scope is caller-independent; the one resolver input that can break that is
+    // the shared `visited` map (the caller's forward path). If a CONTRIBUTING file
+    // is already in `visited`, C's resolved scope is truncated and caller-path-
+    // dependent — via either of two channels: (1) a visited forward-closure member
+    // short-circuits its `source()`, dropping its subtree; (2) a visited backward
+    // parent of a non-standalone member is zeroed by the revisit guard, dropping
+    // the packages it INHERITED / had loaded by siblings (its own `library()`
+    // calls survive via the direct artifact read). Either truncated scope must
+    // never be cached or served. So the hook is skipped whenever any member of the
+    // FULL contributing set (forward closure ∪ backward parents of non-standalone
+    // members — exactly what `standalone_closure_fingerprint_and_members` returns)
+    // is already in `visited`. A clean reach (no contributing file visited) resolves
+    // the full closure and is cached. This is conservatively over-broad — see #488.
     //
     // On a hit we return EXACTLY what the un-memoized resolver would: the
     // truncation-free + `reach_depth <= compute_depth` rule mirrors

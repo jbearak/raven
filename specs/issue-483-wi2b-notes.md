@@ -213,3 +213,17 @@ recursive `parent_scope` is zeroed).
   **Tripwire:** if the resolver is ever changed so the inline `path_ctx` fallback can be
   authoritative over (or diverge from) the graph edges, the callee's `path_ctx` fingerprint
   MUST be added to `StandaloneScopeKey` (mirroring `ForwardChildKey::path_fp`).
+
+- **`ScopedSymbol.defined_end_column` not in the interface fingerprint** (Codex session
+  `019ed291`): a non-bug, unreachable. `defined_end_column` is deliberately excluded from
+  `ScopedSymbol`'s `PartialEq`/`Hash` (`scope.rs:602`) — it is cosmetic positional metadata
+  (issue #459: highlight the full `` `foo` `` token vs the bare `foo`), carrying no symbol
+  identity. It is read by exactly one consumer, `scoped_symbol_range` (`handlers.rs`), used
+  only for **go-to-definition** ranges. Go-to-definition resolves via
+  `scope_at_position_with_graph`, which seeds `ForwardChildMemo::default()` with no cache
+  handle, so it never reads a cached scope. The standalone cache is consulted only by the
+  diagnostics path (`StandaloneCacheCtx` is built only in `DiagnosticsSnapshot::new`), and
+  diagnostics never read `defined_end_column`. So a stale cached `defined_end_column` is
+  never observed, and `compute_interface_hash` (shared with revalidation) is not widened for
+  it. **Tripwire:** if the standalone cache is ever wired into go-to-definition / hover /
+  any surface that reads `defined_end_column`, the fingerprint must then cover it.
