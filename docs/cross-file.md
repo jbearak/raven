@@ -138,7 +138,8 @@ This matters because `help("mutate", package = "tidyverse")` is empty — only `
 
 ### Cross-File Package Propagation
 
-Packages loaded in parent files are available in sourced children:
+Package visibility follows source order. Packages loaded in a caller before a
+`source()` call are available in that sourced child:
 
 ```r
 # main.R
@@ -147,7 +148,9 @@ source("analysis.R")  # dplyr available in analysis.R
 library(ggplot2)      # NOT available in analysis.R (loaded after source)
 ```
 
-Packages loaded in child files do NOT propagate back to parents (forward-only).
+Packages loaded by the sourced child are available to the caller after the
+`source()` call returns. They are not retroactively visible to code that ran
+before the call site.
 
 ### Supported Call Patterns
 
@@ -208,10 +211,12 @@ The header directive `# raven: standalone` (see
 [directives](directives.md#standalone-module-directive)) opts a file out of that
 backward contribution. **When computing the standalone file's own diagnostics,
 and when resolving it as a sourced child**, Raven resolves it **in isolation**:
-no backward parent-prefix walk, no caller package set or data aliases, and no
-caller working directory. Its own scope is determined by the file itself plus
-its own forward `source()` closure, resolved from the standalone file's own path
-context — not by who sources it.
+no backward parent-prefix walk, no caller package set, no caller-derived bare
+`data()` aliases, and no caller working directory. Its own scope is determined
+by the file itself plus its own forward `source()` closure, resolved from the
+standalone file's own path context — not by who sources it. `data(..., package =
+"...")` and bare `data(stem)` after packages loaded by the standalone file
+itself still use Raven's package database normally.
 
 The isolation is **asymmetric**. Nothing flows *in* from a caller into the
 file's own scope, but the file still contributes *out*: its own definitions and
@@ -221,18 +226,23 @@ packages still makes them available to its callers.
 
 Raven resolves non-standalone files inside that forward closure with parent
 prefixes restricted to the same closure, so outside callers cannot affect the
-standalone scope indirectly through a shared member. Because the resulting scope
-is caller-independent, Raven can reuse it across callers and across edits that
-leave the standalone file's exported interface and forward closure unchanged.
-The cache is deliberately conservative: interface edits, the global dependency
-edge revision changing anywhere in the workspace, path-resolution context
-changes, package configuration changes, and max-depth changes recompute it.
+standalone scope indirectly through a shared member. Because the resulting EOF
+scope is caller-independent, Raven can reuse it across callers, EOF scope
+queries for the standalone file itself, and edits that leave the standalone
+file's exported interface and forward closure unchanged. The diagnostic stream
+for the standalone file still stays position-aware; it does not blindly replace
+the file's timeline with an EOF cache hit. The cache is deliberately
+conservative: interface edits, the global dependency edge revision changing
+anywhere in the workspace, path-resolution context changes, package
+fact/library refreshes, package configuration changes, and max-depth changes
+recompute it.
 
 The directive is the sound, opt-in way to assert this independence, so Raven
 never has to over-approximate it. If the assertion is wrong (the file truly
-needs a caller-provided binding), the only consequence is a false-positive
-"undefined" *inside the standalone file* — a safe direction, never a missed bug
-in a caller.
+needs a caller-provided binding, package, bare `data()` alias, or working
+directory), the only consequence is a false-positive "undefined" in the
+standalone file or in callers that relied on those caller-dependent exports — a
+safe direction, never a missed bug.
 `# raven: nse` / `# raven: func` propagation over `source()` edges is unaffected
 (it is graph-level, not scope-level).
 

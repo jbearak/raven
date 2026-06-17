@@ -86,12 +86,12 @@ tests green.**
 
 Original analysis (kept for context):
 
-### Root cause (re-verified against code)
+### Root cause
 
-`compute_or_get_cached_prefix` (`scope.rs:8000`) memoizes STEP-1 backward-walk
-prefixes per `(uri, query_inside_function)` in the per-snapshot
-`ParentPrefixCache`. But at **`scope.rs:8034` it allocates a fresh
-`ForwardChildMemo` per prefix computation**:
+`compute_or_get_cached_prefix` memoizes STEP-1 backward-walk prefixes per
+`(uri, query_inside_function, standalone_closure_context_fp)` in the per-snapshot
+`ParentPrefixCache`. The original WI1 problem was that the streaming prefix path
+allocated a fresh `ForwardChildMemo` per prefix computation:
 
 ```rust
 let prefix_forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
@@ -103,7 +103,7 @@ from scratch → O(N²) re-resolution of the hub closure. For `functions.r`:
 
 ### Why sharing is safe (the invariant that licenses it)
 
-The doc comment at `scope.rs:8024-8034` explains why the memo is currently
+The `compute_or_get_cached_prefix` doc comment explains why the memo was
 fresh-per-prefix: the prefix is computed at a **canonical `current_depth = 0`
 origin**, whose forward-child depths do NOT match the actual depth a streaming
 forward sweep reaches the same child at. Reusing prefix-resolved children in the
@@ -121,46 +121,43 @@ the cross-prefix-root reuse can still diverge on the `depth_exceeded`/`chain`
 advisory — never on symbols. See the corrected "Residual risk" note above and
 issue #484.)
 
-The depth-reuse rule (`scope.rs:1159-1192`, reuse only when
+The depth-reuse rule in `ForwardChildMemo` (reuse only when
 `child_depth <= compute_depth`, cache only `depth_exceeded.is_empty()` scopes)
-and the cycle-disable (`scope.rs:1138-1152`, `graph_has_cycle` cell → bypass
-memo on any cyclic graph) are properties of `ForwardChildMemo` itself and carry
-over unchanged to a shared instance.
+and the cycle-disable (`graph_has_cycle` cell → bypass memo on any cyclic graph)
+are properties of `ForwardChildMemo` itself and carry over unchanged to a shared
+instance.
 
 ### Design
 
 Give the prefix memo the **snapshot** lifetime instead of the
-**per-prefix-call** lifetime, keyed to the same scope as `ParentPrefixCache`
-(which is already one-per-snapshot, see its doc at `scope.rs:4767`). Concretely:
-add a `prefix_forward_child_memo: RefCell<ForwardChildMemo>` field to
-`ParentPrefixCache`, and at `scope.rs:8034` (the **streaming** entry point's
-prefix path, the diagnostics hot path) borrow that field instead of allocating a
-fresh memo.
+**per-prefix-call** lifetime, keyed to the same scope as `ParentPrefixCache`.
+Concretely: add a stream-owned
+`prefix_forward_child_memo: RefCell<ForwardChildMemo>` and have the streaming
+entry point's prefix path borrow that field instead of allocating a fresh memo.
 
 **Scope of WI1 — stream path only.** The other prefix entry point,
-`scope_at_position_with_graph_cached` (`scope.rs:4846`), allocates ONE
-`forward_child_memo` *per position query* and shares it between its single
-prefix computation (`scope.rs:4867`) and STEP 2 (`scope.rs:4902`). Both legs run
-at `current_depth = 0` there, so that local memo is already correct and is NOT
-the O(N²) site (it is per-query, not per-prefix). The validated 8.4× prototype
-touched only the stream path. Sharing a memo *across* position queries within a
-snapshot is a separate, unvalidated optimization (interactive hover/completion
-latency) and is **explicitly out of WI1** to preserve its "validated,
-byte-identical, low-risk" property. Leave `scope.rs:4846` unchanged.
+`scope_at_position_with_graph_cached`, allocates one `forward_child_memo` *per
+position query* and shares it between its single prefix computation and STEP 2.
+Both legs run at `current_depth = 0` there, so that local memo is already
+correct and is NOT the O(N²) site (it is per-query, not per-prefix). The
+validated 8.4× prototype touched only the stream path. Sharing a memo *across*
+position queries within a snapshot is a separate, unvalidated optimization
+(interactive hover/completion latency) and is **explicitly out of WI1** to
+preserve its "validated, byte-identical, low-risk" property. Leave the recursive
+cached entry point unchanged.
 
 - It rides `ParentPrefixCache`'s existing one-per-snapshot discipline and
-  snapshot-boundary warning (`scope.rs:4767-4798`), so it cannot leak across
-  snapshots.
+  snapshot-boundary warning, so it cannot leak across snapshots.
 - It stays strictly separate from the stream's actual-depth
   `forward_child_memo` (a different `RefCell`, never passed where the stream's
   memo is expected). The separation the doc comment requires is preserved.
 - The shared memo accumulates across all `compute_or_get_cached_prefix` calls
   within the snapshot, collapsing the O(N²) re-resolution to O(N).
 
-`ParentPrefixCache` is constructed in ~30 sites (production: `handlers.rs:393`
-`DiagnosticsSnapshot`, the streaming collectors; plus `qualified_resolve.rs` and
-many tests). Because the new field is `Default`, `ParentPrefixCache::new()` /
-`::default()` keep working at every site with no signature change.
+`ParentPrefixCache` is constructed in `DiagnosticsSnapshot`, the streaming
+collectors, `qualified_resolve.rs`, and many tests. Because the new field is
+`Default`, `ParentPrefixCache::new()` / `::default()` keep working at every site
+with no signature change.
 
 ### Verification
 
@@ -190,7 +187,7 @@ explicitly deferred).
    When computing scope for a position *inside* a standalone file C, Raven does
    **not** walk backward to the files that `source()` C (no STEP-1 parent-prefix
    walk), **and** does **not** inherit any caller-provided *inputs*: caller
-   packages (`scope.rs:5412,5715`), the caller's `DataAliasProvider`, or the
+   packages, the caller's `DataAliasProvider`, or the
    caller's working directory. C's scope is computed from C's own definitions,
    C's own loaded packages, C's own `# raven: cd`, and C's own forward closure —
    nothing flows **in** from any caller. This is what makes C's EOF scope a pure
@@ -200,39 +197,37 @@ explicitly deferred).
    **Asymmetry — the OUTPUT direction is unchanged.** C still contributes its
    own bindings AND its own loaded packages **out** to every caller via the
    normal additive forward merge (`merge_child_source_packages`,
-   `scope.rs:5960`). A primary, intended use of `standalone` is a module that
-   `library()`-loads the packages its callers rely on: those package loads must
-   still propagate up to callers. Isolation drops caller→C inheritance; it does
-   NOT drop C→caller contribution. Both the symbols C defines and the packages C
+   called from the forward-source merge). A primary, intended use of
+   `standalone` is a module that `library()`-loads the packages its callers rely
+   on: those package loads must still propagate up to callers. Isolation drops
+   caller→C inheritance; it does NOT drop C→caller contribution. Both the
+   symbols C defines and the packages C
    loads remain part of C's cached isolated EOF scope and flow to callers.
 2. **It only ADDS to a caller's scope.** Already the default forward behavior
-   (the forward merge at `scope.rs:5905` / `scope.rs:5960` only *inserts* the
-   child's surviving symbols and *merges in* its packages). `standalone` does not
-   change this. Recorded for completeness; no code.
+   (the forward merge only *inserts* the child's surviving symbols and *merges
+   in* its packages). `standalone` does not change this. Recorded for
+   completeness; no code.
 3. **C's `rm()`/`remove()` effects do not propagate out to callers.** **Already
-   guaranteed by the existing additive merge** — verified at `scope.rs:5905`,
-   which iterates `child_scope.symbols` (C's EOF map, with C's own removals
-   already applied during C's resolution at `scope.rs:5992`) and never replays
-   C's `Removal` events against the caller's accumulated scope. A caller's own
-   bindings are therefore untouched by C's `rm()` regardless of `standalone`.
-   No code; asserted as part of the contract.
+   guaranteed by the existing additive merge**, which iterates
+   `child_scope.symbols` (C's EOF map, with C's own removals already applied
+   during C's resolution) and never replays C's `Removal` events against the
+   caller's accumulated scope. A caller's own bindings are therefore untouched
+   by C's `rm()` regardless of `standalone`. No code; asserted as part of the
+   contract.
 
 **Net:** the only behavioral switch is knob 1 (skip backward walk + drop
-caller-inherited packages/provider/cd for C). Knobs 2 and 3 are pre-existing
+caller-inherited packages/cd for C). Knobs 2 and 3 are pre-existing
 properties of the additive forward merge, documented here so the contract is
 explicit.
 
-> **Design vs shipped.** This section describes knob 1 as fully *designed*. Knob
-> 1 has two halves: (a) the **backward-walk skip**, which drops the caller
+> **Historical WI2a note.** This section describes knob 1 as the intended whole.
+> Knob 1 had two halves: (a) the **backward-walk skip**, which drops the caller
 > **symbols and packages** C would inherit through its backward edges (the only
 > things the backward `ParentPrefix` carries); and (b) **caller-independent
-> forward resolution**, which would additionally drop the caller's
-> forward-threaded `DataAliasProvider` / working directory / packages when C is
-> resolved as a caller's forward child. Only half (a) shipped in WI2a; half (b)
-> — and thus the full "pure function of `(C, C's forward closure)`" property the
-> perf/caching argument relies on — is deferred to WI2b (#483). See the "Shipped
-> scope (WI2a)" note below. References to knob 1 in this design section describe
-> the intended whole.
+> forward resolution**, which additionally drops the caller's forward-threaded
+> `DataAliasProvider` / working directory / packages when C is resolved as a
+> caller's forward child. WI2a shipped only half (a). WI2b (#483) completes half
+> (b) and is the current contract described below.
 
 ### Why required (perf + correctness)
 
@@ -246,10 +241,12 @@ explicit.
   standalone prevents that class.
 
 **Opt-in safety (safe direction).** The user vouches for the property. If a
-"standalone" callee actually relies on a caller-provided binding, the worst case
-is a false-positive *undefined inside the callee* — never a hidden real bug in a
-caller. This is why it needs no over-approximation/provider/trimmed-view
-soundness machinery (those are #480's traps): the directive *asserts* the
+"standalone" callee actually relies on a caller-provided binding, package, data
+alias, or working directory, the worst case is a false-positive *undefined*
+inside the callee or in callers that relied on those caller-dependent exports —
+never a hidden real bug. This is why it needs no
+over-approximation/provider/trimmed-view soundness machinery (those are #480's
+traps): the directive *asserts* the
 independence rather than inferring it.
 
 ### Parsing & metadata
@@ -258,13 +255,13 @@ independence rather than inferring it.
   `# raven:` families. The directive is **file-level** and **header-only**: it
   must appear in the header region (consecutive blank/comment lines from file
   start). Note the existing parser has two precedents: backward/working-dir
-  directives are gated on an `in_header` flag (`directive.rs:549`), while
-  `ignore-file` is parsed *without* that gate (`directive.rs:737`). `standalone`
-  follows the **backward/cd precedent**: add an explicit `in_header` gate.
+  directives are gated on an `in_header` flag, while `ignore-file` is parsed
+  *without* that gate. `standalone` follows the **backward/cd precedent**: add
+  an explicit `in_header` gate.
   Accept the `@lsp-standalone` alias for parity (`DIRECTIVE_PREFIX`
   alternation). No payload; an optional trailing `# comment` is allowed.
-- Add `pub standalone: bool` (`#[serde(default)]`) to `CrossFileMetadata`
-  (`types.rs:185`). `false` by default = today's behavior everywhere.
+- Add `pub standalone: bool` (`#[serde(default)]`) to `CrossFileMetadata`.
+  `false` by default = today's behavior everywhere.
 - Test: a `# raven: standalone` appearing *after* code is silently ignored
   (header-only gate).
 
@@ -275,26 +272,33 @@ When the **queried URI** C has `metadata(C).standalone == true`, short-circuit
 the backward walk: return an **empty `ParentPrefix`** for C (no walk to C's
 `backward` edges). Additionally, when C is resolved as a forward child of a
 caller A, resolve C with **canonical, caller-independent inputs** (empty/base
-package set, `None` provider, C's own `PathContext`) rather than A's inherited
-packages/provider/cd (`scope.rs:5412,5715`) — so C's scope is byte-identical
-whether computed for C's own diagnostics or as A's forward child. This canonical
+package set and C's own `PathContext`) rather than A's inherited packages/cd.
+The `DataAliasProvider` remains available so C's own `data(..., package = "...")`
+and bare `data(stem)` after C's own `library()` calls expand normally; caller
+packages do not feed bare `data(stem)`. With provider availability included in
+the key and provider content invalidated by the package cache epoch, C's
+isolated forward-child scope is byte-identical across callers and cache hits.
+C's own root diagnostics use the same standalone backward-walk isolation. A
+root EOF scope can also use the persistent cache, but it has a distinct
+scope-flavor key because depth-0 base exports are part of the root query and can
+be removed by C's own timeline. Position-by-position diagnostics for C remain
+timeline-aware; they do not blindly substitute an EOF cache hit. This canonical
 resolution is the precondition that makes the WI2b cache's callee identity
 caller-independent. The persistent key is intentionally broader than C's URI:
-URI, full-graph edge revision, path-context fingerprint, closure-interface
-fingerprint, and package/config generation.
+URI, full-graph edge revision, path-context fingerprint, scope-flavor
+fingerprint, closure-interface fingerprint, active-closure context fingerprint,
+provider availability, package cache epoch, and standalone-scope invalidation
+generation.
 
 > **Current shipped scope (WI2b / #483).** The WI2a review found that only the
 > backward-walk skip had landed. WI2b completes part 2: standalone forward
-> children now receive caller-independent packages/provider/path context, and
+> children now receive caller-independent packages/path context, and
 > non-standalone members of a standalone callee's forward closure ignore
 > backward parents outside that same closure. This is the directive-scoped
-> behavior change that makes the isolated scope cacheable across callers.
-> (#483) along with the cache itself. The two are decoupled deliberately: part 1
-> delivers the own-diagnostics isolation and the hub-perf win that WI2a targets,
-> while part 2 only matters once the cross-snapshot cache exists. User-facing
-> docs (`docs/directives.md`, `docs/cross-file.md`) describe **only** the
-> shipped part-1 semantics ("when computing a standalone file's *own*
-> diagnostics").
+> behavior change that makes the isolated scope cacheable across callers, and
+> shipped in #483 along with the cache itself. User-facing docs
+> (`docs/directives.md`, `docs/cross-file.md`) now describe both own-diagnostics
+> isolation and caller-independent forward-child resolution.
 
 This alone removes the ~84-caller backward union when computing `functions.r`'s
 own diagnostics and fixes the caller-union over-approximation class (#476
@@ -302,10 +306,9 @@ own diagnostics and fixes the caller-union over-approximation class (#476
 diagnostic cost drops sharply with **no caching machinery at all**.
 
 Interface-hash wiring (revalidation): `standalone` changes cross-file scope, so
-it MUST feed `compute_interface_hash` (`scope.rs:4493`) — add the `standalone`
-bool so toggling the directive in any connected file revalidates dependents. The
-metadata-free hash path passes `false`; the metadata-aware path passes
-`metadata.standalone`.
+it MUST feed `compute_interface_hash`; toggling the directive in any connected
+file revalidates dependents. The metadata-free hash path passes `false`; the
+metadata-aware path passes `metadata.standalone`.
 
 ### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — MEASURE-GATED
 
@@ -326,51 +329,86 @@ closure with those member parent-prefix walks restricted to parents inside the
 same closure, preserving cache-on == cache-off behavior while keeping the value
 cacheable.
 
-**Soundness of the cache key.** Because WI2a resolves C with caller-independent
-inputs, C's isolated scope does NOT depend on any of the caller-varying fields
-in `ForwardChildKey` (`path_fp`/`pkg_fp`/`provider_fp`, `scope.rs:1015`). So C's
-URI plus C's path-context fingerprint are sufficient key inputs *for the scope
-value* — provided invalidation correctly detects changes to C or its forward
-closure.
+**Soundness of the cache key.** Because WI2b resolves C with caller-independent
+inputs, C's isolated scope does NOT depend on caller-varying inherited packages
+or caller path context from `ForwardChildKey`. It can differ between
+provider-present and provider-absent queries, so the persistent key records
+provider availability; provider content changes are covered by the
+package cache epoch. C's URI plus C's path-context fingerprint are
+sufficient key inputs *for the scope value* once those provider and invalidation
+inputs are included, provided invalidation correctly detects changes to C or its
+forward closure.
 
 **Invalidation — per-closure `interface_hash` fingerprint (chosen design).**
 
 Cache key = `(C_uri, edge_revision, path_context_fingerprint,
-closure_interface_fingerprint, package_config_generation)`:
+scope_flavor_fingerprint, closure_interface_fingerprint,
+closure_context_fingerprint, data_alias_provider_available, package_cache_epoch,
+standalone_scope_invalidation_generation)`:
 
-- `edge_revision` (`dependency.rs:535`) pins the **membership** of C's forward
-  closure. It bumps on any structural edge change (`dependency.rs:959-983`),
-  including a closure member adding/retargeting a `source()` or moving a call
-  site.
+- `edge_revision` conservatively pins the **membership** of C's forward closure.
+  It bumps on any structural edge change, including unrelated workspace edges;
+  that broad nonce is intentional because it also covers edge-order and
+  call-site changes without deriving a second graph-shape fingerprint.
+- `scope_flavor_fingerprint` separates ordinary forward-child entries from
+  root EOF entries that include depth-0 base exports. This prevents a
+  forward-child scope, which never carries base exports, from being reused for a
+  root EOF query where `rm(base_name)` semantics depend on base exports being
+  present before the local timeline runs.
 - `path_context_fingerprint` pins C's own forward path-resolution context,
   including workspace-root fallback inputs when no explicit or inherited
   working directory is in effect.
 - `closure_interface_fingerprint` = a hash over the per-file `interface_hash` of
-  every file in `{C} ∪ forward_closure(C)` (all already computed and cached in
-  artifacts). C's isolated scope is the composition of the closure members'
-  *exported interfaces* in `source()` order, so `(edge_revision, Σ
-  interface_hash)` fully determines it.
-- `package_config_generation`: a coarse counter bumped whenever the package
+  every file in `{C} ∪ forward_closure(C)`, where membership is walked through
+  the same active path contexts used by isolated scope resolution (all hashes
+  are already computed and cached in artifacts). C's isolated scope is the
+  composition of the closure members' *exported interfaces* in `source()` order,
+  so `(edge_revision, path_context_fingerprint, Σ interface_hash)` fully
+  determines it.
+- `closure_context_fingerprint` pins the active edge/path-context shape used
+  inside the standalone closure, including member parent-prefix filtering
+  inputs. It makes context-only changes explicit rather than relying on a proof
+  that edge revision or interface hashes always move with them.
+- `data_alias_provider_available` separates provider-present scopes, where
+  standalone-local `data()` calls can expand package database aliases, from
+  provider-absent scopes, where only literal-stem fallback symbols are present.
+  Provider content changes are package-library changes and are covered by the
+  package cache epoch rather than by hashing a callback object.
+- `package_cache_epoch` pins the package-library snapshot that backs
+  `DataAliasProvider` lookups for standalone-local `data()` alias expansion.
+- `standalone_scope_invalidation_generation`: a coarse counter bumped whenever the package
   library or relevant config changes (R re-init, `packages_*` settings,
   `maxChainDepth`). C's isolated scope also depends on `base_exports` /
   package-library state / config, which the other key components do not capture.
 
+The resolver applies the standalone closure context even when a value is not
+eligible for persistence. It deliberately skips the cross-snapshot cache when
+the active closure cannot be fully materialized from the snapshot artifacts,
+when the same URI is reached through multiple active path contexts, or when the
+active path walk finds a cycle. It also skips persistence whenever the
+resolution graph handed to the scope query is cyclic, matching the per-query
+forward-child memo boundary where traversal history can affect a child scope.
+Diagnostic and interactive snapshots precollect active standalone-closure
+members discovered through the same path-context walk, even when those members
+are outside the trimmed graph neighborhood.
+
 **Why `interface_hash`, not source-text (decision revised after review).** The
-dominant IDE editing pattern on a hub workspace is editing a file *inside* the
-hub's closure (e.g. `functions.r`, which `bootstrap.r` sources). Computing
-diagnostics for that file resolves the standalone parent's isolated scope, so it
-consults this cache on **every keystroke**. A **source-text** fingerprint would
-miss on every comment / whitespace / function-body / local edit — i.e. most
-edits — recomputing the whole closure each keystroke and defeating the cache's
-purpose for the active file. `interface_hash` busts **only** when a closure
-member's *top-level exported interface* changes (add/rename/remove a top-level
-symbol, signature, or package load) — exactly when C's scope genuinely changed —
-so body/comment/local edits stay cache hits.
+dominant IDE editing pattern on a hub workspace is editing a caller of the hub,
+or editing a file inside the hub's closure and then revalidating the hub's many
+callers. Those resolutions consult the standalone hub's cached isolated scope.
+A **source-text** fingerprint would miss on every edit, recomputing the whole
+closure each keystroke and defeating the cache's purpose. `interface_hash`
+busts only when a closure member's exported interface changes, including
+position-sensitive top-level symbols, signatures, removals, declarations, data
+loads, and package-load placement/scope. Comment, whitespace, function-body, and
+local edits are cache hits when they leave that interface hash unchanged.
 
 Editing a **caller** of C (not in C's closure) leaves the fingerprint unchanged
 either way → hit. Validating the fingerprint is O(closure size) over precomputed
-`u64`s. Closure *membership* is the cheap graph walk already cached by
-`edge_revision` (the `subgraph_cache`).
+`u64`s. Closure *membership* is walked fresh from the active path contexts used
+for isolated resolution; `edge_revision` pins structural graph changes, and the
+path-context fingerprint separates inherited working-directory/workspace-root
+cases that can retarget relative sources.
 
 **Soundness depends on `interface_hash` completeness — already a system
 invariant.** Dependent revalidation correctness (`compute_affected_dependents_
@@ -396,14 +434,17 @@ lookup + miss-compute holding no `WorldState` guard.** The cache's own internal
 `RwLock`/LRU follows the `subgraph_cache` pattern (`dependency.rs:521-547`):
 read locks `peek()` (no promotion), write locks `push()`.
 
-> **Codex review targets (round 2):** (a) the canonical-input resolution in WI2a
-> — is there any other caller-varying input beyond packages/provider/cd that
-> feeds C's scope (so URI is a sufficient cache key)? (b) is `interface_hash`
-> (post-#482) a *complete* fingerprint of a file's scope-contributing exported
-> interface — does C's isolated scope depend on anything in a closure member
-> beyond what `interface_hash` covers? — and is closure membership truly pinned
-> by `edge_revision`? (c) the `Arc`-handle-out lock discipline under concurrent
-> `did_change`.
+> **Review outcome:** WI2b uses canonical standalone-child inputs and a broader
+> persistent key than URI alone: callee URI, full-graph edge revision, path
+> context fingerprint, scope-flavor fingerprint, active-closure interface
+> fingerprint, active-closure context fingerprint, data-alias provider
+> availability, package cache epoch, and standalone-scope invalidation
+> generation. `interface_hash` completeness remains the shared invariant for
+> dependent revalidation and standalone cache
+> invalidation, and the cache handle is cloned out of `WorldState` snapshots
+> before diagnostic and interactive qualified-member scope resolution. Cyclic
+> graphs and non-materializable active closures still resolve with the isolated
+> closure context but do not persist a cross-snapshot entry.
 
 ### Interactions (resolved; Codex round 2 to stress-test)
 
@@ -423,15 +464,16 @@ read locks `peek()` (no promotion), write locks `push()`.
   propagation. **Scope boundary to document explicitly:** because knob 1 also
   drops caller-inherited *packages*, a package the caller loads that an NSE
   policy depends on is no longer in-play *inside* C (ancestor packages are
-  otherwise included, `handlers.rs:5607`). This is intended isolation
-  (safe-direction: worst case a false-positive inside C). Document that
+  otherwise included by package-mode contribution code). This is intended isolation
+  (safe-direction: worst case a false-positive in C or in callers relying on
+  caller-dependent exports from C). Document that
   `standalone` isolates C's lexical scope **and** its in-play package set from
   callers, while leaving NSE/func *directive* propagation over graph edges
   intact.
 - **Package mode** — orthogonal; `standalone` is about `source()` topology, not
   package exports. No change.
 - **`sys.source` / `local = TRUE`** — these already get local scoping
-  (`should_apply_local_scoping`, `scope.rs:1201`). `standalone` is about the
+  (`should_apply_local_scoping`). `standalone` is about the
   *callee's* backward walk, independent of how a caller sources it. Document that
   `standalone` and per-call local scoping compose without conflict.
 
@@ -447,19 +489,21 @@ read locks `peek()` (no promotion), write locks `push()`.
 ### Verification
 
 - New unit/integration tests: (a) standalone callee with a deliberately
-  caller-provided binding → false-positive *inside the callee* (proves knob 1);
-  (b) a standalone callee's scope is byte-identical whether computed for its own
-  diagnostics or as a forward child of two different callers with *different*
-  loaded packages (proves caller-independent canonical resolution); (c) toggling
-  `standalone` revalidates dependents (interface-hash wiring); (d) header-only
+  caller-provided binding/package → false-positive rather than hidden bug
+  (proves knob 1);
+  (b) a standalone callee's isolated forward-child scope is byte-identical across
+  two different callers with *different* loaded packages (proves
+  caller-independent canonical resolution), and root EOF cache entries preserve
+  depth-0 base-export removal semantics through a distinct scope flavor; (c)
+  toggling `standalone` revalidates dependents (interface-hash wiring); (d) header-only
   gate: `# raven: standalone` after code is ignored; (e) `# raven: cd` / `nse` /
   `local=TRUE` interaction tests; (f) WI2b cache: editing a caller, or a
   comment / function-body / local binding *inside* a closure member, leaves C's
   `closure_interface_fingerprint` unchanged → cache hit (assert no recompute);
   changing a closure member's top-level interface (add/rename/remove a top-level
-  symbol, signature, or package load) → cache miss → recompute; package/config
-  generation bump → miss; and packages C loads still propagate to the caller
-  after a cache hit. (g) `ScopedSymbol` `Hash`/`Eq` field-parity test (#482
+  symbol, signature, or package load) → cache miss → recompute; standalone-scope
+  invalidation generation bump → miss; and packages C loads still propagate to
+  the caller after a cache hit. (g) `ScopedSymbol` `Hash`/`Eq` field-parity test (#482
   prerequisite).
 - On worldwide: add `# raven: standalone` to `scripts/functions.r` (and/or
   `bootstrap.r` per measurement), re-measure `functions.r` and `raven check .`,

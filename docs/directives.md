@@ -15,7 +15,7 @@ All directives support optional colon and quotes:
 # raven: sourced-by: '../main.R'
 ```
 
-**Header-only directives:** Backward directives and working directory directives must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if placed after the first line of code. Forward directives, declaration directives, and ignore directives can appear anywhere.
+**Header-only directives:** Backward directives, working directory directives, and standalone module directives must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if placed after the first line of code. Forward directives, declaration directives, and ignore directives can appear anywhere.
 
 ## Forward Directives
 
@@ -136,10 +136,12 @@ When computing a standalone file's **own** diagnostics, and when resolving that
 file as a sourced child of another file, it is resolved **in isolation** from
 the files that `source()` it:
 
-- It does **not** inherit symbols or loaded packages from any caller — no
-  backward parent-prefix walk and no caller package set during forward-child
-  resolution. Its own cross-file scope is determined by the file itself and its
-  own forward `source()` closure, not by who sources it.
+- It does **not** inherit symbols, loaded packages, or bare `data()` aliases
+  from any caller — no backward parent-prefix walk and no caller package set
+  during forward-child resolution. Its own cross-file scope is determined by the
+  file itself and its own forward `source()` closure, not by who sources it.
+  `data(..., package = "...")` and bare `data(stem)` after the standalone file's
+  own `library()` calls still use Raven's package database normally.
 - It uses its own path context when following its forward `source()` calls. A
   caller's inherited `# raven: cd` does not change how the standalone file's
   own forward paths resolve.
@@ -153,18 +155,23 @@ the files that `source()` it:
 others (a hub). Declaring it standalone both **prevents** caller-union
 over-approximation (one caller's bindings leaking into the file's analysis on
 behalf of another) and makes Raven much faster on hub-heavy workspaces, because
-Raven can reuse the file's isolated scope across callers and many edits that do
-not change the exported interface of the hub or any file in its forward closure.
-Reuse is conservative: dependency-edge changes anywhere in the workspace bump a
-global edge revision and force a recompute. If a non-standalone file in the
-hub's forward closure is also sourced from outside that closure, the outside
-parent is not allowed to shape the standalone hub's isolated scope.
+Raven can reuse the file's isolated EOF scope across callers, EOF scope queries
+for the standalone file itself, and many edits that do not change the exported
+interface of the hub or any file in its forward closure. Diagnostics for the
+standalone file itself remain position-aware; Raven does not replace the whole
+timeline with an EOF cache hit. Reuse is conservative: dependency-edge changes
+anywhere in the workspace, path-context changes, package fact/library refreshes,
+package/scope configuration changes, and max-depth changes force a recompute. If
+a non-standalone file in the hub's forward closure is also sourced from outside
+that closure, the outside parent is not allowed to shape the standalone hub's
+isolated scope.
 
 **Opt-in and safe-direction.** You vouch that the file is self-contained. If it
-actually relies on a binding a caller provides, the worst case is a
-false-positive *“undefined variable”* **inside the standalone file itself** —
-never a hidden real bug in a caller. (Mark the *root* setup file that provides
-the shared environment as standalone, not a leaf that consumes it.)
+actually relies on a caller-provided binding, package, bare `data()` alias, or
+working directory, the worst case is a false-positive *“undefined variable”* in
+the standalone file or in callers that relied on those caller-dependent exports —
+never a hidden real bug. (Mark the *root* setup file that provides the shared
+environment as standalone, not a leaf that consumes it.)
 
 **Interactions.** `standalone` only suppresses the *caller→file* direction. It
 composes with `# raven: cd` (the file uses its own working directory),

@@ -299,6 +299,27 @@ impl CombinedEntry {
 
 type PackageCache = HashMap<String, Arc<PackageInfo>>;
 type CombinedCache = HashMap<String, Arc<CombinedEntry>>;
+
+#[derive(Clone)]
+pub(crate) struct PackageFactSnapshot {
+    packages: Arc<PackageCache>,
+    cache_epoch: u64,
+}
+
+impl PackageFactSnapshot {
+    pub(crate) fn cache_epoch(&self) -> u64 {
+        self.cache_epoch
+    }
+
+    pub(crate) fn data_objects_for_stem(&self, package: &str, stem: &str) -> Vec<String> {
+        self.packages
+            .get(package)
+            .and_then(|info| info.data_aliases.get(stem))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 enum CachedCompletionEntry {
     Combined {
         loaded_package: String,
@@ -336,6 +357,12 @@ pub struct PackageLibrary {
     /// attribution during cache warm-up or invalidation. See issue #407.
     combined_entries: ArcSwap<CombinedCache>,
     combined_entries_write: Mutex<()>,
+    /// Monotonic epoch for in-memory package fact snapshots.
+    ///
+    /// Scope cache keys that depend on package-derived facts, such as `data()`
+    /// alias expansion, capture this epoch so background prefetch/invalidation
+    /// cannot leave stale cross-snapshot scope entries reachable.
+    cache_epoch: std::sync::atomic::AtomicU64,
     /// Base packages (always available)
     base_packages: HashSet<String>,
     /// Base package exports (combined from all base packages).
@@ -367,6 +394,7 @@ impl PackageLibrary {
             packages_write: Mutex::new(()),
             combined_entries: ArcSwap::from_pointee(HashMap::new()),
             combined_entries_write: Mutex::new(()),
+            cache_epoch: std::sync::atomic::AtomicU64::new(0),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
@@ -389,6 +417,7 @@ impl PackageLibrary {
             packages_write: Mutex::new(()),
             combined_entries: ArcSwap::from_pointee(HashMap::new()),
             combined_entries_write: Mutex::new(()),
+            cache_epoch: std::sync::atomic::AtomicU64::new(0),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
@@ -409,6 +438,30 @@ impl PackageLibrary {
     /// Get the base exports
     pub fn base_exports(&self) -> &Arc<HashSet<String>> {
         &self.base_exports
+    }
+
+    /// Monotonic epoch for cached package facts.
+    pub(crate) fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Snapshot package facts together with the epoch that identifies them.
+    ///
+    /// The standalone scope cache key uses `cache_epoch`, while `data()` alias
+    /// expansion reads package facts. Capturing both under `packages_write`
+    /// keeps a resolver from pairing an old epoch with a newly published map
+    /// (or the reverse) during background package-cache publication.
+    pub(crate) fn package_fact_snapshot(&self) -> PackageFactSnapshot {
+        let _guard = self.packages_write.lock();
+        PackageFactSnapshot {
+            packages: self.packages.load_full(),
+            cache_epoch: self.cache_epoch(),
+        }
+    }
+
+    fn bump_cache_epoch(&self) {
+        self.cache_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Check if a symbol is exported by base packages
@@ -450,6 +503,7 @@ impl PackageLibrary {
         let mut next = self.packages.load_full().as_ref().clone();
         let result = f(&mut next);
         self.packages.store(Arc::new(next));
+        self.bump_cache_epoch();
         result
     }
 
@@ -2908,6 +2962,37 @@ mod tests {
         lib.set_providers(vec![Box::new(Fake)]);
 
         assert!(!lib.export_metadata_missing("ravenproviderpkg").await);
+    }
+
+    #[tokio::test]
+    async fn package_cache_epoch_bumps_on_package_fact_mutations() {
+        let lib = PackageLibrary::new_empty();
+        let initial = lib.cache_epoch();
+
+        lib.insert_package(PackageInfo::new("pkg1".to_string(), HashSet::new()))
+            .await;
+        let after_insert = lib.cache_epoch();
+        assert!(after_insert > initial);
+
+        lib.update_combined_entries(|combined| {
+            combined.insert(
+                "pkg1".to_string(),
+                Arc::new(CombinedEntry::new(HashSet::new(), HashMap::new())),
+            );
+        });
+        assert_eq!(
+            lib.cache_epoch(),
+            after_insert,
+            "aggregate export-cache publications must not invalidate package-fact snapshots"
+        );
+
+        let names = HashSet::from(["pkg1".to_string()]);
+        lib.invalidate_many(&names).await;
+        let after_invalidate = lib.cache_epoch();
+        assert!(after_invalidate > after_insert);
+
+        lib.clear_cache().await;
+        assert!(lib.cache_epoch() > after_invalidate);
     }
 
     #[tokio::test]

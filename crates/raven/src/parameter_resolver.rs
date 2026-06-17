@@ -16,7 +16,8 @@ use tree_sitter::Node;
 use url::Url;
 
 use crate::cross_file::SymbolKind;
-use crate::cross_file::scope::ScopeAtPosition;
+use crate::cross_file::scope::{ParentPrefixCache, ScopeAtPosition};
+use crate::handlers::{CrossFileScopeSnapshot, DiagCancelToken};
 use crate::state::WorldState;
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,70 @@ pub fn resolve_user_only(
     resolve_from_cross_file(state, function_name, current_uri, position)
 }
 
+pub(crate) fn resolve_with_scope_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    cache: &SignatureCache,
+    function_name: &str,
+    namespace: Option<&str>,
+    is_internal: bool,
+    current_uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<FunctionSignature> {
+    if let Some(ns) = namespace {
+        let cache_key = format!("{}::{}", ns, function_name);
+        if let Some(sig) = cache.get_package(&cache_key) {
+            return Some(sig);
+        }
+    }
+
+    if namespace.is_none()
+        && let Some(sig) =
+            resolve_user_only_with_scope_snapshot(snapshot, function_name, current_uri, position)
+    {
+        return Some(sig);
+    }
+
+    let scope = get_scope_from_snapshot(snapshot, current_uri, position);
+    let all_packages = collect_packages_at_position_from_parts(
+        snapshot.package_library_ready,
+        snapshot.package_library.base_packages(),
+        &scope,
+    );
+
+    let resolved_package = if let Some(ns) = namespace {
+        Some(ns.to_string())
+    } else {
+        let pkg_list: Vec<String> = all_packages.to_vec();
+        snapshot
+            .package_library
+            .find_package_owner_for_symbol(function_name, &pkg_list)
+    };
+
+    resolve_package_signature(
+        &snapshot.package_library,
+        cache,
+        function_name,
+        resolved_package.as_deref(),
+        is_internal,
+    )
+}
+
+fn resolve_user_only_with_scope_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    function_name: &str,
+    current_uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<FunctionSignature> {
+    if let Some((text, tree)) = snapshot.get_text_and_tree(current_uri)
+        && let Some(sig) =
+            resolve_from_text_tree(function_name, current_uri, position, &text, &tree)
+    {
+        return Some(sig);
+    }
+
+    resolve_from_cross_file_snapshot(snapshot, function_name, current_uri, position)
+}
+
 /// Resolve function parameters with multi-phase resolution.
 ///
 /// Resolution priority:
@@ -291,86 +356,90 @@ pub fn resolve(
             .find_package_owner_for_symbol(function_name, &pkg_list)
     };
 
-    if let Some(ref pkg_name) = resolved_package {
-        let cache_key = format!("{}::{}", pkg_name, function_name);
-        if let Some(sig) = cache.get_package(&cache_key) {
-            return Some(sig);
-        }
+    resolve_package_signature(
+        &state.package_library,
+        cache,
+        function_name,
+        resolved_package.as_deref(),
+        is_internal,
+    )
+}
 
-        // R subprocess integration with graceful degradation (Requirement 11.1, 11.2, 11.3)
-        // Query R for function formals using get_function_formals
-        if let Some(r_subprocess) = state.package_library.r_subprocess() {
-            // Get tokio runtime handle for async call from sync context
-            let handle = match tokio::runtime::Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => {
-                    log::trace!(
-                        "No tokio runtime available for R subprocess query; skipping package function {}::{}",
-                        pkg_name,
-                        function_name
-                    );
-                    return None;
-                }
-            };
+fn resolve_package_signature(
+    package_library: &crate::package_library::PackageLibrary,
+    cache: &SignatureCache,
+    function_name: &str,
+    package_name: Option<&str>,
+    is_internal: bool,
+) -> Option<FunctionSignature> {
+    let pkg_name = package_name?;
+    let cache_key = format!("{}::{}", pkg_name, function_name);
+    if let Some(sig) = cache.get_package(&cache_key) {
+        return Some(sig);
+    }
 
-            // Call async get_function_formals from sync context
-            let formals_result = handle.block_on(r_subprocess.get_function_formals(
-                function_name,
-                Some(pkg_name),
-                !is_internal,
-            ));
-
-            match formals_result {
-                Ok(params) => {
-                    // Success: build signature, cache it, and return
-                    let signature = FunctionSignature {
-                        name: function_name.to_string(),
-                        parameters: params,
-                        source: SignatureSource::RSubprocess {
-                            package: Some(pkg_name.clone()),
-                        },
-                    };
-                    cache.insert_package(cache_key, signature.clone());
-                    log::trace!(
-                        "Resolved package function {}::{} via R subprocess ({} params)",
-                        pkg_name,
-                        function_name,
-                        signature.parameters.len()
-                    );
-                    return Some(signature);
-                }
-                Err(e) => {
-                    // Graceful degradation: log error and return None
-                    // Timeouts are logged at warn level (Requirement 11.3)
-                    // Other errors (parse failures, missing functions) at trace level
-                    if e.to_string().contains("timeout") || e.to_string().contains("timed out") {
-                        log::warn!(
-                            "R subprocess timeout querying formals for {}::{}: {}",
-                            pkg_name,
-                            function_name,
-                            e
-                        );
-                    } else {
-                        log::trace!(
-                            "Failed to get formals for {}::{} from R subprocess: {}",
-                            pkg_name,
-                            function_name,
-                            e
-                        );
-                    }
-                    // Fall through to return None (standard completions will still appear)
-                }
-            }
-        } else {
+    let Some(r_subprocess) = package_library.r_subprocess() else {
+        log::trace!(
+            "No R subprocess available; cannot query formals for {}::{}",
+            pkg_name,
+            function_name
+        );
+        return None;
+    };
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
             log::trace!(
-                "No R subprocess available; cannot query formals for {}::{}",
+                "No tokio runtime available for R subprocess query; skipping package function {}::{}",
                 pkg_name,
                 function_name
             );
+            return None;
+        }
+    };
+
+    let formals_result = handle.block_on(r_subprocess.get_function_formals(
+        function_name,
+        Some(pkg_name),
+        !is_internal,
+    ));
+    match formals_result {
+        Ok(params) => {
+            let signature = FunctionSignature {
+                name: function_name.to_string(),
+                parameters: params,
+                source: SignatureSource::RSubprocess {
+                    package: Some(pkg_name.to_string()),
+                },
+            };
+            cache.insert_package(cache_key, signature.clone());
+            log::trace!(
+                "Resolved package function {}::{} via R subprocess ({} params)",
+                pkg_name,
+                function_name,
+                signature.parameters.len()
+            );
+            Some(signature)
+        }
+        Err(e) => {
+            if e.to_string().contains("timeout") || e.to_string().contains("timed out") {
+                log::warn!(
+                    "R subprocess timeout querying formals for {}::{}: {}",
+                    pkg_name,
+                    function_name,
+                    e
+                );
+            } else {
+                log::trace!(
+                    "Failed to get formals for {}::{} from R subprocess: {}",
+                    pkg_name,
+                    function_name,
+                    e
+                );
+            }
+            None
         }
     }
-
-    None
 }
 
 /// Retrieve document text and parsed AST from any available document source.
@@ -473,15 +542,25 @@ fn resolve_from_current_file(
     let text = doc.analysis_text();
 
     // Search for the nearest function definition before cursor position
+    resolve_from_text_tree(function_name, uri, position, &text, tree)
+}
+
+fn resolve_from_text_tree(
+    function_name: &str,
+    uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+    text: &str,
+    tree: &tree_sitter::Tree,
+) -> Option<FunctionSignature> {
     let func_node =
-        find_function_definition_before_position(tree.root_node(), function_name, &text, position)?;
+        find_function_definition_before_position(tree.root_node(), function_name, text, position)?;
 
     // Find the formal_parameters child of the function_definition node
     let params_node = func_node
         .children(&mut func_node.walk())
         .find(|c| c.kind() == "parameters")?;
 
-    let parameters = extract_from_ast(params_node, &text);
+    let parameters = extract_from_ast(params_node, text);
     // Anchor roxygen at the assignment-expression start (the `f <-` line), not
     // the `function` keyword line: for a multi-line definition the block attaches
     // above the assignment, so the keyword line would scan past it and drop the
@@ -560,6 +639,48 @@ fn resolve_from_cross_file(
         .children(&mut func_node.walk())
         .find(|c| c.kind() == "parameters")?;
 
+    let parameters = extract_from_ast(params_node, &source_text);
+
+    Some(FunctionSignature {
+        name: function_name.to_string(),
+        parameters,
+        source: SignatureSource::CrossFile {
+            uri: symbol.source_uri.clone(),
+            line: symbol.defined_line,
+        },
+    })
+}
+
+fn resolve_from_cross_file_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    function_name: &str,
+    uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<FunctionSignature> {
+    let scope = get_scope_from_snapshot(snapshot, uri, position);
+    let lookup_key = crate::handlers::unquote_backtick_name(function_name).unwrap_or(function_name);
+    let symbol = scope
+        .symbols
+        .get(function_name)
+        .or_else(|| scope.symbols.get(lookup_key))?;
+
+    if symbol.source_uri == *uri
+        || symbol.kind != SymbolKind::Function
+        || symbol.source_uri.as_str().starts_with("package:")
+    {
+        return None;
+    }
+
+    let (source_text, source_tree) = snapshot.get_text_and_tree(&symbol.source_uri)?;
+    let func_node = find_function_definition_at_line(
+        source_tree.root_node(),
+        function_name,
+        &source_text,
+        symbol.defined_line,
+    )?;
+    let params_node = func_node
+        .children(&mut func_node.walk())
+        .find(|c| c.kind() == "parameters")?;
     let parameters = extract_from_ast(params_node, &source_text);
 
     Some(FunctionSignature {
@@ -802,14 +923,20 @@ fn get_scope(
 
     // `data()` alias expansion provider (issue #429); gated on package-library
     // readiness so we never expand against an empty cache.
+    let package_facts = (state.cross_file_config.packages_enabled && state.package_library_ready)
+        .then(|| state.package_library.package_fact_snapshot());
     let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-        state.package_library.data_objects_for_stem_sync(pkg, stem)
+        package_facts
+            .as_ref()
+            .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
     };
-    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: state.package_library.base_packages(),
-        });
+    let data_provider = package_facts.as_ref().map(|facts| {
+        scope::DataAliasProvider::with_cache_epoch(
+            &data_lookup,
+            state.package_library.base_packages(),
+            facts.cache_epoch(),
+        )
+    });
 
     scope::scope_at_position_with_graph(
         uri,
@@ -834,12 +961,39 @@ fn get_scope(
 /// Combines base packages, inherited packages, and loaded packages from the
 /// scope resolver's position-aware package list.
 fn collect_packages_at_position(state: &WorldState, scope: &ScopeAtPosition) -> Vec<String> {
+    collect_packages_at_position_from_parts(
+        state.package_library_ready,
+        state.package_library.base_packages(),
+        scope,
+    )
+}
+
+fn get_scope_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> ScopeAtPosition {
+    let mut prefix_cache = ParentPrefixCache::new();
+    snapshot.scope_at(
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        &mut prefix_cache,
+    )
+}
+
+fn collect_packages_at_position_from_parts(
+    package_library_ready: bool,
+    base_packages: &HashSet<String>,
+    scope: &ScopeAtPosition,
+) -> Vec<String> {
     let mut pkg_set: HashSet<String> = HashSet::new();
     let mut all_packages: Vec<String> = Vec::new();
 
     // Base packages first (always available without library() calls)
-    if state.package_library_ready {
-        for pkg in state.package_library.base_packages() {
+    if package_library_ready {
+        for pkg in base_packages {
             if pkg_set.insert(pkg.clone()) {
                 all_packages.push(pkg.clone());
             }

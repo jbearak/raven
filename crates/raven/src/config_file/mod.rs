@@ -99,7 +99,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     if cross_file_config_updated
         && standalone_scope_cache_config_changed(&old_cross_file_config, &state.cross_file_config)
     {
-        state.bump_standalone_scope_package_config_generation();
+        state.bump_standalone_scope_invalidation_generation();
     }
     state.symbol_config = crate::backend::parse_symbol_config(&merged).unwrap_or_default();
     state.completion_config = crate::backend::parse_completion_config(&merged).unwrap_or_default();
@@ -253,5 +253,39 @@ mod tests {
         assert!(lintr_auto_enable_allowed(
             &json!({ "linting": { "autoEnableFromDotLintr": "no" } })
         ));
+    }
+
+    #[test]
+    fn standalone_scope_generation_bumps_on_scope_and_package_config_changes() {
+        let mut state = state_with(
+            json!({ "diagnostics": { "undefinedVariableSeverity": "error" } }),
+            "/ws/raven.toml",
+            None,
+        );
+        let start = state.standalone_scope_invalidation_generation();
+
+        recompute_parsed_configs(&mut state);
+        assert_eq!(
+            state.standalone_scope_invalidation_generation(),
+            start,
+            "diagnostic severity does not affect standalone scope contents"
+        );
+
+        state.raw_client_settings = json!({ "crossFile": { "maxChainDepth": 32 } });
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 1);
+
+        state.raw_client_settings = json!({
+            "crossFile": { "maxChainDepth": 32 },
+            "packages": { "enabled": false }
+        });
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 2);
+
+        state.set_package_library(
+            std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
+            true,
+        );
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 3);
     }
 }

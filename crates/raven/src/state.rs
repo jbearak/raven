@@ -509,7 +509,7 @@ pub struct WorldState {
     pub help_cache: crate::help::HelpCache,
     pub html_help_cache: crate::help::HtmlHelpCache,
     pub signature_cache: Arc<SignatureCache>,
-    pub standalone_scope_cache: Arc<crate::cross_file::scope::StandaloneScopeCache>,
+    pub(crate) standalone_scope_cache: Arc<crate::cross_file::scope::StandaloneScopeCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
 
@@ -734,18 +734,18 @@ impl WorldState {
         self.html_help_cache.drain();
     }
 
-    pub fn bump_standalone_scope_package_config_generation(&self) -> u64 {
-        self.standalone_scope_cache.bump_package_config_generation()
+    pub(crate) fn bump_standalone_scope_invalidation_generation(&self) -> u64 {
+        self.standalone_scope_cache.bump_invalidation_generation()
     }
 
-    pub fn standalone_scope_package_config_generation(&self) -> u64 {
-        self.standalone_scope_cache.package_config_generation()
+    pub(crate) fn standalone_scope_invalidation_generation(&self) -> u64 {
+        self.standalone_scope_cache.invalidation_generation()
     }
 
     pub fn set_package_library(&mut self, library: Arc<PackageLibrary>, ready: bool) {
         self.package_library = library;
         self.package_library_ready = ready;
-        self.bump_standalone_scope_package_config_generation();
+        self.bump_standalone_scope_invalidation_generation();
     }
 
     /// Create a content provider for this state

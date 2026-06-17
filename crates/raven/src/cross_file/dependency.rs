@@ -709,18 +709,16 @@ impl DependencyGraph {
         // and source positioning, so a metadata-only change (e.g. moving
         // the source() call to a different line) must invalidate the cache
         // even when the target URI set is unchanged. `edges_changed` and
-        // `edge_revision` then both track full-edge equality.
-        let old_forward: HashSet<DependencyEdge> = self
-            .forward
-            .get(uri)
-            .map(|edges| edges.iter().cloned().collect())
-            .unwrap_or_default();
+        // `edge_revision` then both track full-edge equality. Order matters
+        // too: parent-prefix resolution observes backward vector order when
+        // merging same-named parent symbols.
+        let old_forward: Vec<DependencyEdge> = self.forward.get(uri).cloned().unwrap_or_default();
         // Snapshot backward edges (incoming `is_backward_directive` edges)
         // before removal: a `# raven: sourced-by` directive change rewires the
         // backward map for `uri` and the forward map for each parent, but
         // leaves `forward[uri]` (this file's outgoing edges) untouched.
-        // Same full-edge equality applies here.
-        let old_backward: HashSet<DependencyEdge> = self
+        // Same full-edge ordered equality applies here.
+        let old_backward: Vec<DependencyEdge> = self
             .backward
             .get(uri)
             .map(|edges| {
@@ -728,7 +726,7 @@ impl DependencyGraph {
                     .iter()
                     .filter(|e| e.is_backward_directive)
                     .cloned()
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
@@ -954,15 +952,11 @@ impl DependencyGraph {
         // `forward[uri]`, but they DO change the dependency graph that
         // `collect_neighborhood` and `detect_cycle` traverse — so the caches
         // keyed on `edge_revision` must be invalidated for those too. We
-        // compare full DependencyEdge values (not just URIs), so a
-        // metadata-only change (e.g. moved call site) also bumps the
-        // revision and refreshes diagnostic positioning.
-        let new_forward: HashSet<DependencyEdge> = self
-            .forward
-            .get(uri)
-            .map(|edges| edges.iter().cloned().collect())
-            .unwrap_or_default();
-        let new_backward: HashSet<DependencyEdge> = self
+        // compare ordered full DependencyEdge values (not just URIs), so a
+        // metadata-only change (e.g. moved call site) or order-only change also
+        // bumps the revision and refreshes diagnostic positioning/precedence.
+        let new_forward: Vec<DependencyEdge> = self.forward.get(uri).cloned().unwrap_or_default();
+        let new_backward: Vec<DependencyEdge> = self
             .backward
             .get(uri)
             .map(|edges| {
@@ -970,7 +964,7 @@ impl DependencyGraph {
                     .iter()
                     .filter(|e| e.is_backward_directive)
                     .cloned()
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         result.edges_changed = old_forward != new_forward || old_backward != new_backward;
@@ -1677,8 +1671,21 @@ impl DependencyGraph {
     /// `memo_equiv_*` suite pins the symbol-equivalence guarantee, including the
     /// gate-admitted-with-truncation case (`memo_equiv_gate_admitted_with_truncation`).
     pub fn prefix_memo_share_safe(&self, from: &Url, max_depth: usize, budget: usize) -> bool {
+        self.prefix_memo_share_safe_with_cancel(from, max_depth, budget, &|| false)
+    }
+
+    /// Cancellation-aware variant of [`Self::prefix_memo_share_safe`].
+    /// Cancellation conservatively disables sharing, preserving correctness
+    /// while letting superseded diagnostic passes stop before a full probe.
+    pub fn prefix_memo_share_safe_with_cancel(
+        &self,
+        from: &Url,
+        max_depth: usize,
+        budget: usize,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> bool {
         // Need at least one hop of headroom below the truncation limit.
-        if max_depth < 2 {
+        if max_depth < 2 || is_cancelled() {
             return false;
         }
         let depth_cap = max_depth - 1;
@@ -1689,6 +1696,9 @@ impl DependencyGraph {
         let mut steps = 0usize;
         while let Some((cur, depth)) = queue.pop_front() {
             steps += 1;
+            if steps & 255 == 0 && is_cancelled() {
+                return false;
+            }
             if steps > budget {
                 return false; // conservative: cannot verify the whole neighborhood
             }
@@ -2098,6 +2108,21 @@ mod tests {
             |_| None,
         );
         assert!(!graph.prefix_memo_share_safe(&url("A.R"), 64, 0));
+    }
+
+    /// Issue #483: a superseded diagnostic pass must not spend the full prefix
+    /// memo-share probe after cancellation; cancellation conservatively gates
+    /// sharing off.
+    #[test]
+    fn prefix_memo_share_safe_cancellation_is_false() {
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &make_meta_with_source("B.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(!graph.prefix_memo_share_safe_with_cancel(&url("A.R"), 64, 200_000, &|| true,));
     }
 
     /// Issue #479: the truncation gate deliberately does NOT consider
@@ -2739,6 +2764,58 @@ mod tests {
             graph.subgraph_cache_hits(),
             hits_before,
             "backward-edge change must invalidate subgraph cache"
+        );
+    }
+
+    #[test]
+    fn test_edge_revision_bumps_on_backward_edge_reorder() {
+        // Parent-prefix merging is order-sensitive for same-named symbols, so
+        // a pure reorder of backward directives must invalidate graph-keyed
+        // caches even when the DependencyEdge set is unchanged.
+        let mut graph = DependencyGraph::new();
+        let child = Url::parse("file:///project/child.R").unwrap();
+
+        let child_meta_ab = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: "a.R".to_string(),
+                    call_site: CallSiteSpec::Line(1),
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: "b.R".to_string(),
+                    call_site: CallSiteSpec::Line(1),
+                    directive_line: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&child, &child_meta_ab, Some(&workspace_root()), |_| None);
+        let revision_before = graph.edge_revision();
+
+        let child_meta_ba = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: "b.R".to_string(),
+                    call_site: CallSiteSpec::Line(1),
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: "a.R".to_string(),
+                    call_site: CallSiteSpec::Line(1),
+                    directive_line: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let result = graph.update_file(&child, &child_meta_ba, Some(&workspace_root()), |_| None);
+        assert!(
+            result.edges_changed,
+            "reordering same-edge backward directives must mark edges_changed"
+        );
+        assert!(
+            graph.edge_revision() > revision_before,
+            "order-only edge changes must bump edge_revision"
         );
     }
 

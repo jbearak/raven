@@ -88,6 +88,126 @@ pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
     EMPTY.get_or_init(|| Arc::new(HashSet::new()))
 }
 
+fn precollect_scope_snapshot_uri(
+    content_provider: &impl ContentProvider,
+    uri: &Url,
+    artifacts_map: &mut HashMap<Url, Arc<scope::ScopeArtifacts>>,
+    metadata_map: &mut HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+    if let Some(artifacts) = content_provider.get_artifacts(uri) {
+        artifacts_map.insert(uri.clone(), artifacts);
+    }
+    let metadata = content_provider.get_metadata(uri);
+    if let Some(metadata) = metadata.as_ref() {
+        metadata_map.insert(uri.clone(), metadata.clone());
+    }
+    metadata
+}
+
+fn precollect_open_text_for_scope_snapshot(
+    state: &WorldState,
+    uri: &Url,
+    text_tree_map: &mut HashMap<Url, (String, tree_sitter::Tree)>,
+    raw_text_map: &mut HashMap<Url, String>,
+) {
+    if let Some(doc) = state.document_store.get_without_touch(uri) {
+        raw_text_map.insert(uri.clone(), doc.contents.to_string());
+        if let Some(tree) = doc.tree.as_ref() {
+            text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
+        }
+    } else if let Some(doc) = state.documents.get(uri) {
+        raw_text_map.insert(uri.clone(), doc.text());
+        if let Some(tree) = doc.tree.as_ref() {
+            text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
+        }
+    } else {
+        #[cfg(test)]
+        if let Some(entry) = state.workspace_index_new.get(uri) {
+            let raw = entry.contents.to_string();
+            raw_text_map.insert(uri.clone(), raw.clone());
+            if let Some(tree) = entry.tree.as_ref() {
+                let analysis =
+                    crate::cross_file::analysis_text_for_path(uri.path(), &raw).into_owned();
+                text_tree_map.insert(uri.clone(), (analysis, tree.clone()));
+            }
+        } else if let Some(doc) = state.workspace_index.get(uri) {
+            raw_text_map.insert(uri.clone(), doc.text());
+            if let Some(tree) = doc.tree.as_ref() {
+                text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
+            }
+        }
+    }
+}
+
+struct ActiveStandaloneSnapshotInputs<'a> {
+    graph: &'a crate::cross_file::dependency::DependencyGraph,
+    max_depth: usize,
+    max_visited: usize,
+    workspace_root: Option<&'a Url>,
+    seed_uris: &'a [Url],
+    is_cancelled: &'a dyn Fn() -> bool,
+}
+
+fn active_standalone_snapshot_members(
+    content_provider: &impl ContentProvider,
+    inputs: ActiveStandaloneSnapshotInputs<'_>,
+    snapshot_uris: &mut HashSet<Url>,
+) -> Vec<Url> {
+    let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+    let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+    let mut extra_uris = Vec::new();
+    let mut active_seen = HashSet::new();
+    let mut remaining_extra = inputs.max_visited.saturating_sub(snapshot_uris.len());
+    if remaining_extra == 0 || (inputs.is_cancelled)() {
+        return extra_uris;
+    }
+
+    for seed_uri in inputs.seed_uris {
+        if active_seen.len() >= inputs.max_visited
+            || remaining_extra == 0
+            || (inputs.is_cancelled)()
+        {
+            break;
+        }
+        if active_seen.contains(seed_uri) {
+            continue;
+        }
+        if !get_metadata(seed_uri).is_some_and(|metadata| metadata.standalone) {
+            continue;
+        }
+        let walk_budget = remaining_extra
+            .saturating_add(1)
+            .min(inputs.max_visited.saturating_sub(active_seen.len()));
+        if walk_budget == 0 {
+            break;
+        }
+        let closure_inputs = scope::StandaloneActiveClosureSnapshotInputs {
+            graph: inputs.graph,
+            max_depth: inputs.max_depth,
+            max_visited: walk_budget,
+            workspace_root: inputs.workspace_root,
+            is_cancelled: inputs.is_cancelled,
+        };
+        for member in scope::standalone_active_closure_members_for_snapshot(
+            seed_uri,
+            &closure_inputs,
+            &get_artifacts,
+            &get_metadata,
+        ) {
+            active_seen.insert(member.clone());
+            if snapshot_uris.insert(member.clone()) {
+                extra_uris.push(member);
+                remaining_extra -= 1;
+                if remaining_extra == 0 {
+                    return extra_uris;
+                }
+            }
+        }
+    }
+
+    extra_uris
+}
+
 /// A snapshot of all state needed for diagnostic computation.
 ///
 /// Built under the read lock, then used to compute diagnostics
@@ -115,33 +235,31 @@ pub(crate) struct DiagnosticsSnapshot {
     /// The trimmed graph resets its internal revision to zero, so persistent
     /// standalone scope cache keys use this full-graph value instead.
     pub cross_file_edge_revision: u64,
-    pub standalone_scope_package_config_generation: u64,
+    pub standalone_scope_invalidation_generation: u64,
     pub workspace_folders: Vec<Url>,
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
+    pub package_facts: Option<crate::package_library::PackageFactSnapshot>,
     pub workspace_scan_complete: bool,
 
     /// Short-circuit signal for cross-file NSE/func collection: `true` iff some
     /// metadata entry this query could read — this file's own `directive_meta`
-    /// OR any neighbor in `metadata_map` — carries a `# raven: nse` /
-    /// `# raven: func` directive. Computed during the (already O(neighborhood))
-    /// `metadata_map` assembly in [`DiagnosticsSnapshot::build`], so it adds no
-    /// new asymptotic cost.
+    /// OR any precollected metadata entry — carries a `# raven: nse` /
+    /// `# raven: func` directive. Computed during the snapshot `metadata_map`
+    /// assembly in [`DiagnosticsSnapshot::build`].
     ///
     /// When `false`, [`collect_cross_file_nse`] returns empty WITHOUT the two
     /// graph traversals, neighborhood sort/dedup, and per-member metadata scans.
     /// Soundness: that collector reads ONLY members of the revalidation-
     /// consistent set `S(uri)`, every one of which is a neighbor present in
     /// `metadata_map` (the set is computed over the trimmed neighborhood
-    /// subgraph). So if no entry in `metadata_map` is directive-bearing, the
-    /// collected result is necessarily `{ nse: [], funcs: [] }` — this signal is
-    /// read from the exact same data, via the exact same content provider, that
-    /// the collector would consult. (The OR with Q's own `directive_meta` is a
-    /// conservative over-count, not a correctness requirement: the collector
+    /// subgraph). Active standalone-closure extras can also be present, but only
+    /// as a conservative over-count: they may turn the signal on and force the
+    /// collection walk, never make us skip a real foreign directive. (The OR with
+    /// Q's own `directive_meta` is the same kind of over-count: the collector
     /// excludes Q itself and Q's own directives flow through the local NSE path,
     /// and chunk enrichment only touches suppressions — never `nse`/`func`
-    /// declarations — so this term can only make the signal *more* true, never
-    /// wrongly skip.)
+    /// declarations.)
     pub any_nse_or_func_directives: bool,
 
     // Pre-collected scope data for all reachable files
@@ -159,7 +277,7 @@ pub(crate) struct DiagnosticsSnapshot {
 
     // Package library (Arc, cheap clone)
     pub package_library: std::sync::Arc<crate::package_library::PackageLibrary>,
-    pub standalone_scope_cache: std::sync::Arc<scope::StandaloneScopeCache>,
+    pub(crate) standalone_scope_cache: std::sync::Arc<scope::StandaloneScopeCache>,
 
     // File type (from document, not URI — needed for untitled JAGS/Stan buffers)
     pub file_type: FileType,
@@ -191,10 +309,222 @@ pub(crate) struct DiagnosticsSnapshot {
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
+#[derive(Clone)]
+pub(crate) struct CrossFileScopeSnapshot {
+    pub(crate) cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
+    pub(crate) cross_file_edge_revision: u64,
+    pub(crate) standalone_scope_invalidation_generation: u64,
+    pub(crate) standalone_scope_cache: Arc<scope::StandaloneScopeCache>,
+    pub(crate) workspace_folders: Vec<Url>,
+    pub(crate) cross_file_config: crate::cross_file::config::CrossFileConfig,
+    pub(crate) base_exports: Arc<HashSet<String>>,
+    pub(crate) package_library: Arc<crate::package_library::PackageLibrary>,
+    pub(crate) package_library_ready: bool,
+    pub(crate) package_facts: Option<crate::package_library::PackageFactSnapshot>,
+    pub(crate) help_cache: crate::help::HelpCache,
+    pub(crate) signature_cache: Arc<crate::parameter_resolver::SignatureCache>,
+    pub(crate) artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
+    pub(crate) metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    pub(crate) text_tree_map: HashMap<Url, (String, tree_sitter::Tree)>,
+    pub(crate) raw_text_map: HashMap<Url, String>,
+    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+}
+
+impl CrossFileScopeSnapshot {
+    /// Build a bounded cross-file snapshot for one scope-bearing interactive
+    /// request. Call this under the `WorldState` read lock, then drop the guard
+    /// before invoking [`Self::scope_at`] or snapshot-backed parameter/signature
+    /// resolution. Persistent standalone-scope cache misses can recursively
+    /// resolve a callee closure, so they must not run while `did_change` writers
+    /// are blocked behind the read lock.
+    pub(crate) fn build(state: &WorldState, uri: &Url) -> Self {
+        Self::build_with_cancel(state, uri, &|| false)
+    }
+
+    pub(crate) fn build_with_cancel(
+        state: &WorldState,
+        uri: &Url,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Self {
+        let max_depth = state.cross_file_config.max_chain_depth;
+        let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+        let payload =
+            state
+                .cross_file_graph
+                .cached_neighborhood_subgraph(uri, max_depth, max_visited);
+        let content_provider = state.content_provider();
+        let mut artifacts_map = HashMap::new();
+        let mut metadata_map = HashMap::new();
+        let mut text_tree_map = HashMap::new();
+        let mut raw_text_map = HashMap::new();
+
+        let mut seed_uris: Vec<Url> = payload.neighborhood.iter().cloned().collect();
+        seed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut snapshot_uris: HashSet<Url> = seed_uris.iter().cloned().collect();
+        for neighbor_uri in &seed_uris {
+            precollect_scope_snapshot_uri(
+                &content_provider,
+                neighbor_uri,
+                &mut artifacts_map,
+                &mut metadata_map,
+            );
+            precollect_open_text_for_scope_snapshot(
+                state,
+                neighbor_uri,
+                &mut text_tree_map,
+                &mut raw_text_map,
+            );
+        }
+        let active_extra_uris = active_standalone_snapshot_members(
+            &content_provider,
+            ActiveStandaloneSnapshotInputs {
+                graph: payload.subgraph.as_ref(),
+                max_depth,
+                max_visited,
+                workspace_root: state.workspace_folders.first(),
+                seed_uris: &seed_uris,
+                is_cancelled,
+            },
+            &mut snapshot_uris,
+        );
+        for extra_uri in &active_extra_uris {
+            precollect_scope_snapshot_uri(
+                &content_provider,
+                extra_uri,
+                &mut artifacts_map,
+                &mut metadata_map,
+            );
+            precollect_open_text_for_scope_snapshot(
+                state,
+                extra_uri,
+                &mut text_tree_map,
+                &mut raw_text_map,
+            );
+        }
+
+        Self {
+            cross_file_graph: payload.subgraph.clone(),
+            cross_file_edge_revision: state.cross_file_graph.edge_revision(),
+            standalone_scope_invalidation_generation: state
+                .standalone_scope_invalidation_generation(),
+            standalone_scope_cache: state.standalone_scope_cache.clone(),
+            workspace_folders: state.workspace_folders.clone(),
+            cross_file_config: state.cross_file_config.clone(),
+            base_exports: cross_file_base_exports(state),
+            package_library: state.package_library.clone(),
+            package_library_ready: state.package_library_ready,
+            package_facts: (state.cross_file_config.packages_enabled
+                && state.package_library_ready)
+                .then(|| state.package_library.package_fact_snapshot()),
+            help_cache: state.help_cache.clone(),
+            signature_cache: state.signature_cache.clone(),
+            artifacts_map,
+            metadata_map,
+            text_tree_map,
+            raw_text_map,
+            scope_contribution: state.package_state.scope_contribution().clone(),
+        }
+    }
+
+    pub(crate) fn get_artifacts(&self, uri: &Url) -> Option<Arc<scope::ScopeArtifacts>> {
+        self.artifacts_map.get(uri).cloned()
+    }
+
+    pub(crate) fn get_metadata(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        self.metadata_map.get(uri).cloned()
+    }
+
+    pub(crate) fn get_text_and_tree(&self, uri: &Url) -> Option<(String, tree_sitter::Tree)> {
+        if let Some(text_tree) = self.text_tree_map.get(uri) {
+            return Some(text_tree.clone());
+        }
+
+        let raw_text = self.get_raw_text(uri)?;
+        let analysis_text =
+            crate::cross_file::analysis_text_for_path(uri.path(), &raw_text).into_owned();
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None))?;
+        Some((analysis_text, tree))
+    }
+
+    pub(crate) fn get_raw_text(&self, uri: &Url) -> Option<String> {
+        self.raw_text_map.get(uri).cloned().or_else(|| {
+            uri.to_file_path()
+                .ok()
+                .and_then(|path| crate::state::read_source(&path).ok())
+        })
+    }
+
+    pub(crate) fn scope_at(
+        &self,
+        uri: &Url,
+        line: u32,
+        column: u32,
+        cancel: &DiagCancelToken,
+        prefix_cache: &mut scope::ParentPrefixCache,
+    ) -> scope::ScopeAtPosition {
+        let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
+            self.get_artifacts(target_uri)
+        };
+        let get_metadata = |target_uri: &Url| -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+            self.get_metadata(target_uri)
+        };
+        let is_cancelled = || cancel.is_cancelled();
+
+        let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+            self.package_facts
+                .as_ref()
+                .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
+        };
+        let data_provider = self.package_facts.as_ref().map(|facts| {
+            scope::DataAliasProvider::with_cache_epoch(
+                &data_lookup,
+                self.package_library.base_packages(),
+                facts.cache_epoch(),
+            )
+        });
+
+        let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
+            &self.standalone_scope_cache,
+            self.cross_file_edge_revision,
+            self.standalone_scope_invalidation_generation,
+        );
+
+        scope::scope_at_position_with_graph_cached_with_standalone_cache(
+            uri,
+            line,
+            column,
+            &get_artifacts,
+            &get_metadata,
+            &self.cross_file_graph,
+            self.workspace_folders.first(),
+            self.cross_file_config.max_chain_depth,
+            &self.base_exports,
+            self.cross_file_config.hoist_globals_in_functions,
+            self.cross_file_config.backward_dependencies,
+            &is_cancelled,
+            prefix_cache,
+            Some(&self.scope_contribution),
+            data_provider.as_ref(),
+            Some(standalone_cache_context),
+        )
+    }
+}
+
 impl DiagnosticsSnapshot {
     /// Build a snapshot from WorldState under the read lock.
     pub fn build(state: &WorldState, uri: &Url) -> Option<Self> {
-        Self::build_with_open_documents(state, uri, &state.documents)
+        Self::build_with_cancel(state, uri, &|| false)
+    }
+
+    pub fn build_with_cancel(
+        state: &WorldState,
+        uri: &Url,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Option<Self> {
+        Self::build_with_open_documents_and_cancel(state, uri, &state.documents, is_cancelled)
     }
 
     /// Like [`Self::build`] but with an explicit open-documents map instead of
@@ -211,6 +541,15 @@ impl DiagnosticsSnapshot {
         state: &WorldState,
         uri: &Url,
         open_documents: &HashMap<Url, crate::state::Document>,
+    ) -> Option<Self> {
+        Self::build_with_open_documents_and_cancel(state, uri, open_documents, &|| false)
+    }
+
+    pub fn build_with_open_documents_and_cancel(
+        state: &WorldState,
+        uri: &Url,
+        open_documents: &HashMap<Url, crate::state::Document>,
+        is_cancelled: &impl Fn() -> bool,
     ) -> Option<Self> {
         let build_start = std::time::Instant::now();
         let doc = open_documents.get(uri)?;
@@ -287,23 +626,45 @@ impl DiagnosticsSnapshot {
         let mut metadata_map = HashMap::new();
         // Short-circuit signal for `collect_cross_file_nse`: does ANY metadata
         // entry the collector could read carry a `# raven: nse` / `# raven: func`
-        // directive? `collect_cross_file_nse` reads only members of the
-        // revalidation-consistent set, every one of which is in this
-        // `metadata_map` (the set is computed over the trimmed neighborhood
-        // subgraph, so all members are neighbors). So scanning these entries —
-        // the exact data the collector consults, via the same content provider —
-        // is a sound and tight signal: when none is directive-bearing, the
-        // collected result is provably `{ nse: [], funcs: [] }` for this query.
-        // Computed in this already-O(neighborhood) loop, so it adds no new
-        // asymptotic cost (just a `bool` OR per entry already being inserted).
+        // directive? `collect_cross_file_nse` reads members of the
+        // revalidation-consistent set, all of which are in the trimmed
+        // neighborhood and therefore in this `metadata_map`. Active standalone
+        // closure extras may also be inserted below; those are a conservative
+        // over-count for this signal, never a false skip.
         let mut any_nse_or_func_directives = directive_meta.has_nse_or_func_directives();
-        for neighbor_uri in &payload.neighborhood {
-            if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
-                artifacts_map.insert(neighbor_uri.clone(), artifacts);
-            }
-            if let Some(metadata) = content_provider.get_metadata(neighbor_uri) {
+        let mut seed_uris: Vec<Url> = payload.neighborhood.iter().cloned().collect();
+        seed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut snapshot_uris: HashSet<Url> = seed_uris.iter().cloned().collect();
+        for neighbor_uri in &seed_uris {
+            if let Some(metadata) = precollect_scope_snapshot_uri(
+                &content_provider,
+                neighbor_uri,
+                &mut artifacts_map,
+                &mut metadata_map,
+            ) {
                 any_nse_or_func_directives |= metadata.has_nse_or_func_directives();
-                metadata_map.insert(neighbor_uri.clone(), metadata);
+            }
+        }
+        let active_extra_uris = active_standalone_snapshot_members(
+            &content_provider,
+            ActiveStandaloneSnapshotInputs {
+                graph: payload.subgraph.as_ref(),
+                max_depth,
+                max_visited,
+                workspace_root: state.workspace_folders.first(),
+                seed_uris: &seed_uris,
+                is_cancelled,
+            },
+            &mut snapshot_uris,
+        );
+        for extra_uri in &active_extra_uris {
+            if let Some(metadata) = precollect_scope_snapshot_uri(
+                &content_provider,
+                extra_uri,
+                &mut artifacts_map,
+                &mut metadata_map,
+            ) {
+                any_nse_or_func_directives |= metadata.has_nse_or_func_directives();
             }
         }
         let precollect_elapsed = precollect_start.elapsed();
@@ -340,8 +701,8 @@ impl DiagnosticsSnapshot {
         let subgraph_elapsed = subgraph_start.elapsed();
         let cross_file_edge_revision = state.cross_file_graph.edge_revision();
         let standalone_scope_cache = state.standalone_scope_cache.clone();
-        let standalone_scope_package_config_generation =
-            state.standalone_scope_package_config_generation();
+        let standalone_scope_invalidation_generation =
+            state.standalone_scope_invalidation_generation();
 
         let total_elapsed = build_start.elapsed();
         log::trace!(
@@ -411,10 +772,13 @@ impl DiagnosticsSnapshot {
             lint_config,
             cross_file_graph: trimmed_graph,
             cross_file_edge_revision,
-            standalone_scope_package_config_generation,
+            standalone_scope_invalidation_generation,
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
             package_library_ready: state.package_library_ready,
+            package_facts: (state.cross_file_config.packages_enabled
+                && state.package_library_ready)
+                .then(|| state.package_library.package_fact_snapshot()),
             workspace_scan_complete: state.workspace_scan_complete,
             any_nse_or_func_directives,
             artifacts_map,
@@ -467,19 +831,23 @@ impl DiagnosticsSnapshot {
         // undefined. Disabled until the package library is ready (and packages
         // are enabled) so we never expand against an empty cache.
         let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-            self.package_library.data_objects_for_stem_sync(pkg, stem)
+            self.package_facts
+                .as_ref()
+                .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
         };
-        let data_provider = (self.cross_file_config.packages_enabled && self.package_library_ready)
-            .then(|| scope::DataAliasProvider {
-                lookup: &data_lookup,
-                base_packages: self.package_library.base_packages(),
-            });
+        let data_provider = self.package_facts.as_ref().map(|facts| {
+            scope::DataAliasProvider::with_cache_epoch(
+                &data_lookup,
+                self.package_library.base_packages(),
+                facts.cache_epoch(),
+            )
+        });
 
         let mut cache = self.parent_prefix_cache.borrow_mut();
         let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
             &self.standalone_scope_cache,
             self.cross_file_edge_revision,
-            self.standalone_scope_package_config_generation,
+            self.standalone_scope_invalidation_generation,
         );
         scope::scope_at_position_with_graph_cached_with_standalone_cache(
             uri,
@@ -3447,12 +3815,12 @@ fn get_cross_file_symbols(
 /// discipline in cross-file work".
 ///
 /// **Interactive request handlers** — `goto_definition`, `hover`,
-/// `completion`, `signature_help` — generally resolve a single position per
-/// request and may hold the guard for the call's duration. Interactive paths
-/// that resolve many related positions under one request (for example
+/// `completion`, `signature_help` — should clone the required scope inputs into
+/// a `CrossFileScopeSnapshot` before scope resolution. Interactive paths that
+/// resolve many related positions under one request (for example
 /// `qualified_resolve::resolve_qualified_member` candidate validation) should
-/// use `get_cross_file_scope_with_cache` with a request-local
-/// `ParentPrefixCache` so repeated parent walks are shared.
+/// pass a request-local `ParentPrefixCache` through snapshot lookups so repeated
+/// parent walks are shared.
 ///
 /// # Returns
 ///
@@ -3484,14 +3852,20 @@ pub(crate) fn get_cross_file_scope(
     let is_cancelled = || cancel.is_cancelled();
 
     // `data()` alias expansion provider (issue #429); see `get_scope`.
+    let package_facts = (state.cross_file_config.packages_enabled && state.package_library_ready)
+        .then(|| state.package_library.package_fact_snapshot());
     let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-        state.package_library.data_objects_for_stem_sync(pkg, stem)
+        package_facts
+            .as_ref()
+            .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
     };
-    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: state.package_library.base_packages(),
-        });
+    let data_provider = package_facts.as_ref().map(|facts| {
+        scope::DataAliasProvider::with_cache_epoch(
+            &data_lookup,
+            state.package_library.base_packages(),
+            facts.cache_epoch(),
+        )
+    });
 
     scope::scope_at_position_with_graph(
         uri,
@@ -3508,79 +3882,6 @@ pub(crate) fn get_cross_file_scope(
         &is_cancelled,
         package_contribution,
         data_provider.as_ref(),
-    )
-}
-
-/// Cached counterpart of `get_cross_file_scope` for request-local batches.
-///
-/// Use this when one interactive request needs to resolve multiple related
-/// positions while holding the same `WorldState` read guard. The caller owns
-/// the `ParentPrefixCache`; do not share it across independent requests or
-/// state snapshots.
-///
-/// Note: this entry point's parent-prefix seeding (`(u32::MAX, u32::MAX)`)
-/// is a slightly wider over-approximation than `get_cross_file_scope`'s
-/// for cyclic dependency graphs. Single-position callers that want the
-/// non-cached behavior must continue to use `get_cross_file_scope`.
-pub(crate) fn get_cross_file_scope_with_cache(
-    state: &WorldState,
-    uri: &Url,
-    line: u32,
-    column: u32,
-    cancel: &DiagCancelToken,
-    prefix_cache: &mut scope::ParentPrefixCache,
-    // Package-mode contribution: production LSP/diagnostics paths now pass
-    // `Some(state.package_state.scope_contribution())` (see
-    // `DiagnosticsSnapshot::scope_contribution` and call sites) so package-
-    // internal and imported symbols are injected into the resolved scope.
-    // `None` is an explicit opt-out used by tests and non-package-mode
-    // contexts; it is no longer a "wire it up later" placeholder.
-    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
-) -> scope::ScopeAtPosition {
-    let content_provider = state.content_provider();
-    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-        content_provider.get_artifacts(target_uri)
-    };
-    let get_metadata =
-        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-            content_provider.get_metadata(target_uri)
-        };
-    let base_exports = cross_file_base_exports(state);
-    let is_cancelled = || cancel.is_cancelled();
-
-    // `data()` alias expansion provider (issue #429); see `get_scope`.
-    let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-        state.package_library.data_objects_for_stem_sync(pkg, stem)
-    };
-    let data_provider = (state.cross_file_config.packages_enabled && state.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: state.package_library.base_packages(),
-        });
-
-    let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
-        &state.standalone_scope_cache,
-        state.cross_file_graph.edge_revision(),
-        state.standalone_scope_package_config_generation(),
-    );
-
-    scope::scope_at_position_with_graph_cached_with_standalone_cache(
-        uri,
-        line,
-        column,
-        &get_artifacts,
-        &get_metadata,
-        &state.cross_file_graph,
-        state.workspace_folders.first(),
-        state.cross_file_config.max_chain_depth,
-        &base_exports,
-        state.cross_file_config.hoist_globals_in_functions,
-        state.cross_file_config.backward_dependencies,
-        &is_cancelled,
-        prefix_cache,
-        package_contribution,
-        data_provider.as_ref(),
-        Some(standalone_cache_context),
     )
 }
 
@@ -5365,20 +5666,22 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     // `data()` alias expansion provider (issue #429); see `get_scope`.
     let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
         snapshot
-            .package_library
-            .data_objects_for_stem_sync(pkg, stem)
+            .package_facts
+            .as_ref()
+            .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
     };
-    let data_provider = (snapshot.cross_file_config.packages_enabled
-        && snapshot.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: snapshot.package_library.base_packages(),
-        });
+    let data_provider = snapshot.package_facts.as_ref().map(|facts| {
+        scope::DataAliasProvider::with_cache_epoch(
+            &data_lookup,
+            snapshot.package_library.base_packages(),
+            facts.cache_epoch(),
+        )
+    });
 
     let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
         &snapshot.standalone_scope_cache,
         snapshot.cross_file_edge_revision,
-        snapshot.standalone_scope_package_config_generation,
+        snapshot.standalone_scope_invalidation_generation,
     );
     let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
@@ -6198,20 +6501,22 @@ fn collect_undefined_variables_from_snapshot(
     // `data()` alias expansion provider (issue #429); see `get_scope`.
     let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
         snapshot
-            .package_library
-            .data_objects_for_stem_sync(pkg, stem)
+            .package_facts
+            .as_ref()
+            .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
     };
-    let data_provider = (snapshot.cross_file_config.packages_enabled
-        && snapshot.package_library_ready)
-        .then(|| scope::DataAliasProvider {
-            lookup: &data_lookup,
-            base_packages: snapshot.package_library.base_packages(),
-        });
+    let data_provider = snapshot.package_facts.as_ref().map(|facts| {
+        scope::DataAliasProvider::with_cache_epoch(
+            &data_lookup,
+            snapshot.package_library.base_packages(),
+            facts.cache_epoch(),
+        )
+    });
 
     let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
         &snapshot.standalone_scope_cache,
         snapshot.cross_file_edge_revision,
-        snapshot.standalone_scope_package_config_generation,
+        snapshot.standalone_scope_invalidation_generation,
     );
     let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
@@ -17330,7 +17635,7 @@ fn ts_point_to_lsp_position(text: &str, point: Point) -> Position {
 }
 
 #[derive(Debug, Clone)]
-struct DollarMemberCompletionContext {
+pub(crate) struct DollarMemberCompletionContext {
     /// Container the member is completed against (`alpha$beta` in
     /// `alpha$beta$gam|`), built from the AST so `$`/`@`/`[["lit"]]` segments
     /// all work and an intermediate segment is never treated as a free variable.
@@ -17338,6 +17643,21 @@ struct DollarMemberCompletionContext {
     op: crate::extract_op::ExtractOp,
     typed_prefix: String,
     replace_range: Range,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedQualifiedMemberHover {
+    pub(crate) name: String,
+    pub(crate) node_range: Range,
+    pub(crate) path: crate::qualified_resolve::QualifiedPath,
+    pub(crate) op: crate::extract_op::ExtractOp,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedQualifiedMemberGoto {
+    pub(crate) rhs_name: String,
+    pub(crate) path: crate::qualified_resolve::QualifiedPath,
+    pub(crate) op: crate::extract_op::ExtractOp,
 }
 
 fn detect_dollar_member_completion_context(
@@ -17495,13 +17815,24 @@ fn dollar_member_completion_items(
     position: Position,
     context: &DollarMemberCompletionContext,
 ) -> Vec<CompletionItem> {
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    dollar_member_completion_items_from_snapshot(&snapshot, uri, position, context)
+}
+
+pub(crate) fn dollar_member_completion_items_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    context: &DollarMemberCompletionContext,
+) -> Vec<CompletionItem> {
     let rendered_path = render_qualified_path(&context.path);
-    crate::qualified_resolve::complete_qualified_members(
-        state,
+    crate::qualified_resolve::complete_qualified_members_with_snapshot(
+        snapshot,
         uri,
         position,
         &context.path,
         context.op,
+        &DiagCancelToken::never(),
     )
     .into_iter()
     .filter(|candidate| {
@@ -17517,7 +17848,7 @@ fn dollar_member_completion_items(
             format!("member of {}", rendered_path)
         } else {
             let relative_path =
-                compute_relative_path(&candidate.uri, state.workspace_folders.first());
+                compute_relative_path(&candidate.uri, snapshot.workspace_folders.first());
             format!("member of {} from {}", rendered_path, relative_path)
         };
         CompletionItem {
@@ -17536,8 +17867,99 @@ fn dollar_member_completion_items(
     .collect()
 }
 
-fn push_scoped_symbol_completion(
+pub(crate) fn prepare_dollar_member_completion(
     state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<DollarMemberCompletionContext> {
+    let doc = state.get_document(uri)?;
+    if doc.is_rmd_document() && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+    {
+        return None;
+    }
+    if doc.file_type != FileType::R {
+        return None;
+    }
+    let text = doc.analysis_text();
+    let tree = doc.tree.as_ref()?;
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        return None;
+    }
+    detect_dollar_member_completion_context(tree, &text, position)
+}
+
+fn qualified_member_at_position(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<(
+    String,
+    Range,
+    crate::qualified_resolve::QualifiedPath,
+    crate::extract_op::ExtractOp,
+)> {
+    let doc = state
+        .get_document(uri)
+        .or_else(|| state.workspace_index.get(uri))?;
+    if doc.file_type != FileType::R {
+        return None;
+    }
+    let tree = doc.tree.as_ref()?;
+    let text = doc.analysis_text();
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        return None;
+    }
+
+    let point = lsp_position_to_ts_point(&text, position);
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    if node.kind() != "identifier" {
+        return None;
+    }
+    let (lhs_node, op) = crate::extract_op::extract_operator_rhs(node)?;
+    let path = crate::qualified_resolve::build_qualified_path(lhs_node, &text)?;
+    let rhs_name = node_text(node, &text).to_string();
+    let node_range = Range {
+        start: ts_point_to_lsp_position(&text, node.start_position()),
+        end: ts_point_to_lsp_position(&text, node.end_position()),
+    };
+    Some((rhs_name, node_range, path, op))
+}
+
+pub(crate) fn prepare_qualified_member_hover(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<PreparedQualifiedMemberHover> {
+    let (name, node_range, path, op) = qualified_member_at_position(state, uri, position)?;
+    Some(PreparedQualifiedMemberHover {
+        name,
+        node_range,
+        path,
+        op,
+    })
+}
+
+pub(crate) fn prepare_qualified_member_goto(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<PreparedQualifiedMemberGoto> {
+    let (rhs_name, _node_range, path, op) = qualified_member_at_position(state, uri, position)?;
+    Some(PreparedQualifiedMemberGoto { rhs_name, path, op })
+}
+
+fn push_scoped_symbol_completion(
+    workspace_root: Option<&Url>,
     request_uri: &Url,
     name: &str,
     symbol: &ScopedSymbol,
@@ -17587,10 +18009,7 @@ fn push_scoped_symbol_completion(
 
     // Use signature if available, otherwise show source file for cross-file symbols.
     let relative_path = if is_cross_file && !is_package_internal {
-        Some(compute_relative_path(
-            &symbol.source_uri,
-            state.workspace_folders.first(),
-        ))
+        Some(compute_relative_path(&symbol.source_uri, workspace_root))
     } else {
         None
     };
@@ -17631,13 +18050,196 @@ fn push_scoped_symbol_completion(
     });
 }
 
-pub fn completion(
+#[allow(clippy::too_many_arguments)]
+fn completion_response_from_scope(
+    workspace_root: Option<&Url>,
+    package_library: &crate::package_library::PackageLibrary,
+    package_library_ready: bool,
+    packages_enabled: bool,
+    full_imports: &std::collections::BTreeSet<String>,
+    uri: &Url,
+    scope: scope::ScopeAtPosition,
+    mut parameter_items: Vec<CompletionItem>,
+) -> CompletionResponse {
+    let mut items = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    // Add R keywords (control flow and common functions)
+    let keywords = [
+        "if", "else", "repeat", "while", "function", "for", "in", "next", "break", "library",
+        "require", "return", "print",
+    ];
+
+    for kw in keywords {
+        items.push(CompletionItem {
+            label: kw.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
+            ..Default::default()
+        });
+        seen_names.insert(kw.to_string());
+    }
+
+    // Add R constants (distinct from keywords, aligned with R-LS)
+    for constant in R_CONSTANTS {
+        items.push(CompletionItem {
+            label: constant.to_string(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, constant)),
+            ..Default::default()
+        });
+        seen_names.insert(constant.to_string());
+    }
+
+    // Add visible same-file symbols first so local definitions take precedence
+    // over package exports without leaking future or out-of-scope assignments.
+    for (name, symbol) in scope
+        .symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.source_uri.as_str() == uri.as_str())
+    {
+        push_scoped_symbol_completion(
+            workspace_root,
+            uri,
+            name.as_ref(),
+            symbol,
+            &mut items,
+            &mut seen_names,
+        );
+    }
+
+    // Add package exports only if packages feature is enabled
+    if packages_enabled {
+        // Combine base packages, inherited, and loaded packages using a set for O(1) dedup
+        // Requirement 6.3: Base packages SHALL be available at all positions
+        let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut all_packages: Vec<String> = Vec::new();
+
+        // Base packages first (always available without library() calls)
+        if package_library_ready {
+            for pkg in package_library.base_packages() {
+                if pkg_set.insert(pkg.as_str()) {
+                    all_packages.push(pkg.clone());
+                }
+            }
+        }
+
+        // Then inherited and explicitly loaded packages
+        for pkg in scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+        {
+            if pkg_set.insert(pkg.as_str()) {
+                all_packages.push(pkg.clone());
+            }
+        }
+
+        // Also include NAMESPACE `import(pkg)` whole-package imports. Without
+        // this, the diagnostic pipeline (which already consults
+        // `scope_contribution.full_imports`, see
+        // `collect_undefined_variables_from_snapshot`) stays silent on
+        // references to those packages' exports while the completion list
+        // doesn't offer them — an asymmetry that forces users to type
+        // imported function names from memory.
+        for pkg in full_imports {
+            if pkg_set.insert(pkg.as_str()) {
+                all_packages.push(pkg.clone());
+            }
+        }
+
+        // Add package exports (after local definitions, before cross-file symbols)
+        // Requirement 9.4: Local definitions > package exports > cross-file symbols
+        // Requirement 9.3: When multiple packages export same symbol, show all with attribution
+        //
+        // Attribute each export to its true owner (issue #407): under
+        // `library(tidyverse)`, `mutate` is detailed/resolved as `{dplyr}` so
+        // the resolve handler opens dplyr's help topic, not the empty
+        // `help("mutate", package = "tidyverse")`.
+        let package_exports = package_library.get_owned_exports_for_completions(&all_packages);
+        for (export_name, package_names) in package_exports {
+            if seen_names.contains(&export_name) {
+                continue; // Local definitions take precedence
+            }
+            seen_names.insert(export_name.clone());
+
+            // Requirement 9.3: Show all packages that export this symbol
+            for package_name in package_names {
+                // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
+                items.push(CompletionItem {
+                    label: export_name.clone(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: Some(format!("{{{}}}", package_name)),
+                    sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
+                    // Store topic and package for completionItem/resolve documentation lookup
+                    data: Some(serde_json::json!({
+                        "topic": export_name,
+                        "package": package_name,
+                    })),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Add visible cross-file symbols after package exports.
+    // Requirement 9.5: Package exports > cross-file symbols
+    // Requirement 9.6: Function signatures SHALL appear in completion detail field
+    for (name, symbol) in scope
+        .symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.source_uri.as_str() != uri.as_str())
+    {
+        push_scoped_symbol_completion(
+            workspace_root,
+            uri,
+            name.as_ref(),
+            symbol,
+            &mut items,
+            &mut seen_names,
+        );
+    }
+
+    // Filter out reserved words from identifier completions
+    // (Keywords and constants are added separately with specific CompletionItemKind)
+    // Requirements 5.1, 5.2, 5.3: Reserved words should not appear as identifier completions
+    items.retain(|item| {
+        matches!(
+            item.kind,
+            Some(CompletionItemKind::KEYWORD) | Some(CompletionItemKind::CONSTANT)
+        ) || !crate::reserved_words::is_reserved_word(&item.label)
+    });
+
+    // Prepend parameter items so they appear first in the list.
+    items.splice(0..0, parameter_items.drain(..));
+
+    CompletionResponse::Array(items)
+}
+
+pub(crate) enum PreparedScopeCompletion {
+    Immediate(Option<CompletionResponse>),
+    General {
+        parameter_completion: Option<PreparedParameterCompletion>,
+    },
+}
+
+pub(crate) struct PreparedParameterCompletion {
+    function_name: String,
+    namespace: Option<String>,
+    is_internal: bool,
+    token: String,
+    position: Position,
+}
+
+pub(crate) fn prepare_completion_for_scope_snapshot(
     state: &WorldState,
     uri: &Url,
     position: Position,
     context: Option<CompletionContext>,
-) -> Option<CompletionResponse> {
-    let doc = state.get_document(uri)?;
+) -> PreparedScopeCompletion {
+    let Some(doc) = state.get_document(uri) else {
+        return PreparedScopeCompletion::Immediate(None);
+    };
     // Rmd/Quarto: completions are first-class inside R chunk bodies, but a
     // prose/YAML line maps to a blank masked line that the R logic below would
     // treat as top-level R (offering R symbols while the user types prose).
@@ -17646,7 +18248,7 @@ pub fn completion(
     // analysis text).
     if doc.is_rmd_document() && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
     {
-        return None;
+        return PreparedScopeCompletion::Immediate(None);
     }
     // Byte offsets paired with `tree` index into the analysis text (masked for
     // Rmd). Behavior-neutral for plain R, where this equals the raw text.
@@ -17654,12 +18256,18 @@ pub fn completion(
 
     // JAGS/Stan completion filtering
     match doc.file_type {
-        FileType::Jags => return Some(jags_completion(&text, uri)),
-        FileType::Stan => return Some(stan_completion(&text, uri)),
+        FileType::Jags => {
+            return PreparedScopeCompletion::Immediate(Some(jags_completion(&text, uri)));
+        }
+        FileType::Stan => {
+            return PreparedScopeCompletion::Immediate(Some(stan_completion(&text, uri)));
+        }
         FileType::R => { /* fall through to existing R logic */ }
     }
 
-    let tree = doc.tree.as_ref()?;
+    let Some(tree) = doc.tree.as_ref() else {
+        return PreparedScopeCompletion::Immediate(None);
+    };
 
     // Check for file path context first (source() calls and LSP directives)
     // Requirements 1.1-1.6, 2.1-2.7: Provide file path completions in appropriate contexts
@@ -17700,193 +18308,24 @@ pub fn completion(
             workspace_root,
             position, // Pass cursor position for text_edit range
         );
-        return Some(CompletionResponse::Array(items));
+        return PreparedScopeCompletion::Immediate(Some(CompletionResponse::Array(items)));
     }
 
     if let Some(member_context) = detect_dollar_member_completion_context(tree, &text, position) {
         let items = dollar_member_completion_items(state, uri, position, &member_context);
-        return Some(CompletionResponse::Array(items));
+        return PreparedScopeCompletion::Immediate(Some(CompletionResponse::Array(items)));
     }
     let point = lsp_position_to_ts_point(&text, position);
-    let node = tree.root_node().descendant_for_point_range(point, point)?;
-
-    let mut items = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
+    let Some(node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return PreparedScopeCompletion::Immediate(None);
+    };
 
     // Check if we're in a namespace context (pkg::)
     if find_namespace_context(&node, &text).is_some() {
         // TODO: Get package exports from library
-        return Some(CompletionResponse::Array(items));
+        return PreparedScopeCompletion::Immediate(Some(CompletionResponse::Array(Vec::new())));
     }
 
-    // Add R keywords (control flow and common functions)
-    let keywords = [
-        "if", "else", "repeat", "while", "function", "for", "in", "next", "break", "library",
-        "require", "return", "print",
-    ];
-
-    for kw in keywords {
-        items.push(CompletionItem {
-            label: kw.to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
-            ..Default::default()
-        });
-        seen_names.insert(kw.to_string());
-    }
-
-    // Add R constants (distinct from keywords, aligned with R-LS)
-    for constant in R_CONSTANTS {
-        items.push(CompletionItem {
-            label: constant.to_string(),
-            kind: Some(CompletionItemKind::CONSTANT),
-            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, constant)),
-            ..Default::default()
-        });
-        seen_names.insert(constant.to_string());
-    }
-
-    // Get scope at cursor position for visible local/cross-file symbols and package exports.
-    // Requirements 9.1, 9.2: Add package exports to completions with package attribution
-    let scope = get_cross_file_scope(
-        state,
-        uri,
-        position.line,
-        position.character,
-        &DiagCancelToken::never(),
-        Some(state.package_state.scope_contribution()),
-    );
-
-    // Add visible same-file symbols first so local definitions take precedence
-    // over package exports without leaking future or out-of-scope assignments.
-    for (name, symbol) in scope
-        .symbols
-        .iter()
-        .filter(|(_, symbol)| symbol.source_uri.as_str() == uri.as_str())
-    {
-        push_scoped_symbol_completion(
-            state,
-            uri,
-            name.as_ref(),
-            symbol,
-            &mut items,
-            &mut seen_names,
-        );
-    }
-
-    // Add package exports only if packages feature is enabled
-    if state.cross_file_config.packages_enabled {
-        // Combine base packages, inherited, and loaded packages using a set for O(1) dedup
-        // Requirement 6.3: Base packages SHALL be available at all positions
-        let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut all_packages: Vec<String> = Vec::new();
-
-        // Base packages first (always available without library() calls)
-        if state.package_library_ready {
-            for pkg in state.package_library.base_packages() {
-                if pkg_set.insert(pkg.as_str()) {
-                    all_packages.push(pkg.clone());
-                }
-            }
-        }
-
-        // Then inherited and explicitly loaded packages
-        for pkg in scope
-            .inherited_packages
-            .iter()
-            .chain(scope.loaded_packages.iter())
-        {
-            if pkg_set.insert(pkg.as_str()) {
-                all_packages.push(pkg.clone());
-            }
-        }
-
-        // Also include NAMESPACE `import(pkg)` whole-package imports. Without
-        // this, the diagnostic pipeline (which already consults
-        // `scope_contribution.full_imports`, see
-        // `collect_undefined_variables_from_snapshot`) stays silent on
-        // references to those packages' exports while the completion list
-        // doesn't offer them — an asymmetry that forces users to type
-        // imported function names from memory.
-        for pkg in state.package_state.scope_contribution().full_imports.iter() {
-            if pkg_set.insert(pkg.as_str()) {
-                all_packages.push(pkg.clone());
-            }
-        }
-
-        // Add package exports (after local definitions, before cross-file symbols)
-        // Requirement 9.4: Local definitions > package exports > cross-file symbols
-        // Requirement 9.3: When multiple packages export same symbol, show all with attribution
-        //
-        // Attribute each export to its true owner (issue #407): under
-        // `library(tidyverse)`, `mutate` is detailed/resolved as `{dplyr}` so
-        // the resolve handler opens dplyr's help topic, not the empty
-        // `help("mutate", package = "tidyverse")`.
-        let package_exports = state
-            .package_library
-            .get_owned_exports_for_completions(&all_packages);
-        for (export_name, package_names) in package_exports {
-            if seen_names.contains(&export_name) {
-                continue; // Local definitions take precedence
-            }
-            seen_names.insert(export_name.clone());
-
-            // Requirement 9.3: Show all packages that export this symbol
-            for package_name in package_names {
-                // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
-                items.push(CompletionItem {
-                    label: export_name.clone(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    detail: Some(format!("{{{}}}", package_name)),
-                    sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
-                    // Store topic and package for completionItem/resolve documentation lookup
-                    data: Some(serde_json::json!({
-                        "topic": export_name,
-                        "package": package_name,
-                    })),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    // Add visible cross-file symbols after package exports.
-    // Requirement 9.5: Package exports > cross-file symbols
-    // Requirement 9.6: Function signatures SHALL appear in completion detail field
-    for (name, symbol) in scope
-        .symbols
-        .iter()
-        .filter(|(_, symbol)| symbol.source_uri.as_str() != uri.as_str())
-    {
-        push_scoped_symbol_completion(
-            state,
-            uri,
-            name.as_ref(),
-            symbol,
-            &mut items,
-            &mut seen_names,
-        );
-    }
-
-    // Filter out reserved words from identifier completions
-    // (Keywords and constants are added separately with specific CompletionItemKind)
-    // Requirements 5.1, 5.2, 5.3: Reserved words should not appear as identifier completions
-    items.retain(|item| {
-        matches!(
-            item.kind,
-            Some(CompletionItemKind::KEYWORD) | Some(CompletionItemKind::CONSTANT)
-        ) || !crate::reserved_words::is_reserved_word(&item.label)
-    });
-
-    // Check if inside function call — if so, prepend parameter completions.
-    // Token detection (namespace accessor check via find_namespace_context above)
-    // happens BEFORE this point — if accessor is present, we already returned early,
-    // so parameter completions are naturally suppressed for namespace-qualified tokens.
-    // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
-    // may fail, so we also do a text-based check here as a fallback.
-    //
-    // When trigger_on_open_paren is false, suppress parameter completions triggered by `(`.
-    // Manual invocation (Ctrl+Space) still shows them regardless of config.
     let suppress_paren_trigger = !state.completion_config.trigger_on_open_paren
         && matches!(
             &context,
@@ -17896,26 +18335,75 @@ pub fn completion(
                 ..
             }) if ch == "("
         );
+    let mut parameter_completion = None;
     if !suppress_paren_trigger && !has_namespace_accessor_at_cursor(&text, position) {
         let call_context =
             crate::completion_context::detect_function_call_context(tree, &text, position);
         if let Some(ctx) = call_context {
             let token = get_token_at_cursor(&text, position);
-            let param_items = get_parameter_completions(
-                state,
-                uri,
-                &ctx.function_name,
-                ctx.namespace.as_deref(),
-                ctx.is_internal,
-                &token,
+            parameter_completion = Some(PreparedParameterCompletion {
+                function_name: ctx.function_name,
+                namespace: ctx.namespace,
+                is_internal: ctx.is_internal,
+                token,
                 position,
-            );
-            // Prepend parameter items so they appear first in the list
-            items.splice(0..0, param_items);
+            });
         }
     }
 
-    Some(CompletionResponse::Array(items))
+    PreparedScopeCompletion::General {
+        parameter_completion,
+    }
+}
+
+pub(crate) fn completion_from_scope_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    prepared: PreparedScopeCompletion,
+) -> Option<CompletionResponse> {
+    let parameter_completion = match prepared {
+        PreparedScopeCompletion::Immediate(response) => return response,
+        PreparedScopeCompletion::General {
+            parameter_completion,
+        } => parameter_completion,
+    };
+    let parameter_items = parameter_completion
+        .as_ref()
+        .map(|ctx| get_parameter_completions_from_snapshot(snapshot, uri, ctx))
+        .unwrap_or_default();
+    let mut prefix_cache = scope::ParentPrefixCache::new();
+    let scope = snapshot.scope_at(
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        &mut prefix_cache,
+    );
+    Some(completion_response_from_scope(
+        snapshot.workspace_folders.first(),
+        &snapshot.package_library,
+        snapshot.package_library_ready,
+        snapshot.cross_file_config.packages_enabled,
+        &snapshot.scope_contribution.full_imports,
+        uri,
+        scope,
+        parameter_items,
+    ))
+}
+
+pub fn completion(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    context: Option<CompletionContext>,
+) -> Option<CompletionResponse> {
+    let prepared = prepare_completion_for_scope_snapshot(state, uri, position, context);
+    if let PreparedScopeCompletion::Immediate(response) = prepared {
+        return response;
+    }
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    completion_from_scope_snapshot(&snapshot, uri, position, prepared)
 }
 
 /// Check if the text before the cursor contains a namespace accessor (`::` or `:::`).
@@ -17974,23 +18462,19 @@ fn get_token_at_cursor(text: &str, position: Position) -> String {
 /// each as a `CompletionItem` with appropriate sort prefix, kind, and metadata.
 ///
 /// Requirements: 2.2, 2.3, 2.6, 5.1-5.7, 6.1-6.6
-fn get_parameter_completions(
-    state: &WorldState,
+fn get_parameter_completions_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
     uri: &Url,
-    function_name: &str,
-    namespace: Option<&str>,
-    is_internal: bool,
-    token: &str,
-    position: Position,
+    ctx: &PreparedParameterCompletion,
 ) -> Vec<CompletionItem> {
-    let signature = match crate::parameter_resolver::resolve(
-        state,
-        &state.signature_cache,
-        function_name,
-        namespace,
-        is_internal,
+    let signature = match crate::parameter_resolver::resolve_with_scope_snapshot(
+        snapshot,
+        &snapshot.signature_cache,
+        &ctx.function_name,
+        ctx.namespace.as_deref(),
+        ctx.is_internal,
         uri,
-        position,
+        ctx.position,
     ) {
         Some(sig) => sig,
         None => return Vec::new(),
@@ -18001,7 +18485,7 @@ fn get_parameter_completions(
     // TODO: Handle base::options() special case — query names(.Options) from R
     // subprocess and append as additional parameter completions (R-LS parity).
 
-    let token_lower = token.to_lowercase();
+    let token_lower = ctx.token.to_lowercase();
 
     parameters
         .iter()
@@ -18028,7 +18512,7 @@ fn get_parameter_completions(
             let detail = Some("parameter".to_string());
 
             // Build the data JSON for completionItem/resolve
-            let data = build_parameter_data(&p.name, function_name, &signature.source);
+            let data = build_parameter_data(&p.name, &ctx.function_name, &signature.source);
 
             CompletionItem {
                 label: p.name.clone(),
@@ -18575,6 +19059,26 @@ fn member_definition_info(
     extract_definition_statement(&symbol, state)
 }
 
+pub(crate) fn member_definition_info_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    location: &tower_lsp::lsp_types::Location,
+) -> Option<DefinitionInfo> {
+    let name: Arc<str> = Arc::from("");
+    let defined_end_column = scoped_symbol_default_end(location.range.start.character, &name);
+    let symbol = ScopedSymbol {
+        name,
+        kind: scope::SymbolKind::Variable,
+        source_uri: location.uri.clone(),
+        defined_line: location.range.start.line,
+        defined_column: location.range.start.character,
+        defined_end_column,
+        signature: None,
+        is_declared: false,
+    };
+    let (content, tree) = snapshot.get_text_and_tree(&symbol.source_uri)?;
+    extract_statement_from_tree(&tree, &symbol, &content)
+}
+
 /// Render the standard local/sourced-definition hover body: a code block with
 /// the definition statement followed by a file-location line — "this file,
 /// line N" for same-file definitions, or "[rel/path](uri), line N" otherwise.
@@ -18601,6 +19105,49 @@ fn local_definition_hover(
         ));
     }
     value
+}
+
+pub(crate) fn local_definition_hover_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    def_info: &DefinitionInfo,
+    current_uri: &Url,
+) -> String {
+    let mut value = format!("```r\n{}\n```\n\n", def_info.statement);
+    if def_info.source_uri == *current_uri {
+        value.push_str(&format!("this file, line {}", def_info.line + 1));
+    } else {
+        let relative_path =
+            compute_relative_path(&def_info.source_uri, snapshot.workspace_folders.first());
+        value.push_str(&format!(
+            "[{}]({}), line {}",
+            relative_path,
+            def_info.source_uri.as_str(),
+            def_info.line + 1
+        ));
+    }
+    value
+}
+
+pub(crate) fn qualified_member_hover_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    prepared: &PreparedQualifiedMemberHover,
+) -> Option<Hover> {
+    let location = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
+        snapshot,
+        uri,
+        position,
+        &prepared.path,
+        &prepared.name,
+        prepared.op,
+        &DiagCancelToken::never(),
+    )?;
+    let def_info = member_definition_info_from_snapshot(snapshot, &location)?;
+    Some(markdown_hover(
+        local_definition_hover_from_snapshot(snapshot, &def_info, uri),
+        prepared.node_range,
+    ))
 }
 
 /// Result of finding a statement node - includes whether to extract header only
@@ -19808,16 +20355,26 @@ fn parse_single_param(param_str: &str) -> crate::parameter_resolver::ParameterIn
 ///
 /// # Returns
 /// Some(SignatureInformation) if successful, None if extraction fails
+#[cfg(test)]
 fn try_build_user_signature(
     state: &WorldState,
     function_name: &str,
     uri: &Url,
     position: Position,
 ) -> Option<SignatureInformation> {
-    // Use Parameter_Resolver::resolve() to get function signature
-    let signature = crate::parameter_resolver::resolve(
-        state,
-        &state.signature_cache,
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    try_build_user_signature_from_snapshot(&snapshot, function_name, uri, position)
+}
+
+fn try_build_user_signature_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    function_name: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<SignatureInformation> {
+    let signature = crate::parameter_resolver::resolve_with_scope_snapshot(
+        snapshot,
+        &snapshot.signature_cache,
         function_name,
         None,  // namespace - None for user functions
         false, // is_internal
@@ -19838,9 +20395,11 @@ fn try_build_user_signature(
         }
     };
 
-    // Get the document text for roxygen extraction
-    let doc = state.get_document(source_uri)?;
-    let text = doc.text();
+    // Get the raw document text for roxygen extraction. The snapshot also has
+    // analysis text for AST slicing, but roxygen blocks are source text.
+    let text = snapshot
+        .get_raw_text(source_uri)
+        .or_else(|| snapshot.get_text_and_tree(source_uri).map(|(text, _)| text))?;
 
     // Use extract_roxygen_block() to get documentation
     let roxygen_block = crate::roxygen::extract_roxygen_block(&text, source_line);
@@ -19902,16 +20461,20 @@ pub struct SignatureHelpContext {
     resolution: SignatureResolution,
 }
 
-/// Synchronous phase of signature help: extracts call context, resolves scope,
-/// and determines whether async work is needed.
-///
-/// Call this under a read lock, then release the lock before calling
-/// [`resolve_signature_help`].
-pub fn prepare_signature_help(
+pub(crate) struct PreparedSignatureHelp {
+    function_name: String,
+    position: Position,
+    active_parameter: Option<u32>,
+}
+
+/// Synchronous phase of signature help: extracts only the local call context.
+/// Build a [`CrossFileScopeSnapshot`] under the same read lock, release the
+/// lock, then call [`signature_help_context_from_snapshot`] for cross-file work.
+pub(crate) fn prepare_signature_help_for_scope_snapshot(
     state: &WorldState,
     uri: &Url,
     position: Position,
-) -> Option<SignatureHelpContext> {
+) -> Option<PreparedSignatureHelp> {
     let doc = state.get_document(uri)?;
     // Rmd/Quarto: signature help is first-class inside R chunk bodies, but a
     // prose position maps to a blank masked line. The call-node search below
@@ -19950,33 +20513,53 @@ pub fn prepare_signature_help(
     let func_node = children[0];
     let func_name = node_text(func_node, &text);
 
-    // Determine if package or user function using cross-file scope
-    let scope = get_cross_file_scope(
-        state,
+    let active_param = detect_active_parameter(call_node, point);
+
+    Some(PreparedSignatureHelp {
+        function_name: func_name.to_string(),
+        position,
+        active_parameter: active_param,
+    })
+}
+
+pub(crate) fn signature_help_context_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    prepared: PreparedSignatureHelp,
+) -> Option<SignatureHelpContext> {
+    let func_name = prepared.function_name.as_str();
+    let mut prefix_cache = scope::ParentPrefixCache::new();
+    let scope = snapshot.scope_at(
         uri,
-        position.line,
-        position.character,
+        prepared.position.line,
+        prepared.position.character,
         &DiagCancelToken::never(),
-        Some(state.package_state.scope_contribution()),
+        &mut prefix_cache,
     );
 
-    /// Try user signature, falling back to a minimal signature with source attribution.
     fn resolve_user_or_fallback(
-        state: &WorldState,
+        snapshot: &CrossFileScopeSnapshot,
         func_name: &str,
         uri: &Url,
         position: Position,
         scope: &scope::ScopeAtPosition,
     ) -> SignatureResolution {
         SignatureResolution::Ready(
-            try_build_user_signature(state, func_name, uri, position)
-                .unwrap_or_else(|| build_fallback_signature(func_name, scope, uri, state)),
+            try_build_user_signature_from_snapshot(snapshot, func_name, uri, position)
+                .unwrap_or_else(|| {
+                    build_fallback_signature(
+                        func_name,
+                        scope,
+                        uri,
+                        snapshot.workspace_folders.first(),
+                    )
+                }),
         )
     }
 
     // Resolve the R executable path for any package help lookups.
     // Falls back to "R" (PATH lookup) when no explicit path is configured.
-    let r_path: std::path::PathBuf = state
+    let r_path: std::path::PathBuf = snapshot
         .cross_file_config
         .packages_r_path
         .clone()
@@ -19986,16 +20569,21 @@ pub fn prepare_signature_help(
     let resolution = if let Some(symbol) = scope.symbols.get(func_name) {
         if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
             SignatureResolution::Package {
-                help_cache: state.help_cache.clone(),
+                help_cache: snapshot.help_cache.clone(),
                 func_name: func_name.to_string(),
                 package_name: pkg.to_string(),
-                fallback: build_fallback_signature(func_name, &scope, uri, state),
+                fallback: build_fallback_signature(
+                    func_name,
+                    &scope,
+                    uri,
+                    snapshot.workspace_folders.first(),
+                ),
                 r_path: r_path.clone(),
             }
         } else {
-            resolve_user_or_fallback(state, func_name, uri, position, &scope)
+            resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
         }
-    } else if state.cross_file_config.packages_enabled {
+    } else if snapshot.cross_file_config.packages_enabled {
         let all_packages: Vec<String> = scope
             .inherited_packages
             .iter()
@@ -20003,31 +20591,46 @@ pub fn prepare_signature_help(
             .cloned()
             .collect();
 
-        if let Some(pkg_name) = state
+        if let Some(pkg_name) = snapshot
             .package_library
             .find_package_owner_for_symbol(func_name, &all_packages)
         {
             SignatureResolution::Package {
-                help_cache: state.help_cache.clone(),
+                help_cache: snapshot.help_cache.clone(),
                 func_name: func_name.to_string(),
                 package_name: pkg_name,
-                fallback: build_fallback_signature(func_name, &scope, uri, state),
+                fallback: build_fallback_signature(
+                    func_name,
+                    &scope,
+                    uri,
+                    snapshot.workspace_folders.first(),
+                ),
                 r_path,
             }
         } else {
-            resolve_user_or_fallback(state, func_name, uri, position, &scope)
+            resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
         }
     } else {
-        resolve_user_or_fallback(state, func_name, uri, position, &scope)
+        resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
     };
 
-    // Detect active parameter
-    let active_param = detect_active_parameter(call_node, point);
-
     Some(SignatureHelpContext {
-        active_parameter: active_param,
+        active_parameter: prepared.active_parameter,
         resolution,
     })
+}
+
+/// Convenience wrapper retained for tests and legacy synchronous callers.
+/// Production LSP paths should use the split snapshot API so cross-file scope
+/// resolution runs after the `WorldState` read lock is released.
+pub fn prepare_signature_help(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<SignatureHelpContext> {
+    let prepared = prepare_signature_help_for_scope_snapshot(state, uri, position)?;
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    signature_help_context_from_snapshot(&snapshot, uri, prepared)
 }
 
 /// Async phase of signature help: performs R subprocess work (if needed)
@@ -20062,7 +20665,7 @@ fn build_fallback_signature(
     func_name: &str,
     scope: &scope::ScopeAtPosition,
     uri: &Url,
-    state: &WorldState,
+    workspace_root: Option<&Url>,
 ) -> SignatureInformation {
     let (label, documentation) = if let Some(symbol) = scope.symbols.get(func_name) {
         let fallback = format!("{}(...)", func_name);
@@ -20075,7 +20678,6 @@ fn build_fallback_signature(
                 value: format!("from `{}`", pkg),
             }))
         } else if symbol.source_uri != *uri {
-            let workspace_root = state.workspace_folders.first();
             let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -52119,6 +52721,67 @@ result <- helper_with_spaces(42)"#;
         );
     }
 
+    #[test]
+    fn test_local_true_source_of_standalone_file_stays_local() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        let main_path = workspace_path.join("main.R");
+        let helper_path = workspace_path.join("helper.R");
+
+        let main_code = "result <- helper()\nsource(\"helper.R\", local=TRUE)\n";
+        let helper_code = "# raven: standalone\nhelper <- function() 1\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helper_url = Url::from_file_path(&helper_path).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        state
+            .documents
+            .insert(helper_url.clone(), Document::new(helper_code, None));
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(main_code, None));
+        state.cross_file_graph.update_file(
+            &helper_url,
+            &crate::cross_file::extract_metadata(helper_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let messages: Vec<String> = diagnostics(&state, &main_url, &DiagCancelToken::never())
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Undefined variable: helper")),
+            "local=TRUE must keep a standalone callee's symbols out of the caller; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("used before")),
+            "local=TRUE sources should not produce a used-before-sourced attribution; got {messages:?}"
+        );
+    }
+
     /// Regression lock for issue #135 (Phase 1, Category A).
     ///
     /// `sys.source("helper.R", envir=new.env())` evaluates in a fresh env;
@@ -53955,6 +54618,127 @@ mod position_aware_tests {
         let document = Document::new(content, None);
         state.documents.insert(uri.clone(), document);
         uri
+    }
+
+    #[test]
+    fn diagnostics_snapshot_materializes_active_standalone_closure_targets() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+        use crate::cross_file::types::CrossFileMetadata;
+        use crate::workspace_index::IndexEntry;
+        use ropey::Rope;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        fn index_closed_file(
+            state: &mut WorldState,
+            workspace_root: &Url,
+            uri: &Url,
+            code: &str,
+            metadata: CrossFileMetadata,
+        ) {
+            state
+                .cross_file_graph
+                .update_file(uri, &metadata, Some(workspace_root), |_| None);
+            let tree = parse_r_code(code);
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
+            ));
+            let metadata = Arc::new(metadata);
+            let entry = IndexEntry {
+                contents: Rope::from_str(code),
+                tree: Some(tree),
+                loaded_packages: Vec::new(),
+                snapshot: FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: code.len() as u64,
+                    content_hash: None,
+                },
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        }
+
+        let mut state = create_test_state();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        state.workspace_folders.push(workspace_root.clone());
+
+        let c = Url::parse("file:///project/c/c.R").unwrap();
+        let m = Url::parse("file:///project/m/m.R").unwrap();
+        let active_leaf = Url::parse("file:///project/c/leaf.R").unwrap();
+        let graph_leaf = Url::parse("file:///project/outside/leaf.R").unwrap();
+
+        let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
+        let m_code = "source(\"leaf.R\")\nm_sym <- leaf_sym\n";
+        let active_leaf_code = "leaf_sym <- 1\n";
+        let graph_leaf_code = "outside_leaf <- 1\n";
+
+        state
+            .documents
+            .insert(c.clone(), Document::new(c_code, None));
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        state
+            .cross_file_graph
+            .update_file(&c, &c_meta, Some(&workspace_root), |_| None);
+
+        let mut m_meta = crate::cross_file::extract_metadata(m_code);
+        m_meta.inherited_working_directory = Some("/project/outside".to_string());
+        index_closed_file(&mut state, &workspace_root, &m, m_code, m_meta);
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &active_leaf,
+            active_leaf_code,
+            CrossFileMetadata::default(),
+        );
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &graph_leaf,
+            graph_leaf_code,
+            CrossFileMetadata::default(),
+        );
+
+        let payload = state.cross_file_graph.cached_neighborhood_subgraph(
+            &c,
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        );
+        assert!(
+            payload.neighborhood.contains(&graph_leaf),
+            "fixture sanity: the indexed graph follows m.R's inherited outside working directory"
+        );
+        assert!(
+            !payload.neighborhood.contains(&active_leaf),
+            "fixture sanity: the active standalone leaf is not in the graph neighborhood"
+        );
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &c).expect("snapshot");
+        assert!(
+            snapshot.artifacts_map.contains_key(&active_leaf),
+            "snapshot must precollect active standalone closure targets outside the graph neighborhood"
+        );
+        let scope = snapshot.get_scope(&c, u32::MAX, u32::MAX, &DiagCancelToken::never());
+        assert!(
+            scope.symbols.contains_key("leaf_sym"),
+            "active leaf symbols must be visible through the standalone closure"
+        );
+        assert!(
+            !scope.symbols.contains_key("outside_leaf"),
+            "isolated standalone closure must not use the globally indexed outside-WD target"
+        );
+
+        state.cross_file_config.max_transitive_dependents_visited = payload.neighborhood.len();
+        let saturated_snapshot = DiagnosticsSnapshot::build(&state, &c).expect("snapshot");
+        assert!(
+            !saturated_snapshot.artifacts_map.contains_key(&active_leaf),
+            "active standalone precollection must not add extra URIs once the neighborhood budget is saturated"
+        );
     }
 
     #[test]
@@ -59191,6 +59975,31 @@ my_func <- function(a = default_value) {
         assert!(
             !msgs.iter().any(|m| m.contains("undefined_var")),
             "NSE directive in a sourced child must suppress the parent call; got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn nse_func_propagation_crosses_standalone_source_edge() {
+        let msgs = cross_file_diag_messages(
+            &[
+                (
+                    "parent.R",
+                    "source(\"child.R\")\nmyverb(real_df, undefined_expr)\n",
+                ),
+                (
+                    "child.R",
+                    "# raven: standalone\n# raven: func myverb(data, expr)\n# raven: nse: myverb(expr)\n",
+                ),
+            ],
+            "parent.R",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("real_df")),
+            "data-bound positional stays reported; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("undefined_expr")),
+            "standalone changes scope resolution, not graph-level NSE/func propagation; got {msgs:?}"
         );
     }
 

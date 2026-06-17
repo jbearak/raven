@@ -79,10 +79,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
-use crate::content_provider::ContentProvider;
 use crate::cross_file::scope::LineIndex;
 use crate::extract_op::ExtractOp;
-use crate::handlers::DiagCancelToken;
+use crate::handlers::{CrossFileScopeSnapshot, DiagCancelToken};
 use crate::state::WorldState;
 use crate::utf16::{byte_offset_to_utf16_column, utf16_column_to_byte_offset};
 
@@ -399,13 +398,11 @@ struct CandidateBatch {
 /// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
 /// `foo@bar`).
 ///
-/// Snapshot-scope invariant: the shared candidate collector creates one
-/// `ParentPrefixCache` per request and reuses it for the initial cursor lookup
-/// plus all non-defining-file candidate validations. Callers must hold a
-/// `WorldState` read guard (as `goto_definition` does) while calling this
-/// function so `get_cross_file_scope_with_cache` and subsequent scope lookups,
-/// including `candidate_lhs_matches_symbol`, observe the same graph/artifacts
-/// snapshot.
+/// The shared candidate collector creates one `ParentPrefixCache` per request
+/// and reuses it for the initial cursor lookup plus all non-defining-file
+/// candidate validations. This compatibility wrapper snapshots the needed
+/// cross-file inputs before resolving; hot LSP paths that already have a
+/// snapshot should call [`resolve_qualified_member_with_snapshot`] directly.
 ///
 /// This stable convenience API delegates to
 /// [`resolve_qualified_member_with_cancel`] with [`DiagCancelToken::never`],
@@ -419,8 +416,9 @@ pub fn resolve_qualified_member(
     rhs_name: &str,
     op: ExtractOp,
 ) -> Option<Location> {
-    resolve_qualified_member_with_cancel(
-        state,
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    resolve_qualified_member_with_snapshot(
+        &snapshot,
         uri,
         position,
         path,
@@ -432,11 +430,10 @@ pub fn resolve_qualified_member(
 
 /// Cancellation-aware variant of [`resolve_qualified_member`].
 ///
-/// Same snapshot-scope invariant: callers must hold a `WorldState` read guard
-/// (as `goto_definition_with_cancel` does) so the shared collector's single
-/// `ParentPrefixCache`, the initial `get_cross_file_scope_with_cache` lookup,
-/// and every non-defining-file `candidate_lhs_matches_symbol` re-resolve all
-/// observe the same graph/artifacts snapshot.
+/// Compatibility wrapper that snapshots the needed cross-file inputs before
+/// resolving. Hot LSP paths that must release the `WorldState` read lock before
+/// persistent standalone-cache miss computation should call
+/// [`resolve_qualified_member_with_snapshot`] directly.
 ///
 /// `cancel` is polled cooperatively at scope-lookup and loop boundaries.
 /// Returns `None` on cancellation; passing [`DiagCancelToken::never`] yields
@@ -451,8 +448,22 @@ pub fn resolve_qualified_member_with_cancel(
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Option<Location> {
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    resolve_qualified_member_with_snapshot(&snapshot, uri, position, path, rhs_name, op, cancel)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_qualified_member_with_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    path: &QualifiedPath,
+    rhs_name: &str,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Option<Location> {
     let batch = collect_qualified_member_candidates_with_cancel(
-        state,
+        snapshot,
         uri,
         position,
         path,
@@ -484,8 +495,9 @@ pub fn complete_qualified_members(
     path: &QualifiedPath,
     op: ExtractOp,
 ) -> Vec<QualifiedMemberCompletion> {
-    complete_qualified_members_with_cancel(
-        state,
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    complete_qualified_members_with_snapshot(
+        &snapshot,
         uri,
         position,
         path,
@@ -507,8 +519,20 @@ pub fn complete_qualified_members_with_cancel(
     op: ExtractOp,
     cancel: &DiagCancelToken,
 ) -> Vec<QualifiedMemberCompletion> {
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    complete_qualified_members_with_snapshot(&snapshot, uri, position, path, op, cancel)
+}
+
+pub(crate) fn complete_qualified_members_with_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    path: &QualifiedPath,
+    op: ExtractOp,
+    cancel: &DiagCancelToken,
+) -> Vec<QualifiedMemberCompletion> {
     let Some(batch) = collect_qualified_member_candidates_with_cancel(
-        state, uri, position, path, None, op, cancel,
+        snapshot, uri, position, path, None, op, cancel,
     ) else {
         return Vec::new();
     };
@@ -569,7 +593,7 @@ pub fn complete_qualified_members_with_cancel(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_qualified_member_candidates_with_cancel(
-    state: &WorldState,
+    snapshot: &CrossFileScopeSnapshot,
     uri: &Url,
     position: Position,
     path: &QualifiedPath,
@@ -582,14 +606,12 @@ fn collect_qualified_member_candidates_with_cancel(
     }
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
 
-    let scope = crate::handlers::get_cross_file_scope_with_cache(
-        state,
+    let scope = snapshot.scope_at(
         uri,
         position.line,
         position.character,
         cancel,
         &mut prefix_cache,
-        Some(state.package_state.scope_contribution()),
     );
     if cancel.is_cancelled() {
         return None;
@@ -652,8 +674,7 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut defining_candidates: Vec<Candidate> = Vec::new();
     {
-        let (defining_text, defining_tree) =
-            crate::parameter_resolver::get_text_and_tree(state, &defining_uri)?;
+        let (defining_text, defining_tree) = snapshot.get_text_and_tree(&defining_uri)?;
         let defining_col_mapper = ColMapper::new(&defining_text);
         let symbol_fn_scope = function_scope_at(
             &defining_tree,
@@ -746,7 +767,6 @@ fn collect_qualified_member_candidates_with_cancel(
 
     let mut cross_file_candidates: Vec<Candidate> = Vec::new();
     let contributor_ranks = contributor_file_ranks(&scope.chain);
-    let content_provider = state.content_provider();
     let lhs_arc: std::sync::Arc<str> = std::sync::Arc::from(lhs_name);
     let mut needs_validation: Vec<Candidate> = Vec::new();
     for candidate_uri in scope
@@ -757,14 +777,12 @@ fn collect_qualified_member_candidates_with_cancel(
         if cancel.is_cancelled() {
             return None;
         }
-        let file_redefines_lhs = content_provider
+        let file_redefines_lhs = snapshot
             .get_artifacts(candidate_uri)
             .map(|art| art.exported_interface.contains_key(&lhs_arc))
             .unwrap_or(true);
 
-        if let Some((candidate_text, candidate_tree)) =
-            crate::parameter_resolver::get_text_and_tree(state, candidate_uri)
-        {
+        if let Some((candidate_text, candidate_tree)) = snapshot.get_text_and_tree(candidate_uri) {
             let candidate_col_mapper = ColMapper::new(&candidate_text);
             if file_redefines_lhs {
                 // File redefines lhs_name: walk full tree, per-candidate
@@ -861,7 +879,7 @@ fn collect_qualified_member_candidates_with_cancel(
                 if cross_file_candidates.len() == pre_len {
                     continue;
                 }
-                let scope_changes = content_provider
+                let scope_changes = snapshot
                     .get_artifacts(candidate_uri)
                     .map(|art| top_level_scope_change_positions_for(&art, lhs_name))
                     .unwrap_or_default();
@@ -875,7 +893,7 @@ fn collect_qualified_member_candidates_with_cancel(
                     let region = scope_changes.partition_point(|p| *p <= cand_pos);
                     if last_region != Some(region) {
                         last_region_valid = candidate_lhs_matches_symbol(
-                            state,
+                            snapshot,
                             &cand,
                             lhs_name,
                             symbol,
@@ -893,7 +911,14 @@ fn collect_qualified_member_candidates_with_cancel(
     }
     needs_validation.retain(|c| {
         candidate_effect_visible_in_scope(c, &scope.visible_positions)
-            && candidate_lhs_matches_symbol(state, c, lhs_name, symbol, cancel, &mut prefix_cache)
+            && candidate_lhs_matches_symbol(
+                snapshot,
+                c,
+                lhs_name,
+                symbol,
+                cancel,
+                &mut prefix_cache,
+            )
     });
     cross_file_candidates.extend(needs_validation);
     if cancel.is_cancelled() {
@@ -926,7 +951,7 @@ fn collect_qualified_member_candidates_with_cancel(
     // into scope — sourcing re-establishes the whole value, so it competes for
     // the latest cutoff.
     if !path.segments.is_empty() {
-        let source_pos = direct_source_positions(state, &cursor_uri, position);
+        let source_pos = direct_source_positions(snapshot, &cursor_uri, position);
         type Key = (u32, u32, u8, u32, u32);
         let global_key = |uri: &Url, line: u32, col: u32| -> Option<Key> {
             if *uri == cursor_uri {
@@ -966,7 +991,7 @@ fn collect_qualified_member_candidates_with_cancel(
     }
 
     let contributor_distances = contributor_file_distances(
-        &state.cross_file_graph,
+        &snapshot.cross_file_graph,
         &cursor_uri,
         &scope.chain,
         &scope.visible_positions,
@@ -988,12 +1013,12 @@ fn collect_qualified_member_candidates_with_cancel(
 /// (its source point) against a cursor-file reassignment. Transitively-sourced
 /// files are absent (the cutoff keeps those conservatively).
 fn direct_source_positions(
-    state: &WorldState,
+    snapshot: &CrossFileScopeSnapshot,
     cursor_uri: &Url,
     cursor: Position,
 ) -> HashMap<Url, (u32, u32)> {
     let mut map: HashMap<Url, (u32, u32)> = HashMap::new();
-    for edge in state.cross_file_graph.get_dependencies(cursor_uri) {
+    for edge in snapshot.cross_file_graph.get_dependencies(cursor_uri) {
         if let (Some(line), Some(col)) = (edge.call_site_line, edge.call_site_column)
             && (line, col) <= (cursor.line, cursor.character)
         {
@@ -1113,7 +1138,7 @@ fn candidate_effect_visible_in_scope(
 /// unrelated function bodies (where `foo` shadows the imported one) and
 /// candidates appearing before the import is in scope.
 fn candidate_lhs_matches_symbol(
-    state: &WorldState,
+    snapshot: &CrossFileScopeSnapshot,
     c: &Candidate,
     lhs_name: &str,
     symbol: &crate::cross_file::scope::ScopedSymbol,
@@ -1123,14 +1148,12 @@ fn candidate_lhs_matches_symbol(
     if cancel.is_cancelled() {
         return false;
     }
-    let scope = crate::handlers::get_cross_file_scope_with_cache(
-        state,
+    let scope = snapshot.scope_at(
         &c.uri,
         c.lhs_pos.line,
         c.lhs_pos.character,
         cancel,
         prefix_cache,
-        Some(state.package_state.scope_contribution()),
     );
     if cancel.is_cancelled() {
         return false;
@@ -2380,20 +2403,13 @@ alpha@beta$
             dollar_samples.sort();
 
             // Compare against a single full scope query at the same cursor.
+            let scope_snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
             let mut scope_samples = [std::time::Duration::ZERO; 5];
             for s in &mut scope_samples {
                 let cancel = DiagCancelToken::never();
                 let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
                 let start = std::time::Instant::now();
-                let _scope = crate::handlers::get_cross_file_scope_with_cache(
-                    &state,
-                    &uri,
-                    cursor_line,
-                    3,
-                    &cancel,
-                    &mut cache,
-                    Some(state.package_state.scope_contribution()),
-                );
+                let _scope = scope_snapshot.scope_at(&uri, cursor_line, 3, &cancel, &mut cache);
                 *s = start.elapsed();
             }
             scope_samples.sort();
@@ -2474,20 +2490,14 @@ alpha@beta$
             }
             dollar_samples.sort();
 
+            let scope_snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &main_uri);
             let mut scope_samples = [std::time::Duration::ZERO; 5];
             for s in &mut scope_samples {
                 let cancel = DiagCancelToken::never();
                 let mut cache = crate::cross_file::scope::ParentPrefixCache::new();
                 let start = std::time::Instant::now();
-                let _scope = crate::handlers::get_cross_file_scope_with_cache(
-                    &state,
-                    &main_uri,
-                    cursor_line,
-                    3,
-                    &cancel,
-                    &mut cache,
-                    Some(state.package_state.scope_contribution()),
-                );
+                let _scope =
+                    scope_snapshot.scope_at(&main_uri, cursor_line, 3, &cancel, &mut cache);
                 *s = start.elapsed();
             }
             scope_samples.sort();

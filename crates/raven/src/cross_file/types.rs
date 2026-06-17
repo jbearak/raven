@@ -230,14 +230,18 @@ pub struct CrossFileMetadata {
     /// Callee-side `# raven: standalone` directive (issues #479/#483). When
     /// `true`, this file is a self-contained module. Its own diagnostics skip
     /// the backward parent-prefix walk, and callers that resolve it as a forward
-    /// child use caller-independent inputs: no caller packages, no caller
-    /// `DataAliasProvider`, and the file's own path context (explicit
-    /// `# raven: cd` or file-relative, never an inherited caller working
-    /// directory). It still contributes its own definitions and its own loaded
-    /// packages forward to callers through the normal additive merge.
-    /// Header-only (must appear before any code). Opt-in and safe-direction: a
-    /// mislabeled standalone file can at worst raise a false "undefined" inside
-    /// itself, never hide a real bug in a caller. See `docs/directives.md`.
+    /// child use caller-independent inputs: no caller packages and the file's
+    /// own path context (explicit `# raven: cd` or file-relative, never an
+    /// inherited caller working directory). The global `DataAliasProvider`
+    /// remains available for standalone-local `data(..., package = "...")`
+    /// calls and bare `data(stem)` after the file's own `library()` calls; the
+    /// persistent cache keys provider availability and package-fact epoch. It
+    /// still contributes its own definitions and its own loaded packages forward
+    /// to callers through the normal additive merge. Header-only (must appear
+    /// before any code). Opt-in and safe-direction: a mislabeled standalone file
+    /// can at worst raise a false "undefined" in itself or in callers that
+    /// relied on caller-dependent exports, never hide a real bug. See
+    /// `docs/directives.md`.
     #[serde(default)]
     pub standalone: bool,
 }

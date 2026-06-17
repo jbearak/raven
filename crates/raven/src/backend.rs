@@ -1992,7 +1992,10 @@ async fn run_debounced_diagnostics(
         }
 
         // Build the snapshot (captures all state needed for diagnostics)
-        let snapshot = handlers::DiagnosticsSnapshot::build(&state, &affected_uri);
+        let snapshot =
+            handlers::DiagnosticsSnapshot::build_with_cancel(&state, &affected_uri, &|| {
+                cancel.is_cancelled()
+            });
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
 
@@ -5564,7 +5567,28 @@ impl LanguageServer for Backend {
         match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             let state = handle.block_on(state.read());
-            handlers::completion(&state, &uri, position, context)
+            if let Some(member_context) =
+                handlers::prepare_dollar_member_completion(&state, &uri, position)
+            {
+                let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
+                drop(state);
+                let items = handlers::dollar_member_completion_items_from_snapshot(
+                    &snapshot,
+                    &uri,
+                    position,
+                    &member_context,
+                );
+                return Some(CompletionResponse::Array(items));
+            }
+            let prepared =
+                handlers::prepare_completion_for_scope_snapshot(&state, &uri, position, context);
+            let prepared = match prepared {
+                handlers::PreparedScopeCompletion::Immediate(response) => return response,
+                general @ handlers::PreparedScopeCompletion::General { .. } => general,
+            };
+            let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            drop(state);
+            handlers::completion_from_scope_snapshot(&snapshot, &uri, position, prepared)
         })
         .await
         {
@@ -5610,27 +5634,42 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let state = self.state.read().await;
-        Ok(handlers::hover(
-            &state,
-            &params.text_document_position_params.text_document.uri,
-            params.text_document_position_params.position,
-        )
-        .await)
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        if let Some(prepared) = handlers::prepare_qualified_member_hover(&state, &uri, position) {
+            let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            drop(state);
+            return Ok(handlers::qualified_member_hover_from_snapshot(
+                &snapshot, &uri, position, &prepared,
+            ));
+        }
+        Ok(handlers::hover(&state, &uri, position).await)
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        // Phase 1: sync work under read lock
-        let ctx = {
+        // Phase 1: capture local context and cross-file inputs under read lock.
+        let prepared = {
             let state = self.state.read().await;
-            handlers::prepare_signature_help(&state, &uri, position)
+            handlers::prepare_signature_help_for_scope_snapshot(&state, &uri, position).map(
+                |prepared| {
+                    let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
+                    (prepared, snapshot)
+                },
+            )
         }; // read lock released
 
-        // Phase 2: async work (package help fetch) without holding the lock
-        Ok(match ctx {
-            Some(ctx) => handlers::resolve_signature_help(ctx).await,
+        // Phase 2: cross-file scope resolution and async package help fetch
+        // without holding the WorldState lock.
+        Ok(match prepared {
+            Some((prepared, snapshot)) => {
+                match handlers::signature_help_context_from_snapshot(&snapshot, &uri, prepared) {
+                    Some(ctx) => handlers::resolve_signature_help(ctx).await,
+                    None => None,
+                }
+            }
             None => None,
         })
     }
@@ -5652,6 +5691,38 @@ impl LanguageServer for Backend {
         };
         if cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
+        }
+
+        if let Some(prepared) = handlers::prepare_qualified_member_goto(
+            &state,
+            &params.text_document_position_params.text_document.uri,
+            params.text_document_position_params.position,
+        ) {
+            let uri = params
+                .text_document_position_params
+                .text_document
+                .uri
+                .clone();
+            let position = params.text_document_position_params.position;
+            let snapshot =
+                handlers::CrossFileScopeSnapshot::build_with_cancel(&state, &uri, &|| {
+                    cancel.is_cancelled()
+                });
+            drop(state);
+            let result = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
+                &snapshot,
+                &uri,
+                position,
+                &prepared.path,
+                &prepared.rhs_name,
+                prepared.op,
+                &cancel,
+            )
+            .map(GotoDefinitionResponse::Scalar);
+            if cancel.is_cancelled() {
+                return Err(JsonRpcError::request_cancelled());
+            }
+            return Ok(result);
         }
 
         let result = handlers::goto_definition_with_cancel(
@@ -12697,6 +12768,371 @@ lineLength = 200
         } else {
             Vec::new()
         }
+    }
+
+    fn assert_completion_response_contains(
+        response: &Option<tower_lsp::lsp_types::CompletionResponse>,
+        expected: &str,
+    ) {
+        let Some(response) = response else {
+            panic!("expected completion response containing {expected}");
+        };
+        let contains = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => {
+                items.iter().any(|item| item.label == expected)
+            }
+            tower_lsp::lsp_types::CompletionResponse::List(list) => {
+                list.items.iter().any(|item| item.label == expected)
+            }
+        };
+        assert!(
+            contains,
+            "expected completion response to contain {expected}: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_member_completion_resolves_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nfoo <- list(bar = 1)\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nfoo$";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 4);
+        let (member_context, snapshot) = {
+            let state = backend.state.read().await;
+            let member_context =
+                crate::handlers::prepare_dollar_member_completion(&state, &uri, position)
+                    .expect("dollar-member context must prepare under read lock");
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (member_context, snapshot)
+        };
+
+        let _write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot scope resolution");
+        let items = crate::handlers::dollar_member_completion_items_from_snapshot(
+            &snapshot,
+            &uri,
+            position,
+            &member_context,
+        );
+        assert!(
+            items.iter().any(|item| item.label == "bar"),
+            "snapshot-qualified completion should resolve while WorldState is write-locked: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identifier_completion_resolves_standalone_cache_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_sym <- 1\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchi";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 3);
+
+        {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_completion_for_scope_snapshot(
+                &state, &uri, position, None,
+            );
+            assert!(
+                matches!(
+                    prepared,
+                    crate::handlers::PreparedScopeCompletion::General { .. }
+                ),
+                "fixture should take the general identifier completion path"
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let response = crate::handlers::completion_from_scope_snapshot(
+                &snapshot, &uri, position, prepared,
+            );
+            assert_completion_response_contains(&response, "child_sym");
+        }
+
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_completion_for_scope_snapshot(
+                &state, &uri, position, None,
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot completion");
+        let response =
+            crate::handlers::completion_from_scope_snapshot(&snapshot, &uri, position, prepared);
+        assert_completion_response_contains(&response, "child_sym");
+        drop(write_guard);
+
+        let cache_hits = backend
+            .state
+            .read()
+            .await
+            .standalone_scope_cache
+            .stats_for_test()
+            .0;
+        assert!(
+            cache_hits > 0,
+            "second identifier completion should hit the persistent standalone cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn parameter_completion_resolves_standalone_function_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_fn <- function(alpha, beta = 1) alpha\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchild_fn(1)";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 9);
+
+        {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_completion_for_scope_snapshot(
+                &state, &uri, position, None,
+            );
+            assert!(
+                matches!(
+                    prepared,
+                    crate::handlers::PreparedScopeCompletion::General {
+                        parameter_completion: Some(_)
+                    }
+                ),
+                "fixture should prepare a parameter-completion context"
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let response = crate::handlers::completion_from_scope_snapshot(
+                &snapshot, &uri, position, prepared,
+            );
+            assert_completion_response_contains(&response, "alpha");
+        }
+
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_completion_for_scope_snapshot(
+                &state, &uri, position, None,
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot parameter completion");
+        let response =
+            crate::handlers::completion_from_scope_snapshot(&snapshot, &uri, position, prepared);
+        assert_completion_response_contains(&response, "alpha");
+        drop(write_guard);
+    }
+
+    #[tokio::test]
+    async fn signature_help_resolves_standalone_function_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_fn <- function(alpha, beta = 1) alpha\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchild_fn(1)";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 9);
+
+        {
+            let state = backend.state.read().await;
+            let prepared =
+                crate::handlers::prepare_signature_help_for_scope_snapshot(&state, &uri, position)
+                    .expect("signature-help context should prepare");
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let ctx =
+                crate::handlers::signature_help_context_from_snapshot(&snapshot, &uri, prepared)
+                    .expect("signature-help context should resolve from snapshot");
+            let help = crate::handlers::resolve_signature_help(ctx)
+                .await
+                .expect("signature help should resolve");
+            assert!(
+                help.signatures
+                    .iter()
+                    .any(|sig| sig.label.contains("alpha")),
+                "signature help should include the cross-file function parameters: {help:?}"
+            );
+        }
+
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared =
+                crate::handlers::prepare_signature_help_for_scope_snapshot(&state, &uri, position)
+                    .expect("signature-help context should prepare");
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot signature help");
+        let ctx = crate::handlers::signature_help_context_from_snapshot(&snapshot, &uri, prepared)
+            .expect("signature-help context should resolve while WorldState is write-locked");
+        drop(write_guard);
+        let help = crate::handlers::resolve_signature_help(ctx)
+            .await
+            .expect("signature help should resolve");
+        assert!(
+            help.signatures
+                .iter()
+                .any(|sig| sig.label.contains("alpha")),
+            "signature help should include the cross-file function parameters: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_root_eof_snapshot_uses_cache_with_empty_package_contribution() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("leaf.R"), "leaf_sym <- 1\n").unwrap();
+        let child = "# raven: standalone\nsource(\"leaf.R\")\nstandalone_sym <- leaf_sym\n";
+        fs::write(tmp.path().join("child.R"), child).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "child.R", "r", child).await;
+        let backend = svc.inner();
+
+        let first_snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::CrossFileScopeSnapshot::build(&state, &uri)
+        };
+        let mut first_prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let first = first_snapshot.scope_at(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &crate::handlers::DiagCancelToken::never(),
+            &mut first_prefix_cache,
+        );
+        assert!(
+            first.symbols.contains_key("leaf_sym"),
+            "fixture sanity: root EOF scope should resolve the standalone forward closure"
+        );
+
+        let second_snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::CrossFileScopeSnapshot::build(&state, &uri)
+        };
+        let mut second_prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let second = second_snapshot.scope_at(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &crate::handlers::DiagCancelToken::never(),
+            &mut second_prefix_cache,
+        );
+        assert_eq!(first.symbols, second.symbols);
+        assert_eq!(first.chain, second.chain);
+        assert_eq!(
+            first.parent_prefix_symbol_names,
+            second.parent_prefix_symbol_names
+        );
+        assert_eq!(first.visible_positions, second.visible_positions);
+        assert_eq!(first.depth_exceeded, second.depth_exceeded);
+        assert_eq!(first.loaded_packages, second.loaded_packages);
+        assert_eq!(first.inherited_packages, second.inherited_packages);
+        assert_eq!(first.package_origins, second.package_origins);
+
+        let cache_hits = backend
+            .state
+            .read()
+            .await
+            .standalone_scope_cache
+            .stats_for_test()
+            .0;
+        assert!(
+            cache_hits > 0,
+            "second root EOF snapshot query should hit despite the normal empty package contribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_snapshot_resolves_standalone_cache_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_sym <- 1\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchild_sym\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+
+        {
+            let state = backend.state.read().await;
+            let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri)
+                .expect("snapshot must build");
+            let diags = crate::handlers::diagnostics_from_snapshot(
+                &snapshot,
+                &uri,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .unwrap_or_default();
+            assert!(
+                !diags.iter().any(|diag| diag.message.contains("child_sym")),
+                "warm-up diagnostics should resolve the standalone child: {diags:?}"
+            );
+        }
+
+        let snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::build(&state, &uri).expect("snapshot must build")
+        };
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot diagnostics");
+        let diags = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        assert!(
+            !diags.iter().any(|diag| diag.message.contains("child_sym")),
+            "snapshot diagnostics should resolve while WorldState is write-locked: {diags:?}"
+        );
+        drop(write_guard);
+        let cache_hits = backend
+            .state
+            .read()
+            .await
+            .standalone_scope_cache
+            .stats_for_test()
+            .0;
+        assert!(
+            cache_hits > 0,
+            "second diagnostics snapshot should hit the persistent standalone cache"
+        );
     }
 
     /// Flag #1: an open Rmd whose chunk `source()`s an existing helper must

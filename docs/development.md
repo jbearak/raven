@@ -218,7 +218,8 @@ The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX,
 
 The hash is deterministic and includes:
 - Exported symbols — each hashed through `impl Hash for ScopedSymbol`, which covers that type's full identity field set (`name`, `kind`, `source_uri`, `defined_line`, `defined_column`, `signature`, `is_declared`) and deliberately excludes only `defined_end_column` (positional highlight metadata). `Hash` must mirror `PartialEq` field-for-field: a field present in one but not the other makes the hash blind to that kind of edit. The `signature` inclusion (issue #482) is what makes a formals-only edit (`f <- function(a)` → `f <- function(a, b)`) bust the hash and revalidate dependents; `scoped_symbol_hash_eq_field_parity` pins the two impls' field sets together.
-- Loaded packages (from `library()` / `require()` / `loadNamespace()`)
+- Package loads (package name, position, and function scope from `library()` /
+  `require()` / `loadNamespace()`)
 - Declared symbols (from `# raven: var` / `# raven: func` directives)
 
 The backend uses `old_interface_hash` vs `new_interface_hash` to decide whether to revalidate dependents.
@@ -243,16 +244,39 @@ Default capacities are defined close to each cache:
 Most cache sizes are configurable via VS Code settings and applied during
 initialization/config change. `StandaloneScopeCache` is fixed-size today.
 
-`StandaloneScopeCache` is owned by `WorldState` as an `Arc`. Diagnostic and
-interactive callers clone that `Arc`, plus the current edge revision and package
-configuration generation, while holding the `WorldState` read lock and then drop
-the guard before resolving scope. The key is the standalone callee URI, graph
-edge revision, the callee's path-context fingerprint, a hash of the
-`interface_hash` values for the callee plus its forward closure, and the
-package/config generation. Hits therefore skip re-resolving a
-caller-independent isolated scope only when dependency membership, path
-resolution inputs, exported interfaces, package facts, and depth-sensitive
-config are unchanged.
+`StandaloneScopeCache` is owned by `WorldState` as an `Arc`. Snapshot-based
+diagnostics and scope-bearing interactive paths clone that `Arc`, plus the
+current edge revision and standalone-scope invalidation generation, while
+holding the `WorldState` read lock and then drop the guard before resolving
+scope. Converted interactive paths include identifier completion, parameter
+completion, signature help, diagnostics, and qualified-member completion/hover/
+go-to-definition. General hover/go-to-definition still have legacy direct-scope
+branches; do not add persistent cache lookup/store to a path that still holds
+the `WorldState` guard. The key is the standalone callee URI, graph edge
+revision, the callee's path-context fingerprint, a scope-flavor fingerprint
+(ordinary forward-child vs. root EOF with depth-0 base exports), a hash of the
+`interface_hash` values for the callee plus its forward closure (walked through
+the same active path contexts used by isolated resolution), the active closure
+context fingerprint, whether a `DataAliasProvider` is available, the package
+library cache epoch, and the standalone-scope invalidation generation. Hits
+therefore skip re-resolving a caller-independent isolated scope only when
+dependency membership, path resolution inputs, root/child scope flavor, exported
+interfaces, active closure edges/path contexts, provider availability, package
+facts, and depth-sensitive config are unchanged. Provider content itself comes
+from the package library and is covered by the package cache epoch rather than
+by hashing the provider object.
+
+Some isolated closures are intentionally resolved but not persisted: if the
+active closure reaches a member whose artifacts are missing from the snapshot,
+reaches the same URI under multiple active path contexts, forms an active path
+cycle, or the resolution graph handed to the scope query is cyclic, the resolver
+still applies the standalone closure context for the current query but skips the
+cross-snapshot cache lookup/store.
+
+Snapshots also materialize active standalone-closure targets discovered through
+those path contexts, even when the globally indexed dependency neighborhood
+points at a different URI. This keeps the later lock-free scope resolution
+complete without reacquiring `WorldState`.
 
 While computing a standalone callee's isolated scope, recursive parent-prefix
 walks for non-standalone members of the callee's forward closure are restricted
@@ -277,7 +301,7 @@ Raven intentionally keeps `tower-lsp` at `.concurrency_level(1)` so text-sync no
 
 Raven keeps `tower-lsp` at `.concurrency_level(1)` to preserve ordered text sync, which means tower-lsp's built-in `$/cancelRequest` notification can be delayed behind the in-flight request it is supposed to cancel. `start_lsp()` wraps the `LspService` in `RequestCancellationService`, which intercepts `$/cancelRequest` synchronously in `Service::call` and records cancellations in a request-id keyed registry before tower-lsp queues the notification.
 
-Interactive handlers that can spend noticeable time in cross-file scope resolution should use a request-scoped `DiagCancelToken` from the registry and poll it through long loops and scope helpers. Qualified-member go-to-definition threads this token through `goto_definition_with_cancel` → `resolve_qualified_member_with_cancel` → `get_cross_file_scope_with_cache`, including per-candidate validation. New interactive multi-position resolvers should follow the same pattern: keep a request-local `ParentPrefixCache`, pass the token into every scope lookup, and check the token between candidate batches while still preserving a single `WorldState` snapshot.
+Interactive handlers that can spend noticeable time in cross-file scope resolution should use a request-scoped `DiagCancelToken` from the registry and poll it through long loops and scope helpers. Qualified-member go-to-definition threads this token through `goto_definition_with_cancel` → `resolve_qualified_member_with_cancel` → `CrossFileScopeSnapshot::scope_at`, including per-candidate validation. New interactive multi-position resolvers should follow the same pattern: clone the required scope inputs into a `CrossFileScopeSnapshot`, keep a request-local `ParentPrefixCache`, pass the token into every scope lookup, and check the token between candidate batches without holding the `WorldState` lock across resolution.
 
 ### Semantic tokens
 
