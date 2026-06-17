@@ -121,52 +121,55 @@ source("child.R")
 source("utils.R")  # Resolves to <workspace>/data/project/utils.R
 ```
 
-## Standalone Module Directive
+## Self-Contained Sourced Files
 
 ```r
-# raven: standalone
-# @lsp-standalone        # alias
+# raven: self-contained
+# raven: standalone          # alias
+# @lsp-self-contained        # alias
+# @lsp-standalone            # alias
 ```
 
-Place `# raven: standalone` in the **header** of a sourced *library* file to
-declare it self-contained. It takes no arguments and is **header-only** (it must
-appear before any code; a `standalone` token after code is ignored).
+Place `# raven: self-contained` in the **header** of a sourced helper, setup,
+or library-style file to declare that it does not rely on caller-provided
+bindings. It takes no arguments and is **header-only** (it must appear before
+any code; a `self-contained` or `standalone` token after code is ignored).
 
-A standalone file is resolved **in isolation** from the files that `source()`
-it — both when computing its own diagnostics and when it is pulled in as another
-file's forward `source()` child:
+A self-contained file is resolved **in isolation** from the files that
+`source()` it - both when computing its own diagnostics and when it is pulled in
+as another file's forward `source()` child:
 
-- It does **not** inherit symbols, loaded packages, working directory, or
-  data-alias provider from any caller — no backward parent-prefix walk, and a
-  caller's forward resolution feeds it canonical, caller-independent inputs. Its
-  cross-file scope is a pure function of the file itself and its own forward
-  `source()` closure, not of who sources it.
+- It does **not** inherit variables, loaded packages, or working directory from
+  any caller - no backward parent-prefix walk, and a caller's forward resolution
+  feeds it canonical, caller-independent inputs. Its cross-file scope is a pure
+  function of the file itself and its own forward `source()` closure, not of who
+  sources it.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.
 - Its own `rm()`/`remove()` of its own symbols still affects what it exports
   (unchanged); it never removes a caller's bindings.
 
-**When to use it.** A self-contained helper/library file that is sourced by many
-others (a hub). Declaring it standalone both **prevents** caller-union
-over-approximation (one caller's bindings leaking into the file's analysis on
-behalf of another) and makes Raven much faster on hub-heavy workspaces: because
-the file's scope no longer depends on its callers, Raven resolves it once and
-reuses that result across all of them, across edit-triggered revalidation, and
-across keystrokes (a persistent cache), instead of re-resolving it per caller.
+**When to use it.** A self-contained helper/setup file that is sourced by many
+others, especially when that hub also sources a deep or broad chain of files.
+Declaring it self-contained both **prevents** caller-union over-approximation
+(one caller's bindings leaking into the file's analysis on behalf of another)
+and can make Raven much faster on deeply nested, high-fan-out source graphs.
 
 **Opt-in and safe-direction.** You vouch that the file is self-contained. If it
 actually relies on a binding a caller provides, the worst case is a
-false-positive *“undefined variable”* **inside the standalone file itself** —
+false-positive *"undefined variable"* **inside the self-contained file itself** -
 never a hidden real bug in a caller. (Mark the *root* setup file that provides
-the shared environment as standalone, not a leaf that consumes it.)
+the shared environment as self-contained, not a leaf that consumes it.)
 
-**Interactions.** `standalone` only suppresses the *caller→file* direction. It
-composes with `# raven: cd` (the file uses its own working directory),
-`# raven: nse` / `# raven: func` (directive propagation over `source()` edges is
-unaffected), package mode, and per-call `local = TRUE` / `sys.source()` (which
-govern how a *caller* sources the file, independent of the file's own
-isolation). See `docs/cross-file.md` for the resolution model.
+**Interactions.** `self-contained` only suppresses the *caller -> file*
+direction. It composes with `# raven: cd` (the file uses its own working
+directory), `# raven: nse` / `# raven: func` (directive propagation over
+`source()` edges is unaffected), package mode, and per-call `local = TRUE` /
+`sys.source()` (which govern how a *caller* sources the file, independent of
+the file's own isolation). See [Speeding Up Cross-File Analysis](cross-file-analysis-performance.md)
+for the practical guidance and [Cross-File Analysis](cross-file.md) for the
+resolution model.
 
 ## Declaration Directives
 
@@ -462,4 +465,3 @@ extend the unused-suppression sweep to **every** ignore directive
 Inside `.Rmd` / `.qmd` documents you can suppress a whole chunk with the knitr
 chunk option `raven.ignore` or the in-chunk `# raven: ignore-chunk` directive.
 See [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk).
-

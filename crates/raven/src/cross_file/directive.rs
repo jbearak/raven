@@ -494,13 +494,19 @@ fn patterns() -> &'static DirectivePatterns {
                 ]
                 .concat(),
             ).unwrap(),
-            // Callee-side "standalone module" directive (issue #479):
-            // `# raven: standalone` (alias `@lsp-standalone`). Header-only,
-            // file-level, no payload. End-anchored with an optional trailing
-            // `# comment`, so stray trailing text fails to match (a malformed
-            // payload is ignored rather than half-parsed).
+            // Callee-side "self-contained source" directive (issue #479):
+            // `# raven: self-contained` / `# raven: standalone` (and their
+            // `@lsp-` aliases). Header-only, file-level, no payload.
+            // End-anchored with an optional trailing `# comment`, so stray
+            // trailing text fails to match (a malformed payload is ignored
+            // rather than half-parsed).
             standalone: Regex::new(
-                &[r"^\s*#\s*", DIRECTIVE_PREFIX, r"standalone\s*(?:#.*)?$"].concat(),
+                &[
+                    r"^\s*#\s*",
+                    DIRECTIVE_PREFIX,
+                    r"(?:self-contained|standalone)\s*(?:#.*)?$",
+                ]
+                .concat(),
             )
             .unwrap(),
         }
@@ -600,13 +606,16 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             continue;
         }
 
-        // Header-only: standalone-module directive (issue #479). File-level, no
-        // payload. Like the backward/working-dir directives it is only honored
-        // in the header so a `standalone` token deeper in the file (e.g. inside
-        // a string or a later comment) cannot retroactively change the file's
-        // cross-file scoping semantics.
+        // Header-only: self-contained source directive (issue #479).
+        // File-level, no payload. Like the backward/working-dir directives it
+        // is only honored in the header so a later `self-contained` /
+        // `standalone` token (e.g. inside a string or a later comment) cannot
+        // retroactively change the file's cross-file scoping semantics.
         if in_header && patterns.standalone.is_match(line) {
-            log::trace!("  Parsed standalone directive at line {}", line_num);
+            log::trace!(
+                "  Parsed self-contained/standalone directive at line {}",
+                line_num
+            );
             meta.standalone = true;
             continue;
         }
@@ -2851,8 +2860,18 @@ x <- undefined"#;
     }
 
     #[test]
+    fn self_contained_directive_sets_flag() {
+        assert!(parse_directives("# raven: self-contained\nx <- 1\n").standalone);
+    }
+
+    #[test]
     fn standalone_directive_lsp_alias_sets_flag() {
         assert!(parse_directives("# @lsp-standalone\nx <- 1\n").standalone);
+    }
+
+    #[test]
+    fn self_contained_directive_lsp_alias_sets_flag() {
+        assert!(parse_directives("# @lsp-self-contained\nx <- 1\n").standalone);
     }
 
     #[test]
@@ -2861,10 +2880,22 @@ x <- undefined"#;
     }
 
     #[test]
+    fn self_contained_directive_allows_trailing_comment() {
+        assert!(parse_directives("# raven: self-contained  # a module\n").standalone);
+    }
+
+    #[test]
     fn standalone_directive_is_header_only() {
         // A `standalone` token after code must NOT set the flag (header-only,
         // like the backward/working-dir directives).
         assert!(!parse_directives("x <- 1\n# raven: standalone\n").standalone);
+    }
+
+    #[test]
+    fn self_contained_directive_is_header_only() {
+        // A `self-contained` token after code must NOT set the flag
+        // (header-only, like the backward/working-dir directives).
+        assert!(!parse_directives("x <- 1\n# raven: self-contained\n").standalone);
     }
 
     #[test]
@@ -2877,5 +2908,12 @@ x <- undefined"#;
         // End-anchored: an unexpected payload fails to match rather than being
         // half-parsed.
         assert!(!parse_directives("# raven: standalone foo\n").standalone);
+    }
+
+    #[test]
+    fn self_contained_directive_rejects_payload() {
+        // End-anchored: an unexpected payload fails to match rather than being
+        // half-parsed.
+        assert!(!parse_directives("# raven: self-contained foo\n").standalone);
     }
 }

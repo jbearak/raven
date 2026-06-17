@@ -84,6 +84,7 @@ Each feature above links to its own page. Beyond those:
 - [CLI](docs/cli.md) — `raven check` (full diagnostics) and `raven lint` (style) for CI and command-line usage
 - [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
 - [Non-Standard Evaluation](docs/non-standard-evaluation.md) — How Raven handles NSE, when to add `# raven: nse`, and when to use other escape hatches
+- [Speeding Up Cross-File Analysis](docs/cross-file-analysis-performance.md) — When `# raven: self-contained` improves analysis of high-fan-out source graphs
 - [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
 - [Chunk Keybinding Comparison](docs/keybinding-comparison.md) — Chunk shortcuts across Raven, Quarto, RStudio, and REditorSupport
