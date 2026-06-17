@@ -64858,6 +64858,24 @@ mod issue_459_backtick_navigation_tests {
         );
     }
 
+    /// A malformed multi-index assignment (`x[["a", "b"]] <- 1`, which R reads as
+    /// `x[["a"]][["b"]] <- 1`) must NOT be collected as a definition of `x$a` —
+    /// the read and write sides share the sole-positional-string shape rule, so
+    /// goto from `x[["a"]]` only lands on a genuine single-member definition.
+    #[test]
+    fn goto_does_not_resolve_to_multiarg_assignment() {
+        let mut state = create_state();
+        let code = "x <- list(a = 0)\nx[[\"a\", \"b\"]] <- 1\nx[[\"a\"]]\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on the final `x[["a"]]` (line 2). The only valid definition is
+        // the constructor on line 0 — never the recursive-index assignment.
+        let l = scalar(goto_definition(&state, &uri, Position::new(2, 4)));
+        assert_eq!(
+            l.range.start.line, 0,
+            "must resolve to the list() construction, not the `[[\"a\", \"b\"]] <- ` assignment"
+        );
+    }
+
     /// A multi-argument terminal `[[` is not a single static member.
     #[test]
     fn goto_from_multiarg_subscript_declines() {

@@ -240,9 +240,28 @@ fn subset2_sole_string_subscript<'a>(
         return None;
     }
     let args = subset2.child_by_field_name("arguments")?;
+    sole_positional_string_arg(args, text)
+}
+
+/// The sole positional literal-string argument of an `arguments` node, returned
+/// as `(bare value, string node)`. `None` unless the arguments are **exactly
+/// one positional** (unnamed) `string` whose value is simple (see
+/// [`simple_string_literal_value`]): a second `argument` (multi-index
+/// `x[["a", "b"]]` / `x[["a", exact = FALSE]]`), a named argument
+/// (`x[[name = "a"]]`), a non-string value (`x[[1]]`, `x[[i]]`), or an
+/// escaped/empty/multiline string all yield `None`.
+///
+/// This is the one shape rule shared by the **read** side (the `[[` member
+/// predicate [`subset2_sole_string_subscript`], used for go-to-definition /
+/// hover / find-references entry) and the **write** side
+/// ([`member_assignment_candidate_from_string_subscript`], which collects
+/// `foo[["bar"]] <- …` definitions). Keeping them on one helper prevents the
+/// read and write sides from disagreeing on which `[[`/`[` subscripts count as
+/// a single static member — e.g. so `x[["a", "b"]] <- 1` (R recursive indexing,
+/// `x[["a"]][["b"]] <- 1`) is never mistaken for a definition of `x$a`.
+fn sole_positional_string_arg<'a>(args: Node<'a>, text: &'a str) -> Option<(&'a str, Node<'a>)> {
     // The subscript is always an `argument` node (tree-sitter-r wraps it even
-    // when positional). Require exactly one — a second `argument` means a
-    // multi-index `[[`, which is not a single static member.
+    // when positional). Require exactly one.
     let mut walker = args.walk();
     let mut the_arg: Option<Node> = None;
     for child in args.children(&mut walker) {
@@ -440,8 +459,10 @@ fn member_assignment_candidate_from_string_subscript(
     }
     let head_id = leftmost_identifier(t_lhs)?;
     let args = target.child_by_field_name("arguments")?;
-    let string_node = first_direct_string_argument(args)?;
-    let member_name = simple_string_literal_value(string_node, text)?;
+    // Same sole-positional-string shape rule as the read side: a multi-index /
+    // named subscript assignment (`x[["a", "b"]] <- …`, R recursive indexing)
+    // is NOT a definition of the first member, so it must not be collected.
+    let (member_name, string_node) = sole_positional_string_arg(args, text)?;
     if rhs_name.is_some_and(|rhs_name| member_name != rhs_name) {
         return None;
     }
@@ -454,22 +475,6 @@ fn member_assignment_candidate_from_string_subscript(
         fn_scope: enclosing_function_id(assignment),
         lhs_pos: lhs_range.start,
     })
-}
-
-fn first_direct_string_argument(args: Node) -> Option<Node> {
-    let mut walker = args.walk();
-    for child in args.children(&mut walker) {
-        if child.kind() == "string" {
-            return Some(child);
-        }
-        if child.kind() == "argument"
-            && let Some(value) = child.child_by_field_name("value")
-            && value.kind() == "string"
-        {
-            return Some(value);
-        }
-    }
-    None
 }
 
 fn simple_string_literal_value<'a>(node: Node, text: &'a str) -> Option<&'a str> {
