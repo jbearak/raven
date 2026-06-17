@@ -13859,6 +13859,58 @@ fn collect_nse_facts<'t>(
     }
 }
 
+/// Issue #475: the canonical names of file-local top-level `name <-
+/// function(...)` definitions — the functions whose bodies raven statically
+/// analyzed. The code-action handler passes this to [`nse_quick_fix_edit`] to
+/// suppress the speculative "declare # raven: nse" fix for a bare call to such a
+/// function, mirroring [`nse_hint_for_usage`]'s inline-hint suppression (which
+/// reads the same `local_function_defs` keys off the already-built
+/// `NseAnalysis`). Runs the shared [`collect_nse_facts`] walk — the single source
+/// of "what is a local function definition" — so the two paths cannot drift.
+/// Aliases (`f <- pkg::g`) and non-callable bindings are excluded by
+/// `collect_nse_facts`: an alias targets an unanalyzable package function, so a
+/// surviving diagnostic on its call keeps the hint.
+///
+/// The set is last-binding-wins (inherited from `collect_nse_facts`, matching
+/// `local_function_policies` on the diagnostic-path `NseAnalysis`): a name
+/// redefined within the file is classified by its FINAL top-level binding. So in
+/// the unusual shape `f <- pkg::g; f(undef); f <- function(x) x`, the earlier
+/// alias call is suppressed because `f`'s final binding is a definition — the
+/// same imprecision the policy resolver already had, in the safe (over-suppress)
+/// direction, not a behavior this helper introduces.
+pub(crate) fn collect_local_function_def_names(root: Node, text: &str) -> HashSet<String> {
+    let mut local_function_defs: HashMap<String, Node> = HashMap::new();
+    // Disabled: the formal-order tracker only feeds per-formal directive
+    // resolution, which the code-action path does not perform.
+    let mut formal_order = FormalOrderTracker::default();
+    let mut local_callee_shadows = HashSet::new();
+    let mut local_callee_aliases = HashMap::new();
+    let mut data_table_objects = HashSet::new();
+    let mut non_data_table_objects = HashSet::new();
+    let mut class_transitions = HashMap::new();
+    let mut reference_class_generators = HashMap::new();
+    let mut reference_class_by_class = HashMap::new();
+    let mut reference_class_method_functions = HashMap::new();
+    let mut data_table_qualifier_seen = false;
+    collect_nse_facts(
+        root,
+        text,
+        &mut local_function_defs,
+        &mut formal_order,
+        &mut local_callee_shadows,
+        &mut local_callee_aliases,
+        &mut data_table_objects,
+        &mut non_data_table_objects,
+        &mut class_transitions,
+        &mut reference_class_generators,
+        &mut reference_class_by_class,
+        &mut reference_class_method_functions,
+        &mut data_table_qualifier_seen,
+        false,
+    );
+    local_function_defs.into_keys().collect()
+}
+
 /// Gather helper names from `Generator$methods(name = helper)` registrations.
 /// Direct `function(...)` values are recognized from their syntax later; only
 /// identifier-valued helpers need this file-level pre-pass.
@@ -14912,7 +14964,15 @@ fn nse_hint_for_usage<'t>(
     text: &'t str,
     analysis: &NseAnalysis<'_>,
 ) -> Option<(String, Option<String>)> {
-    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, analysis.base_exports)?;
+    // Issue #475: suppress the hint for a bare call to a file-local function
+    // definition (raven analyzed its body). Read the `local_function_policies`
+    // keys directly off the already-built analysis — the code-action twin
+    // ([`nse_quick_fix_edit`]) recomputes the identical set via
+    // [`collect_local_function_def_names`], so the two paths share the signal.
+    let (call, callee, formal) =
+        nse_eligible_call_arg(usage_node, text, analysis.base_exports, |n| {
+            analysis.local_function_policies.contains_key(n)
+        })?;
     // Discoverability only: suppress the hint when a `# raven: nse` directive
     // ALREADY governs this exact call. A surviving diagnostic under a governing
     // directive is on an argument the user deliberately left uncaptured, so
@@ -15006,9 +15066,10 @@ fn nse_eligible_call_arg<'t>(
     usage_node: Node<'t>,
     text: &'t str,
     base_exports: Option<&HashSet<String>>,
+    is_local_fn_def: impl Fn(&str) -> bool,
 ) -> Option<(Node<'t>, String, Option<String>)> {
     let (call, callee, formal) = enclosing_call_arg_context(usage_node, text)?;
-    let (_pkg, bare) = split_callee_qualifier(&callee);
+    let (pkg, bare) = split_callee_qualifier(&callee);
     // Canonicalize a redundantly backticked syntactic callee before the
     // builtin/base filter (issue #460 Codex review): `resolve_call_arg_policy`
     // canonicalizes too, so `` `mean`(missing) `` / `` base::`paste`(missing) ``
@@ -15016,6 +15077,21 @@ fn nse_eligible_call_arg<'t>(
     // miss `is_builtin`/`base_exports` and offer a misleading `# raven: nse` fix.
     let bare = crate::r_names::canonical_use_name(bare);
     if is_builtin(bare) || base_exports.is_some_and(|e| e.contains(bare)) {
+        return None;
+    }
+    // Issue #475: a BARE call to a file-local `name <- function(...)` definition
+    // invokes a function whose body raven statically analyzed — raven already
+    // knows its NSE surface (or that it has none), so the speculative "if this
+    // captures the argument with NSE, declare it with # raven: nse" hint is
+    // unwarranted, and acting on it would mislabel an ordinary undefined variable
+    // as a masked symbol. Reserve the hint/quick-fix for package functions raven
+    // cannot see into. Two deliberate restrictions:
+    //   * UNQUALIFIED callees only — a `pkg::name(...)` call invokes the package
+    //     export, never a same-named local binding, so it keeps the hint.
+    //   * literal function DEFINITIONS only — aliases (`f <- pkg::g`) are NOT in
+    //     this set; their target is an unanalyzable package function, so a
+    //     surviving diagnostic on such a call keeps the hint.
+    if pkg.is_none() && is_local_fn_def(bare) {
         return None;
     }
     // A non-syntactic named-argument label (e.g. `` `weird name` = x ``) cannot
@@ -15052,12 +15128,20 @@ pub(crate) struct NseQuickFix {
 /// text the node's tree was parsed from. `base_exports`, when supplied, filters
 /// out base-package callees so the quick-fix matches [`nse_hint_for_usage`]:
 /// declaring NSE on a standard-eval base function is never the right fix.
+/// `local_fn_defs`, when supplied, names the file's top-level `name <-
+/// function(...)` definitions (from [`collect_local_function_def_names`]); a bare
+/// call to one is suppressed (issue #475), mirroring the inline-hint suppression
+/// in [`nse_hint_for_usage`] so the message hint and the lightbulb stay in
+/// lockstep on what counts as an NSE candidate.
 pub(crate) fn nse_quick_fix_edit(
     usage_node: Node,
     text: &str,
     base_exports: Option<&HashSet<String>>,
+    local_fn_defs: Option<&HashSet<String>>,
 ) -> Option<NseQuickFix> {
-    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, base_exports)?;
+    let (call, callee, formal) = nse_eligible_call_arg(usage_node, text, base_exports, |n| {
+        local_fn_defs.is_some_and(|s| s.contains(n))
+    })?;
     let insert_line = call.start_position().row as u32;
     let indent: String = text
         .lines()
@@ -60335,15 +60419,15 @@ my_func <- function(a = default_value) {
         );
     }
 
-    // Issue #455: when an `undefined-variable` diagnostic fires for an
-    // identifier inside a non-builtin call argument, the message should
-    // suggest `# raven: nse` to aid discoverability.
+    // Issue #455 + #475: when an `undefined-variable` diagnostic fires for an
+    // identifier inside a call argument to a PACKAGE function raven cannot
+    // analyze, the message suggests `# raven: nse` for discoverability. (Per
+    // #475 the hint is NOT emitted for user-defined functions raven analyzed.)
     #[test]
     fn undefined_in_user_call_arg_gets_nse_hint() {
-        // Local user function, no NSE declared: undefined `x` in its arg gets a hint.
-        let diags = collect_undefined_messages(
-            "my_filter <- function(df, cond) df\nmy_filter(real_df, x)\n",
-        );
+        // Qualified package callee, no NSE declared: undefined `x` in its arg
+        // gets a hint (raven cannot see the package function's body).
+        let diags = collect_undefined_messages("somepkg::my_filter(real_df, x)\n");
         let d = diags
             .iter()
             .find(|m| m.contains("Undefined variable: x"))
@@ -60360,16 +60444,15 @@ my_func <- function(a = default_value) {
         // formal in the directive grammar (`split_formal_list` rejects it), so a
         // `# raven: nse my_fn(`weird name`)` suggestion would silently re-parse
         // to whole-call. The hint must instead fall back to the parseable
-        // formal-less func+nse suggestion.
-        let diags = collect_undefined_messages(
-            "my_fn <- function(`weird name`) `weird name`\nmy_fn(`weird name` = undef)\n",
-        );
+        // formal-less func+nse suggestion. Uses a qualified package callee so the
+        // call is hint-eligible under issue #475.
+        let diags = collect_undefined_messages("pkgx::my_fn(`weird name` = undef)\n");
         let d = diags
             .iter()
             .find(|m| m.contains("Undefined variable: undef"))
             .expect("undef reported");
         assert!(
-            !d.contains("nse my_fn(`weird name`)"),
+            !d.contains("nse pkgx::my_fn(`weird name`)"),
             "must not propose an unparseable per-formal directive: {d}"
         );
         assert!(
@@ -60379,12 +60462,13 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
-    fn nse_hint_suggestion_quotes_nonsyntactic_callee() {
-        // The suggested directive for a NON-SYNTACTIC callee must use the quoted
-        // form (`"my data fn"`) so it parses — not the raw backtick spelling,
-        // which the directive grammar rejects (the suggestion would then silently
-        // never govern). Guards `callee_directive_form` through the emit path;
-        // other backtick-callee tests only hand-write quoted directives.
+    fn no_nse_hint_for_nonsyntactic_local_function_def() {
+        // Issue #475: a non-syntactic LOCAL function definition is still a
+        // function raven statically analyzed; a bare call to it gets no hint.
+        // (Quoting of a non-syntactic callee in the suggestion stays covered for
+        // the still-eligible qualified case by
+        // `nse_hint_suggestion_quotes_whole_qualified_nonsyntactic_callee` and
+        // for the quick-fix by `nse_quick_fix_quotes_nonsyntactic_callee`.)
         let diags = collect_undefined_messages(
             "`my data fn` <- function(df, cond) df\n`my data fn`(real_df, undef_arg)\n",
         );
@@ -60393,12 +60477,8 @@ my_func <- function(a = default_value) {
             .find(|m| m.contains("Undefined variable: undef_arg"))
             .expect("undef_arg reported");
         assert!(
-            d.contains("# raven: func \"my data fn\""),
-            "suggestion must quote the non-syntactic callee: {d}"
-        );
-        assert!(
-            !d.contains("# raven: func `my data fn`"),
-            "suggestion must not emit the raw backtick callee form: {d}"
+            !d.contains("# raven: nse") && !d.contains("# raven: func"),
+            "no hint for a (non-syntactic) user-defined function: {d}"
         );
     }
 
@@ -60570,9 +60650,11 @@ my_func <- function(a = default_value) {
     fn nse_hint_fires_when_directive_is_after_the_call() {
         // A directive written AFTER the call does not govern it, so the hint
         // must still fire on the earlier call (suppression is position-aware).
-        let diags = collect_undefined_messages(
-            "my_func <- function(a) a\nmy_func(undef_arg)\n# raven: nse my_func\n",
-        );
+        // Uses a qualified package callee so the call is hint-eligible under
+        // issue #475 (a same-named local def would be suppressed regardless of
+        // directive position; that is covered by its own test).
+        let diags =
+            collect_undefined_messages("otherpkg::foo(undef_arg)\n# raven: nse otherpkg::foo\n");
         let d = diags
             .iter()
             .find(|m| m.contains("Undefined variable: undef_arg"))
@@ -60580,6 +60662,63 @@ my_func <- function(a = default_value) {
         assert!(
             d.contains("# raven: nse"),
             "hint must fire when the only directive is declared after the call: {d}"
+        );
+    }
+
+    #[test]
+    fn no_nse_hint_for_user_defined_function_arg() {
+        // Issue #475: `getSims` is a same-file standard-eval function raven
+        // statically analyzed; raven already knows it captures nothing, so an
+        // undefined argument must report the plain diagnostic with NO
+        // speculative "maybe declare # raven: nse / # raven: func" hint.
+        let diags = collect_undefined_messages(
+            "getSims <- function(chain, v) chain\ngetSims(ub_chain, \"x\")\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: ub_chain"))
+            .expect("ub_chain flagged");
+        assert!(
+            !d.contains("# raven: nse") && !d.contains("# raven: func"),
+            "no NSE hint for a statically-analyzed user-defined function: {d}"
+        );
+    }
+
+    #[test]
+    fn no_nse_hint_for_user_defined_function_uncaptured_arg() {
+        // Issue #475: even when a local function IS detected as NSE for one
+        // formal (`expr` via substitute), an undefined variable in a
+        // NON-captured argument (`data`) reports plainly — raven knows the
+        // function's full NSE surface, so it never asks the user to declare it.
+        let diags = collect_undefined_messages(
+            "myfn <- function(data, expr) substitute(expr)\nmyfn(undef_data, x + 1)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_data"))
+            .expect("undef_data flagged");
+        assert!(
+            !d.contains("# raven: nse") && !d.contains("# raven: func"),
+            "no NSE hint for an uncaptured arg of an analyzed user-defined function: {d}"
+        );
+    }
+
+    #[test]
+    fn nse_hint_still_fires_for_qualified_package_call_despite_local_def() {
+        // Issue #475: the hint is RESERVED for package functions raven cannot
+        // analyze. A qualified `pkg::fn(...)` call invokes the package export,
+        // not a same-named local binding, so it must keep the hint even when a
+        // local `getSims <- function(...)` exists (the suppression is bare-only).
+        let diags = collect_undefined_messages(
+            "getSims <- function(chain) chain\nsomepkg::getSims(undef_arg)\n",
+        );
+        let d = diags
+            .iter()
+            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .expect("undef_arg flagged");
+        assert!(
+            d.contains("# raven: nse"),
+            "qualified package call keeps the NSE hint despite a same-named local def: {d}"
         );
     }
 
@@ -60745,23 +60884,85 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn nse_quick_fix_inserts_directive_above_call() {
-        let src = "my_filter <- function(df, cond) df\n  my_filter(real_df, x)\n";
+        // A qualified `pkg::verb(...)` call is a package function raven cannot
+        // analyze — exactly the reserved case where the fix is still offered
+        // (issue #475). Verifies insert line, indent preservation, and the
+        // placeholder directive text.
+        let src = "# leading\n  mypkg::my_filter(real_df, undef)\n";
         let tree = parse_r_code(src);
-        // Use the second `x` (the call argument), not the formal in the def.
-        let node = first_ident(tree.root_node(), src, "x");
-        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        let node = first_ident(tree.root_node(), src, "undef");
+        let fix = super::nse_quick_fix_edit(node, src, None, None).expect("edit");
         assert_eq!(fix.insert_line, 1);
-        assert_eq!(fix.text, "  # raven: nse my_filter(CAPTURED_FORMAL)\n");
+        assert_eq!(
+            fix.text,
+            "  # raven: nse mypkg::my_filter(CAPTURED_FORMAL)\n"
+        );
         assert!(fix.title.contains("# raven: nse"));
     }
 
     #[test]
     fn nse_quick_fix_named_arg_uses_formal_name() {
-        let src = "my_filter <- function(df, cond) df\nmy_filter(df = real_df, cond = x)\n";
+        let src = "mypkg::my_filter(df = real_df, cond = undef)\n";
         let tree = parse_r_code(src);
-        let node = first_ident(tree.root_node(), src, "x");
-        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
-        assert_eq!(fix.text, "# raven: nse my_filter(cond)\n");
+        let node = first_ident(tree.root_node(), src, "undef");
+        let fix = super::nse_quick_fix_edit(node, src, None, None).expect("edit");
+        assert_eq!(fix.text, "# raven: nse mypkg::my_filter(cond)\n");
+    }
+
+    #[test]
+    fn nse_quick_fix_suppressed_for_local_function_def() {
+        // Issue #475: a bare call to a file-local `name <- function(...)` def is
+        // a function raven statically analyzed; with that name in `local_fn_defs`
+        // the quick-fix is suppressed (mirroring the inline-hint suppression).
+        // Passing `None` (no local-def info) leaves the fix offered — proving the
+        // set is what drives the suppression.
+        let src = "my_filter <- function(df, cond) df\nmy_filter(real_df, undef)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undef");
+        assert!(
+            super::nse_quick_fix_edit(node, src, None, None).is_some(),
+            "without local-def info the fix is offered"
+        );
+        let local: std::collections::HashSet<String> =
+            std::iter::once("my_filter".to_string()).collect();
+        assert!(
+            super::nse_quick_fix_edit(node, src, None, Some(&local)).is_none(),
+            "a bare call to a local function definition gets no quick-fix"
+        );
+    }
+
+    #[test]
+    fn nse_quick_fix_suppressed_for_nonsyntactic_local_function_def() {
+        // Issue #475 + canonicalization: a non-syntactic local def (`` `my fn` ``)
+        // must be suppressed too. Builds the local-def set via the production
+        // helper `collect_local_function_def_names`, so the test also pins that
+        // its storage key and the call-site lookup key agree for a backticked
+        // name (both keep their required backticks through `canonical_use_name`).
+        let src = "`my fn` <- function(df, cond) df\n`my fn`(real_df, undef)\n";
+        let tree = parse_r_code(src);
+        let root = tree.root_node();
+        let local = super::collect_local_function_def_names(root, src);
+        let node = first_ident(root, src, "undef");
+        assert!(
+            super::nse_quick_fix_edit(node, src, None, Some(&local)).is_none(),
+            "a bare call to a non-syntactic local function definition gets no quick-fix"
+        );
+    }
+
+    #[test]
+    fn nse_quick_fix_qualified_not_suppressed_by_same_named_local_def() {
+        // Issue #475 (bare-only restriction): a qualified `pkg::f(...)` call must
+        // still offer the fix even when `f` is a local function definition — R
+        // invokes the package export, not the local binding.
+        let src = "mypkg::my_filter(real_df, undef)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undef");
+        let local: std::collections::HashSet<String> =
+            std::iter::once("my_filter".to_string()).collect();
+        assert!(
+            super::nse_quick_fix_edit(node, src, None, Some(&local)).is_some(),
+            "qualified call keeps the fix despite a same-named local def"
+        );
     }
 
     #[test]
@@ -60769,7 +60970,7 @@ my_func <- function(a = default_value) {
         let src = "paste(undefined_x)\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "undefined_x");
-        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, None, None).is_none());
     }
 
     #[test]
@@ -60777,7 +60978,7 @@ my_func <- function(a = default_value) {
         let src = "x + 1\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "x");
-        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, None, None).is_none());
     }
 
     #[test]
@@ -60787,7 +60988,7 @@ my_func <- function(a = default_value) {
         let src = "g(undefined_fn(1))\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "undefined_fn");
-        assert!(super::nse_quick_fix_edit(node, src, None).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, None, None).is_none());
     }
 
     #[test]
@@ -60798,11 +60999,11 @@ my_func <- function(a = default_value) {
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "undefined_x");
         // Without base exports, the quick-fix is offered (callee is unresolved).
-        assert!(super::nse_quick_fix_edit(node, src, None).is_some());
+        assert!(super::nse_quick_fix_edit(node, src, None, None).is_some());
         // With `some_base_fn` known as a base export, it is suppressed.
         let base: std::collections::HashSet<String> =
             std::iter::once("some_base_fn".to_string()).collect();
-        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base), None).is_none());
     }
 
     #[test]
@@ -60813,7 +61014,7 @@ my_func <- function(a = default_value) {
         let src = "mypkg::my_verb(masked)\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "masked");
-        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        let fix = super::nse_quick_fix_edit(node, src, None, None).expect("edit");
         assert_eq!(fix.text, "# raven: nse mypkg::my_verb(CAPTURED_FORMAL)\n");
     }
 
@@ -60825,10 +61026,12 @@ my_func <- function(a = default_value) {
     /// a blanket whole-call directive.
     #[test]
     fn nse_quick_fix_placeholder_is_a_no_op_when_applied_verbatim() {
-        let src = "f <- function(a) a\nf(undef)\n";
+        // Qualified callee (a package function raven can't analyze) so the fix is
+        // offered under the issue #475 suppression rules.
+        let src = "mypkg::f(undef)\n";
         let tree = parse_r_code(src);
         let node = first_ident(tree.root_node(), src, "undef");
-        let fix = super::nse_quick_fix_edit(node, src, None).expect("edit");
+        let fix = super::nse_quick_fix_edit(node, src, None, None).expect("edit");
         // The inserted directive must parse as a per-formal directive matching the
         // (nonexistent) placeholder formal — NOT a blanket whole-call directive
         // that would suppress every argument if the user applied the fix verbatim.
@@ -60842,6 +61045,28 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_quick_fix_quotes_nonsyntactic_callee() {
+        // `callee_directive_form` quoting via the quick-fix: a non-syntactic
+        // callee must be quoted (`"my data fn"`) so the inserted directive parses,
+        // not spelled with raw backticks. Passes `None` for `local_fn_defs` (no
+        // local-def info) so the bare callee is treated as eligible.
+        let src = "`my data fn`(real_df, undef_arg)\n";
+        let tree = parse_r_code(src);
+        let node = first_ident(tree.root_node(), src, "undef_arg");
+        let fix = super::nse_quick_fix_edit(node, src, None, None).expect("edit");
+        assert!(
+            fix.text.contains("# raven: nse \"my data fn\""),
+            "must quote the non-syntactic callee: {}",
+            fix.text
+        );
+        assert!(
+            !fix.text.contains("`my data fn`"),
+            "must not emit the raw backtick callee form: {}",
+            fix.text
+        );
+    }
+
+    #[test]
     fn nse_quick_fix_qualified_base_export_filtered_by_bare_suffix() {
         // A qualified `base::paste(...)` is filtered via the bare suffix, just
         // like the bare `paste(...)` builtin.
@@ -60850,7 +61075,7 @@ my_func <- function(a = default_value) {
         let node = first_ident(tree.root_node(), src, "undefined_x");
         let base: std::collections::HashSet<String> =
             std::iter::once("paste".to_string()).collect();
-        assert!(super::nse_quick_fix_edit(node, src, Some(&base)).is_none());
+        assert!(super::nse_quick_fix_edit(node, src, Some(&base), None).is_none());
     }
 }
 

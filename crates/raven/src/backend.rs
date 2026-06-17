@@ -5758,6 +5758,17 @@ impl LanguageServer for Backend {
             } else {
                 Vec::new()
             };
+        // Issue #475: the file's top-level `name <- function(...)` definitions, so
+        // the quick-fix can be suppressed for a bare call to a function raven
+        // statically analyzed — mirroring `nse_hint_for_usage` (which reads the
+        // same set off the diagnostic-path `NseAnalysis`). Computed once per
+        // request, and only when an undefined diagnostic is actually present.
+        let local_fn_defs: std::collections::HashSet<String> =
+            if params.context.diagnostics.iter().any(&is_undefined) {
+                handlers::collect_local_function_def_names(root, &text)
+            } else {
+                std::collections::HashSet::new()
+            };
         for diag in &params.context.diagnostics {
             if !is_undefined(diag) {
                 continue;
@@ -5772,7 +5783,9 @@ impl LanguageServer for Backend {
             let Some(usage_node) = root.descendant_for_point_range(start, end) else {
                 continue;
             };
-            if let Some(fix) = handlers::nse_quick_fix_edit(usage_node, &text, base_exports) {
+            if let Some(fix) =
+                handlers::nse_quick_fix_edit(usage_node, &text, base_exports, Some(&local_fn_defs))
+            {
                 // Skip when a directive already governs this call: the user has
                 // declared NSE for the callee, so offering to (re)declare it
                 // would insert a conflicting directive.
@@ -12268,10 +12281,12 @@ lineLength = 200
             CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
             TextDocumentIdentifier, WorkDoneProgressParams,
         };
-        // `my_fn(undef_a, undef_b)` on line 1: `undef_a` at cols 6-13,
-        // `undef_b` at cols 15-22. Both are positional args of the local
-        // (non-builtin) `my_fn`, so each maps to `# raven: nse my_fn(<formal>)`.
-        let content = "my_fn <- function(a, b) a\nmy_fn(undef_a, undef_b)\n";
+        // `pkg::my_fn(undef_a, undef_b)` on line 1: `undef_a` at cols 11-18,
+        // `undef_b` at cols 20-27. Both are positional args of a qualified
+        // PACKAGE callee (a function raven cannot analyze — the case where the
+        // fix is still offered under issue #475), so each maps to
+        // `# raven: nse pkg::my_fn(<formal>)` and the two must dedupe to one.
+        let content = "# leading\npkg::my_fn(undef_a, undef_b)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
         let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
@@ -12292,7 +12307,7 @@ lineLength = 200
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             range: Range::default(),
             context: CodeActionContext {
-                diagnostics: vec![undef(6, 13), undef(15, 22)],
+                diagnostics: vec![undef(11, 18), undef(20, 27)],
                 only: None,
                 trigger_kind: None,
             },
@@ -12458,16 +12473,17 @@ lineLength = 200
         // governs-check is position-gated (`line < call_line`), so the later
         // directive must NOT suppress the quick-fix for the earlier call — the
         // code-action counterpart of `nse_hint_fires_when_directive_is_after_the_call`.
-        // `masked` (the would-be-captured arg) is at cols 12-18 of line 1.
-        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n# raven: nse my_func(y)\n";
+        // Qualified PACKAGE callee so the call is fix-eligible under issue #475;
+        // `masked` (the would-be-captured arg) is at cols 17-23 of line 1.
+        let content = "# leading\npkg::my_func(p1, masked)\n# raven: nse pkg::my_func(y)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
         let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
 
         let undef_masked = Diagnostic {
             range: Range {
-                start: Position::new(1, 12),
-                end: Position::new(1, 18),
+                start: Position::new(1, 17),
+                end: Position::new(1, 23),
             },
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
@@ -12505,6 +12521,62 @@ lineLength = 200
     }
 
     #[tokio::test]
+    async fn code_action_no_nse_quick_fix_for_local_function_def() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Issue #475 (full code-action path): a bare call to a file-local
+        // function definition raven analyzed gets NO NSE quick-fix, exercising
+        // the `collect_local_function_def_names` wiring in the handler — the
+        // code-action counterpart of the inline-hint suppression. `undef` (the
+        // arg of `my_fn(p1, undef)` on line 1) is at cols 10-15.
+        let content = "my_fn <- function(a, b) a\nmy_fn(p1, undef)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = Diagnostic {
+            range: Range {
+                start: Position::new(1, 10),
+                end: Position::new(1, 15),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "a bare call to a local function definition yields no NSE quick-fix: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn code_action_skips_non_undefined_diagnostic() {
         use tower_lsp::lsp_types::{
             CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
@@ -12514,8 +12586,9 @@ lineLength = 200
         // UNDEFINED_VARIABLE must yield no NSE quick-fix even when it sits on an
         // eligible call argument. The positive control (same range, UNDEFINED
         // code) DOES yield the fix, so the zero below is the filter at work, not
-        // an ineligible setup.
-        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        // an ineligible setup. Qualified PACKAGE callee so the arg (`p1` at cols
+        // 13-15) is fix-eligible under issue #475.
+        let content = "# leading\npkg::my_func(p1, masked)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
         let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
@@ -12526,8 +12599,8 @@ lineLength = 200
             async move {
                 let diag = Diagnostic {
                     range: Range {
-                        start: Position::new(1, 8),
-                        end: Position::new(1, 10),
+                        start: Position::new(1, 13),
+                        end: Position::new(1, 15),
                     },
                     code: Some(NumberOrString::String(code.to_string())),
                     message: "diag".to_string(),
@@ -12578,16 +12651,17 @@ lineLength = 200
         // action even when an eligible undefined-variable diagnostic is present.
         // The same diagnostic with no filter DOES yield the quick-fix, so the
         // zero-count below is the filter at work, not a setup that produced
-        // nothing to filter.
-        let content = "my_func <- function(x, y) x\nmy_func(p1, masked)\n";
+        // nothing to filter. Qualified PACKAGE callee so the arg (`p1` at cols
+        // 13-15) is fix-eligible under issue #475.
+        let content = "# leading\npkg::my_func(p1, masked)\n";
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("t.R"), content).unwrap();
         let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
 
         let undef = Diagnostic {
             range: Range {
-                start: Position::new(1, 8),
-                end: Position::new(1, 10),
+                start: Position::new(1, 13),
+                end: Position::new(1, 15),
             },
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
