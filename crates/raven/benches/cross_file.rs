@@ -19,6 +19,13 @@ use raven::cross_file::{
 };
 use raven::test_utils::fixture_workspace::{FixtureConfig, create_fixture_workspace};
 
+use raven::cross_file::standalone_cache::{StandaloneCacheCtx, StandaloneScopeCache};
+use raven::cross_file::{
+    BackwardDependencyMode, ParentPrefixCache,
+    scope_at_position_with_graph_cached_with_standalone_cache,
+};
+use raven::test_utils::standalone_hub::{HubCorpus, build_hub_corpus};
+
 /// Pre-compute scope artifacts and metadata for all files in a workspace.
 ///
 /// Returns maps keyed by URI for use with `scope_at_position_with_graph`.
@@ -643,6 +650,108 @@ fn bench_dependency_graph(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Benchmark: WI2b standalone-scope cache (issue #483)
+//
+// Resolves a CALLER of a `# raven: standalone` hub at EOF — the depth>=1
+// forward-child path the persistent cache serves (resolving the hub directly is
+// the depth-0 own-root path the cache excludes). Compares cache cold-miss vs
+// warm-hit vs off, the fan-out aggregate, and the single-completion cost, each
+// with vs without the directive. Corpus shape mirrors worldwide (deep/wide) so
+// the directive's benefit is representative.
+// See specs/issue-483-wi2b-benchmarks-design.md.
+// ---------------------------------------------------------------------------
+
+fn resolve_caller(c: &HubCorpus, caller: &Url, ctx: Option<StandaloneCacheCtx>) {
+    let mut prefix_cache = ParentPrefixCache::new();
+    let base: HashSet<String> = HashSet::new();
+    black_box(scope_at_position_with_graph_cached_with_standalone_cache(
+        caller,
+        u32::MAX,
+        u32::MAX,
+        &|u| c.artifacts.get(u).cloned(),
+        &|u| c.metadata.get(u).cloned(),
+        &c.graph,
+        Some(&c.folder),
+        64,
+        &base,
+        true,
+        BackwardDependencyMode::Auto,
+        &|| false,
+        &mut prefix_cache,
+        None,
+        None,
+        ctx,
+    ));
+}
+
+fn ctx_for(c: &HubCorpus, cache: Arc<StandaloneScopeCache>) -> StandaloneCacheCtx {
+    StandaloneCacheCtx {
+        cache,
+        edge_revision: c.graph.edge_revision(),
+        package_config_generation: 0,
+    }
+}
+
+fn bench_standalone_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cross_file_standalone_cache");
+    group.sample_size(20);
+
+    let corpus = build_hub_corpus(true, 50, 3, 80);
+    let nodir = build_hub_corpus(false, 50, 3, 80);
+    let c0 = corpus.caller_uris[0].clone();
+    let n0 = nodir.caller_uris[0].clone();
+
+    // Cache mechanism (given isolation): cold-miss vs warm-hit vs off.
+    group.bench_function("caller_resolve/cold_miss", |b| {
+        b.iter(|| {
+            resolve_caller(
+                &corpus,
+                &c0,
+                Some(ctx_for(&corpus, Arc::new(StandaloneScopeCache::new()))),
+            )
+        })
+    });
+    let warm = Arc::new(StandaloneScopeCache::new());
+    resolve_caller(&corpus, &c0, Some(ctx_for(&corpus, warm.clone())));
+    group.bench_function("caller_resolve/warm_hit", |b| {
+        b.iter(|| resolve_caller(&corpus, &c0, Some(ctx_for(&corpus, warm.clone()))))
+    });
+    group.bench_function("caller_resolve/cache_off", |b| {
+        b.iter(|| resolve_caller(&corpus, &c0, None))
+    });
+
+    // Directive's aggregate benefit: fan-out over all callers, directive+shared
+    // cache vs no-directive (cache never engages).
+    group.bench_function("fanout/with_directive", |b| {
+        b.iter(|| {
+            let cache = Arc::new(StandaloneScopeCache::new());
+            for u in &corpus.caller_uris {
+                resolve_caller(&corpus, u, Some(ctx_for(&corpus, cache.clone())));
+            }
+        })
+    });
+    group.bench_function("fanout/without_directive", |b| {
+        b.iter(|| {
+            for u in &nodir.caller_uris {
+                resolve_caller(&nodir, u, None);
+            }
+        })
+    });
+
+    // Single-completion steady-state cost: warm cache (directive) vs no-directive.
+    let warm2 = Arc::new(StandaloneScopeCache::new());
+    resolve_caller(&corpus, &c0, Some(ctx_for(&corpus, warm2.clone())));
+    group.bench_function("completion/with_directive", |b| {
+        b.iter(|| resolve_caller(&corpus, &c0, Some(ctx_for(&corpus, warm2.clone()))))
+    });
+    group.bench_function("completion/without_directive", |b| {
+        b.iter(|| resolve_caller(&nodir, &n0, None))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_scope_resolution,
@@ -651,5 +760,6 @@ criterion_group!(
     bench_scope_hotspots,
     bench_interval_tree_queries,
     bench_forward_child_memo,
+    bench_standalone_cache,
 );
 criterion_main!(benches);
