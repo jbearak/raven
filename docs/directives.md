@@ -167,7 +167,7 @@ direction. It composes with `# raven: cd` (the file uses its own working
 directory), `# raven: nse` / `# raven: func` (directive propagation over
 `source()` edges is unaffected), package mode, and per-call `local = TRUE` /
 `sys.source()` (which govern how a *caller* sources the file, independent of
-the file's own isolation). See [Cross-File Performance](cross-file-performance.md)
+the file's own isolation). See [Speeding Up Cross-File Analysis](cross-file-analysis-performance.md)
 for the practical guidance and [Cross-File Analysis](cross-file.md) for the
 resolution model.
 

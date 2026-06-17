@@ -1,4 +1,4 @@
-# Cross-File Performance
+# Speeding Up Cross-File Analysis
 
 Raven follows `source()` chains so diagnostics, completions, hover, go-to
 definition, and find-references can reflect what is actually in scope at a

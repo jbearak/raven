@@ -214,8 +214,8 @@ that itself sources dozens of files through a nested chain - the directive can
 let Raven reuse one caller-independent scope instead of re-resolving the same
 closure in many caller contexts.
 
-See [Cross-File Performance](cross-file-performance.md) for when to use
-`# raven: self-contained`, and [Directives](directives.md#self-contained-sourced-scripts)
+See [Speeding Up Cross-File Analysis](cross-file-analysis-performance.md) for when to use
+`# raven: self-contained`, and [Directives](directives.md#self-contained-sourced-files)
 for the exact syntax. `# raven: nse` / `# raven: func` propagation over
 `source()` edges is unaffected (it is graph-level, not scope-level).
 
