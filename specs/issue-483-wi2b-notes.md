@@ -82,7 +82,7 @@ This makes a cache hit byte-identical to the un-memoized resolver under any
 
 ## Refinement 3 — key components, sourced as follows
 
-`key = (callee_uri, edge_revision, closure_interface_fingerprint, package_config_generation)`
+`key = (callee_uri, edge_revision, closure_interface_fingerprint, max_chain_depth, hoist_globals, backward_dep_mode, package_config_generation)`
 
 - `callee_uri`: the standalone file `uri`.
 - `edge_revision`: global value from `WorldState.cross_file_graph`, captured under
@@ -106,10 +106,24 @@ This makes a cache hit byte-identical to the un-memoized resolver under any
   HIT when a member's external backward parent was edited — its `library()` line
   bumps neither `edge_revision` nor a forward-only fingerprint; regression test
   `standalone_cache_invalidates_on_member_backward_parent_edit`.)
-- `package_config_generation`: a new coarse `u64` counter on `WorldState`, bumped
-  on R/package-library re-init and on `packages_*` / `maxChainDepth` /
-  `hoist_globals` / `backward_dependencies` / `base_exports` config changes — the
-  isolated scope depends on package/config state the other key parts don't capture.
+- `max_chain_depth`, `hoist_globals`, `backward_dep_mode`: the resolver's
+  traversal-config scalars, read from its own call arguments at resolution time
+  (not captured under the `WorldState` lock like `edge_revision` /
+  `package_config_generation`). These are **explicit, separate** key fields — not
+  folded into `package_config_generation` — because each independently changes the
+  cached scope: a `maxChainDepth` change makes the same reach truncate differently
+  (a scope verified truncation-free at depth 64 is not necessarily so at depth 3),
+  and `hoist_globals` / `backward_dep_mode` change how the closure's non-standalone
+  members resolve their own backward walks. See the `StandaloneScopeKey` doc
+  comment in `standalone_cache.rs`.
+- `package_config_generation`: a coarse `u64` counter on `WorldState`, bumped
+  **only** on `PackageLibrary` (re)initialization / rebuild
+  (`bump_package_config_generation` — e.g. R re-init or a mid-session libpath
+  change). Defense-in-depth: the depth-≥1 cached scope is independent of
+  `base_exports` / package content, but this guards against any package-state input
+  the analysis missed. The config scalars (`maxChainDepth` / `hoist_globals` /
+  `backward_dependencies`) are keyed explicitly above, so they do **not** rely on
+  this counter.
 
 ## Refinement 4 — cache ownership, handle plumbing, lock discipline
 
