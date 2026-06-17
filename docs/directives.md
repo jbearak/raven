@@ -139,11 +139,11 @@ A self-contained file is resolved **in isolation** from the files that
 `source()` it - both when computing its own diagnostics and when it is pulled in
 as another file's forward `source()` child:
 
-- It does **not** inherit symbols, loaded packages, working directory, or
-  data-alias provider from any caller - no backward parent-prefix walk, and a
-  caller's forward resolution feeds it canonical, caller-independent inputs. Its
-  cross-file scope is a pure function of the file itself and its own forward
-  `source()` closure, not of who sources it.
+- It does **not** inherit variables, loaded packages, or working directory from
+  any caller - no backward parent-prefix walk, and a caller's forward resolution
+  feeds it canonical, caller-independent inputs. Its cross-file scope is a pure
+  function of the file itself and its own forward `source()` closure, not of who
+  sources it.
 - It **still contributes** its own definitions *and* its own `library()`-loaded
   packages forward to callers (the normal additive `source()` merge is
   unchanged). A module that loads the packages its callers rely on still works.
