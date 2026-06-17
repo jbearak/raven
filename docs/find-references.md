@@ -34,6 +34,7 @@ Unlike completions and diagnostics, Find References does **not** consult the `so
 
 - Definitions (left-hand sides of assignments, function parameters) are listed alongside usages.
 - Same-named symbols in files that are *not* connected by any `source()` path are pooled together rather than treated as distinct symbols.
+- Because the search keys on the member *name* and not the accessor operator, the `` x$`name` `` and `x@name` forms, the `x[["name"]]` literal-string subscript form, and a `name =` constructor argument all pool together — cmd-clicking any one returns the others. The `[[` form participates only for a single, positional, literal string subscript (the same rule [Go-to-Definition](go-to-definition.md) uses); `x[[i]]`, `x[[1]]`, `x["name"]`, and computed/named/multi-argument subscripts are not matched, and a plain string literal that is not a `[[` subscript is never treated as a reference.
 
 If you need a result scoped to one symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
 

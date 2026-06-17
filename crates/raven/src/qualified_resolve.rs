@@ -201,11 +201,12 @@ pub fn build_qualified_path(lhs: Node, text: &str) -> Option<QualifiedPath> {
                 node = node.child_by_field_name("lhs")?;
             }
             "subset2" => {
-                // `foo[["lit"]]` — `$`-equivalent. Reject computed/numeric indices.
+                // `foo[["lit"]]` — `$`-equivalent. The shared strict predicate
+                // rejects computed/numeric indices AND named/multi-argument
+                // subscripts (`x[[name = "a"]]`, `x[["a", "b"]]`), so a malformed
+                // intermediate cannot be silently mis-walked as a single member.
                 let func = node.child_by_field_name("function")?;
-                let args = node.child_by_field_name("arguments")?;
-                let string_node = first_direct_string_argument(args)?;
-                let name = simple_string_literal_value(string_node, text)?;
+                let (name, _string_node) = subset2_sole_string_subscript(node, text)?;
                 rev_segments.push(Segment {
                     name: name.to_string(),
                     op: ExtractOp::Dollar,
@@ -215,6 +216,137 @@ pub fn build_qualified_path(lhs: Node, text: &str) -> Option<QualifiedPath> {
             _ => return None,
         }
     }
+}
+
+/// Strict predicate: is `subset2` a `[[` access whose subscript is a **single
+/// positional literal string** (`x[["name"]]`)? Returns the bare member value
+/// and the `string` node. `None` for `[` (`subset`), computed/numeric indices
+/// (`x[[i]]`, `x[[1]]`), **named** subscripts (`x[[name = "a"]]`, the `exact =`
+/// form), **multi-argument** subscripts (`x[["a", "b"]]`,
+/// `x[["a", exact = FALSE]]`), or non-simple strings (escaped/empty/multiline —
+/// see [`simple_string_literal_value`]).
+///
+/// This is the single source of truth for "literal-string `[[` member
+/// subscript", shared by [`build_qualified_path`]'s `subset2` arm, the terminal
+/// cursor helper [`string_subscript_member_at`], and the find-references string
+/// matcher ([`string_subscript_value`]), so the three cannot drift in which
+/// `[[` shapes count as a static member access. `[[` is the `$`-equivalent
+/// extractor; `[` returns a sub-container, not the element, so it is excluded.
+fn subset2_sole_string_subscript<'a>(
+    subset2: Node<'a>,
+    text: &'a str,
+) -> Option<(&'a str, Node<'a>)> {
+    if subset2.kind() != "subset2" {
+        return None;
+    }
+    let args = subset2.child_by_field_name("arguments")?;
+    // The subscript is always an `argument` node (tree-sitter-r wraps it even
+    // when positional). Require exactly one — a second `argument` means a
+    // multi-index `[[`, which is not a single static member.
+    let mut walker = args.walk();
+    let mut the_arg: Option<Node> = None;
+    for child in args.children(&mut walker) {
+        if child.kind() == "argument" {
+            if the_arg.is_some() {
+                return None;
+            }
+            the_arg = Some(child);
+        }
+    }
+    let arg = the_arg?;
+    // A `name` field means a keyword subscript (`x[[name = "a"]]`): not a member.
+    if arg.child_by_field_name("name").is_some() {
+        return None;
+    }
+    let value_node = arg.child_by_field_name("value")?;
+    if value_node.kind() != "string" {
+        return None;
+    }
+    let value = simple_string_literal_value(value_node, text)?;
+    Some((value, value_node))
+}
+
+/// A terminal `[["name"]]` string-subscript member access at the cursor —
+/// the `$`-equivalent counterpart to [`crate::extract_op::extract_operator_rhs`]
+/// for the string-subscript spelling. See module-level docs and issue #461.
+pub struct StringSubscriptMember<'a> {
+    /// The container LHS — the `[[`'s `function` child. Feed to
+    /// [`build_qualified_path`] to recover the container path.
+    pub container: Node<'a>,
+    /// The bare member name (the string's value, without quotes).
+    pub value: String,
+    /// The `string` node, for its source range (find-references highlight).
+    pub string_node: Node<'a>,
+}
+
+/// Resolve a cursor `node` to its enclosing literal-string `[[` subscript, if
+/// any. The cursor may land on the `string` node itself or its inner
+/// `string_content`; both are accepted. Returns `None` unless the string is the
+/// sole positional literal subscript of a `subset2` (per
+/// [`subset2_sole_string_subscript`]).
+///
+/// This lets go-to-definition, hover, and find-references treat
+/// `` x$`name` `` and `x[["name"]]` symmetrically: the caller synthesizes the
+/// equivalent `$`-member query from [`StringSubscriptMember::value`] via
+/// `callee_name_for_match`.
+pub fn string_subscript_member_at<'a>(
+    node: Node<'a>,
+    text: &'a str,
+) -> Option<StringSubscriptMember<'a>> {
+    // Cursor lands on the `string` (on a quote) or its `string_content` child.
+    let string_node = if node.kind() == "string" {
+        node
+    } else {
+        let parent = node.parent()?;
+        if parent.kind() == "string" {
+            parent
+        } else {
+            return None;
+        }
+    };
+    let (subset2, value) = string_subscript_context(string_node, text)?;
+    let container = subset2.child_by_field_name("function")?;
+    Some(StringSubscriptMember {
+        container,
+        value: value.to_string(),
+        string_node,
+    })
+}
+
+/// Bare member value for a `string` node that is a literal `[[` subscript (the
+/// find-references-direction view of [`subset2_sole_string_subscript`]: caller
+/// holds the `string`, not the `subset2`). `None` for any other string.
+pub fn string_subscript_value<'a>(string_node: Node<'a>, text: &'a str) -> Option<&'a str> {
+    string_subscript_context(string_node, text).map(|(_, value)| value)
+}
+
+/// Shared core for the two directions above: from a `string` node, confirm it is
+/// the sole positional literal subscript of an enclosing `subset2` and return
+/// that `subset2` plus the bare value.
+fn string_subscript_context<'a>(
+    string_node: Node<'a>,
+    text: &'a str,
+) -> Option<(Node<'a>, &'a str)> {
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let arg = string_node.parent()?;
+    if arg.kind() != "argument" {
+        return None;
+    }
+    let args = arg.parent()?;
+    if args.kind() != "arguments" {
+        return None;
+    }
+    let subset2 = args.parent()?;
+    let (value, matched) = subset2_sole_string_subscript(subset2, text)?;
+    // Guard against a string that is *a* subscript but not *the* sole one we
+    // landed on (defensive — `subset2_sole_string_subscript` already enforces
+    // a single argument, so `matched` is `string_node` whenever it is `Some`).
+    if matched.id() != string_node.id() {
+        return None;
+    }
+    Some((subset2, value))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2015,6 +2147,131 @@ mod tests {
                 "expected None for {text:?}"
             );
         }
+    }
+
+    /// First node of a given kind in a pre-order walk (helper for the
+    /// string-subscript tests, which need the `string`/`subset2` node).
+    fn first_node_of_kind<'a>(
+        tree: &'a tree_sitter::Tree,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        fn rec<'a>(n: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+            if n.kind() == kind {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                if let Some(found) = rec(ch, kind) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        rec(tree.root_node(), kind)
+    }
+
+    #[test]
+    fn subset2_sole_string_subscript_accepts_single_positional_literal() {
+        let text = "x[[\"name\"]]";
+        let tree = parse_r(text);
+        let subset2 = first_node_of_kind(&tree, "subset2").expect("subset2");
+        let (value, sn) = super::subset2_sole_string_subscript(subset2, text).expect("accepted");
+        assert_eq!(value, "name");
+        assert_eq!(sn.kind(), "string");
+    }
+
+    #[test]
+    fn subset2_sole_string_subscript_rejects_non_member_shapes() {
+        // Computed / numeric / named / multi-arg / single-bracket / escaped.
+        for text in [
+            "x[[i]]",
+            "x[[1]]",
+            "x[[name = \"a\"]]",
+            "x[[\"a\", \"b\"]]",
+            "x[[\"a\", exact = FALSE]]",
+            "x[[\"a\\tb\"]]",
+        ] {
+            let tree = parse_r(text);
+            let subset2 = first_node_of_kind(&tree, "subset2").expect("subset2");
+            assert!(
+                super::subset2_sole_string_subscript(subset2, text).is_none(),
+                "expected reject for {text:?}"
+            );
+        }
+        // Single-bracket `[` is a `subset`, never a `subset2`.
+        let text = "x[\"name\"]";
+        let tree = parse_r(text);
+        assert!(first_node_of_kind(&tree, "subset2").is_none());
+    }
+
+    #[test]
+    fn build_path_tightened_rejects_malformed_intermediate_subscript() {
+        // Multi-arg / named intermediate `[[` must DECLINE, not silently
+        // mis-walk as a single member (ISSUE 1 of the spec review).
+        for text in [
+            "x[[\"a\", \"b\"]]",
+            "x[[name = \"a\"]]",
+            "x[[\"a\", exact = FALSE]]",
+        ] {
+            let tree = parse_r(text);
+            let lhs = lhs_node_ending_at(&tree, text.len());
+            assert!(
+                super::build_qualified_path(lhs, text).is_none(),
+                "expected None for {text:?}"
+            );
+        }
+        // The well-formed single-literal case still resolves.
+        let text = "x[[\"a\"]]";
+        let tree = parse_r(text);
+        let lhs = lhs_node_ending_at(&tree, text.len());
+        let path = super::build_qualified_path(lhs, text).expect("path");
+        assert_eq!(path.head, "x");
+        assert_eq!(path.segments.len(), 1);
+        assert_eq!(path.segments[0].name, "a");
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::Dollar);
+    }
+
+    #[test]
+    fn string_subscript_member_at_resolves_terminal_subscript() {
+        let text = "fruit[[\"macintosh apple\"]]";
+        let tree = parse_r(text);
+        let string_node = first_node_of_kind(&tree, "string").expect("string");
+        let m = super::string_subscript_member_at(string_node, text).expect("member");
+        assert_eq!(m.value, "macintosh apple");
+        // The container LHS is the `[[`'s function child — the head identifier.
+        let path = super::build_qualified_path(m.container, text).expect("path");
+        assert_eq!(path.head, "fruit");
+        assert!(path.segments.is_empty());
+    }
+
+    #[test]
+    fn string_subscript_member_at_resolves_mixed_container() {
+        // Terminal `[[` after a mixed `@`/`$` container (ISSUE 7).
+        let text = "a@b[[\"c\"]]";
+        let tree = parse_r(text);
+        let string_node = first_node_of_kind(&tree, "string").expect("string");
+        let m = super::string_subscript_member_at(string_node, text).expect("member");
+        assert_eq!(m.value, "c");
+        let path = super::build_qualified_path(m.container, text).expect("path");
+        assert_eq!(path.head, "a");
+        let names: Vec<_> = path.segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
+        assert_eq!(path.segments[0].op, crate::extract_op::ExtractOp::At);
+    }
+
+    #[test]
+    fn string_subscript_value_only_matches_double_bracket_subscript() {
+        // A `[[` subscript yields its value.
+        let text = "x[[\"name\"]]";
+        let tree = parse_r(text);
+        let s = first_node_of_kind(&tree, "string").expect("string");
+        assert_eq!(super::string_subscript_value(s, text), Some("name"));
+
+        // A plain string argument to a call is NOT a subscript.
+        let text = "print(\"name\")";
+        let tree = parse_r(text);
+        let s = first_node_of_kind(&tree, "string").expect("string");
+        assert_eq!(super::string_subscript_value(s, text), None);
     }
 
     fn dollar_path(head: &str, segments: &[&str]) -> super::QualifiedPath {
