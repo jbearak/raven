@@ -313,6 +313,15 @@ pub async fn run(args: CheckArgs) -> i32 {
         collect_target_diagnostics(&mut state, &targets).await;
     operator_error |= collect_operator_error;
 
+    // Issue #483 (WI2b): report standalone-scope cache effectiveness at trace
+    // level — proves cross-snapshot reuse on hub workspaces (and is a cheap
+    // diagnosis hook). No-op unless `RUST_LOG=raven::cli=trace`.
+    log::trace!(
+        "standalone scope cache: {} hits, {} misses",
+        state.standalone_scope_cache.hits(),
+        state.standalone_scope_cache.misses()
+    );
+
     let any_above_threshold = all_diags
         .iter()
         .any(|(_, d)| SeverityLevel::from_diag(d) > args.max_severity);

@@ -1343,6 +1343,7 @@ impl Backend {
             if !state.package_library_ready {
                 state.package_library = library;
                 state.package_library_ready = ready;
+                state.bump_package_config_generation();
                 (true, ready)
             } else {
                 log::trace!("PackageLibrary already initialized (race), keeping existing");
@@ -2623,6 +2624,7 @@ impl LanguageServer for Backend {
             if !state.package_library_ready {
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
+                state.bump_package_config_generation();
                 true
             } else {
                 log::info!(
@@ -2815,6 +2817,7 @@ impl LanguageServer for Backend {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
                     state.package_library_ready = ready;
+                    state.bump_package_config_generation();
                     // Swapping the library may have changed `lib_paths`
                     // (renv switch, `.Rprofile` edit). Re-resolve
                     // `source(system.file(...))` edges against the new paths
@@ -6382,6 +6385,7 @@ impl Backend {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
                 state.package_library_ready = package_library_ready;
+                state.bump_package_config_generation();
                 // The new library may carry different `lib_paths` (the user
                 // changed `raven.packages.additionalLibraryPaths`, or a
                 // raven.toml reload re-ran `.libPaths()`). Re-resolve

@@ -183,6 +183,12 @@ pub(crate) struct DiagnosticsSnapshot {
     /// symbols into resolution results for files under `R/` and `tests/testthat/`.
     /// Also used in the diagnostic loop for full-import package checks.
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+    /// Issue #483 (WI2b): persistent standalone-scope cache context, captured
+    /// under the `WorldState` read lock during `build` (the `Arc` handle plus
+    /// the *real* graph's `edge_revision` and the `package_config_generation`)
+    /// so that scope resolution can consult/populate the cross-snapshot cache
+    /// with no `WorldState` guard held. `None` when caching is disabled.
+    pub(crate) standalone_ctx: Option<crate::cross_file::standalone_cache::StandaloneCacheCtx>,
 }
 
 impl DiagnosticsSnapshot {
@@ -409,6 +415,21 @@ impl DiagnosticsSnapshot {
             rmd_declared_params,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
+            // Issue #483 (WI2b): capture the persistent-cache handle and key
+            // components under the read lock; the cache is consulted later with
+            // no `WorldState` guard held. `edge_revision` MUST come from the real
+            // graph (the trimmed `cross_file_graph` above is a clone whose
+            // counter resets to 0). `None` when disabled via the env toggle
+            // (cache-on vs cache-off byte-identity gate).
+            standalone_ctx: if crate::cross_file::standalone_cache::standalone_cache_disabled() {
+                None
+            } else {
+                Some(crate::cross_file::standalone_cache::StandaloneCacheCtx {
+                    cache: state.standalone_scope_cache.clone(),
+                    edge_revision: state.cross_file_graph.edge_revision(),
+                    package_config_generation: state.package_config_generation,
+                })
+            },
         })
     }
 
@@ -458,7 +479,7 @@ impl DiagnosticsSnapshot {
             });
 
         let mut cache = self.parent_prefix_cache.borrow_mut();
-        scope::scope_at_position_with_graph_cached(
+        scope::scope_at_position_with_graph_cached_with_standalone_cache(
             uri,
             line,
             column,
@@ -474,6 +495,7 @@ impl DiagnosticsSnapshot {
             &mut cache,
             Some(&self.scope_contribution),
             data_provider.as_ref(),
+            self.standalone_ctx.clone(),
         )
     }
 }
@@ -5344,7 +5366,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new(
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -5358,6 +5380,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        snapshot.standalone_ctx.clone(),
     );
 
     // Pre-compute the names of test-attached packages (testthat under
@@ -6171,7 +6194,7 @@ fn collect_undefined_variables_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new(
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -6185,6 +6208,7 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        snapshot.standalone_ctx.clone(),
     );
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.

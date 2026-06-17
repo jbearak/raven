@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
 /// How backward dependencies (parent files that source this file) are resolved
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackwardDependencyMode {
     /// Only use backward relationships from explicit `# raven: sourced-by`
     /// directives (`@lsp-sourced-by` is a permanent alias that parses identically).

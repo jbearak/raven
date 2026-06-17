@@ -553,6 +553,19 @@ pub struct WorldState {
 
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
+    /// Persistent (cross-snapshot) cache of `# raven: standalone` callees'
+    /// isolated EOF scopes (issue #483 / WI2b). Behind an `Arc` so the
+    /// diagnostics snapshot can clone the handle out from under the read lock
+    /// and consult the cache with no `WorldState` guard held (CLAUDE.md locking
+    /// discipline). Survives the per-snapshot `DependencyGraph` clone, which
+    /// resets its own caches.
+    pub standalone_scope_cache: Arc<crate::cross_file::standalone_cache::StandaloneScopeCache>,
+    /// Coarse monotonic counter bumped on package-library re-init (`#483`). A
+    /// component of the `StandaloneScopeCache` key: the depth-≥1 isolated scope
+    /// is independent of `base_exports`/package content (those are depth-0 /
+    /// downstream), so this is defense-in-depth against any package-state input
+    /// the analysis missed; a missed bump cannot cause a stale-content hit.
+    pub package_config_generation: u64,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
@@ -576,6 +589,16 @@ impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
         self.package_state.workspace()
+    }
+
+    /// Bump the package/config generation (issue #483) so the persistent
+    /// `StandaloneScopeCache` treats entries computed before a package-library
+    /// re-init as belonging to a different key. Defensive: the depth-≥1 isolated
+    /// scope is independent of package-library content, so a missed bump cannot
+    /// produce a stale-content hit — this only adds isolation if some
+    /// package-state input feeds the scope that the analysis did not foresee.
+    pub fn bump_package_config_generation(&mut self) {
+        self.package_config_generation = self.package_config_generation.wrapping_add(1);
     }
 
     /// Apply a `PackageInputDelta` produced by an event handler.
@@ -707,6 +730,10 @@ impl WorldState {
             per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
+            standalone_scope_cache: Arc::new(
+                crate::cross_file::standalone_cache::StandaloneScopeCache::new(),
+            ),
+            package_config_generation: 0,
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),

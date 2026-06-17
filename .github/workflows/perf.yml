@@ -92,16 +92,21 @@ jobs:
 
       # On push to main: save results as the new baseline.
       # On PRs: compare against the main baseline.
-      # Only the startup bench is tracked for CI regressions — it's the
-      # fastest and most representative. cross_file and lsp_operations
-      # can be run locally with `cargo bench`.
+      # The startup bench plus the WI2b standalone-cache group are tracked for
+      # CI regressions — both fast and representative. The standalone-cache group
+      # is filtered out of the otherwise-heavy `cross_file` bench (the rest of
+      # cross_file and lsp_operations are run locally with `cargo bench`).
       - name: Run benchmarks (push to main — save baseline)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline main
+        run: |
+          cargo bench -p raven --features test-support --bench startup -- --save-baseline main
+          cargo bench -p raven --features test-support --bench cross_file -- --save-baseline main cross_file_standalone_cache
 
       - name: Run benchmarks (PR — compare against main)
         if: github.event_name == 'pull_request'
-        run: cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+        run: |
+          cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
+          cargo bench -p raven --features test-support --bench cross_file -- --save-baseline pr cross_file_standalone_cache
 
       - name: Save Criterion baseline cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

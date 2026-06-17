@@ -995,6 +995,220 @@ pub(crate) struct ForwardChildMemo {
     /// edge-revision-cached `contains_cycle`) and reused, avoiding a per-child
     /// atomic load + `RwLock` read in dense graphs.
     graph_has_cycle: std::cell::Cell<Option<bool>>,
+    /// Issue #483 (WI2b): handle to the persistent cross-snapshot
+    /// `StandaloneScopeCache` plus the `WorldState`-captured key components
+    /// (`edge_revision`, `package_config_generation`). `None` outside the
+    /// diagnostics path (other entry points do not cache standalone scopes).
+    /// Seeded once per top-level query / `ScopeStream`; threaded with the memo
+    /// to every recursive resolution so the EOF hook can consult it.
+    standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+    /// Per-query memo keyed by a standalone callee's URI, holding its
+    /// `closure_interface_fingerprint` and the FULL contributing-set membership
+    /// (`C`'s forward `source()` closure PLUS the backward parents of any
+    /// non-standalone closure member — see `standalone_closure_fingerprint_and_members`),
+    /// NOT just `{C} ∪ forward_closure(C)`. The backward parents are load-bearing:
+    /// a visited backward parent of a non-standalone member loses its inherited /
+    /// sibling-loaded packages at the revisit guard, so the contamination gate
+    /// must cover them too (regression `standalone_cache_skips_when_member_backward_parent_is_visited`,
+    /// fixed in commit bfdacbf5). Both are constant within one query (the snapshot
+    /// graph + artifacts are fixed), so computing them once per callee avoids
+    /// re-walking the contributing set on every consult. The member list is used
+    /// to gate the cache on visited-contamination (see the EOF hook).
+    standalone_closures: HashMap<Url, (u64, std::sync::Arc<Vec<Url>>)>,
+}
+
+impl ForwardChildMemo {
+    /// Construct a memo seeded with the WI2b persistent-cache context (issue
+    /// #483). `None` leaves the standalone cache disabled (every entry point
+    /// except the diagnostics path passes `None`).
+    fn with_standalone_ctx(
+        ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+    ) -> std::cell::RefCell<Self> {
+        std::cell::RefCell::new(Self {
+            standalone_ctx: ctx,
+            ..Self::default()
+        })
+    }
+}
+
+/// Whether the graph contains any source cycle, cached on the memo for the
+/// query's lifetime (the answer is invariant within a query). Shared by
+/// [`resolve_forward_child_memoized`] and the WI2b standalone-cache hook so
+/// both gate on the identical "acyclic" precondition without each re-locking
+/// the graph per call.
+fn forward_memo_graph_has_cycle(
+    memo: &std::cell::RefCell<ForwardChildMemo>,
+    graph: &super::dependency::DependencyGraph,
+) -> bool {
+    let m = memo.borrow();
+    match m.graph_has_cycle.get() {
+        Some(c) => c,
+        None => {
+            let c = graph.contains_cycle();
+            m.graph_has_cycle.set(Some(c));
+            c
+        }
+    }
+}
+
+/// Compute (and memoize on the supplied `ForwardChildMemo`) the
+/// `closure_interface_fingerprint` and the **full contributing-set** membership
+/// (the forward `source()` closure of `uri` PLUS the backward parents of every
+/// non-standalone member — see "Returned member list" below) for a standalone
+/// callee `uri` (issue #483).
+///
+/// ## What the fingerprint must cover
+///
+/// A cache HIT must reproduce the un-memoized resolution byte-for-byte, so the
+/// fingerprint must change whenever ANY file whose content feeds the callee's
+/// isolated EOF scope changes. That set — the **contributing set** — is NOT just
+/// the forward `source()` closure of `uri`. When the callee sources a
+/// *non-standalone* member `M`, `M` runs its own STEP-1 backward parent walk
+/// (`parent_prefix_at`), so `M`'s backward parents (and their forward sources,
+/// transitively) also contribute (e.g. an `A` that does `library(pkg)` and also
+/// `source()`s `M` leaks `pkg` into the callee's scope via `M`'s prefix). Those
+/// files are caller-independent (the walk picks them up regardless of which file
+/// ultimately sourced the callee), but they lie OUTSIDE the forward closure, so
+/// neither `edge_revision` (no source edge changed when `A`'s `library()` line is
+/// edited) nor a forward-only fingerprint would catch an edit to them — a stale
+/// cross-snapshot HIT. So the contributing set is the closure under:
+///   * **forward** source edges from every file in the set (a file's sources
+///     always contribute), and
+///   * **backward** source edges only from a **non-standalone** file (its own
+///     parent walk contributes its parents; a standalone file's backward walk is
+///     skipped — WI2a part 1 / part 2 — which is exactly what keeps the key
+///     independent of the callee's own callers).
+///
+/// The fingerprint is an order-sensitive hash over the per-file `interface_hash`
+/// of the contributing set (sorted for determinism), read from `get_artifacts`.
+/// Because `interface_hash` is a complete change-detector for a file's exported,
+/// scope-contributing interface (post-#482) and `edge_revision` pins set
+/// membership, `(edge_revision, Σ interface_hash over the contributing set)`
+/// fully determines the callee's isolated EOF scope. A body/comment/local edit
+/// leaves a member's `interface_hash` unchanged → cache hit; a top-level
+/// interface edit anywhere in the contributing set changes it → miss → recompute.
+/// Following forward edges out of a backward parent (rather than only its
+/// pre-`source()` prefix) over-approximates safely — extra invalidation, never a
+/// stale hit.
+///
+/// ## Why walking the trimmed graph is sound under neighborhood truncation
+///
+/// This walk follows the SAME `graph` the resolver does, which in production is
+/// the TRIMMED neighborhood subgraph (`extract_subgraph` over the `max_visited`
+/// neighborhood). One might fear that under budget truncation the trimmed graph
+/// drops an edge to a contributor that the resolver still reaches via its
+/// `source.resolved_uri` / path fallback (`scope_at_position_with_graph_recursive`
+/// STEP 2), so this fingerprint — which has no such fallback — would silently
+/// omit it. It does not, because **contribution is gated by artifact
+/// availability, which equals neighborhood membership**: the resolver's
+/// `get_artifacts` reads only the snapshot's `artifacts_map`, populated solely
+/// from the neighborhood (`DiagnosticsSnapshot::build`). For a file F OUTSIDE the
+/// neighborhood the fallback may compute F's URI, but `get_artifacts(F)` is
+/// `None`, so F contributes no symbols/packages — exactly as this walk (which
+/// also skips F) assumes. For a file INSIDE the neighborhood, `extract_subgraph`
+/// keeps every intra-neighborhood edge (both endpoints present), so the resolver
+/// reaches it through a real edge this walk also traverses — never only through
+/// the fallback. The resolver's actual contributing set therefore equals this
+/// walk's set in every regime, truncated or not, so `(edge_revision, Σ
+/// interface_hash)` remains a complete determinant. (A truncated resolution is an
+/// approximate-but-self-consistent scope; the cross-snapshot cache reuses it
+/// soundly because a fresh resolution would be truncated identically.)
+///
+/// ## Returned member list
+///
+/// The returned `Vec<Url>` is the **full contributing set** (forward closure plus
+/// the backward parents of non-standalone members). The EOF hook uses it to gate
+/// on visited-contamination: if ANY contributing file is already in the resolver's
+/// `visited`, the resolved scope would be a *truncated*, caller-path-dependent one
+/// that must never be cached. Two truncation channels make this necessary:
+///   * a **forward-closure** member already visited → its forward `source()`
+///     short-circuits (the revisit guard returns an empty scope), dropping its
+///     whole subtree; and
+///   * a **backward parent** of a non-standalone member already visited → the
+///     same revisit guard zeroes the parent's recursive scope, so while the
+///     parent's OWN `library()` calls still propagate (read directly from its
+///     artifacts), the packages it *inherited* from its own parents and the ones
+///     *loaded* by its sourced siblings are silently dropped from the member's
+///     prefix — and therefore from the callee's scope.
+///
+/// Because whether a contributing file is visited is exactly the caller-path the
+/// URI-keyed cache assumes away, the guard MUST cover both channels; gating on the
+/// forward closure alone admitted a stale cross-reach HIT (regression
+/// `standalone_cache_skips_when_member_backward_parent_is_visited`).
+///
+/// Both walks carry their own `seen` guard, so source cycles terminate (and the
+/// cache is only consulted on acyclic graphs anyway). A file with no artifacts
+/// contributes its URI string to the hash but no interface bits (the absence is
+/// itself part of the key).
+fn standalone_closure_fingerprint_and_members<F, G>(
+    uri: &Url,
+    graph: &super::dependency::DependencyGraph,
+    get_artifacts: &F,
+    get_metadata: &G,
+    memo: &std::cell::RefCell<ForwardChildMemo>,
+) -> (u64, Arc<Vec<Url>>)
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<Arc<super::types::CrossFileMetadata>>,
+{
+    if let Some((fp, members)) = memo.borrow().standalone_closures.get(uri) {
+        return (*fp, Arc::clone(members));
+    }
+    // Full contributing set: the closure under forward source edges from every
+    // file, and backward source edges only out of a non-standalone file (see the
+    // doc comment). Start from `uri` (standalone, so its own backward edges are
+    // never followed). This single set is BOTH hashed into the fingerprint AND
+    // returned as the contamination-guard member list — any contributing file
+    // being already `visited` yields a truncated, caller-path-dependent scope
+    // (a forward member's source short-circuits; a backward parent's inherited /
+    // sibling-loaded packages are dropped by the revisit guard), so the guard
+    // must cover the whole set, not just the forward closure.
+    let mut contrib: HashSet<Url> = HashSet::new();
+    let mut work: std::collections::VecDeque<Url> = std::collections::VecDeque::new();
+    contrib.insert(uri.clone());
+    work.push_back(uri.clone());
+    while let Some(f) = work.pop_front() {
+        for edge in graph.get_dependencies(&f) {
+            if contrib.insert(edge.to.clone()) {
+                work.push_back(edge.to.clone());
+            }
+        }
+        // A standalone file's own backward parent walk is skipped during
+        // resolution, so its parents never contribute — do not follow its
+        // backward edges (this is what keeps a hub's key caller-independent).
+        let is_standalone = get_metadata(&f).is_some_and(|m| m.standalone);
+        if !is_standalone {
+            for edge in graph.get_dependents(&f) {
+                if contrib.insert(edge.from.clone()) {
+                    work.push_back(edge.from.clone());
+                }
+            }
+        }
+    }
+    let mut contrib_sorted: Vec<Url> = contrib.into_iter().collect();
+    contrib_sorted.sort();
+
+    let mut hasher = DefaultHasher::new();
+    contrib_sorted.len().hash(&mut hasher);
+    for member in &contrib_sorted {
+        // The URI string anchors each member's contribution to its identity so
+        // that two sets with the same multiset of interface hashes but different
+        // membership cannot collide.
+        member.as_str().hash(&mut hasher);
+        match get_artifacts(member) {
+            Some(arts) => {
+                1u8.hash(&mut hasher);
+                arts.interface_hash.hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    let fp = hasher.finish();
+    let members = Arc::new(contrib_sorted);
+    memo.borrow_mut()
+        .standalone_closures
+        .insert(uri.clone(), (fp, Arc::clone(&members)));
+    (fp, members)
 }
 
 /// Key for [`ForwardChildMemo`]. Captures every caller-varying input that
@@ -1141,17 +1355,7 @@ fn resolve_forward_child_memoized(
     // A cycle anywhere in the graph makes child scopes visited-dependent.
     // `contains_cycle` is invariant for this query, so compute it once and
     // cache it on the memo rather than re-locking the graph for every child.
-    let has_cycle = {
-        let m = memo.borrow();
-        match m.graph_has_cycle.get() {
-            Some(c) => c,
-            None => {
-                let c = graph.contains_cycle();
-                m.graph_has_cycle.set(Some(c));
-                c
-            }
-        }
-    };
+    let has_cycle = forward_memo_graph_has_cycle(memo, graph);
     if forward_child_memo_disabled() || has_cycle {
         bump_forward_child_compute_count();
         return compute();
@@ -1206,6 +1410,66 @@ fn resolve_forward_child_memoized(
 /// `sys_source_global_env = false`).
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
+}
+
+/// Build a forward-`source()` child's [`PathContext`](super::path_resolve::PathContext),
+/// applying the WI2b "part 2" standalone-isolation rule.
+///
+/// A `# raven: standalone` child uses its OWN context (its `from_metadata`, or a
+/// bare `new()`), **ignoring** the caller's `chdir` / inherited working directory
+/// — which is precisely what lets the #483 cache key a standalone callee on its
+/// URI alone (its isolated scope is then a pure function of `(C, C's closure)`,
+/// independent of who sourced it). A non-standalone child inherits the caller's
+/// working directory: an explicit child `# raven: cd` wins; otherwise the parent's
+/// directory, selected by the `chdir` flag.
+///
+/// Shared verbatim by the recursive resolver
+/// (`scope_at_position_with_graph_recursive`) and the streaming
+/// `ScopeStream::resolve_source_contribution` so this isolation rule — load-bearing
+/// for cache caller-independence — has a single definition that cannot drift
+/// between the two forward-resolution entry points.
+fn build_forward_child_path_context<G>(
+    child_uri: &Url,
+    child_is_standalone: bool,
+    chdir: bool,
+    parent_ctx: Option<&super::path_resolve::PathContext>,
+    workspace_root: Option<&Url>,
+    get_metadata: &G,
+) -> Option<super::path_resolve::PathContext>
+where
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    if child_is_standalone {
+        get_metadata(child_uri)
+            .and_then(|m| {
+                super::path_resolve::PathContext::from_metadata(child_uri, &m, workspace_root)
+            })
+            .or_else(|| super::path_resolve::PathContext::new(child_uri, workspace_root))
+    } else {
+        let child_path = child_uri.to_file_path().ok();
+        child_path.as_ref().and_then(|cp| {
+            let ctx = parent_ctx?;
+            // Child has its own metadata: use it, but inherit a working dir if it
+            // declares none. Otherwise build the context from the parent's, per chdir.
+            if let Some(cm) = get_metadata(child_uri) {
+                let mut child_ctx = super::path_resolve::PathContext::from_metadata(
+                    child_uri,
+                    &cm,
+                    workspace_root,
+                )?;
+                if child_ctx.working_directory.is_none() {
+                    child_ctx.inherited_working_directory = if chdir {
+                        Some(cp.parent()?.to_path_buf())
+                    } else {
+                        Some(ctx.effective_working_directory())
+                    };
+                }
+                Some(child_ctx)
+            } else {
+                Some(ctx.child_context_for_source(cp, chdir))
+            }
+        })
+    }
 }
 /// Finds the innermost function-scope interval that contains the given position.
 ///
@@ -1601,19 +1865,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // `# raven: var`). No directive declarations exist on this path.
     fold_declarations_into_exported_interface(&mut artifacts);
 
-    // Extract package names from PackageLoad events for interface hash computation
-    // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
-    let loaded_packages: Vec<String> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|event| {
-            if let ScopeEvent::PackageLoad { package, .. } = event {
-                Some(package.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Extract package loads (with position) from PackageLoad events for interface
+    // hash computation (Requirement 14.5: interface hash must include loaded
+    // packages for cache invalidation; position matters — see
+    // `extract_package_load_positions`).
+    let loaded_packages = extract_package_load_positions(&artifacts.timeline);
 
     // Compute interface hash including symbols, loaded packages, declared
     // symbols, and top-level rm() events (which affect cross-file scope at
@@ -1873,18 +2129,9 @@ pub fn compute_artifacts_with_metadata(
     // symbols, later ones win.
     fold_declarations_into_exported_interface(&mut artifacts);
 
-    // Extract package names from PackageLoad events for interface hash computation
-    let loaded_packages: Vec<String> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|event| {
-            if let ScopeEvent::PackageLoad { package, .. } = event {
-                Some(package.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Extract package loads (with position) from PackageLoad events for interface
+    // hash computation (see `extract_package_load_positions`).
+    let loaded_packages = extract_package_load_positions(&artifacts.timeline);
 
     // Collect declared symbols from metadata for interface hash computation
     // (Requirements 10.1-10.4: interface hash must include declared symbols for cache invalidation)
@@ -4495,14 +4742,42 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 ///
 /// # Returns
 ///
-/// `u64` hash of the provided `interface`, `packages`, `declared_symbols`,
-/// `top_level_removals`, `data_loads`, and `declarations` (the
-/// `(name, line)` pairs of all timeline `Declaration` events — see
-/// [`extract_top_level_declarations`]).
+/// `u64` hash of the provided `interface`, `package_loads` (each package name
+/// with its `(line, column)` — position matters for cross-file scope, see the
+/// hashing site), `declared_symbols`, `top_level_removals`, `data_loads`, and
+/// `declarations` (the `(name, line)` pairs of all timeline `Declaration`
+/// events — see [`extract_top_level_declarations`]).
+/// Extract `(package, line, column, function_scope)` for every `PackageLoad`
+/// timeline event, for inclusion in [`compute_interface_hash`]. Both position AND
+/// function scope are preserved (unlike a bare name set) because a
+/// `library()`/`require()` load's contribution to a file that `source()`s this
+/// one is gated on BOTH (it contributes only when it precedes the `source()` call
+/// AND its function scope is the same-or-ancestor of the call's) — see the
+/// package hashing site in `compute_interface_hash`. All loads are included
+/// (top-level and function-scoped); over-including only widens invalidation,
+/// never admits a stale cache hit (the WI2b standalone-scope cache, #483, relies
+/// on this completeness).
+type PackageLoadKey = (String, u32, u32, Option<FunctionScopeInterval>);
+
+fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<PackageLoadKey> {
+    timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::PackageLoad {
+                package,
+                line,
+                column,
+                function_scope,
+            } => Some((package.clone(), *line, *column, *function_scope)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
-    packages: &[String],
+    package_loads: &[PackageLoadKey],
     declared_symbols: &[super::types::DeclaredSymbol],
     nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
@@ -4529,12 +4804,26 @@ fn compute_interface_hash(
         }
     }
 
-    // Include loaded packages in the hash (sorted for determinism)
-    // This ensures cache invalidation when packages change (Requirement 14.5)
-    let mut sorted_packages: Vec<_> = packages.iter().collect();
-    sorted_packages.sort();
-    for package in sorted_packages {
+    // Include loaded packages WITH their (line, column) position AND function
+    // scope (Requirement 14.5). Neither the name set alone nor position alone is
+    // a complete change-detector: a `library()`/`require()` load contributes to a
+    // file that `source()`s this one only when it PRECEDES the `source()` call
+    // site (position) AND its function scope is the same-or-ancestor of the
+    // call's (scope). So MOVING a `library()` across a `source()`, or flipping it
+    // between top-level and function-scoped at a fixed position, changes the
+    // cross-file scope even though the package-name multiset is unchanged;
+    // omitting either let the persistent standalone-scope cache (#483) serve a
+    // stale isolated scope. Sort by the `(name, line, column)` prefix — unique
+    // per load — since `Option<FunctionScopeInterval>` is not `Ord`; the full
+    // four-tuple (incl. scope) is hashed. Mirrors the `line` inclusion for
+    // declared symbols below.
+    let mut sorted_packages: Vec<_> = package_loads.iter().collect();
+    sorted_packages.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+    for (package, line, column, function_scope) in sorted_packages {
         package.hash(&mut hasher);
+        line.hash(&mut hasher);
+        column.hash(&mut hasher);
+        function_scope.hash(&mut hasher);
     }
 
     // Include declared symbols in the hash (sorted for determinism)
@@ -4825,8 +5114,59 @@ impl ParentPrefixCache {
 /// approximate — the visited map is seeded with `(u32::MAX, u32::MAX)` so the
 /// prefix covers all positions in the queried URI within the snapshot — but
 /// `entry`/`or_insert` merging keeps STEP 2 sound.
+///
+/// This thin wrapper passes no WI2b standalone-scope cache (issue #483); the
+/// diagnostics path calls [`scope_at_position_with_graph_cached_with_standalone_cache`]
+/// directly to enable the cross-snapshot cache.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph_cached<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &mut ParentPrefixCache,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    scope_at_position_with_graph_cached_with_standalone_cache(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+        data_alias_provider,
+        None,
+    )
+}
+
+/// As [`scope_at_position_with_graph_cached`], but threads a WI2b persistent
+/// standalone-scope cache context (issue #483). Seeds the per-query
+/// forward-child memo so the EOF hook in `scope_at_position_with_graph_recursive`
+/// can consult/populate the cross-snapshot cache. `None` is equivalent to the
+/// wrapper above.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_cached_with_standalone_cache<F, G>(
     uri: &Url,
     line: u32,
     column: u32,
@@ -4845,6 +5185,10 @@ pub fn scope_at_position_with_graph_cached<F, G>(
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
     // `data()` file-stem alias provider (issue #429); see [`DataAliasProvider`].
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    // Issue #483 (WI2b): persistent standalone-scope cache context, or `None` to
+    // disable caching. Seeds the per-query forward-child memo so the EOF hook in
+    // `scope_at_position_with_graph_recursive` can consult/populate the cache.
+    standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -4861,8 +5205,9 @@ where
     };
 
     // Per-query forward-child memo (issue #472), shared by the prefix
-    // computation (STEP 1) and the recursive STEP 2 below.
-    let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+    // computation (STEP 1) and the recursive STEP 2 below. Seeded with the WI2b
+    // standalone-cache context (issue #483) so the EOF hook can consult it.
+    let forward_child_memo = ForwardChildMemo::with_standalone_ctx(standalone_ctx);
 
     // Cache lookup. On hit, we share the Arc with the caller. On miss, we
     // compute the prefix (mirroring STEP 1's visited[uri] = (line, col)
@@ -4966,6 +5311,34 @@ pub(crate) struct ParentPrefix {
     // always be empty and was removed in I2.
     pub inherited_packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
+}
+
+impl ParentPrefix {
+    /// Whether this prefix contributes nothing. A standalone file's prefix is
+    /// always empty (its backward walk is skipped), so the WI2b cache hook uses
+    /// this as a hard guard: it only caches/serves a standalone EOF resolution
+    /// whose merged prefix is empty, keeping a cache hit byte-identical to the
+    /// un-memoized resolution regardless of how the (empty) prefix was supplied.
+    pub(crate) fn is_empty(&self) -> bool {
+        // Destructure so adding a field to `ParentPrefix` is a COMPILE error
+        // here rather than a silent hole in this load-bearing guard: a new
+        // caller-dependent field omitted from the emptiness test would let the
+        // WI2b hook cache/serve a caller-dependent scope under a URI-only key.
+        let Self {
+            symbols,
+            chain,
+            visible_positions,
+            depth_exceeded,
+            inherited_packages,
+            package_origins,
+        } = self;
+        symbols.is_empty()
+            && chain.is_empty()
+            && visible_positions.is_empty()
+            && depth_exceeded.is_empty()
+            && inherited_packages.is_empty()
+            && package_origins.is_empty()
+    }
 }
 
 /// STEP 1 of `scope_at_position_with_graph_recursive`: collect parent (backward)
@@ -5120,45 +5493,39 @@ where
         let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
         let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
 
-        // Resolve the parent's metadata once: it drives both the local-scoping
-        // policy below and the parent `PathContext` further down.
+        // Resolve the parent's metadata once for the parent `PathContext`
+        // further down. (The local-scoping policy below reads its flags from the
+        // edge, not from this metadata.)
         let parent_meta = get_metadata(&edge.from);
 
-        // Determine if this local-scoped edge applies the declared-only inheritance
-        // policy. `local = TRUE` / `sys.source(local = an env)` evaluate the child
-        // in the *caller's* environment (R `?source`): at top level that env is
+        // Determine if this edge applies the declared-only inheritance policy.
+        // `local = TRUE` / a non-global `sys.source` evaluate the child in the
+        // *caller's* environment (R `?source`): at top level that env is
         // `.GlobalEnv`, so the child sees ALL of the parent's prior top-level
-        // bindings — identical to `local = FALSE` for backward inheritance. Only a
-        // `local = TRUE` call sited *inside a function* binds the child to a
-        // function frame whose locals must not be modeled as global inheritance.
+        // bindings — identical to `local = FALSE` for backward inheritance. Only
+        // a `local = TRUE` call sited *inside a function*, or a `sys.source` into
+        // a non-global env, binds the child to a frame whose locals must not be
+        // modeled as global inheritance.
         //
         // Issue #476: the old logic treated every `local = TRUE` edge as
         // declared-only, dropping regular top-level symbols (e.g. a hub that
         // `source()`s helpers and then `source("report.R", local = TRUE)` — the
         // report could not see the helpers). We now restrict the declared-only
         // policy to function-scoped local calls, matching R's environment rules.
+        //
+        // Both `is_function_scoped` and `sys_source_global_env` are carried on
+        // the edge (folded into edge equality for the #483 cache), so read them
+        // directly: a single source of truth with `edge_revision`, cheaper than
+        // re-scanning `parent_meta.sources`, and correct even with two
+        // `sys.source` calls (one global, one not) on the same line — each call's
+        // edge carries its own flag.
         let is_local_scoped = if edge.local {
-            // Top-level local=TRUE inherits like local=FALSE; only a function-scoped
-            // local source binds to a non-global frame (declared-only).
-            parent_meta.as_ref().is_some_and(|meta| {
-                meta.sources.iter().any(|s| {
-                    s.line == call_site_line
-                        && s.column == call_site_col
-                        && s.local == edge.local
-                        && s.is_sys_source == edge.is_sys_source
-                        && s.is_function_scoped
-                })
-            })
+            // Top-level local=TRUE inherits like local=FALSE; only a
+            // function-scoped local source binds to a non-global frame.
+            edge.is_function_scoped
         } else if edge.is_sys_source {
-            // For sys.source, check if it's targeting global env
-            if let Some(meta) = parent_meta.as_ref() {
-                !meta
-                    .sources
-                    .iter()
-                    .any(|s| s.is_sys_source && s.sys_source_global_env && s.line == call_site_line)
-            } else {
-                true // Assume non-global if no metadata
-            }
+            // A non-global sys.source (envir != globalenv) is declared-only.
+            !edge.sys_source_global_env
         } else {
             false
         };
@@ -5460,6 +5827,108 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
+    // Issue #483 (WI2b): persistent cross-snapshot cache for a `# raven:
+    // standalone` callee's isolated EOF scope. The hook fires only for an EOF
+    // resolution of a standalone file at depth >= 1 with canonical inputs (no
+    // provider, no package_contribution, empty inherited packages, empty/no
+    // prefix). The own-root query (depth 0) is excluded because only it injects
+    // `base_exports`, giving a different scope shape.
+    //
+    // VISITED-CONTAMINATION GUARD (load-bearing). The cache assumes C's isolated
+    // scope is caller-independent; the one resolver input that can break that is
+    // the shared `visited` map (the caller's forward path). If a CONTRIBUTING file
+    // is already in `visited`, C's resolved scope is truncated and caller-path-
+    // dependent — via either of two channels: (1) a visited forward-closure member
+    // short-circuits its `source()`, dropping its subtree; (2) a visited backward
+    // parent of a non-standalone member is zeroed by the revisit guard, dropping
+    // the packages it INHERITED / had loaded by siblings (its own `library()`
+    // calls survive via the direct artifact read). Either truncated scope must
+    // never be cached or served. So the hook is skipped whenever any member of the
+    // FULL contributing set (forward closure ∪ backward parents of non-standalone
+    // members — exactly what `standalone_closure_fingerprint_and_members` returns)
+    // is already in `visited`. A clean reach (no contributing file visited) resolves
+    // the full closure and is cached. This is conservatively over-broad — see #488.
+    //
+    // On a hit we return EXACTLY what the un-memoized resolver would: the
+    // truncation-free + `reach_depth <= compute_depth` rule mirrors
+    // `ForwardChildMemo`. On a miss we record the key and store the
+    // truncation-free result at the clean tail return below.
+    //
+    // The conditions are ordered cheapest-first: integer/`Option` checks, then
+    // the per-query cache-context presence (absent ⇒ not the diagnostics path ⇒
+    // no metadata lookup), then the metadata + acyclic + fingerprint/membership
+    // work and the contamination check.
+    let standalone_store: Option<(
+        super::standalone_cache::StandaloneCacheCtx,
+        super::standalone_cache::StandaloneScopeKey,
+    )> = if line == u32::MAX
+        && column == u32::MAX
+        && current_depth >= 1
+        && data_alias_provider.is_none()
+        && package_contribution.is_none()
+        && inherited_packages.is_empty()
+        && pre_computed_prefix.is_none_or(|p| p.is_empty())
+    {
+        // Cheap presence check first (no Arc clone): only the diagnostics path
+        // supplies a ctx (`is_some()` borrows without cloning, preserving the
+        // "absent ⇒ no metadata lookup" ordering). Clone — an Arc bump — only
+        // once the file is confirmed standalone in an acyclic graph; otherwise
+        // every non-standalone EOF forward child on the diagnostics path would
+        // pay an avoidable atomic inc/dec. `standalone_ctx` is not mutated
+        // between the two borrows, so the clone is guaranteed `Some`.
+        let ctx = if forward_child_memo.borrow().standalone_ctx.is_some()
+            && get_metadata(uri).is_some_and(|m| m.standalone)
+            && !forward_memo_graph_has_cycle(forward_child_memo, graph)
+        {
+            forward_child_memo.borrow().standalone_ctx.clone()
+        } else {
+            None
+        };
+        match ctx {
+            Some(ctx) => {
+                let (fingerprint, members) = standalone_closure_fingerprint_and_members(
+                    uri,
+                    graph,
+                    get_artifacts,
+                    get_metadata,
+                    forward_child_memo,
+                );
+                // Skip the cache if any CONTRIBUTING file is already visited: a
+                // visited forward member's source() short-circuits, and a visited
+                // backward parent of a non-standalone member loses its inherited /
+                // sibling-loaded packages at the revisit guard. Either way the
+                // resolved scope is truncated and caller-path-dependent, so it must
+                // never be cached (`members` is the full contributing set).
+                //
+                // This is conservatively over-broad: in a dense graph the
+                // contributing set often intersects `visited` even when no
+                // package-dropping truncation actually happens, so some sound
+                // entries are skipped (a perf cost, never a correctness one). A
+                // precise, package-contribution-aware replacement is tracked in #488.
+                if members.iter().any(|m| visited.contains_key(m)) {
+                    None
+                } else {
+                    let key = super::standalone_cache::StandaloneScopeKey {
+                        callee_uri: uri.clone(),
+                        edge_revision: ctx.edge_revision,
+                        closure_interface_fingerprint: fingerprint,
+                        max_chain_depth: max_depth,
+                        hoist_globals,
+                        backward_dep_mode,
+                        package_config_generation: ctx.package_config_generation,
+                    };
+                    if let Some(cached) = ctx.cache.get(&key, current_depth) {
+                        return (*cached).clone();
+                    }
+                    Some((ctx, key))
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Initialize scope with inherited_packages from parameter
     // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
     let mut scope = ScopeAtPosition {
@@ -5806,49 +6275,50 @@ where
                             }
                         }
 
+                        // Issue #483 part 2: a `# raven: standalone` callee is
+                        // resolved with caller-independent inputs — empty
+                        // packages, no `data()` provider, and its OWN
+                        // PathContext (never the caller's inherited/chdir working
+                        // directory). This makes the callee's isolated scope a
+                        // pure function of `(C, C's forward closure)`, the
+                        // precondition that lets the WI2b cache key on C's URI
+                        // alone. Safe-direction and opt-in: at worst a false
+                        // "undefined" inside the standalone file's contribution.
+                        let child_is_standalone =
+                            get_metadata(&child_uri).is_some_and(|m| m.standalone);
+                        let child_provider = if child_is_standalone {
+                            None
+                        } else {
+                            data_alias_provider
+                        };
+                        let empty_packages_for_standalone = HashSet::new();
                         let owned_packages: HashSet<String>;
-                        let packages_for_child: &HashSet<String> =
-                            if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
-                                &scope.inherited_packages
-                            } else {
-                                owned_packages = scope
-                                    .inherited_packages
-                                    .iter()
-                                    .chain(extra_packages.iter())
-                                    .chain(scope.loaded_packages.iter())
-                                    .cloned()
-                                    .collect();
-                                &owned_packages
-                            };
+                        let packages_for_child: &HashSet<String> = if child_is_standalone {
+                            &empty_packages_for_standalone
+                        } else if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
+                            &scope.inherited_packages
+                        } else {
+                            owned_packages = scope
+                                .inherited_packages
+                                .iter()
+                                .chain(extra_packages.iter())
+                                .chain(scope.loaded_packages.iter())
+                                .cloned()
+                                .collect();
+                            &owned_packages
+                        };
 
-                        // Build child PathContext, respecting chdir flag
-                        let child_path = child_uri.to_file_path().ok();
-                        let child_ctx = child_path.as_ref().and_then(|cp| {
-                            let ctx = path_ctx.as_ref()?;
-                            // Get child's metadata for its own working directory directive
-                            let child_meta = get_metadata(&child_uri);
-                            if let Some(cm) = child_meta {
-                                // Child has its own metadata - use it, but inherit working dir if no explicit one
-                                let mut child_ctx =
-                                    super::path_resolve::PathContext::from_metadata(
-                                        &child_uri,
-                                        &cm,
-                                        workspace_root,
-                                    )?;
-                                if child_ctx.working_directory.is_none() {
-                                    // Inherit from parent based on chdir flag
-                                    child_ctx.inherited_working_directory = if source.chdir {
-                                        Some(cp.parent()?.to_path_buf())
-                                    } else {
-                                        Some(ctx.effective_working_directory())
-                                    };
-                                }
-                                Some(child_ctx)
-                            } else {
-                                // No metadata for child - create context based on chdir
-                                Some(ctx.child_context_for_source(cp, source.chdir))
-                            }
-                        });
+                        // Build child PathContext, respecting chdir flag. A
+                        // standalone callee (part 2) uses its OWN context,
+                        // ignoring the caller's chdir / inherited working dir.
+                        let child_ctx = build_forward_child_path_context(
+                            &child_uri,
+                            child_is_standalone,
+                            source.chdir,
+                            path_ctx.as_ref(),
+                            workspace_root,
+                            get_metadata,
+                        );
 
                         // Early exit on cancellation before expensive recursive traversal
                         if is_cancelled() {
@@ -5874,7 +6344,7 @@ where
                             // (the common case in the dense graphs this targets)
                             // pays nothing for it.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = data_alias_provider_fp(data_alias_provider);
+                            let provider_fp = data_alias_provider_fp(child_provider);
                             resolve_forward_child_memoized(
                                 forward_child_memo,
                                 graph,
@@ -5913,7 +6383,7 @@ where
                                         true,
                                         None,
                                         None,
-                                        data_alias_provider,
+                                        child_provider,
                                         forward_child_memo,
                                     )
                                 },
@@ -5939,7 +6409,7 @@ where
                                 false,
                                 None,
                                 None,
-                                data_alias_provider,
+                                child_provider,
                                 forward_child_memo,
                             )
                         };
@@ -6185,6 +6655,19 @@ where
             .map(|a| a.calls_dev_load_all)
             .unwrap_or(false);
         append_package_contribution(&mut scope, uri, contrib, dev_load_all);
+    }
+
+    // Issue #483 (WI2b): populate the persistent standalone cache. Only the
+    // clean tail return reaches here — the cancellation early-returns above
+    // return a partial scope and never store. Mirror `ForwardChildMemo`: cache
+    // only a truncation-free scope (an empty `depth_exceeded` guarantees the
+    // full closure resolved, so it is reusable for any shallower-or-equal
+    // reach), and never one produced under cancellation.
+    if let Some((ctx, key)) = standalone_store
+        && !is_cancelled()
+        && scope.depth_exceeded.is_empty()
+    {
+        ctx.cache.store(key, Arc::new(scope.clone()), current_depth);
     }
 
     scope
@@ -6897,6 +7380,15 @@ where
     /// that `snapshot()` and `is_visible()` never have to materialize them
     /// on the hot path. With `hoist_globals=false` the `(uri, true)` slot
     /// is identical to `(uri, false)`, so we share the same `Arc`.
+    ///
+    /// This thin wrapper passes no WI2b standalone-scope cache (issue #483); the
+    /// diagnostics path calls [`ScopeStream::new_with_standalone_cache`] directly
+    /// to enable the cross-snapshot cache. Since that switch, the only callers
+    /// are tests and the `test-support` bench (`bench_scope_stream_sweep`), so it
+    /// is gated to those configs — otherwise a plain `cargo build` (no
+    /// `test-support`) would report it as dead code, contradicting the repo's
+    /// zero-warnings discipline.
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queried_uri: &'a Url,
@@ -6913,6 +7405,54 @@ where
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
         data_alias_provider: Option<&'a DataAliasProvider<'a>>,
     ) -> Option<Self> {
+        Self::new_with_standalone_cache(
+            queried_uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            prefix_cache,
+            package_contribution,
+            data_alias_provider,
+            None,
+        )
+    }
+
+    /// As [`ScopeStream::new`], but threads a WI2b persistent standalone-scope
+    /// cache context (issue #483), seeding both the actual-depth and shared
+    /// prefix forward-child memos so the EOF hook can consult/populate the
+    /// cross-snapshot cache. `None` is equivalent to [`ScopeStream::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_standalone_cache(
+        queried_uri: &'a Url,
+        get_artifacts: &'a F,
+        get_metadata: &'a G,
+        graph: &'a super::dependency::DependencyGraph,
+        workspace_root: Option<&'a Url>,
+        max_depth: usize,
+        base_exports: &'a HashSet<String>,
+        hoist_globals: bool,
+        backward_dep_mode: super::config::BackwardDependencyMode,
+        is_cancelled: &'a dyn Fn() -> bool,
+        prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+        package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+        data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+        // Issue #483 (WI2b): persistent standalone-scope cache context, or `None`
+        // to disable caching. Seeds the actual-depth forward-child memo (forward
+        // children) and, WHEN prefix-memo sharing is enabled, the shared prefix
+        // memo (backward-parent-at-EOF resolution of a standalone hub) so the EOF
+        // hook can consult/populate the cache from that path too. When sharing is
+        // gated off (or for the isolated `query_inside_function = true` slot),
+        // `compute_or_get_cached_prefix` falls back to an ephemeral memo with no
+        // cache context, so the backward-parent path simply recomputes — a missed
+        // optimization, never a stale hit.
+        standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+    ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
         // Per-stream forward-child memo (issue #472), shared across the forward
@@ -6921,8 +7461,9 @@ where
         // `compute_or_get_cached_prefix` resolves prefixes at a canonical
         // depth-0 origin and uses a SEPARATE prefix memo (or, when sharing is
         // gated off, its own ephemeral memo) to avoid polluting this
-        // actual-depth one (see its doc comment).
-        let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+        // actual-depth one (see its doc comment). Both memos are seeded with the
+        // WI2b cache context (issue #483).
+        let forward_child_memo = ForwardChildMemo::with_standalone_ctx(standalone_ctx.clone());
 
         // Shared prefix forward-child memo (issue #479). The gate
         // (`prefix_memo_share_safe`) proves only the no-possible-truncation half
@@ -6938,7 +7479,7 @@ where
         let prefix_forward_child_memo =
             if graph.prefix_memo_share_safe(queried_uri, max_depth, PREFIX_MEMO_SHARE_PROBE_BUDGET)
             {
-                Some(std::cell::RefCell::new(ForwardChildMemo::default()))
+                Some(ForwardChildMemo::with_standalone_ctx(standalone_ctx))
             } else {
                 None
             };
@@ -7838,30 +8379,30 @@ where
             return contrib;
         }
 
-        // Build child PathContext, respecting source.chdir. Mirrors the
-        // logic at `scope.rs:3554-3581`.
-        let child_path = child_uri.to_file_path().ok();
-        let child_ctx = child_path.as_ref().and_then(|cp| {
-            let ctx = self.path_ctx.as_ref()?;
-            let child_meta = (self.get_metadata)(&child_uri);
-            if let Some(cm) = child_meta {
-                let mut child_ctx = super::path_resolve::PathContext::from_metadata(
-                    &child_uri,
-                    &cm,
-                    self.workspace_root,
-                )?;
-                if child_ctx.working_directory.is_none() {
-                    child_ctx.inherited_working_directory = if source.chdir {
-                        Some(cp.parent()?.to_path_buf())
-                    } else {
-                        Some(ctx.effective_working_directory())
-                    };
-                }
-                Some(child_ctx)
-            } else {
-                Some(ctx.child_context_for_source(cp, source.chdir))
-            }
-        });
+        // Issue #483 part 2: a `# raven: standalone` callee is resolved with
+        // caller-independent inputs (no `data()` provider, its OWN PathContext).
+        // The packages set passed to a child here is already empty (the child's
+        // own parent walk handles its inheritance), so only the provider and
+        // context need the standalone substitution. See the recursive
+        // forward-source dispatch for the full rationale.
+        let child_is_standalone = (self.get_metadata)(&child_uri).is_some_and(|m| m.standalone);
+        let child_provider = if child_is_standalone {
+            None
+        } else {
+            self.data_alias_provider
+        };
+
+        // Build child PathContext, respecting source.chdir. A standalone callee
+        // uses its OWN context, ignoring the caller's chdir / inherited working
+        // directory (shared with the recursive resolver via this helper).
+        let child_ctx = build_forward_child_path_context(
+            &child_uri,
+            child_is_standalone,
+            source.chdir,
+            self.path_ctx.as_ref(),
+            self.workspace_root,
+            self.get_metadata,
+        );
 
         // Cancel-aware short-circuit before kicking off the child recursion.
         if (self.is_cancelled)() {
@@ -7908,7 +8449,7 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
-        let provider_fp = data_alias_provider_fp(self.data_alias_provider);
+        let provider_fp = data_alias_provider_fp(child_provider);
         // The streaming path resolves forward children of the queried URI at
         // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
@@ -7941,7 +8482,7 @@ where
                     true,
                     Some(&child_prefix),
                     None,
-                    self.data_alias_provider,
+                    child_provider,
                     &self.forward_child_memo,
                 )
             },
@@ -9710,6 +10251,1108 @@ mod tests {
         assert!(
             resolve_parent(true).symbols.contains_key("child_sym"),
             "caller must still see a standalone callee's own definitions (knob 2)"
+        );
+    }
+
+    /// Issue #483 part 2: a `# raven: standalone` callee resolved as a forward
+    /// child is resolved with caller-independent inputs. In particular the
+    /// caller's `DataAliasProvider` is NOT threaded into a standalone child, so
+    /// the child's `data()` call is not expanded by the caller's provider —
+    /// making the child's scope a pure function of `(C, C's forward closure)`,
+    /// the precondition for keying the WI2b cache on C's URI alone. Knob 2 is
+    /// preserved: the caller still sees the child's own (non-provider)
+    /// definitions.
+    #[test]
+    fn standalone_forward_child_ignores_caller_data_alias_provider() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let root = Url::parse("file:///project").unwrap();
+        // x.r is the standalone callee: `data(api)` (would expand to
+        // apiclus1/apistrat under the provider) and defines x_sym.
+        let x_uri = Url::parse("file:///project/x.r").unwrap();
+        let x_code = "# raven: standalone\ndata(api)\nx_sym <- 1\n";
+        // q.r sources x.r (forward edge, resolved with the real provider).
+        let q_uri = Url::parse("file:///project/q.r").unwrap();
+        let q_code = "source(\"x.r\")\n";
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut metas: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code) in [(&x_uri, x_code), (&q_uri, q_code)] {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(&root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+        let get_artifacts = |u: &Url| artifacts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let base_exports = HashSet::new();
+        let base_packages: HashSet<String> = ["survey".to_string()].into_iter().collect();
+        let lookup = fake_alias_lookup;
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+
+        let scope = scope_at_position_with_graph(
+            &q_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            64,
+            &base_exports,
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        // Knob 2: the caller still sees the standalone child's own definition.
+        assert!(
+            scope.symbols.contains_key("x_sym"),
+            "caller must still see a standalone child's own definition (knob 2)"
+        );
+        // Part 2: the caller's provider is NOT applied to the standalone child,
+        // so its `data(api)` is not expanded to dataset aliases.
+        assert!(
+            !scope.symbols.contains_key("apiclus1") && !scope.symbols.contains_key("apistrat"),
+            "standalone forward child must be resolved with NO caller DataAliasProvider \
+             (part 2); got: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ===================================================================
+    // Issue #483 (WI2b): persistent standalone-scope cache integration tests.
+    // ===================================================================
+
+    type CacheArtifacts = HashMap<Url, Arc<ScopeArtifacts>>;
+    type CacheMetas = HashMap<Url, std::sync::Arc<crate::cross_file::types::CrossFileMetadata>>;
+
+    /// Build artifacts + metadata + a dependency graph for `(uri, code)` files.
+    fn build_cache_scenario(
+        root: &Url,
+        files: &[(Url, &str)],
+    ) -> (
+        CacheArtifacts,
+        CacheMetas,
+        crate::cross_file::dependency::DependencyGraph,
+    ) {
+        let mut artifacts: CacheArtifacts = HashMap::new();
+        let mut metas: CacheMetas = HashMap::new();
+        let mut graph = crate::cross_file::dependency::DependencyGraph::new();
+        for (uri, code) in files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+                code,
+                Some(&tree),
+            ));
+            graph.update_file(uri, &meta, Some(root), |_| None);
+            metas.insert(uri.clone(), meta);
+        }
+        (artifacts, metas, graph)
+    }
+
+    /// Recompute one file's artifacts in place (simulating an edit) without
+    /// touching graph edges.
+    fn replace_artifacts(artifacts: &mut CacheArtifacts, uri: &Url, code: &str) {
+        let tree = parse_r(code);
+        artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+    }
+
+    /// Resolve `uri`'s full-EOF scope through the cached entry point with a
+    /// shared persistent standalone cache. Closures are rebuilt from the maps
+    /// each call so a test can simulate edits by mutating the maps in between.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_eof_cached(
+        uri: &Url,
+        artifacts: &CacheArtifacts,
+        metas: &CacheMetas,
+        graph: &crate::cross_file::dependency::DependencyGraph,
+        root: &Url,
+        cache: &Arc<crate::cross_file::standalone_cache::StandaloneScopeCache>,
+        edge_revision: u64,
+        package_config_generation: u64,
+    ) -> ScopeAtPosition {
+        let get_artifacts = |u: &Url| artifacts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let ctx = crate::cross_file::standalone_cache::StandaloneCacheCtx {
+            cache: cache.clone(),
+            edge_revision,
+            package_config_generation,
+        };
+        let mut prefix_cache = ParentPrefixCache::new();
+        scope_at_position_with_graph_cached_with_standalone_cache(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            graph,
+            Some(root),
+            64,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &mut prefix_cache,
+            None,
+            None,
+            Some(ctx),
+        )
+    }
+
+    /// The standard scenario: two callers `a`,`b` source a standalone `hub`
+    /// which sources `leaf`. `hub`'s isolated scope (hub_fn + leaf_fn) is what
+    /// gets cached and reused across callers.
+    fn standard_cache_files() -> (Url, Url, Url, Url, Url) {
+        let root = Url::parse("file:///proj").unwrap();
+        let leaf = Url::parse("file:///proj/leaf.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        (root, leaf, hub, a, b)
+    }
+
+    #[test]
+    fn standalone_cache_second_caller_hits_and_is_caller_independent() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        // a and b load DIFFERENT packages — part 2 makes hub caller-independent,
+        // so hub's cached scope (and key) is identical for both.
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "library(pkgA)\nsource(\"hub.r\")\n"),
+                (b.clone(), "library(pkgB)\nsource(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+
+        let sa = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert!(sa.symbols.contains_key("hub_fn") && sa.symbols.contains_key("leaf_fn"));
+        assert_eq!(cache.misses(), 1, "first caller computes hub's scope");
+        assert_eq!(cache.hits(), 0);
+
+        let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert!(sb.symbols.contains_key("hub_fn") && sb.symbols.contains_key("leaf_fn"));
+        assert_eq!(
+            cache.hits(),
+            1,
+            "second caller (different loaded package) must hit the SAME hub key — \
+             proves caller-independence (part 2) and the URI-keyed cache"
+        );
+    }
+
+    /// Regression for the cross-snapshot staleness bug found in WI2b review.
+    ///
+    /// A standalone callee's isolated scope can depend on the backward parents of
+    /// its NON-standalone forward-closure members: when standalone `hub` sources
+    /// non-standalone `m`, `m`'s own `parent_prefix_at` walk pulls in `m`'s other
+    /// parent `a` (which does `library(dplyr)`), so `dplyr` leaks into `hub`'s
+    /// isolated scope. `a` lies OUTSIDE `hub`'s forward closure `{hub, m}`, so an
+    /// edit to `a`'s `library()` line bumps neither `edge_revision` (no source
+    /// edge changed) nor a forward-only fingerprint. The fingerprint must cover
+    /// the full contributing set (forward closure + backward parents of
+    /// non-standalone members), so that:
+    ///   (a) the entry is still reused across callers (`a`'s contribution is
+    ///       caller-independent — the same for any file that sources `hub`), and
+    ///   (b) editing `a` invalidates the entry (no stale HIT).
+    #[test]
+    fn standalone_cache_invalidates_on_member_backward_parent_edit() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let c = Url::parse("file:///proj/c.r").unwrap();
+        // `a` loads dplyr then sources m (so `a` is a backward parent of m, and
+        // dplyr is in scope at `a`'s source(m)). hub is standalone and sources m.
+        // Callers `b` and `c` source hub only. m is non-standalone. NB: the
+        // leaking parent `a` must NOT itself source hub — a caller that is also a
+        // contributing backward parent is on its own `visited` path, which the
+        // contamination guard now (correctly) refuses to cache; routing the leak
+        // through a non-caller `a` keeps the cross-caller reuse this test asserts.
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "library(dplyr)\nsource(\"m.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+                (c.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        // Populate the cache via caller `b`, then resolve via caller `c`: `c`
+        // must HIT (the leaked package is caller-independent), proving the
+        // contributing-set fix did not break cross-caller reuse.
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let sc = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&sb), vec!["dplyr".to_string()]);
+        assert_eq!(
+            pkgs(&sc),
+            vec!["dplyr".to_string()],
+            "second caller must see the same caller-independent scope"
+        );
+        assert_eq!(cache.hits(), 1, "second caller must reuse the cached scope");
+
+        // EDIT `a`: library(dplyr) -> library(tidyr). Only a library() call
+        // changed, NOT a source() edge, so edge_revision is unchanged; `a` is a
+        // backward parent of m, not a member of hub's forward closure.
+        replace_artifacts(&mut arts, &a, "library(tidyr)\nsource(\"m.r\")\n");
+
+        // Same persistent cache: must NOT serve the stale dplyr scope.
+        let sc_after = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache, rev, 0);
+        // Reference: a fresh cache reflects the edit.
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let sc_ref = resolve_eof_cached(&c, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&sc_after),
+            pkgs(&sc_ref),
+            "stale HIT: persistent cache served pre-edit `a`'s package after `a` changed"
+        );
+        assert_eq!(
+            pkgs(&sc_after),
+            vec!["tidyr".to_string()],
+            "post-edit scope must reflect the new library() in the member's backward parent"
+        );
+    }
+
+    /// Regression for the visited-dependent backward-parent staleness found in
+    /// the WI2b adversarial review. A standalone callee C's isolated scope can
+    /// depend on whether a backward parent of one of its NON-standalone
+    /// forward-closure members is already in the resolver's `visited` map — and
+    /// `visited` is the caller's forward-path, which the URI-keyed cache assumes
+    /// away. That breaks caller-independence: two diagnostic roots in one session
+    /// compute the SAME key but DIFFERENT scopes, so the first reach's value is
+    /// served stale to the second.
+    ///
+    /// Diamond (all forward `source()` edges, acyclic): `gp` does
+    /// `library(dplyr)` then `source("p.r")`; `p` sources both `c` and `m`;
+    /// standalone `c` sources `m`; `a` sources `c`. `m`'s backward parents are
+    /// `{c, p}`, and `p` transitively INHERITS dplyr from `gp` (p loads nothing
+    /// itself). All four of `{c, m, p, gp}` are in C's contributing set.
+    ///
+    /// - Root `gp`: the path resolves `p` at EOF before reaching `c`, so when
+    ///   `m`'s backward walk re-reaches `p` the revisit guard returns an empty
+    ///   parent scope and `p`'s INHERITED dplyr is dropped — C's scope has NO
+    ///   dplyr. (`p`'s OWN `library()` calls would survive via the direct-artifact
+    ///   channel, but dplyr is inherited, not loaded by `p`.)
+    /// - Root `a`: `p` is not visited, the walk picks dplyr up — C has dplyr.
+    ///
+    /// Both reaches produce the identical cache key (same contributing-set
+    /// fingerprint over `{c, m, p, gp}`, same `edge_revision`, same config), so a
+    /// `gp`-warmed entry would be served stale to the `a` reach. Fixed by having
+    /// the contamination guard skip caching when ANY contributing-set member
+    /// (forward closure OR a backward parent of a non-standalone member) is in
+    /// `visited`, not just the forward closure.
+    #[test]
+    fn standalone_cache_skips_when_member_backward_parent_is_visited() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let gp = Url::parse("file:///proj/gp.r").unwrap();
+        let p = Url::parse("file:///proj/p.r").unwrap();
+        let c = Url::parse("file:///proj/c.r").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    c.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nc_fn <- function() 2\n",
+                ),
+                (p.clone(), "source(\"c.r\")\nsource(\"m.r\")\n"),
+                (gp.clone(), "library(dplyr)\nsource(\"p.r\")\n"),
+                (a.clone(), "source(\"c.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        // Warm the shared cache from root `gp`: the path visits `p` at EOF before
+        // reaching `c`, so c's resolved scope is the visited-TRUNCATED one (no
+        // dplyr — the inherited package is dropped at the revisit guard).
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let _ = resolve_eof_cached(&gp, &arts, &metas, &graph, &root, &cache, rev, 0);
+
+        // Resolve from root `a` on the SAME cache. A stale HIT would serve gp's
+        // truncated (no-dplyr) scope; the correct (cache-off) result has dplyr.
+        let sa = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let sa_ref = resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&sa),
+            pkgs(&sa_ref),
+            "stale HIT: the gp-reach cached a visited-truncated scope and served it to the a-reach"
+        );
+        assert_eq!(
+            pkgs(&sa),
+            vec!["dplyr".to_string()],
+            "a's reach resolves c fresh (p not visited) and must see dplyr inherited via m's \
+             backward parent p"
+        );
+    }
+
+    /// Regression for the fourth WI2b staleness variant: a contributing file's
+    /// `library()`/`require()` FUNCTION SCOPE (not just its position) affects the
+    /// isolated scope — a function-scoped load contributes to a sourced child only
+    /// when the `source()` call shares or descends that scope. Flipping `a`'s load
+    /// from top-level to function-scoped at a FIXED `(line, column)` (wrapping it
+    /// in an IIFE) changes whether `pkg` reaches the standalone hub, while leaving
+    /// the package name+position, source() edges, and `edge_revision` unchanged.
+    /// Fixed by hashing each load's `function_scope` in `compute_interface_hash`.
+    #[test]
+    fn standalone_cache_invalidates_on_package_function_scope_flip() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                // library(pkg) at line 1, col 0, TOP-LEVEL: contributes to m's
+                // prefix at source(m) and so leaks into hub's isolated scope.
+                (
+                    a.clone(),
+                    "# pad\nlibrary(pkg)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+                ),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        let cache = Arc::new(StandaloneScopeCache::new());
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&before), vec!["pkg".to_string()]);
+
+        // Wrap the load in an IIFE so it becomes function-scoped, keeping the
+        // `library` token at the SAME (line 1, col 0) and the source() calls on
+        // the same lines (so edge_revision is unchanged). Now top-level source(m)
+        // is not in the load's scope -> pkg must NOT contribute.
+        replace_artifacts(
+            &mut arts,
+            &a,
+            "(function(){\nlibrary(pkg)})()\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+        );
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&after),
+            pkgs(&reference),
+            "stale HIT: cache served pre-flip package set after a library() became function-scoped"
+        );
+        assert!(
+            pkgs(&after).is_empty(),
+            "a function-scoped library() must not propagate to a top-level source(), got {:?}",
+            pkgs(&after)
+        );
+    }
+
+    /// A `source()` REORDER inside a standalone callee changes its isolated
+    /// scope (first-source-wins decides which definition of a shared symbol
+    /// survives), and this is covered by `edge_revision` in the cache key — NOT
+    /// by the interface fingerprint, which does not hash `source()` call
+    /// positions. Reordering changes the edges' `call_site_line`, so the single
+    /// persistent graph's `update_file` bumps the global `edge_revision`,
+    /// changing the key. (Modeled with one graph + `update_file`, as in
+    /// production; building two independent graphs would reset the per-graph
+    /// counter and not exercise the monotonic global one.)
+    #[test]
+    fn standalone_cache_invalidates_on_source_reorder() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let bb = Url::parse("file:///proj/bb.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let caller = Url::parse("file:///proj/caller.r").unwrap();
+        // hub (standalone) sources a then bb; both define `x` -> order decides
+        // which source_uri wins.
+        let (mut arts, mut metas, mut graph) = build_cache_scenario(
+            &root,
+            &[
+                (a.clone(), "x <- 1\n"),
+                (bb.clone(), "x <- 2\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"a.r\")\nsource(\"bb.r\")\n",
+                ),
+                (caller.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev_a = graph.edge_revision();
+        let s1 = resolve_eof_cached(&caller, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        let x1 = s1.symbols.get("x").map(|s| s.source_uri.to_string());
+
+        // EDIT hub: reorder to source bb then a. Model a real edit: update BOTH
+        // artifacts and the SINGLE persistent graph (update_file bumps the global
+        // edge_revision because the source() call_site_lines change).
+        let new_hub = "# raven: standalone\nsource(\"bb.r\")\nsource(\"a.r\")\n";
+        replace_artifacts(&mut arts, &hub, new_hub);
+        let tree = parse_r(new_hub);
+        let new_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            new_hub,
+            Some(&tree),
+        ));
+        graph.update_file(&hub, &new_meta, Some(&root), |_| None);
+        metas.insert(hub.clone(), new_meta);
+        let rev_b = graph.edge_revision();
+
+        let s2 = resolve_eof_cached(&caller, &arts, &metas, &graph, &root, &cache, rev_b, 0);
+        let x2 = s2.symbols.get("x").map(|s| s.source_uri.to_string());
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let s2_ref = resolve_eof_cached(
+            &caller,
+            &arts,
+            &metas,
+            &graph,
+            &root,
+            &cache_fresh,
+            rev_b,
+            0,
+        );
+        let x2_ref = s2_ref.symbols.get("x").map(|s| s.source_uri.to_string());
+        assert!(
+            rev_b > rev_a,
+            "reordering source() calls must bump edge_revision"
+        );
+        // The reorder must actually change which definition of `x` wins
+        // (first-source-wins: a.r before the edit, bb.r after) — otherwise the
+        // test would pass vacuously while no longer exercising the staleness it
+        // is named for.
+        assert_eq!(
+            x1.as_deref(),
+            Some("file:///proj/a.r"),
+            "pre-edit: a.r wins"
+        );
+        assert_eq!(
+            x2.as_deref(),
+            Some("file:///proj/bb.r"),
+            "post-reorder: bb.r must win"
+        );
+        assert_ne!(x1, x2, "the reorder must change `x`'s winning source");
+        assert_eq!(x2, x2_ref, "STALE on source() reorder");
+    }
+
+    /// Regression (confirmed by Codex): two `sys.source()` calls on ONE line —
+    /// one into `globalenv()`, one into `new.env()` — must each use their OWN
+    /// envir to decide backward inheritance. `parent_prefix_at` reads
+    /// `edge.sys_source_global_env` per edge, so the non-global child does NOT
+    /// inherit the parent's top-level symbols while the global one does. (The
+    /// earlier line-only metadata scan let a global `sys.source` on the same line
+    /// wrongly classify a non-global call as global, suppressing diagnostics.)
+    #[test]
+    fn sys_source_two_calls_on_one_line_use_per_call_envir() {
+        let root = Url::parse("file:///proj").unwrap();
+        let parent = Url::parse("file:///proj/parent.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (
+                    parent.clone(),
+                    "parent_sym <- 1\nsys.source(\"a.r\", envir = globalenv()); sys.source(\"b.r\", envir = new.env())\n",
+                ),
+                (a.clone(), "a_sym <- 1\n"),
+                (b.clone(), "b_sym <- 1\n"),
+            ],
+        );
+        let get_artifacts = |u: &Url| arts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let resolve = |uri: &Url| {
+            scope_at_position_with_graph(
+                uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+        // a.r is sourced via a GLOBAL-env sys.source -> inherits parent_sym.
+        let scope_a = resolve(&a);
+        assert!(
+            scope_a.symbols.contains_key("parent_sym"),
+            "a global sys.source child must inherit the parent's top-level symbol"
+        );
+        // b.r is sourced via a NON-global sys.source on the SAME line -> must NOT
+        // inherit parent_sym (non-global frame => declared-only inheritance).
+        let scope_b = resolve(&b);
+        assert!(
+            !scope_b.symbols.contains_key("parent_sym"),
+            "a non-global sys.source child must NOT inherit the parent's top-level symbol, even when a global sys.source shares its line"
+        );
+    }
+
+    /// Regression for the cross-snapshot staleness bug found in WI2b review
+    /// (confirmed by Codex): whether a `sys.source()` callee contributes its
+    /// top-level symbols depends on its `envir` argument — `globalenv()`
+    /// contributes (like `source()`), a non-global env does NOT (see
+    /// `should_apply_local_scoping`). That flag (`sys_source_global_env`) is
+    /// absent from `compute_interface_hash`, so toggling
+    /// `globalenv()` ↔ `new.env()` at a FIXED call site leaves the closure
+    /// fingerprint unchanged. The fix carries `sys_source_global_env` on the
+    /// `DependencyEdge` (folded into full-edge equality), so the toggle bumps
+    /// `edge_revision` — which IS in the cache key — and the stale isolated
+    /// scope is not served. Without the edge field this test would hit the
+    /// pre-toggle entry and still see `leaf_fn`.
+    #[test]
+    fn standalone_cache_invalidates_on_sys_source_envir_toggle() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        // hub (standalone) pulls leaf in via a GLOBAL-env sys.source -> leaf_fn
+        // contributes to hub's isolated scope.
+        let hub_global = "# raven: standalone\nsys.source(\"leaf.r\", envir = globalenv())\nhub_fn <- function() 2\n";
+        let (mut arts, mut metas, mut graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (hub.clone(), hub_global),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev_a = graph.edge_revision();
+        // Warm via a, then resolve b: leaf_fn is present (global sys.source).
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        assert!(
+            before.symbols.contains_key("leaf_fn"),
+            "a global-env sys.source must contribute leaf_fn"
+        );
+
+        // EDIT hub: same call site, change envir to a NON-global env. leaf_fn
+        // must no longer contribute. Update artifacts AND the persistent graph
+        // (the edge's sys_source_global_env flips true->false, so update_file
+        // bumps the global edge_revision).
+        let hub_local = "# raven: standalone\nsys.source(\"leaf.r\", envir = new.env())\nhub_fn <- function() 2\n";
+        replace_artifacts(&mut arts, &hub, hub_local);
+        let tree = parse_r(hub_local);
+        let new_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            hub_local,
+            Some(&tree),
+        ));
+        graph.update_file(&hub, &new_meta, Some(&root), |_| None);
+        metas.insert(hub.clone(), new_meta);
+        let rev_b = graph.edge_revision();
+        assert!(
+            rev_b > rev_a,
+            "toggling sys.source envir must bump edge_revision"
+        );
+
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev_b, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference =
+            resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev_b, 0);
+        assert_eq!(
+            after.symbols.contains_key("leaf_fn"),
+            reference.symbols.contains_key("leaf_fn"),
+            "stale HIT: cache served the pre-toggle scope after sys.source envir changed"
+        );
+        assert!(
+            !after.symbols.contains_key("leaf_fn"),
+            "after the toggle to a non-global env, leaf_fn must NOT be in hub's scope"
+        );
+    }
+
+    /// Regression for the second cross-snapshot staleness bug found in WI2b
+    /// review (confirmed by Codex): a contributing file's package-load POSITION
+    /// affects the isolated scope (a `library()` contributes to a sourced child
+    /// only when it precedes the `source()` call), but `compute_interface_hash`
+    /// once hashed package NAMES without position. So MOVING `library(dplyr)`
+    /// from before to after `source("m.r")` — same package set, no source-edge
+    /// change, so neither the name hash nor `edge_revision` moved — left the
+    /// persistent cache serving a stale isolated scope (still carrying dplyr).
+    /// Fixed by hashing each package load's `(line, column)` in the interface
+    /// hash, which feeds the cache's `closure_interface_fingerprint`.
+    #[test]
+    fn standalone_cache_invalidates_on_library_move_across_source() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let m = Url::parse("file:///proj/m.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (m.clone(), "m_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"m.r\")\nhub_fn <- function() 2\n",
+                ),
+                // dplyr loaded BEFORE source(m): it contributes to m's prefix and
+                // so leaks into hub's isolated scope.
+                (
+                    a.clone(),
+                    "library(dplyr)\nsource(\"hub.r\")\nsource(\"m.r\")\n",
+                ),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let rev = graph.edge_revision();
+        fn pkgs(s: &ScopeAtPosition) -> Vec<String> {
+            let mut v: Vec<String> = s
+                .loaded_packages
+                .iter()
+                .chain(s.inherited_packages.iter())
+                .chain(s.package_origins.keys())
+                .cloned()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        let cache = Arc::new(StandaloneScopeCache::new());
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(pkgs(&before), vec!["dplyr".to_string()]);
+
+        // MOVE library(dplyr) to AFTER both source() calls. Same package set, no
+        // symbols, source() edges unchanged. dplyr now loads after source(m), so
+        // it must NOT contribute to hub's isolated scope.
+        replace_artifacts(
+            &mut arts,
+            &a,
+            "source(\"hub.r\")\nsource(\"m.r\")\nlibrary(dplyr)\n",
+        );
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev, 0);
+        assert_eq!(
+            pkgs(&after),
+            pkgs(&reference),
+            "stale HIT: cache served pre-move package set after a library() moved across a source()"
+        );
+        assert!(
+            pkgs(&after).is_empty(),
+            "after the move dplyr loads past source(m) and must not be in hub's scope, got {:?}",
+            pkgs(&after)
+        );
+    }
+
+    #[test]
+    fn standalone_cache_body_edit_to_closure_member_stays_hit() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(cache.misses(), 1);
+
+        // Edit leaf's BODY only (same top-level interface). edge_revision and
+        // interface_hash are unchanged → fingerprint unchanged → still a hit.
+        replace_artifacts(&mut arts, &leaf, "leaf_fn <- function() { 42 + 1 }\n");
+        let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert!(sb.symbols.contains_key("leaf_fn"));
+        assert_eq!(
+            cache.hits(),
+            1,
+            "a body/comment edit to a closure member must stay a cache HIT"
+        );
+    }
+
+    #[test]
+    fn standalone_cache_interface_edit_to_closure_member_misses() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        let (mut arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(cache.misses(), 1);
+
+        // Add a top-level symbol to leaf → interface_hash changes → fingerprint
+        // changes → cache MISS → recompute → the new symbol is now visible.
+        replace_artifacts(
+            &mut arts,
+            &leaf,
+            "leaf_fn <- function() 1\nleaf_fn2 <- function() 9\n",
+        );
+        let sb = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert_eq!(
+            cache.hits(),
+            0,
+            "an interface edit must NOT hit the stale entry"
+        );
+        assert_eq!(cache.misses(), 2, "the interface edit recomputes");
+        assert!(
+            sb.symbols.contains_key("leaf_fn2"),
+            "the recomputed scope reflects the closure member's new interface"
+        );
+    }
+
+    #[test]
+    fn standalone_cache_generation_bump_misses() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        // A package_config_generation bump (e.g. R re-init) changes the key.
+        resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 1);
+        assert_eq!(cache.hits(), 0, "a generation bump must invalidate the key");
+        assert_eq!(cache.misses(), 2);
+        // And an edge_revision bump likewise.
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev + 1, 1);
+        assert_eq!(
+            cache.hits(),
+            0,
+            "an edge_revision bump must invalidate the key"
+        );
+        assert_eq!(cache.misses(), 3);
+    }
+
+    #[test]
+    fn standalone_cache_hit_value_is_byte_identical_to_uncached() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\nleaf_x <- 7\n"),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let get_artifacts = |u: &Url| arts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        // Uncached resolution of caller b (no standalone cache context).
+        let uncached = scope_at_position_with_graph(
+            &b,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            64,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        // Warm the cache via caller a, then resolve b through the cache (HIT on hub).
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev, 0);
+        let cached = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert!(cache.hits() >= 1, "b must hit hub's cached scope");
+        // The merged caller scope must match the uncached resolution across every
+        // scope-carrying field, not just the symbol key set — a HIT that diverged
+        // in package state (the failure mode found in WI2b review) or in a
+        // symbol's resolved identity must be caught here.
+        // Full per-symbol identity: every `ScopedSymbol` field a caller consumes
+        // (position fields drive hover/go-to-definition ranges; `is_declared`
+        // drives declared-vs-real precedence at cross-file merges), not just
+        // name+source+line+kind/signature. A HIT diverging in any of these is
+        // exactly the provenance drift this byte-identity gate must catch.
+        #[allow(clippy::type_complexity)]
+        fn symbol_identities(
+            s: &ScopeAtPosition,
+        ) -> Vec<(String, String, u32, u32, u32, bool, String)> {
+            let mut v: Vec<(String, String, u32, u32, u32, bool, String)> = s
+                .symbols
+                .iter()
+                .map(|(name, sym)| {
+                    (
+                        name.to_string(),
+                        sym.source_uri.to_string(),
+                        sym.defined_line,
+                        sym.defined_column,
+                        sym.defined_end_column,
+                        sym.is_declared,
+                        format!("{:?}|{:?}", sym.kind, sym.signature),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        fn sorted(set: &HashSet<String>) -> Vec<String> {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort();
+            v
+        }
+        fn sorted_arc_str(set: &HashSet<Arc<str>>) -> Vec<String> {
+            let mut v: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        }
+        // package_origins VALUES (the per-package origin-URI sets), not just the
+        // keys — origins feed the same-file leak filter at cross-file merges.
+        fn origins(m: &HashMap<String, HashSet<Arc<Url>>>) -> Vec<(String, Vec<String>)> {
+            let mut v: Vec<(String, Vec<String>)> = m
+                .iter()
+                .map(|(k, set)| {
+                    let mut urls: Vec<String> = set.iter().map(|u| u.to_string()).collect();
+                    urls.sort();
+                    (k.clone(), urls)
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        fn vis(m: &HashMap<Url, (u32, u32)>) -> Vec<(String, u32, u32)> {
+            let mut v: Vec<(String, u32, u32)> = m
+                .iter()
+                .map(|(u, (l, c))| (u.to_string(), *l, *c))
+                .collect();
+            v.sort();
+            v
+        }
+        fn depths(v: &[(Url, u32, u32)]) -> Vec<(String, u32, u32)> {
+            let mut out: Vec<(String, u32, u32)> =
+                v.iter().map(|(u, l, c)| (u.to_string(), *l, *c)).collect();
+            out.sort();
+            out
+        }
+        fn chain_strs(v: &[Url]) -> Vec<String> {
+            v.iter().map(|u| u.to_string()).collect()
+        }
+        assert_eq!(
+            symbol_identities(&cached),
+            symbol_identities(&uncached),
+            "a cache HIT must yield the same symbols (name + source + line/column/end_column + is_declared + kind/signature)"
+        );
+        assert_eq!(
+            sorted(&cached.inherited_packages),
+            sorted(&uncached.inherited_packages),
+            "inherited_packages must match uncached"
+        );
+        assert_eq!(
+            sorted(&cached.loaded_packages),
+            sorted(&uncached.loaded_packages),
+            "loaded_packages must match uncached"
+        );
+        assert_eq!(
+            origins(&cached.package_origins),
+            origins(&uncached.package_origins),
+            "package_origins (keys AND origin-URI sets) must match uncached"
+        );
+        // The remaining scope-carrying fields a cached scope also carries and
+        // callers consume: chain order, per-file visible positions, the
+        // parent-prefix-only symbol set, and depth-exceeded markers.
+        assert_eq!(
+            chain_strs(&cached.chain),
+            chain_strs(&uncached.chain),
+            "chain must match uncached (order included)"
+        );
+        assert_eq!(
+            vis(&cached.visible_positions),
+            vis(&uncached.visible_positions),
+            "visible_positions must match uncached"
+        );
+        assert_eq!(
+            sorted_arc_str(&cached.parent_prefix_symbol_names),
+            sorted_arc_str(&uncached.parent_prefix_symbol_names),
+            "parent_prefix_symbol_names must match uncached"
+        );
+        assert_eq!(
+            depths(&cached.depth_exceeded),
+            depths(&uncached.depth_exceeded),
+            "depth_exceeded must match uncached"
+        );
+    }
+
+    #[test]
+    fn standalone_cache_not_poisoned_by_contaminated_resolution() {
+        // Regression for the worldwide cache-on != cache-off bug: resolving a
+        // closure member with hoisted (inside-function) references resolves the
+        // standalone hub as a backward parent at EOF with the member already in
+        // `visited`, short-circuiting the hub's `source(member)` and producing a
+        // TRUNCATED hub scope. That truncated scope must never be cached and
+        // served to a clean forward-child caller (which needs the full closure).
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let root = Url::parse("file:///proj").unwrap();
+        let leaf = Url::parse("file:///proj/leaf.r").unwrap();
+        let hub = Url::parse("file:///proj/hub.r").unwrap();
+        let caller = Url::parse("file:///proj/caller.r").unwrap();
+        // leaf references `hub_fn` INSIDE a function body (so resolving leaf with
+        // hoist_globals walks to hub at EOF). hub defines hub_fn and sources leaf.
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (
+                    leaf.clone(),
+                    "g <- function() hub_fn()\nleaf_fn <- function() 1\n",
+                ),
+                (
+                    hub.clone(),
+                    "# raven: standalone\nsource(\"leaf.r\")\nhub_fn <- function() 2\n",
+                ),
+                (caller.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev = graph.edge_revision();
+
+        // Resolve leaf at an inside-function position with hoist_globals=true so
+        // the backward walk queries hub at EOF with leaf in `visited`.
+        let get_artifacts = |u: &Url| arts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let ctx = crate::cross_file::standalone_cache::StandaloneCacheCtx {
+            cache: cache.clone(),
+            edge_revision: rev,
+            package_config_generation: 0,
+        };
+        let mut prefix_cache = ParentPrefixCache::new();
+        let _leaf_scope = scope_at_position_with_graph_cached_with_standalone_cache(
+            &leaf,
+            0,
+            16, // inside g's body, at `hub_fn`
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            64,
+            &HashSet::new(),
+            true, // hoist_globals: forces parent query at EOF
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &mut prefix_cache,
+            None,
+            None,
+            Some(ctx),
+        );
+        // The contaminated resolution must NOT have stored a (truncated) hub
+        // entry — otherwise the caller below would lose `leaf_fn`.
+        assert_eq!(
+            cache.len(),
+            0,
+            "a visited-contaminated hub resolution must not be cached"
+        );
+
+        // Now a clean forward-child caller resolves hub fully → sees leaf_fn.
+        let scaller = resolve_eof_cached(&caller, &arts, &metas, &graph, &root, &cache, rev, 0);
+        assert!(
+            scaller.symbols.contains_key("leaf_fn") && scaller.symbols.contains_key("hub_fn"),
+            "the caller must see the FULL hub closure (leaf_fn + hub_fn), proving \
+             no poisoned/truncated entry was served; got: {:?}",
+            scaller.symbols.keys().collect::<Vec<_>>()
         );
     }
 
