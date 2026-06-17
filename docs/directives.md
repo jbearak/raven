@@ -211,6 +211,8 @@ The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — in
 
 Teach Raven that a function uses non-standard evaluation (NSE), so bare
 identifiers in its captured arguments are not flagged as undefined variables.
+For examples and guidance on when to use this directive, see
+[Non-Standard Evaluation](non-standard-evaluation.md).
 
 ```r
 # raven: nse my_func              # whole-call: every argument is NSE
@@ -460,5 +462,4 @@ extend the unused-suppression sweep to **every** ignore directive
 Inside `.Rmd` / `.qmd` documents you can suppress a whole chunk with the knitr
 chunk option `raven.ignore` or the in-chunk `# raven: ignore-chunk` directive.
 See [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk).
-
 

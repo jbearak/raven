@@ -4,7 +4,7 @@ Raven is a static analyzer for R that resolves what's in scope at each line — 
 
 Raven is fast and runs all of this in realtime in your editor, with diagnostics updating instantly as you type. It also fills a gap at the other end of the workflow: automated checks in pull requests — running `raven check` flags undefined variables and other errors before code merges, the kind of automated review that's table stakes for other languages but has long been missing for R.
 
-Doing this well in R is hard — part of why so little static tooling exists for the language. R leans heavily on non-standard evaluation (NSE): a function can take its arguments as unevaluated code and decide what the symbols mean at runtime, so `col` in `dplyr::filter(df, col > 0)` is a data-frame column, not an undefined variable. A checker that didn't account for this would flag idiomatic R as errors; Raven recognizes these NSE contexts and leaves them unflagged — though code that pulls names into scope at runtime, such as `attach()`, can still draw a false positive, which you resolve by declaring those symbols with a [directive](docs/directives.md). The same analysis isn't only defensive: wherever it can determine an object's structure statically, Raven completes its fields — start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session.
+Doing this well in R is hard — part of why so little static tooling exists for the language. R leans heavily on [non-standard evaluation](docs/non-standard-evaluation.md) (NSE): a function can take its arguments as unevaluated code and decide what the symbols mean at runtime, so `col` in `dplyr::filter(df, col > 0)` is a data-frame column, not an undefined variable. A checker that didn't account for this would flag idiomatic R as errors; Raven recognizes these NSE contexts and leaves them unflagged — though code that pulls names into scope at runtime, such as `attach()`, can still draw a false positive, which you resolve by declaring those symbols with a [directive](docs/directives.md). The same analysis isn't only defensive: wherever it can determine an object's structure statically, Raven completes its fields — start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session.
 
 Beyond code intelligence, Raven's VS Code extension can bring the rest of an R workflow into the editor — an [R console](docs/r-console.md) with [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers — but it's built to add to your setup rather than change it: those R-session features defer by default to REditorSupport or Positron, and the language server runs alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver) ([details below](#how-raven-differs)).
 
@@ -25,6 +25,7 @@ Raven's sibling project [Sight](https://github.com/jbearak/sight) implements a l
 - **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
 - **[Hover](docs/hover.md)** — Symbol info including source file and package origin
 - **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
+- **[Non-standard evaluation](docs/non-standard-evaluation.md)** — NSE-aware diagnostics for data-masking, tidyselect, ggplot mappings, Shiny, foreach, and custom helpers
 - **[Linting](docs/linting.md)** — Opt-in style/lint rules (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
 - **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
@@ -82,6 +83,7 @@ Each feature above links to its own page. Beyond those:
 - [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
 - [CLI](docs/cli.md) — `raven check` (full diagnostics) and `raven lint` (style) for CI and command-line usage
 - [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
+- [Non-Standard Evaluation](docs/non-standard-evaluation.md) — How Raven handles NSE, when to add `# raven: nse`, and when to use other escape hatches
 - [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
 - [Comparison](docs/comparison.md) — How Raven compares to other R tools
 - [Chunk Keybinding Comparison](docs/keybinding-comparison.md) — Chunk shortcuts across Raven, Quarto, RStudio, and REditorSupport

@@ -12,7 +12,7 @@ Raven activates **package mode** when the workspace root contains a `DESCRIPTION
 
 3. **Roxygen + NAMESPACE merge** — Raven unions imports and exports parsed from the generated `NAMESPACE` file with roxygen tags (`@import`, `@importFrom`, `@export`) parsed from `R/*.R` files. Imports visible to your code are the combined set from both sources, so you get correct import resolution whether you edit `NAMESPACE` directly, rely on `devtools::document()` to regenerate it from roxygen, or are mid-edit between the two.
 
-4. **Own NSE verbs** — The package's own exported non-standard-evaluation verbs keep their argument policy inside the package's own files (any of its `.R`/`.Rmd`/`.qmd` source files — `R/`, `tests/`, vignettes, `man/` examples, `inst/`, `data-raw/`, and so on). When you develop a package named `dplyr`, a `filter(df, x > 1)` in its test suite does not flag the masked column `x`, even though no `library(dplyr)` attaches the package under development. See [data-masking and NSE](diagnostics.md#call-arguments-and-bracket-indices) for how the per-call argument policy works.
+4. **Own NSE verbs** — The package's own exported non-standard-evaluation verbs keep their argument policy inside the package's own files (any of its `.R`/`.Rmd`/`.qmd` source files — `R/`, `tests/`, vignettes, `man/` examples, `inst/`, `data-raw/`, and so on). When you develop a package named `dplyr`, a `filter(df, x > 1)` in its test suite does not flag the masked column `x`, even though no `library(dplyr)` attaches the package under development. See [Non-Standard Evaluation](non-standard-evaluation.md) for how the per-call argument policy works.
 
 ## What's Supported
 
@@ -361,8 +361,9 @@ non-data.table, so `df[undefined_var, ]` is flagged. `[[` is always checked.
 A statement-level by-reference converter updates that classification from the
 call onward: `setDT(x)` makes `x` a data.table, `setDF(x)` makes it a plain
 data.frame, and `setattr(x, "class", ...)` sets the class explicitly.
-See [Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the
-full rules and the `undefinedVariableInBracketIndices` opt-out.
+See [Non-Standard Evaluation](non-standard-evaluation.md) and
+[Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the full
+rules and the `undefinedVariableInBracketIndices` opt-out.
 
 ### Live Updates
 
