@@ -308,3 +308,11 @@ line-only metadata scan misclassified (regression
   **Tripwire:** if `artifacts_map` is ever seeded beyond the neighborhood (so `get_artifacts` can
   return `Some` for a file absent from the trimmed subgraph), this fingerprint walk must then follow
   the resolver's `resolved_uri` / path fallback, or the truncation gate must be reinstated.
+
+## Benchmarks + directive performance gate
+
+Design: `specs/issue-483-wi2b-benchmarks-design.md`. Implementation:
+
+- **Shared corpus builder** `test_utils::standalone_hub::build_hub_corpus(standalone, width, depth, callers)` (test-support-gated) — a worldwide-shaped hub workspace, directive toggleable.
+- **Criterion group** `cross_file_standalone_cache` in `benches/cross_file.rs`: `caller_resolve/{cold_miss,warm_hit,cache_off}`, `fanout/{with,without}_directive`, `completion/{with,without}_directive`. Measured on the deep synthetic corpus: fan-out 6.25×, completion 6.68×, warm-hit vs cache-off 5.7× (worldwide is larger still: completion 203→20 ms ≈ 10×). Tracked in CI via `perf.yml` (filtered, fast).
+- **Hard gate** `standalone_cache::tests::standalone_directive_enables_fanout_cache_reuse` — DETERMINISTIC: the directive must let the fan-out reuse the cached hub scope (≥ N−5 hits over N callers; a non-standalone hub consults the cache 0 times). Runs in the normal suite (~0.5 s). The `#[ignore]`d `standalone_directive_fanout_is_faster` is the wall-clock companion (release-run, ≥1.5× vs measured ~6×).
