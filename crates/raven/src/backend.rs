@@ -12521,6 +12521,62 @@ lineLength = 200
     }
 
     #[tokio::test]
+    async fn code_action_no_nse_quick_fix_for_local_function_def() {
+        use tower_lsp::lsp_types::{
+            CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,
+            TextDocumentIdentifier, WorkDoneProgressParams,
+        };
+        // Issue #475 (full code-action path): a bare call to a file-local
+        // function definition raven analyzed gets NO NSE quick-fix, exercising
+        // the `collect_local_function_def_names` wiring in the handler — the
+        // code-action counterpart of the inline-hint suppression. `undef` (the
+        // arg of `my_fn(p1, undef)` on line 1) is at cols 10-15.
+        let content = "my_fn <- function(a, b) a\nmy_fn(p1, undef)\n";
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("t.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "t.R", "r", content).await;
+
+        let undef = Diagnostic {
+            range: Range {
+                start: Position::new(1, 10),
+                end: Position::new(1, 15),
+            },
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            message: "Undefined variable".to_string(),
+            ..Default::default()
+        };
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: vec![undef],
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let actions = svc
+            .inner()
+            .code_action(params)
+            .await
+            .expect("code_action ok")
+            .unwrap_or_default();
+        let nse_actions = actions
+            .iter()
+            .filter(|a| {
+                matches!(a, CodeActionOrCommand::CodeAction(ca) if ca.title.contains("# raven: nse"))
+            })
+            .count();
+        assert_eq!(
+            nse_actions, 0,
+            "a bare call to a local function definition yields no NSE quick-fix: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn code_action_skips_non_undefined_diagnostic() {
         use tower_lsp::lsp_types::{
             CodeActionContext, CodeActionParams, Diagnostic, PartialResultParams, Position, Range,

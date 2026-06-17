@@ -60924,6 +60924,24 @@ my_func <- function(a = default_value) {
     }
 
     #[test]
+    fn nse_quick_fix_suppressed_for_nonsyntactic_local_function_def() {
+        // Issue #475 + canonicalization: a non-syntactic local def (`` `my fn` ``)
+        // must be suppressed too. Builds the local-def set via the production
+        // helper `collect_local_function_def_names`, so the test also pins that
+        // its storage key and the call-site lookup key agree for a backticked
+        // name (both keep their required backticks through `canonical_use_name`).
+        let src = "`my fn` <- function(df, cond) df\n`my fn`(real_df, undef)\n";
+        let tree = parse_r_code(src);
+        let root = tree.root_node();
+        let local = super::collect_local_function_def_names(root, src);
+        let node = first_ident(root, src, "undef");
+        assert!(
+            super::nse_quick_fix_edit(node, src, None, Some(&local)).is_none(),
+            "a bare call to a non-syntactic local function definition gets no quick-fix"
+        );
+    }
+
+    #[test]
     fn nse_quick_fix_qualified_not_suppressed_by_same_named_local_def() {
         // Issue #475 (bare-only restriction): a qualified `pkg::f(...)` call must
         // still offer the fix even when `f` is a local function definition — R
