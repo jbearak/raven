@@ -21304,9 +21304,11 @@ proptest! {
         // filter for function-scoped local=TRUE: `f` is no longer a *declared*
         // symbol but a real top-level definition, which this test does not probe.
         // Exclude the collision so the test exercises its intended scenario — an
-        // independent *declared* symbol flowing to the child. (Mirrors the
-        // `prop_assume!` guard in
-        // `prop_cross_file_declaration_vs_regular_symbol_with_top_level_local_true`.)
+        // independent *declared* symbol flowing to the child. (The sibling test
+        // `prop_cross_file_declaration_vs_regular_symbol_with_top_level_local_true`
+        // sidesteps the same scaffolding collision differently: it names its
+        // scaffolding `__child_local__`, which `r_symbol_name()` never generates,
+        // rather than excluding a drawn value.)
         prop_assume!(symbol_name != "f");
 
         let parent_uri = make_url("parent");

@@ -427,6 +427,33 @@ pub struct DependencyEdge {
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
+    /// For a `sys.source()` edge, whether it targets the global environment
+    /// (`envir = globalenv()` or the directive default). A non-global
+    /// `sys.source` does NOT contribute its child's top-level symbols to the
+    /// caller (see `should_apply_local_scoping` / `ForwardSource::inherits_symbols`),
+    /// exactly like `local = TRUE`. It is carried on the edge — and folded into
+    /// full-edge equality below — so that toggling `globalenv()` ↔ `new.env()`
+    /// at a fixed call site counts as an edge change and bumps `edge_revision`.
+    /// Without this, the cross-snapshot standalone-scope cache (#483), whose key
+    /// includes `edge_revision`, would serve a stale isolated scope after such a
+    /// toggle (the flag is absent from `compute_interface_hash` too). Always
+    /// `true` for plain `source()` and for backward-directive edges, mirroring
+    /// the `is_sys_source = false` convention.
+    pub sys_source_global_env: bool,
+    /// Whether the `source()`/`sys.source()` call is lexically inside a function
+    /// body. A function-scoped call does NOT contribute its child's symbols to
+    /// the caller's top-level (EOF) scope, and a function-scoped `local = TRUE`
+    /// call binds the child to a non-global frame (declared-only inheritance) —
+    /// see the forward gate in `scope_at_position_with_graph_recursive` and the
+    /// `is_local_scoped` decision in `parent_prefix_at`. Carried on the edge —
+    /// and folded into full-edge equality below — for the same reason as
+    /// `sys_source_global_env`: a contrived-but-real edit can flip it at a FIXED
+    /// call site (e.g. dropping an enclosing `function(){...}` wrapper on a prior
+    /// line) without changing the source's `(line, column)` or the file's
+    /// `interface_hash`, so without it on the edge such a toggle would neither
+    /// bump `edge_revision` nor be seen by the standalone-scope cache (#483) or
+    /// dependent revalidation. Always `false` for `# raven` directives.
+    pub is_function_scoped: bool,
     /// True if the edge was created from any Raven directive — forward-family
     /// (`# raven: source`/`run`/`include`) or backward-family
     /// (`# raven: sourced-by`/`run-by`/`included-by`) — rather than an
@@ -456,6 +483,8 @@ struct EdgeKey {
     local: bool,
     chdir: bool,
     is_sys_source: bool,
+    sys_source_global_env: bool,
+    is_function_scoped: bool,
     is_backward_directive: bool,
 }
 
@@ -469,6 +498,8 @@ impl DependencyEdge {
             local: self.local,
             chdir: self.chdir,
             is_sys_source: self.is_sys_source,
+            sys_source_global_env: self.sys_source_global_env,
+            is_function_scoped: self.is_function_scoped,
             is_backward_directive: self.is_backward_directive,
         }
     }
@@ -762,6 +793,8 @@ impl DependencyGraph {
                             local: source.local,
                             chdir: source.chdir,
                             is_sys_source: source.is_sys_source,
+                            sys_source_global_env: source.sys_source_global_env,
+                            is_function_scoped: source.is_function_scoped,
                             is_directive: true,
                             is_backward_directive: false,
                         };
@@ -833,6 +866,8 @@ impl DependencyGraph {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
+                    sys_source_global_env: true,
+                    is_function_scoped: false,
                     is_directive: true,
                     is_backward_directive: true,
                 };
@@ -862,6 +897,8 @@ impl DependencyGraph {
                     local: source.local,
                     chdir: source.chdir,
                     is_sys_source: source.is_sys_source,
+                    sys_source_global_env: source.sys_source_global_env,
+                    is_function_scoped: source.is_function_scoped,
                     is_directive: false,
                     is_backward_directive: false,
                 };
@@ -2040,6 +2077,72 @@ mod tests {
             sources: vec![make_source(path, line)],
             ..Default::default()
         }
+    }
+
+    /// Regression (WI2b cache soundness, confirmed by Codex): a `source()` /
+    /// `sys.source()` call's `sys_source_global_env` and `is_function_scoped`
+    /// flags change whether/how it contributes symbols, yet an edit can flip
+    /// either at a FIXED `(line, column)` — e.g. `envir = globalenv()` →
+    /// `new.env()`, or dropping an enclosing `function(){}` wrapper on a prior
+    /// line. Both flags are carried on `DependencyEdge` and folded into
+    /// full-edge equality, so such a flip is an edge change that bumps
+    /// `edge_revision`; the standalone-scope cache key (#483) and dependent
+    /// revalidation both depend on it. Without the fields, the flipped edges
+    /// would compare equal and `edge_revision` would not move.
+    #[test]
+    fn edge_revision_bumps_on_source_semantics_flip_at_fixed_position() {
+        use super::super::types::ForwardSource;
+        fn meta(sys_global: bool, func_scoped: bool) -> CrossFileMetadata {
+            CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    path: "B.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: true,
+                    sys_source_global_env: sys_global,
+                    is_function_scoped: func_scoped,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &meta(true, false),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        let rev0 = graph.edge_revision();
+
+        // Flip ONLY sys_source_global_env (same line/col/path/other flags).
+        graph.update_file(
+            &url("A.R"),
+            &meta(false, false),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        let rev1 = graph.edge_revision();
+        assert!(
+            rev1 > rev0,
+            "flipping sys_source_global_env at a fixed call site must bump edge_revision"
+        );
+
+        // Flip ONLY is_function_scoped.
+        graph.update_file(
+            &url("A.R"),
+            &meta(false, true),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        let rev2 = graph.edge_revision();
+        assert!(
+            rev2 > rev1,
+            "flipping is_function_scoped at a fixed call site must bump edge_revision"
+        );
     }
 
     /// Issue #479: the truncation gate admits a shallow acyclic neighborhood.

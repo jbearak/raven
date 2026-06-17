@@ -1003,10 +1003,16 @@ pub(crate) struct ForwardChildMemo {
     /// to every recursive resolution so the EOF hook can consult it.
     standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
     /// Per-query memo keyed by a standalone callee's URI, holding its
-    /// `closure_interface_fingerprint` and the membership of `{C} ∪
-    /// forward_closure(C)`. Both are constant within one query (the snapshot
+    /// `closure_interface_fingerprint` and the FULL contributing-set membership
+    /// (`C`'s forward `source()` closure PLUS the backward parents of any
+    /// non-standalone closure member — see `standalone_closure_fingerprint_and_members`),
+    /// NOT just `{C} ∪ forward_closure(C)`. The backward parents are load-bearing:
+    /// a visited backward parent of a non-standalone member loses its inherited /
+    /// sibling-loaded packages at the revisit guard, so the contamination gate
+    /// must cover them too (regression `standalone_cache_skips_when_member_backward_parent_is_visited`,
+    /// fixed in commit bfdacbf5). Both are constant within one query (the snapshot
     /// graph + artifacts are fixed), so computing them once per callee avoids
-    /// re-walking the forward closure on every consult. The member list is used
+    /// re-walking the contributing set on every consult. The member list is used
     /// to gate the cache on visited-contamination (see the EOF hook).
     standalone_closures: HashMap<Url, (u64, std::sync::Arc<Vec<Url>>)>,
 }
@@ -1046,8 +1052,10 @@ fn forward_memo_graph_has_cycle(
 }
 
 /// Compute (and memoize on the supplied `ForwardChildMemo`) the
-/// `closure_interface_fingerprint` and the forward-closure membership `{uri} ∪
-/// forward_closure(uri)` for a standalone callee `uri` (issue #483).
+/// `closure_interface_fingerprint` and the **full contributing-set** membership
+/// (the forward `source()` closure of `uri` PLUS the backward parents of every
+/// non-standalone member — see "Returned member list" below) for a standalone
+/// callee `uri` (issue #483).
 ///
 /// ## What the fingerprint must cover
 ///
@@ -1082,6 +1090,29 @@ fn forward_memo_graph_has_cycle(
 /// Following forward edges out of a backward parent (rather than only its
 /// pre-`source()` prefix) over-approximates safely — extra invalidation, never a
 /// stale hit.
+///
+/// ## Why walking the trimmed graph is sound under neighborhood truncation
+///
+/// This walk follows the SAME `graph` the resolver does, which in production is
+/// the TRIMMED neighborhood subgraph (`extract_subgraph` over the `max_visited`
+/// neighborhood). One might fear that under budget truncation the trimmed graph
+/// drops an edge to a contributor that the resolver still reaches via its
+/// `source.resolved_uri` / path fallback (`scope_at_position_with_graph_recursive`
+/// STEP 2), so this fingerprint — which has no such fallback — would silently
+/// omit it. It does not, because **contribution is gated by artifact
+/// availability, which equals neighborhood membership**: the resolver's
+/// `get_artifacts` reads only the snapshot's `artifacts_map`, populated solely
+/// from the neighborhood (`DiagnosticsSnapshot::build`). For a file F OUTSIDE the
+/// neighborhood the fallback may compute F's URI, but `get_artifacts(F)` is
+/// `None`, so F contributes no symbols/packages — exactly as this walk (which
+/// also skips F) assumes. For a file INSIDE the neighborhood, `extract_subgraph`
+/// keeps every intra-neighborhood edge (both endpoints present), so the resolver
+/// reaches it through a real edge this walk also traverses — never only through
+/// the fallback. The resolver's actual contributing set therefore equals this
+/// walk's set in every regime, truncated or not, so `(edge_revision, Σ
+/// interface_hash)` remains a complete determinant. (A truncated resolution is an
+/// approximate-but-self-consistent scope; the cross-snapshot cache reuses it
+/// soundly because a fresh resolution would be truncated identically.)
 ///
 /// ## Returned member list
 ///
@@ -1379,6 +1410,66 @@ fn resolve_forward_child_memoized(
 /// `sys_source_global_env = false`).
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
+}
+
+/// Build a forward-`source()` child's [`PathContext`](super::path_resolve::PathContext),
+/// applying the WI2b "part 2" standalone-isolation rule.
+///
+/// A `# raven: standalone` child uses its OWN context (its `from_metadata`, or a
+/// bare `new()`), **ignoring** the caller's `chdir` / inherited working directory
+/// — which is precisely what lets the #483 cache key a standalone callee on its
+/// URI alone (its isolated scope is then a pure function of `(C, C's closure)`,
+/// independent of who sourced it). A non-standalone child inherits the caller's
+/// working directory: an explicit child `# raven: cd` wins; otherwise the parent's
+/// directory, selected by the `chdir` flag.
+///
+/// Shared verbatim by the recursive resolver
+/// (`scope_at_position_with_graph_recursive`) and the streaming
+/// `ScopeStream::resolve_source_contribution` so this isolation rule — load-bearing
+/// for cache caller-independence — has a single definition that cannot drift
+/// between the two forward-resolution entry points.
+fn build_forward_child_path_context<G>(
+    child_uri: &Url,
+    child_is_standalone: bool,
+    chdir: bool,
+    parent_ctx: Option<&super::path_resolve::PathContext>,
+    workspace_root: Option<&Url>,
+    get_metadata: &G,
+) -> Option<super::path_resolve::PathContext>
+where
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    if child_is_standalone {
+        get_metadata(child_uri)
+            .and_then(|m| {
+                super::path_resolve::PathContext::from_metadata(child_uri, &m, workspace_root)
+            })
+            .or_else(|| super::path_resolve::PathContext::new(child_uri, workspace_root))
+    } else {
+        let child_path = child_uri.to_file_path().ok();
+        child_path.as_ref().and_then(|cp| {
+            let ctx = parent_ctx?;
+            // Child has its own metadata: use it, but inherit a working dir if it
+            // declares none. Otherwise build the context from the parent's, per chdir.
+            if let Some(cm) = get_metadata(child_uri) {
+                let mut child_ctx = super::path_resolve::PathContext::from_metadata(
+                    child_uri,
+                    &cm,
+                    workspace_root,
+                )?;
+                if child_ctx.working_directory.is_none() {
+                    child_ctx.inherited_working_directory = if chdir {
+                        Some(cp.parent()?.to_path_buf())
+                    } else {
+                        Some(ctx.effective_working_directory())
+                    };
+                }
+                Some(child_ctx)
+            } else {
+                Some(ctx.child_context_for_source(cp, chdir))
+            }
+        })
+    }
 }
 /// Finds the innermost function-scope interval that contains the given position.
 ///
@@ -5229,12 +5320,24 @@ impl ParentPrefix {
     /// whose merged prefix is empty, keeping a cache hit byte-identical to the
     /// un-memoized resolution regardless of how the (empty) prefix was supplied.
     pub(crate) fn is_empty(&self) -> bool {
-        self.symbols.is_empty()
-            && self.chain.is_empty()
-            && self.visible_positions.is_empty()
-            && self.depth_exceeded.is_empty()
-            && self.inherited_packages.is_empty()
-            && self.package_origins.is_empty()
+        // Destructure so adding a field to `ParentPrefix` is a COMPILE error
+        // here rather than a silent hole in this load-bearing guard: a new
+        // caller-dependent field omitted from the emptiness test would let the
+        // WI2b hook cache/serve a caller-dependent scope under a URI-only key.
+        let Self {
+            symbols,
+            chain,
+            visible_positions,
+            depth_exceeded,
+            inherited_packages,
+            package_origins,
+        } = self;
+        symbols.is_empty()
+            && chain.is_empty()
+            && visible_positions.is_empty()
+            && depth_exceeded.is_empty()
+            && inherited_packages.is_empty()
+            && package_origins.is_empty()
     }
 }
 
@@ -5390,45 +5493,39 @@ where
         let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
         let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
 
-        // Resolve the parent's metadata once: it drives both the local-scoping
-        // policy below and the parent `PathContext` further down.
+        // Resolve the parent's metadata once for the parent `PathContext`
+        // further down. (The local-scoping policy below reads its flags from the
+        // edge, not from this metadata.)
         let parent_meta = get_metadata(&edge.from);
 
-        // Determine if this local-scoped edge applies the declared-only inheritance
-        // policy. `local = TRUE` / `sys.source(local = an env)` evaluate the child
-        // in the *caller's* environment (R `?source`): at top level that env is
+        // Determine if this edge applies the declared-only inheritance policy.
+        // `local = TRUE` / a non-global `sys.source` evaluate the child in the
+        // *caller's* environment (R `?source`): at top level that env is
         // `.GlobalEnv`, so the child sees ALL of the parent's prior top-level
-        // bindings — identical to `local = FALSE` for backward inheritance. Only a
-        // `local = TRUE` call sited *inside a function* binds the child to a
-        // function frame whose locals must not be modeled as global inheritance.
+        // bindings — identical to `local = FALSE` for backward inheritance. Only
+        // a `local = TRUE` call sited *inside a function*, or a `sys.source` into
+        // a non-global env, binds the child to a frame whose locals must not be
+        // modeled as global inheritance.
         //
         // Issue #476: the old logic treated every `local = TRUE` edge as
         // declared-only, dropping regular top-level symbols (e.g. a hub that
         // `source()`s helpers and then `source("report.R", local = TRUE)` — the
         // report could not see the helpers). We now restrict the declared-only
         // policy to function-scoped local calls, matching R's environment rules.
+        //
+        // Both `is_function_scoped` and `sys_source_global_env` are carried on
+        // the edge (folded into edge equality for the #483 cache), so read them
+        // directly: a single source of truth with `edge_revision`, cheaper than
+        // re-scanning `parent_meta.sources`, and correct even with two
+        // `sys.source` calls (one global, one not) on the same line — each call's
+        // edge carries its own flag.
         let is_local_scoped = if edge.local {
-            // Top-level local=TRUE inherits like local=FALSE; only a function-scoped
-            // local source binds to a non-global frame (declared-only).
-            parent_meta.as_ref().is_some_and(|meta| {
-                meta.sources.iter().any(|s| {
-                    s.line == call_site_line
-                        && s.column == call_site_col
-                        && s.local == edge.local
-                        && s.is_sys_source == edge.is_sys_source
-                        && s.is_function_scoped
-                })
-            })
+            // Top-level local=TRUE inherits like local=FALSE; only a
+            // function-scoped local source binds to a non-global frame.
+            edge.is_function_scoped
         } else if edge.is_sys_source {
-            // For sys.source, check if it's targeting global env
-            if let Some(meta) = parent_meta.as_ref() {
-                !meta
-                    .sources
-                    .iter()
-                    .any(|s| s.is_sys_source && s.sys_source_global_env && s.line == call_site_line)
-            } else {
-                true // Assume non-global if no metadata
-            }
+            // A non-global sys.source (envir != globalenv) is declared-only.
+            !edge.sys_source_global_env
         } else {
             false
         };
@@ -5772,12 +5869,23 @@ where
         && inherited_packages.is_empty()
         && pre_computed_prefix.is_none_or(|p| p.is_empty())
     {
-        let ctx = forward_child_memo.borrow().standalone_ctx.clone();
+        // Cheap presence check first (no Arc clone): only the diagnostics path
+        // supplies a ctx (`is_some()` borrows without cloning, preserving the
+        // "absent ⇒ no metadata lookup" ordering). Clone — an Arc bump — only
+        // once the file is confirmed standalone in an acyclic graph; otherwise
+        // every non-standalone EOF forward child on the diagnostics path would
+        // pay an avoidable atomic inc/dec. `standalone_ctx` is not mutated
+        // between the two borrows, so the clone is guaranteed `Some`.
+        let ctx = if forward_child_memo.borrow().standalone_ctx.is_some()
+            && get_metadata(uri).is_some_and(|m| m.standalone)
+            && !forward_memo_graph_has_cycle(forward_child_memo, graph)
+        {
+            forward_child_memo.borrow().standalone_ctx.clone()
+        } else {
+            None
+        };
         match ctx {
-            Some(ctx)
-                if get_metadata(uri).is_some_and(|m| m.standalone)
-                    && !forward_memo_graph_has_cycle(forward_child_memo, graph) =>
-            {
+            Some(ctx) => {
                 let (fingerprint, members) = standalone_closure_fingerprint_and_members(
                     uri,
                     graph,
@@ -5815,7 +5923,7 @@ where
                     Some((ctx, key))
                 }
             }
-            _ => None,
+            None => None,
         }
     } else {
         None
@@ -6203,50 +6311,14 @@ where
                         // Build child PathContext, respecting chdir flag. A
                         // standalone callee (part 2) uses its OWN context,
                         // ignoring the caller's chdir / inherited working dir.
-                        let child_ctx = if child_is_standalone {
-                            get_metadata(&child_uri)
-                                .and_then(|m| {
-                                    super::path_resolve::PathContext::from_metadata(
-                                        &child_uri,
-                                        &m,
-                                        workspace_root,
-                                    )
-                                })
-                                .or_else(|| {
-                                    super::path_resolve::PathContext::new(
-                                        &child_uri,
-                                        workspace_root,
-                                    )
-                                })
-                        } else {
-                            let child_path = child_uri.to_file_path().ok();
-                            child_path.as_ref().and_then(|cp| {
-                                let ctx = path_ctx.as_ref()?;
-                                // Get child's metadata for its own working directory directive
-                                let child_meta = get_metadata(&child_uri);
-                                if let Some(cm) = child_meta {
-                                    // Child has its own metadata - use it, but inherit working dir if no explicit one
-                                    let mut child_ctx =
-                                        super::path_resolve::PathContext::from_metadata(
-                                            &child_uri,
-                                            &cm,
-                                            workspace_root,
-                                        )?;
-                                    if child_ctx.working_directory.is_none() {
-                                        // Inherit from parent based on chdir flag
-                                        child_ctx.inherited_working_directory = if source.chdir {
-                                            Some(cp.parent()?.to_path_buf())
-                                        } else {
-                                            Some(ctx.effective_working_directory())
-                                        };
-                                    }
-                                    Some(child_ctx)
-                                } else {
-                                    // No metadata for child - create context based on chdir
-                                    Some(ctx.child_context_for_source(cp, source.chdir))
-                                }
-                            })
-                        };
+                        let child_ctx = build_forward_child_path_context(
+                            &child_uri,
+                            child_is_standalone,
+                            source.chdir,
+                            path_ctx.as_ref(),
+                            workspace_root,
+                            get_metadata,
+                        );
 
                         // Early exit on cancellation before expensive recursive traversal
                         if is_cancelled() {
@@ -7311,7 +7383,12 @@ where
     ///
     /// This thin wrapper passes no WI2b standalone-scope cache (issue #483); the
     /// diagnostics path calls [`ScopeStream::new_with_standalone_cache`] directly
-    /// to enable the cross-snapshot cache.
+    /// to enable the cross-snapshot cache. Since that switch, the only callers
+    /// are tests and the `test-support` bench (`bench_scope_stream_sweep`), so it
+    /// is gated to those configs — otherwise a plain `cargo build` (no
+    /// `test-support`) would report it as dead code, contradicting the repo's
+    /// zero-warnings discipline.
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queried_uri: &'a Url,
@@ -7366,10 +7443,14 @@ where
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
         data_alias_provider: Option<&'a DataAliasProvider<'a>>,
         // Issue #483 (WI2b): persistent standalone-scope cache context, or `None`
-        // to disable caching. Seeds BOTH the actual-depth forward-child memo
-        // (forward children) and the shared prefix memo (backward-parent-at-EOF
-        // resolution of a standalone hub) so the EOF hook can consult/populate
-        // the cache from either path.
+        // to disable caching. Seeds the actual-depth forward-child memo (forward
+        // children) and, WHEN prefix-memo sharing is enabled, the shared prefix
+        // memo (backward-parent-at-EOF resolution of a standalone hub) so the EOF
+        // hook can consult/populate the cache from that path too. When sharing is
+        // gated off (or for the isolated `query_inside_function = true` slot),
+        // `compute_or_get_cached_prefix` falls back to an ephemeral memo with no
+        // cache context, so the backward-parent path simply recomputes — a missed
+        // optimization, never a stale hit.
         standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
@@ -8311,43 +8392,17 @@ where
             self.data_alias_provider
         };
 
-        // Build child PathContext, respecting source.chdir. Mirrors the
-        // logic at `scope.rs:3554-3581`. A standalone callee uses its OWN
-        // context, ignoring the caller's chdir / inherited working directory.
-        let child_ctx = if child_is_standalone {
-            (self.get_metadata)(&child_uri)
-                .and_then(|m| {
-                    super::path_resolve::PathContext::from_metadata(
-                        &child_uri,
-                        &m,
-                        self.workspace_root,
-                    )
-                })
-                .or_else(|| super::path_resolve::PathContext::new(&child_uri, self.workspace_root))
-        } else {
-            let child_path = child_uri.to_file_path().ok();
-            child_path.as_ref().and_then(|cp| {
-                let ctx = self.path_ctx.as_ref()?;
-                let child_meta = (self.get_metadata)(&child_uri);
-                if let Some(cm) = child_meta {
-                    let mut child_ctx = super::path_resolve::PathContext::from_metadata(
-                        &child_uri,
-                        &cm,
-                        self.workspace_root,
-                    )?;
-                    if child_ctx.working_directory.is_none() {
-                        child_ctx.inherited_working_directory = if source.chdir {
-                            Some(cp.parent()?.to_path_buf())
-                        } else {
-                            Some(ctx.effective_working_directory())
-                        };
-                    }
-                    Some(child_ctx)
-                } else {
-                    Some(ctx.child_context_for_source(cp, source.chdir))
-                }
-            })
-        };
+        // Build child PathContext, respecting source.chdir. A standalone callee
+        // uses its OWN context, ignoring the caller's chdir / inherited working
+        // directory (shared with the recursive resolver via this helper).
+        let child_ctx = build_forward_child_path_context(
+            &child_uri,
+            child_is_standalone,
+            source.chdir,
+            self.path_ctx.as_ref(),
+            self.workspace_root,
+            self.get_metadata,
+        );
 
         // Cancel-aware short-circuit before kicking off the child recursion.
         if (self.is_cancelled)() {
@@ -10725,14 +10780,157 @@ mod tests {
             0,
         );
         let x2_ref = s2_ref.symbols.get("x").map(|s| s.source_uri.to_string());
-        eprintln!(
-            "rev_a={rev_a} rev_b={rev_b} x1={x1:?} x2(persistent)={x2:?} x2(fresh)={x2_ref:?}"
-        );
         assert!(
             rev_b > rev_a,
             "reordering source() calls must bump edge_revision"
         );
+        // The reorder must actually change which definition of `x` wins
+        // (first-source-wins: a.r before the edit, bb.r after) — otherwise the
+        // test would pass vacuously while no longer exercising the staleness it
+        // is named for.
+        assert_eq!(
+            x1.as_deref(),
+            Some("file:///proj/a.r"),
+            "pre-edit: a.r wins"
+        );
+        assert_eq!(
+            x2.as_deref(),
+            Some("file:///proj/bb.r"),
+            "post-reorder: bb.r must win"
+        );
+        assert_ne!(x1, x2, "the reorder must change `x`'s winning source");
         assert_eq!(x2, x2_ref, "STALE on source() reorder");
+    }
+
+    /// Regression (confirmed by Codex): two `sys.source()` calls on ONE line —
+    /// one into `globalenv()`, one into `new.env()` — must each use their OWN
+    /// envir to decide backward inheritance. `parent_prefix_at` reads
+    /// `edge.sys_source_global_env` per edge, so the non-global child does NOT
+    /// inherit the parent's top-level symbols while the global one does. (The
+    /// earlier line-only metadata scan let a global `sys.source` on the same line
+    /// wrongly classify a non-global call as global, suppressing diagnostics.)
+    #[test]
+    fn sys_source_two_calls_on_one_line_use_per_call_envir() {
+        let root = Url::parse("file:///proj").unwrap();
+        let parent = Url::parse("file:///proj/parent.r").unwrap();
+        let a = Url::parse("file:///proj/a.r").unwrap();
+        let b = Url::parse("file:///proj/b.r").unwrap();
+        let (arts, metas, graph) = build_cache_scenario(
+            &root,
+            &[
+                (
+                    parent.clone(),
+                    "parent_sym <- 1\nsys.source(\"a.r\", envir = globalenv()); sys.source(\"b.r\", envir = new.env())\n",
+                ),
+                (a.clone(), "a_sym <- 1\n"),
+                (b.clone(), "b_sym <- 1\n"),
+            ],
+        );
+        let get_artifacts = |u: &Url| arts.get(u).cloned();
+        let get_metadata = |u: &Url| metas.get(u).cloned();
+        let resolve = |uri: &Url| {
+            scope_at_position_with_graph(
+                uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                64,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+        // a.r is sourced via a GLOBAL-env sys.source -> inherits parent_sym.
+        let scope_a = resolve(&a);
+        assert!(
+            scope_a.symbols.contains_key("parent_sym"),
+            "a global sys.source child must inherit the parent's top-level symbol"
+        );
+        // b.r is sourced via a NON-global sys.source on the SAME line -> must NOT
+        // inherit parent_sym (non-global frame => declared-only inheritance).
+        let scope_b = resolve(&b);
+        assert!(
+            !scope_b.symbols.contains_key("parent_sym"),
+            "a non-global sys.source child must NOT inherit the parent's top-level symbol, even when a global sys.source shares its line"
+        );
+    }
+
+    /// Regression for the cross-snapshot staleness bug found in WI2b review
+    /// (confirmed by Codex): whether a `sys.source()` callee contributes its
+    /// top-level symbols depends on its `envir` argument — `globalenv()`
+    /// contributes (like `source()`), a non-global env does NOT (see
+    /// `should_apply_local_scoping`). That flag (`sys_source_global_env`) is
+    /// absent from `compute_interface_hash`, so toggling
+    /// `globalenv()` ↔ `new.env()` at a FIXED call site leaves the closure
+    /// fingerprint unchanged. The fix carries `sys_source_global_env` on the
+    /// `DependencyEdge` (folded into full-edge equality), so the toggle bumps
+    /// `edge_revision` — which IS in the cache key — and the stale isolated
+    /// scope is not served. Without the edge field this test would hit the
+    /// pre-toggle entry and still see `leaf_fn`.
+    #[test]
+    fn standalone_cache_invalidates_on_sys_source_envir_toggle() {
+        use crate::cross_file::standalone_cache::StandaloneScopeCache;
+        let (root, leaf, hub, a, b) = standard_cache_files();
+        // hub (standalone) pulls leaf in via a GLOBAL-env sys.source -> leaf_fn
+        // contributes to hub's isolated scope.
+        let hub_global = "# raven: standalone\nsys.source(\"leaf.r\", envir = globalenv())\nhub_fn <- function() 2\n";
+        let (mut arts, mut metas, mut graph) = build_cache_scenario(
+            &root,
+            &[
+                (leaf.clone(), "leaf_fn <- function() 1\n"),
+                (hub.clone(), hub_global),
+                (a.clone(), "source(\"hub.r\")\n"),
+                (b.clone(), "source(\"hub.r\")\n"),
+            ],
+        );
+        let cache = Arc::new(StandaloneScopeCache::new());
+        let rev_a = graph.edge_revision();
+        // Warm via a, then resolve b: leaf_fn is present (global sys.source).
+        resolve_eof_cached(&a, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        let before = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev_a, 0);
+        assert!(
+            before.symbols.contains_key("leaf_fn"),
+            "a global-env sys.source must contribute leaf_fn"
+        );
+
+        // EDIT hub: same call site, change envir to a NON-global env. leaf_fn
+        // must no longer contribute. Update artifacts AND the persistent graph
+        // (the edge's sys_source_global_env flips true->false, so update_file
+        // bumps the global edge_revision).
+        let hub_local = "# raven: standalone\nsys.source(\"leaf.r\", envir = new.env())\nhub_fn <- function() 2\n";
+        replace_artifacts(&mut arts, &hub, hub_local);
+        let tree = parse_r(hub_local);
+        let new_meta = std::sync::Arc::new(crate::cross_file::extract_metadata_with_tree(
+            hub_local,
+            Some(&tree),
+        ));
+        graph.update_file(&hub, &new_meta, Some(&root), |_| None);
+        metas.insert(hub.clone(), new_meta);
+        let rev_b = graph.edge_revision();
+        assert!(
+            rev_b > rev_a,
+            "toggling sys.source envir must bump edge_revision"
+        );
+
+        let after = resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache, rev_b, 0);
+        let cache_fresh = Arc::new(StandaloneScopeCache::new());
+        let reference =
+            resolve_eof_cached(&b, &arts, &metas, &graph, &root, &cache_fresh, rev_b, 0);
+        assert_eq!(
+            after.symbols.contains_key("leaf_fn"),
+            reference.symbols.contains_key("leaf_fn"),
+            "stale HIT: cache served the pre-toggle scope after sys.source envir changed"
+        );
+        assert!(
+            !after.symbols.contains_key("leaf_fn"),
+            "after the toggle to a non-global env, leaf_fn must NOT be in hub's scope"
+        );
     }
 
     /// Regression for the second cross-snapshot staleness bug found in WI2b
@@ -10967,8 +11165,16 @@ mod tests {
         // scope-carrying field, not just the symbol key set — a HIT that diverged
         // in package state (the failure mode found in WI2b review) or in a
         // symbol's resolved identity must be caught here.
-        fn symbol_identities(s: &ScopeAtPosition) -> Vec<(String, String, u32, String)> {
-            let mut v: Vec<(String, String, u32, String)> = s
+        // Full per-symbol identity: every `ScopedSymbol` field a caller consumes
+        // (position fields drive hover/go-to-definition ranges; `is_declared`
+        // drives declared-vs-real precedence at cross-file merges), not just
+        // name+source+line+kind/signature. A HIT diverging in any of these is
+        // exactly the provenance drift this byte-identity gate must catch.
+        #[allow(clippy::type_complexity)]
+        fn symbol_identities(
+            s: &ScopeAtPosition,
+        ) -> Vec<(String, String, u32, u32, u32, bool, String)> {
+            let mut v: Vec<(String, String, u32, u32, u32, bool, String)> = s
                 .symbols
                 .iter()
                 .map(|(name, sym)| {
@@ -10976,6 +11182,9 @@ mod tests {
                         name.to_string(),
                         sym.source_uri.to_string(),
                         sym.defined_line,
+                        sym.defined_column,
+                        sym.defined_end_column,
+                        sym.is_declared,
                         format!("{:?}|{:?}", sym.kind, sym.signature),
                     )
                 })
@@ -10988,10 +11197,46 @@ mod tests {
             v.sort();
             v
         }
+        fn sorted_arc_str(set: &HashSet<Arc<str>>) -> Vec<String> {
+            let mut v: Vec<String> = set.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        }
+        // package_origins VALUES (the per-package origin-URI sets), not just the
+        // keys — origins feed the same-file leak filter at cross-file merges.
+        fn origins(m: &HashMap<String, HashSet<Arc<Url>>>) -> Vec<(String, Vec<String>)> {
+            let mut v: Vec<(String, Vec<String>)> = m
+                .iter()
+                .map(|(k, set)| {
+                    let mut urls: Vec<String> = set.iter().map(|u| u.to_string()).collect();
+                    urls.sort();
+                    (k.clone(), urls)
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        fn vis(m: &HashMap<Url, (u32, u32)>) -> Vec<(String, u32, u32)> {
+            let mut v: Vec<(String, u32, u32)> = m
+                .iter()
+                .map(|(u, (l, c))| (u.to_string(), *l, *c))
+                .collect();
+            v.sort();
+            v
+        }
+        fn depths(v: &[(Url, u32, u32)]) -> Vec<(String, u32, u32)> {
+            let mut out: Vec<(String, u32, u32)> =
+                v.iter().map(|(u, l, c)| (u.to_string(), *l, *c)).collect();
+            out.sort();
+            out
+        }
+        fn chain_strs(v: &[Url]) -> Vec<String> {
+            v.iter().map(|u| u.to_string()).collect()
+        }
         assert_eq!(
             symbol_identities(&cached),
             symbol_identities(&uncached),
-            "a cache HIT must yield the same symbols (name + source + line + kind/signature)"
+            "a cache HIT must yield the same symbols (name + source + line/column/end_column + is_declared + kind/signature)"
         );
         assert_eq!(
             sorted(&cached.inherited_packages),
@@ -11003,13 +11248,33 @@ mod tests {
             sorted(&uncached.loaded_packages),
             "loaded_packages must match uncached"
         );
-        let mut cached_po: Vec<String> = cached.package_origins.keys().cloned().collect();
-        let mut uncached_po: Vec<String> = uncached.package_origins.keys().cloned().collect();
-        cached_po.sort();
-        uncached_po.sort();
         assert_eq!(
-            cached_po, uncached_po,
-            "package_origins must match uncached"
+            origins(&cached.package_origins),
+            origins(&uncached.package_origins),
+            "package_origins (keys AND origin-URI sets) must match uncached"
+        );
+        // The remaining scope-carrying fields a cached scope also carries and
+        // callers consume: chain order, per-file visible positions, the
+        // parent-prefix-only symbol set, and depth-exceeded markers.
+        assert_eq!(
+            chain_strs(&cached.chain),
+            chain_strs(&uncached.chain),
+            "chain must match uncached (order included)"
+        );
+        assert_eq!(
+            vis(&cached.visible_positions),
+            vis(&uncached.visible_positions),
+            "visible_positions must match uncached"
+        );
+        assert_eq!(
+            sorted_arc_str(&cached.parent_prefix_symbol_names),
+            sorted_arc_str(&uncached.parent_prefix_symbol_names),
+            "parent_prefix_symbol_names must match uncached"
+        );
+        assert_eq!(
+            depths(&cached.depth_exceeded),
+            depths(&uncached.depth_exceeded),
+            "depth_exceeded must match uncached"
         );
     }
 
