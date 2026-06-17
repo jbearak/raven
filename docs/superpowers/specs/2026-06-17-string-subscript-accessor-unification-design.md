@@ -46,19 +46,27 @@ equivalent `$`-member query** at each cursor entry point:
   bare (`col` → `col`).
 - Feed that spelling into the existing `$`-member code path unchanged.
 
-Because `callee_name_for_match(V)` reproduces exactly the spelling the `$`-rhs
-identifier node carries, a `[["name"]]` query becomes **byte-for-byte identical**
-to the corresponding `` $`name` `` query. This guarantees perfect symmetry with
-zero new resolution logic, and means the `[[` form automatically inherits every
-present and future behavior of the `$` form (container path matching, cross-file
-candidate collection, tie-breaking, position-awareness).
+Because `callee_name_for_match(V)` reproduces exactly the canonical spelling the
+`$`-rhs identifier node carries, a `[["name"]]` query becomes **identical to the
+corresponding `` $`name` `` cursor query** — same container path, same `rhs_name`
+spelling, same `ExtractOp::Dollar`. The two *cursor* forms therefore produce
+identical results: the `[[` form inherits every present and future behavior of
+the `$` cursor (container path matching, cross-file candidate collection,
+tie-breaking, position-awareness) **and inherits its blind spots unchanged**.
 
-This deliberately does **not** make the `[[` cursor resolve anything the
-`` $`name` `` cursor does not. In particular, neither form resolves to a
-`x[["name"]] <- …` *assignment* whose member-name comparison is spelling-bare
-(a pre-existing raw-equality detail in `qualified_resolve.rs` that affects `$`
-and `[[` equally); that is out of scope for #461, which asks only for the two
-*cursor* forms to behave the same as each other.
+Concretely, candidate filtering in `qualified_resolve.rs` is **raw string
+equality** on the member name (it is not backtick-normalized). So neither cursor
+form resolves to:
+
+- a `x[["name"]] <- …` *assignment* whose stored member name is spelling-bare
+  (`"name"`) while the synthesized/typed `rhs_name` is backticked; or
+- a redundantly-backticked construction `list(\`col\` = 1)` when the query
+  spelling is bare `col`.
+
+Both gaps are **pre-existing** raw-equality details that affect the `$` cursor
+identically; #461 asks only that the two cursor forms behave the *same as each
+other*, which the synthesized-query approach guarantees by construction. Closing
+the raw-equality gaps would change `$` behavior too and is out of scope.
 
 ## Components
 
@@ -79,21 +87,34 @@ where `StringSubscriptMember { container: Node, value: String, string_node: Node
 Implementation:
 - Ascend from `node` to the enclosing `string` node (cursor may land on the
   `string` itself or a child token); bail if none within the immediate ancestry.
+- Delegate the "is this a `[[` member subscript" decision to the shared
+  predicate below; `container = subset2.child_by_field_name("function")`.
+
+**Shared strict predicate** —
+`subset2_sole_string_subscript(subset2: Node, text) -> Option<(value, string_node)>`:
+- `subset2.kind() == "subset2"` (`[[`), **not** `subset` (`[`).
+- The `arguments` node holds **exactly one** argument, that argument is
+  **positional** (no `name` field — rejecting `x[[name = "a"]]` and the
+  `exact =`/multi-arg forms like `x[["a", exact = FALSE]]`), and its value is a
+  `string`.
 - `value = simple_string_literal_value(string_node, text)?` (reuses the existing
   escaping/empty/multiline rejection).
-- Walk the string's parent to the `arguments` node (string may be a direct child
-  of `arguments` or the `value` of an `argument`, mirroring
-  `first_direct_string_argument`).
-- Require `arguments`' parent is a `subset2` (`[[`), **not** `subset` (`[`).
-- Require the string is the **sole** subscript: it is the
-  `first_direct_string_argument(arguments)` *and* `arguments` contains no comma
-  (rejecting `x[["a", "b"]]`).
-- `container = subset2.child_by_field_name("function")`.
 
-A small `string_subscript_value(string_node, text) -> Option<&str>` predicate
-(string node → bare value iff it is a sole `[[` subscript) is factored out so the
-find-references per-node matcher and `string_subscript_member_at` share one
-definition of "is a `[[` member subscript" and cannot drift.
+This single predicate is the only definition of "literal-string `[[` member
+subscript" and is consumed by **all three** sites so they cannot drift:
+1. `string_subscript_member_at` (terminal cursor helper, above);
+2. `build_qualified_path`'s `subset2` arm — **tightened** to use it (see below);
+3. the find-references per-node string matcher.
+
+**`build_qualified_path` tightening (ISSUE 1):** today the `subset2` arm uses
+`first_direct_string_argument` with no comma / sole-argument / positional check,
+so an *intermediate* `x[["a", "b"]]$c` or `x[[name = "a"]]$c` is silently
+mis-walked as `x$a$c`. Routing the `subset2` arm through
+`subset2_sole_string_subscript` makes such malformed/multi-arg intermediates
+**decline** (`None`), consistent with the strict terminal helper. This affects
+the `$` and `[[` forms equally (a strict improvement). Existing accepted cases
+(`alpha@beta[["gamma"]]`, single-literal subscripts) are unchanged; existing
+declines (`alpha[[i]]`, `alpha[[1]]`) still decline.
 
 ### 2. Go-to-definition — `handlers.rs` (`goto_definition*`, ~20320)
 
@@ -129,10 +150,13 @@ that hover Step 4 reuses goto's resolver).
 synthesized backticked/bare spelling keys identically to the `$` form.
 
 **(b) Matching (`find_references_in_subtree`):** in addition to the existing
-`identifier`-node match, when a node is a `string` that is a sole `[[` subscript
-(`string_subscript_value`), compute its match key as
+`identifier`-node match, when a node is a `string` whose parent `subset2`
+satisfies `subset2_sole_string_subscript`, compute its match key as
 `canonical_use_name(&callee_name_for_match(value))` and, if it equals
-`canonical_name`, push the **string node's** range.
+`canonical_name`, push the **string node's** range. (The per-node walk reaches
+the string directly, so it inspects `string.parent()` chain up to the `subset2`
+rather than starting from the `subset2`; a thin wrapper over the shared predicate
+covers this direction.)
 
 `canonical_use_name(callee_name_for_match(V))` yields the same canonical key the
 identifier path produces for the equivalent `$`-rhs / construction-arg spelling
@@ -140,12 +164,16 @@ identifier path produces for the equivalent `$`-rhs / construction-arg spelling
 one reference set. Behavior for existing identifier matching is unchanged
 (string matching is purely additive).
 
-This makes find-references symmetric from **any** of the three forms: cursor on
+This makes find-references symmetric from **any** of the forms: cursor on
 `` $`name` ``, `[["name"]]`, or the construction named argument unions all
 identifier occurrences **and** all `[["name"]]` occurrences. It is consistent
 with find-references' existing **name-based, container-agnostic** semantics
 (documented in `find-references.md`): it already pools all same-named members
-across containers; this extends that pooling to the `[[` spelling.
+across containers — and across `$` *and* `@` accessors, since the matcher keys
+on identifier text alone, not the operator. Adding `[[` string subscripts
+extends that same name pool to the `[[` spelling (ISSUE 5: a `[["slot"]]`
+reference will pool with `obj@slot` too — this is the pre-existing
+operator-agnostic pooling, not a new conflation, and is documented as such).
 
 ### 5. Documentation
 
@@ -155,11 +183,20 @@ across containers; this extends that pooling to the `[[` spelling.
   assignments as member-assignment targets; add the *cursor-on-subscript* case.
 - `docs/find-references.md` — note that `[["name"]]` literal-string subscripts
   are pooled with the `` $`name` `` / construction forms.
-- `docs/limitations.md` — record the boundaries: only **literal**,
-  single-string `[[` subscripts participate; computed/dynamic subscripts
-  (`x[[i]]`, `x[[paste0(...)]]`), numeric indices (`x[[1]]`), escaped/multiline
-  strings, multi-arg `[[`, and single-bracket `x["name"]` do **not** (and why —
-  `[[` with a runtime expression is not statically a name).
+- `docs/limitations.md` — record the boundaries: only a **single positional
+  literal** string `[[` subscript participates as a *cursor* entry point;
+  computed/dynamic subscripts (`x[[i]]`, `x[[paste0(...)]]`), numeric indices
+  (`x[[1]]`), escaped/multiline strings, named/multi-arg `[[`
+  (`x[[name = "a"]]`, `x[["a", exact = FALSE]]`), and **single-bracket**
+  `x["name"]` do **not** initiate navigation (and why — `[[` with a runtime
+  expression is not statically a name; `[` returns a sub-container, not the
+  element, so it is not `$`-equivalent).
+  - ISSUE 3 precision: this is about the **cursor sitting on** `x["name"]`. It
+    is distinct from the existing, unchanged behavior that a `foo["bar"] <- …`
+    *assignment target* is a resolution candidate for `` foo$bar ``/
+    `foo[["bar"]]` (member-assignment collection already accepts both `subset`
+    and `subset2` targets). The docs must not imply single-bracket assignments
+    stop being candidates.
 
 ## Testing (TDD)
 
@@ -170,7 +207,12 @@ Rust unit/integration tests in `handlers.rs` / `qualified_resolve.rs`:
   `a$b[["c"]]` and `a[["b"]]$c`.
 - **Goto declines (None):** `x[[i]]` (computed), `x[[1]]` (numeric),
   `x["name"]` (single bracket), `f()[["x"]]` (non-static head),
-  `x[["a", "b"]]` (multi-arg), `x[["a\tb"]]` (escaped).
+  `x[["a", "b"]]` and `x[["a", exact = FALSE]]` (multi-arg),
+  `x[[name = "a"]]` (named subscript), `x[["a\tb"]]` (escaped).
+- **Mixed-accessor terminal `[[` (ISSUE 7):** `a@b[["c"]]` and `a[["b"]]@c`
+  resolve `c` against the full mixed container path; and an intermediate
+  multi-arg/named `[[` (`x[["a", "b"]]$c`, `x[[name = "a"]]$c`) now **declines**
+  via the tightened `build_qualified_path`.
 - **Find-references symmetry:** from each of (0)/(1)/(2), the result set unions
   all three; the pushed `[[` range covers the string node. Include a
   syntactic-name variant and a cross-file variant.
@@ -191,3 +233,7 @@ CI gates (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets
   bare; that pre-existing raw-equality detail affects `$` and `[[` equally and
   is orthogonal to making the two cursor forms symmetric.
 - No unification of single-bracket `[` or non-literal `[[` subscripts.
+- No support for `assign("name", …)` or replacement-function forms
+  (`` `[[<-`(x, "name", …) ``) as member definition sites (ISSUE 8): the
+  candidate collector only walks `<-`/`=`/`<<-`/`->`/`->>` assignments and
+  constructor literals, for both `$` and `[[`. Out of scope.
