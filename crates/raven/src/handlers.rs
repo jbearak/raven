@@ -13870,6 +13870,14 @@ fn collect_nse_facts<'t>(
 /// Aliases (`f <- pkg::g`) and non-callable bindings are excluded by
 /// `collect_nse_facts`: an alias targets an unanalyzable package function, so a
 /// surviving diagnostic on its call keeps the hint.
+///
+/// The set is last-binding-wins (inherited from `collect_nse_facts`, matching
+/// `local_function_policies` on the diagnostic-path `NseAnalysis`): a name
+/// redefined within the file is classified by its FINAL top-level binding. So in
+/// the unusual shape `f <- pkg::g; f(undef); f <- function(x) x`, the earlier
+/// alias call is suppressed because `f`'s final binding is a definition — the
+/// same imprecision the policy resolver already had, in the safe (over-suppress)
+/// direction, not a behavior this helper introduces.
 pub(crate) fn collect_local_function_def_names(root: Node, text: &str) -> HashSet<String> {
     let mut local_function_defs: HashMap<String, Node> = HashMap::new();
     // Disabled: the formal-order tracker only feeds per-formal directive
