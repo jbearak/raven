@@ -250,8 +250,9 @@ current edge revision and standalone-scope invalidation generation, while
 holding the `WorldState` read lock and then drop the guard before resolving
 scope. Converted interactive paths include identifier completion, parameter
 completion, signature help, diagnostics, hover, qualified-member completion/
-go-to-definition, general identifier go-to-definition, and package-scope probes
-used by package prefetch/libpath affected-document filtering. Do not add
+go-to-definition, and general identifier go-to-definition. Package-scope probes
+use their own bounded capture/finish snapshot path for package
+prefetch/libpath affected-document filtering. Do not add
 persistent cache lookup/store to a path that still holds the `WorldState` guard.
 The key is the standalone callee URI, graph edge
 revision, the callee's path-context fingerprint, a scope-flavor fingerprint
@@ -282,6 +283,10 @@ members are precollected only within the remaining traversal budget and while
 the request is not cancelled. If that budget is saturated, the snapshot omits
 those active-only extras in the safe direction rather than reacquiring
 `WorldState` during scope resolution.
+If active materialization has to fall back to reading a target directly from
+disk because it was not present in the captured snapshot/open-document corpus,
+that snapshot can still use the materialized file, but persistent standalone cache
+lookup/store is disabled for the snapshot.
 
 While computing a standalone callee's isolated scope, recursive parent-prefix
 walks for non-standalone members of the callee's forward closure are restricted

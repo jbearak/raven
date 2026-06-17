@@ -310,7 +310,7 @@ it MUST feed `compute_interface_hash`; toggling the directive in any connected
 file revalidates dependents. The metadata-free hash path passes `false`; the
 metadata-aware path passes `metadata.standalone`.
 
-### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — IMPLEMENTED; PR MEASUREMENTS PENDING
+### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — IMPLEMENTED
 
 Knob 1 (WI2a) makes C's direct caller inputs independent. WI2b caches C's
 isolated EOF scope when the whole forward closure is likewise caller-independent
@@ -376,8 +376,8 @@ standalone_scope_invalidation_generation)`:
   package cache epoch rather than by hashing a callback object.
 - `package_cache_epoch` pins the package-library snapshot that backs
   `DataAliasProvider` lookups for standalone-local `data()` alias expansion.
-- `standalone_scope_invalidation_generation`: a coarse counter bumped whenever the package
-  library or relevant config changes (R re-init, `packages_*` settings,
+- `standalone_scope_invalidation_generation`: a coarse counter bumped whenever
+  the package library or relevant config changes (R re-init, `packages_*` settings,
   `maxChainDepth`, `maxTransitiveDependentsVisited`). C's isolated scope also
   depends on `base_exports` / package-library state / config, which the other
   key components do not capture.
@@ -389,12 +389,32 @@ when the same URI is reached through multiple active path contexts, or when the
 active path walk finds a cycle. It also skips persistence whenever the
 resolution graph handed to the scope query is cyclic, matching the per-query
 forward-child memo boundary where traversal history can affect a child scope.
-Diagnostic and interactive snapshots precollect active standalone-closure
-members discovered through the same path-context walk, even when those members
-are outside the trimmed graph neighborhood. This precollection is bounded by the
-remaining traversal budget and request cancellation; when the snapshot is
-saturated it omits active-only extras in the safe direction instead of
-reacquiring `WorldState` during lock-free scope resolution.
+Diagnostic, interactive, and package-scope probe snapshots precollect active
+standalone-closure members discovered through the same path-context walk, even
+when those members are outside the trimmed graph neighborhood. This
+precollection is bounded by the remaining traversal budget and request
+cancellation; when the snapshot is saturated it omits active-only extras in the
+safe direction instead of reacquiring `WorldState` during lock-free scope
+resolution.
+If active precollection has to materialize a target directly from disk because
+the target was absent from the captured snapshot/open-document corpus, that
+request may use the disk materialization but disables persistent
+standalone-scope lookup/store for the snapshot.
+
+**Worldwide measurements for #483.** On `/Users/jmb/repos/worldwide` with
+`bootstrap.r` temporarily marked `# raven: standalone`, the release
+`raven check .` sorted `undefined-variable` output was byte-identical with the
+standalone cache enabled and disabled (372 diagnostics either way). With no
+standalone directive, the current branch's sorted `undefined-variable` output
+was byte-identical to a temporary release build from the then-current `main`
+(365 diagnostics). That 365 count is a same-revision regression check for this
+branch, not a replacement for the original #479 case-study baseline above
+(`d15afd67`, 361 diagnostics saved in `/tmp/baseline_undefined.txt`).
+Three release `raven check .` runs with the directive were 9.79s / 10.01s /
+8.83s with the cache enabled and 21.31s / 22.18s / 22.49s with
+`RAVEN_STANDALONE_SCOPE_CACHE=0` (median 9.79s vs. 22.18s, about 56% faster).
+A trace run with `RUST_LOG=raven::cross_file::scope=trace` reported 769
+standalone-scope cache hits, 10 stores, and 234 skips.
 
 **Why `interface_hash`, not source-text (decision revised after review).** The
 dominant IDE editing pattern on a hub workspace is editing a caller of the hub,

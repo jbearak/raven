@@ -511,7 +511,7 @@ pub(crate) fn get_text_and_tree(
 /// Finds the nearest function definition that appears before the cursor position,
 /// preferring the innermost enclosing scope. Works for untitled/unsaved documents
 /// since it uses in-memory content.
-fn resolve_from_current_file(
+pub(crate) fn resolve_from_current_file(
     state: &WorldState,
     function_name: &str,
     uri: &Url,

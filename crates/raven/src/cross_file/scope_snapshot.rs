@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -75,7 +76,7 @@ pub(crate) fn precollect_scope_snapshot_uri(
     artifacts_map: &mut HashMap<Url, Arc<scope::ScopeArtifacts>>,
     metadata_map: &mut HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
 ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-    if let Some(artifacts) = content_provider.get_artifacts(uri) {
+    if let Some(artifacts) = content_provider.get_cached_artifacts(uri) {
         artifacts_map.insert(uri.clone(), artifacts);
     }
     let metadata = content_provider.get_metadata(uri);
@@ -168,9 +169,25 @@ struct SnapshotCorpus {
     artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
     metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     raw_text_map: HashMap<Url, SnapshotText>,
+    disk_attempted: HashSet<Url>,
+    dynamic_disk_materialized: bool,
 }
 
 impl SnapshotCorpus {
+    fn from_snapshot_maps(
+        artifacts_map: &HashMap<Url, Arc<scope::ScopeArtifacts>>,
+        metadata_map: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+        raw_text_map: &HashMap<Url, SnapshotText>,
+    ) -> Self {
+        Self {
+            artifacts_map: artifacts_map.clone(),
+            metadata_map: metadata_map.clone(),
+            raw_text_map: raw_text_map.clone(),
+            disk_attempted: HashSet::new(),
+            dynamic_disk_materialized: false,
+        }
+    }
+
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<scope::ScopeArtifacts>> {
         self.artifacts_map.get(uri).cloned()
     }
@@ -181,6 +198,117 @@ impl SnapshotCorpus {
 
     fn get_text(&self, uri: &Url) -> Option<SnapshotText> {
         self.raw_text_map.get(uri).cloned()
+    }
+
+    fn get_or_materialize_artifacts(&mut self, uri: &Url) -> Option<Arc<scope::ScopeArtifacts>> {
+        if !self.artifacts_map.contains_key(uri) {
+            let _ = self.compute_artifacts_from_snapshot_text(uri);
+        }
+        if !self.artifacts_map.contains_key(uri) {
+            self.materialize_disk_uri(uri);
+        }
+        self.get_artifacts(uri)
+    }
+
+    fn get_or_materialize_metadata(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if !self.metadata_map.contains_key(uri) {
+            self.compute_metadata_from_snapshot_text(uri);
+        }
+        if !self.metadata_map.contains_key(uri) {
+            self.materialize_disk_uri(uri);
+        }
+        self.get_metadata(uri)
+    }
+
+    fn compute_metadata_from_snapshot_text(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if let Some(metadata) = self.get_metadata(uri) {
+            return Some(metadata);
+        }
+        let text = self.get_text(uri)?;
+        let analysis = text.analysis_string();
+        let tree = text
+            .tree()
+            .or_else(|| crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None)))?;
+        let metadata = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            &analysis,
+            Some(&tree),
+        ));
+        self.metadata_map.insert(uri.clone(), metadata.clone());
+        Some(metadata)
+    }
+
+    fn compute_artifacts_from_snapshot_text(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<scope::ScopeArtifacts>> {
+        if let Some(artifacts) = self.get_artifacts(uri) {
+            return Some(artifacts);
+        }
+        let text = self.get_text(uri)?;
+        let analysis = text.analysis_string();
+        let tree = text
+            .tree()
+            .or_else(|| crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None)))?;
+        let metadata = self.compute_metadata_from_snapshot_text(uri)?;
+        let artifacts = Arc::new(scope::compute_artifacts_with_metadata(
+            uri,
+            &tree,
+            &analysis,
+            Some(&metadata),
+        ));
+        self.artifacts_map
+            .entry(uri.clone())
+            .or_insert_with(|| artifacts.clone());
+        Some(artifacts)
+    }
+
+    fn materialize_disk_uri(&mut self, uri: &Url) {
+        if !self.disk_attempted.insert(uri.clone()) {
+            return;
+        }
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let Ok(raw) = crate::state::read_source(&path) else {
+            return;
+        };
+        let chunk_kind = crate::chunks::classify_chunk_document(uri.path());
+        let analysis = crate::cross_file::analysis_text_for_kind(chunk_kind, &raw);
+        let Some(tree) =
+            crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None))
+        else {
+            return;
+        };
+        let metadata = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            analysis.as_ref(),
+            Some(&tree),
+        ));
+        let artifacts = Arc::new(scope::compute_artifacts_with_metadata(
+            uri,
+            &tree,
+            analysis.as_ref(),
+            Some(&metadata),
+        ));
+        self.artifacts_map
+            .entry(uri.clone())
+            .or_insert_with(|| artifacts.clone());
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| metadata.clone());
+        self.raw_text_map
+            .entry(uri.clone())
+            .or_insert(SnapshotText::Rope {
+                raw: Rope::from_str(&raw),
+                chunk_kind,
+                tree: Some(tree),
+            });
+        self.dynamic_disk_materialized = true;
     }
 
     fn insert_open_doc(
@@ -204,22 +332,12 @@ impl SnapshotCorpus {
     }
 
     fn insert_legacy_document(&mut self, uri: &Url, doc: &crate::state::Document) {
-        if let Some(tree) = doc.tree.as_ref() {
-            let text = doc.analysis_text();
-            let metadata = Arc::new(crate::cross_file::extract_metadata(&text));
-            let artifacts = Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            ));
-            self.artifacts_map
-                .entry(uri.clone())
-                .or_insert_with(|| artifacts.clone());
-            self.metadata_map
-                .entry(uri.clone())
-                .or_insert_with(|| metadata.clone());
+        if let Some(artifacts) = doc.cached_artifacts_for_uri(uri) {
+            self.artifacts_map.entry(uri.clone()).or_insert(artifacts);
         }
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| doc.metadata_handle());
         self.raw_text_map
             .entry(uri.clone())
             .or_insert(SnapshotText::Rope {
@@ -229,36 +347,30 @@ impl SnapshotCorpus {
             });
     }
 
-    fn insert_index_handles(
-        &mut self,
-        uri: Url,
-        artifacts: Arc<scope::ScopeArtifacts>,
-        metadata: Arc<crate::cross_file::CrossFileMetadata>,
-        contents: Rope,
-        tree: Option<tree_sitter::Tree>,
-    ) {
-        self.artifacts_map.entry(uri.clone()).or_insert(artifacts);
-        self.metadata_map.entry(uri.clone()).or_insert(metadata);
-        self.raw_text_map
-            .entry(uri.clone())
-            .or_insert(SnapshotText::Rope {
-                raw: contents,
-                chunk_kind: crate::chunks::classify_chunk_document(uri.path()),
-                tree,
-            });
+    fn insert_state_document_if_open(&mut self, state: &WorldState, uri: &Url) -> bool {
+        if let Some(doc) = state.document_store.get_without_touch(uri) {
+            self.insert_open_doc(
+                uri,
+                doc.contents.clone(),
+                doc.chunk_kind,
+                doc.tree.clone(),
+                doc.artifacts.clone(),
+                doc.metadata.clone(),
+            );
+            return true;
+        }
+
+        if let Some(doc) = state.documents.get(uri) {
+            self.insert_legacy_document(uri, doc);
+            return true;
+        }
+
+        false
     }
 
-    fn insert_cross_file_index(
-        &mut self,
-        uri: &Url,
-        index: &crate::cross_file::workspace_index::CrossFileWorkspaceIndex,
-    ) {
-        if let Some(artifacts) = index.get_artifacts(uri) {
-            self.artifacts_map.entry(uri.clone()).or_insert(artifacts);
-        }
-        if let Some(metadata) = index.get_metadata(uri) {
-            self.metadata_map.entry(uri.clone()).or_insert(metadata);
-        }
+    fn has_deferred_artifacts(&self, uris: &[Url]) -> bool {
+        uris.iter()
+            .any(|uri| !self.artifacts_map.contains_key(uri) && self.raw_text_map.contains_key(uri))
     }
 
     fn precollect_uri(
@@ -280,9 +392,7 @@ impl SnapshotCorpus {
     }
 }
 
-fn capture_active_corpus(state: &WorldState) -> SnapshotCorpus {
-    let mut corpus = SnapshotCorpus::default();
-
+fn capture_active_open_documents(state: &WorldState, corpus: &mut SnapshotCorpus) {
     for uri in state.document_store.uris() {
         if let Some(doc) = state.document_store.get_without_touch(&uri) {
             corpus.insert_open_doc(
@@ -298,23 +408,9 @@ fn capture_active_corpus(state: &WorldState) -> SnapshotCorpus {
     for (uri, doc) in &state.documents {
         corpus.insert_legacy_document(uri, doc);
     }
-    for (uri, artifacts, metadata, contents, tree) in
-        state.workspace_index_new.iter_scope_snapshot_handles()
-    {
-        corpus.insert_index_handles(uri, artifacts, metadata, contents, tree);
-    }
-    for uri in state.cross_file_workspace_index.uris() {
-        corpus.insert_cross_file_index(&uri, &state.cross_file_workspace_index);
-    }
-    for (uri, doc) in &state.workspace_index {
-        corpus.insert_legacy_document(uri, doc);
-    }
-
-    corpus
 }
 
 pub(crate) struct CrossFileScopeSnapshotCapture {
-    full_graph: Option<Arc<crate::cross_file::dependency::DependencyGraph>>,
     subgraph: Arc<crate::cross_file::dependency::DependencyGraph>,
     cross_file_edge_revision: u64,
     standalone_scope_invalidation_generation: u64,
@@ -334,40 +430,63 @@ pub(crate) struct CrossFileScopeSnapshotCapture {
     metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     raw_text_map: HashMap<Url, SnapshotText>,
     active_corpus: Option<SnapshotCorpus>,
+    expand_active_standalone_members: bool,
+    persistent_cache_enabled: bool,
     max_depth: usize,
     max_visited: usize,
 }
 
 impl CrossFileScopeSnapshotCapture {
     pub(crate) fn finish(mut self, is_cancelled: &impl Fn() -> bool) -> CrossFileScopeSnapshot {
-        if let Some(corpus) = self.active_corpus.as_ref() {
-            let get_active_artifacts = |target_uri: &Url| corpus.get_artifacts(target_uri);
-            let get_active_metadata = |target_uri: &Url| corpus.get_metadata(target_uri);
-            let active_extra_uris = scope::standalone_active_snapshot_members(
-                scope::StandaloneActiveSnapshotMembersInputs {
-                    graph: self.subgraph.as_ref(),
-                    max_depth: self.max_depth,
-                    max_visited: self.max_visited,
-                    workspace_root: self.workspace_folders.first(),
-                    seed_uris: &self.seed_uris,
-                    is_cancelled,
-                },
-                &mut self.snapshot_uris,
-                &get_active_artifacts,
-                &get_active_metadata,
-            );
-            for extra_uri in &active_extra_uris {
+        if let Some(mut corpus) = self.active_corpus.take() {
+            for seed_uri in &self.seed_uris {
+                corpus.compute_metadata_from_snapshot_text(seed_uri);
+                let _ = corpus.compute_artifacts_from_snapshot_text(seed_uri);
                 corpus.precollect_uri(
-                    extra_uri,
+                    seed_uri,
                     &mut self.artifacts_map,
                     &mut self.metadata_map,
                     &mut self.raw_text_map,
                 );
             }
-            if !active_extra_uris.is_empty()
-                && let Some(full_graph) = self.full_graph.as_ref()
-            {
-                self.subgraph = Arc::new(full_graph.extract_subgraph(&self.snapshot_uris));
+
+            if self.expand_active_standalone_members {
+                let corpus = RefCell::new(corpus);
+                let active_extra_uris = {
+                    let get_active_artifacts = |target_uri: &Url| {
+                        corpus.borrow_mut().get_or_materialize_artifacts(target_uri)
+                    };
+                    let get_active_metadata = |target_uri: &Url| {
+                        corpus.borrow_mut().get_or_materialize_metadata(target_uri)
+                    };
+                    scope::standalone_active_snapshot_members(
+                        scope::StandaloneActiveSnapshotMembersInputs {
+                            graph: self.subgraph.as_ref(),
+                            max_depth: self.max_depth,
+                            max_visited: self.max_visited,
+                            workspace_root: self.workspace_folders.first(),
+                            seed_uris: &self.seed_uris,
+                            is_cancelled,
+                        },
+                        &mut self.snapshot_uris,
+                        &get_active_artifacts,
+                        &get_active_metadata,
+                    )
+                };
+                let corpus = corpus.into_inner();
+                for extra_uri in &active_extra_uris {
+                    corpus.precollect_uri(
+                        extra_uri,
+                        &mut self.artifacts_map,
+                        &mut self.metadata_map,
+                        &mut self.raw_text_map,
+                    );
+                }
+                if corpus.dynamic_disk_materialized {
+                    self.persistent_cache_enabled = false;
+                }
+            } else if corpus.dynamic_disk_materialized {
+                self.persistent_cache_enabled = false;
             }
         }
 
@@ -388,6 +507,7 @@ impl CrossFileScopeSnapshotCapture {
             metadata_map: self.metadata_map,
             raw_text_map: self.raw_text_map,
             scope_contribution: self.scope_contribution,
+            persistent_cache_enabled: self.persistent_cache_enabled,
         }
     }
 }
@@ -410,15 +530,21 @@ pub(crate) struct CrossFileScopeSnapshot {
     pub(crate) metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     raw_text_map: HashMap<Url, SnapshotText>,
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+    persistent_cache_enabled: bool,
 }
 
 impl CrossFileScopeSnapshot {
-    /// Build a bounded cross-file snapshot for one scope-bearing interactive
-    /// request. Call this under the `WorldState` read lock, then drop the guard
-    /// before invoking [`Self::scope_at`] or snapshot-backed parameter/signature
-    /// resolution. Persistent standalone-scope cache misses can recursively
-    /// resolve a callee closure, so they must not run while `did_change` writers
-    /// are blocked behind the read lock.
+    /// Convenience wrapper that captures and immediately finalizes a bounded
+    /// cross-file snapshot for one scope-bearing request.
+    ///
+    /// Production LSP paths should prefer [`Self::capture`], drop the
+    /// `WorldState` read guard, and then call
+    /// [`CrossFileScopeSnapshotCapture::finish`] before invoking
+    /// [`Self::scope_at`] or snapshot-backed parameter/signature resolution.
+    /// Finalization can materialize active standalone closure members, and
+    /// persistent standalone-scope cache misses can recursively resolve a callee
+    /// closure; neither belongs under the read lock while `did_change` writers
+    /// are waiting.
     pub(crate) fn build(state: &WorldState, uri: &Url) -> Self {
         Self::capture(state, uri).finish(&|| false)
     }
@@ -440,30 +566,42 @@ impl CrossFileScopeSnapshot {
                 .cross_file_graph
                 .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let content_provider = state.content_provider();
-        let mut artifacts_map = HashMap::new();
-        let mut metadata_map = HashMap::new();
-        let mut raw_text_map = HashMap::new();
+        let mut corpus = SnapshotCorpus::default();
 
         let mut seed_uris: Vec<Url> = payload.neighborhood.iter().cloned().collect();
         seed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         let snapshot_uris: HashSet<Url> = seed_uris.iter().cloned().collect();
         for neighbor_uri in &seed_uris {
-            precollect_scope_snapshot_uri(
-                &content_provider,
-                neighbor_uri,
-                &mut artifacts_map,
-                &mut metadata_map,
-            );
-            precollect_text_for_scope_snapshot(state, neighbor_uri, &mut raw_text_map);
+            if !corpus.insert_state_document_if_open(state, neighbor_uri) {
+                precollect_scope_snapshot_uri(
+                    &content_provider,
+                    neighbor_uri,
+                    &mut corpus.artifacts_map,
+                    &mut corpus.metadata_map,
+                );
+                precollect_text_for_scope_snapshot(state, neighbor_uri, &mut corpus.raw_text_map);
+            }
         }
         let has_standalone_seed = seed_uris.iter().any(|seed| {
-            metadata_map
+            corpus
+                .metadata_map
                 .get(seed)
                 .is_some_and(|metadata| metadata.standalone)
         });
+        let has_deferred_seed_artifacts = corpus.has_deferred_artifacts(&seed_uris);
+
+        let active_corpus = if has_standalone_seed || has_deferred_seed_artifacts {
+            capture_active_open_documents(state, &mut corpus);
+            Some(SnapshotCorpus::from_snapshot_maps(
+                &corpus.artifacts_map,
+                &corpus.metadata_map,
+                &corpus.raw_text_map,
+            ))
+        } else {
+            None
+        };
 
         CrossFileScopeSnapshotCapture {
-            full_graph: has_standalone_seed.then(|| Arc::new(state.cross_file_graph.clone())),
             subgraph: payload.subgraph.clone(),
             cross_file_edge_revision: state.cross_file_graph.edge_revision(),
             standalone_scope_invalidation_generation: state
@@ -482,10 +620,12 @@ impl CrossFileScopeSnapshot {
             scope_contribution: state.package_state.scope_contribution().clone(),
             seed_uris,
             snapshot_uris,
-            artifacts_map,
-            metadata_map,
-            raw_text_map,
-            active_corpus: has_standalone_seed.then(|| capture_active_corpus(state)),
+            artifacts_map: corpus.artifacts_map,
+            metadata_map: corpus.metadata_map,
+            raw_text_map: corpus.raw_text_map,
+            active_corpus,
+            expand_active_standalone_members: has_standalone_seed,
+            persistent_cache_enabled: true,
             max_depth,
             max_visited,
         }
@@ -545,11 +685,13 @@ impl CrossFileScopeSnapshot {
             )
         });
 
-        let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
-            &self.standalone_scope_cache,
-            self.cross_file_edge_revision,
-            self.standalone_scope_invalidation_generation,
-        );
+        let standalone_cache_context = self.persistent_cache_enabled.then(|| {
+            scope::StandaloneScopeCacheContext::new(
+                &self.standalone_scope_cache,
+                self.cross_file_edge_revision,
+                self.standalone_scope_invalidation_generation,
+            )
+        });
 
         scope::scope_at_position_with_graph_cached_with_standalone_cache(
             uri,
@@ -567,7 +709,7 @@ impl CrossFileScopeSnapshot {
             prefix_cache,
             Some(&self.scope_contribution),
             data_provider.as_ref(),
-            Some(standalone_cache_context),
+            standalone_cache_context,
         )
     }
 }

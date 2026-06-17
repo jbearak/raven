@@ -98,14 +98,6 @@ pub struct IndexEntry {
     pub indexed_at_version: u64,
 }
 
-pub type ScopeSnapshotHandle = (
-    Url,
-    Arc<ScopeArtifacts>,
-    Arc<CrossFileMetadata>,
-    Rope,
-    Option<Tree>,
-);
-
 impl Clone for IndexEntry {
     fn clone(&self) -> Self {
         Self {
@@ -366,28 +358,6 @@ impl WorkspaceIndex {
                 guard
                     .iter()
                     .map(|(k, v)| (k.clone(), v.artifacts.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Iterate over the handles needed by cross-file scope snapshots without
-    /// cloning full index entries.
-    pub fn iter_scope_snapshot_handles(&self) -> Vec<ScopeSnapshotHandle> {
-        self.inner
-            .read()
-            .map(|guard| {
-                guard
-                    .iter()
-                    .map(|(uri, entry)| {
-                        (
-                            uri.clone(),
-                            entry.artifacts.clone(),
-                            entry.metadata.clone(),
-                            entry.contents.clone(),
-                            entry.tree.clone(),
-                        )
-                    })
                     .collect()
             })
             .unwrap_or_default()

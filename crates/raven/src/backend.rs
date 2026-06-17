@@ -5,7 +5,7 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +26,7 @@ use tower_lsp::jsonrpc::{
 };
 use tower_lsp::lsp_types::*;
 
+use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::state::{IndentationSettings, SymbolConfig, WorldState, scan_workspace};
@@ -1078,8 +1079,8 @@ struct ActiveCancellableRequest {
 /// to preserve ordered text-sync handling, so cancellation notifications can sit
 /// behind an in-flight request. `RequestCancellationService` therefore updates
 /// this registry synchronously in `Service::call`, before tower-lsp queues the
-/// notification future, and request handlers poll the matching token while doing
-/// CPU-bound work under the `WorldState` read guard.
+/// notification future, and request handlers poll the matching token while
+/// waiting for the `WorldState` read guard and during off-lock CPU-bound work.
 #[derive(Debug, Default)]
 struct RequestCancellationRegistry {
     active: StdRwLock<HashMap<JsonRpcId, ActiveCancellableRequest>>,
@@ -1968,7 +1969,8 @@ async fn run_debounced_diagnostics(
         _ = tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)) => {}
     }
 
-    // Build snapshot under the read lock (brief hold), then compute diagnostics outside
+    // Capture snapshot inputs under the read lock (brief hold), then finalize
+    // and compute diagnostics outside.
     let snapshot_data = {
         let state = state_arc.read().await;
 
@@ -1991,34 +1993,49 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        // Build the snapshot (captures all state needed for diagnostics)
-        let snapshot =
-            handlers::DiagnosticsSnapshot::build_with_cancel(&state, &affected_uri, &|| {
-                cancel.is_cancelled()
-            });
+        // Capture snapshot inputs under the lock; active standalone expansion
+        // runs after the guard is dropped.
+        let snapshot_capture =
+            handlers::DiagnosticsSnapshot::capture_with_cancel(&state, &affected_uri);
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
 
-        snapshot.map(|s| (s, workspace_folder, missing_file_severity))
+        snapshot_capture.map(|s| (s, workspace_folder, missing_file_severity))
     }; // Read lock released here
 
-    let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
+    let Some((snapshot_capture, workspace_folder, missing_file_severity)) = snapshot_data else {
         return;
+    };
+
+    let affected_uri_for_task = affected_uri.clone();
+    let cancel_for_task = cancel.clone();
+    let snapshot_result = match tokio::task::spawn_blocking(move || {
+        let snapshot = snapshot_capture.finish(&|| cancel_for_task.is_cancelled());
+        let directive_meta = snapshot.directive_meta.clone();
+        let sync_diagnostics = handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &affected_uri_for_task,
+            &cancel_for_task,
+        )?;
+        Some((sync_diagnostics, directive_meta))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::trace!("Diagnostics worker failed for {}: {e}", affected_uri);
+            return;
+        }
     };
 
     if let Some(traversal_truncation) = traversal_truncation.as_deref() {
         check_and_warn_traversal_truncation(&state_arc, &client, traversal_truncation).await;
     }
 
-    // Compute diagnostics WITHOUT holding any lock
-    let sync_diagnostics =
-        match handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel) {
-            Some(diags) => diags,
-            None => {
-                log::trace!("Diagnostics cancelled for {}", affected_uri);
-                return;
-            }
-        };
+    let Some((sync_diagnostics, directive_meta)) = snapshot_result else {
+        log::trace!("Diagnostics cancelled for {}", affected_uri);
+        return;
+    };
 
     if cancel.is_cancelled() {
         log::trace!(
@@ -2032,7 +2049,7 @@ async fn run_debounced_diagnostics(
     let diagnostics = handlers::diagnostics_async_standalone(
         &affected_uri,
         sync_diagnostics,
-        &snapshot.directive_meta,
+        &directive_meta,
         workspace_folder.as_ref(),
         missing_file_severity,
     )
@@ -3748,7 +3765,8 @@ impl LanguageServer for Backend {
                     // applied to the merged set below.
                     let data_packages: Vec<String> =
                         doc.map(|d| d.data_packages.clone()).unwrap_or_default();
-                    let snapshot = state.build_package_scope_snapshot(&[(uri.clone(), last_line)]);
+                    let snapshot =
+                        state.capture_package_scope_snapshot(&[(uri.clone(), last_line)]);
                     (
                         snapshot,
                         state.package_library.clone(),
@@ -3757,24 +3775,35 @@ impl LanguageServer for Backend {
                     )
                 }; // read lock released
 
-                let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                let scope = probe.scope_at(&uri, probe_line);
+                let uri_for_task = uri.clone();
+                let pkgs = match tokio::task::spawn_blocking(move || {
+                    let probe = probe.finish();
+                    let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
+                    let scope = probe.scope_at(&uri_for_task, probe_line);
 
-                let mut pkgs = scope.inherited_packages;
-                pkgs.extend(scope.loaded_packages);
-                // Issue #429: warm `data(..., package = "pkg")` packages too, so
-                // the diagnostics-time `data()` alias expansion resolves their
-                // dataset object names in the editor (parity with `raven check`).
-                pkgs.extend(data_packages);
-                // Filter the merged set so suspicious names from inherited
-                // packages (which originate in parents' library_calls and
-                // are not pre-validated) cannot reach the R subprocess /
-                // filesystem path. Mirrors the validation applied to direct
-                // library_calls via extract_loaded_packages_from_library_calls.
-                let pkgs: Vec<String> = pkgs
-                    .into_iter()
-                    .filter(|p| is_valid_package_name(p))
-                    .collect();
+                    let mut pkgs = scope.inherited_packages;
+                    pkgs.extend(scope.loaded_packages);
+                    // Issue #429: warm `data(..., package = "pkg")` packages too, so
+                    // the diagnostics-time `data()` alias expansion resolves their
+                    // dataset object names in the editor (parity with `raven check`).
+                    pkgs.extend(data_packages);
+                    // Filter the merged set so suspicious names from inherited
+                    // packages (which originate in parents' library_calls and
+                    // are not pre-validated) cannot reach the R subprocess /
+                    // filesystem path. Mirrors the validation applied to direct
+                    // library_calls via extract_loaded_packages_from_library_calls.
+                    pkgs.into_iter()
+                        .filter(|p| is_valid_package_name(p))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                {
+                    Ok(pkgs) => pkgs,
+                    Err(e) => {
+                        log::trace!("did_open package prefetch probe failed for {}: {e}", uri);
+                        Vec::new()
+                    }
+                };
 
                 (pkg_lib, ready, pkgs)
             };
@@ -4281,13 +4310,33 @@ impl LanguageServer for Backend {
                             .get(&revalidation_uri)
                             .map(|d| d.text().lines().count().saturating_sub(1) as u32)
                             .unwrap_or(0);
-                        state.build_package_scope_snapshot(&[(revalidation_uri.clone(), last_line)])
+                        state.capture_package_scope_snapshot(&[(
+                            revalidation_uri.clone(),
+                            last_line,
+                        )])
                     }; // read lock released
 
-                    let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                    let scope = probe.scope_at(&revalidation_uri, probe_line);
-                    all_packages.extend(scope.inherited_packages);
-                    all_packages.extend(scope.loaded_packages);
+                    let revalidation_uri_for_task = revalidation_uri.clone();
+                    let inherited = match tokio::task::spawn_blocking(move || {
+                        let probe = probe.finish();
+                        let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
+                        let scope = probe.scope_at(&revalidation_uri_for_task, probe_line);
+                        let mut packages = scope.inherited_packages;
+                        packages.extend(scope.loaded_packages);
+                        packages
+                    })
+                    .await
+                    {
+                        Ok(packages) => packages,
+                        Err(e) => {
+                            log::trace!(
+                                "background package prefetch probe failed for {}: {e}",
+                                revalidation_uri
+                            );
+                            HashSet::new()
+                        }
+                    };
+                    all_packages.extend(inherited);
                 }
 
                 if all_packages.is_empty() {
@@ -5633,21 +5682,35 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
+        enum SignaturePlan {
+            Ready(handlers::SignatureHelpContext),
+            Snapshot(
+                handlers::PreparedSignatureHelp,
+                Box<crate::cross_file::scope_snapshot::CrossFileScopeSnapshotCapture>,
+            ),
+        }
+
         // Phase 1: capture local context and cross-file inputs under read lock.
-        let prepared = {
+        let plan = {
             let state = self.state.read().await;
             handlers::prepare_signature_help_for_scope_snapshot(&state, &uri, position).map(
                 |prepared| {
+                    if let Some(ctx) =
+                        handlers::signature_help_context_from_current_file(&state, &uri, &prepared)
+                    {
+                        return SignaturePlan::Ready(ctx);
+                    }
                     let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
-                    (prepared, capture)
+                    SignaturePlan::Snapshot(prepared, Box::new(capture))
                 },
             )
         }; // read lock released
 
         // Phase 2: cross-file scope resolution and async package help fetch
         // without holding the WorldState lock.
-        Ok(match prepared {
-            Some((prepared, capture)) => {
+        Ok(match plan {
+            Some(SignaturePlan::Ready(ctx)) => handlers::resolve_signature_help(ctx).await,
+            Some(SignaturePlan::Snapshot(prepared, capture)) => {
                 let uri_for_task = uri.clone();
                 let ctx = match tokio::task::spawn_blocking(move || {
                     let snapshot = capture.finish(&|| false);
@@ -7306,33 +7369,23 @@ impl Backend {
 /// `HashMap::get`/`HashMap::insert` call.
 ///
 /// Lock discipline: the read lock on `WorldState` is only held while
-/// building [`handlers::DiagnosticsSnapshot`] (which captures all
-/// inputs the scope engine needs) and capturing the directive metadata
-/// / workspace folder / severity. The lock is then released BEFORE the
-/// heavy `diagnostics_from_snapshot` call (which runs scope resolution)
-/// and the async missing-file checks. This matches the snapshot
-/// pattern's design intent — "Built under the read lock, then used to
-/// compute diagnostics without holding any lock" — and is required for
-/// the parallel reload driver: with up to 8 concurrent
-/// `publish_diagnostics_inner` tasks, holding the read lock across
-/// scope resolution would block `did_change` writers for the full
-/// duration of every parallel diagnostic computation.
+/// capturing [`handlers::DiagnosticsSnapshot`] inputs and the small
+/// workspace-folder / severity values. The lock is then released BEFORE
+/// active standalone closure materialization, `diagnostics_from_snapshot`
+/// scope resolution, and the async missing-file checks. This matches the
+/// snapshot pattern's design intent and is required for the parallel reload
+/// driver: with up to 8 concurrent `publish_diagnostics_inner` tasks, holding
+/// the read lock across resolution would block `did_change` writers for the
+/// full duration of every parallel diagnostic computation.
 pub(crate) async fn publish_diagnostics_inner(
     state_arc: &Arc<RwLock<WorldState>>,
     client: &Client,
     uri: &Url,
 ) {
-    // Phase 1: brief read lock — gate check, build the diagnostics
-    // snapshot, capture inputs for the off-lock work. NO scope
-    // resolution or other heavy work happens inside this scope.
-    let (
-        version,
-        diagnostics_enabled,
-        snapshot,
-        directive_meta,
-        workspace_folder,
-        missing_file_severity,
-    ) = {
+    // Phase 1: brief read lock — gate check and capture diagnostics
+    // snapshot inputs for the off-lock work. NO active materialization,
+    // scope resolution, or other heavy work happens inside this scope.
+    let (version, diagnostics_enabled, snapshot_capture, workspace_folder, missing_file_severity) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
 
@@ -7355,35 +7408,20 @@ pub(crate) async fn publish_diagnostics_inner(
         }
 
         // Capture the diagnostics master switch under the read lock so
-        // it gates BOTH the sync snapshot build AND the async
+        // it gates BOTH the sync snapshot capture AND the async
         // missing-file checks below — without this, a config reload
         // that flips `diagnostics.enabled` to `false` could still
         // publish missing-file diagnostics from the async phase.
         let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
 
-        // Skip the snapshot build entirely when the master switch is
+        // Skip the snapshot capture entirely when the master switch is
         // off — saves the snapshot's metadata clone + neighborhood walk.
         // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if diagnostics_enabled {
-            handlers::DiagnosticsSnapshot::build(&state, uri)
+        let snapshot_capture = if diagnostics_enabled {
+            handlers::DiagnosticsSnapshot::capture_with_cancel(&state, uri)
         } else {
             None
         };
-
-        // Metadata for async missing-file checks. Reuse the snapshot's
-        // `directive_meta`, which is `extract_metadata` (not just directives):
-        // it carries AST-detected `source()` calls AND is masked-correct for
-        // Rmd/Quarto (chunk bodies only). The old `parse_directives(doc.text())`
-        // here was raw and directives-only, so an AST `source("missing.R")`
-        // inside a chunk was stripped by `diagnostics_async_standalone`'s
-        // retain() and never re-added — losing the missing-file diagnostic
-        // (#343). Mirrors the dependent-revalidation path, which already passes
-        // `snapshot.directive_meta`. When the snapshot is absent (diagnostics
-        // disabled) the async phase below is skipped, so the fallback is inert.
-        let directive_meta = snapshot
-            .as_ref()
-            .map(|s| s.directive_meta.clone())
-            .unwrap_or_default();
 
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
@@ -7391,29 +7429,59 @@ pub(crate) async fn publish_diagnostics_inner(
         (
             version,
             diagnostics_enabled,
-            snapshot,
-            directive_meta,
+            snapshot_capture,
             workspace_folder,
             missing_file_severity,
         )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
 
-    // Phase 2: run `diagnostics_from_snapshot` outside the lock. This is
-    // the heavy phase the snapshot pattern was designed to keep
-    // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
-    // Replicate the remaining `handlers::diagnostics` early-exits via
-    // snapshot fields, which already mirror `doc.file_type` from build time.
-    let sync_diagnostics = match snapshot {
-        // Rmd/Quarto documents flow through too (issue #343): the snapshot
-        // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
-        // sees only real R chunk-body content. JAGS/Stan stay suppressed via the
-        // `file_type == R` condition.
-        Some(snap) if snap.file_type == crate::file_type::FileType::R => {
-            handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
+    // Metadata for async missing-file checks. Reuse the snapshot's
+    // `directive_meta`, which is `extract_metadata` (not just directives):
+    // it carries AST-detected `source()` calls AND is masked-correct for
+    // Rmd/Quarto (chunk bodies only). The old `parse_directives(doc.text())`
+    // here was raw and directives-only, so an AST `source("missing.R")`
+    // inside a chunk was stripped by `diagnostics_async_standalone`'s
+    // retain() and never re-added — losing the missing-file diagnostic
+    // (#343). Mirrors the dependent-revalidation path, which already passes
+    // `snapshot.directive_meta`. When the snapshot is absent (diagnostics
+    // disabled) the async phase below is skipped, so the fallback is inert.
+    //
+    // Phase 2 also runs `diagnostics_from_snapshot` outside the lock and on a
+    // blocking worker. Snapshot finalization may materialize active standalone
+    // closure members from disk; diagnostics then does synchronous scope
+    // resolution.
+    let uri_for_task = uri.clone();
+    let (sync_diagnostics, directive_meta) = match tokio::task::spawn_blocking(move || {
+        let snapshot = snapshot_capture.map(|capture| capture.finish(&|| false));
+        let directive_meta = snapshot
+            .as_ref()
+            .map(|s| s.directive_meta.clone())
+            .unwrap_or_default();
+        let sync_diagnostics = match snapshot {
+            // Rmd/Quarto documents flow through too (issue #343): the snapshot
+            // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
+            // sees only real R chunk-body content. JAGS/Stan stay suppressed via the
+            // `file_type == R` condition.
+            Some(snap) if snap.file_type == crate::file_type::FileType::R => {
+                handlers::diagnostics_from_snapshot(
+                    &snap,
+                    &uri_for_task,
+                    &handlers::DiagCancelToken::never(),
+                )
                 .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        (sync_diagnostics, directive_meta)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::trace!("publish_diagnostics_inner: diagnostics worker failed for {uri}: {e}");
+            (Vec::new(), Default::default())
         }
-        _ => Vec::new(),
     };
 
     // Phase 3: async missing-file existence checks. Gated on
@@ -7543,35 +7611,48 @@ pub(crate) async fn prefetch_packages_for_open_documents(
     let (doc_packages, probe) = {
         let state = state_arc.read().await;
         let (doc_pkgs, docs) = collect_open_document_packages(&state);
-        let snapshot = state.build_package_scope_snapshot(&docs);
+        let snapshot = state.capture_package_scope_snapshot(&docs);
         (doc_pkgs, snapshot)
     }; // read lock released
 
-    let mut all_pkgs = doc_packages;
-    // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
-    // scope for the package's own R files, so warm those exports too (parity
-    // with `raven check`'s `prefetch_reported_packages`). `full_imports` is
-    // empty outside package mode, making this a no-op there.
-    all_pkgs.extend(probe.scope_contribution.full_imports.iter().cloned());
-    for (uri, line) in &probe.docs {
-        let scope = probe.scope_at(uri, *line);
-        for p in scope.inherited_packages {
-            all_pkgs.insert(p);
+    let (packages, doc_count) = match tokio::task::spawn_blocking(move || {
+        let probe = probe.finish();
+        let doc_count = probe.docs.len();
+        let mut all_pkgs = doc_packages;
+        // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
+        // scope for the package's own R files, so warm those exports too (parity
+        // with `raven check`'s `prefetch_reported_packages`). `full_imports` is
+        // empty outside package mode, making this a no-op there.
+        all_pkgs.extend(probe.scope_contribution.full_imports.iter().cloned());
+        for (uri, line) in &probe.docs {
+            let scope = probe.scope_at(uri, *line);
+            for p in scope.inherited_packages {
+                all_pkgs.insert(p);
+            }
+            for p in scope.loaded_packages {
+                all_pkgs.insert(p);
+            }
         }
-        for p in scope.loaded_packages {
-            all_pkgs.insert(p);
-        }
-    }
 
-    let packages: Vec<String> = all_pkgs
-        .into_iter()
-        .filter(|p| is_valid_package_name(p))
-        .collect();
+        let packages: Vec<String> = all_pkgs
+            .into_iter()
+            .filter(|p| is_valid_package_name(p))
+            .collect();
+        (packages, doc_count)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::trace!("open-document package prefetch probe failed: {e}");
+            (Vec::new(), 0)
+        }
+    };
     if !packages.is_empty() {
         log::trace!(
             "Prefetching {} packages for {} open documents",
             packages.len(),
-            probe.docs.len()
+            doc_count
         );
         pkg_lib.prefetch_packages(&packages).await;
     }
@@ -7716,41 +7797,330 @@ pub(crate) fn restart_libpath_watcher<'a>(
 }
 
 /// Pre-collected snapshot of the inputs `scope_at_position_with_graph` needs
-/// for filtering open documents by package scope. Captured under the read
-/// lock so the (potentially expensive) per-document scope traversal can run
-/// outside the lock — see the libpath consumer's `Changed` branch.
+/// for filtering open documents by package scope. Immutable inputs are captured
+/// under the read lock, then active standalone materialization and the
+/// potentially expensive per-document scope traversal run outside the lock —
+/// see the libpath consumer's `Changed` branch.
 ///
-/// Built via `WorldState::build_package_scope_snapshot` to ensure the full
-/// dependency neighborhood (including closed parent files) is included.
+/// Built via `WorldState::capture_package_scope_snapshot(...).finish()` to
+/// ensure the dependency neighborhood, including closed parent files, is
+/// included without holding `WorldState` through active closure expansion.
 pub(crate) struct ScopeProbeSnapshot {
-    pub(crate) docs: Vec<(Url, u32)>,
-    pub(crate) artifacts_map:
-        std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
-    pub(crate) metadata_map:
-        std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    docs: Vec<(Url, u32)>,
+    artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
+    metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     /// Per-document `loaded_packages` from the document store (includes
     /// function-local `library()` calls that the EOF scope probe misses).
-    pub(crate) doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
-    pub(crate) graph: crate::cross_file::dependency::DependencyGraph,
-    pub(crate) cross_file_edge_revision: u64,
-    pub(crate) standalone_scope_invalidation_generation: u64,
-    pub(crate) standalone_scope_cache: Arc<crate::cross_file::scope::StandaloneScopeCache>,
-    pub(crate) workspace_folder: Option<Url>,
-    pub(crate) max_chain_depth: usize,
-    pub(crate) backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
-    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+    doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
+    graph: crate::cross_file::dependency::DependencyGraph,
+    cross_file_edge_revision: u64,
+    standalone_scope_invalidation_generation: u64,
+    standalone_scope_cache: Arc<crate::cross_file::scope::StandaloneScopeCache>,
+    workspace_folder: Option<Url>,
+    max_chain_depth: usize,
+    backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+    scope_contribution: crate::package_state::PackageScopeContribution,
+    persistent_cache_enabled: bool,
+}
+
+struct ScopeProbeActiveCorpus {
+    artifacts_map: std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
+    metadata_map: std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    active_docs: std::collections::HashMap<Url, crate::state::DocumentArtifactSnapshot>,
+    disk_attempted: HashSet<Url>,
+    dynamic_disk_materialized: bool,
+}
+
+impl ScopeProbeActiveCorpus {
+    fn from_snapshot_maps(
+        artifacts_map: &std::collections::HashMap<
+            Url,
+            Arc<crate::cross_file::scope::ScopeArtifacts>,
+        >,
+        metadata_map: &std::collections::HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    ) -> Self {
+        Self {
+            artifacts_map: artifacts_map.clone(),
+            metadata_map: metadata_map.clone(),
+            active_docs: std::collections::HashMap::new(),
+            disk_attempted: HashSet::new(),
+            dynamic_disk_materialized: false,
+        }
+    }
+
+    fn insert_document_state(&mut self, uri: &Url, doc: &crate::document_store::DocumentState) {
+        self.artifacts_map
+            .entry(uri.clone())
+            .or_insert_with(|| doc.artifacts.clone());
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| doc.metadata.clone());
+    }
+
+    fn insert_document(&mut self, uri: &Url, doc: &crate::state::Document) {
+        if let Some(artifacts) = doc.cached_artifacts_for_uri(uri) {
+            self.artifacts_map.entry(uri.clone()).or_insert(artifacts);
+        }
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| doc.metadata_handle());
+        self.active_docs
+            .entry(uri.clone())
+            .or_insert_with(|| doc.artifact_snapshot());
+    }
+
+    fn get_or_materialize_artifacts(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
+        if !self.artifacts_map.contains_key(uri) {
+            self.compute_active_artifacts(uri);
+        }
+        if !self.artifacts_map.contains_key(uri) {
+            self.materialize_disk_uri(uri);
+        }
+        self.artifacts_map.get(uri).cloned()
+    }
+
+    fn get_or_materialize_metadata(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
+        if !self.metadata_map.contains_key(uri)
+            && let Some(snapshot) = self.active_docs.get(uri)
+        {
+            self.metadata_map
+                .insert(uri.clone(), snapshot.metadata_handle());
+        }
+        if !self.metadata_map.contains_key(uri) {
+            self.materialize_disk_uri(uri);
+        }
+        self.metadata_map.get(uri).cloned()
+    }
+
+    fn compute_active_artifacts(&mut self, uri: &Url) {
+        let Some(snapshot) = self.active_docs.get(uri) else {
+            return;
+        };
+        let Some(artifacts) = snapshot.compute_artifacts_for_uri(uri) else {
+            return;
+        };
+        self.artifacts_map.entry(uri.clone()).or_insert(artifacts);
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| snapshot.metadata_handle());
+    }
+
+    fn materialize_disk_uri(&mut self, uri: &Url) {
+        if !self.disk_attempted.insert(uri.clone()) {
+            return;
+        }
+        let Ok(path) = uri.to_file_path() else {
+            return;
+        };
+        let Ok(raw) = crate::state::read_source(&path) else {
+            return;
+        };
+        let chunk_kind = crate::chunks::classify_chunk_document(uri.path());
+        let analysis = crate::cross_file::analysis_text_for_kind(chunk_kind, &raw);
+        let Some(tree) =
+            crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None))
+        else {
+            return;
+        };
+        let metadata = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            analysis.as_ref(),
+            Some(&tree),
+        ));
+        let artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            uri,
+            &tree,
+            analysis.as_ref(),
+            Some(&metadata),
+        ));
+        self.artifacts_map
+            .entry(uri.clone())
+            .or_insert_with(|| artifacts.clone());
+        self.metadata_map
+            .entry(uri.clone())
+            .or_insert_with(|| metadata.clone());
+        self.dynamic_disk_materialized = true;
+    }
+}
+
+pub(crate) struct ScopeProbeSnapshotCapture {
+    snapshot: ScopeProbeSnapshot,
+    active_corpus: ScopeProbeActiveCorpus,
+    seed_uris: Vec<Url>,
+    snapshot_uris: HashSet<Url>,
+    max_visited: usize,
+}
+
+impl ScopeProbeSnapshotCapture {
+    pub(crate) fn capture(state: &WorldState, docs: &[(Url, u32)]) -> Self {
+        let max_depth = state.cross_file_config.max_chain_depth;
+        let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+        // Scale the shared visited budget with seed count so workspaces with many
+        // open files retain coverage equivalent to the old per-seed loop, capped to
+        // bound lock-hold time when the user has hundreds of files open.
+        //
+        // Two ceilings apply, whichever is smaller. The relative one
+        // (`max_visited * 50`) caps the per-seed-count scaling. The absolute one
+        // (`WorldState::MULTI_SEED_VISITED_CEILING`) bounds total nodes regardless
+        // of the configured budget, so the raised default of
+        // `max_transitive_dependents_visited` (issue #473 lifted it from 2_000 to
+        // 50_000) cannot push the multi-seed walk to 2.5M nodes — an unnecessary
+        // latency/memory cliff. At the new default the absolute ceiling binds once
+        // `docs.len() >= 4`; 200_000 still far exceeds any real workspace's file
+        // count (the neighborhood is naturally bounded by it), so it never trims
+        // coverage in practice. The same ceiling guards
+        // `recompute_open_neighborhood_pins`, the other multi-seed walk.
+        let effective_max_visited = max_visited
+            .saturating_mul(docs.len().max(1))
+            .min(max_visited.saturating_mul(50))
+            .min(WorldState::MULTI_SEED_VISITED_CEILING);
+
+        let neighborhood = state.cross_file_graph.collect_neighborhood_multi(
+            docs.iter().map(|(uri, _)| uri.clone()),
+            max_depth,
+            effective_max_visited,
+        );
+        let initial_graph = state.cross_file_graph.extract_subgraph(&neighborhood);
+        let content_provider = state.content_provider();
+        let mut seeds: Vec<Url> = neighborhood.iter().cloned().collect();
+        seeds.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        let mut artifacts_map = HashMap::with_capacity(neighborhood.len());
+        let mut metadata_map = HashMap::with_capacity(neighborhood.len());
+        for u in &neighborhood {
+            let artifacts = if let Some(doc) = state.document_store.get_without_touch(u) {
+                Some(doc.artifacts.clone())
+            } else if let Some(doc) = state.documents.get(u) {
+                doc.cached_artifacts_for_uri(u)
+            } else {
+                content_provider.get_cached_artifacts(u)
+            };
+            if let Some(a) = artifacts {
+                artifacts_map.insert(u.clone(), a);
+            }
+            if let Some(m) = content_provider.get_metadata(u) {
+                metadata_map.insert(u.clone(), m);
+            }
+        }
+
+        let mut active_corpus =
+            ScopeProbeActiveCorpus::from_snapshot_maps(&artifacts_map, &metadata_map);
+        for uri in state.document_store.uris() {
+            if let Some(doc) = state.document_store.get_without_touch(&uri) {
+                active_corpus.insert_document_state(&uri, doc);
+            }
+        }
+        for (uri, doc) in &state.documents {
+            active_corpus.insert_document(uri, doc);
+        }
+        for u in &neighborhood {
+            if let Some(doc) = state.workspace_index.get(u) {
+                active_corpus.insert_document(u, doc);
+            }
+        }
+
+        let snapshot = ScopeProbeSnapshot {
+            docs: docs.to_vec(),
+            artifacts_map,
+            metadata_map,
+            doc_loaded_packages: state
+                .documents
+                .iter()
+                .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
+                .collect(),
+            graph: initial_graph,
+            cross_file_edge_revision: state.cross_file_graph.edge_revision(),
+            standalone_scope_invalidation_generation: state
+                .standalone_scope_invalidation_generation(),
+            standalone_scope_cache: state.standalone_scope_cache.clone(),
+            workspace_folder: state.workspace_folders.first().cloned(),
+            max_chain_depth: state.cross_file_config.max_chain_depth,
+            backward_dependencies: state.cross_file_config.backward_dependencies,
+            scope_contribution: state.package_state.scope_contribution().clone(),
+            persistent_cache_enabled: true,
+        };
+
+        Self {
+            snapshot,
+            active_corpus,
+            seed_uris: seeds,
+            snapshot_uris: neighborhood,
+            max_visited: effective_max_visited,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> ScopeProbeSnapshot {
+        let corpus = std::cell::RefCell::new(self.active_corpus);
+        for seed_uri in &self.seed_uris {
+            let mut corpus = corpus.borrow_mut();
+            corpus.get_or_materialize_metadata(seed_uri);
+            corpus.get_or_materialize_artifacts(seed_uri);
+        }
+        let active_extra_uris = {
+            let get_active_artifacts =
+                |target_uri: &Url| corpus.borrow_mut().get_or_materialize_artifacts(target_uri);
+            let get_active_metadata =
+                |target_uri: &Url| corpus.borrow_mut().get_or_materialize_metadata(target_uri);
+            crate::cross_file::scope::standalone_active_snapshot_members(
+                crate::cross_file::scope::StandaloneActiveSnapshotMembersInputs {
+                    graph: &self.snapshot.graph,
+                    max_depth: self.snapshot.max_chain_depth,
+                    max_visited: self.max_visited,
+                    workspace_root: self.snapshot.workspace_folder.as_ref(),
+                    seed_uris: &self.seed_uris,
+                    is_cancelled: &|| false,
+                },
+                &mut self.snapshot_uris,
+                &get_active_artifacts,
+                &get_active_metadata,
+            )
+        };
+        let corpus = corpus.into_inner();
+        let mut materialized_uris = self.seed_uris.clone();
+        materialized_uris.extend(active_extra_uris.iter().cloned());
+        materialized_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        materialized_uris.dedup();
+        for uri in &materialized_uris {
+            if let Some(artifacts) = corpus.artifacts_map.get(uri) {
+                self.snapshot
+                    .artifacts_map
+                    .insert(uri.clone(), artifacts.clone());
+            }
+            if let Some(metadata) = corpus.metadata_map.get(uri) {
+                self.snapshot
+                    .metadata_map
+                    .insert(uri.clone(), metadata.clone());
+            }
+        }
+        if corpus.dynamic_disk_materialized {
+            self.snapshot.persistent_cache_enabled = false;
+        }
+        self.snapshot
+    }
 }
 
 impl ScopeProbeSnapshot {
+    #[cfg(test)]
+    pub(crate) fn graph_for_test(&self) -> &crate::cross_file::dependency::DependencyGraph {
+        &self.graph
+    }
+
     fn scope_at(&self, uri: &Url, line: u32) -> crate::cross_file::scope::ScopeAtPosition {
         let get_artifacts = |target_uri: &Url| self.artifacts_map.get(target_uri).cloned();
         let get_metadata = |target_uri: &Url| self.metadata_map.get(target_uri).cloned();
         let empty_base_exports = std::collections::HashSet::new();
-        let standalone_cache_context = crate::cross_file::scope::StandaloneScopeCacheContext::new(
-            &self.standalone_scope_cache,
-            self.cross_file_edge_revision,
-            self.standalone_scope_invalidation_generation,
-        );
+        let standalone_cache_context = self.persistent_cache_enabled.then(|| {
+            crate::cross_file::scope::StandaloneScopeCacheContext::new(
+                &self.standalone_scope_cache,
+                self.cross_file_edge_revision,
+                self.standalone_scope_invalidation_generation,
+            )
+        });
         crate::cross_file::scope::scope_at_position_with_graph_with_standalone_cache(
             uri,
             line,
@@ -7768,7 +8138,7 @@ impl ScopeProbeSnapshot {
             // Probe reads only packages, not `scope.symbols`; no `data()` alias
             // expansion needed (issue #429).
             None,
-            Some(standalone_cache_context),
+            standalone_cache_context,
         )
     }
 }
@@ -7940,35 +8310,45 @@ async fn run_libpath_consumer(
                         })
                         .collect();
 
-                    state.build_package_scope_snapshot(&docs)
+                    state.capture_package_scope_snapshot(&docs)
                 };
-
-                let mut affected_uris: Vec<Url> = probe
-                    .docs
-                    .iter()
-                    .filter_map(|(uri, line)| {
-                        let scope = probe.scope_at(uri, *line);
-                        // Scope probe captures inherited + global-scope packages.
-                        // Also check the document's full loaded_packages which
-                        // includes function-local library() calls the EOF scope
-                        // probe misses.
-                        let scope_hit = scope
-                            .inherited_packages
-                            .iter()
-                            .chain(scope.loaded_packages.iter())
-                            .any(|p| trigger_set.contains(p));
-                        let doc_hit = probe
-                            .doc_loaded_packages
-                            .get(uri)
-                            .map(|pkgs| pkgs.iter().any(|p| trigger_set.contains(p)))
-                            .unwrap_or(false);
-                        if scope_hit || doc_hit {
-                            Some(uri.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let mut affected_uris: Vec<Url> = match tokio::task::spawn_blocking(move || {
+                    let probe = probe.finish();
+                    probe
+                        .docs
+                        .iter()
+                        .filter_map(|(uri, line)| {
+                            let scope = probe.scope_at(uri, *line);
+                            // Scope probe captures inherited + global-scope packages.
+                            // Also check the document's full loaded_packages which
+                            // includes function-local library() calls the EOF scope
+                            // probe misses.
+                            let scope_hit = scope
+                                .inherited_packages
+                                .iter()
+                                .chain(scope.loaded_packages.iter())
+                                .any(|p| trigger_set.contains(p));
+                            let doc_hit = probe
+                                .doc_loaded_packages
+                                .get(uri)
+                                .map(|pkgs| pkgs.iter().any(|p| trigger_set.contains(p)))
+                                .unwrap_or(false);
+                            if scope_hit || doc_hit {
+                                Some(uri.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .await
+                {
+                    Ok(uris) => uris,
+                    Err(e) => {
+                        log::trace!("libpath package-scope filter failed: {e}");
+                        Vec::new()
+                    }
+                };
 
                 // Union in the system.file republish set: open documents whose
                 // resolution changed plus their open transitive dependents —
@@ -10275,7 +10655,9 @@ mod tests {
 mod refresh_packages_tests {
     use super::*;
     use std::collections::HashSet;
+    use std::fs;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn refresh_clears_package_cache_and_returns_count() {
@@ -10745,19 +11127,25 @@ mod refresh_packages_tests {
             assert!(state.workspace_index_new.insert(uri.clone(), entry));
         }
 
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("c")).unwrap();
+        fs::create_dir_all(tmp.path().join("m")).unwrap();
+        fs::create_dir_all(tmp.path().join("outside")).unwrap();
+
         let mut state = WorldState::new();
-        let workspace_root = Url::parse("file:///project").unwrap();
+        let workspace_root = Url::from_directory_path(tmp.path()).unwrap();
         state.workspace_folders.push(workspace_root.clone());
 
-        let c = Url::parse("file:///project/c/c.R").unwrap();
-        let m = Url::parse("file:///project/m/m.R").unwrap();
-        let active_leaf = Url::parse("file:///project/c/leaf.R").unwrap();
-        let graph_leaf = Url::parse("file:///project/outside/leaf.R").unwrap();
+        let c = Url::from_file_path(tmp.path().join("c/c.R")).unwrap();
+        let m = Url::from_file_path(tmp.path().join("m/m.R")).unwrap();
+        let active_leaf = Url::from_file_path(tmp.path().join("c/leaf.R")).unwrap();
+        let graph_leaf = Url::from_file_path(tmp.path().join("outside/leaf.R")).unwrap();
 
         let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
         let m_code = "source(\"leaf.R\")\n";
         let active_leaf_code = "library(dplyr)\nleaf_sym <- 1\n";
         let graph_leaf_code = "outside_leaf <- 1\n";
+        fs::write(tmp.path().join("c/leaf.R"), active_leaf_code).unwrap();
 
         state
             .documents
@@ -10768,15 +11156,8 @@ mod refresh_packages_tests {
             .update_file(&c, &c_meta, Some(&workspace_root), |_| None);
 
         let mut m_meta = crate::cross_file::extract_metadata(m_code);
-        m_meta.inherited_working_directory = Some("/project/outside".to_string());
+        m_meta.inherited_working_directory = Some(tmp.path().join("outside").display().to_string());
         index_closed_file(&mut state, &workspace_root, &m, m_code, m_meta);
-        index_closed_file(
-            &mut state,
-            &workspace_root,
-            &active_leaf,
-            active_leaf_code,
-            CrossFileMetadata::default(),
-        );
         index_closed_file(
             &mut state,
             &workspace_root,
@@ -10800,13 +11181,14 @@ mod refresh_packages_tests {
         );
 
         let state = std::sync::RwLock::new(state);
-        let snapshot = {
+        let snapshot_capture = {
             let guard = state.read().expect("state read lock");
-            guard.build_package_scope_snapshot(&[(c.clone(), u32::MAX)])
+            guard.capture_package_scope_snapshot(&[(c.clone(), u32::MAX)])
         };
         let write_guard = state
             .try_write()
-            .expect("package-scope snapshot must not keep a WorldState read guard alive");
+            .expect("package-scope snapshot capture must not keep a WorldState read guard alive");
+        let snapshot = snapshot_capture.finish();
         assert!(
             snapshot.artifacts_map.contains_key(&active_leaf),
             "package-scope probes must precollect active standalone closure targets"
@@ -10831,6 +11213,131 @@ mod refresh_packages_tests {
             hit_scope.loaded_packages.contains("dplyr")
                 || hit_scope.inherited_packages.contains("dplyr"),
             "package-scope probe cache hit must also run without a WorldState read guard"
+        );
+    }
+
+    #[test]
+    fn package_scope_snapshot_uses_open_active_standalone_member_without_disabling_cache() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+        use crate::cross_file::types::CrossFileMetadata;
+        use crate::state::{Document, WorldState};
+        use crate::workspace_index::IndexEntry;
+        use ropey::Rope;
+        use std::time::SystemTime;
+
+        fn parse_r_code(code: &str) -> tree_sitter::Tree {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        }
+
+        fn index_closed_file(
+            state: &mut WorldState,
+            workspace_root: &Url,
+            uri: &Url,
+            code: &str,
+            metadata: CrossFileMetadata,
+        ) {
+            state
+                .cross_file_graph
+                .update_file(uri, &metadata, Some(workspace_root), |_| None);
+            let tree = parse_r_code(code);
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
+            ));
+            let metadata = Arc::new(metadata);
+            let entry = IndexEntry {
+                contents: Rope::from_str(code),
+                tree: Some(tree),
+                loaded_packages: Vec::new(),
+                snapshot: FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: code.len() as u64,
+                    content_hash: None,
+                },
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        }
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("c")).unwrap();
+        fs::create_dir_all(tmp.path().join("m")).unwrap();
+        fs::create_dir_all(tmp.path().join("outside")).unwrap();
+
+        let mut state = WorldState::new();
+        let workspace_root = Url::from_directory_path(tmp.path()).unwrap();
+        state.workspace_folders.push(workspace_root.clone());
+
+        let c = Url::from_file_path(tmp.path().join("c/c.R")).unwrap();
+        let m = Url::from_file_path(tmp.path().join("m/m.R")).unwrap();
+        let active_leaf = Url::from_file_path(tmp.path().join("c/leaf.R")).unwrap();
+        let graph_leaf = Url::from_file_path(tmp.path().join("outside/leaf.R")).unwrap();
+
+        let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
+        let m_code = "source(\"leaf.R\")\n";
+        let active_leaf_code = "library(dplyr)\nleaf_sym <- 1\n";
+        let graph_leaf_code = "outside_leaf <- 1\n";
+
+        state
+            .documents
+            .insert(c.clone(), Document::new(c_code, None));
+        state
+            .documents
+            .insert(active_leaf.clone(), Document::new(active_leaf_code, None));
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        state
+            .cross_file_graph
+            .update_file(&c, &c_meta, Some(&workspace_root), |_| None);
+
+        let mut m_meta = crate::cross_file::extract_metadata(m_code);
+        m_meta.inherited_working_directory = Some(tmp.path().join("outside").display().to_string());
+        index_closed_file(&mut state, &workspace_root, &m, m_code, m_meta);
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &graph_leaf,
+            graph_leaf_code,
+            CrossFileMetadata::default(),
+        );
+
+        let first_snapshot = state
+            .capture_package_scope_snapshot(&[(c.clone(), u32::MAX)])
+            .finish();
+        assert!(
+            first_snapshot.persistent_cache_enabled,
+            "open active precollection must not disable persistent standalone cache eligibility"
+        );
+        assert!(
+            first_snapshot.artifacts_map.contains_key(&active_leaf),
+            "package-scope probes must precollect open active standalone closure members"
+        );
+        let first_scope = first_snapshot.scope_at(&c, u32::MAX);
+        assert!(
+            first_scope.loaded_packages.contains("dplyr")
+                || first_scope.inherited_packages.contains("dplyr"),
+            "package-scope probe must see packages from the open active member"
+        );
+
+        let second_snapshot = state
+            .capture_package_scope_snapshot(&[(c.clone(), u32::MAX)])
+            .finish();
+        assert!(
+            second_snapshot.persistent_cache_enabled,
+            "a second open-active package-scope snapshot must remain cache-eligible"
+        );
+        let second_scope = second_snapshot.scope_at(&c, u32::MAX);
+        assert!(
+            second_scope.loaded_packages.contains("dplyr")
+                || second_scope.inherited_packages.contains("dplyr")
         );
     }
 
@@ -13499,30 +14006,16 @@ lineLength = 200
         let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
 
-        {
+        let snapshot_capture = {
             let state = backend.state.read().await;
-            let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri)
-                .expect("snapshot must build");
-            let diags = crate::handlers::diagnostics_from_snapshot(
-                &snapshot,
-                &uri,
-                &crate::handlers::DiagCancelToken::never(),
-            )
-            .unwrap_or_default();
-            assert!(
-                !diags.iter().any(|diag| diag.message.contains("child_sym")),
-                "warm-up diagnostics should resolve the standalone child: {diags:?}"
-            );
-        }
-
-        let snapshot = {
-            let state = backend.state.read().await;
-            crate::handlers::DiagnosticsSnapshot::build(&state, &uri).expect("snapshot must build")
+            crate::handlers::DiagnosticsSnapshot::capture_with_cancel(&state, &uri)
+                .expect("snapshot must build")
         };
+        let snapshot = snapshot_capture.finish(&|| false);
         let write_guard = backend
             .state
             .try_write()
-            .expect("read guard must be released before snapshot diagnostics");
+            .expect("read guard must be released before first snapshot diagnostics");
         let diags = crate::handlers::diagnostics_from_snapshot(
             &snapshot,
             &uri,
@@ -13531,9 +14024,39 @@ lineLength = 200
         .unwrap_or_default();
         assert!(
             !diags.iter().any(|diag| diag.message.contains("child_sym")),
-            "snapshot diagnostics should resolve while WorldState is write-locked: {diags:?}"
+            "first snapshot diagnostics should resolve and populate the cache while WorldState is write-locked: {diags:?}"
         );
         drop(write_guard);
+
+        let (_hits, _misses, stores, _len, _gen) = backend
+            .state
+            .read()
+            .await
+            .standalone_scope_cache
+            .stats_for_test();
+        assert!(
+            stores > 0,
+            "first off-lock diagnostics run should store the standalone child scope"
+        );
+
+        let second_snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::capture_with_cancel(&state, &uri)
+                .expect("snapshot must build")
+                .finish(&|| false)
+        };
+        let second_diags = crate::handlers::diagnostics_from_snapshot(
+            &second_snapshot,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap_or_default();
+        assert!(
+            !second_diags
+                .iter()
+                .any(|diag| diag.message.contains("child_sym")),
+            "second diagnostics snapshot should resolve via cache: {second_diags:?}"
+        );
         let cache_hits = backend
             .state
             .read()

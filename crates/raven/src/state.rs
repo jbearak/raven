@@ -10,7 +10,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::content_provider::ContentProvider;
 use crate::indentation::IndentationStyle;
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
@@ -180,6 +179,16 @@ pub struct Document {
     pub contents: Rope,
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
+    /// Cross-file metadata derived from the same analysis text as [`tree`].
+    ///
+    /// Legacy open documents are still consulted by snapshot builders while the
+    /// `DocumentStore` migration is in progress. Keep metadata/artifacts cached
+    /// here too so those builders can clone handles under the `WorldState` lock
+    /// instead of re-extracting scope data for every snapshot.
+    pub metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    /// Scope artifacts derived from [`tree`] and [`metadata`].
+    pub artifacts: Arc<crate::cross_file::scope::ScopeArtifacts>,
+    artifact_uri: Option<Url>,
     /// Packages named in `data(..., package = "pkg")` calls (issue #429). These
     /// are NOT attached like `library()` packages, but their `data/` enumeration
     /// must be warmed so `data()` alias expansion can resolve the dataset object
@@ -201,6 +210,43 @@ pub struct Document {
     pub revision: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct DocumentArtifactSnapshot {
+    contents: Rope,
+    masked_text: Option<String>,
+    tree: Option<Tree>,
+    metadata: Arc<crate::cross_file::CrossFileMetadata>,
+}
+
+impl DocumentArtifactSnapshot {
+    pub(crate) fn metadata_handle(&self) -> Arc<crate::cross_file::CrossFileMetadata> {
+        self.metadata.clone()
+    }
+
+    pub(crate) fn compute_artifacts_for_uri(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
+        let tree = self.tree.as_ref()?;
+        let analysis_text;
+        let text = match self.masked_text.as_deref() {
+            Some(masked) => masked,
+            None => {
+                analysis_text = self.contents.to_string();
+                &analysis_text
+            }
+        };
+        Some(Arc::new(
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                text,
+                Some(&self.metadata),
+            ),
+        ))
+    }
+}
+
 impl Document {
     #[cfg(test)]
     pub fn new(text: &str, version: Option<i32>) -> Self {
@@ -211,7 +257,13 @@ impl Document {
         // Determine the chunk kind BEFORE parsing: for Rmd/Quarto documents the
         // tree must be parsed from the masked analysis text, not the raw text.
         let chunk_kind = classify_chunk_document(uri.path());
-        Self::new_with_kind(text, version, file_type_from_uri(uri), chunk_kind)
+        Self::new_with_kind(
+            text,
+            version,
+            file_type_from_uri(uri),
+            chunk_kind,
+            Some(uri),
+        )
     }
 
     pub fn new_with_language_id(
@@ -227,12 +279,13 @@ impl Document {
             version,
             file_type_from_language_id_or_uri(language_id, uri),
             chunk_kind,
+            Some(uri),
         )
     }
 
     pub fn new_with_file_type(text: &str, version: Option<i32>, file_type: FileType) -> Self {
         // No URI/languageId signal, so default to `# %%` cell detection.
-        Self::new_with_kind(text, version, file_type, ChunkKind::R)
+        Self::new_with_kind(text, version, file_type, ChunkKind::R, None)
     }
 
     /// Shared constructor: builds the analysis representation up front so the
@@ -243,6 +296,7 @@ impl Document {
         version: Option<i32>,
         file_type: FileType,
         chunk_kind: ChunkKind,
+        uri: Option<&Url>,
     ) -> Self {
         let contents = Rope::from_str(text);
         // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
@@ -256,10 +310,27 @@ impl Document {
         // calls inside chunks are found and prose mentions are not.
         let loaded_packages = extract_loaded_packages(&tree, analysis_text);
         let data_packages = extract_data_packages(&tree, analysis_text);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(analysis_text));
+        let artifact_uri = uri.cloned();
+        let artifacts = tree
+            .as_ref()
+            .zip(uri)
+            .map(|(tree, uri)| {
+                Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    analysis_text,
+                    Some(&metadata),
+                ))
+            })
+            .unwrap_or_else(|| Arc::new(crate::cross_file::scope::ScopeArtifacts::default()));
         Self {
             contents,
             tree,
             loaded_packages,
+            metadata,
+            artifacts,
+            artifact_uri,
             data_packages,
             file_type,
             chunk_kind,
@@ -315,6 +386,20 @@ impl Document {
         self.tree = parse_document_text(analysis_text, self.file_type);
         self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
         self.data_packages = extract_data_packages(&self.tree, analysis_text);
+        self.metadata = Arc::new(crate::cross_file::extract_metadata(analysis_text));
+        self.artifacts = self
+            .tree
+            .as_ref()
+            .zip(self.artifact_uri.as_ref())
+            .map(|(tree, uri)| {
+                Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    analysis_text,
+                    Some(&self.metadata),
+                ))
+            })
+            .unwrap_or_else(|| Arc::new(crate::cross_file::scope::ScopeArtifacts::default()));
     }
 
     pub fn text(&self) -> String {
@@ -334,6 +419,48 @@ impl Document {
             Some(masked) => masked.clone(),
             None => self.contents.to_string(),
         }
+    }
+
+    pub fn metadata_handle(&self) -> Arc<crate::cross_file::CrossFileMetadata> {
+        self.metadata.clone()
+    }
+
+    pub(crate) fn artifact_snapshot(&self) -> DocumentArtifactSnapshot {
+        DocumentArtifactSnapshot {
+            contents: self.contents.clone(),
+            masked_text: self.masked_text.clone(),
+            tree: self.tree.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    pub(crate) fn cached_artifacts_for_uri(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
+        self.artifact_uri
+            .as_ref()
+            .is_some_and(|cached| cached == uri)
+            .then(|| self.artifacts.clone())
+    }
+
+    pub fn artifacts_for_uri(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
+        if let Some(artifacts) = self.cached_artifacts_for_uri(uri) {
+            return Some(artifacts);
+        }
+        let tree = self.tree.as_ref()?;
+        let analysis_text = self.analysis_text();
+        Some(Arc::new(
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &analysis_text,
+                Some(&self.metadata),
+            ),
+        ))
     }
 
     /// True when the document is an R Markdown / Quarto document.
@@ -615,12 +742,12 @@ impl Default for WorldState {
 impl WorldState {
     /// Absolute ceiling on the multi-seed neighborhood-traversal budget,
     /// independent of the configured `max_transitive_dependents_visited`. Both
-    /// multi-seed walks (`build_package_scope_snapshot` and
+    /// multi-seed walks (`capture_package_scope_snapshot` and
     /// `recompute_open_neighborhood_pins`) scale the budget by open-doc count
     /// and cap it here, so the raised #473 default (50_000) cannot drive a walk
     /// to millions of nodes when many files are open. Far above any real
     /// workspace's file count, so it never trims coverage in practice.
-    const MULTI_SEED_VISITED_CEILING: usize = 200_000;
+    pub(crate) const MULTI_SEED_VISITED_CEILING: usize = 200_000;
 
     /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
     ///
@@ -789,99 +916,31 @@ impl WorldState {
     }
 
     /// Build a snapshot of the dependency neighborhood for package scope
-    /// resolution. The snapshot includes artifacts/metadata for all files
-    /// reachable from `docs` via the cross-file dependency graph (not just
-    /// open documents), so inherited packages from closed parent files are
-    /// discovered.
+    /// resolution.
     ///
-    /// Call this under the read lock, then drop the lock before running
-    /// `scope_at_position_with_graph` against the returned snapshot.
+    /// Convenience wrapper for tests and legacy callers. Production callers that
+    /// already hold the `WorldState` read lock should call
+    /// [`Self::capture_package_scope_snapshot`], drop the guard, then call
+    /// `finish()` before probing scope so active standalone materialization runs
+    /// off-lock.
+    #[cfg(test)]
     pub(crate) fn build_package_scope_snapshot(
         &self,
         docs: &[(Url, u32)],
     ) -> crate::backend::ScopeProbeSnapshot {
-        let max_depth = self.cross_file_config.max_chain_depth;
-        let max_visited = self.cross_file_config.max_transitive_dependents_visited;
-        // Scale the shared visited budget with seed count so workspaces with many
-        // open files retain coverage equivalent to the old per-seed loop, capped to
-        // bound lock-hold time when the user has hundreds of files open.
-        //
-        // Two ceilings apply, whichever is smaller. The relative one
-        // (`max_visited * 50`) caps the per-seed-count scaling. The absolute one
-        // (`MULTI_SEED_VISITED_CEILING`) bounds total nodes regardless of the
-        // configured budget, so the raised default of
-        // `max_transitive_dependents_visited` (issue #473 lifted it from 2_000 to
-        // 50_000) cannot push the multi-seed walk to 2.5M nodes — an unnecessary
-        // latency/memory cliff. At the new default the absolute ceiling binds once
-        // `docs.len() >= 4`; 200_000 still far exceeds any real workspace's file
-        // count (the neighborhood is naturally bounded by it), so it never trims
-        // coverage in practice. The same ceiling guards
-        // `recompute_open_neighborhood_pins`, the other multi-seed walk.
-        let effective_max_visited = max_visited
-            .saturating_mul(docs.len().max(1))
-            .min(max_visited.saturating_mul(50))
-            .min(Self::MULTI_SEED_VISITED_CEILING);
+        self.capture_package_scope_snapshot(docs).finish()
+    }
 
-        let mut neighborhood = self.cross_file_graph.collect_neighborhood_multi(
-            docs.iter().map(|(uri, _)| uri.clone()),
-            max_depth,
-            effective_max_visited,
-        );
-        let initial_graph = self.cross_file_graph.extract_subgraph(&neighborhood);
-
-        let content_provider = self.content_provider();
-        let get_active_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
-        let get_active_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
-        let mut seeds: Vec<Url> = neighborhood.iter().cloned().collect();
-        seeds.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-        let active_extra_uris = crate::cross_file::scope::standalone_active_snapshot_members(
-            crate::cross_file::scope::StandaloneActiveSnapshotMembersInputs {
-                graph: &initial_graph,
-                max_depth,
-                max_visited: effective_max_visited,
-                workspace_root: self.workspace_folders.first(),
-                seed_uris: &seeds,
-                is_cancelled: &|| false,
-            },
-            &mut neighborhood,
-            &get_active_artifacts,
-            &get_active_metadata,
-        );
-
-        let mut artifacts_map = HashMap::with_capacity(neighborhood.len());
-        let mut metadata_map = HashMap::with_capacity(neighborhood.len());
-        for u in &neighborhood {
-            if let Some(a) = content_provider.get_artifacts(u) {
-                artifacts_map.insert(u.clone(), a);
-            }
-            if let Some(m) = content_provider.get_metadata(u) {
-                metadata_map.insert(u.clone(), m);
-            }
-        }
-
-        crate::backend::ScopeProbeSnapshot {
-            docs: docs.to_vec(),
-            artifacts_map,
-            metadata_map,
-            doc_loaded_packages: self
-                .documents
-                .iter()
-                .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
-                .collect(),
-            graph: if active_extra_uris.is_empty() {
-                initial_graph
-            } else {
-                self.cross_file_graph.extract_subgraph(&neighborhood)
-            },
-            cross_file_edge_revision: self.cross_file_graph.edge_revision(),
-            standalone_scope_invalidation_generation: self
-                .standalone_scope_invalidation_generation(),
-            standalone_scope_cache: self.standalone_scope_cache.clone(),
-            workspace_folder: self.workspace_folders.first().cloned(),
-            max_chain_depth: self.cross_file_config.max_chain_depth,
-            backward_dependencies: self.cross_file_config.backward_dependencies,
-            scope_contribution: self.package_state.scope_contribution().clone(),
-        }
+    /// Capture immutable package-scope probe inputs under the read lock.
+    ///
+    /// The returned capture still needs `finish()` before scope probing; that
+    /// step walks active standalone closures and may decode closed files from
+    /// disk, so production callers run it after dropping `WorldState`.
+    pub(crate) fn capture_package_scope_snapshot(
+        &self,
+        docs: &[(Url, u32)],
+    ) -> crate::backend::ScopeProbeSnapshotCapture {
+        crate::backend::ScopeProbeSnapshotCapture::capture(self, docs)
     }
 
     /// Recompute the pinned URI set across all caches that hold open-document
@@ -910,7 +969,7 @@ impl WorldState {
 
         let max_depth = self.cross_file_config.max_chain_depth;
         let max_visited = self.cross_file_config.max_transitive_dependents_visited;
-        // Same scaling AND absolute ceiling as build_package_scope_snapshot:
+        // Same scaling AND absolute ceiling as capture_package_scope_snapshot:
         // bound lock-hold time while preserving per-seed coverage. The absolute
         // ceiling matters with the raised default (issue #473): 50 open files at
         // the 50_000 default would otherwise allow a 2.5M-node walk.
@@ -991,18 +1050,18 @@ impl WorldState {
         uri: &Url,
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         if let Some(doc) = self.documents.get(uri) {
-            // Parse from `analysis_text()`: masked for Rmd/Quarto (so a
+            // Cached from `analysis_text()`: masked for Rmd/Quarto (so a
             // `# raven: cd` in prose is ignored while one inside a chunk is a
             // real directive), raw for everything else (behavior-neutral).
-            return Some(Arc::new(crate::cross_file::directive::parse_directives(
-                &doc.analysis_text(),
-            )));
+            return Some(doc.metadata_handle());
         }
         if let Some(meta) = self.cross_file_workspace_index.get_metadata(uri) {
             return Some(meta);
         }
         let content_provider = self.content_provider();
-        if let Some(content) = content_provider.get_content(uri) {
+        if let Some(content) =
+            crate::content_provider::ContentProvider::get_content(&content_provider, uri)
+        {
             // Cached content is RAW; mask Rmd/Quarto before extracting so
             // directives come from chunk bodies, not prose (#343).
             return Some(Arc::new(crate::cross_file::extract_metadata_for_path(
@@ -1041,12 +1100,9 @@ impl WorldState {
             .or_else(|| self.workspace_index_new.get_metadata(uri))
             .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
             .or_else(|| {
-                // `analysis_text()`: masked for Rmd/Quarto (directives/source()/
-                // library() come from chunk bodies, not prose), raw otherwise
-                // (behavior-neutral for plain R / JAGS / Stan).
-                self.documents
-                    .get(uri)
-                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text())))
+                // Legacy open documents cache metadata derived from the same
+                // analysis text as their tree/artifacts.
+                self.documents.get(uri).map(|doc| doc.metadata_handle())
             })
             .or_else(|| {
                 // Cached content is RAW; mask Rmd/Quarto before extracting so
@@ -2700,7 +2756,7 @@ mod tests {
         for chain in 0..NUM_CHAINS {
             let mut current = chain_url(chain, 0);
             for level in 0..CHAIN_LEN - 1 {
-                let deps = snapshot.graph.get_dependencies(&current);
+                let deps = snapshot.graph_for_test().get_dependencies(&current);
                 assert!(
                     !deps.is_empty(),
                     "chain {} truncated at level {}: node {} missing from snapshot subgraph",

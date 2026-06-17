@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tower_lsp::lsp_types::Url;
 
 use crate::cross_file::file_cache::CrossFileFileCache;
-use crate::cross_file::scope::{self, ScopeArtifacts};
+use crate::cross_file::scope::ScopeArtifacts;
 use crate::cross_file::types::CrossFileMetadata;
 use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
 use crate::document_store::DocumentStore;
@@ -52,6 +52,16 @@ pub trait ContentProvider: Send + Sync {
     /// Returns the scope artifacts (exported interface, timeline, etc.)
     /// for the given URI, or None if not available.
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>>;
+
+    /// Get artifacts only when they are already cached for this exact URI.
+    ///
+    /// Snapshot capture paths use this while holding `WorldState` so a legacy
+    /// document whose cached artifacts were built without a URI cannot fall
+    /// back to recomputing scope artifacts under the state lock. General
+    /// callers that are already off-lock can use [`Self::get_artifacts`].
+    fn get_cached_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
+        self.get_artifacts(uri)
+    }
 
     /// Check if URI exists in cache (no I/O)
     ///
@@ -239,8 +249,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         if let Some(legacy_docs) = self.legacy_documents
             && let Some(doc) = legacy_docs.get(uri)
         {
-            let text = doc.analysis_text();
-            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
+            return Some(doc.metadata_handle());
         }
 
         // 3. Check WorkspaceIndex
@@ -260,8 +269,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         if let Some(legacy_ws) = self.legacy_workspace_index
             && let Some(doc) = legacy_ws.get(uri)
         {
-            let text = doc.analysis_text();
-            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
+            return Some(doc.metadata_handle());
         }
 
         None
@@ -289,18 +297,8 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         //    mis-slice on a non-UTF-8 boundary.
         if let Some(legacy_docs) = self.legacy_documents
             && let Some(doc) = legacy_docs.get(uri)
-            && let Some(tree) = &doc.tree
         {
-            let text = doc.analysis_text();
-            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let metadata = crate::cross_file::extract_metadata(&text);
-            return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            )));
+            return doc.artifacts_for_uri(uri);
         }
 
         // 3. Check WorkspaceIndex
@@ -319,18 +317,43 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         //    Analysis text matches the tree's byte offsets (see step 2).
         if let Some(legacy_ws) = self.legacy_workspace_index
             && let Some(doc) = legacy_ws.get(uri)
-            && let Some(tree) = &doc.tree
         {
-            let text = doc.analysis_text();
-            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let metadata = crate::cross_file::extract_metadata(&text);
-            return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            )));
+            return doc.artifacts_for_uri(uri);
+        }
+
+        None
+    }
+
+    fn get_cached_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
+        // 1. Check DocumentStore
+        if let Some(doc) = self.document_store.get_without_touch(uri) {
+            return Some(doc.artifacts.clone());
+        }
+
+        // 2. Check legacy documents HashMap without recomputing artifacts.
+        if let Some(legacy_docs) = self.legacy_documents
+            && let Some(doc) = legacy_docs.get(uri)
+        {
+            return doc.cached_artifacts_for_uri(uri);
+        }
+
+        // 3. Check WorkspaceIndex
+        if let Some(artifacts) = self.workspace_index.get_artifacts(uri) {
+            return Some(artifacts);
+        }
+
+        // 4. Check legacy cross_file_workspace_index
+        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
+            && let Some(artifacts) = legacy_cf_ws.get_artifacts(uri)
+        {
+            return Some(artifacts);
+        }
+
+        // 5. Check legacy workspace_index without recomputing artifacts.
+        if let Some(legacy_ws) = self.legacy_workspace_index
+            && let Some(doc) = legacy_ws.get(uri)
+        {
+            return doc.cached_artifacts_for_uri(uri);
         }
 
         None

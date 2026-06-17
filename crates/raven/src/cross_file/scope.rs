@@ -1059,6 +1059,7 @@ enum ForwardChildKey {
 }
 
 impl ForwardChildKey {
+    #[inline(always)]
     fn new(
         child_uri: &Url,
         path_fp: u64,
@@ -1103,6 +1104,7 @@ fn data_alias_provider_fp(provider: Option<&DataAliasProvider<'_>>) -> usize {
     provider.map_or(0, |p| p as *const DataAliasProvider as usize)
 }
 
+#[inline(always)]
 fn data_alias_provider_cache_epoch(provider: Option<&DataAliasProvider<'_>>) -> u64 {
     provider.map_or(0, DataAliasProvider::cache_epoch)
 }
@@ -1826,15 +1828,16 @@ where
 }
 
 /// Return the active standalone forward-closure members that a snapshot must
-/// materialize before the `WorldState` read guard is dropped.
+/// materialize before lock-free scope resolution.
 ///
 /// Snapshot graphs are trimmed neighborhoods built from globally indexed edges.
 /// A non-standalone member inside a standalone closure can resolve its own
 /// `source()` paths differently once caller working-directory inheritance is
-/// stripped. This helper walks that active path-context closure through the
-/// live content provider, so diagnostics and qualified-member requests copy any
-/// such active-only targets into their immutable snapshot maps before scope
-/// resolution runs lock-free.
+/// stripped. Callers therefore capture a bounded active corpus while holding
+/// the `WorldState` read guard, then run this helper after dropping the guard.
+/// If an active target is only available by direct disk materialization, that
+/// snapshot may use it for the current request but must disable persistent
+/// standalone-scope cache lookup/store.
 pub(crate) struct StandaloneActiveSnapshotMembersInputs<'a> {
     pub(crate) graph: &'a super::dependency::DependencyGraph,
     pub(crate) max_depth: usize,
@@ -1849,8 +1852,7 @@ pub(crate) struct StandaloneActiveSnapshotMembersInputs<'a> {
 /// The caller supplies the URI set it will materialize. This helper spends the
 /// shared traversal budget once across all standalone seeds, tracks members
 /// seen by earlier walks, and returns only newly inserted URIs so callers can
-/// precollect artifacts/text and decide whether the trimmed graph must be
-/// re-extracted.
+/// copy active artifacts/text into their immutable snapshot maps.
 pub(crate) fn standalone_active_snapshot_members<F, G>(
     inputs: StandaloneActiveSnapshotMembersInputs<'_>,
     snapshot_uris: &mut HashSet<Url>,
@@ -2007,6 +2009,7 @@ fn bump_forward_child_compute_count() {}
 /// keeping the memo byte-equivalent to the un-memoized resolver even under a
 /// small `maxChainDepth`. A scope produced under cancellation is never cached.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn resolve_forward_child_memoized(
     memo: &std::cell::RefCell<ForwardChildMemo>,
     graph: &super::dependency::DependencyGraph,
@@ -2089,6 +2092,7 @@ fn resolve_forward_child_memoized(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn resolve_forward_child_with_standalone_cache<F, G>(
     standalone_cache_context: Option<StandaloneScopeCacheContext<'_>>,
     child_is_standalone: bool,
