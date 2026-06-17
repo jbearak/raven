@@ -8,6 +8,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 |---|---|
 | Variable or function identifier | The most recent in-scope assignment (same file or sourced file) |
 | RHS of `$` or `@` (`foo$bar`) | The member assignment or constructor-literal field — see [$ and @ Member Resolution](#-and--member-resolution) |
+| Literal-string `[[` subscript (`foo[["bar"]]`) | Same as `` foo$`bar` `` — `[[` is the `$`-equivalent extractor; see [$ and @ Member Resolution](#-and--member-resolution) |
 | Symbol declared via `# raven: var` / `# raven: func` | The directive line itself — see [Declared Symbols](#declared-symbols) |
 | File path inside `source()` or a path directive | The referenced file, opened at line 0 |
 | Identifier in `.stan`, `.jags`, or `.bugs` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
@@ -52,7 +53,9 @@ When you cmd-click the RHS of `$` or `@` (e.g. `config$host`), Raven resolves it
 
 Nested members resolve against the full container path at any depth — cmd-clicking `gamma` in `alpha$beta$gamma` resolves it as a member of `alpha$beta` (descending nested constructor literals or matching `alpha$beta$gamma <- …` assignments), never as the free variable `gamma`. `$`, `@`, and `[["lit"]]` segments may be mixed in the chain.
 
-If multiple candidates exist across the dependency graph, Raven tie-breaks by graph distance (closer wins). Cmd-clicking on `$` or `@` itself (the punctuation) does nothing — only identifiers are navigable.
+The **string-subscript form `foo[["bar"]]`** is the `$`-equivalent extractor, so cmd-clicking the literal-string subscript navigates exactly as `` foo$`bar` `` does — handy for non-syntactic names (`df[["weird col"]]` ↔ `` df$`weird col` ``). This applies only to a **single, positional, literal** string subscript. It does **not** apply to computed or dynamic subscripts (`x[[i]]`, `x[[paste0("a", "b")]]`), numeric indices (`x[[1]]`), named or multi-argument subscripts (`x[[name = "a"]]`, `x[["a", exact = FALSE]]`), or the single-bracket form `x["bar"]` (which returns a sub-container, not the element). A cursor on any of those does not navigate as a member. (This is distinct from `foo["bar"] <- …` *assignments*, which remain resolution candidates — see above.)
+
+If multiple candidates exist across the dependency graph, Raven tie-breaks by graph distance (closer wins). Cmd-clicking on `$` or `@` itself (the punctuation) does nothing — only identifiers and literal-string `[[` subscripts are navigable.
 
 For the full scope rules, see [$ and @ Member Resolution](cross-file.md#-and--member-resolution) in the cross-file doc.
 

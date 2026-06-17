@@ -19123,6 +19123,35 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         .named_descendant_for_point_range(point_start, point_end)
         .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
 
+    // Terminal `x[["name"]]` string-subscript member hover (#461): `[[` is the
+    // `$`-equivalent extractor, so a cursor on the literal-string subscript
+    // shows the same local-definition hover as `` x$`name` ``. Mirrors
+    // go-to-definition and hover Step 4, keeping hover/goto in parity. Placed
+    // before the `identifier`/`string` `name` gate because the cursor node may
+    // be the inner `string_content`; resolution falls through (no early return)
+    // for a subscript with no local member definition.
+    if let Some(m) = crate::qualified_resolve::string_subscript_member_at(node, &text)
+        && let Some(path) = crate::qualified_resolve::build_qualified_path(m.container, &text)
+        && let Some(location) = crate::qualified_resolve::resolve_qualified_member(
+            state,
+            uri,
+            position,
+            &path,
+            &crate::cross_file::directive::callee_name_for_match(&m.value),
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        && let Some(def_info) = member_definition_info(state, &location)
+    {
+        let string_range = Range {
+            start: ts_point_to_lsp_position(&text, m.string_node.start_position()),
+            end: ts_point_to_lsp_position(&text, m.string_node.end_position()),
+        };
+        return Some(markdown_hover(
+            local_definition_hover(state, &def_info, uri),
+            string_range,
+        ));
+    }
+
     // Get the identifier
     let name = if node.kind() == "identifier" || node.kind() == "string" {
         node_text(node, &text)
@@ -20317,6 +20346,39 @@ pub fn goto_definition_with_cancel(
     let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
+    // Terminal `x[["name"]]` string-subscript member (#461): `[[` is the
+    // `$`-equivalent extractor, so a cursor on the literal-string subscript
+    // navigates exactly as `` x$`name` `` does. We synthesize the equivalent
+    // `$`-member query (`callee_name_for_match` re-quotes a non-syntactic name)
+    // and dispatch to the same resolver — the two cursor forms are identical by
+    // construction. Placed before the `identifier` gate because the cursor node
+    // here is a `string`/`string_content`, not an `identifier`.
+    if let Some(m) = crate::qualified_resolve::string_subscript_member_at(node, &text) {
+        let path = crate::qualified_resolve::build_qualified_path(m.container, &text)?;
+        let rhs_name = crate::cross_file::directive::callee_name_for_match(&m.value);
+        let location = if cancel.is_never() {
+            crate::qualified_resolve::resolve_qualified_member(
+                state,
+                uri,
+                position,
+                &path,
+                &rhs_name,
+                crate::extract_op::ExtractOp::Dollar,
+            )
+        } else {
+            crate::qualified_resolve::resolve_qualified_member_with_cancel(
+                state,
+                uri,
+                position,
+                &path,
+                &rhs_name,
+                crate::extract_op::ExtractOp::Dollar,
+                cancel,
+            )
+        };
+        return location.map(GotoDefinitionResponse::Scalar);
+    }
+
     if node.kind() != "identifier" {
         return None;
     }
@@ -20766,11 +20828,20 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
-    if node.kind() != "identifier" {
+    // Find-references target name. An `identifier` uses its own text; a cursor
+    // on a `x[["name"]]` literal-string subscript (#461) derives the equivalent
+    // `$`-member spelling (`callee_name_for_match` re-quotes a non-syntactic
+    // value) so the search keys identically to `` x$`name` `` — unioning the
+    // `$`, `[[`, and construction forms. `subscript_name` backs the borrow.
+    let subscript_name;
+    let name: &str = if node.kind() == "identifier" {
+        node_text(node, &text)
+    } else if let Some(m) = crate::qualified_resolve::string_subscript_member_at(node, &text) {
+        subscript_name = crate::cross_file::directive::callee_name_for_match(&m.value);
+        &subscript_name
+    } else {
         return None;
-    }
-
-    let name = node_text(node, &text);
+    };
     let mut locations = Vec::new();
 
     // Search current document
@@ -20894,6 +20965,29 @@ fn find_references_in_subtree(
             range: Range {
                 start: ts_point_to_lsp_position(text, start_pos),
                 end: ts_point_to_lsp_position(text, end_pos),
+            },
+        });
+    }
+
+    // Issue #461: a `x[["name"]]` literal-string subscript is the `$`-equivalent
+    // member spelling, so it joins the same name pool as `` x$`name` `` and the
+    // construction named argument. Match by the SAME canonical key the
+    // identifier arm uses: `callee_name_for_match` re-quotes a non-syntactic
+    // value so it canonicalizes identically to the backticked `$`-rhs spelling.
+    // Find-references is name-based and operator-agnostic (it already pools `$`
+    // and `@` members of the same name), so this extends that pool to `[[`.
+    // The pushed range is the `string` node span.
+    if node.kind() == "string"
+        && let Some(value) = crate::qualified_resolve::string_subscript_value(node, text)
+        && crate::r_names::canonical_use_name(&crate::cross_file::directive::callee_name_for_match(
+            value,
+        )) == canonical_name
+    {
+        locations.push(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: ts_point_to_lsp_position(text, node.start_position()),
+                end: ts_point_to_lsp_position(text, node.end_position()),
             },
         });
     }
@@ -64698,6 +64792,172 @@ mod issue_459_backtick_navigation_tests {
         assert_eq!(
             l.range.end.character, 26,
             "highlight ends one past the closing backtick (full 7-col `` `my fn` `` token)"
+        );
+    }
+
+    // ── Issue #461: `x[["name"]]` string-subscript accessor unification ──────
+    //
+    // A literal-string `[[` subscript is `$`-equivalent, so the cursor forms
+    // `` x$`name` `` and `x[["name"]]` behave identically for goto, hover, and
+    // find-references. The construction site, the `$` use, and the `[[` use all
+    // pool together.
+
+    /// The canonical scenario: three spellings of the same non-syntactic member.
+    const NSE_SCENARIO: &str = "fruit <- list(`macintosh apple` = 1)\n\
+                                fruit$`macintosh apple`\n\
+                                fruit[[\"macintosh apple\"]]\n";
+
+    /// Goto from the terminal `[["macintosh apple"]]` subscript (line 2) lands on
+    /// the `list(...)` construction (line 0) — exactly as the `$` form does.
+    #[test]
+    fn goto_from_string_subscript_lands_on_construction() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        // Cursor inside the string literal on line 2.
+        let l = scalar(goto_definition(&state, &uri, Position::new(2, 12)));
+        assert_eq!(l.uri, uri);
+        assert_eq!(l.range.start.line, 0, "construction is on line 0");
+    }
+
+    /// Symmetry sanity: the `$` form lands on the same construction line, so the
+    /// two cursor forms agree.
+    #[test]
+    fn goto_from_dollar_and_subscript_agree() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        let from_dollar = scalar(goto_definition(&state, &uri, Position::new(1, 10)));
+        let from_subscript = scalar(goto_definition(&state, &uri, Position::new(2, 12)));
+        assert_eq!(
+            from_dollar.range.start.line,
+            from_subscript.range.start.line
+        );
+        assert_eq!(from_dollar.range, from_subscript.range);
+    }
+
+    /// A syntactic member name resolves through `[[` too (`df[["col"]]`).
+    #[test]
+    fn goto_from_syntactic_string_subscript_resolves() {
+        let mut state = create_state();
+        let code = "df <- list(col = 1)\ndf[[\"col\"]]\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let l = scalar(goto_definition(&state, &uri, Position::new(1, 5)));
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// Single-bracket `x["name"]` is NOT `$`-equivalent (it returns a
+    /// sub-container), so a cursor on it must not navigate — even when the `[[`
+    /// form would.
+    #[test]
+    fn goto_from_single_bracket_subscript_declines() {
+        let mut state = create_state();
+        let code = "fruit <- list(`macintosh apple` = 1)\nfruit[\"macintosh apple\"]\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        assert!(
+            goto_definition(&state, &uri, Position::new(1, 12)).is_none(),
+            "single-bracket subscript must not navigate as a member"
+        );
+    }
+
+    /// A malformed multi-index assignment (`x[["a", "b"]] <- 1`, which R reads as
+    /// `x[["a"]][["b"]] <- 1`) must NOT be collected as a definition of `x$a` —
+    /// the read and write sides share the sole-positional-string shape rule, so
+    /// goto from `x[["a"]]` only lands on a genuine single-member definition.
+    #[test]
+    fn goto_does_not_resolve_to_multiarg_assignment() {
+        let mut state = create_state();
+        let code = "x <- list(a = 0)\nx[[\"a\", \"b\"]] <- 1\nx[[\"a\"]]\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        // Cursor on the final `x[["a"]]` (line 2). The only valid definition is
+        // the constructor on line 0 — never the recursive-index assignment.
+        let l = scalar(goto_definition(&state, &uri, Position::new(2, 4)));
+        assert_eq!(
+            l.range.start.line, 0,
+            "must resolve to the list() construction, not the `[[\"a\", \"b\"]] <- ` assignment"
+        );
+    }
+
+    /// A multi-argument terminal `[[` is not a single static member.
+    #[test]
+    fn goto_from_multiarg_subscript_declines() {
+        let mut state = create_state();
+        let code = "fruit <- list(`macintosh apple` = 1)\nfruit[[\"macintosh apple\", \"x\"]]\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        assert!(
+            goto_definition(&state, &uri, Position::new(1, 12)).is_none(),
+            "multi-arg `[[` must not navigate as a single member"
+        );
+    }
+
+    /// Find-references from the `[[` form unions the construction site, the `$`
+    /// use, and the `[[` use (all three lines).
+    #[test]
+    fn references_from_string_subscript_unions_all_forms() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        let refs = references(&state, &uri, Position::new(2, 12)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1, 2]);
+    }
+
+    /// Symmetry: find-references from the `$` form also includes the `[[` use.
+    #[test]
+    fn references_from_dollar_includes_string_subscript() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        let refs = references(&state, &uri, Position::new(1, 10)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1, 2]);
+    }
+
+    /// Symmetry: find-references from the construction named argument includes
+    /// the `[[` use.
+    #[test]
+    fn references_from_construction_includes_string_subscript() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        let refs = references(&state, &uri, Position::new(0, 18)).expect("references Some");
+        assert_eq!(ref_lines(&refs), vec![0, 1, 2]);
+    }
+
+    /// Find-references must NOT match a plain string literal that is not a `[[`
+    /// subscript — string matching is subscript-gated, not free-text.
+    #[test]
+    fn references_ignores_non_subscript_string_literal() {
+        let mut state = create_state();
+        let code = "fruit <- list(`macintosh apple` = 1)\n\
+                    fruit[[\"macintosh apple\"]]\n\
+                    print(\"macintosh apple\")\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        let refs = references(&state, &uri, Position::new(1, 12)).expect("references Some");
+        assert_eq!(
+            ref_lines(&refs),
+            vec![0, 1],
+            "the plain `print(\"...\")` string on line 2 is not a subscript reference"
+        );
+    }
+
+    /// A cursor on a plain (non-subscript) string yields no references at all.
+    #[test]
+    fn references_from_non_subscript_string_is_none() {
+        let mut state = create_state();
+        let code = "print(\"macintosh apple\")\n";
+        let uri = add_doc(&mut state, "file:///t.R", code);
+        assert!(references(&state, &uri, Position::new(0, 10)).is_none());
+    }
+
+    /// Hover on the `[[` subscript shows the same local-definition hover as the
+    /// `$` form (hover/goto parity).
+    #[tokio::test]
+    async fn hover_on_string_subscript_matches_dollar_form() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", NSE_SCENARIO);
+        let result = super::hover(&state, &uri, Position::new(2, 12)).await;
+        let hover = result.expect("hover on `[[` member must resolve to the construction");
+        let text = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            text.contains("fruit <- list(`macintosh apple` = 1)"),
+            "hover should show the construction statement; got: {text}"
         );
     }
 }
