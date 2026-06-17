@@ -194,43 +194,30 @@ See [Configuration](configuration.md) for watcher settings (`packages.watchLibra
 
 Propagation reuses the same dependency graph and path-resolution rules (`# raven: cd`, workspace-root fallback, `max_chain_depth`) as the scope and package facts above; backward directives participate as ordinary edges but gain no extra path fallback. The propagation set is the revalidation-consistent neighborhood — a file's ancestors plus the descendant subtrees of itself and its ancestors — so editing a `# raven: nse` (or a `# raven: func` whose formals feed cross-file positional matching) in any connected file revalidates the dependents that rely on it. Cross-file propagation is intentionally **coarse and file-level**: a propagated directive ignores its original line and governs the whole connected file, and it is consulted below the precise built-in NSE policy tables so it cannot coarsen a known verb. Two unconnected files never share NSE directives.
 
-## Standalone modules (`# raven: standalone`)
+## Self-contained sourced files (`# raven: self-contained`)
 
 By default a file's cross-file scope includes a **backward** contribution: the
-bindings visible at every `source()` call that pulls the file in. For a *hub* —
-one file sourced by many others — that means resolving the file's scope as the
-union over all its callers, which is both a performance cost (the hub's
-neighborhood is re-resolved per caller) and a source of over-approximation (one
-caller's bindings can mask a genuine "undefined" that another caller would
-expose).
+bindings visible at every `source()` call that pulls the file in. For ordinary
+script fragments, that matches R's dynamic behavior: the file may intentionally
+use variables created by its caller.
 
-The header directive `# raven: standalone` (see
-[directives](directives.md#standalone-module-directive)) opts a file out of that
-backward contribution. Raven resolves a standalone file **in isolation**: no
-backward parent-prefix walk, and — whether it is resolved for its own
-diagnostics or pulled in as another file's forward `source()` child — no
-caller-inherited symbols, loaded packages, working directory, or data-alias
-provider. Its scope becomes a pure function of `(the file, its own forward
-source() closure)`, independent of who sources it.
+Some sourced files are different. A shared helper or setup file may be
+self-contained: it defines its own inputs, loads its own packages, and sources
+its own helper chain. The header directive `# raven: self-contained`
+(alias: `# raven: standalone`) opts that file out of the backward caller
+contribution. Raven resolves it **in isolation** from callers, while still
+letting its own definitions and `library()` loads flow forward to every caller.
 
-The isolation is **asymmetric**. Nothing flows *in* from a caller into the
-file's own scope, but the file still contributes *out*: its own definitions and
-its own `library()`-loaded packages still propagate to every caller through the
-normal additive forward merge. So a standalone setup file that loads shared
-packages still makes them available to its callers.
+This is both more precise and faster for true source hubs. In deeply nested,
+high-fan-out graphs - for example, a setup file sourced by dozens of scripts
+that itself sources dozens of files through a nested chain - the directive can
+let Raven reuse one caller-independent scope instead of re-resolving the same
+closure in many caller contexts.
 
-Because a standalone file's isolated scope no longer depends on its callers,
-Raven resolves it **once and reuses it**: across every caller in a single
-analysis pass, across the revalidation fan-out when an unrelated file is edited,
-and across keystrokes (the per-file snapshots of `raven check`, which share a
-persistent cache). A hub sourced by dozens of scripts is resolved a single time
-instead of once per caller. The directive is the sound, opt-in form of that
-reuse — you assert the independence, so Raven never has to over-approximate it.
-If the assertion is wrong (the file truly needs a caller-provided binding), the
-only consequence is a false-positive "undefined" *inside the standalone file* —
-a safe direction, never a missed bug in a caller. `# raven: nse` /
-`# raven: func` propagation over `source()` edges is unaffected (it is
-graph-level, not scope-level).
+See [Cross-File Performance](cross-file-performance.md) for when to use
+`# raven: self-contained`, and [Directives](directives.md#self-contained-sourced-scripts)
+for the exact syntax. `# raven: nse` / `# raven: func` propagation over
+`source()` edges is unaffected (it is graph-level, not scope-level).
 
 ## Position-Aware Scope
 
