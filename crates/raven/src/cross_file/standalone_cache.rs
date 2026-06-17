@@ -299,4 +299,126 @@ mod tests {
         );
         assert!(cache.get(&k1, 0).is_some());
     }
+
+    // ---- WI2b directive performance gate (issue #483) ----
+    //
+    // See `specs/issue-483-wi2b-benchmarks-design.md`. The hard gate is
+    // deterministic (cache-reuse mechanism), not wall-clock, so it never flakes
+    // on shared CI runners; the `cross_file_standalone_cache` criterion bench
+    // tracks the actual speedup (~6x on this corpus).
+
+    /// Resolve a caller of the hub at EOF, optionally threading the WI2b cache.
+    /// The caller `source()`s the hub, so the hub resolves as a depth>=1 forward
+    /// child — the path the persistent cache serves (resolving the hub directly
+    /// is the depth-0 own-root path the cache excludes).
+    fn gate_resolve_caller(
+        corpus: &crate::test_utils::standalone_hub::HubCorpus,
+        caller: &Url,
+        ctx: Option<StandaloneCacheCtx>,
+    ) {
+        let mut prefix_cache = crate::cross_file::ParentPrefixCache::new();
+        let base: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let _ = crate::cross_file::scope_at_position_with_graph_cached_with_standalone_cache(
+            caller,
+            u32::MAX,
+            u32::MAX,
+            &|u| corpus.artifacts.get(u).cloned(),
+            &|u| corpus.metadata.get(u).cloned(),
+            &corpus.graph,
+            Some(&corpus.folder),
+            64,
+            &base,
+            true,
+            BackwardDependencyMode::Auto,
+            &|| false,
+            &mut prefix_cache,
+            None,
+            None,
+            ctx,
+        );
+    }
+
+    fn gate_ctx(
+        corpus: &crate::test_utils::standalone_hub::HubCorpus,
+        cache: &Arc<StandaloneScopeCache>,
+    ) -> StandaloneCacheCtx {
+        StandaloneCacheCtx {
+            cache: cache.clone(),
+            edge_revision: corpus.graph.edge_revision(),
+            package_config_generation: 0,
+        }
+    }
+
+    /// HARD GATE (deterministic, non-flaky): the `# raven: standalone` directive
+    /// must let a hub's isolated scope be reused across its callers. With the
+    /// directive, resolving N callers computes the hub once and serves ~N-1 cache
+    /// hits; without it the cache is never consulted. A regression that breaks
+    /// caller-independence (every caller misses) fails this — i.e. the directive
+    /// stops being faster.
+    #[test]
+    fn standalone_directive_enables_fanout_cache_reuse() {
+        const N: usize = 50;
+        let with = crate::test_utils::standalone_hub::build_hub_corpus(true, 40, 2, N);
+        let cache = Arc::new(StandaloneScopeCache::new());
+        for u in &with.caller_uris {
+            gate_resolve_caller(&with, u, Some(gate_ctx(&with, &cache)));
+        }
+        assert!(
+            cache.hits() as usize >= N - 5,
+            "directive fan-out must reuse the cached hub scope across callers: \
+             {} hits / {} misses over {N} callers",
+            cache.hits(),
+            cache.misses(),
+        );
+
+        let without = crate::test_utils::standalone_hub::build_hub_corpus(false, 40, 2, N);
+        let cache_off = Arc::new(StandaloneScopeCache::new());
+        for u in &without.caller_uris {
+            gate_resolve_caller(&without, u, Some(gate_ctx(&without, &cache_off)));
+        }
+        assert_eq!(
+            cache_off.hits() + cache_off.misses(),
+            0,
+            "a non-standalone hub must never consult the standalone cache",
+        );
+    }
+
+    /// Wall-clock companion to the deterministic gate. `#[ignore]`d so it stays
+    /// out of the debug unit-test hot path (resolution is ~20x slower in debug,
+    /// and the ratio — not the absolute — is what matters). Run in release:
+    /// `cargo test --release --features test-support -- --ignored standalone_directive_fanout_is_faster`.
+    /// Measured ~6x on this corpus; asserts a generous >=1.5x so it fails only on
+    /// a gross regression, never on machine noise (ratio measured back-to-back on
+    /// the same host).
+    #[test]
+    #[ignore]
+    fn standalone_directive_fanout_is_faster() {
+        use std::time::Instant;
+        let with = crate::test_utils::standalone_hub::build_hub_corpus(true, 50, 3, 80);
+        let without = crate::test_utils::standalone_hub::build_hub_corpus(false, 50, 3, 80);
+        let time_fanout =
+            |corpus: &crate::test_utils::standalone_hub::HubCorpus, cached: bool| -> f64 {
+                let cache = Arc::new(StandaloneScopeCache::new());
+                let t0 = Instant::now();
+                for u in &corpus.caller_uris {
+                    let c = if cached {
+                        Some(gate_ctx(corpus, &cache))
+                    } else {
+                        None
+                    };
+                    gate_resolve_caller(corpus, u, c);
+                }
+                t0.elapsed().as_secs_f64() * 1000.0
+            };
+        let mut w: Vec<f64> = (0..7).map(|_| time_fanout(&with, true)).collect();
+        let mut wo: Vec<f64> = (0..7).map(|_| time_fanout(&without, false)).collect();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wo.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (with_ms, without_ms) = (w[3], wo[3]);
+        assert!(
+            without_ms >= with_ms * 1.5,
+            "standalone directive must make fan-out >=1.5x faster: \
+             with={with_ms:.1}ms without={without_ms:.1}ms",
+        );
+    }
 }
