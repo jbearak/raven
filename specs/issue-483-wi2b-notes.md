@@ -9,16 +9,21 @@ decisions made during coding. They refine (do not contradict) the WI2b section o
 - **Part 1 shipped** (`scope.rs:5042`): `parent_prefix_at` returns the empty
   `ParentPrefix` for a standalone `uri`. So a standalone file's own backward walk
   is skipped.
-- **Part 2 NOT shipped**: both forward-child sites still thread the caller's
-  packages / `DataAliasProvider` / working directory into a standalone child:
-  - streaming/recursive forward-source dispatch: `scope.rs:5810` (`packages_for_child`),
-    `5826` (`child_ctx`), `5877` (`provider_fp`), `5896`/`5922` recursive calls.
-  - `ScopeStream::resolve_source_contribution`: `scope.rs:7844` (`child_ctx`),
-    `7911` (`provider_fp`), `7924` recursive call.
-- The backward parent walk already resolves a parent at `scope.rs:5199` with
-  `inherited_packages = {}` (`5211`), `data_alias_provider = None` (`5238`),
-  and the parent's OWN `PathContext` (`5175`). So the **backward-parent** path is
-  already caller-independent; only the **forward-child** path needs part 2.
+- **Part 2 shipped**: both forward-child sites now resolve a standalone child with
+  caller-independent inputs — empty packages, no `DataAliasProvider`, and the
+  child's OWN `PathContext` (ignoring the caller's `# raven: cd` / inherited
+  working directory):
+  - recursive forward-source dispatch (`scope_at_position_with_graph_recursive`):
+    `scope.rs:6181` (`child_provider = None`), `6188` (`packages_for_child` empty),
+    `6206` (`child_ctx` from the child's own metadata), `6275` (`provider_fp` of the
+    `None` provider), recursive calls at `6276`/`6294`.
+  - `ScopeStream::resolve_source_contribution`: `scope.rs:8308` (`child_provider =
+    None`), `8317` (`child_ctx`), packages already empty on this path (`8393`/`8407`),
+    `8397` (`provider_fp`), recursive call at `8410`.
+- The backward parent walk already resolved a parent caller-independently — with
+  `inherited_packages = {}` (`scope.rs:5481`), `data_alias_provider = None` (`5500`),
+  and the parent's OWN `PathContext` (`5445`) — so it never needed part 2; part 2
+  brought the **forward-child** path to the same caller-independence.
 - `interface_hash` is per-file on `ScopeArtifacts` (`scope.rs:755`) and
   `compute_interface_hash` already folds in `standalone` (`scope.rs:4521`) and
   (post-#482) `ScopedSymbol.signature`.
@@ -172,6 +177,22 @@ parent of a non-standalone member loses the packages it *inherited* / had *loade
 siblings* (its own `library()` calls survive via the direct-artifact read, but the
 recursive `parent_scope` is zeroed).
 
+**The fingerprint walks the same (trimmed) graph the resolver uses — and that is sound
+even under `max_visited` truncation.** In production both run over the trimmed neighborhood
+subgraph. One might fear that under truncation `extract_subgraph` drops an edge to a
+contributor the resolver still reaches via its `source.resolved_uri` / path fallback (which
+the fingerprint walk lacks), omitting it from the key. It does not, because contribution is
+gated by **artifact availability = neighborhood membership**: the resolver's `get_artifacts`
+reads only `DiagnosticsSnapshot::artifacts_map`, populated solely from the neighborhood. For
+a file outside the neighborhood the fallback may compute its URI, but `get_artifacts` returns
+`None`, so it contributes nothing — exactly as the fingerprint (which also omits it) assumes.
+For a file inside the neighborhood, `extract_subgraph` keeps every intra-neighborhood edge,
+so the resolver reaches it through a real edge the fingerprint also traverses. The resolver's
+contributing set therefore equals the fingerprint's set in every regime, so a truncated
+resolution is an approximate-but-self-consistent scope that the cache reuses soundly (a fresh
+resolution would be truncated identically). See the long-form argument on
+`standalone_closure_fingerprint_and_members`.
+
 ## Staleness fixes found in WI2b adversarial review (each reproduced with a failing test first)
 
 1. **Contributing-set fingerprint** (`353e819e`): a forward-only fingerprint missed an
@@ -192,13 +213,52 @@ recursive `parent_scope` is zeroed).
    354/10 → 255/8, byte-identity preserved). A precise (package-contribution-aware or
    post-hoc) replacement that recovers those hits is tracked in **#488**.
 
+## Refinement 5 — source-call contribution flags carried on the dependency edge
+
+Review (Codex) surfaced two more inputs that change a `source()`/`sys.source()`
+call's *contribution* but were not in the cache key, because they can flip at a
+**fixed `(line, column)`** with the file's `interface_hash` unchanged:
+
+- **`sys.source(..., envir = …)`** — a non-global env (`new.env()`) does NOT
+  contribute the child's top-level symbols (`should_apply_local_scoping`); editing
+  `globalenv()` → `new.env()` is a same-position argument change.
+- **function-scope** — a `source()` lexically inside a `function(){}` body does not
+  contribute at top level; dropping an enclosing wrapper on a *prior* line can flip
+  this without moving the call.
+
+Neither `sys_source_global_env` nor `is_function_scoped` was on `DependencyEdge`,
+so such a flip left the edge byte-identical → `edge_revision` did not move → the
+persistent cache (keyed on `edge_revision`) could serve a stale isolated scope, and
+dependents were not revalidated. Fix: both flags are now carried on `DependencyEdge`
+and folded into full-edge equality (`dependency.rs`), so a flip is an edge change
+that bumps `edge_revision`. Regression: `edge_revision_bumps_on_source_semantics_flip_at_fixed_position`
+and `standalone_cache_invalidates_on_sys_source_envir_toggle`.
+
+Because the edge now carries them, `parent_prefix_at` reads
+`edge.sys_source_global_env` / `edge.is_function_scoped` **directly** instead of
+re-scanning `parent_meta.sources` — a single source of truth, and correct even with
+two `sys.source` calls (one global, one not) on the same line, which the prior
+line-only metadata scan misclassified (regression
+`sys_source_two_calls_on_one_line_use_per_call_envir`).
+
 ## Refuted findings (documented to prevent re-flagging)
 
-- **`rm()` removal column not hashed** (Codex session `019ed1e4`): FALSE POSITIVE. `rm()`
-  removes a *symbol*, and symbols from a member's backward parent are leak-filtered at the
-  M→C merge (`child_source_symbol_is_leak`), so a removed symbol never reaches C's scope;
-  `rm()` cannot remove packages. `compute_interface_hash` is shared with revalidation, so
-  no removal-column plumbing was added.
+- **`rm()` removal column not hashed** (Codex sessions `019ed1e4`, re-flagged later with a
+  same-line-reorder reproduction): FALSE POSITIVE on two independent grounds.
+  (a) **Edge-position sensitivity** (covers the re-flag's reproduction — C's own
+  `source("leaf"); rm(x)` reordered to `rm(x); source("leaf")`): for an `rm()` to flip
+  execution order relative to a `source()` call, ONE of them must move. If they swap across
+  lines, `rm`'s line changes → `interface_hash` changes (removals hash `(name, line)`). If
+  they swap on one line, the `source()` call's **column** necessarily changes (moving `rm`
+  before it pushes it right) → `DependencyEdge`/`EdgeKey` differ → `edge_revision` bumps →
+  cache MISS. The precondition "same line/UTF-16 column while order flips" is unsatisfiable.
+  The `(name, line)` removal hash is also *tighter* than `(name, line, column)` would be: a
+  same-line `rm` move that stays on the same side of every `source()` does not change the EOF
+  scope and correctly must not invalidate.
+  (b) **Backward-parent channel**: a symbol removed from a member's backward parent is
+  leak-filtered at the M→C merge (`child_source_symbol_is_leak`), so it never reaches C's
+  scope; `rm()` cannot remove packages. `compute_interface_hash` is shared with revalidation,
+  so no removal-column plumbing was added.
 
 - **Callee `PathContext` not in the key** (Codex session `019ed229`): a non-bug, shadowed
   by the dependency graph. The resolver resolves forward children from graph edges
@@ -227,3 +287,24 @@ recursive `parent_scope` is zeroed).
   never observed, and `compute_interface_hash` (shared with revalidation) is not widened for
   it. **Tripwire:** if the standalone cache is ever wired into go-to-definition / hover /
   any surface that reads `defined_end_column`, the fingerprint must then cover it.
+
+- **Fingerprint walks the trimmed neighborhood subgraph → "stale hit under `max_visited`
+  truncation"** (code-review, CONFIRMED-vote): a non-bug. The concern: `standalone_closure_fingerprint_and_members`
+  walks the same trimmed `graph` the resolver uses, so under budget truncation `extract_subgraph`
+  drops edges to out-of-neighborhood files; the resolver's `source.resolved_uri` / path fallback
+  (`scope.rs` STEP 2) could still reach such a file F and feed its content into C's scope, while the
+  fingerprint (no fallback) omits F — so an edit to F would not bump the key. The miss in this
+  analysis: **contribution is gated by `get_artifacts`, which equals neighborhood membership.** The
+  diagnostics resolver's `get_artifacts` closure reads only `DiagnosticsSnapshot::artifacts_map`,
+  populated solely from `payload.neighborhood` (`handlers.rs` precollect loop). For an
+  out-of-neighborhood F the fallback may compute F's URI, but `get_artifacts(F)` is `None`, so F
+  contributes nothing — exactly as the fingerprint assumes. For an in-neighborhood file,
+  `extract_subgraph` retains every intra-neighborhood edge (both endpoints present), so the resolver
+  reaches it via a real edge the fingerprint also walks, never only via the fallback. Hence the
+  resolver's contributing set equals the fingerprint's set in every regime; a truncated resolution is
+  approximate-but-self-consistent and the cache reuses it soundly (a fresh resolution would truncate
+  identically). An earlier draft added a `neighborhood_visited_truncated` gate to skip the cache under
+  truncation; it was reverted as unnecessary once the `get_artifacts` gating was traced.
+  **Tripwire:** if `artifacts_map` is ever seeded beyond the neighborhood (so `get_artifacts` can
+  return `Some` for a file absent from the trimmed subgraph), this fingerprint walk must then follow
+  the resolver's `resolved_uri` / path fallback, or the truncation gate must be reinstated.
