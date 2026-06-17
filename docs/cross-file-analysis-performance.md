@@ -161,12 +161,22 @@ sourced by many scripts. Raven supports that pattern, and
 depends on whichever script sourced it.
 
 For reusable function code, the long-term R best practice is often to make a
-small package and place functions under `R/`. That gives you package metadata,
-dependency declarations, tests, documentation, and a clearer boundary than a
-large `functions.R` sourced everywhere. For project-local analysis repos, a
+small package and place functions under `R/`. In Raven, that layout becomes
+special only when [**package mode** is active](r-package-dev.md#configuration),
+for example when the workspace root has a `DESCRIPTION` file with a valid
+`Package:` field, or `raven.packages.packageMode` is set to `enabled`. In
+package mode, top-level symbols in `R/*.R` files are mutually visible without
+explicit `source()` calls, matching package-development workflows.
+
+In an ordinary script project, `R/` is just a directory name. Moving helpers
+there can still be a nice convention, but Raven will not automatically load
+those files merely because they live under `R/`; the project still needs
+ordinary `source()` calls, forward directives such as `# raven: source R/helpers.R`,
+or package-mode metadata. For project-local analysis repos, a
 sourced helper or setup file remains a reasonable intermediate shape. See
-[R Packages: The package within](https://r-pkgs.org/package-within.html) and
-[R Packages: R code](https://r-pkgs.org/code.html).
+[R Packages: The package within](https://r-pkgs.org/package-within.html),
+[R Packages: R code](https://r-pkgs.org/code.html), and
+[R Package Development](r-package-dev.md).
 
 ## Syntax
 
