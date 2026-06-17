@@ -17,7 +17,9 @@ use url::Url;
 
 use crate::cross_file::SymbolKind;
 use crate::cross_file::scope::{ParentPrefixCache, ScopeAtPosition};
-use crate::handlers::{CrossFileScopeSnapshot, DiagCancelToken};
+use crate::cross_file::scope_snapshot::{
+    CrossFileScopeSnapshot, DiagCancelToken, empty_base_exports,
+};
 use crate::state::WorldState;
 
 // ---------------------------------------------------------------------------
@@ -240,11 +242,17 @@ pub(crate) fn resolve_with_scope_snapshot(
         if let Some(sig) = cache.get_package(&cache_key) {
             return Some(sig);
         }
+        return resolve_package_signature(
+            &snapshot.package_library,
+            cache,
+            function_name,
+            Some(ns),
+            is_internal,
+        );
     }
 
-    if namespace.is_none()
-        && let Some(sig) =
-            resolve_user_only_with_scope_snapshot(snapshot, function_name, current_uri, position)
+    if let Some(sig) =
+        resolve_user_only_with_scope_snapshot(snapshot, function_name, current_uri, position)
     {
         return Some(sig);
     }
@@ -256,14 +264,10 @@ pub(crate) fn resolve_with_scope_snapshot(
         &scope,
     );
 
-    let resolved_package = if let Some(ns) = namespace {
-        Some(ns.to_string())
-    } else {
-        let pkg_list: Vec<String> = all_packages.to_vec();
-        snapshot
-            .package_library
-            .find_package_owner_for_symbol(function_name, &pkg_list)
-    };
+    let pkg_list: Vec<String> = all_packages.to_vec();
+    let resolved_package = snapshot
+        .package_library
+        .find_package_owner_for_symbol(function_name, &pkg_list);
 
     resolve_package_signature(
         &snapshot.package_library,
@@ -274,7 +278,7 @@ pub(crate) fn resolve_with_scope_snapshot(
     )
 }
 
-fn resolve_user_only_with_scope_snapshot(
+pub(crate) fn resolve_user_only_with_scope_snapshot(
     snapshot: &CrossFileScopeSnapshot,
     function_name: &str,
     current_uri: &Url,
@@ -316,52 +320,31 @@ pub fn resolve(
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
-    // --- Phase 1: Package cache (namespace-qualified calls) ---
-
-    // For namespace-qualified calls (e.g., dplyr::filter), check package cache
+    // For namespace-qualified calls (e.g., dplyr::filter), no cross-file scope
+    // is needed: the namespace is the package owner.
     if let Some(ns) = namespace {
         let cache_key = format!("{}::{}", ns, function_name);
         if let Some(sig) = cache.get_package(&cache_key) {
             return Some(sig);
         }
+        return resolve_package_signature(
+            &state.package_library,
+            cache,
+            function_name,
+            Some(ns),
+            is_internal,
+        );
     }
 
-    // --- Phases 2 & 3: Local / cross-file (only for unqualified calls) ---
-    // Namespace-qualified calls (e.g., dplyr::filter) skip user-defined lookup
-    // and go straight to package resolution.
-    if namespace.is_none()
-        && let Some(sig) = resolve_user_only(state, function_name, current_uri, position)
-    {
-        return Some(sig);
-    }
-
-    // --- Phase 4: Package resolution ---
-    // For unqualified names, check package cache with all possible package keys
-    // before attempting R subprocess
-    let scope = get_scope(state, current_uri, position);
-    let all_packages = collect_packages_at_position(state, &scope);
-
-    // If namespace is specified, we already checked the cache above.
-    // For unqualified names, try to find which package exports this function.
-    let resolved_package = if let Some(ns) = namespace {
-        Some(ns.to_string())
-    } else {
-        // Resolve the true owner package (issue #407) so formals come from the
-        // package that actually defines the function (e.g. `dplyr` for a
-        // `mutate` made visible through `library(tidyverse)`), not the
-        // aggregate that merely made it visible.
-        let pkg_list: Vec<String> = all_packages.to_vec();
-        state
-            .package_library
-            .find_package_owner_for_symbol(function_name, &pkg_list)
-    };
-
-    resolve_package_signature(
-        &state.package_library,
+    let snapshot = CrossFileScopeSnapshot::build(state, current_uri);
+    resolve_with_scope_snapshot(
+        &snapshot,
         cache,
         function_name,
-        resolved_package.as_deref(),
+        None,
         is_internal,
+        current_uri,
+        position,
     )
 }
 
@@ -918,7 +901,7 @@ fn get_scope(
     let base_exports = if state.package_library_ready {
         state.package_library.base_exports().clone()
     } else {
-        crate::handlers::empty_base_exports().clone()
+        empty_base_exports().clone()
     };
 
     // `data()` alias expansion provider (issue #429); gated on package-library
@@ -960,14 +943,6 @@ fn get_scope(
 ///
 /// Combines base packages, inherited packages, and loaded packages from the
 /// scope resolver's position-aware package list.
-fn collect_packages_at_position(state: &WorldState, scope: &ScopeAtPosition) -> Vec<String> {
-    collect_packages_at_position_from_parts(
-        state.package_library_ready,
-        state.package_library.base_packages(),
-        scope,
-    )
-}
-
 fn get_scope_from_snapshot(
     snapshot: &CrossFileScopeSnapshot,
     uri: &Url,

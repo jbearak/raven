@@ -3757,29 +3757,8 @@ impl LanguageServer for Backend {
                     )
                 }; // read lock released
 
-                let empty_base_exports = std::collections::HashSet::new();
-                let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
-                let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
                 let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                    &uri,
-                    probe_line,
-                    u32::MAX,
-                    &get_artifacts,
-                    &get_metadata,
-                    &probe.graph,
-                    probe.workspace_folder.as_ref(),
-                    probe.max_chain_depth,
-                    &empty_base_exports,
-                    false,
-                    probe.backward_dependencies,
-                    &|| false,
-                    Some(&probe.scope_contribution),
-                    // Package-scope probe reads only `inherited_packages` /
-                    // `loaded_packages`, never `scope.symbols`, so `data()`
-                    // alias expansion (issue #429) is unnecessary here.
-                    None,
-                );
+                let scope = probe.scope_at(&uri, probe_line);
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
@@ -4305,28 +4284,8 @@ impl LanguageServer for Backend {
                         state.build_package_scope_snapshot(&[(revalidation_uri.clone(), last_line)])
                     }; // read lock released
 
-                    let empty_base = std::collections::HashSet::new();
-                    let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
-                    let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
                     let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                    let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                        &revalidation_uri,
-                        probe_line,
-                        u32::MAX,
-                        &get_artifacts,
-                        &get_metadata,
-                        &probe.graph,
-                        probe.workspace_folder.as_ref(),
-                        probe.max_chain_depth,
-                        &empty_base,
-                        false,
-                        probe.backward_dependencies,
-                        &|| false,
-                        Some(&probe.scope_contribution),
-                        // Probe reads only packages, not `scope.symbols`;
-                        // no `data()` alias expansion needed (issue #429).
-                        None,
-                    );
+                    let scope = probe.scope_at(&revalidation_uri, probe_line);
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
                 }
@@ -5567,27 +5526,16 @@ impl LanguageServer for Backend {
         match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             let state = handle.block_on(state.read());
-            if let Some(member_context) =
-                handlers::prepare_dollar_member_completion(&state, &uri, position)
-            {
-                let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
-                drop(state);
-                let items = handlers::dollar_member_completion_items_from_snapshot(
-                    &snapshot,
-                    &uri,
-                    position,
-                    &member_context,
-                );
-                return Some(CompletionResponse::Array(items));
-            }
             let prepared =
                 handlers::prepare_completion_for_scope_snapshot(&state, &uri, position, context);
             let prepared = match prepared {
                 handlers::PreparedScopeCompletion::Immediate(response) => return response,
-                general @ handlers::PreparedScopeCompletion::General { .. } => general,
+                scope_backed @ (handlers::PreparedScopeCompletion::DollarMember(_)
+                | handlers::PreparedScopeCompletion::General { .. }) => scope_backed,
             };
-            let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
             drop(state);
+            let snapshot = capture.finish(&|| false);
             handlers::completion_from_scope_snapshot(&snapshot, &uri, position, prepared)
         })
         .await
@@ -5633,17 +5581,52 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let state = self.state.read().await;
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        if let Some(prepared) = handlers::prepare_qualified_member_hover(&state, &uri, position) {
-            let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
-            drop(state);
-            return Ok(handlers::qualified_member_hover_from_snapshot(
-                &snapshot, &uri, position, &prepared,
-            ));
+        enum HoverPlan {
+            Namespace(handlers::NamespaceHoverContext),
+            Scope(
+                handlers::PreparedHover,
+                Box<crate::cross_file::scope_snapshot::CrossFileScopeSnapshotCapture>,
+            ),
         }
-        Ok(handlers::hover(&state, &uri, position).await)
+
+        let plan = {
+            let state = self.state.read().await;
+            handlers::prepare_hover_for_scope_snapshot(&state, &uri, position).map(|prepared| {
+                match handlers::split_prepared_hover(&state, prepared) {
+                    handlers::PreparedHoverResolution::Namespace(ctx) => HoverPlan::Namespace(ctx),
+                    handlers::PreparedHoverResolution::Scope(prepared) => {
+                        let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
+                        HoverPlan::Scope(prepared, Box::new(capture))
+                    }
+                }
+            })
+        };
+        Ok(match plan {
+            Some(HoverPlan::Namespace(ctx)) => handlers::resolve_namespace_hover(ctx).await,
+            Some(HoverPlan::Scope(prepared, capture)) => {
+                let uri_for_task = uri.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let snapshot = capture.finish(&|| false);
+                    let handle = tokio::runtime::Handle::current();
+                    handle.block_on(handlers::hover_from_scope_snapshot(
+                        &snapshot,
+                        &uri_for_task,
+                        prepared,
+                    ))
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::trace!("hover: spawn_blocking failed: {e}");
+                        return Err(tower_lsp::jsonrpc::Error::internal_error());
+                    }
+                }
+            }
+            None => None,
+        })
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
@@ -5655,8 +5638,8 @@ impl LanguageServer for Backend {
             let state = self.state.read().await;
             handlers::prepare_signature_help_for_scope_snapshot(&state, &uri, position).map(
                 |prepared| {
-                    let snapshot = handlers::CrossFileScopeSnapshot::build(&state, &uri);
-                    (prepared, snapshot)
+                    let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
+                    (prepared, capture)
                 },
             )
         }; // read lock released
@@ -5664,8 +5647,25 @@ impl LanguageServer for Backend {
         // Phase 2: cross-file scope resolution and async package help fetch
         // without holding the WorldState lock.
         Ok(match prepared {
-            Some((prepared, snapshot)) => {
-                match handlers::signature_help_context_from_snapshot(&snapshot, &uri, prepared) {
+            Some((prepared, capture)) => {
+                let uri_for_task = uri.clone();
+                let ctx = match tokio::task::spawn_blocking(move || {
+                    let snapshot = capture.finish(&|| false);
+                    handlers::signature_help_context_from_snapshot(
+                        &snapshot,
+                        &uri_for_task,
+                        prepared,
+                    )
+                })
+                .await
+                {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        log::trace!("signature_help: spawn_blocking failed: {e}");
+                        return Err(tower_lsp::jsonrpc::Error::internal_error());
+                    }
+                };
+                match ctx {
                     Some(ctx) => handlers::resolve_signature_help(ctx).await,
                     None => None,
                 }
@@ -5704,33 +5704,77 @@ impl LanguageServer for Backend {
                 .uri
                 .clone();
             let position = params.text_document_position_params.position;
-            let snapshot =
-                handlers::CrossFileScopeSnapshot::build_with_cancel(&state, &uri, &|| {
-                    cancel.is_cancelled()
-                });
+            let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
             drop(state);
-            let result = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
-                &snapshot,
-                &uri,
-                position,
-                &prepared.path,
-                &prepared.rhs_name,
-                prepared.op,
-                &cancel,
-            )
-            .map(GotoDefinitionResponse::Scalar);
+            let cancel_for_task = cancel.clone();
+            let uri_for_task = uri.clone();
+            let result = tokio::select! {
+                joined = tokio::task::spawn_blocking(move || {
+                    let snapshot = capture.finish(&|| cancel_for_task.is_cancelled());
+                    crate::qualified_resolve::resolve_qualified_member_with_snapshot(
+                        &snapshot,
+                        &uri_for_task,
+                        position,
+                        &prepared.path,
+                        &prepared.rhs_name,
+                        prepared.op,
+                        &cancel_for_task,
+                    )
+                    .map(GotoDefinitionResponse::Scalar)
+                }) => match joined {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::trace!("goto_definition qualified: spawn_blocking failed: {e}");
+                        return Err(tower_lsp::jsonrpc::Error::internal_error());
+                    }
+                },
+                _ = cancel.cancelled() => return Err(JsonRpcError::request_cancelled()),
+            };
             if cancel.is_cancelled() {
                 return Err(JsonRpcError::request_cancelled());
             }
             return Ok(result);
         }
 
-        let result = handlers::goto_definition_with_cancel(
-            &state,
-            &params.text_document_position_params.text_document.uri,
-            params.text_document_position_params.position,
-            &cancel,
-        );
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
+        let position = params.text_document_position_params.position;
+        let prepared =
+            handlers::prepare_goto_definition_for_scope_snapshot(&state, &uri, position, &cancel);
+        let result = match prepared {
+            handlers::PreparedGotoDefinition::Immediate(response) => {
+                drop(state);
+                response
+            }
+            prepared @ handlers::PreparedGotoDefinition::Identifier(_) => {
+                let capture = handlers::CrossFileScopeSnapshot::capture(&state, &uri);
+                drop(state);
+                let cancel_for_task = cancel.clone();
+                let uri_for_task = uri.clone();
+                tokio::select! {
+                    joined = tokio::task::spawn_blocking(move || {
+                        let snapshot = capture.finish(&|| cancel_for_task.is_cancelled());
+                        handlers::goto_definition_from_scope_snapshot(
+                            &snapshot,
+                            &uri_for_task,
+                            position,
+                            prepared,
+                            &cancel_for_task,
+                        )
+                    }) => match joined {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::trace!("goto_definition identifier: spawn_blocking failed: {e}");
+                            return Err(tower_lsp::jsonrpc::Error::internal_error());
+                        }
+                    },
+                    _ = cancel.cancelled() => return Err(JsonRpcError::request_cancelled()),
+                }
+            }
+        };
         if cancel.is_cancelled() {
             return Err(JsonRpcError::request_cancelled());
         }
@@ -7509,28 +7553,8 @@ pub(crate) async fn prefetch_packages_for_open_documents(
     // with `raven check`'s `prefetch_reported_packages`). `full_imports` is
     // empty outside package mode, making this a no-op there.
     all_pkgs.extend(probe.scope_contribution.full_imports.iter().cloned());
-    let empty_base_exports = std::collections::HashSet::new();
-    let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
-    let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
     for (uri, line) in &probe.docs {
-        let scope = crate::cross_file::scope::scope_at_position_with_graph(
-            uri,
-            *line,
-            u32::MAX,
-            &get_artifacts,
-            &get_metadata,
-            &probe.graph,
-            probe.workspace_folder.as_ref(),
-            probe.max_chain_depth,
-            &empty_base_exports,
-            false,
-            probe.backward_dependencies,
-            &|| false,
-            Some(&probe.scope_contribution),
-            // Probe reads only packages, not `scope.symbols`; no `data()`
-            // alias expansion needed (issue #429).
-            None,
-        );
+        let scope = probe.scope_at(uri, *line);
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
         }
@@ -7708,10 +7732,45 @@ pub(crate) struct ScopeProbeSnapshot {
     /// function-local `library()` calls that the EOF scope probe misses).
     pub(crate) doc_loaded_packages: std::collections::HashMap<Url, Vec<String>>,
     pub(crate) graph: crate::cross_file::dependency::DependencyGraph,
+    pub(crate) cross_file_edge_revision: u64,
+    pub(crate) standalone_scope_invalidation_generation: u64,
+    pub(crate) standalone_scope_cache: Arc<crate::cross_file::scope::StandaloneScopeCache>,
     pub(crate) workspace_folder: Option<Url>,
     pub(crate) max_chain_depth: usize,
     pub(crate) backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+}
+
+impl ScopeProbeSnapshot {
+    fn scope_at(&self, uri: &Url, line: u32) -> crate::cross_file::scope::ScopeAtPosition {
+        let get_artifacts = |target_uri: &Url| self.artifacts_map.get(target_uri).cloned();
+        let get_metadata = |target_uri: &Url| self.metadata_map.get(target_uri).cloned();
+        let empty_base_exports = std::collections::HashSet::new();
+        let standalone_cache_context = crate::cross_file::scope::StandaloneScopeCacheContext::new(
+            &self.standalone_scope_cache,
+            self.cross_file_edge_revision,
+            self.standalone_scope_invalidation_generation,
+        );
+        crate::cross_file::scope::scope_at_position_with_graph_with_standalone_cache(
+            uri,
+            line,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &self.graph,
+            self.workspace_folder.as_ref(),
+            self.max_chain_depth,
+            &empty_base_exports,
+            false,
+            self.backward_dependencies,
+            &|| false,
+            Some(&self.scope_contribution),
+            // Probe reads only packages, not `scope.symbols`; no `data()` alias
+            // expansion needed (issue #429).
+            None,
+            Some(standalone_cache_context),
+        )
+    }
 }
 
 /// State-side preparation for a `LibpathEvent::Dropped`: clears the package
@@ -7869,7 +7928,6 @@ async fn run_libpath_consumer(
                 // compute [...] from the snapshot." Holding the lock across N
                 // cross-file scope resolutions can starve `did_change`
                 // writers in workspaces with many open files.
-                use std::collections::HashSet;
                 let probe = {
                     let state = state_arc.read().await;
 
@@ -7885,38 +7943,11 @@ async fn run_libpath_consumer(
                     state.build_package_scope_snapshot(&docs)
                 };
 
-                let get_artifacts =
-                    |target_uri: &Url| -> Option<Arc<crate::cross_file::scope::ScopeArtifacts>> {
-                        probe.artifacts_map.get(target_uri).cloned()
-                    };
-                let get_metadata = |target_uri: &Url| -> Option<
-                    std::sync::Arc<crate::cross_file::CrossFileMetadata>,
-                > {
-                    probe.metadata_map.get(target_uri).cloned()
-                };
-                let empty_base_exports: HashSet<String> = HashSet::new();
                 let mut affected_uris: Vec<Url> = probe
                     .docs
                     .iter()
                     .filter_map(|(uri, line)| {
-                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                            uri,
-                            *line,
-                            u32::MAX,
-                            &get_artifacts,
-                            &get_metadata,
-                            &probe.graph,
-                            probe.workspace_folder.as_ref(),
-                            probe.max_chain_depth,
-                            &empty_base_exports,
-                            false,
-                            probe.backward_dependencies,
-                            &|| false,
-                            Some(&probe.scope_contribution),
-                            // Probe reads only packages, not `scope.symbols`;
-                            // no `data()` alias expansion needed (issue #429).
-                            None,
-                        );
+                        let scope = probe.scope_at(uri, *line);
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
                         // includes function-local library() calls the EOF scope
@@ -10608,10 +10639,6 @@ mod refresh_packages_tests {
             "closed parent must be included in snapshot metadata_map"
         );
 
-        // Verify scope resolution using the snapshot discovers inherited packages.
-        let get_artifacts = |u: &Url| snapshot.artifacts_map.get(u).cloned();
-        let get_metadata = |u: &Url| snapshot.metadata_map.get(u).cloned();
-
         // Debug: check child artifacts have source() in timeline
         let child_arts = snapshot.artifacts_map.get(&child_uri);
         assert!(
@@ -10640,8 +10667,6 @@ mod refresh_packages_tests {
             assert_eq!(dep.to, parent_uri, "edge must point to parent");
         }
 
-        let empty_base: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         // Debug: check parent artifacts have PackageLoad event
         let parent_arts = snapshot.artifacts_map.get(&parent_uri).unwrap();
         assert!(
@@ -10651,22 +10676,7 @@ mod refresh_packages_tests {
                 .any(|e| { matches!(e, crate::cross_file::scope::ScopeEvent::PackageLoad { .. }) }),
             "parent must have PackageLoad event"
         );
-        let scope = crate::cross_file::scope::scope_at_position_with_graph(
-            &child_uri,
-            1,
-            u32::MAX,
-            &get_artifacts,
-            &get_metadata,
-            &snapshot.graph,
-            snapshot.workspace_folder.as_ref(),
-            snapshot.max_chain_depth,
-            &empty_base,
-            false,
-            snapshot.backward_dependencies,
-            &|| false,
-            Some(&snapshot.scope_contribution),
-            None,
-        );
+        let scope = snapshot.scope_at(&child_uri, 1);
         // dplyr appears in loaded_packages (from forward source() chain),
         // not inherited_packages (which come from backward/parent edges).
         let all_packages: std::collections::HashSet<&String> = scope
@@ -10680,6 +10690,147 @@ mod refresh_packages_tests {
              inherited={:?}, loaded={:?}",
             scope.inherited_packages,
             scope.loaded_packages
+        );
+    }
+
+    #[test]
+    fn package_scope_snapshot_includes_active_standalone_members() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+        use crate::cross_file::types::CrossFileMetadata;
+        use crate::state::{Document, WorldState};
+        use crate::workspace_index::IndexEntry;
+        use ropey::Rope;
+        use std::time::SystemTime;
+
+        fn parse_r_code(code: &str) -> tree_sitter::Tree {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        }
+
+        fn index_closed_file(
+            state: &mut WorldState,
+            workspace_root: &Url,
+            uri: &Url,
+            code: &str,
+            metadata: CrossFileMetadata,
+        ) {
+            state
+                .cross_file_graph
+                .update_file(uri, &metadata, Some(workspace_root), |_| None);
+            let tree = parse_r_code(code);
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
+            ));
+            let metadata = Arc::new(metadata);
+            let entry = IndexEntry {
+                contents: Rope::from_str(code),
+                tree: Some(tree),
+                loaded_packages: Vec::new(),
+                snapshot: FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: code.len() as u64,
+                    content_hash: None,
+                },
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        }
+
+        let mut state = WorldState::new();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        state.workspace_folders.push(workspace_root.clone());
+
+        let c = Url::parse("file:///project/c/c.R").unwrap();
+        let m = Url::parse("file:///project/m/m.R").unwrap();
+        let active_leaf = Url::parse("file:///project/c/leaf.R").unwrap();
+        let graph_leaf = Url::parse("file:///project/outside/leaf.R").unwrap();
+
+        let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
+        let m_code = "source(\"leaf.R\")\n";
+        let active_leaf_code = "library(dplyr)\nleaf_sym <- 1\n";
+        let graph_leaf_code = "outside_leaf <- 1\n";
+
+        state
+            .documents
+            .insert(c.clone(), Document::new(c_code, None));
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        state
+            .cross_file_graph
+            .update_file(&c, &c_meta, Some(&workspace_root), |_| None);
+
+        let mut m_meta = crate::cross_file::extract_metadata(m_code);
+        m_meta.inherited_working_directory = Some("/project/outside".to_string());
+        index_closed_file(&mut state, &workspace_root, &m, m_code, m_meta);
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &active_leaf,
+            active_leaf_code,
+            CrossFileMetadata::default(),
+        );
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &graph_leaf,
+            graph_leaf_code,
+            CrossFileMetadata::default(),
+        );
+
+        let payload = state.cross_file_graph.cached_neighborhood_subgraph(
+            &c,
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        );
+        assert!(
+            payload.neighborhood.contains(&graph_leaf),
+            "fixture sanity: graph neighborhood follows m.R's inherited outside working directory"
+        );
+        assert!(
+            !payload.neighborhood.contains(&active_leaf),
+            "fixture sanity: active standalone leaf is outside the graph neighborhood"
+        );
+
+        let state = std::sync::RwLock::new(state);
+        let snapshot = {
+            let guard = state.read().expect("state read lock");
+            guard.build_package_scope_snapshot(&[(c.clone(), u32::MAX)])
+        };
+        let write_guard = state
+            .try_write()
+            .expect("package-scope snapshot must not keep a WorldState read guard alive");
+        assert!(
+            snapshot.artifacts_map.contains_key(&active_leaf),
+            "package-scope probes must precollect active standalone closure targets"
+        );
+
+        let scope = snapshot.scope_at(&c, u32::MAX);
+        let hit_scope = snapshot.scope_at(&c, u32::MAX);
+        drop(write_guard);
+        let all_packages: std::collections::HashSet<&String> = scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+            .collect();
+        assert!(
+            all_packages.contains(&"dplyr".to_string()),
+            "package-scope probe must see packages loaded through active standalone closure; \
+             inherited={:?}, loaded={:?}",
+            scope.inherited_packages,
+            scope.loaded_packages
+        );
+        assert!(
+            hit_scope.loaded_packages.contains("dplyr")
+                || hit_scope.inherited_packages.contains("dplyr"),
+            "package-scope probe cache hit must also run without a WorldState read guard"
         );
     }
 
@@ -11419,6 +11570,7 @@ mod refresh_packages_tests {
 #[cfg(test)]
 mod project_config_initialize_tests {
     use super::*;
+    use crate::state::Document;
     use std::fs;
     use tempfile::TempDir;
     use tower_lsp::lsp_types::{
@@ -12791,6 +12943,32 @@ lineLength = 200
         );
     }
 
+    fn assert_goto_response_uri_ends_with(
+        response: &tower_lsp::lsp_types::GotoDefinitionResponse,
+        expected_suffix: &str,
+    ) {
+        let location = match response {
+            tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(location) => location,
+            tower_lsp::lsp_types::GotoDefinitionResponse::Array(locations) => locations
+                .first()
+                .expect("expected at least one goto-definition location"),
+            tower_lsp::lsp_types::GotoDefinitionResponse::Link(links) => {
+                let link = links
+                    .first()
+                    .expect("expected at least one goto-definition link");
+                assert!(
+                    link.target_uri.path().ends_with(expected_suffix),
+                    "expected goto target to end with {expected_suffix}: {response:?}"
+                );
+                return;
+            }
+        };
+        assert!(
+            location.uri.path().ends_with(expected_suffix),
+            "expected goto target to end with {expected_suffix}: {response:?}"
+        );
+    }
+
     #[tokio::test]
     async fn qualified_member_completion_resolves_without_worldstate_read_guard() {
         let tmp = TempDir::new().unwrap();
@@ -12805,28 +12983,103 @@ lineLength = 200
         let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let position = Position::new(1, 4);
-        let (member_context, snapshot) = {
+        let (prepared, snapshot) = {
             let state = backend.state.read().await;
-            let member_context =
-                crate::handlers::prepare_dollar_member_completion(&state, &uri, position)
-                    .expect("dollar-member context must prepare under read lock");
+            let prepared = crate::handlers::prepare_completion_for_scope_snapshot(
+                &state, &uri, position, None,
+            );
+            assert!(
+                matches!(
+                    prepared,
+                    crate::handlers::PreparedScopeCompletion::DollarMember(_)
+                ),
+                "fixture should prepare a deferred dollar-member completion"
+            );
             let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
-            (member_context, snapshot)
+            (prepared, snapshot)
         };
 
         let _write_guard = backend
             .state
             .try_write()
             .expect("read guard must be released before snapshot scope resolution");
-        let items = crate::handlers::dollar_member_completion_items_from_snapshot(
-            &snapshot,
-            &uri,
-            position,
-            &member_context,
-        );
+        let response =
+            crate::handlers::completion_from_scope_snapshot(&snapshot, &uri, position, prepared);
+        let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response else {
+            panic!("expected dollar-member completion array");
+        };
         assert!(
             items.iter().any(|item| item.label == "bar"),
             "snapshot-qualified completion should resolve while WorldState is write-locked: {items:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_scope_snapshot_preserves_open_document_chunk_kind() {
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let raw = "prose_symbol <- 1\n```{r}\nchunk_symbol <- 2\n```\n";
+        let mut state = WorldState::new();
+        state.documents.insert(
+            uri.clone(),
+            Document::new_with_language_id(raw, Some(1), &uri, Some("rmd")),
+        );
+
+        let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+        let (analysis_text, _) = snapshot
+            .get_text_and_tree(&uri)
+            .expect("snapshot must retain text for the open untitled Rmd document");
+
+        assert!(
+            !analysis_text.contains("prose_symbol"),
+            "untitled Rmd prose must stay masked in snapshot analysis text: {analysis_text:?}"
+        );
+        assert!(
+            analysis_text.contains("chunk_symbol <- 2"),
+            "R chunk body must remain visible in snapshot analysis text: {analysis_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_member_goto_resolves_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nfoo <- list(bar = 1)\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nfoo$bar\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 5);
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_qualified_member_goto(&state, &uri, position)
+                .expect("qualified-member goto context must prepare under read lock");
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot qualified-member goto");
+        let location = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
+            &snapshot,
+            &uri,
+            position,
+            &prepared.path,
+            &prepared.rhs_name,
+            prepared.op,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .expect("qualified-member goto should resolve while WorldState is write-locked");
+        drop(write_guard);
+
+        assert!(
+            location.uri.path().ends_with("child.R"),
+            "qualified-member goto should navigate to the standalone child: {location:?}"
         );
     }
 
@@ -12891,6 +13144,87 @@ lineLength = 200
         assert!(
             cache_hits > 0,
             "second identifier completion should hit the persistent standalone cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn identifier_goto_resolves_standalone_cache_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_sym <- 1\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchild_sym\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 2);
+
+        {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_goto_definition_for_scope_snapshot(
+                &state,
+                &uri,
+                position,
+                &crate::handlers::DiagCancelToken::never(),
+            );
+            assert!(
+                matches!(
+                    prepared,
+                    crate::handlers::PreparedGotoDefinition::Identifier(_)
+                ),
+                "fixture should take the scope-backed identifier goto path"
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let response = crate::handlers::goto_definition_from_scope_snapshot(
+                &snapshot,
+                &uri,
+                position,
+                prepared,
+                &crate::handlers::DiagCancelToken::never(),
+            )
+            .expect("warm-up identifier goto should resolve");
+            assert_goto_response_uri_ends_with(&response, "child.R");
+        }
+
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared = crate::handlers::prepare_goto_definition_for_scope_snapshot(
+                &state,
+                &uri,
+                position,
+                &crate::handlers::DiagCancelToken::never(),
+            );
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot identifier goto");
+        let response = crate::handlers::goto_definition_from_scope_snapshot(
+            &snapshot,
+            &uri,
+            position,
+            prepared,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .expect("identifier goto should resolve while WorldState is write-locked");
+        drop(write_guard);
+        assert_goto_response_uri_ends_with(&response, "child.R");
+
+        let cache_hits = backend
+            .state
+            .read()
+            .await
+            .standalone_scope_cache
+            .stats_for_test()
+            .0;
+        assert!(
+            cache_hits > 0,
+            "second identifier goto should hit the persistent standalone cache"
         );
     }
 
@@ -13006,6 +13340,84 @@ lineLength = 200
                 .iter()
                 .any(|sig| sig.label.contains("alpha")),
             "signature help should include the cross-file function parameters: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hover_resolves_standalone_function_without_worldstate_read_guard() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "# raven: standalone\nchild_fn <- function(alpha) alpha\n",
+        )
+        .unwrap();
+        let parent = "source(\"child.R\")\nchild_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let position = Position::new(1, 1);
+        let (prepared, snapshot) = {
+            let state = backend.state.read().await;
+            let prepared =
+                crate::handlers::prepare_hover_for_scope_snapshot(&state, &uri, position)
+                    .expect("hover context should prepare");
+            let snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            (prepared, snapshot)
+        };
+
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("read guard must be released before snapshot hover");
+        let hover = crate::handlers::hover_from_scope_snapshot(&snapshot, &uri, prepared)
+            .await
+            .expect("hover should resolve while WorldState is write-locked");
+        drop(write_guard);
+
+        let rendered = format!("{hover:?}");
+        assert!(
+            rendered.contains("child_fn <- function"),
+            "hover should include the cross-file definition: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_hover_uses_fast_path_without_scope_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let code = "nosuchpkg::foo()\n";
+        fs::write(tmp.path().join("main.R"), code).unwrap();
+
+        let (svc, uri) = open_in_workspace(&tmp, "main.R", "r", code).await;
+        let backend = svc.inner();
+        let position = Position::new(0, 2);
+
+        let namespace = {
+            let state = backend.state.read().await;
+            let prepared =
+                crate::handlers::prepare_hover_for_scope_snapshot(&state, &uri, position)
+                    .expect("namespace hover context should prepare");
+            match crate::handlers::split_prepared_hover(&state, prepared) {
+                crate::handlers::PreparedHoverResolution::Namespace(ctx) => ctx,
+                crate::handlers::PreparedHoverResolution::Scope(_) => {
+                    panic!("namespace hover must bypass scope snapshot construction")
+                }
+            }
+        };
+
+        let write_guard = backend
+            .state
+            .try_write()
+            .expect("namespace hover fast path must release the WorldState read guard");
+        let hover = crate::handlers::resolve_namespace_hover(namespace)
+            .await
+            .expect("namespace hover should resolve without a scope snapshot");
+        drop(write_guard);
+
+        let rendered = format!("{hover:?}");
+        assert!(
+            rendered.contains("Package `nosuchpkg` is not installed."),
+            "namespace hover should use package-side rendering: {rendered}"
         );
     }
 

@@ -161,7 +161,8 @@ interface of the hub or any file in its forward closure. Diagnostics for the
 standalone file itself remain position-aware; Raven does not replace the whole
 timeline with an EOF cache hit. Reuse is conservative: dependency-edge changes
 anywhere in the workspace, path-context changes, package fact/library refreshes,
-package/scope configuration changes, and max-depth changes force a recompute. If
+package/scope configuration changes, and traversal-budget changes
+(`maxChainDepth` or `maxTransitiveDependentsVisited`) force a recompute. If
 a non-standalone file in the hub's forward closure is also sourced from outside
 that closure, the outside parent is not allowed to shape the standalone hub's
 isolated scope.

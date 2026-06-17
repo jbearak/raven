@@ -1602,6 +1602,7 @@ fn standalone_scope_cache_disabled() -> bool {
 struct StandaloneClosureFingerprint {
     interface_fingerprint: u64,
     resolved_members: Vec<Url>,
+    visited_context_count: usize,
     /// Whether this isolated closure may be persisted cross-snapshot. `false`
     /// still applies the per-query standalone closure context, but skips the
     /// persistent cache lookup/store. Ineligible cases: missing active member
@@ -1629,6 +1630,7 @@ struct StandaloneClosureContext {
     /// keys; this is intentionally broader than a plain parent allow-list hash.
     context_fingerprint: u64,
     active_edges_by_child: HashMap<Url, Vec<ActiveStandaloneEdge>>,
+    path_contexts: HashMap<Url, super::path_resolve::PathContext>,
     active_edges_have_cycle: bool,
 }
 
@@ -1642,6 +1644,10 @@ impl StandaloneClosureContext {
             .get(uri)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    fn path_context_for(&self, uri: &Url) -> Option<&super::path_resolve::PathContext> {
+        self.path_contexts.get(uri)
     }
 
     fn has_active_cycle(&self) -> bool {
@@ -1805,6 +1811,7 @@ where
     Some(StandaloneClosureFingerprint {
         interface_fingerprint: h.finish(),
         resolved_members,
+        visited_context_count: seen_contexts.len(),
         persistent_cacheable: all_members_resolved
             && !ambiguous_path_contexts
             && !active_edges_have_cycle,
@@ -1812,6 +1819,7 @@ where
             context_fingerprint,
             member_set,
             active_edges_by_child,
+            path_contexts,
             active_edges_have_cycle,
         },
     })
@@ -1827,17 +1835,25 @@ where
 /// live content provider, so diagnostics and qualified-member requests copy any
 /// such active-only targets into their immutable snapshot maps before scope
 /// resolution runs lock-free.
-pub(crate) struct StandaloneActiveClosureSnapshotInputs<'a> {
+pub(crate) struct StandaloneActiveSnapshotMembersInputs<'a> {
     pub(crate) graph: &'a super::dependency::DependencyGraph,
     pub(crate) max_depth: usize,
     pub(crate) max_visited: usize,
     pub(crate) workspace_root: Option<&'a Url>,
+    pub(crate) seed_uris: &'a [Url],
     pub(crate) is_cancelled: &'a dyn Fn() -> bool,
 }
 
-pub(crate) fn standalone_active_closure_members_for_snapshot<F, G>(
-    callee_uri: &Url,
-    inputs: &StandaloneActiveClosureSnapshotInputs<'_>,
+/// Expand a snapshot URI set with active standalone closure members.
+///
+/// The caller supplies the URI set it will materialize. This helper spends the
+/// shared traversal budget once across all standalone seeds, tracks members
+/// seen by earlier walks, and returns only newly inserted URIs so callers can
+/// precollect artifacts/text and decide whether the trimmed graph must be
+/// re-extracted.
+pub(crate) fn standalone_active_snapshot_members<F, G>(
+    inputs: StandaloneActiveSnapshotMembersInputs<'_>,
+    snapshot_uris: &mut HashSet<Url>,
     get_artifacts: &F,
     get_metadata: &G,
 ) -> Vec<Url>
@@ -1845,29 +1861,78 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
-    if (inputs.is_cancelled)() || !get_metadata(callee_uri).is_some_and(|m| m.standalone) {
-        return Vec::new();
+    use std::collections::VecDeque;
+
+    let mut extra_uris = Vec::new();
+    let mut active_seen = HashSet::new();
+    let mut walked_roots = HashSet::new();
+    let mut queued_roots: HashSet<Url> = inputs.seed_uris.iter().cloned().collect();
+    let mut root_queue: VecDeque<Url> = inputs.seed_uris.iter().cloned().collect();
+    let mut remaining_extra = inputs.max_visited.saturating_sub(snapshot_uris.len());
+    let mut remaining_walk_visits = inputs.max_visited;
+    if remaining_extra == 0 || (inputs.is_cancelled)() {
+        return extra_uris;
     }
 
-    let root_path_ctx = own_path_context_for_uri(callee_uri, get_metadata, inputs.workspace_root);
-    let Some(closure) = standalone_closure_fingerprint_and_members(
-        callee_uri,
-        inputs.graph,
-        inputs.max_depth,
-        0,
-        get_artifacts,
-        get_metadata,
-        inputs.workspace_root,
-        root_path_ctx.as_ref(),
-        inputs.is_cancelled,
-        Some(inputs.max_visited),
-    ) else {
-        return Vec::new();
-    };
+    while let Some(seed_uri) = root_queue.pop_front() {
+        if active_seen.len() >= inputs.max_visited
+            || remaining_extra == 0
+            || remaining_walk_visits == 0
+            || (inputs.is_cancelled)()
+        {
+            break;
+        }
+        if !walked_roots.insert(seed_uri.clone()) {
+            continue;
+        }
+        if !get_metadata(&seed_uri).is_some_and(|metadata| metadata.standalone) {
+            continue;
+        }
 
-    let mut members: Vec<Url> = closure.context.member_set.into_iter().collect();
-    members.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-    members
+        let walk_budget = remaining_extra.saturating_add(1).min(remaining_walk_visits);
+        if walk_budget == 0 {
+            break;
+        }
+
+        let root_path_ctx =
+            own_path_context_for_uri(&seed_uri, get_metadata, inputs.workspace_root);
+        let Some(closure) = standalone_closure_fingerprint_and_members(
+            &seed_uri,
+            inputs.graph,
+            inputs.max_depth,
+            0,
+            get_artifacts,
+            get_metadata,
+            inputs.workspace_root,
+            root_path_ctx.as_ref(),
+            inputs.is_cancelled,
+            Some(walk_budget),
+        ) else {
+            continue;
+        };
+        remaining_walk_visits = remaining_walk_visits.saturating_sub(closure.visited_context_count);
+
+        let mut members: Vec<Url> = closure.context.member_set.iter().cloned().collect();
+        members.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        for member in members {
+            if get_metadata(&member).is_some_and(|metadata| metadata.standalone)
+                && !walked_roots.contains(&member)
+                && queued_roots.insert(member.clone())
+            {
+                root_queue.push_back(member.clone());
+            }
+            active_seen.insert(member.clone());
+            if snapshot_uris.insert(member.clone()) {
+                extra_uris.push(member);
+                remaining_extra -= 1;
+                if remaining_extra == 0 {
+                    return extra_uris;
+                }
+            }
+        }
+    }
+
+    extra_uris
 }
 
 fn scope_chain_covers_members(scope: &ScopeAtPosition, members: &[Url]) -> bool {
@@ -6382,27 +6447,40 @@ where
     // so that `line=eof` correctly includes symbols from later sources.
     let mut parent_edge_indices: HashMap<(Url, u64), usize> = HashMap::new();
     let mut parent_edges: Vec<ParentEdgeCandidate> = Vec::new();
-    let active_edges = standalone_closure_context
-        .map(|ctx| ctx.active_edges_to(uri))
-        .unwrap_or(&[]);
-    let active_parent_uris: HashSet<Url> = active_edges
-        .iter()
-        .map(|active_edge| active_edge.edge.from.clone())
-        .collect();
-    let mut candidate_edges: Vec<ParentEdgeCandidate> = graph
-        .get_dependents(uri)
-        .into_iter()
-        .filter(|edge| {
-            standalone_closure_context.is_none()
-                || !active_parent_uris.contains(&edge.from)
-                || edge.is_backward_directive
-        })
-        .cloned()
-        .map(|edge| ParentEdgeCandidate {
-            edge,
-            parent_path_context: None,
-        })
-        .collect();
+    let mut candidate_edges: Vec<ParentEdgeCandidate> =
+        if let Some(ctx) = standalone_closure_context {
+            graph
+                .get_dependents(uri)
+                .into_iter()
+                .filter_map(|edge| {
+                    // In an active standalone closure, graph-derived source edges
+                    // may have been indexed under an inherited/global path context
+                    // that the isolated closure deliberately ignores. Only the
+                    // source edges recorded by the active closure walk below are
+                    // trusted. Backward directives are already explicit parent
+                    // declarations; when they point at an in-closure parent, keep
+                    // them even if an active source edge from the same parent also
+                    // exists so Explicit/Auto backward modes can still honor the
+                    // directive's call-site boundary.
+                    if !edge.is_backward_directive || !ctx.contains(&edge.from) {
+                        return None;
+                    }
+                    Some(ParentEdgeCandidate {
+                        edge: edge.clone(),
+                        parent_path_context: ctx.path_context_for(&edge.from).cloned(),
+                    })
+                })
+                .collect()
+        } else {
+            graph
+                .get_dependents(uri)
+                .into_iter()
+                .map(|edge| ParentEdgeCandidate {
+                    edge: edge.clone(),
+                    parent_path_context: None,
+                })
+                .collect()
+        };
     if let Some(ctx) = standalone_closure_context {
         candidate_edges.extend(ctx.active_edges_to(uri).iter().map(|active_edge| {
             ParentEdgeCandidate {
@@ -10703,6 +10781,100 @@ mod tests {
     }
 
     #[test]
+    fn standalone_active_snapshot_walks_seed_even_when_seen_as_member() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let b_uri = Url::parse("file:///project/b.R").unwrap();
+        let m_uri = Url::parse("file:///project/m.R").unwrap();
+        let leaf_uri = Url::parse("file:///project/leaf.R").unwrap();
+
+        let files: Vec<(Url, &str, CrossFileMetadata)> = vec![
+            (
+                a_uri.clone(),
+                "# raven: standalone\nsource(\"b.R\")\n",
+                CrossFileMetadata {
+                    standalone: true,
+                    sources: vec![ForwardSource {
+                        path: "b.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                b_uri.clone(),
+                "# raven: standalone\nsource(\"m.R\")\n",
+                CrossFileMetadata {
+                    standalone: true,
+                    sources: vec![ForwardSource {
+                        path: "m.R".to_string(),
+                        line: 1,
+                        column: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                m_uri.clone(),
+                "source(\"leaf.R\")\n",
+                CrossFileMetadata {
+                    sources: vec![ForwardSource {
+                        path: "leaf.R".to_string(),
+                        line: 0,
+                        column: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                leaf_uri.clone(),
+                "leaf_value <- 1\n",
+                CrossFileMetadata::default(),
+            ),
+        ];
+
+        let mut artifacts = HashMap::new();
+        let mut metadata = HashMap::new();
+        let mut graph = DependencyGraph::new();
+        for (uri, code, meta) in &files {
+            let tree = parse_r(code);
+            artifacts.insert(uri.clone(), Arc::new(compute_artifacts(uri, &tree, code)));
+            let meta = Arc::new(meta.clone());
+            metadata.insert(uri.clone(), meta.clone());
+            graph.update_file(uri, &meta, Some(&workspace_root), |_| None);
+        }
+
+        let mut snapshot_uris = HashSet::from([a_uri.clone(), b_uri.clone(), m_uri.clone()]);
+        let seed_uris = vec![a_uri.clone(), b_uri.clone()];
+        let extras = standalone_active_snapshot_members(
+            StandaloneActiveSnapshotMembersInputs {
+                graph: &graph,
+                max_depth: 3,
+                max_visited: 16,
+                workspace_root: Some(&workspace_root),
+                seed_uris: &seed_uris,
+                is_cancelled: &|| false,
+            },
+            &mut snapshot_uris,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+        );
+
+        assert!(
+            extras.contains(&leaf_uri),
+            "b.R must still be walked as its own standalone root even after a.R's closure saw it as a member"
+        );
+        assert!(snapshot_uris.contains(&leaf_uri));
+    }
+
+    #[test]
     fn test_interface_hash_changes() {
         let code1 = "x <- 1";
         let code2 = "x <- 1\ny <- 2";
@@ -12072,20 +12244,21 @@ child_sym <- api_obj + census_obj\n";
         let c_code = "# raven: standalone\nsource(\"../a/a.R\", chdir = TRUE)\n";
         let a_code = "source(\"pre.R\")\nsource(\"m.R\")\n";
         let active_pre_code = "a_sym <- 1\n";
-        let active_m_code = "m_sym <- a_sym\n";
+        let active_m_code = "# raven: sourced-by a.R\nm_sym <- a_sym\n";
         let outside_pre_code = "outside_sym <- 1\n";
         let outside_m_code = "outside_m <- 1\n";
 
         let c_meta = crate::cross_file::extract_metadata(c_code);
         let mut a_meta = crate::cross_file::extract_metadata(a_code);
         a_meta.inherited_working_directory = Some("/project/outside".to_string());
+        let active_m_meta = crate::cross_file::extract_metadata(active_m_code);
 
         let mut metadata: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
         for (uri, meta) in [
             (c.clone(), c_meta),
             (a.clone(), a_meta),
             (active_pre.clone(), CrossFileMetadata::default()),
-            (active_m.clone(), CrossFileMetadata::default()),
+            (active_m.clone(), active_m_meta),
             (outside_pre.clone(), CrossFileMetadata::default()),
             (outside_m.clone(), CrossFileMetadata::default()),
         ] {
@@ -12127,8 +12300,15 @@ child_sym <- api_obj + census_obj\n";
             !graph
                 .get_dependents(&active_m)
                 .iter()
-                .any(|edge| edge.from == a),
-            "fixture sanity: active a.R -> m.R edge is absent from the global graph"
+                .any(|edge| edge.from == a && !edge.is_backward_directive),
+            "fixture sanity: active a.R -> m.R source edge is absent from the global graph"
+        );
+        assert!(
+            graph
+                .get_dependents(&active_m)
+                .iter()
+                .any(|edge| edge.from == a && edge.is_backward_directive),
+            "fixture sanity: active_m.R has an explicit backward directive to a.R"
         );
 
         let get_artifacts =
@@ -12189,6 +12369,125 @@ child_sym <- api_obj + census_obj\n";
         assert!(
             !prefix.symbols.contains_key("outside_sym"),
             "active parent context must not reuse a.R's globally indexed outside inherited WD"
+        );
+    }
+
+    #[test]
+    fn standalone_member_parent_prefix_rejects_non_active_graph_source_edge() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let c = Url::parse("file:///project/c/c.R").unwrap();
+        let p = Url::parse("file:///project/active/p.R").unwrap();
+        let active_m = Url::parse("file:///project/active/m.R").unwrap();
+        let global_m = Url::parse("file:///project/global/m.R").unwrap();
+
+        let c_code = "# raven: standalone\nsource(\"../global/m.R\")\nsource(\"../active/p.R\", chdir = TRUE)\n";
+        let p_code = "p_sym <- 1\nsource(\"m.R\")\n";
+        let active_m_code = "active_m <- 1\n";
+        let global_m_code = "global_m <- 1\n";
+
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        let mut p_meta = crate::cross_file::extract_metadata(p_code);
+        p_meta.inherited_working_directory = Some("/project/global".to_string());
+
+        let mut metadata: HashMap<Url, std::sync::Arc<CrossFileMetadata>> = HashMap::new();
+        for (uri, meta) in [
+            (c.clone(), c_meta),
+            (p.clone(), p_meta),
+            (active_m.clone(), CrossFileMetadata::default()),
+            (global_m.clone(), CrossFileMetadata::default()),
+        ] {
+            metadata.insert(uri, Arc::new(meta));
+        }
+
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        for (uri, code) in [
+            (&c, c_code),
+            (&p, p_code),
+            (&active_m, active_m_code),
+            (&global_m, global_m_code),
+        ] {
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    uri,
+                    &parse_r(code),
+                    code,
+                    Some(metadata[uri].as_ref()),
+                )),
+            );
+        }
+
+        let mut graph = DependencyGraph::new();
+        for uri in [&c, &p, &active_m, &global_m] {
+            graph.update_file(uri, &metadata[uri], Some(&workspace_root), |_| None);
+        }
+        assert!(
+            graph
+                .get_dependencies(&p)
+                .iter()
+                .any(|edge| edge.to == global_m),
+            "fixture sanity: globally indexed p.R source() points at global/m.R"
+        );
+
+        let get_artifacts =
+            |target: &Url| -> Option<Arc<ScopeArtifacts>> { artifacts.get(target).cloned() };
+        let get_metadata = |target: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            metadata.get(target).cloned()
+        };
+        let root_ctx = own_path_context_for_uri(&c, &get_metadata, Some(&workspace_root));
+        let closure = standalone_closure_fingerprint_and_members(
+            &c,
+            &graph,
+            64,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            Some(&workspace_root),
+            root_ctx.as_ref(),
+            &|| false,
+            None,
+        )
+        .expect("closure should compute");
+        assert!(closure.context.contains(&p));
+        assert!(closure.context.contains(&active_m));
+        assert!(closure.context.contains(&global_m));
+        assert!(
+            closure
+                .context
+                .active_edges_to(&global_m)
+                .iter()
+                .all(|active_edge| active_edge.edge.from != p),
+            "fixture sanity: p.R -> global/m.R is not an active standalone edge"
+        );
+
+        let mut visited = HashMap::new();
+        visited.insert(global_m.clone(), (u32::MAX, u32::MAX));
+        let prefix = parent_prefix_at(
+            &global_m,
+            false,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            64,
+            1,
+            &mut visited,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&closure.context),
+            &std::cell::RefCell::new(ForwardChildMemo::default()),
+            None,
+        );
+
+        assert!(
+            !prefix.symbols.contains_key("p_sym"),
+            "an in-closure parent must not contribute through a graph source edge that was not part of the active standalone closure"
         );
     }
 

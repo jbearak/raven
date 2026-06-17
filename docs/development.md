@@ -249,10 +249,11 @@ diagnostics and scope-bearing interactive paths clone that `Arc`, plus the
 current edge revision and standalone-scope invalidation generation, while
 holding the `WorldState` read lock and then drop the guard before resolving
 scope. Converted interactive paths include identifier completion, parameter
-completion, signature help, diagnostics, and qualified-member completion/hover/
-go-to-definition. General hover/go-to-definition still have legacy direct-scope
-branches; do not add persistent cache lookup/store to a path that still holds
-the `WorldState` guard. The key is the standalone callee URI, graph edge
+completion, signature help, diagnostics, hover, qualified-member completion/
+go-to-definition, general identifier go-to-definition, and package-scope probes
+used by package prefetch/libpath affected-document filtering. Do not add
+persistent cache lookup/store to a path that still holds the `WorldState` guard.
+The key is the standalone callee URI, graph edge
 revision, the callee's path-context fingerprint, a scope-flavor fingerprint
 (ordinary forward-child vs. root EOF with depth-0 base exports), a hash of the
 `interface_hash` values for the callee plus its forward closure (walked through
@@ -276,7 +277,11 @@ cross-snapshot cache lookup/store.
 Snapshots also materialize active standalone-closure targets discovered through
 those path contexts, even when the globally indexed dependency neighborhood
 points at a different URI. This keeps the later lock-free scope resolution
-complete without reacquiring `WorldState`.
+complete without reacquiring `WorldState` while remaining bounded: active-only
+members are precollected only within the remaining traversal budget and while
+the request is not cancelled. If that budget is saturated, the snapshot omits
+those active-only extras in the safe direction rather than reacquiring
+`WorldState` during scope resolution.
 
 While computing a standalone callee's isolated scope, recursive parent-prefix
 walks for non-standalone members of the callee's forward closure are restricted

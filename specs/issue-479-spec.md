@@ -310,7 +310,7 @@ it MUST feed `compute_interface_hash`; toggling the directive in any connected
 file revalidates dependents. The metadata-free hash path passes `false`; the
 metadata-aware path passes `metadata.standalone`.
 
-### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — MEASURE-GATED
+### WI2b — persistent isolated-scope cache (the cross-snapshot/IDE win) — IMPLEMENTED; PR MEASUREMENTS PENDING
 
 Knob 1 (WI2a) makes C's direct caller inputs independent. WI2b caches C's
 isolated EOF scope when the whole forward closure is likewise caller-independent
@@ -378,8 +378,9 @@ standalone_scope_invalidation_generation)`:
   `DataAliasProvider` lookups for standalone-local `data()` alias expansion.
 - `standalone_scope_invalidation_generation`: a coarse counter bumped whenever the package
   library or relevant config changes (R re-init, `packages_*` settings,
-  `maxChainDepth`). C's isolated scope also depends on `base_exports` /
-  package-library state / config, which the other key components do not capture.
+  `maxChainDepth`, `maxTransitiveDependentsVisited`). C's isolated scope also
+  depends on `base_exports` / package-library state / config, which the other
+  key components do not capture.
 
 The resolver applies the standalone closure context even when a value is not
 eligible for persistence. It deliberately skips the cross-snapshot cache when
@@ -390,7 +391,10 @@ resolution graph handed to the scope query is cyclic, matching the per-query
 forward-child memo boundary where traversal history can affect a child scope.
 Diagnostic and interactive snapshots precollect active standalone-closure
 members discovered through the same path-context walk, even when those members
-are outside the trimmed graph neighborhood.
+are outside the trimmed graph neighborhood. This precollection is bounded by the
+remaining traversal budget and request cancellation; when the snapshot is
+saturated it omits active-only extras in the safe direction instead of
+reacquiring `WorldState` during lock-free scope resolution.
 
 **Why `interface_hash`, not source-text (decision revised after review).** The
 dominant IDE editing pattern on a hub workspace is editing a caller of the hub,
@@ -507,7 +511,9 @@ read locks `peek()` (no promotion), write locks `push()`.
   prerequisite).
 - On worldwide: add `# raven: standalone` to `scripts/functions.r` (and/or
   `bootstrap.r` per measurement), re-measure `functions.r` and `raven check .`,
-  report deltas. Diagnostics byte-identical except in the directive-bearing file.
+  report deltas in the #483 PR. Diagnostics byte-identical except in the
+  directive-bearing file; cache-on and cache-off builds for the same directive
+  setup must also match.
 
 ---
 

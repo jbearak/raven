@@ -26,45 +26,11 @@ use crate::utf16::utf16_column_to_byte_offset;
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
 
-/// Lightweight cooperative cancellation handle for diagnostic computation.
-///
-/// Wraps an optional `CancellationToken` so that diagnostic functions can
-/// periodically check whether the computation should be aborted (e.g., because
-/// a newer edit arrived). `DiagCancelToken::never()` returns a no-op token
-/// that is always uncancelled — used by tests and non-debounced call sites.
-#[derive(Clone, Default)]
-pub struct DiagCancelToken(Option<tokio_util::sync::CancellationToken>);
-
-impl DiagCancelToken {
-    /// A token that is never cancelled. Use for tests and non-debounced paths.
-    pub fn never() -> Self {
-        Self(None)
-    }
-
-    /// Wrap a live cancellation token.
-    pub fn from_token(token: tokio_util::sync::CancellationToken) -> Self {
-        Self(Some(token))
-    }
-
-    /// Returns `true` if the computation should stop.
-    #[inline]
-    pub fn is_cancelled(&self) -> bool {
-        self.0.as_ref().is_some_and(|t| t.is_cancelled())
-    }
-    /// Returns `true` for the no-op token created by [`DiagCancelToken::never`].
-    #[inline]
-    pub(crate) fn is_never(&self) -> bool {
-        self.0.is_none()
-    }
-
-    /// Resolves when the computation should stop.
-    pub async fn cancelled(&self) {
-        match &self.0 {
-            Some(token) => token.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    }
-}
+pub use crate::cross_file::scope_snapshot::DiagCancelToken;
+pub(crate) use crate::cross_file::scope_snapshot::{
+    CrossFileScopeSnapshot, cross_file_base_exports, empty_base_exports,
+    precollect_scope_snapshot_uri,
+};
 
 fn reference_class_field_accessor_matches(field: &str, name: &str) -> bool {
     let mut chars = field.chars();
@@ -78,135 +44,6 @@ fn reference_class_field_accessor_matches(field: &str, name: &str) -> bool {
 // ============================================================================
 // Diagnostics Snapshot
 // ============================================================================
-
-/// Process-wide cached empty `Arc<HashSet<String>>`. Reused whenever a
-/// snapshot or fallback path needs an "empty base_exports" stand-in so we
-/// don't allocate a fresh Arc per snapshot when the package library isn't
-/// ready (e.g. cold start or `WorldState::new` without an R subprocess).
-pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
-    static EMPTY: OnceLock<Arc<HashSet<String>>> = OnceLock::new();
-    EMPTY.get_or_init(|| Arc::new(HashSet::new()))
-}
-
-fn precollect_scope_snapshot_uri(
-    content_provider: &impl ContentProvider,
-    uri: &Url,
-    artifacts_map: &mut HashMap<Url, Arc<scope::ScopeArtifacts>>,
-    metadata_map: &mut HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
-) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-    if let Some(artifacts) = content_provider.get_artifacts(uri) {
-        artifacts_map.insert(uri.clone(), artifacts);
-    }
-    let metadata = content_provider.get_metadata(uri);
-    if let Some(metadata) = metadata.as_ref() {
-        metadata_map.insert(uri.clone(), metadata.clone());
-    }
-    metadata
-}
-
-fn precollect_open_text_for_scope_snapshot(
-    state: &WorldState,
-    uri: &Url,
-    text_tree_map: &mut HashMap<Url, (String, tree_sitter::Tree)>,
-    raw_text_map: &mut HashMap<Url, String>,
-) {
-    if let Some(doc) = state.document_store.get_without_touch(uri) {
-        raw_text_map.insert(uri.clone(), doc.contents.to_string());
-        if let Some(tree) = doc.tree.as_ref() {
-            text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
-        }
-    } else if let Some(doc) = state.documents.get(uri) {
-        raw_text_map.insert(uri.clone(), doc.text());
-        if let Some(tree) = doc.tree.as_ref() {
-            text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
-        }
-    } else {
-        #[cfg(test)]
-        if let Some(entry) = state.workspace_index_new.get(uri) {
-            let raw = entry.contents.to_string();
-            raw_text_map.insert(uri.clone(), raw.clone());
-            if let Some(tree) = entry.tree.as_ref() {
-                let analysis =
-                    crate::cross_file::analysis_text_for_path(uri.path(), &raw).into_owned();
-                text_tree_map.insert(uri.clone(), (analysis, tree.clone()));
-            }
-        } else if let Some(doc) = state.workspace_index.get(uri) {
-            raw_text_map.insert(uri.clone(), doc.text());
-            if let Some(tree) = doc.tree.as_ref() {
-                text_tree_map.insert(uri.clone(), (doc.analysis_text(), tree.clone()));
-            }
-        }
-    }
-}
-
-struct ActiveStandaloneSnapshotInputs<'a> {
-    graph: &'a crate::cross_file::dependency::DependencyGraph,
-    max_depth: usize,
-    max_visited: usize,
-    workspace_root: Option<&'a Url>,
-    seed_uris: &'a [Url],
-    is_cancelled: &'a dyn Fn() -> bool,
-}
-
-fn active_standalone_snapshot_members(
-    content_provider: &impl ContentProvider,
-    inputs: ActiveStandaloneSnapshotInputs<'_>,
-    snapshot_uris: &mut HashSet<Url>,
-) -> Vec<Url> {
-    let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
-    let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
-    let mut extra_uris = Vec::new();
-    let mut active_seen = HashSet::new();
-    let mut remaining_extra = inputs.max_visited.saturating_sub(snapshot_uris.len());
-    if remaining_extra == 0 || (inputs.is_cancelled)() {
-        return extra_uris;
-    }
-
-    for seed_uri in inputs.seed_uris {
-        if active_seen.len() >= inputs.max_visited
-            || remaining_extra == 0
-            || (inputs.is_cancelled)()
-        {
-            break;
-        }
-        if active_seen.contains(seed_uri) {
-            continue;
-        }
-        if !get_metadata(seed_uri).is_some_and(|metadata| metadata.standalone) {
-            continue;
-        }
-        let walk_budget = remaining_extra
-            .saturating_add(1)
-            .min(inputs.max_visited.saturating_sub(active_seen.len()));
-        if walk_budget == 0 {
-            break;
-        }
-        let closure_inputs = scope::StandaloneActiveClosureSnapshotInputs {
-            graph: inputs.graph,
-            max_depth: inputs.max_depth,
-            max_visited: walk_budget,
-            workspace_root: inputs.workspace_root,
-            is_cancelled: inputs.is_cancelled,
-        };
-        for member in scope::standalone_active_closure_members_for_snapshot(
-            seed_uri,
-            &closure_inputs,
-            &get_artifacts,
-            &get_metadata,
-        ) {
-            active_seen.insert(member.clone());
-            if snapshot_uris.insert(member.clone()) {
-                extra_uris.push(member);
-                remaining_extra -= 1;
-                if remaining_extra == 0 {
-                    return extra_uris;
-                }
-            }
-        }
-    }
-
-    extra_uris
-}
 
 /// A snapshot of all state needed for diagnostic computation.
 ///
@@ -307,210 +144,6 @@ pub(crate) struct DiagnosticsSnapshot {
     /// symbols into resolution results for files under `R/` and `tests/testthat/`.
     /// Also used in the diagnostic loop for full-import package checks.
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
-}
-
-#[derive(Clone)]
-pub(crate) struct CrossFileScopeSnapshot {
-    pub(crate) cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
-    pub(crate) cross_file_edge_revision: u64,
-    pub(crate) standalone_scope_invalidation_generation: u64,
-    pub(crate) standalone_scope_cache: Arc<scope::StandaloneScopeCache>,
-    pub(crate) workspace_folders: Vec<Url>,
-    pub(crate) cross_file_config: crate::cross_file::config::CrossFileConfig,
-    pub(crate) base_exports: Arc<HashSet<String>>,
-    pub(crate) package_library: Arc<crate::package_library::PackageLibrary>,
-    pub(crate) package_library_ready: bool,
-    pub(crate) package_facts: Option<crate::package_library::PackageFactSnapshot>,
-    pub(crate) help_cache: crate::help::HelpCache,
-    pub(crate) signature_cache: Arc<crate::parameter_resolver::SignatureCache>,
-    pub(crate) artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
-    pub(crate) metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
-    pub(crate) text_tree_map: HashMap<Url, (String, tree_sitter::Tree)>,
-    pub(crate) raw_text_map: HashMap<Url, String>,
-    pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
-}
-
-impl CrossFileScopeSnapshot {
-    /// Build a bounded cross-file snapshot for one scope-bearing interactive
-    /// request. Call this under the `WorldState` read lock, then drop the guard
-    /// before invoking [`Self::scope_at`] or snapshot-backed parameter/signature
-    /// resolution. Persistent standalone-scope cache misses can recursively
-    /// resolve a callee closure, so they must not run while `did_change` writers
-    /// are blocked behind the read lock.
-    pub(crate) fn build(state: &WorldState, uri: &Url) -> Self {
-        Self::build_with_cancel(state, uri, &|| false)
-    }
-
-    pub(crate) fn build_with_cancel(
-        state: &WorldState,
-        uri: &Url,
-        is_cancelled: &impl Fn() -> bool,
-    ) -> Self {
-        let max_depth = state.cross_file_config.max_chain_depth;
-        let max_visited = state.cross_file_config.max_transitive_dependents_visited;
-        let payload =
-            state
-                .cross_file_graph
-                .cached_neighborhood_subgraph(uri, max_depth, max_visited);
-        let content_provider = state.content_provider();
-        let mut artifacts_map = HashMap::new();
-        let mut metadata_map = HashMap::new();
-        let mut text_tree_map = HashMap::new();
-        let mut raw_text_map = HashMap::new();
-
-        let mut seed_uris: Vec<Url> = payload.neighborhood.iter().cloned().collect();
-        seed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-        let mut snapshot_uris: HashSet<Url> = seed_uris.iter().cloned().collect();
-        for neighbor_uri in &seed_uris {
-            precollect_scope_snapshot_uri(
-                &content_provider,
-                neighbor_uri,
-                &mut artifacts_map,
-                &mut metadata_map,
-            );
-            precollect_open_text_for_scope_snapshot(
-                state,
-                neighbor_uri,
-                &mut text_tree_map,
-                &mut raw_text_map,
-            );
-        }
-        let active_extra_uris = active_standalone_snapshot_members(
-            &content_provider,
-            ActiveStandaloneSnapshotInputs {
-                graph: payload.subgraph.as_ref(),
-                max_depth,
-                max_visited,
-                workspace_root: state.workspace_folders.first(),
-                seed_uris: &seed_uris,
-                is_cancelled,
-            },
-            &mut snapshot_uris,
-        );
-        for extra_uri in &active_extra_uris {
-            precollect_scope_snapshot_uri(
-                &content_provider,
-                extra_uri,
-                &mut artifacts_map,
-                &mut metadata_map,
-            );
-            precollect_open_text_for_scope_snapshot(
-                state,
-                extra_uri,
-                &mut text_tree_map,
-                &mut raw_text_map,
-            );
-        }
-
-        Self {
-            cross_file_graph: payload.subgraph.clone(),
-            cross_file_edge_revision: state.cross_file_graph.edge_revision(),
-            standalone_scope_invalidation_generation: state
-                .standalone_scope_invalidation_generation(),
-            standalone_scope_cache: state.standalone_scope_cache.clone(),
-            workspace_folders: state.workspace_folders.clone(),
-            cross_file_config: state.cross_file_config.clone(),
-            base_exports: cross_file_base_exports(state),
-            package_library: state.package_library.clone(),
-            package_library_ready: state.package_library_ready,
-            package_facts: (state.cross_file_config.packages_enabled
-                && state.package_library_ready)
-                .then(|| state.package_library.package_fact_snapshot()),
-            help_cache: state.help_cache.clone(),
-            signature_cache: state.signature_cache.clone(),
-            artifacts_map,
-            metadata_map,
-            text_tree_map,
-            raw_text_map,
-            scope_contribution: state.package_state.scope_contribution().clone(),
-        }
-    }
-
-    pub(crate) fn get_artifacts(&self, uri: &Url) -> Option<Arc<scope::ScopeArtifacts>> {
-        self.artifacts_map.get(uri).cloned()
-    }
-
-    pub(crate) fn get_metadata(
-        &self,
-        uri: &Url,
-    ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-        self.metadata_map.get(uri).cloned()
-    }
-
-    pub(crate) fn get_text_and_tree(&self, uri: &Url) -> Option<(String, tree_sitter::Tree)> {
-        if let Some(text_tree) = self.text_tree_map.get(uri) {
-            return Some(text_tree.clone());
-        }
-
-        let raw_text = self.get_raw_text(uri)?;
-        let analysis_text =
-            crate::cross_file::analysis_text_for_path(uri.path(), &raw_text).into_owned();
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None))?;
-        Some((analysis_text, tree))
-    }
-
-    pub(crate) fn get_raw_text(&self, uri: &Url) -> Option<String> {
-        self.raw_text_map.get(uri).cloned().or_else(|| {
-            uri.to_file_path()
-                .ok()
-                .and_then(|path| crate::state::read_source(&path).ok())
-        })
-    }
-
-    pub(crate) fn scope_at(
-        &self,
-        uri: &Url,
-        line: u32,
-        column: u32,
-        cancel: &DiagCancelToken,
-        prefix_cache: &mut scope::ParentPrefixCache,
-    ) -> scope::ScopeAtPosition {
-        let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-            self.get_artifacts(target_uri)
-        };
-        let get_metadata = |target_uri: &Url| -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-            self.get_metadata(target_uri)
-        };
-        let is_cancelled = || cancel.is_cancelled();
-
-        let data_lookup = |pkg: &str, stem: &str| -> Vec<String> {
-            self.package_facts
-                .as_ref()
-                .map_or_else(Vec::new, |facts| facts.data_objects_for_stem(pkg, stem))
-        };
-        let data_provider = self.package_facts.as_ref().map(|facts| {
-            scope::DataAliasProvider::with_cache_epoch(
-                &data_lookup,
-                self.package_library.base_packages(),
-                facts.cache_epoch(),
-            )
-        });
-
-        let standalone_cache_context = scope::StandaloneScopeCacheContext::new(
-            &self.standalone_scope_cache,
-            self.cross_file_edge_revision,
-            self.standalone_scope_invalidation_generation,
-        );
-
-        scope::scope_at_position_with_graph_cached_with_standalone_cache(
-            uri,
-            line,
-            column,
-            &get_artifacts,
-            &get_metadata,
-            &self.cross_file_graph,
-            self.workspace_folders.first(),
-            self.cross_file_config.max_chain_depth,
-            &self.base_exports,
-            self.cross_file_config.hoist_globals_in_functions,
-            self.cross_file_config.backward_dependencies,
-            &is_cancelled,
-            prefix_cache,
-            Some(&self.scope_contribution),
-            data_provider.as_ref(),
-            Some(standalone_cache_context),
-        )
-    }
 }
 
 impl DiagnosticsSnapshot {
@@ -645,9 +278,10 @@ impl DiagnosticsSnapshot {
                 any_nse_or_func_directives |= metadata.has_nse_or_func_directives();
             }
         }
-        let active_extra_uris = active_standalone_snapshot_members(
-            &content_provider,
-            ActiveStandaloneSnapshotInputs {
+        let get_active_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+        let get_active_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+        let active_extra_uris = scope::standalone_active_snapshot_members(
+            scope::StandaloneActiveSnapshotMembersInputs {
                 graph: payload.subgraph.as_ref(),
                 max_depth,
                 max_visited,
@@ -656,6 +290,8 @@ impl DiagnosticsSnapshot {
                 is_cancelled,
             },
             &mut snapshot_uris,
+            &get_active_artifacts,
+            &get_active_metadata,
         );
         for extra_uri in &active_extra_uris {
             if let Some(metadata) = precollect_scope_snapshot_uri(
@@ -693,11 +329,12 @@ impl DiagnosticsSnapshot {
             })
         });
 
-        // Hold the trimmed subgraph as an Arc clone of the cached payload.
-        // The cache returns an `Arc<DependencyGraph>`, so this is a refcount
-        // bump rather than a deep clone of the trimmed forward/backward maps.
         let subgraph_start = std::time::Instant::now();
-        let trimmed_graph = payload.subgraph.clone();
+        let trimmed_graph = if active_extra_uris.is_empty() {
+            payload.subgraph.clone()
+        } else {
+            Arc::new(state.cross_file_graph.extract_subgraph(&snapshot_uris))
+        };
         let subgraph_elapsed = subgraph_start.elapsed();
         let cross_file_edge_revision = state.cross_file_graph.edge_revision();
         let standalone_scope_cache = state.standalone_scope_cache.clone();
@@ -3780,6 +3417,7 @@ impl HierarchyBuilder {
 /// # Returns
 ///
 /// A `HashMap` mapping symbol names to their corresponding `ScopedSymbol` entries.
+#[cfg(test)]
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
@@ -3795,6 +3433,24 @@ fn get_cross_file_symbols(
         Some(state.package_state.scope_contribution()),
     )
     .symbols
+}
+
+fn get_cross_file_symbols_from_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    line: u32,
+    column: u32,
+) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
+    let mut prefix_cache = scope::ParentPrefixCache::new();
+    snapshot
+        .scope_at(
+            uri,
+            line,
+            column,
+            &DiagCancelToken::never(),
+            &mut prefix_cache,
+        )
+        .symbols
 }
 
 /// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
@@ -3883,17 +3539,6 @@ pub(crate) fn get_cross_file_scope(
         package_contribution,
         data_provider.as_ref(),
     )
-}
-
-/// Pick the right `base_exports` for cross-file scope resolution. Returns
-/// the cached empty set during cold start so we don't allocate a fresh Arc
-/// per call when the package library hasn't reported library paths yet.
-fn cross_file_base_exports(state: &WorldState) -> Arc<HashSet<String>> {
-    if state.package_library_ready {
-        state.package_library.base_exports().clone()
-    } else {
-        empty_base_exports().clone()
-    }
 }
 
 // ============================================================================
@@ -5262,33 +4907,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         return;
     };
 
-    let get_artifacts = |target_uri: &Url| -> Option<Arc<scope::ScopeArtifacts>> {
-        snapshot.artifacts_map.get(target_uri).cloned()
-    };
-    let get_metadata =
-        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
-            snapshot.metadata_map.get(target_uri).cloned()
-        };
-
-    let empty_base_exports = HashSet::new();
-    let scope_result = scope::scope_at_position_with_graph(
-        uri,
-        u32::MAX,
-        u32::MAX,
-        &get_artifacts,
-        &get_metadata,
-        &snapshot.cross_file_graph,
-        snapshot.workspace_folders.first(),
-        snapshot.cross_file_config.max_chain_depth,
-        &empty_base_exports,
-        false,
-        snapshot.cross_file_config.backward_dependencies,
-        &|| cancel.is_cancelled(),
-        Some(&snapshot.scope_contribution),
-        // No `data()` alias expansion (issue #429): this pass only reads
-        // `scope_result.depth_exceeded`, never `scope.symbols`.
-        None,
-    );
+    let scope_result = snapshot.get_scope(uri, u32::MAX, u32::MAX, cancel);
 
     {
         for (exceeded_uri, line, col) in &scope_result.depth_exceeded {
@@ -17646,14 +17265,6 @@ pub(crate) struct DollarMemberCompletionContext {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PreparedQualifiedMemberHover {
-    pub(crate) name: String,
-    pub(crate) node_range: Range,
-    pub(crate) path: crate::qualified_resolve::QualifiedPath,
-    pub(crate) op: crate::extract_op::ExtractOp,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct PreparedQualifiedMemberGoto {
     pub(crate) rhs_name: String,
     pub(crate) path: crate::qualified_resolve::QualifiedPath,
@@ -17809,16 +17420,6 @@ fn render_qualified_path(path: &crate::qualified_resolve::QualifiedPath) -> Stri
     rendered
 }
 
-fn dollar_member_completion_items(
-    state: &WorldState,
-    uri: &Url,
-    position: Position,
-    context: &DollarMemberCompletionContext,
-) -> Vec<CompletionItem> {
-    let snapshot = CrossFileScopeSnapshot::build(state, uri);
-    dollar_member_completion_items_from_snapshot(&snapshot, uri, position, context)
-}
-
 pub(crate) fn dollar_member_completion_items_from_snapshot(
     snapshot: &CrossFileScopeSnapshot,
     uri: &Url,
@@ -17867,32 +17468,6 @@ pub(crate) fn dollar_member_completion_items_from_snapshot(
     .collect()
 }
 
-pub(crate) fn prepare_dollar_member_completion(
-    state: &WorldState,
-    uri: &Url,
-    position: Position,
-) -> Option<DollarMemberCompletionContext> {
-    let doc = state.get_document(uri)?;
-    if doc.is_rmd_document() && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
-    {
-        return None;
-    }
-    if doc.file_type != FileType::R {
-        return None;
-    }
-    let text = doc.analysis_text();
-    let tree = doc.tree.as_ref()?;
-    let file_path_context =
-        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
-    if !matches!(
-        file_path_context,
-        crate::file_path_intellisense::FilePathContext::None
-    ) {
-        return None;
-    }
-    detect_dollar_member_completion_context(tree, &text, position)
-}
-
 fn qualified_member_at_position(
     state: &WorldState,
     uri: &Url,
@@ -17933,20 +17508,6 @@ fn qualified_member_at_position(
         end: ts_point_to_lsp_position(&text, node.end_position()),
     };
     Some((rhs_name, node_range, path, op))
-}
-
-pub(crate) fn prepare_qualified_member_hover(
-    state: &WorldState,
-    uri: &Url,
-    position: Position,
-) -> Option<PreparedQualifiedMemberHover> {
-    let (name, node_range, path, op) = qualified_member_at_position(state, uri, position)?;
-    Some(PreparedQualifiedMemberHover {
-        name,
-        node_range,
-        path,
-        op,
-    })
 }
 
 pub(crate) fn prepare_qualified_member_goto(
@@ -18218,6 +17779,7 @@ fn completion_response_from_scope(
 
 pub(crate) enum PreparedScopeCompletion {
     Immediate(Option<CompletionResponse>),
+    DollarMember(DollarMemberCompletionContext),
     General {
         parameter_completion: Option<PreparedParameterCompletion>,
     },
@@ -18312,8 +17874,7 @@ pub(crate) fn prepare_completion_for_scope_snapshot(
     }
 
     if let Some(member_context) = detect_dollar_member_completion_context(tree, &text, position) {
-        let items = dollar_member_completion_items(state, uri, position, &member_context);
-        return PreparedScopeCompletion::Immediate(Some(CompletionResponse::Array(items)));
+        return PreparedScopeCompletion::DollarMember(member_context);
     }
     let point = lsp_position_to_ts_point(&text, position);
     let Some(node) = tree.root_node().descendant_for_point_range(point, point) else {
@@ -18364,6 +17925,15 @@ pub(crate) fn completion_from_scope_snapshot(
 ) -> Option<CompletionResponse> {
     let parameter_completion = match prepared {
         PreparedScopeCompletion::Immediate(response) => return response,
+        PreparedScopeCompletion::DollarMember(member_context) => {
+            let items = dollar_member_completion_items_from_snapshot(
+                snapshot,
+                uri,
+                position,
+                &member_context,
+            );
+            return Some(CompletionResponse::Array(items));
+        }
         PreparedScopeCompletion::General {
             parameter_completion,
         } => parameter_completion,
@@ -18593,8 +18163,11 @@ fn is_namespace_package_side(node: Node) -> bool {
 /// Session-free: reads DESCRIPTION off disk (no R subprocess), mirroring
 /// `parse_description_depends`'s consumers. This replaces the old `pkg::pkg`
 /// help-lookup artifact that rendered an awkward `from {pkg}` for the LHS.
-fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
-    let Some(pkg_dir) = state.package_library.find_package_directory(pkg) else {
+fn package_metadata_hover_from_library(
+    package_library: &crate::package_library::PackageLibrary,
+    pkg: &str,
+) -> String {
+    let Some(pkg_dir) = package_library.find_package_directory(pkg) else {
         return format!("Package `{}` is not installed.", pkg);
     };
 
@@ -18965,6 +18538,14 @@ pub fn extract_definition_statement(
     extract_statement_from_tree(tree, symbol, &content)
 }
 
+pub(crate) fn extract_definition_statement_from_snapshot(
+    symbol: &ScopedSymbol,
+    snapshot: &CrossFileScopeSnapshot,
+) -> Option<DefinitionInfo> {
+    let (content, tree) = snapshot.get_text_and_tree(&symbol.source_uri)?;
+    extract_statement_from_tree(&tree, symbol, &content)
+}
+
 fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
     if byte_offset >= line.len() {
         return line.len();
@@ -19020,45 +18601,6 @@ fn extract_statement_from_tree(
     })
 }
 
-/// Build a [`DefinitionInfo`] for a local member definition discovered by the
-/// qualified-member resolver (`obj$name`/`obj@slot`, #382 step 4).
-///
-/// A `$`/`@` member is always an assignment/constructor definition, so this
-/// delegates to [`extract_definition_statement`] with a synthetic
-/// `Variable`-kind [`ScopedSymbol`] pointing at the member's name range — the
-/// same path local variables take — rather than re-implementing the
-/// content/tree-acquisition and statement-extraction machinery. The synthetic
-/// `name` is unused by that path (which keys off `source_uri` + position).
-///
-/// This shares [`extract_definition_statement`]'s document-store coverage with
-/// the main cross-file-scope hover path. If go-to-definition can locate a
-/// member whose defining file is indexed-only (not in `documents` or the file
-/// cache), hover may resolve the location but find no statement to render and
-/// fall through to suppression — the same boundary that path already has, not a
-/// member-specific gap.
-fn member_definition_info(
-    state: &WorldState,
-    location: &tower_lsp::lsp_types::Location,
-) -> Option<DefinitionInfo> {
-    let name: std::sync::Arc<str> = std::sync::Arc::from("");
-    // Synthetic symbol consumed by `extract_definition_statement` (keys off
-    // source_uri + position); the highlight end is unused. Preserve the old
-    // `defined_column + utf16_len(name)` value via the shared helper (empty
-    // name ⇒ end == start column).
-    let defined_end_column = scoped_symbol_default_end(location.range.start.character, &name);
-    let symbol = ScopedSymbol {
-        name,
-        kind: scope::SymbolKind::Variable,
-        source_uri: location.uri.clone(),
-        defined_line: location.range.start.line,
-        defined_column: location.range.start.character,
-        defined_end_column,
-        signature: None,
-        is_declared: false,
-    };
-    extract_definition_statement(&symbol, state)
-}
-
 pub(crate) fn member_definition_info_from_snapshot(
     snapshot: &CrossFileScopeSnapshot,
     location: &tower_lsp::lsp_types::Location,
@@ -19084,29 +18626,6 @@ pub(crate) fn member_definition_info_from_snapshot(
 /// line N" for same-file definitions, or "[rel/path](uri), line N" otherwise.
 /// Shared by the cross-file-scope hover path and the qualified-member
 /// (#382 step 4) path so they cannot drift.
-fn local_definition_hover(
-    state: &WorldState,
-    def_info: &DefinitionInfo,
-    current_uri: &Url,
-) -> String {
-    // No escaping needed inside code blocks — markdown does not interpret
-    // special characters there.
-    let mut value = format!("```r\n{}\n```\n\n", def_info.statement);
-    if def_info.source_uri == *current_uri {
-        value.push_str(&format!("this file, line {}", def_info.line + 1));
-    } else {
-        let workspace_root = state.workspace_folders.first();
-        let relative_path = compute_relative_path(&def_info.source_uri, workspace_root);
-        value.push_str(&format!(
-            "[{}]({}), line {}",
-            relative_path,
-            def_info.source_uri.as_str(),
-            def_info.line + 1
-        ));
-    }
-    value
-}
-
 pub(crate) fn local_definition_hover_from_snapshot(
     snapshot: &CrossFileScopeSnapshot,
     def_info: &DefinitionInfo,
@@ -19126,28 +18645,6 @@ pub(crate) fn local_definition_hover_from_snapshot(
         ));
     }
     value
-}
-
-pub(crate) fn qualified_member_hover_from_snapshot(
-    snapshot: &CrossFileScopeSnapshot,
-    uri: &Url,
-    position: Position,
-    prepared: &PreparedQualifiedMemberHover,
-) -> Option<Hover> {
-    let location = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
-        snapshot,
-        uri,
-        position,
-        &prepared.path,
-        &prepared.name,
-        prepared.op,
-        &DiagCancelToken::never(),
-    )?;
-    let def_info = member_definition_info_from_snapshot(snapshot, &location)?;
-    Some(markdown_hover(
-        local_definition_hover_from_snapshot(snapshot, &def_info, uri),
-        prepared.node_range,
-    ))
 }
 
 /// Result of finding a statement node - includes whether to extract header only
@@ -19556,38 +19053,97 @@ fn resolve_directive_origin(
 /// 5. Cached R help text or a one-time lookup of R help for builtins and other symbols.
 ///
 /// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use tower_lsp::lsp_types::Position;
-/// # use url::Url;
-/// # use raven::state::WorldState;
-/// # use raven::handlers::hover;
-/// # async fn example() {
-/// # let state: WorldState = todo!();
-/// # let uri: Url = todo!();
-/// // Assuming `state` is available and `uri` refers to an open R document:
-/// let pos = Position::new(10, 4);
-/// let _ = hover(&state, &uri, pos).await;
-/// # }
-/// ```
-///
-/// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
-pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+pub(crate) struct PreparedHover {
+    position: Position,
+    name: String,
+    node_kind: String,
+    node_range: Range,
+    namespace: Option<PreparedHoverNamespace>,
+    named_arg_funcname: Option<String>,
+    parameter_definition_doc: Option<String>,
+    member_context: Option<PreparedHoverMember>,
+    suppress_structural: bool,
+    r_path: std::path::PathBuf,
+}
+
+enum PreparedHoverNamespace {
+    PackageSide,
+    Member { package: String },
+}
+
+#[allow(dead_code)] // Used by the LSP backend's async-trait hover path; release-lib reachability misses it.
+pub(crate) struct NamespaceHoverContext {
+    name: String,
+    node_range: Range,
+    namespace: PreparedHoverNamespace,
+    package_library: Arc<crate::package_library::PackageLibrary>,
+    help_cache: crate::help::HelpCache,
+    r_path: std::path::PathBuf,
+}
+
+#[allow(dead_code)] // See `NamespaceHoverContext`.
+pub(crate) enum PreparedHoverResolution {
+    Namespace(NamespaceHoverContext),
+    Scope(PreparedHover),
+}
+
+struct PreparedHoverMember {
+    path: crate::qualified_resolve::QualifiedPath,
+    op: crate::extract_op::ExtractOp,
+}
+
+#[allow(dead_code)] // See `NamespaceHoverContext`.
+pub(crate) fn split_prepared_hover(
+    state: &WorldState,
+    prepared: PreparedHover,
+) -> PreparedHoverResolution {
+    match prepared.namespace {
+        Some(namespace) => PreparedHoverResolution::Namespace(NamespaceHoverContext {
+            name: prepared.name,
+            node_range: prepared.node_range,
+            namespace,
+            package_library: state.package_library.clone(),
+            help_cache: state.help_cache.clone(),
+            r_path: prepared.r_path,
+        }),
+        None => PreparedHoverResolution::Scope(prepared),
+    }
+}
+
+#[allow(dead_code)] // See `NamespaceHoverContext`.
+pub(crate) async fn resolve_namespace_hover(ctx: NamespaceHoverContext) -> Option<Hover> {
+    match ctx.namespace {
+        PreparedHoverNamespace::PackageSide => Some(markdown_hover(
+            package_metadata_hover_from_library(&ctx.package_library, &ctx.name),
+            ctx.node_range,
+        )),
+        PreparedHoverNamespace::Member { package } => {
+            let mut value = build_help_panel_link(&ctx.name, &package);
+            if let Some(help_text) =
+                get_help_cached(&ctx.help_cache, &ctx.name, Some(&package), ctx.r_path).await
+            {
+                value.push_str(&format!("```\n{}\n```", help_text));
+            } else {
+                value.push_str(&format!("```r\n{}\n```\n", ctx.name));
+                value.push_str(&format!("\nfrom {{{}}}", package));
+            }
+            Some(markdown_hover(value, ctx.node_range))
+        }
+    }
+}
+
+pub(crate) fn prepare_hover_for_scope_snapshot(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+) -> Option<PreparedHover> {
     let doc = state.get_document(uri)?;
     if doc.file_type != FileType::R {
         return None;
     }
     let tree = doc.tree.as_ref()?;
-    // For Rmd the tree is parsed from the masked analysis text; pair byte
-    // offsets with it. A prose position maps to a blank masked line, so the
-    // identifier lookup below finds no `identifier`/`string` node and returns
-    // None — hover is naturally inert on prose without an explicit guard.
     let text = doc.analysis_text();
 
-    // Resolve the R executable path once for all help lookups in this hover call.
-    // Falls back to "R" (PATH lookup) when no explicit path is configured.
     let r_path: std::path::PathBuf = state
         .cross_file_config
         .packages_r_path
@@ -19605,161 +19161,178 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         .named_descendant_for_point_range(point_start, point_end)
         .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
 
-    // Get the identifier
-    let name = if node.kind() == "identifier" || node.kind() == "string" {
-        node_text(node, &text)
-    } else {
+    if node.kind() != "identifier" && node.kind() != "string" {
         return None;
-    };
+    }
 
+    let name = node_text(node, &text).to_string();
+    let node_kind = node.kind().to_string();
     let node_range = Range {
         start: ts_point_to_lsp_position(&text, node.start_position()),
         end: ts_point_to_lsp_position(&text, node.end_position()),
     };
 
-    // Explicit `pkg::name` / `pkg:::name` qualifier wins over the cross-file
-    // scope's name resolution. Without this, hovering `filter` in
-    // `dplyr::filter()` would resolve to whichever `filter` the workspace
-    // scope happened to surface (often `base`/`stats::filter`), and the
-    // bold help-panel link would point at the wrong package.
-    if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
-        // Package side (`pkg` in `pkg::name`): show the package's DESCRIPTION
-        // Title/Description instead of a `pkg::pkg` help artifact (#382 step 1).
-        // The member (RHS) side keeps the qualified help-topic behavior below.
+    let namespace = find_namespace_context(&node, &text).map(|qualifier_pkg| {
         if node.kind() == "identifier" && is_namespace_package_side(node) {
-            return Some(markdown_hover(
-                package_metadata_hover(state, name),
-                node_range,
-            ));
-        }
-
-        let pkg_owned = qualifier_pkg.to_string();
-        let mut value = build_help_panel_link(name, &pkg_owned);
-        if let Some(help_text) =
-            get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
-        {
-            value.push_str(&format!("```\n{}\n```", help_text));
+            PreparedHoverNamespace::PackageSide
         } else {
-            // No help text available — still show the qualified heading + a
-            // 'from {pkg}' attribution so the user sees we honored the
-            // qualifier even when R doesn't have a topic for it.
-            value.push_str(&format!("```r\n{}\n```\n", name));
-            value.push_str(&format!("\nfrom {{{}}}", pkg_owned));
+            PreparedHoverNamespace::Member {
+                package: qualifier_pkg.to_string(),
+            }
         }
-        return Some(markdown_hover(value, node_range));
-    }
+    });
 
-    // #382 steps 2-4: structural labels that hover can now *resolve* rather than
-    // blanket-suppress. Each branch is purely additive and gated on its own AST
-    // shape, and any label that does NOT resolve falls through to the
-    // `is_structural_label` gate below — so the invariant is resolve-or-suppress,
-    // never resolve-or-attribute (the #379 `from {base}` defect class). The
-    // shared predicate is left untouched, so diagnostics are unaffected.
-    if node.kind() == "identifier" {
-        // Step 2: a named-argument label that resolves to a *user-defined*
-        // function's exact (non-`...`) formal shows that formal + default +
-        // `@param` doc. Package/builtin/unresolvable callees, and labels that
-        // are not a real formal, fall through to suppression — never to package
-        // attribution (the #379 `from {base}` defect). `resolve_user_only` makes
-        // no R-subprocess call, so it is safe in this async context.
-        if let Some(func_node) = named_arg_call_function(node) {
-            let funcname = node_text(func_node, &text);
-            if let Some(signature) =
-                crate::parameter_resolver::resolve_user_only(state, funcname, uri, position)
-                && let Some(param) = signature
-                    .parameters
-                    .iter()
-                    .find(|p| p.name == name && !p.is_dots)
-            {
-                // `param.name == name` (matched above), so `label()` renders the
-                // hovered formal as `name = default` / bare `name`.
-                let decl = param.label();
-                // `line` is in the masked-analysis-text coordinate system (the
-                // source's tree is parsed from `analysis_text()`), so extract
-                // roxygen from the analysis text — using raw `text()` could misread
-                // an Rmd prose `#` heading above a chunk as a comment. Matches
-                // step 3's use of the analysis text.
-                let param_doc = match &signature.source {
-                    // Same document as the hover: reuse the analysis text already in
-                    // hand rather than re-fetching and re-cloning it.
-                    crate::parameter_resolver::SignatureSource::CurrentFile { line, .. } => {
-                        crate::roxygen::user_function_param_doc(&text, *line, name)
-                    }
-                    // A sourced file may be indexed/cached but not open. Read its
-                    // analysis text via the same multi-store path the signature
-                    // resolved through (`get_text_and_tree`), not open documents
-                    // only — otherwise `@param` docs silently vanish for the common
-                    // closed-helper-file case.
-                    crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
-                        crate::parameter_resolver::get_text_and_tree(state, uri).and_then(
-                            |(src_text, _)| {
-                                crate::roxygen::user_function_param_doc(&src_text, *line, name)
-                            },
-                        )
-                    }
-                    crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
-                };
+    let is_identifier = node.kind() == "identifier";
+    let named_arg_funcname = is_identifier
+        .then(|| {
+            named_arg_call_function(node).map(|func_node| node_text(func_node, &text).to_string())
+        })
+        .flatten();
+
+    let parameter_definition_doc = if is_identifier
+        && let Some(func_line) = is_parameter_name(node)
+            .then(|| enclosing_named_function_line(node))
+            .flatten()
+    {
+        crate::roxygen::user_function_param_doc(&text, func_line, &name)
+    } else {
+        None
+    };
+
+    let member_context = if is_identifier {
+        crate::extract_op::extract_operator_rhs(node).and_then(|(lhs_node, op)| {
+            crate::qualified_resolve::build_qualified_path(lhs_node, &text)
+                .map(|path| PreparedHoverMember { path, op })
+        })
+    } else {
+        None
+    };
+
+    let suppress_structural = is_identifier && is_structural_label(node);
+
+    Some(PreparedHover {
+        position,
+        name,
+        node_kind,
+        node_range,
+        namespace,
+        named_arg_funcname,
+        parameter_definition_doc,
+        member_context,
+        suppress_structural,
+        r_path,
+    })
+}
+/// Resolve hover using a snapshot captured under the `WorldState` read lock.
+pub(crate) async fn hover_from_scope_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    prepared: PreparedHover,
+) -> Option<Hover> {
+    let name = prepared.name.as_str();
+    let node_range = prepared.node_range;
+
+    // Explicit `pkg::name` / `pkg:::name` qualifier wins over cross-file scope.
+    if let Some(namespace) = &prepared.namespace {
+        match namespace {
+            PreparedHoverNamespace::PackageSide => {
                 return Some(markdown_hover(
-                    parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
+                    package_metadata_hover_from_library(&snapshot.package_library, name),
                     node_range,
                 ));
             }
+            PreparedHoverNamespace::Member { package } => {
+                let mut value = build_help_panel_link(name, package);
+                if let Some(help_text) = get_help_cached(
+                    &snapshot.help_cache,
+                    name,
+                    Some(package),
+                    prepared.r_path.clone(),
+                )
+                .await
+                {
+                    value.push_str(&format!("```\n{}\n```", help_text));
+                } else {
+                    value.push_str(&format!("```r\n{}\n```\n", name));
+                    value.push_str(&format!("\nfrom {{{}}}", package));
+                }
+                return Some(markdown_hover(value, node_range));
+            }
         }
+    }
 
-        // Step 3: a parameter name at a definition site shows its `@param`
-        // roxygen when the enclosing *named* function is documented; otherwise
-        // it falls through to suppression (nothing for undocumented/anonymous).
-        if is_parameter_name(node)
-            && let Some(func_line) = enclosing_named_function_line(node)
-            && let Some(doc) = crate::roxygen::user_function_param_doc(&text, func_line, name)
+    if prepared.node_kind == "identifier" {
+        if let Some(funcname) = prepared.named_arg_funcname.as_deref()
+            && let Some(signature) =
+                crate::parameter_resolver::resolve_user_only_with_scope_snapshot(
+                    snapshot,
+                    funcname,
+                    uri,
+                    prepared.position,
+                )
+            && let Some(param) = signature
+                .parameters
+                .iter()
+                .find(|p| p.name == name && !p.is_dots)
         {
+            let decl = param.label();
+            let param_doc = match &signature.source {
+                crate::parameter_resolver::SignatureSource::CurrentFile { uri, line }
+                | crate::parameter_resolver::SignatureSource::CrossFile { uri, line } => {
+                    snapshot.get_text_and_tree(uri).and_then(|(src_text, _)| {
+                        crate::roxygen::user_function_param_doc(&src_text, *line, name)
+                    })
+                }
+                crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
+            };
             return Some(markdown_hover(
-                parameter_hover(name, None, Some(&doc)),
+                parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
                 node_range,
             ));
         }
 
-        // Step 4: an `obj$name` / `obj@slot` member whose container has a *local*
-        // member definition shows that definition — reusing go-to-definition's
-        // `qualified_resolve`, so the two stay in parity. Members of
-        // package/runtime objects have no static definition and fall through to
-        // suppression (no live session to inspect).
-        if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node)
-            && let Some(path) = crate::qualified_resolve::build_qualified_path(lhs_node, &text)
-            && let Some(location) = crate::qualified_resolve::resolve_qualified_member(
-                state, uri, position, &path, name, op,
+        if let Some(doc) = prepared.parameter_definition_doc.as_deref() {
+            return Some(markdown_hover(
+                parameter_hover(name, None, Some(doc)),
+                node_range,
+            ));
+        }
+
+        if let Some(member) = &prepared.member_context
+            && let Some(location) = crate::qualified_resolve::resolve_qualified_member_with_snapshot(
+                snapshot,
+                uri,
+                prepared.position,
+                &member.path,
+                name,
+                member.op,
+                &DiagCancelToken::never(),
             )
-            && let Some(def_info) = member_definition_info(state, &location)
+            && let Some(def_info) = member_definition_info_from_snapshot(snapshot, &location)
         {
             return Some(markdown_hover(
-                local_definition_hover(state, &def_info, uri),
+                local_definition_hover_from_snapshot(snapshot, &def_info, uri),
                 node_range,
             ));
         }
     }
 
-    // Suppress hovers on structural labels (see `is_structural_label` for the
-    // set and the rationale, including why assignment targets are excluded).
-    // Gated on `identifier` because strings (file-path hover) must not reach the
-    // predicate, and placed after the namespace branch so qualified `pkg::name`
-    // hovers still resolve.
-    if node.kind() == "identifier" && is_structural_label(node) {
+    if prepared.suppress_structural {
         return None;
     }
 
-    // Try cross-file symbols (includes local scope with definition extraction)
     log::trace!("Calling get_cross_file_symbols for hover");
-    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    let cross_file_symbols = get_cross_file_symbols_from_snapshot(
+        snapshot,
+        uri,
+        prepared.position.line,
+        prepared.position.character,
+    );
     log::trace!(
         "Got {} symbols from cross-file scope",
         cross_file_symbols.len()
     );
-    // Issue #459: a cross-file scope entry is keyed either bare (a regular
-    // assignment def) or backtick-wrapped (a directive-declared non-syntactic
-    // symbol). Mirror go-to-definition: try the RAW spelling first (matches a
-    // wrapped declared key), then the unconditionally-unquoted spelling (matches
-    // a bare regular-def key). Only the lookup key is normalized; `name` keeps
-    // its raw spelling for the rendered hover.
+
     let symbol_key: &str = unquote_backtick_name(name).unwrap_or(name);
     if let Some(symbol) = cross_file_symbols
         .get(name)
@@ -19772,30 +19345,11 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             symbol.is_declared
         );
 
-        // Handle declared symbols (from `# raven: var` / `# raven: func`
-        // directives, or from an `exists("name")` call).
-        // Validates: Requirements 7.1, 7.2, 7.3
         if symbol.is_declared {
-            // Convert 0-based line to 1-based for display
             let display_line = symbol.defined_line + 1;
-
-            // Distinguish a genuine directive declaration from one synthesized
-            // by an `exists("name")` call, via the shared `resolve_directive_origin`
-            // so hover and go-to-definition never disagree: the resolved symbol
-            // is directive-derived iff its own line is a matching-directive line.
-            // When directive-derived, describe the FIRST declaration — its line,
-            // its keyword, AND its kind label all come from that one declaration,
-            // so they cannot contradict each other. When the symbol came from
-            // `exists()`, attribute it to the call (always a variable). If
-            // metadata is unavailable, fall back to a directive label keyed on
-            // the symbol's kind rather than fabricating an `exists()` attribution
-            // for a possibly-real directive. The parser does not retain whether
-            // the user wrote `# raven:` or the `@lsp-` alias, so the canonical
-            // `# raven:` spelling is always surfaced.
-            let metadata = state.content_provider().get_metadata(&symbol.source_uri);
+            let metadata = snapshot.get_metadata(&symbol.source_uri);
             let origin =
                 resolve_directive_origin(metadata.as_deref(), &symbol.name, symbol.defined_line);
-
             let kind_label = |is_function: bool| {
                 if is_function {
                     "declared function"
@@ -19836,36 +19390,31 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 
             let mut value = format!("```r\n{} ({})\n```\n\n{}", name, kind_str, attribution);
             if symbol.source_uri != *uri {
-                let workspace_root = state.workspace_folders.first();
-                let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                let relative_path =
+                    compute_relative_path(&symbol.source_uri, snapshot.workspace_folders.first());
                 value.push_str(&format!("\n\n*Defined in {}*", relative_path));
             }
-
             return Some(markdown_hover(value, node_range));
         }
 
-        // Check if this is a package export (source_uri starts with "package:")
-        // Package exports have URIs like "package:dplyr" or "package:base"
         let package_name = symbol.source_uri.as_str().strip_prefix("package:");
-
-        // Try to extract the definition statement; otherwise fall back to
-        // signature/package-help info for the symbol.
-        let value = match extract_definition_statement(symbol, state) {
-            Some(def_info) => local_definition_hover(state, &def_info, uri),
+        let value = match extract_definition_statement_from_snapshot(symbol, snapshot) {
+            Some(def_info) => local_definition_hover_from_snapshot(snapshot, &def_info, uri),
             None => {
                 let mut value = String::new();
-                let workspace_root = state.workspace_folders.first();
-                // Graceful fallback: show symbol info without definition statement
-                // For package exports, get full R help documentation
-                // Validates: Requirement 10.2
                 log::trace!(
                     "hover: extract_definition_statement returned None for '{}', package_name={:?}",
                     name,
                     package_name
                 );
                 if let Some(pkg) = package_name {
-                    let help_text =
-                        get_help_cached(&state.help_cache, name, Some(pkg), r_path.clone()).await;
+                    let help_text = get_help_cached(
+                        &snapshot.help_cache,
+                        name,
+                        Some(pkg),
+                        prepared.r_path.clone(),
+                    )
+                    .await;
                     log::trace!(
                         "hover: get_help returned {:?}",
                         help_text.as_ref().map(|s| s.len())
@@ -19883,35 +19432,36 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
                     if symbol.source_uri != *uri {
-                        let relative_path =
-                            compute_relative_path(&symbol.source_uri, workspace_root);
+                        let relative_path = compute_relative_path(
+                            &symbol.source_uri,
+                            snapshot.workspace_folders.first(),
+                        );
                         value.push_str(&format!("\n*Defined in {}*", relative_path));
                     }
                 } else {
                     value.push_str(&format!("```r\n{}\n```\n", name));
                     if symbol.source_uri != *uri {
-                        let relative_path =
-                            compute_relative_path(&symbol.source_uri, workspace_root);
+                        let relative_path = compute_relative_path(
+                            &symbol.source_uri,
+                            snapshot.workspace_folders.first(),
+                        );
                         value.push_str(&format!("\n*Defined in {}*", relative_path));
                     }
                 }
                 value
             }
         };
-
         return Some(markdown_hover(value, node_range));
     }
 
-    // Check package exports from the aggregate package cache (if packages enabled)
-    // This surfaces package exports without blocking on R subprocess
-    if state.cross_file_config.packages_enabled {
-        let scope = get_cross_file_scope(
-            state,
+    if snapshot.cross_file_config.packages_enabled {
+        let mut prefix_cache = scope::ParentPrefixCache::new();
+        let scope = snapshot.scope_at(
             uri,
-            position.line,
-            position.character,
+            prepared.position.line,
+            prepared.position.character,
             &DiagCancelToken::never(),
-            Some(state.package_state.scope_contribution()),
+            &mut prefix_cache,
         );
         let all_packages: Vec<String> = scope
             .inherited_packages
@@ -19920,14 +19470,18 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             .cloned()
             .collect();
 
-        if let Some(pkg_name) = state
+        if let Some(pkg_name) = snapshot
             .package_library
             .find_package_owner_for_symbol(name, &all_packages)
         {
             let mut value = String::new();
-
-            let help_text =
-                get_help_cached(&state.help_cache, name, Some(&pkg_name), r_path.clone()).await;
+            let help_text = get_help_cached(
+                &snapshot.help_cache,
+                name,
+                Some(&pkg_name),
+                prepared.r_path.clone(),
+            )
+            .await;
             if let Some(help_text) = help_text {
                 value.push_str(&format!("```\n{}\n```", help_text));
                 value.insert_str(0, &build_help_panel_link(name, &pkg_name));
@@ -19935,19 +19489,29 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 value.push_str(&format!("```r\n{}\n```\n", name));
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
             }
-
             return Some(markdown_hover(value, node_range));
         }
     }
 
-    // Fallback to R help system for built-ins and undefined symbols
-    if let Some(help_text) = get_help_cached(&state.help_cache, name, None, r_path).await {
+    if let Some(help_text) =
+        get_help_cached(&snapshot.help_cache, name, None, prepared.r_path).await
+    {
         return Some(markdown_hover(
             format!("```\n{}\n```", help_text),
             node_range,
         ));
     }
     None
+}
+
+/// Legacy convenience wrapper. Production LSP hover dispatch should use
+/// [`prepare_hover_for_scope_snapshot`] plus [`hover_from_scope_snapshot`] so
+/// async help lookup and cross-file scope resolution run after the `WorldState`
+/// read lock is released.
+pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+    let prepared = prepare_hover_for_scope_snapshot(state, uri, position)?;
+    let snapshot = CrossFileScopeSnapshot::build(state, uri);
+    hover_from_scope_snapshot(&snapshot, uri, prepared).await
 }
 
 /// Build a Markdown-content `Hover` anchored to `range`. Centralizes the
@@ -20372,12 +19936,9 @@ fn try_build_user_signature_from_snapshot(
     uri: &Url,
     position: Position,
 ) -> Option<SignatureInformation> {
-    let signature = crate::parameter_resolver::resolve_with_scope_snapshot(
+    let signature = crate::parameter_resolver::resolve_user_only_with_scope_snapshot(
         snapshot,
-        &snapshot.signature_cache,
         function_name,
-        None,  // namespace - None for user functions
-        false, // is_internal
         uri,
         position,
     )?;
@@ -20528,6 +20089,15 @@ pub(crate) fn signature_help_context_from_snapshot(
     prepared: PreparedSignatureHelp,
 ) -> Option<SignatureHelpContext> {
     let func_name = prepared.function_name.as_str();
+    if let Some(user_signature) =
+        try_build_user_signature_from_snapshot(snapshot, func_name, uri, prepared.position)
+    {
+        return Some(SignatureHelpContext {
+            active_parameter: prepared.active_parameter,
+            resolution: SignatureResolution::Ready(user_signature),
+        });
+    }
+
     let mut prefix_cache = scope::ParentPrefixCache::new();
     let scope = snapshot.scope_at(
         uri,
@@ -20537,24 +20107,18 @@ pub(crate) fn signature_help_context_from_snapshot(
         &mut prefix_cache,
     );
 
-    fn resolve_user_or_fallback(
-        snapshot: &CrossFileScopeSnapshot,
+    fn fallback_resolution(
         func_name: &str,
-        uri: &Url,
-        position: Position,
         scope: &scope::ScopeAtPosition,
+        snapshot: &CrossFileScopeSnapshot,
+        uri: &Url,
     ) -> SignatureResolution {
-        SignatureResolution::Ready(
-            try_build_user_signature_from_snapshot(snapshot, func_name, uri, position)
-                .unwrap_or_else(|| {
-                    build_fallback_signature(
-                        func_name,
-                        scope,
-                        uri,
-                        snapshot.workspace_folders.first(),
-                    )
-                }),
-        )
+        SignatureResolution::Ready(build_fallback_signature(
+            func_name,
+            scope,
+            uri,
+            snapshot.workspace_folders.first(),
+        ))
     }
 
     // Resolve the R executable path for any package help lookups.
@@ -20581,7 +20145,7 @@ pub(crate) fn signature_help_context_from_snapshot(
                 r_path: r_path.clone(),
             }
         } else {
-            resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
+            fallback_resolution(func_name, &scope, snapshot, uri)
         }
     } else if snapshot.cross_file_config.packages_enabled {
         let all_packages: Vec<String> = scope
@@ -20608,10 +20172,10 @@ pub(crate) fn signature_help_context_from_snapshot(
                 r_path,
             }
         } else {
-            resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
+            fallback_resolution(func_name, &scope, snapshot, uri)
         }
     } else {
-        resolve_user_or_fallback(snapshot, func_name, uri, prepared.position, &scope)
+        fallback_resolution(func_name, &scope, snapshot, uri)
     };
 
     Some(SignatureHelpContext {
@@ -20706,6 +20270,292 @@ fn build_fallback_signature(
 // ============================================================================
 // Goto Definition
 // ============================================================================
+
+pub(crate) enum PreparedGotoDefinition {
+    Immediate(Option<GotoDefinitionResponse>),
+    Identifier(PreparedIdentifierGotoDefinition),
+}
+
+pub(crate) struct PreparedIdentifierGotoDefinition {
+    name: String,
+    scope_key: String,
+    exported_interfaces: Vec<(Url, Arc<scope::ScopeArtifacts>)>,
+    tree_fallbacks: Vec<(Url, String, tree_sitter::Tree)>,
+}
+
+/// Capture the syntax-only and index fallback inputs for go-to-definition while
+/// the `WorldState` read lock is held. Scope resolution belongs in
+/// [`goto_definition_from_scope_snapshot`] after the caller has built a
+/// [`CrossFileScopeSnapshot`] and released that lock.
+pub(crate) fn prepare_goto_definition_for_scope_snapshot(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    cancel: &DiagCancelToken,
+) -> PreparedGotoDefinition {
+    if cancel.is_cancelled() {
+        return PreparedGotoDefinition::Immediate(None);
+    }
+    let content_provider = state.content_provider();
+
+    let Some(doc) = state
+        .get_document(uri)
+        .or_else(|| state.workspace_index.get(uri))
+    else {
+        return PreparedGotoDefinition::Immediate(None);
+    };
+    let Some(tree) = doc.tree.as_ref() else {
+        return PreparedGotoDefinition::Immediate(None);
+    };
+    let text = doc.analysis_text();
+
+    let file_path_context =
+        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
+    if !matches!(
+        file_path_context,
+        crate::file_path_intellisense::FilePathContext::None
+    ) {
+        let metadata = match file_path_context {
+            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
+                state.get_enriched_metadata(uri).unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+
+        let response = crate::file_path_intellisense::file_path_definition(
+            tree,
+            &text,
+            position,
+            uri,
+            &metadata,
+            state.workspace_folders.first(),
+        )
+        .map(GotoDefinitionResponse::Scalar);
+        return PreparedGotoDefinition::Immediate(response);
+    }
+
+    if doc.file_type == FileType::Stan {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        let occurrences = collect_stan_identifier_occurrences(&text);
+        let response = stan_identifier_at_position(&occurrences, position).and_then(|target| {
+            let definition = find_stan_definition(&text, &target.name, position)?;
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position::new(definition.line, definition.start_col),
+                    end: Position::new(definition.line, definition.end_col),
+                },
+            }))
+        });
+        return PreparedGotoDefinition::Immediate(response);
+    }
+
+    if doc.file_type == FileType::Jags {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        let occurrences = collect_jags_identifier_occurrences(&text);
+        let response = stan_identifier_at_position(&occurrences, position).and_then(|target| {
+            let is_builtin = crate::jags_builtins::JAGS_KEYWORDS.contains(&target.name.as_str())
+                || crate::jags_builtins::JAGS_DISTRIBUTIONS.contains(&target.name.as_str())
+                || crate::jags_builtins::JAGS_FUNCTIONS.contains(&target.name.as_str());
+            let location = find_jags_definition(&text, &target.name, position)
+                .map(|def| (def.line, def.start_col, def.end_col))
+                .or_else(|| {
+                    if is_builtin {
+                        return None;
+                    }
+                    occurrences
+                        .iter()
+                        .find(|o| o.name == target.name)
+                        .map(|o| (o.line, o.start_col, o.end_col))
+                })?;
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position::new(location.0, location.1),
+                    end: Position::new(location.0, location.2),
+                },
+            }))
+        });
+        return PreparedGotoDefinition::Immediate(response);
+    }
+
+    let point = lsp_position_to_ts_point(&text, position);
+    let Some(node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return PreparedGotoDefinition::Immediate(None);
+    };
+
+    if node.kind() != "identifier" {
+        return PreparedGotoDefinition::Immediate(None);
+    }
+
+    if crate::extract_op::extract_operator_rhs(node).is_some() {
+        return PreparedGotoDefinition::Immediate(None);
+    }
+
+    let name = node_text(node, &text).to_string();
+    let scope_key = unquote_backtick_name(&name).unwrap_or(&name).to_string();
+
+    let mut exported_interfaces = Vec::new();
+    for file_uri in state.document_store.uris() {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        if &file_uri == uri {
+            continue;
+        }
+        if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
+            exported_interfaces.push((file_uri, artifacts));
+        }
+    }
+    for (file_uri, artifacts) in state.workspace_index_new.iter_artifacts() {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        if &file_uri == uri {
+            continue;
+        }
+        exported_interfaces.push((file_uri, artifacts));
+    }
+
+    let mut tree_fallbacks = Vec::new();
+    for (file_uri, doc) in &state.documents {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        if file_uri == uri {
+            continue;
+        }
+        if let Some(tree) = &doc.tree {
+            tree_fallbacks.push((file_uri.clone(), doc.analysis_text(), tree.clone()));
+        }
+    }
+    for (file_uri, doc) in &state.workspace_index {
+        if cancel.is_cancelled() {
+            return PreparedGotoDefinition::Immediate(None);
+        }
+        if file_uri == uri {
+            continue;
+        }
+        if let Some(tree) = &doc.tree {
+            tree_fallbacks.push((file_uri.clone(), doc.analysis_text(), tree.clone()));
+        }
+    }
+
+    PreparedGotoDefinition::Identifier(PreparedIdentifierGotoDefinition {
+        name,
+        scope_key,
+        exported_interfaces,
+        tree_fallbacks,
+    })
+}
+
+pub(crate) fn goto_definition_from_scope_snapshot(
+    snapshot: &CrossFileScopeSnapshot,
+    uri: &Url,
+    position: Position,
+    prepared: PreparedGotoDefinition,
+    cancel: &DiagCancelToken,
+) -> Option<GotoDefinitionResponse> {
+    let prepared = match prepared {
+        PreparedGotoDefinition::Immediate(response) => return response,
+        PreparedGotoDefinition::Identifier(prepared) => prepared,
+    };
+
+    let mut prefix_cache = scope::ParentPrefixCache::new();
+    let scope = snapshot.scope_at(
+        uri,
+        position.line,
+        position.character,
+        cancel,
+        &mut prefix_cache,
+    );
+
+    if let Some(symbol) = scope
+        .symbols
+        .get(prepared.name.as_str())
+        .or_else(|| scope.symbols.get(prepared.scope_key.as_str()))
+    {
+        if symbol.source_uri.as_str().starts_with("package:") {
+            log::trace!(
+                "Symbol '{}' is from package '{}', no navigable source available",
+                prepared.name,
+                symbol
+                    .source_uri
+                    .as_str()
+                    .strip_prefix("package:")
+                    .unwrap_or("unknown")
+            );
+            return None;
+        }
+
+        if symbol.is_declared {
+            let metadata = snapshot.get_metadata(&symbol.source_uri);
+            let definition_line =
+                resolve_directive_origin(metadata.as_deref(), &prepared.name, symbol.defined_line)
+                    .map(|(line, _)| line)
+                    .unwrap_or(symbol.defined_line);
+
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: symbol.source_uri.clone(),
+                range: Range {
+                    start: Position::new(definition_line, 0),
+                    end: Position::new(definition_line, 0),
+                },
+            }));
+        }
+
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: symbol.source_uri.clone(),
+            range: scoped_symbol_range(symbol),
+        }));
+    }
+
+    for (_file_uri, artifacts) in &prepared.exported_interfaces {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if let Some(symbol) = artifacts
+            .exported_interface
+            .get(prepared.name.as_str())
+            .or_else(|| {
+                artifacts
+                    .exported_interface
+                    .get(prepared.scope_key.as_str())
+            })
+        {
+            if symbol.source_uri.as_str().starts_with("package:") {
+                continue;
+            }
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: symbol.source_uri.clone(),
+                range: scoped_symbol_range(symbol),
+            }));
+        }
+    }
+
+    for (file_uri, file_text, tree) in &prepared.tree_fallbacks {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if let Some(def_range) = find_definition_try_both(
+            tree.root_node(),
+            &prepared.name,
+            &prepared.scope_key,
+            file_text,
+        ) {
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: file_uri.clone(),
+                range: def_range,
+            }));
+        }
+    }
+
+    None
+}
 
 /// Locate the definition location for the identifier at the given position by searching
 /// the current document, cross-file symbols, open documents, and the workspace index.
@@ -54593,8 +54443,8 @@ y <- x"#;
 mod position_aware_tests {
     use crate::cross_file::directive::parse_directives;
     use crate::handlers::{
-        DiagCancelToken, DiagnosticsSnapshot, collect_undefined_variables_from_snapshot,
-        diagnostics_from_snapshot, goto_definition,
+        CrossFileScopeSnapshot, DiagCancelToken, DiagnosticsSnapshot,
+        collect_undefined_variables_from_snapshot, diagnostics_from_snapshot, goto_definition,
     };
     use crate::state::{Document, WorldState};
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
@@ -54618,6 +54468,43 @@ mod position_aware_tests {
         let document = Document::new(content, None);
         state.documents.insert(uri.clone(), document);
         uri
+    }
+
+    fn add_document_with_graph(
+        state: &mut WorldState,
+        workspace_root: &Url,
+        uri_str: &str,
+        content: &str,
+    ) -> Url {
+        let uri = add_document(state, uri_str, content);
+        let metadata = crate::cross_file::extract_metadata(content);
+        state
+            .cross_file_graph
+            .update_file(&uri, &metadata, Some(workspace_root), |_| None);
+        uri
+    }
+
+    fn diagnostic_signatures(state: &WorldState, uri: &Url) -> Vec<String> {
+        let snapshot = DiagnosticsSnapshot::build(state, uri).expect("snapshot");
+        let mut signatures: Vec<String> =
+            diagnostics_from_snapshot(&snapshot, uri, &DiagCancelToken::never())
+                .expect("diagnostics")
+                .into_iter()
+                .map(|d| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        d.range.start.line,
+                        d.range.start.character,
+                        d.code
+                            .as_ref()
+                            .map(|code| format!("{code:?}"))
+                            .unwrap_or_default(),
+                        d.message
+                    )
+                })
+                .collect();
+        signatures.sort();
+        signatures
     }
 
     #[test]
@@ -54738,6 +54625,268 @@ mod position_aware_tests {
         assert!(
             !saturated_snapshot.artifacts_map.contains_key(&active_leaf),
             "active standalone precollection must not add extra URIs once the neighborhood budget is saturated"
+        );
+    }
+
+    #[test]
+    fn cross_file_scope_snapshot_materializes_active_standalone_closure_targets() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+        use crate::cross_file::types::CrossFileMetadata;
+        use crate::workspace_index::IndexEntry;
+        use ropey::Rope;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        fn index_closed_file(
+            state: &mut WorldState,
+            workspace_root: &Url,
+            uri: &Url,
+            code: &str,
+            metadata: CrossFileMetadata,
+        ) {
+            state
+                .cross_file_graph
+                .update_file(uri, &metadata, Some(workspace_root), |_| None);
+            let tree = parse_r_code(code);
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                uri,
+                &tree,
+                code,
+                Some(&metadata),
+            ));
+            let metadata = Arc::new(metadata);
+            let entry = IndexEntry {
+                contents: Rope::from_str(code),
+                tree: Some(tree),
+                loaded_packages: Vec::new(),
+                snapshot: FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: code.len() as u64,
+                    content_hash: None,
+                },
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        }
+
+        let mut state = create_test_state();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        state.workspace_folders.push(workspace_root.clone());
+
+        let c = Url::parse("file:///project/c/c.R").unwrap();
+        let m = Url::parse("file:///project/m/m.R").unwrap();
+        let active_leaf = Url::parse("file:///project/c/leaf.R").unwrap();
+        let graph_leaf = Url::parse("file:///project/outside/leaf.R").unwrap();
+
+        let c_code = "# raven: standalone\nsource(\"../m/m.R\")\n";
+        let m_code = "source(\"leaf.R\")\nm_sym <- leaf_sym\n";
+        let active_leaf_code = "leaf_sym <- 1\n";
+        let graph_leaf_code = "outside_leaf <- 1\n";
+
+        state
+            .documents
+            .insert(c.clone(), Document::new(c_code, None));
+        let c_meta = crate::cross_file::extract_metadata(c_code);
+        state
+            .cross_file_graph
+            .update_file(&c, &c_meta, Some(&workspace_root), |_| None);
+
+        let mut m_meta = crate::cross_file::extract_metadata(m_code);
+        m_meta.inherited_working_directory = Some("/project/outside".to_string());
+        index_closed_file(&mut state, &workspace_root, &m, m_code, m_meta);
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &active_leaf,
+            active_leaf_code,
+            CrossFileMetadata::default(),
+        );
+        index_closed_file(
+            &mut state,
+            &workspace_root,
+            &graph_leaf,
+            graph_leaf_code,
+            CrossFileMetadata::default(),
+        );
+
+        let snapshot = CrossFileScopeSnapshot::build(&state, &c);
+        assert!(
+            snapshot.artifacts_map.contains_key(&active_leaf),
+            "interactive snapshot must precollect active standalone closure targets"
+        );
+        let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+        let scope = snapshot.scope_at(
+            &c,
+            u32::MAX,
+            u32::MAX,
+            &DiagCancelToken::never(),
+            &mut prefix_cache,
+        );
+        assert!(
+            scope.symbols.contains_key("leaf_sym"),
+            "interactive scope must see active leaf symbols"
+        );
+        assert!(
+            !scope.symbols.contains_key("outside_leaf"),
+            "interactive scope must not use the globally indexed outside-WD target"
+        );
+
+        let cancelled = CrossFileScopeSnapshot::build_with_cancel(&state, &c, &|| true);
+        assert!(
+            !cancelled.artifacts_map.contains_key(&active_leaf),
+            "active standalone precollection must honor cancellation"
+        );
+    }
+
+    #[test]
+    fn standalone_cache_on_off_diagnostics_are_byte_identical() {
+        let mut state = create_test_state();
+        let workspace_root = Url::parse("file:///project/").unwrap();
+        state.workspace_folders.push(workspace_root.clone());
+
+        add_document_with_graph(
+            &mut state,
+            &workspace_root,
+            "file:///project/a.R",
+            "source(\"hub.R\")\na_result <- hub_fn()\n",
+        );
+        let b = add_document_with_graph(
+            &mut state,
+            &workspace_root,
+            "file:///project/b.R",
+            "source(\"hub.R\")\nb_result <- hub_fn()\nb_missing\n",
+        );
+        add_document_with_graph(
+            &mut state,
+            &workspace_root,
+            "file:///project/hub.R",
+            "# raven: standalone\nsource(\"member.R\")\nhub_fn <- function() member_value\n",
+        );
+        add_document_with_graph(
+            &mut state,
+            &workspace_root,
+            "file:///project/member.R",
+            "member_value <- 1\n",
+        );
+
+        let a = Url::parse("file:///project/a.R").unwrap();
+        let _warm = diagnostic_signatures(&state, &a);
+        let cached = diagnostic_signatures(&state, &b);
+        let uncached =
+            crate::cross_file::scope::with_standalone_scope_cache_disabled_for_test(|| {
+                diagnostic_signatures(&state, &b)
+            });
+
+        assert_eq!(
+            cached, uncached,
+            "diagnostics must be byte-identical with the standalone scope cache enabled or disabled"
+        );
+        assert!(
+            cached
+                .iter()
+                .any(|d| d.contains("Undefined variable: b_missing")),
+            "fixture sanity: diagnostics pipeline must still run"
+        );
+        assert!(
+            !cached
+                .iter()
+                .any(|d| d.contains("Undefined variable: hub_fn")),
+            "cached standalone hub scope must still resolve exported functions"
+        );
+    }
+
+    #[test]
+    fn standalone_misuse_reports_safe_direction_undefined_variable() {
+        let workspace_root = Url::parse("file:///project/").unwrap();
+
+        let collect = |child_code: &str| {
+            let mut state = create_test_state();
+            state.workspace_folders.push(workspace_root.clone());
+            add_document_with_graph(
+                &mut state,
+                &workspace_root,
+                "file:///project/a.R",
+                "caller_sym <- 1\nsource(\"child.R\")\n",
+            );
+            let child = add_document_with_graph(
+                &mut state,
+                &workspace_root,
+                "file:///project/child.R",
+                child_code,
+            );
+            diagnostic_signatures(&state, &child)
+        };
+
+        let standalone = collect("# raven: standalone\n# raven: sourced-by a.R\ncaller_sym\n");
+        assert!(
+            standalone
+                .iter()
+                .any(|d| d.contains("Undefined variable: caller_sym")),
+            "a standalone file that relies on caller state must fail closed with an undefined-variable diagnostic; got {standalone:?}"
+        );
+
+        let non_standalone = collect("# raven: sourced-by a.R\ncaller_sym\n");
+        assert!(
+            !non_standalone
+                .iter()
+                .any(|d| d.contains("Undefined variable: caller_sym")),
+            "non-standalone control should still inherit caller symbols; got {non_standalone:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_misuse_reports_safe_direction_for_caller_package() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let workspace_root = Url::parse("file:///project/").unwrap();
+
+        let collect = |child_code: &str| {
+            let mut state = create_test_state();
+            state.workspace_folders.push(workspace_root.clone());
+            state.cross_file_config.packages_enabled = true;
+
+            let package_library = Arc::new(PackageLibrary::new_empty());
+            rt.block_on(package_library.insert_package(PackageInfo::new(
+                "callerpkg".to_string(),
+                HashSet::from(["caller_export".to_string()]),
+            )));
+            state.set_package_library(package_library, true);
+
+            add_document_with_graph(
+                &mut state,
+                &workspace_root,
+                "file:///project/a.R",
+                "library(callerpkg)\nsource(\"child.R\")\n",
+            );
+            let child = add_document_with_graph(
+                &mut state,
+                &workspace_root,
+                "file:///project/child.R",
+                child_code,
+            );
+            diagnostic_signatures(&state, &child)
+        };
+
+        let standalone = collect("# raven: standalone\n# raven: sourced-by a.R\ncaller_export\n");
+        assert!(
+            standalone
+                .iter()
+                .any(|d| d.contains("Undefined variable: caller_export")),
+            "a standalone file that relies on caller-loaded packages must fail closed; got {standalone:?}"
+        );
+
+        let non_standalone = collect("# raven: sourced-by a.R\ncaller_export\n");
+        assert!(
+            !non_standalone
+                .iter()
+                .any(|d| d.contains("Undefined variable: caller_export")),
+            "non-standalone control should inherit caller-loaded packages; got {non_standalone:?}"
         );
     }
 

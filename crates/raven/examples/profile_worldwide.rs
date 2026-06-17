@@ -403,8 +403,7 @@ fn main() {
     }
     println!("[5] scripts/data.r diagnostics — COLD start (workspace_scan_complete=false):");
     let mut state = make_state(&workspace);
-    state.package_library = lib.clone();
-    state.package_library_ready = true;
+    state.set_package_library(lib.clone(), true);
     let target_uri = open_doc(&mut state, &target, &rt);
     // No apply_workspace_index call — workspace_scan_complete remains false.
     let cancel = DiagCancelToken::never();

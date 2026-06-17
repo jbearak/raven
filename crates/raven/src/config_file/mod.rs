@@ -276,16 +276,55 @@ mod tests {
         assert_eq!(state.standalone_scope_invalidation_generation(), start + 1);
 
         state.raw_client_settings = json!({
-            "crossFile": { "maxChainDepth": 32 },
-            "packages": { "enabled": false }
+            "crossFile": {
+                "maxChainDepth": 32,
+                "maxTransitiveDependentsVisited": 1234
+            }
         });
         recompute_parsed_configs(&mut state);
         assert_eq!(state.standalone_scope_invalidation_generation(), start + 2);
+
+        state.raw_client_settings = json!({
+            "crossFile": {
+                "maxChainDepth": 32,
+                "maxTransitiveDependentsVisited": 1234
+            },
+            "packages": { "enabled": false }
+        });
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 3);
+
+        state.raw_client_settings = json!({
+            "crossFile": {
+                "maxChainDepth": 32,
+                "maxTransitiveDependentsVisited": 1234
+            },
+            "packages": {
+                "enabled": false,
+                "rPath": "/opt/R/bin/R"
+            }
+        });
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 4);
+
+        state.raw_client_settings = json!({
+            "crossFile": {
+                "maxChainDepth": 32,
+                "maxTransitiveDependentsVisited": 1234
+            },
+            "packages": {
+                "enabled": false,
+                "rPath": "/opt/R/bin/R",
+                "additionalLibraryPaths": ["/opt/R/site-library"]
+            }
+        });
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 5);
 
         state.set_package_library(
             std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
             true,
         );
-        assert_eq!(state.standalone_scope_invalidation_generation(), start + 3);
+        assert_eq!(state.standalone_scope_invalidation_generation(), start + 6);
     }
 }

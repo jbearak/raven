@@ -346,7 +346,7 @@ mod lifecycle {
         let mut state = WorldState::new();
         let mut lib = PackageLibrary::new_empty();
         lib.set_lib_paths(vec![libdir.to_path_buf()]);
-        state.package_library = Arc::new(lib);
+        state.set_package_library(Arc::new(lib), false);
         state
     }
 
@@ -587,7 +587,7 @@ mod lifecycle {
         // Library swap: libdir_b now wins resolution.
         let mut lib = PackageLibrary::new_empty();
         lib.set_lib_paths(vec![libdir_b.path().to_path_buf()]);
-        state.package_library = Arc::new(lib);
+        state.set_package_library(Arc::new(lib), false);
         state.resolve_system_file_in_workspace();
 
         let new_target = state

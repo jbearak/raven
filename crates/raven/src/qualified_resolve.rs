@@ -80,8 +80,8 @@ use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
 use crate::cross_file::scope::LineIndex;
+use crate::cross_file::scope_snapshot::{CrossFileScopeSnapshot, DiagCancelToken};
 use crate::extract_op::ExtractOp;
-use crate::handlers::{CrossFileScopeSnapshot, DiagCancelToken};
 use crate::state::WorldState;
 use crate::utf16::{byte_offset_to_utf16_column, utf16_column_to_byte_offset};
 
@@ -2403,7 +2403,8 @@ alpha@beta$
             dollar_samples.sort();
 
             // Compare against a single full scope query at the same cursor.
-            let scope_snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &uri);
+            let scope_snapshot =
+                crate::cross_file::scope_snapshot::CrossFileScopeSnapshot::build(&state, &uri);
             let mut scope_samples = [std::time::Duration::ZERO; 5];
             for s in &mut scope_samples {
                 let cancel = DiagCancelToken::never();
@@ -2490,7 +2491,8 @@ alpha@beta$
             }
             dollar_samples.sort();
 
-            let scope_snapshot = crate::handlers::CrossFileScopeSnapshot::build(&state, &main_uri);
+            let scope_snapshot =
+                crate::cross_file::scope_snapshot::CrossFileScopeSnapshot::build(&state, &main_uri);
             let mut scope_samples = [std::time::Duration::ZERO; 5];
             for s in &mut scope_samples {
                 let cancel = DiagCancelToken::never();

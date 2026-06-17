@@ -21,7 +21,10 @@ helper_function <- function(x) { x * 2 }
 When you open a file in a workspace with detectable `source()` patterns, Raven:
 1. Scans the workspace for `source()` calls and builds a dependency graph
 2. Resolves which symbols are available at each position in each file
-3. Provides completions, diagnostics, hover, and go-to-definition using the full graph
+3. Provides completions, diagnostics, hover, and go-to-definition from a
+   per-request graph snapshot. Raven uses the full graph for change
+   invalidation and cycle/revision bookkeeping, while interactive scope queries
+   use the configured traversal budgets so large workspaces stay responsive.
 
 This happens automatically for standard `source()` patterns.
 
@@ -234,7 +237,7 @@ for the standalone file still stays position-aware; it does not blindly replace
 the file's timeline with an EOF cache hit. The cache is deliberately
 conservative: interface edits, the global dependency edge revision changing
 anywhere in the workspace, path-resolution context changes, package
-fact/library refreshes, package configuration changes, and max-depth changes
+fact/library refreshes, package configuration changes, and traversal-budget changes
 recompute it.
 
 The directive is the sound, opt-in way to assert this independence, so Raven

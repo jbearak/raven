@@ -98,6 +98,14 @@ pub struct IndexEntry {
     pub indexed_at_version: u64,
 }
 
+pub type ScopeSnapshotHandle = (
+    Url,
+    Arc<ScopeArtifacts>,
+    Arc<CrossFileMetadata>,
+    Rope,
+    Option<Tree>,
+);
+
 impl Clone for IndexEntry {
     fn clone(&self) -> Self {
         Self {
@@ -238,6 +246,21 @@ impl WorkspaceIndex {
         entry
     }
 
+    /// Get cached contents for a URI without cloning the full index entry.
+    pub fn get_contents(&self, uri: &Url) -> Option<ropey::Rope> {
+        let guard = self.inner.read().ok()?;
+        guard.peek(uri).map(|entry| entry.contents.clone())
+    }
+
+    /// Get cached contents and parse tree handles without cloning the full
+    /// index entry.
+    pub fn get_contents_and_tree(&self, uri: &Url) -> Option<(ropey::Rope, Option<Tree>)> {
+        let guard = self.inner.read().ok()?;
+        guard
+            .peek(uri)
+            .map(|entry| (entry.contents.clone(), entry.tree.clone()))
+    }
+
     /// Get entry only if fresh
     ///
     /// Returns the entry only if its snapshot matches the provided snapshot.
@@ -332,6 +355,41 @@ impl WorkspaceIndex {
         self.inner
             .read()
             .map(|guard| guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Iterate over exported scope artifacts without cloning full index entries.
+    pub fn iter_artifacts(&self) -> Vec<(Url, Arc<ScopeArtifacts>)> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.artifacts.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Iterate over the handles needed by cross-file scope snapshots without
+    /// cloning full index entries.
+    pub fn iter_scope_snapshot_handles(&self) -> Vec<ScopeSnapshotHandle> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(uri, entry)| {
+                        (
+                            uri.clone(),
+                            entry.artifacts.clone(),
+                            entry.metadata.clone(),
+                            entry.contents.clone(),
+                            entry.tree.clone(),
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

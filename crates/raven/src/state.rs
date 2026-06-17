@@ -503,7 +503,7 @@ pub struct WorldState {
     // Manages installed packages, their exports, and caching for package-aware scope resolution
     // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
     // Arc allows sharing across async tasks without holding WorldState lock
-    pub package_library: Arc<PackageLibrary>,
+    pub(crate) package_library: Arc<PackageLibrary>,
 
     // Caches
     pub help_cache: crate::help::HelpCache,
@@ -560,7 +560,7 @@ pub struct WorldState {
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
-    pub package_library_ready: bool,
+    pub(crate) package_library_ready: bool,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
     /// dependency mode, undefined variable diagnostics are deferred for files
@@ -742,6 +742,9 @@ impl WorldState {
         self.standalone_scope_cache.invalidation_generation()
     }
 
+    /// Replace the active package library and bump every cache generation keyed
+    /// to package facts. Production writers must use this helper rather than
+    /// assigning the fields directly.
     pub fn set_package_library(&mut self, library: Arc<PackageLibrary>, ready: bool) {
         self.package_library = library;
         self.package_library_ready = ready;
@@ -819,13 +822,32 @@ impl WorldState {
             .min(max_visited.saturating_mul(50))
             .min(Self::MULTI_SEED_VISITED_CEILING);
 
-        let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
+        let mut neighborhood = self.cross_file_graph.collect_neighborhood_multi(
             docs.iter().map(|(uri, _)| uri.clone()),
             max_depth,
             effective_max_visited,
         );
+        let initial_graph = self.cross_file_graph.extract_subgraph(&neighborhood);
 
         let content_provider = self.content_provider();
+        let get_active_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+        let get_active_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+        let mut seeds: Vec<Url> = neighborhood.iter().cloned().collect();
+        seeds.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        let active_extra_uris = crate::cross_file::scope::standalone_active_snapshot_members(
+            crate::cross_file::scope::StandaloneActiveSnapshotMembersInputs {
+                graph: &initial_graph,
+                max_depth,
+                max_visited: effective_max_visited,
+                workspace_root: self.workspace_folders.first(),
+                seed_uris: &seeds,
+                is_cancelled: &|| false,
+            },
+            &mut neighborhood,
+            &get_active_artifacts,
+            &get_active_metadata,
+        );
+
         let mut artifacts_map = HashMap::with_capacity(neighborhood.len());
         let mut metadata_map = HashMap::with_capacity(neighborhood.len());
         for u in &neighborhood {
@@ -846,7 +868,15 @@ impl WorldState {
                 .iter()
                 .map(|(uri, doc)| (uri.clone(), doc.loaded_packages.clone()))
                 .collect(),
-            graph: self.cross_file_graph.extract_subgraph(&neighborhood),
+            graph: if active_extra_uris.is_empty() {
+                initial_graph
+            } else {
+                self.cross_file_graph.extract_subgraph(&neighborhood)
+            },
+            cross_file_edge_revision: self.cross_file_graph.edge_revision(),
+            standalone_scope_invalidation_generation: self
+                .standalone_scope_invalidation_generation(),
+            standalone_scope_cache: self.standalone_scope_cache.clone(),
             workspace_folder: self.workspace_folders.first().cloned(),
             max_chain_depth: self.cross_file_config.max_chain_depth,
             backward_dependencies: self.cross_file_config.backward_dependencies,

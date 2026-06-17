@@ -347,6 +347,12 @@ pub struct PackageLibrary {
     /// Readers load immutable snapshots without taking a read lock. Writers
     /// serialize copy-on-write publications through `packages_write`.
     packages: ArcSwap<PackageCache>,
+    /// Coherent package facts used by cross-file scope snapshots.
+    ///
+    /// This pairs the per-package map with the epoch that identifies it, so
+    /// snapshot builders can load data-alias facts without taking
+    /// `packages_write` while holding `WorldState`'s read lock.
+    package_facts: ArcSwap<PackageFactSnapshot>,
     packages_write: Mutex<()>,
     /// Combined aggregate cache keyed by the loaded package name.
     ///
@@ -391,6 +397,10 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: ArcSwap::from_pointee(HashMap::new()),
+            package_facts: ArcSwap::from_pointee(PackageFactSnapshot {
+                packages: Arc::new(HashMap::new()),
+                cache_epoch: 0,
+            }),
             packages_write: Mutex::new(()),
             combined_entries: ArcSwap::from_pointee(HashMap::new()),
             combined_entries_write: Mutex::new(()),
@@ -414,6 +424,10 @@ impl PackageLibrary {
         Self {
             lib_paths: Vec::new(),
             packages: ArcSwap::from_pointee(HashMap::new()),
+            package_facts: ArcSwap::from_pointee(PackageFactSnapshot {
+                packages: Arc::new(HashMap::new()),
+                cache_epoch: 0,
+            }),
             packages_write: Mutex::new(()),
             combined_entries: ArcSwap::from_pointee(HashMap::new()),
             combined_entries_write: Mutex::new(()),
@@ -441,6 +455,7 @@ impl PackageLibrary {
     }
 
     /// Monotonic epoch for cached package facts.
+    #[cfg(test)]
     pub(crate) fn cache_epoch(&self) -> u64 {
         self.cache_epoch.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -448,20 +463,26 @@ impl PackageLibrary {
     /// Snapshot package facts together with the epoch that identifies them.
     ///
     /// The standalone scope cache key uses `cache_epoch`, while `data()` alias
-    /// expansion reads package facts. Capturing both under `packages_write`
-    /// keeps a resolver from pairing an old epoch with a newly published map
-    /// (or the reverse) during background package-cache publication.
+    /// expansion reads package facts. The pair is published atomically through
+    /// `package_facts`, so callers can load it while holding `WorldState`'s
+    /// read lock without blocking behind a package-cache writer.
     pub(crate) fn package_fact_snapshot(&self) -> PackageFactSnapshot {
-        let _guard = self.packages_write.lock();
-        PackageFactSnapshot {
-            packages: self.packages.load_full(),
-            cache_epoch: self.cache_epoch(),
-        }
+        self.package_facts.load_full().as_ref().clone()
+    }
+
+    fn bump_cache_epoch_with_packages(&self, packages: Arc<PackageCache>) {
+        let cache_epoch = self
+            .cache_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1);
+        self.package_facts.store(Arc::new(PackageFactSnapshot {
+            packages,
+            cache_epoch,
+        }));
     }
 
     fn bump_cache_epoch(&self) {
-        self.cache_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.bump_cache_epoch_with_packages(self.packages.load_full());
     }
 
     /// Check if a symbol is exported by base packages
@@ -502,8 +523,9 @@ impl PackageLibrary {
         let _guard = self.packages_write.lock();
         let mut next = self.packages.load_full().as_ref().clone();
         let result = f(&mut next);
-        self.packages.store(Arc::new(next));
-        self.bump_cache_epoch();
+        let next = Arc::new(next);
+        self.packages.store(next.clone());
+        self.bump_cache_epoch_with_packages(next);
         result
     }
 
@@ -1384,6 +1406,7 @@ impl PackageLibrary {
     /// discovered from R or fallback values.
     pub fn set_base_packages(&mut self, packages: HashSet<String>) {
         self.base_packages = packages;
+        self.bump_cache_epoch();
     }
 
     /// Set the base exports
@@ -1392,6 +1415,7 @@ impl PackageLibrary {
     /// from all base packages.
     pub fn set_base_exports(&mut self, exports: HashSet<String>) {
         self.base_exports = Arc::new(exports);
+        self.bump_cache_epoch();
     }
 
     /// Parse a package's NAMESPACE and DESCRIPTION files statically.
@@ -2993,6 +3017,32 @@ mod tests {
 
         lib.clear_cache().await;
         assert!(lib.cache_epoch() > after_invalidate);
+
+        let after_clear = lib.cache_epoch();
+        let mut base_packages = HashSet::new();
+        base_packages.insert("datasets".to_string());
+        let mut mutable_lib = lib;
+        mutable_lib.set_base_packages(base_packages);
+        let after_base_packages = mutable_lib.cache_epoch();
+        assert!(
+            after_base_packages > after_clear,
+            "base package changes affect data() alias expansion and must invalidate package fact snapshots"
+        );
+
+        mutable_lib.set_base_exports(HashSet::from(["mean".to_string()]));
+        assert!(
+            mutable_lib.cache_epoch() > after_base_packages,
+            "base export changes must publish a new package fact epoch"
+        );
+    }
+
+    #[test]
+    fn package_fact_snapshot_does_not_wait_for_publish_gate() {
+        let lib = PackageLibrary::new_empty();
+        lib.with_packages_publish_gate_for_test(|| {
+            let snapshot = lib.package_fact_snapshot();
+            assert_eq!(snapshot.cache_epoch(), lib.cache_epoch());
+        });
     }
 
     #[tokio::test]
