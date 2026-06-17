@@ -63,6 +63,31 @@ pub fn namespace_model_from_content(content: &str) -> PackageNamespaceModel {
                     model.exports.insert(format!("__PATTERN__:{}", pat));
                 }
             }
+        } else if let Some(args) = strip_directive(line, "exportClassPattern") {
+            // S4 class-name pattern — analogue of exportPattern (issue #474).
+            for pat in split_args(args) {
+                if !pat.is_empty() {
+                    model.exports.insert(format!("__PATTERN__:{}", pat));
+                }
+            }
+        } else if let Some(args) = strip_directive(line, "exportClasses") {
+            // Exported S4 class names — included by `getNamespaceExports()`
+            // (issue #474).
+            for name in split_args(args) {
+                let name = unquote(name);
+                if !name.is_empty() {
+                    model.exports.insert(name);
+                }
+            }
+        } else if let Some(args) = strip_directive(line, "exportMethods") {
+            // Exported S4 generics/methods — included by `getNamespaceExports()`
+            // (issue #474: sp::spTransform, maptools::spRbind, sp::spChFIDs).
+            for name in split_args(args) {
+                let name = unquote(name);
+                if !name.is_empty() {
+                    model.exports.insert(name);
+                }
+            }
         } else if let Some(args) = strip_directive(line, "S3method") {
             let parts: Vec<&str> = split_args(args).collect();
             if parts.len() >= 2 {
@@ -463,6 +488,29 @@ S3method(print, myclass)
             !model.exports.contains("\"%>%\""),
             "should NOT contain quoted form"
         );
+    }
+
+    #[test]
+    fn namespace_model_parses_s4_export_directives() {
+        // Issue #474: exportMethods/exportClasses are plain exports;
+        // exportClassPattern is a pattern marker. `export` must not swallow them.
+        let content = "\
+export(rebuild_CRS)
+exportClasses(CRS, Spatial)
+exportMethods(spTransform, \"spChFIDs<-\")
+exportClassPattern(\"^Spatial\")
+";
+        let model = namespace_model_from_content(content);
+        for name in ["rebuild_CRS", "CRS", "Spatial", "spTransform", "spChFIDs<-"] {
+            assert!(
+                model.exports.contains(name),
+                "missing export {name}: {:?}",
+                model.exports
+            );
+        }
+        // This module stores pattern markers verbatim (quotes kept), matching
+        // its existing `exportPattern` handling.
+        assert!(model.exports.contains("__PATTERN__:\"^Spatial\""));
     }
 
     #[test]

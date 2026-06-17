@@ -4154,6 +4154,78 @@ mod tests {
         assert!(exports.contains("funcC"), "transitive export (level 2)");
     }
 
+    /// Write a package whose NAMESPACE exports symbols ONLY via the S4
+    /// directives `exportMethods`/`exportClasses` plus one plain `export`, with
+    /// NO `exportPattern` — the sp/maptools shape from issue #474. Because there
+    /// is no `exportPattern`, the loader takes the static path and never calls
+    /// R, so these names must come from the static parse.
+    fn write_s4_pkg(lib_root: &std::path::Path, name: &str) {
+        let pkg_dir = lib_root.join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            format!("Package: {name}\nVersion: 1.0.0\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("NAMESPACE"),
+            "export(plainFn)\nexportClasses(Spatial)\nexportMethods(spTransform)\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_package_resolves_s4_exports_without_r() {
+        // Issue #474: a no-`exportPattern` package exporting via
+        // exportMethods/exportClasses must resolve through `get_package` with no
+        // R subprocess.
+        let lib_root = tempfile::tempdir().unwrap();
+        write_s4_pkg(lib_root.path(), "sppkg");
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+
+        let info = lib.get_package("sppkg").await.expect("package loads");
+        assert!(info.exports.contains("plainFn"), "plain export");
+        assert!(
+            info.exports.contains("spTransform"),
+            "exportMethods S4 generic must resolve (was the #474 bug): {:?}",
+            info.exports
+        );
+        assert!(
+            info.exports.contains("Spatial"),
+            "exportClasses S4 class must resolve: {:?}",
+            info.exports
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_resolves_s4_exports_without_r() {
+        // Issue #474: the prefetch path makes the same static-vs-pattern
+        // decision as get_package; S4 exports must resolve from cache after a
+        // warm with no R subprocess.
+        let lib_root = tempfile::tempdir().unwrap();
+        write_s4_pkg(lib_root.path(), "sppkg");
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+
+        lib.prefetch_packages(&["sppkg".to_string()]).await;
+
+        let info = lib
+            .get_cached_package("sppkg")
+            .await
+            .expect("prefetched package is cached");
+        assert!(
+            info.exports.contains("spTransform"),
+            "exportMethods S4 generic must resolve via prefetch: {:?}",
+            info.exports
+        );
+        assert!(
+            info.exports.contains("Spatial"),
+            "exportClasses S4 class must resolve via prefetch: {:?}",
+            info.exports
+        );
+    }
+
     /// Build a fake installed package on disk and return `(lib_root, lib)` with
     /// `lib`'s search path pointing at it. `namespace` is the NAMESPACE body and
     /// `datasets` are written one-per-line to `data/datalist`. The returned

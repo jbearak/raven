@@ -21,10 +21,15 @@ fn index_exports_cache() -> &'static DashMap<PathBuf, Vec<String>> {
 
 /// Extracts exported symbol names from an R package NAMESPACE file.
 ///
-/// Recognizes `export(name[, ...])`, `exportPattern("pattern")` and `S3method(generic, class[, method])`.
-/// Comments and blank lines are ignored; multiline directives are supported. `exportPattern` entries
-/// are preserved as markers in the form `__PATTERN__:<pattern>`. S3 methods are returned as
-/// `generic.class`. Whitespace is trimmed and empty names are omitted.
+/// Recognizes `export(name[, ...])`, `exportPattern("pattern")`,
+/// `exportMethods(name[, ...])`, `exportClasses(name[, ...])`,
+/// `exportClassPattern("pattern")` and `S3method(generic, class[, method])`.
+/// Comments and blank lines are ignored; multiline directives are supported.
+/// `exportPattern` and `exportClassPattern` entries are preserved as markers in
+/// the form `__PATTERN__:<pattern>`. `exportMethods` (S4 generics/methods) and
+/// `exportClasses` (S4 class names) are returned as plain names, matching
+/// `getNamespaceExports()`. S3 methods are returned as `generic.class`.
+/// Whitespace is trimmed and empty names are omitted.
 ///
 /// # Returns
 ///
@@ -51,8 +56,12 @@ pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
 /// This function scans normalized NAMESPACE directives and collects:
 ///
 /// - plain exported names from `export(...)` directives,
+/// - S4 generic/method names from `exportMethods(...)` and S4 class names from
+///   `exportClasses(...)` as plain names (issue #474 — these appear in
+///   `getNamespaceExports()` but were previously dropped),
 /// - S3 methods from `S3method(generic, class[, method])` formatted as `generic.class`,
-/// - export patterns from `exportPattern(...)` stored as markers `__PATTERN__:<pattern>`.
+/// - export patterns from `exportPattern(...)` and `exportClassPattern(...)`
+///   stored as markers `__PATTERN__:<pattern>`.
 ///
 /// Comments and blank lines are ignored; whitespace is trimmed and empty names are filtered out.
 fn parse_namespace_content(content: &str) -> Vec<String> {
@@ -90,6 +99,39 @@ fn parse_namespace_content(content: &str) -> Vec<String> {
                     // Store pattern with a prefix to distinguish from regular exports
                     // This allows callers to identify patterns for later expansion
                     exports.push(format!("__PATTERN__:{}", pattern));
+                }
+            }
+        }
+        // Handle exportClassPattern("pattern") — S4 analogue of exportPattern,
+        // matching exported S4 class names by regex. Like exportPattern we can't
+        // expand it without R/INDEX, so store it as a marker (issue #474).
+        // Checked before `exportClasses` is irrelevant (distinct prefixes), but
+        // it must be checked before any `exportClass`-style prefix would match.
+        else if let Some(args) = extract_directive_args(line, "exportClassPattern") {
+            for pattern in parse_comma_separated_args(&args) {
+                if !pattern.is_empty() {
+                    exports.push(format!("__PATTERN__:{}", pattern));
+                }
+            }
+        }
+        // Handle exportClasses(Class1, Class2, ...) — exported S4 class names.
+        // `getNamespaceExports()` includes these, so the static parse must too
+        // (issue #474). Names are plain identifiers (some are also generator
+        // functions, e.g. sp's `CRS`).
+        else if let Some(args) = extract_directive_args(line, "exportClasses") {
+            for name in parse_comma_separated_args(&args) {
+                if !name.is_empty() {
+                    exports.push(name);
+                }
+            }
+        }
+        // Handle exportMethods(generic1, generic2, ...) — exported S4 generics
+        // /methods. `getNamespaceExports()` returns these as the generic names
+        // (issue #474: sp::spTransform, maptools::spRbind, sp::spChFIDs).
+        else if let Some(args) = extract_directive_args(line, "exportMethods") {
+            for name in parse_comma_separated_args(&args) {
+                if !name.is_empty() {
+                    exports.push(name);
                 }
             }
         }
@@ -914,6 +956,106 @@ S3method(summary, myclass)
                 "summary.myclass"
             ]
         );
+    }
+
+    // S4 export directives (issue #474): exportMethods / exportClasses are
+    // plain exports (matching `getNamespaceExports`); exportClassPattern is a
+    // pattern marker like exportPattern.
+
+    #[test]
+    fn test_parse_namespace_export_methods_single() {
+        let content = "exportMethods(spTransform)";
+        let exports = parse_namespace_content(content);
+        assert_eq!(exports, vec!["spTransform"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_export_methods_multiple_multiline() {
+        // Models sp's exportMethods block (issue #474).
+        let content = r#"
+exportMethods(
+    spTransform,
+    spChFIDs,
+    "spChFIDs<-"
+)
+"#;
+        let exports = parse_namespace_content(content);
+        assert_eq!(exports, vec!["spTransform", "spChFIDs", "spChFIDs<-"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_export_classes() {
+        // Models sp's exportClasses block (issue #474).
+        let content = "exportClasses(CRS, Spatial, SpatialPolygons)";
+        let exports = parse_namespace_content(content);
+        assert_eq!(exports, vec!["CRS", "Spatial", "SpatialPolygons"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_export_class_pattern_is_marker() {
+        // exportClassPattern is treated like exportPattern: stored as a marker
+        // so the resolver flips `has_export_pattern` and consults R/INDEX.
+        let content = r#"exportClassPattern("^Spatial")"#;
+        let exports = parse_namespace_content(content);
+        assert_eq!(exports, vec!["__PATTERN__:^Spatial"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_export_prefix_not_swallowed_by_export() {
+        // The `export` branch must not swallow exportMethods/exportClasses.
+        let content = r#"
+export(plainFn)
+exportMethods(gUnaryUnion)
+exportClasses(Spatial)
+"#;
+        let exports = parse_namespace_content(content);
+        assert_eq!(exports, vec!["plainFn", "gUnaryUnion", "Spatial"]);
+    }
+
+    #[test]
+    fn test_parse_namespace_s4_directives_no_export_pattern() {
+        // A package exporting only via export()+exportMethods()+exportClasses()
+        // (no exportPattern) — the sp/maptools shape. None of the names should
+        // be lost, and no `__PATTERN__:` marker should appear.
+        let content = r#"
+export(rebuild_CRS)
+exportClasses(CRS, Spatial)
+exportMethods(spTransform, spChFIDs)
+"#;
+        let exports = parse_namespace_content(content);
+        assert!(!exports.iter().any(|e| e.starts_with("__PATTERN__:")));
+        for name in ["rebuild_CRS", "CRS", "Spatial", "spTransform", "spChFIDs"] {
+            assert!(
+                exports.contains(&name.to_string()),
+                "missing export {name}: {exports:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_namespace_empty_s4_directives() {
+        // Empty S4 directives produce no exports, mirroring empty `export()`.
+        let content = "exportMethods()\nexportClasses()\nexportClassPattern()";
+        let exports = parse_namespace_content(content);
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_namespace_s4_directives_coexist_with_export_pattern() {
+        // When a package mixes exportPattern with S4 directives, the plain S4
+        // names are still collected AND the pattern marker is present (so
+        // `has_export_pattern` still triggers R/INDEX expansion).
+        let content = r#"
+export(plainFn)
+exportPattern("^[^.]")
+exportMethods(spTransform)
+exportClasses(Spatial)
+"#;
+        let exports = parse_namespace_content(content);
+        assert!(exports.contains(&"plainFn".to_string()));
+        assert!(exports.contains(&"spTransform".to_string()));
+        assert!(exports.contains(&"Spatial".to_string()));
+        assert!(exports.contains(&"__PATTERN__:^[^.]".to_string()));
     }
 
     #[test]
