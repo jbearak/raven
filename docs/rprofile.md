@@ -15,6 +15,9 @@ machine-local or process-global rather than project-local.
 
 The same model is used in the editor and by `raven check`.
 
+`.Rprofile` is recognized as an R file, so it gets R syntax highlighting and its
+own diagnostics like any other R script.
+
 ## What Contributes To Scope
 
 The startup prelude contributes:
@@ -78,14 +81,8 @@ an open helper reach the prelude on the next save.
 
 ## Configuration
 
-The `.Rprofile` startup prelude is enabled by default:
-
-```toml
-[packages]
-rprofilePrelude = true
-```
-
-Set `raven.packages.rprofilePrelude` to `false` to disable it.
+The `.Rprofile` startup prelude is enabled by default. Set
+`raven.packages.rprofilePrelude` to `false` to disable it:
 
 ```toml
 [packages]
