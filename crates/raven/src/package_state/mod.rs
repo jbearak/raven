@@ -1072,4 +1072,25 @@ mod scan_data_tests {
             root
         ));
     }
+
+    #[test]
+    fn scripts_file_reached_only_by_broadened_rprofile_fanout() {
+        // The Task-12 backend fanout (`backend.rs`, the `if ns_changed` block in
+        // the watched-files handler) adds open files to the revalidation set when
+        // a sourced helper edit rescans the prelude. Its predicate is
+        // `is_r_source_path(..).is_some() || (rprofile_changed && is_package_workspace_r_file(..))`.
+        // The prelude reaches `scripts/` files, which are NOT package source
+        // paths — so this invariant must hold or the broadening would be a no-op:
+        // a `scripts/*.R` file is matched ONLY by the broadened arm.
+        let root = Path::new("/work/pkg");
+        let script = Path::new("/work/pkg/scripts/analysis.R");
+        assert!(
+            is_r_source_path(script, root).is_none(),
+            "scripts/ is not a package source path; the existing R/+tests arm must miss it"
+        );
+        assert!(
+            is_package_workspace_r_file(script, root),
+            "scripts/ IS a workspace R file; the broadened arm must reach it"
+        );
+    }
 }

@@ -5378,6 +5378,25 @@ impl LanguageServer for Backend {
                                 deltas.push(delta);
                             }
                         }
+                        // Detect whether this batch carries a prelude rescan
+                        // (Task 12): editing a helper that `.Rprofile` sources
+                        // re-scans the prelude, whose symbols/packages reach
+                        // `scripts/` files — files that are NOT `is_r_source_path`
+                        // and so are missed by the R/+tests fanout below. The
+                        // RProfileChanged delta may appear top-level or nested in
+                        // the per-file Batch built by `translate_watched`, so check
+                        // both. Computed BEFORE `deltas` is moved into `Batch`.
+                        let rprofile_changed = deltas.iter().any(|d| {
+                            matches!(d, crate::package_state::PackageInputDelta::RProfileChanged)
+                                || matches!(
+                                    d,
+                                    crate::package_state::PackageInputDelta::Batch(inner)
+                                        if inner.iter().any(|d| matches!(
+                                            d,
+                                            crate::package_state::PackageInputDelta::RProfileChanged
+                                        ))
+                                )
+                        });
                         if !deltas.is_empty() {
                             let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                             state.apply_package_event(&batch);
@@ -5389,12 +5408,19 @@ impl LanguageServer for Backend {
                             // Namespace model changed (e.g. roxygen tags changed in an
                             // external edit). Add all open package files (R/ and
                             // tests/testthat/) to affected set so their @import
-                            // diagnostics are refreshed.
+                            // diagnostics are refreshed. When the prelude rescanned,
+                            // also add every open workspace R-language file (incl.
+                            // `scripts/`), since the prelude contributes to their
+                            // script scope.
                             if let Some(ref root) = state.package_inputs.workspace_root.clone() {
                                 for open_uri in state.documents.keys() {
                                     if let Ok(p) = open_uri.to_file_path()
-                                        && crate::package_state::is_r_source_path(&p, root)
+                                        && (crate::package_state::is_r_source_path(&p, root)
                                             .is_some()
+                                            || (rprofile_changed
+                                                && crate::package_state::is_package_workspace_r_file(
+                                                    &p, root,
+                                                )))
                                         && affected_for_async_set.insert(open_uri.clone())
                                     {
                                         affected_for_async.push(open_uri.clone());

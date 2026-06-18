@@ -181,25 +181,53 @@ fn translate_watched(
     }
 
     if let Some(kind) = is_r_source_path(&path, root) {
-        if deleted {
+        // Compute the base R-source delta first. A package source file edit can
+        // ALSO be a helper that `.Rprofile` follows via `source()`; in that case
+        // the prelude must be re-scanned so its harvested symbols/packages stay
+        // fresh (Task 12 transitive freshness). The base delta is always emitted;
+        // the prelude rescan is folded in as a Batch when applicable.
+        let base = if deleted {
             inputs.r_files.remove(&path);
-            return Some(PackageInputDelta::RFileDeleted { path, kind });
-        }
-        // Decode the disk fallback through the shared BOM-aware seam so this
-        // incremental path matches the bulk scan
-        // (collect_package_r_file_inputs_from_disk); an undecodable file yields
-        // no text and is treated as "no signal" (leaves the prior input).
-        let text = on_disk_text.or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
-        let digest = ContentDigest::of(&text);
-        inputs.r_files.insert(
-            path.clone(),
-            RFileInput {
+            PackageInputDelta::RFileDeleted {
+                path: path.clone(),
                 kind,
-                text,
-                content_digest: digest,
-            },
-        );
-        return Some(PackageInputDelta::RFileChanged { path, kind });
+            }
+        } else {
+            // Decode the disk fallback through the shared BOM-aware seam so this
+            // incremental path matches the bulk scan
+            // (collect_package_r_file_inputs_from_disk); an undecodable file yields
+            // no text and is treated as "no signal" (leaves the prior input).
+            let text =
+                on_disk_text.or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
+            let digest = ContentDigest::of(&text);
+            inputs.r_files.insert(
+                path.clone(),
+                RFileInput {
+                    kind,
+                    text,
+                    content_digest: digest,
+                },
+            );
+            PackageInputDelta::RFileChanged {
+                path: path.clone(),
+                kind,
+            }
+        };
+
+        // Membership uses `canonical_path`: `rprofile_sourced_files` stores the
+        // canonicalized paths the scanner followed (see `scan_workspace_rprofile`),
+        // and `canonical_path` is canonicalized the same way at the top of this fn.
+        if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(&canonical_path) {
+            let scan = super::rprofile::scan_workspace_rprofile(root);
+            inputs.rprofile_symbols = scan.symbols;
+            inputs.rprofile_attached_packages = scan.attached_packages;
+            inputs.rprofile_sourced_files = scan.sourced_files;
+            return Some(PackageInputDelta::Batch(vec![
+                base,
+                PackageInputDelta::RProfileChanged,
+            ]));
+        }
+        return Some(base);
     }
 
     // data/ directory file changes: rescan dataset names.
@@ -937,6 +965,83 @@ mod tests {
                 .rprofile_symbols
                 .contains("helper_a"),
             "live edit must drop the old symbol"
+        );
+    }
+
+    #[test]
+    fn editing_a_sourced_helper_rescans_the_prelude() {
+        // `.Rprofile` sources `R/functions.r`; that helper defines a symbol.
+        // Editing the helper (a package R-source file) must (a) emit the normal
+        // RFileChanged delta for the package source file AND (b) re-scan the
+        // prelude so the new helper symbol is reflected in rprofile_symbols.
+        // The combined effect is delivered as a Batch.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let helper = r_dir.join("functions.r");
+
+        std::fs::write(root.join(".Rprofile"), "source(\"R/functions.r\")\n").unwrap();
+        std::fs::write(&helper, "helper_a <- function() 1\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.model_rprofile = true;
+
+        // Seed the prelude by scanning `.Rprofile` once (records the sourced
+        // helper in rprofile_sourced_files and harvests helper_a).
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        inputs.rprofile_symbols = scan.symbols;
+        inputs.rprofile_attached_packages = scan.attached_packages;
+        inputs.rprofile_sourced_files = scan.sourced_files;
+        assert!(
+            inputs.rprofile_symbols.contains("helper_a"),
+            "precondition: prelude harvests helper_a from the sourced file"
+        );
+
+        // Edit the helper to define a different symbol.
+        std::fs::write(&helper, "helper_b <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        // The watched-file edit yields a Batch carrying the package RFileChanged
+        // delta plus an RProfileChanged delta from the forced prelude rescan.
+        let Some(PackageInputDelta::Batch(deltas)) = delta else {
+            panic!("expected Batch delta, got {:?}", delta);
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::RFileChanged { .. })),
+            "batch must include the base RFileChanged delta: {:?}",
+            deltas
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::RProfileChanged)),
+            "batch must include an RProfileChanged delta from the rescan: {:?}",
+            deltas
+        );
+
+        // The prelude rescan picked up the helper edit.
+        assert!(
+            inputs.rprofile_symbols.contains("helper_b"),
+            "rescan must harvest the new helper symbol, got {:?}",
+            inputs.rprofile_symbols
+        );
+        assert!(
+            !inputs.rprofile_symbols.contains("helper_a"),
+            "rescan must drop the old helper symbol, got {:?}",
+            inputs.rprofile_symbols
         );
     }
 
