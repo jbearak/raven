@@ -432,7 +432,7 @@ See [Package database](package-database.md), [`raven packages freeze`](cli.md#ra
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `raven.packages.packageMode` | `"auto"` | Controls package mode activation |
-| `raven.packages.modelRprofile` | `true` | Models the workspace-root `.Rprofile` startup prelude. See [`.Rprofile` Startup Prelude](rprofile.md). |
+| `raven.packages.rprofilePrelude` | `true` | Uses the workspace-root `.Rprofile` startup prelude. See [`.Rprofile` Startup Prelude](rprofile.md). |
 
 Values for `packageMode`:
 

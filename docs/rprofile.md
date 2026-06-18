@@ -78,16 +78,16 @@ an open helper reach the prelude on the next save.
 
 ## Configuration
 
-`.Rprofile` modeling is enabled by default:
+The `.Rprofile` startup prelude is enabled by default:
 
 ```toml
 [packages]
-modelRprofile = true
+rprofilePrelude = true
 ```
 
-Set `raven.packages.modelRprofile` to `false` to disable this modeling.
+Set `raven.packages.rprofilePrelude` to `false` to disable it.
 
 ```toml
 [packages]
-modelRprofile = false
+rprofilePrelude = false
 ```

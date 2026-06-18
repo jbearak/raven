@@ -287,7 +287,7 @@ Add a setting, default on:
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.packages.modelRprofile` | `true` | Model a workspace-root `.Rprofile`'s top-level `source()`/`library()`/assignments as a script-scope prelude. |
+| `raven.packages.rprofilePrelude` | `true` | Model a workspace-root `.Rprofile`'s top-level `source()`/`library()`/assignments as a script-scope prelude. |
 
 Wire it through all three places required for an LSP-exposed setting:
 `editors/vscode/package.json`, `editors/vscode/src/initializationOptions.ts`,

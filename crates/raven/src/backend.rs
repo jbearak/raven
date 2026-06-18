@@ -432,7 +432,7 @@ pub(crate) fn parse_cross_file_config(
                 _ => crate::cross_file::config::PackageMode::Auto,
             };
         }
-        if let Some(v) = packages.get("modelRprofile").and_then(|v| v.as_bool()) {
+        if let Some(v) = packages.get("rprofilePrelude").and_then(|v| v.as_bool()) {
             config.model_rprofile = v;
         }
     }
@@ -1815,7 +1815,7 @@ pub(crate) fn initialize_package_inputs_from_state(
     // If `.Rprofile` is currently OPEN as a live document, its prelude is owned
     // by the did_open/did_change path (sourced from the in-memory buffer). A
     // disk-based (re)seed here — startup background scan completing late, or a
-    // `packageMode`/`modelRprofile` rebuild — must not clobber that buffer
+    // `packageMode`/`rprofilePrelude` rebuild — must not clobber that buffer
     // prelude with the on-disk scan and lose unsaved edits. Leave the prelude
     // inputs untouched in that case (modeling stays enabled). When modeling is
     // disabled the prelude is cleared regardless (an open buffer can't keep a
@@ -9501,8 +9501,8 @@ mod tests {
         }
 
         #[test]
-        fn parse_cross_file_config_model_rprofile_defaults_on_and_reads_explicit() {
-            // Default-on: a client that omits `packages.modelRprofile` still
+        fn parse_cross_file_config_rprofile_prelude_defaults_on_and_reads_explicit() {
+            // Default-on: a client that omits `packages.rprofilePrelude` still
             // gets the `.Rprofile` prelude — `CrossFileConfig::default()` has
             // `model_rprofile = true` and the parser only overrides when the
             // key is present. This is the value the package seed (in
@@ -9517,20 +9517,20 @@ mod tests {
                 .expect("packages section present → Some");
             assert!(
                 config.model_rprofile,
-                "modelRprofile must default to true when the client omits it"
+                "rprofilePrelude must default to true when the client omits it"
             );
 
             // Explicit values are honored.
-            let off = json!({ "packages": { "modelRprofile": false } });
+            let off = json!({ "packages": { "rprofilePrelude": false } });
             let config = crate::backend::parse_cross_file_config(&off)
                 .unwrap()
                 .expect("packages section present → Some");
             assert!(
                 !config.model_rprofile,
-                "explicit modelRprofile=false must be honored"
+                "explicit rprofilePrelude=false must be honored"
             );
 
-            let on = json!({ "packages": { "modelRprofile": true } });
+            let on = json!({ "packages": { "rprofilePrelude": true } });
             let config = crate::backend::parse_cross_file_config(&on)
                 .unwrap()
                 .expect("packages section present → Some");
@@ -9752,23 +9752,26 @@ mod tests {
         }
 
         #[test]
-        fn parse_cross_file_config_reads_model_rprofile() {
+        fn parse_cross_file_config_reads_rprofile_prelude() {
             let settings = json!({
-                "packages": { "modelRprofile": false }
+                "packages": { "rprofilePrelude": false }
             });
             let config = crate::backend::parse_cross_file_config(&settings)
                 .unwrap()
                 .unwrap();
-            assert!(!config.model_rprofile, "modelRprofile=false must parse");
+            assert!(!config.model_rprofile, "rprofilePrelude=false must parse");
         }
 
         #[test]
-        fn parse_cross_file_config_model_rprofile_defaults_true() {
+        fn parse_cross_file_config_rprofile_prelude_defaults_true() {
             let settings = json!({ "packages": {} });
             let config = crate::backend::parse_cross_file_config(&settings)
                 .unwrap()
                 .unwrap();
-            assert!(config.model_rprofile, "modelRprofile must default to true");
+            assert!(
+                config.model_rprofile,
+                "rprofilePrelude must default to true"
+            );
         }
 
         #[test]

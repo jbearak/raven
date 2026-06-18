@@ -49,7 +49,7 @@ undefinedVariableSeverity = "warning"
 
 Edits to `raven.toml` (or `.lintr`) are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically — no Raven restart required.
 
-Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `modelRprofile`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
+Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
 
 ## Diagnostics
 
@@ -117,7 +117,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 | `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
 | `raven.packages.watchDebounceMs` | `500` | Coalesce rapid filesystem events into a single invalidation pass (ms) |
 | `raven.packages.packageMode` | `"auto"` | R package workspace mode: `"auto"` (detect DESCRIPTION), `"enabled"` (always), `"disabled"` (never). See [R Package Development](r-package-dev.md). |
-| `raven.packages.modelRprofile` | `true` | Model the workspace-root `.Rprofile` startup prelude for ordinary script scope. See [`.Rprofile` Startup Prelude](rprofile.md). |
+| `raven.packages.rprofilePrelude` | `true` | Use the workspace-root `.Rprofile` startup prelude for ordinary script scope. See [`.Rprofile` Startup Prelude](rprofile.md). |
 
 ### Refresh Command
 

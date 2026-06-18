@@ -81,7 +81,7 @@ const DOC_LINKS = {
 };
 
 const DOC_LINK_OVERRIDES = {
-  "raven.packages.modelRprofile": "rprofile.md",
+  "raven.packages.rprofilePrelude": "rprofile.md",
 };
 
 function escapeCell(text) {

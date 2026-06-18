@@ -19,7 +19,7 @@ Copied verbatim from the spec (`docs/superpowers/specs/2026-06-17-rprofile-prelu
 - **Skip / whitelist `renv/activate.R`** — recognize the `renv/activate.R` path and do not follow it for symbol extraction; do not error if it is missing.
 - **Follow `source()` only for literal paths**, reusing the existing path resolution + workspace-root fallback, followed transitively, bounded by a recursion budget.
 - **Project `.Rprofile` only** — model the workspace-root `.Rprofile`, never `~/.Rprofile`.
-- **Setting `raven.packages.modelRprofile`** — boolean, default `true`.
+- **Setting `raven.packages.rprofilePrelude`** — boolean, default `true`.
 - **Single-signal package activation already landed** (commit `ecb8c19a`). Do NOT re-add a NAMESPACE-based `Auto` activation branch.
 
 ### CI gates (run before every commit)
@@ -45,7 +45,7 @@ Zero clippy warnings. Run the relevant `cargo test -p raven <module>` for change
 - `crates/raven/src/package_state/event.rs` — handle a `.Rprofile` change in `translate` / `translate_watched`.
 - `crates/raven/src/cross_file/config.rs` — add `model_rprofile: bool` to `CrossFileConfig` (default `true`).
 - `crates/raven/src/cross_file/scope.rs` — add `append_rprofile_prelude`; call it at the Phase 5a site; mirror prelude names in `compute_contribution_symbol_names`.
-- `crates/raven/src/backend.rs` — parse `packages.modelRprofile`; seed `model_rprofile` + run the scan in `initialize_package_inputs_from_state`; route `.Rprofile` watched changes; broaden the manifest republish set for `RProfileChanged`; re-scan on a live `modelRprofile` toggle.
+- `crates/raven/src/backend.rs` — parse `packages.rprofilePrelude`; seed `model_rprofile` + run the scan in `initialize_package_inputs_from_state`; route `.Rprofile` watched changes; broaden the manifest republish set for `RProfileChanged`; re-scan on a live `rprofilePrelude` toggle.
 - `crates/raven/src/cli/check.rs` — the 11 acceptance tests (uses the existing `collect_diagnostics_blocking` harness).
 
 **Modified (docs / VS Code):**
@@ -160,7 +160,7 @@ it recognizes `renv`'s `source("renv/activate.R")` line and does not follow it.
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.packages.modelRprofile` | `true` | Model a workspace-root `.Rprofile`'s top-level `source()`/`library()`/assignments as a script-scope prelude. |
+| `raven.packages.rprofilePrelude` | `true` | Model a workspace-root `.Rprofile`'s top-level `source()`/`library()`/assignments as a script-scope prelude. |
 ```
 
 - [ ] **Step 3: Cross-link the troubleshooting entry**
@@ -177,14 +177,14 @@ git commit -m "docs(r-package-dev): document the package-visibility boundary and
 
 ---
 
-## Task 2: Add the `modelRprofile` config field (Rust)
+## Task 2: Add the `rprofilePrelude` config field (Rust)
 
 **Files:**
 - Modify: `crates/raven/src/cross_file/config.rs:152` (struct field) and `:225` (Default)
 - Modify: `crates/raven/src/backend.rs:428` (parser) and `crates/raven/src/backend.rs:~9205` (test module)
 
 **Interfaces:**
-- Produces: `CrossFileConfig.model_rprofile: bool` (default `true`); parsed from `packages.modelRprofile`.
+- Produces: `CrossFileConfig.model_rprofile: bool` (default `true`); parsed from `packages.rprofilePrelude`.
 
 - [ ] **Step 1: Write the failing parse test**
 
@@ -194,17 +194,17 @@ In `crates/raven/src/backend.rs`, in the config-parse test module (near `parse_c
 #[test]
 fn parse_cross_file_config_reads_model_rprofile() {
     let settings = serde_json::json!({
-        "packages": { "modelRprofile": false }
+        "packages": { "rprofilePrelude": false }
     });
     let config = parse_cross_file_config(&settings);
-    assert!(!config.model_rprofile, "modelRprofile=false must parse");
+    assert!(!config.model_rprofile, "rprofilePrelude=false must parse");
 }
 
 #[test]
 fn parse_cross_file_config_model_rprofile_defaults_true() {
     let settings = serde_json::json!({ "packages": {} });
     let config = parse_cross_file_config(&settings);
-    assert!(config.model_rprofile, "modelRprofile must default to true");
+    assert!(config.model_rprofile, "rprofilePrelude must default to true");
 }
 ```
 
@@ -239,7 +239,7 @@ In the `impl Default for CrossFileConfig` block, after `package_mode: PackageMod
 In `crates/raven/src/backend.rs`, inside the `if let Some(packages) = packages` block, after the `packageMode` arm (after line 434):
 
 ```rust
-        if let Some(v) = packages.get("modelRprofile").and_then(|v| v.as_bool()) {
+        if let Some(v) = packages.get("rprofilePrelude").and_then(|v| v.as_bool()) {
             config.model_rprofile = v;
         }
 ```
@@ -263,7 +263,7 @@ Expected: PASS. Then `cargo fmt --all && cargo clippy --workspace --all-targets 
 
 ```bash
 git add crates/raven/src/cross_file/config.rs crates/raven/src/backend.rs
-git commit -m "feat(config): add raven.packages.modelRprofile setting (default on)"
+git commit -m "feat(config): add raven.packages.rprofilePrelude setting (default on)"
 ```
 
 ---
@@ -281,7 +281,7 @@ git commit -m "feat(config): add raven.packages.modelRprofile setting (default o
 In `editors/vscode/package.json`, immediately after the `raven.packages.packageMode` block (ends ~line 1306), add:
 
 ```json
-        "raven.packages.modelRprofile": {
+        "raven.packages.rprofilePrelude": {
           "type": "boolean",
           "default": true,
           "description": "Model a workspace-root .Rprofile's top-level source()/library()/assignments as a script-scope prelude, so files where R would source .Rprofile (scripts, data-raw, non-package R/) resolve the helpers it provides. Suppressive only: never introduces a diagnostic."
@@ -293,7 +293,7 @@ In `editors/vscode/package.json`, immediately after the `raven.packages.packageM
 In `editors/vscode/src/initializationOptions.ts`, in the `packages?: { ... }` interface (after `packageMode?: 'auto' | 'enabled' | 'disabled';`, line 89):
 
 ```typescript
-        modelRprofile?: boolean;
+        rprofilePrelude?: boolean;
 ```
 
 - [ ] **Step 3: Read and assign the setting**
@@ -301,14 +301,14 @@ In `editors/vscode/src/initializationOptions.ts`, in the `packages?: { ... }` in
 After `const packageMode = getExplicitSetting<...>(config, 'packages.packageMode');` (line 331):
 
 ```typescript
-    const modelRprofile = getExplicitSetting<boolean>(config, 'packages.modelRprofile');
+    const rprofilePrelude = getExplicitSetting<boolean>(config, 'packages.rprofilePrelude');
 ```
 
-Add `modelRprofile !== undefined ||` to the `if ( ... )` guard (lines 333-340), and inside the block (after the `packageMode` assignment, ~line 363):
+Add `rprofilePrelude !== undefined ||` to the `if ( ... )` guard (lines 333-340), and inside the block (after the `packageMode` assignment, ~line 363):
 
 ```typescript
-        if (modelRprofile !== undefined) {
-            options.packages.modelRprofile = modelRprofile;
+        if (rprofilePrelude !== undefined) {
+            options.packages.rprofilePrelude = rprofilePrelude;
         }
 ```
 
@@ -317,13 +317,13 @@ Add `modelRprofile !== undefined ||` to the `if ( ... )` guard (lines 333-340), 
 In `editors/vscode/src/test/settings.test.ts`, after the `packages.packageMode` row (line 116):
 
 ```typescript
-    { vsCodeKey: 'packages.modelRprofile', jsonPath: ['packages', 'modelRprofile'], type: 'boolean' },
+    { vsCodeKey: 'packages.rprofilePrelude', jsonPath: ['packages', 'rprofilePrelude'], type: 'boolean' },
 ```
 
 - [ ] **Step 5: Regenerate the settings reference**
 
 Run: `bun editors/vscode/scripts/generate-settings-reference.mjs`
-This rewrites `docs/settings-reference.md` to include the `raven.packages.modelRprofile` row.
+This rewrites `docs/settings-reference.md` to include the `raven.packages.rprofilePrelude` row.
 
 - [ ] **Step 6: Run the gating tests**
 
@@ -335,7 +335,7 @@ Expected: PASS (drift test green, mapping test green).
 
 ```bash
 git add editors/vscode/package.json editors/vscode/src/initializationOptions.ts editors/vscode/src/test/settings.test.ts docs/settings-reference.md
-git commit -m "feat(vscode): expose raven.packages.modelRprofile setting"
+git commit -m "feat(vscode): expose raven.packages.rprofilePrelude setting"
 ```
 
 ---
@@ -1690,7 +1690,7 @@ In the manifest-event block (after `deltas` is built, around line 5037, before `
                     .unwrap_or_default();
 ```
 
-- [ ] **Step 8: Re-scan on a live `modelRprofile` toggle**
+- [ ] **Step 8: Re-scan on a live `rprofilePrelude` toggle**
 
 In `reconcile_after_config_recompute` (`crates/raven/src/backend.rs`, the decisions block ~6195), after the `pkg_mode_io_needed` computation, fold in a model-rprofile change so the re-init path (which calls `initialize_package_inputs_from_state` → re-scans `.Rprofile`) also fires on a pure setting toggle:
 
@@ -1907,7 +1907,7 @@ git commit -m "feat(rprofile): refresh prelude when a sourced helper file is edi
 ## Self-review notes (spec coverage)
 
 - Part A docs → Task 1. `.Rprofile` prelude user doc + Configuration row → Task 1.
-- Setting `raven.packages.modelRprofile` (three places + reference + Rust) → Tasks 2, 3.
+- Setting `raven.packages.rprofilePrelude` (three places + reference + Rust) → Tasks 2, 3.
 - Static-parse-only scanner; assignments, library, source() (literal, transitive, workspace fallback, renv skip, local=TRUE excluded, dynamic ignored, conditional harvested) → Tasks 4, 5.
 - Carry through `PackageInputs`/`PackageScopeContribution`/derive, script-mode survival → Task 6.
 - Startup + `raven check` seeding → Task 7.
