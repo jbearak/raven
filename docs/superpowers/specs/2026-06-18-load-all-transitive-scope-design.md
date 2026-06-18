@@ -55,8 +55,10 @@ set (rather than the installed-package database).
 This was option B in the first draft and was wrongly rejected as "leaky." It is
 in fact the cleanest approach: the propagation machinery for attached packages is
 a clean abstraction with a small number of resolution chokepoints. By reusing it,
-the following all come for **free** (no new code), each previously a bespoke
-mechanism or an open bug:
+the following all come **largely for free** — each previously a bespoke mechanism
+or an open bug. (Two pieces still need real work — sentinel emission with
+function-scope annotation, §1/§2 Item 4; and guards for non-chokepoint name
+consumers, §2a Item 1 — so this is "reuse the machinery", not "zero code".)
 
 - **Backward propagation to a directly-opened child** (the reported bug) — a
   directly-opened sourced file collects its parents' pre-`source()` `PackageLoad`
@@ -67,7 +69,9 @@ mechanism or an open bug:
   load_all caller sees the package *after* the call, because child attachments
   already hoist back into the parent's later scope (`scope.loaded_packages` from
   sourced files). The bespoke approach would not have handled this.
-- **Position-awareness** (`(line,col)` comparison + function-scope gate).
+- **Position-awareness** (`(line,col)` comparison + function-scope gate) — free
+  *once* the sentinel `PackageLoad` carries a `function_scope` annotation; that
+  emission is the work called out in §1.
 - **Multi-parent union** (a child sourced by two parents gets the union; safe
   over-approximation, identical to `library()`).
 - **Transitivity** across `a.R → b.R → c.R`.
@@ -94,11 +98,16 @@ mechanism or an open bug:
    sentinel to `rprofile_attached_packages`, subject to the existing
    `rprofile_prelude_applies` withholding (`R/`, `tests/`, built-doc dirs in
    package mode; those already get internals via dev-context).
-4. **R/-change revalidation reuses the libpath-consumer probe** — treat the
-   sentinel as a changed package and reuse the existing "which open docs have
-   package P attached" intersection.
-5. **Resolution backing: thread the contribution into the chokepoints** (option
-   (b)), keeping workspace-local internals out of the installed-package database.
+4. **R/-change revalidation: lock-safe graph closure** — in the watched-file
+   handler, mark a conservative superset (source-graph neighborhood of open
+   `load_all()` carriers + `.Rprofile`-reach) via graph reachability + artifact
+   bools, never scope resolution. (Revised away from "reuse the libpath probe",
+   which is not callable from that handler — see §4.)
+5. **Resolution backing: a local-dev overlay on `package_library`** (refinement
+   of option (b)). Keep workspace-local internals out of the installed-package
+   database, but expose them as a dedicated overlay field on `package_library`
+   that the chokepoints consult via `&self` — *not* as a threaded parameter
+   (which would ripple through `NseAnalysis::build` and every test). See §2.
 
 ## Design
 
@@ -107,42 +116,80 @@ mechanism or an open bug:
 - Define a reserved sentinel package name (a constant that cannot collide with a
   real R package, e.g. containing a character illegal in package names). One
   workspace = one package, so a single sentinel suffices.
-- `call_is_dev_load_all()` already detects the calls. In `collect_definitions`,
-  when it matches **and the file is `under_package_root`** (sub-decision 2), emit
-  `ScopeEvent::PackageLoad { line, column, package: SENTINEL, function_scope }`
-  into the timeline — exactly as a `library()` call would, at the call's
-  position. Drop the now-redundant `calls_dev_load_all` bool from the scope path
-  (retain only if still needed by the revalidation trigger; see §4).
+- `call_is_dev_load_all()` already detects the calls. Emit the sentinel
+  `PackageLoad` through the **same emission path that gives `library()`
+  `PackageLoad` events their `function_scope`** (`scope.rs` ~1846-1849), not via a
+  standalone bool. `collect_definitions` today records only a `calls_dev_load_all`
+  bool (~2700-2708), and `annotate_event_function_scopes` (~1610) does **not**
+  handle `PackageLoad` — so a naively-emitted event would lack the function-scope
+  annotation that makes position/scope behavior work. Routing through the
+  `library()` emission site guarantees identical position + function-scope
+  treatment (closing Codex Item 4).
+- Gate on the caller: emit **only when the `load_all()` caller is
+  `under_package_root`** (sub-decision 2).
+- **Keep** the `calls_dev_load_all` bool — the revalidation closure (§4) needs it
+  to identify load_all carriers cheaply under the lock.
 
-### 2. Resolution at the chokepoints (sub-decision 5)
+### 2. Resolution via a local-dev overlay (sub-decision 5)
 
 The sentinel must resolve to the contribution's internal symbol set
 (`r_internal_symbols ∪ sysdata_symbols ∪ onload_symbols ∪ imported_symbols`).
-Thread the active `PackageScopeContribution` into the three resolution methods in
-`package_library.rs` and special-case the sentinel:
+
+Codex Item 2: threading `PackageScopeContribution` as a parameter into the three
+resolution methods is the wrong shape — they are also reached via
+`NseAnalysis::build` (which takes only `package_library`/`base_exports`,
+`handlers.rs` ~13231-13238) and via `package_library` unit tests that pass no
+contribution, so a parameter would ripple through every NSE call site and break
+test signatures.
+
+Instead, add a **local-dev overlay** to `package_library`: an
+`Option<Arc<LocalDevPackage>>` field holding the sentinel → internal-symbol-set
+mapping, refreshed whenever `apply_package_event` recomputes the contribution
+(single writer). The three resolution methods consult it via `&self` before the
+installed cache:
 
 - `is_symbol_from_loaded_packages` (~668) — undefined-variable suppression.
 - `find_package_owner_for_symbol` (~1287) — hover attribution.
 - `get_owned_exports_for_completions` (~607) — completion enumeration.
 
-Each, when it encounters the sentinel in the attached-package list, consults the
-threaded contribution's internal set instead of the installed cache. Their call
-sites in `handlers.rs` (completion ~17890, hover ~19470, undefined-var ~15317 /
-owner ~14691) pass the contribution (already available in the snapshot).
+This honors option (b)'s intent (local internals never enter the installed-package
+cache; they live in a clearly-separated field) **without** any call-site
+threading. `NseAnalysis::build` already takes `package_library`, so it inherits
+the overlay for free; tests default the overlay to `None`.
 
-Suppress the `PACKAGE_NOT_INSTALLED` diagnostic for the sentinel
-(`handlers.rs` ~5103 / ~5119): `package_exists` returns false for it, so add an
-explicit skip.
+`PACKAGE_NOT_INSTALLED` needs no change: it iterates only
+`directive_meta.library_calls` (`handlers.rs` ~5099), which a timeline-emitted
+sentinel never enters — so it cannot fire a false "not installed" diagnostic.
+
+### 2a. Sentinel guards for other attached-name consumers (Codex Item 1)
+
+Some consumers iterate attached package **names** (from `inherited_packages` /
+`loaded_packages`), not the `package_library` overlay, and would mis-handle the
+sentinel by looking it up or shelling out to R. Add a central
+`is_load_all_sentinel(name)` predicate and skip the sentinel in each:
+
+- `data()` alias expansion (`scope.rs` ~6620) — sentinel has no datasets; skip.
+- pending-cache `package_exists` loop (`handlers.rs` ~6451) — skip (it is not an
+  installed package to fetch).
+- R-subprocess prefetch filters (`backend.rs` ~3905, ~7912) — skip so the sentinel
+  is never sent to `library()`/help in the R subprocess.
+- NSE owner / standard-eval resolution (`handlers.rs` ~13154/~13191/~14691/~15317)
+  resolves owners through the overlay-aware chokepoints, so it needs no extra
+  guard — but confirm during implementation it does not separately enumerate the
+  sentinel against installed metadata.
 
 ### 3. Remove the bespoke load_all injection; keep dev-context
 
 In `append_package_contribution` (`scope.rs` ~6889), remove the `dev_load_all`
-branch (the `(dev_load_all && under_package_root)` arm). The direct `load_all()`
-caller now gets internals via its own timeline's sentinel `PackageLoad` →
-`inherited_packages`/`loaded_packages` → resolution, identical to how a sourced
-child gets them. The independent **dev-context** path
-(`is_dev_context_path` — editing `R/`/`tests/` etc. with no `load_all()` call) is
-**unchanged**; the two conditions were already decoupled booleans.
+branch (the `(dev_load_all && under_package_root)` arm; ~6942). Verified the
+branch injects `r_internal_symbols ∪ sysdata_symbols ∪ onload_symbols ∪
+imported_symbols` — exactly the sentinel's set — and **not** `dataset_symbols`
+(datasets are injected separately for any workspace R file, ~6907-6910, and that
+path is untouched). So the sentinel `PackageLoad` path gives the direct caller
+identical symbol coverage, with no dataset regression (confirms Codex Item 3).
+The independent **dev-context** path (`is_dev_context_path` — editing
+`R/`/`tests/` etc. with no `load_all()` call) is **unchanged**; the two conditions
+were already decoupled booleans.
 
 `.Rprofile`: when the workspace-root `.Rprofile` calls `load_all()` (detected with
 `call_is_dev_load_all` during the `.Rprofile` scan), add the sentinel to
@@ -154,21 +201,37 @@ longer empty, the existing early-return guard passes naturally.
 ### 4. R/-change revalidation (sub-decision 4)
 
 When `R/` changes and the recomputed `PackageScopeContribution` differs
-(`pkg_visibility_changed`), every doc that has the sentinel in its resolved
-attached set must be re-diagnosed — that is exactly the load_all caller, the files
-it `source()`s (callees), and the files that `source()` it (callers).
+(`pkg_visibility_changed`, caught by full-contribution equality — Codex Item 5/6
+confirmed `r_internal_symbols` changes trip it), every doc whose scope includes
+the sentinel must be re-diagnosed — the load_all caller, the files it `source()`s
+(callees), and the files that `source()` it (callers, via the child→parent
+attachment hoist).
 
-Reuse the libpath-consumer affected-docs probe (`backend.rs` ~8294-8310:
-`scope_hit = inherited_packages ∩ trigger_set`) with `trigger_set = {SENTINEL}`.
-That path **snapshots inputs under the lock, drops the guard, then resolves scope
-per open doc** — satisfying the locking invariant (unlike a synchronous closure
-inside the write-lock handler). It covers caller, callees, and callers uniformly
-because all three carry the sentinel in their resolved attached set.
+**The libpath-consumer probe is *not* reusable here** (Codex Item 5, confirmed):
+it lives inside `run_libpath_consumer`'s task (`backend.rs` ~8122-8230), is not
+callable from `did_change_watched_files`, and that handler's existing fanout
+(~5611-5616) only adds open `R/`/`tests/`/`.Rprofile` paths — not arbitrary
+`load_all()` carriers. Extracting and rewiring the probe (which re-resolves scope
+per doc) into the write-lock handler would also violate the locking invariant.
 
-Replace the original draft's bespoke `extend_with_open_package_docs` widening with
-this reuse. (The pre-existing gap — a root-level `analysis.R` calling `load_all()`
-not refreshed on `R/` change — is closed by the same mechanism, since it now
-carries the sentinel.)
+Instead, widen the affected-set with a **lock-safe graph closure**, computed from
+the same cheap primitives the existing source-graph revalidation already uses in
+that handler (`compute_affected_dependents_after_edit` + artifact bools), with
+**no scope resolution under the lock**:
+
+1. seed with every open doc whose artifacts have `calls_dev_load_all` and is
+   `under_package_root` (the carriers — closes the pre-existing root-level
+   `analysis.R` gap);
+2. add their source-graph **descendants** (callees) **and ancestors** (callers,
+   for the child→parent hoist) via the dependency graph;
+3. if `.Rprofile` attaches the sentinel, add every open doc for which
+   `rprofile_prelude_applies`, plus their graph neighborhood.
+
+This is a deliberate **conservative superset**: position-aware correctness of
+suppress/unsuppress is enforced later, at diagnosis-time scope resolution (which
+is position-aware); the revalidation set only needs to guarantee every possibly
+affected doc is re-diagnosed, and over-inclusion costs only a redundant,
+idempotent re-diagnose. Mark the set via the existing force-republish gate.
 
 ### 5. Precedence (unchanged in spirit)
 
@@ -244,6 +307,20 @@ end-to-end, not just a single recompute.
 - **Monotonicity:** republished diagnostics respect document-version
   monotonicity / the force-republish gate (no older-version publish).
 
+### C. Resolution overlay & sentinel guards (Codex Items 1 & 2)
+
+- **Hover** on a load_all internal renders real package help (the improvement),
+  not the bare-symbol fallback.
+- **Completion** in a load_all caller offers the internal symbols.
+- **Overlay isolation:** with no `load_all()` anywhere, the local-dev overlay is
+  empty and resolution is byte-identical to today (regression guard); the sentinel
+  never appears in installed-package enumeration / metadata.
+- **Sentinel guards:** the sentinel name is never sent to the R subprocess
+  (prefetch filter skips it), never triggers a `PACKAGE_NOT_INSTALLED` diagnostic,
+  and `data()` alias expansion ignores it.
+- **NSE call sites** resolve owners through the overlay without a contribution
+  parameter (`NseAnalysis::build` signature unchanged).
+
 ## Docs to update
 
 - `docs/cross-file.md` — `load_all()` modeled as a virtual attached package;
@@ -258,13 +335,15 @@ end-to-end, not just a single recompute.
 - The sentinel `PackageLoad` must be emitted **only** when the `load_all()` caller
   is `under_package_root` (sub-decision 2 gate sits on the caller, never the
   child).
-- Sentinel resolution lives behind the three `package_library` chokepoints only;
-  no other consumer of `inherited_packages` may assume entries are installed
-  packages (the `PACKAGE_NOT_INSTALLED` diagnostic is the one exception, explicitly
-  skipped).
-- R/-change revalidation reuses the libpath-consumer probe and therefore inherits
-  its locking discipline: snapshot inputs under the lock, drop the guard, then
-  resolve scope per doc — never resolve cross-file scope while holding the lock.
+- Sentinel symbol resolution lives behind the three `package_library` chokepoints
+  (via the local-dev overlay) only. Every *other* consumer that iterates attached
+  package **names** and feeds them to installed-package machinery or the R
+  subprocess must skip the sentinel via `is_load_all_sentinel` (§2a). Adding a new
+  such consumer requires adding the guard.
+- R/-change revalidation runs inside the `did_change_watched_files` write-lock
+  handler and therefore must use **only** graph reachability + artifact bools —
+  never cross-file scope resolution under the lock (§4). The libpath-consumer
+  probe is explicitly *not* reused here.
 - The dev-context internals path stays independent of the `load_all()` sentinel
   path; removing the `dev_load_all` branch from `append_package_contribution` must
   not alter dev-context behavior.
