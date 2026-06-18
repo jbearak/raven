@@ -87,6 +87,7 @@ export interface RavenInitializationOptions {
         watchLibraryPaths?: boolean;
         watchDebounceMs?: number;
         packageMode?: 'auto' | 'enabled' | 'disabled';
+        modelRprofile?: boolean;
     };
     symbols?: {
         workspaceMaxResults?: number;
@@ -329,6 +330,7 @@ export function getInitializationOptions(
     const watchLibraryPaths = getExplicitSetting<boolean>(config, 'packages.watchLibraryPaths');
     const watchDebounceMs = getExplicitSetting<number>(config, 'packages.watchDebounceMs');
     const packageMode = getExplicitSetting<'auto' | 'enabled' | 'disabled'>(config, 'packages.packageMode');
+    const modelRprofile = getExplicitSetting<boolean>(config, 'packages.modelRprofile');
 
     if (
         packagesEnabled !== undefined ||
@@ -337,7 +339,8 @@ export function getInitializationOptions(
         missingPackageSeverity !== undefined ||
         watchLibraryPaths !== undefined ||
         watchDebounceMs !== undefined ||
-        packageMode !== undefined
+        packageMode !== undefined ||
+        modelRprofile !== undefined
     ) {
         options.packages = {};
         if (packagesEnabled !== undefined) {
@@ -360,6 +363,9 @@ export function getInitializationOptions(
         }
         if (packageMode !== undefined) {
             options.packages.packageMode = packageMode;
+        }
+        if (modelRprofile !== undefined) {
+            options.packages.modelRprofile = modelRprofile;
         }
     }
 

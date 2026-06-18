@@ -12,6 +12,7 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 pub mod event;
+pub mod rprofile;
 pub mod sysdata;
 
 #[cfg(test)]
@@ -94,6 +95,25 @@ pub struct PackageInputs {
     /// `save(..., file="...sysdata.rda")` calls, with an R-subprocess
     /// fallback when AST finds nothing and an R executable is available.
     pub sysdata_names: BTreeSet<String>,
+    /// Whether `.Rprofile` prelude modeling is enabled (mirrors
+    /// `CrossFileConfig.model_rprofile`). Carried here so the watched-file
+    /// `translate` path can gate the scan without reaching for config.
+    /// Set by `initialize_package_inputs_from_state`; `Default` is `false`
+    /// (seeders set the real value from config, which defaults `true`).
+    pub model_rprofile: bool,
+    /// Top-level symbol names introduced by the workspace-root `.Rprofile`
+    /// (and its transitive literal `source()` targets). Populated by
+    /// `rprofile::scan_workspace_rprofile`. Empty when modeling is off or the
+    /// file is absent.
+    pub rprofile_symbols: BTreeSet<String>,
+    /// Packages attached (top-level `library()`/`require()`) by the
+    /// workspace-root `.Rprofile` and its transitive `source()` targets.
+    pub rprofile_attached_packages: BTreeSet<String>,
+    /// Canonical paths of helper files the prelude followed via `source()`
+    /// (from `RprofileScan::sourced_files`). Used by the optional
+    /// transitive-freshness wiring (Task 12) to rescan when a sourced helper is
+    /// edited. Not carried onto the contribution (watch-routing only).
+    pub rprofile_sourced_files: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +162,7 @@ pub enum PackageInputDelta {
     DescriptionChanged,
     SettingChanged,
     DataDirChanged,
+    RProfileChanged,
     Batch(Vec<PackageInputDelta>),
 }
 
@@ -252,6 +273,39 @@ pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
         return false;
     };
     matches!(first, "demo" | "data-raw" | "vignettes" | "man")
+}
+
+/// True when `path` is an R file under the package's built/checked doc dirs
+/// (`vignettes/`, `man/`, `demo/`) — rebuilt by `R CMD build` / run by
+/// `R CMD check` with the user profile suppressed. Used (in package mode only)
+/// to withhold the `.Rprofile` prelude. DELIBERATELY NARROWER than
+/// [`is_dev_context_path`]: `data-raw/` is dev-only, `.Rbuildignore`d, and run
+/// interactively from the root, so the prelude APPLIES there.
+pub fn is_built_doc_dir_path(path: &Path, workspace_root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(workspace_root) else {
+        return false;
+    };
+    let is_r_extension = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
+    );
+    if !is_r_extension {
+        return false;
+    }
+    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    matches!(first, "vignettes" | "man" | "demo")
+}
+
+/// In package mode, the `.Rprofile` prelude is withheld from files whose
+/// canonical run context is a profile-suppressed `R CMD check` / `build`
+/// session: namespace `R/` (Source) and all test files (via
+/// [`is_r_source_path`]), plus built doc dirs (via [`is_built_doc_dir_path`]).
+/// Callers apply this ONLY when a package workspace is active — in script mode
+/// the prelude applies everywhere, including `R/`.
+pub fn rprofile_withheld_in_package_mode(path: &Path, workspace_root: &Path) -> bool {
+    is_r_source_path(path, workspace_root).is_some() || is_built_doc_dir_path(path, workspace_root)
 }
 
 /// Returns `true` when `path` is an R file anywhere under the workspace root
@@ -697,6 +751,56 @@ mod path_tests {
             root
         ));
     }
+
+    #[test]
+    fn built_doc_dir_path_matches_vignettes_man_demo_only() {
+        let root = Path::new("/work/pkg");
+        assert!(is_built_doc_dir_path(
+            Path::new("/work/pkg/vignettes/v.R"),
+            root
+        ));
+        assert!(is_built_doc_dir_path(Path::new("/work/pkg/man/ex.R"), root));
+        assert!(is_built_doc_dir_path(Path::new("/work/pkg/demo/d.R"), root));
+        // data-raw is APPLIED to (not a built doc dir) — narrower than is_dev_context_path.
+        assert!(!is_built_doc_dir_path(
+            Path::new("/work/pkg/data-raw/prep.R"),
+            root
+        ));
+        assert!(!is_built_doc_dir_path(
+            Path::new("/work/pkg/scripts/a.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn rprofile_withheld_covers_namespace_tests_built_dirs() {
+        let root = Path::new("/work/pkg");
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/R/f.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/tests/foo.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/vignettes/v.R"),
+            root
+        ));
+        // applied-to dirs are NOT withheld
+        assert!(!rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/scripts/a.R"),
+            root
+        ));
+        assert!(!rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/data-raw/prep.R"),
+            root
+        ));
+    }
 }
 
 // ============== OUTPUTS (continued) ==============
@@ -746,8 +850,9 @@ pub struct PackageScopeContribution {
     /// set used for standard-eval export resolution — so a self-package verb
     /// with no known policy stays conservatively arg-suppressed rather than
     /// being newly checked. `None` when no package workspace is detected, and
-    /// `"unknown"` for a package-mode workspace whose DESCRIPTION omits
-    /// `Package:` (harmless — no policy is keyed on `"unknown"`).
+    /// `"unknown"` for an `Enabled`-mode workspace with no DESCRIPTION
+    /// `Package:` field (harmless — no policy is keyed on `"unknown"`). In
+    /// `Auto` mode a missing/empty `Package:` yields no workspace at all.
     pub package_name: Option<String>,
     pub r_internal_symbols: Arc<BTreeSet<String>>,
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
@@ -823,6 +928,21 @@ pub struct PackageScopeContribution {
     /// `assign("x", ..., envir=ns)` or `ns$x <- ...`. Visible alongside
     /// `r_internal_symbols`.
     pub onload_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbol names contributed by a workspace-root `.Rprofile` prelude
+    /// (assignments + transitive `source()` defs). Injected by
+    /// `append_rprofile_prelude` into files where R would source `.Rprofile`
+    /// (gated by `rprofile_withheld_in_package_mode` in package mode).
+    /// Suppressive-only.
+    pub rprofile_symbols: Arc<BTreeSet<String>>,
+    /// Packages attached by the `.Rprofile` prelude. Added to a file's
+    /// `inherited_packages` under the same applicability rule.
+    pub rprofile_attached_packages: Arc<BTreeSet<String>>,
+    /// Workspace root used for the `.Rprofile` prelude's path-containment and
+    /// applicability checks. Set whenever a workspace root is known (BOTH
+    /// package and script mode) — deliberately distinct from `workspace_root`,
+    /// which is `Some` only in package mode. `None` when no root is known.
+    pub rprofile_root: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -951,5 +1071,26 @@ mod scan_data_tests {
             Path::new("/work/pkg/data/foo.csv"),
             root
         ));
+    }
+
+    #[test]
+    fn scripts_file_reached_only_by_broadened_rprofile_fanout() {
+        // The Task-12 backend fanout (`backend.rs`, the `if ns_changed` block in
+        // the watched-files handler) adds open files to the revalidation set when
+        // a sourced helper edit rescans the prelude. Its predicate is
+        // `is_r_source_path(..).is_some() || (rprofile_changed && is_package_workspace_r_file(..))`.
+        // The prelude reaches `scripts/` files, which are NOT package source
+        // paths — so this invariant must hold or the broadening would be a no-op:
+        // a `scripts/*.R` file is matched ONLY by the broadened arm.
+        let root = Path::new("/work/pkg");
+        let script = Path::new("/work/pkg/scripts/analysis.R");
+        assert!(
+            is_r_source_path(script, root).is_none(),
+            "scripts/ is not a package source path; the existing R/+tests arm must miss it"
+        );
+        assert!(
+            is_package_workspace_r_file(script, root),
+            "scripts/ IS a workspace R file; the broadened arm must reach it"
+        );
     }
 }

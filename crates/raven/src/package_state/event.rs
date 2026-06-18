@@ -114,6 +114,71 @@ pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<Pack
     }
 }
 
+/// Apply a (possibly precomputed) `.Rprofile` scan to the prelude inputs.
+///
+/// Pure in-memory — does **no** disk I/O — so it is safe to call while holding
+/// the `WorldState` write lock. This is the seam that lets the live-buffer and
+/// startup/rebuild paths scan OFF-lock (it follows transitive `source()`) and
+/// then apply only the prebuilt result here under the lock.
+///
+/// `scan` is `Some(..)` to install a fresh scan, or `None` to clear the prelude
+/// (a deletion, or when modeling is disabled). When `inputs.model_rprofile` is
+/// false the prelude is cleared regardless of `scan`. Returns the
+/// `RProfileChanged` delta, or `None` only when modeling is disabled AND nothing
+/// needed clearing (so callers don't fire a no-op re-derive).
+pub(crate) fn apply_rprofile_scan(
+    inputs: &mut PackageInputs,
+    scan: Option<super::rprofile::RprofileScan>,
+) -> Option<PackageInputDelta> {
+    if !inputs.model_rprofile {
+        let had = !inputs.rprofile_symbols.is_empty()
+            || !inputs.rprofile_attached_packages.is_empty()
+            || !inputs.rprofile_sourced_files.is_empty();
+        inputs.rprofile_symbols.clear();
+        inputs.rprofile_attached_packages.clear();
+        inputs.rprofile_sourced_files.clear();
+        return had.then_some(PackageInputDelta::RProfileChanged);
+    }
+    match scan {
+        Some(scan) => {
+            inputs.rprofile_symbols = scan.symbols;
+            inputs.rprofile_attached_packages = scan.attached_packages;
+            inputs.rprofile_sourced_files = scan.sourced_files;
+        }
+        None => {
+            inputs.rprofile_symbols.clear();
+            inputs.rprofile_attached_packages.clear();
+            inputs.rprofile_sourced_files.clear();
+        }
+    }
+    Some(PackageInputDelta::RProfileChanged)
+}
+
+/// If `canonical_path` is a file that `.Rprofile` transitively `source()`s (and
+/// modeling is on), rescan the prelude and combine it with `base` as a `Batch`;
+/// otherwise return `base` unchanged. Used by the terminal `translate_watched`
+/// arms (R-source, `data/`, `data-raw/`) so a watched file that is BOTH a
+/// package input AND a sourced helper refreshes both concerns — never one at the
+/// expense of the other. (Like the surrounding arms, the rescan is a bounded
+/// disk read in the `WatchedFileChanged` path, which `translate` sanctions.)
+fn fold_prelude_rescan(
+    inputs: &mut PackageInputs,
+    root: &Path,
+    canonical_path: &Path,
+    base: PackageInputDelta,
+) -> Option<PackageInputDelta> {
+    if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(canonical_path) {
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        apply_rprofile_scan(inputs, Some(scan));
+        Some(PackageInputDelta::Batch(vec![
+            base,
+            PackageInputDelta::RProfileChanged,
+        ]))
+    } else {
+        Some(base)
+    }
+}
+
 fn translate_watched(
     inputs: &mut PackageInputs,
     root: &Path,
@@ -125,10 +190,22 @@ fn translate_watched(
 
     // Normalize root and path once so comparisons against `<root>/DESCRIPTION`
     // and `<root>/NAMESPACE` aren't foiled by symlinks, casing, or trailing
-    // separators. `canonicalize` requires the target to exist; fall back to
-    // the original path on failure (e.g. when the file has just been deleted).
+    // separators. `canonicalize` requires the target to exist; on deletion it
+    // fails (the file is gone), so fall back to canonicalizing the PARENT (which
+    // still exists) and rejoining the file name. Without that, a DELETED
+    // `.Rprofile`-sourced helper under a SYMLINKED workspace root would miss its
+    // `rprofile_sourced_files` membership check (which stores canonical paths)
+    // and leave stale prelude symbols in scope.
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let canonical_path =
+        path.canonicalize()
+            .unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => parent
+                    .canonicalize()
+                    .map(|cp| cp.join(name))
+                    .unwrap_or_else(|_| path.clone()),
+                _ => path.clone(),
+            });
     let canonical_desc = canonical_root.join("DESCRIPTION");
     let canonical_ns = canonical_root.join("NAMESPACE");
 
@@ -156,40 +233,100 @@ fn translate_watched(
         return Some(PackageInputDelta::NamespaceChanged);
     }
 
-    if let Some(kind) = is_r_source_path(&path, root) {
-        if deleted {
-            inputs.r_files.remove(&path);
-            return Some(PackageInputDelta::RFileDeleted { path, kind });
-        }
-        // Decode the disk fallback through the shared BOM-aware seam so this
-        // incremental path matches the bulk scan
-        // (collect_package_r_file_inputs_from_disk); an undecodable file yields
-        // no text and is treated as "no signal" (leaves the prior input).
-        let text = on_disk_text.or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
-        let digest = ContentDigest::of(&text);
-        inputs.r_files.insert(
-            path.clone(),
-            RFileInput {
-                kind,
-                text,
-                content_digest: digest,
-            },
-        );
-        return Some(PackageInputDelta::RFileChanged { path, kind });
+    let canonical_rprofile = canonical_root.join(".Rprofile");
+    if canonical_path == canonical_rprofile || path == root.join(".Rprofile") {
+        // `WatchedFileChanged` MAY do disk I/O (see `translate`'s doc comment):
+        // scan `.Rprofile` from disk unless it was deleted or modeling is off,
+        // then apply via the shared lock-safe seam (which also clears on
+        // delete/disabled and reports whether anything changed).
+        let scan = if deleted || !inputs.model_rprofile {
+            None
+        } else {
+            Some(super::rprofile::scan_workspace_rprofile(root))
+        };
+        return apply_rprofile_scan(inputs, scan);
     }
 
-    // data/ directory file changes: rescan dataset names.
+    if let Some(kind) = is_r_source_path(&path, root) {
+        // Compute the base R-source delta first. A package source file edit can
+        // ALSO be a helper that `.Rprofile` follows via `source()`; in that case
+        // the prelude must be re-scanned so its harvested symbols/packages stay
+        // fresh (Task 12 transitive freshness). The base delta is always emitted;
+        // the prelude rescan is folded in as a Batch when applicable.
+        let base = if deleted {
+            inputs.r_files.remove(&path);
+            PackageInputDelta::RFileDeleted {
+                path: path.clone(),
+                kind,
+            }
+        } else {
+            // Decode the disk fallback through the shared BOM-aware seam so this
+            // incremental path matches the bulk scan
+            // (collect_package_r_file_inputs_from_disk); an undecodable file yields
+            // no text and is treated as "no signal" (leaves the prior input).
+            let text =
+                on_disk_text.or_else(|| crate::state::read_source(&path).ok().map(Arc::from))?;
+            let digest = ContentDigest::of(&text);
+            inputs.r_files.insert(
+                path.clone(),
+                RFileInput {
+                    kind,
+                    text,
+                    content_digest: digest,
+                },
+            );
+            PackageInputDelta::RFileChanged {
+                path: path.clone(),
+                kind,
+            }
+        };
+
+        // Membership uses `canonical_path`: `rprofile_sourced_files` stores the
+        // canonicalized paths the scanner followed (see `scan_workspace_rprofile`),
+        // and `canonical_path` is canonicalized the same way at the top of this fn.
+        // A package source file can ALSO be a `.Rprofile` helper — fold the
+        // prelude rescan in as a Batch when so.
+        return fold_prelude_rescan(inputs, root, &canonical_path, base);
+    }
+
+    // data/ directory file changes: rescan dataset names. A `data/` file can
+    // also be a `.Rprofile`-sourced helper, so fold the prelude rescan in (a
+    // helper here must refresh BOTH dataset names AND the prelude — neither at
+    // the other's expense).
     let data_dir = root.join("data");
     if path.starts_with(&data_dir) && path != data_dir {
         inputs.dataset_names = super::scan_own_package_data_dir(root);
-        return Some(PackageInputDelta::DataDirChanged);
+        return fold_prelude_rescan(
+            inputs,
+            root,
+            &canonical_path,
+            PackageInputDelta::DataDirChanged,
+        );
     }
 
-    // data-raw/ directory file changes: rescan sysdata generating scripts.
+    // data-raw/ directory file changes: rescan sysdata generating scripts (same
+    // dual-concern fold as data/ above).
     let data_raw_dir = root.join("data-raw");
     if path.starts_with(&data_raw_dir) && path != data_raw_dir {
         inputs.sysdata_names = super::sysdata::scan_sysdata_generating_scripts(root);
-        return Some(PackageInputDelta::DataDirChanged);
+        return fold_prelude_rescan(
+            inputs,
+            root,
+            &canonical_path,
+            PackageInputDelta::DataDirChanged,
+        );
+    }
+
+    // A `.Rprofile` may `source()` a helper that lives OUTSIDE every tracked
+    // package input dir (e.g. `scripts/setup.R`, plain `inst/foo.R`). Such a
+    // helper is not an `is_r_source_path`, not a `data*/` file, and not a
+    // tracked package dir, so none of the arms above fire — but editing it must
+    // still re-scan the prelude (Task 12). This arm is LAST among the file arms
+    // so the dual-concern folds above take precedence. Membership uses
+    // `canonical_path` to match the canonical paths the scanner records.
+    if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(&canonical_path) {
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        return apply_rprofile_scan(inputs, Some(scan));
     }
 
     translate_watched_directory(inputs, root, &path, deleted)
@@ -788,6 +925,379 @@ mod tests {
         );
         assert!(matches!(delta, Some(PackageInputDelta::SettingChanged)));
         assert_eq!(inputs.package_mode, PackageMode::Disabled);
+    }
+
+    #[test]
+    fn watched_rprofile_change_rescans_and_emits_delta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+        std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(
+            inputs.rprofile_symbols.contains("my_helper"),
+            "got {:?}",
+            inputs.rprofile_symbols
+        );
+    }
+
+    #[test]
+    fn watched_rprofile_delete_clears_symbols() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+        inputs.rprofile_symbols.insert("old".to_string());
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(inputs.rprofile_symbols.is_empty());
+    }
+
+    #[test]
+    fn watched_rprofile_change_is_noop_when_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = false;
+        std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        // Disabled: no rescan, no symbols. (Delta may be None.)
+        assert!(inputs.rprofile_symbols.is_empty());
+        let _ = delta;
+    }
+
+    #[test]
+    fn acceptance_9_live_update_redrives_contribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+
+        // Initial: helper_a defined.
+        std::fs::write(root.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let _ = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: uri.clone(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        let s1 = crate::package_state::derive_package_state(
+            &crate::package_state::PackageState::new(),
+            &inputs,
+            &PackageInputDelta::RProfileChanged,
+        );
+        assert!(
+            s1.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_a")
+        );
+
+        // Edit: helper_b instead.
+        std::fs::write(root.join(".Rprofile"), "helper_b <- function() 1\n").unwrap();
+        let _ = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        let s2 = crate::package_state::derive_package_state(
+            &s1,
+            &inputs,
+            &PackageInputDelta::RProfileChanged,
+        );
+        assert!(
+            s2.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_b")
+        );
+        assert!(
+            !s2.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_a"),
+            "live edit must drop the old symbol"
+        );
+    }
+
+    #[test]
+    fn editing_a_sourced_helper_rescans_the_prelude() {
+        // `.Rprofile` sources `R/functions.r`; that helper defines a symbol.
+        // Editing the helper (a package R-source file) must (a) emit the normal
+        // RFileChanged delta for the package source file AND (b) re-scan the
+        // prelude so the new helper symbol is reflected in rprofile_symbols.
+        // The combined effect is delivered as a Batch.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let r_dir = root.join("R");
+        std::fs::create_dir_all(&r_dir).unwrap();
+        let helper = r_dir.join("functions.r");
+
+        std::fs::write(root.join(".Rprofile"), "source(\"R/functions.r\")\n").unwrap();
+        std::fs::write(&helper, "helper_a <- function() 1\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.model_rprofile = true;
+
+        // Seed the prelude by scanning `.Rprofile` once (records the sourced
+        // helper in rprofile_sourced_files and harvests helper_a).
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        inputs.rprofile_symbols = scan.symbols;
+        inputs.rprofile_attached_packages = scan.attached_packages;
+        inputs.rprofile_sourced_files = scan.sourced_files;
+        assert!(
+            inputs.rprofile_symbols.contains("helper_a"),
+            "precondition: prelude harvests helper_a from the sourced file"
+        );
+
+        // Edit the helper to define a different symbol.
+        std::fs::write(&helper, "helper_b <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        // The watched-file edit yields a Batch carrying the package RFileChanged
+        // delta plus an RProfileChanged delta from the forced prelude rescan.
+        let Some(PackageInputDelta::Batch(deltas)) = delta else {
+            panic!("expected Batch delta, got {:?}", delta);
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::RFileChanged { .. })),
+            "batch must include the base RFileChanged delta: {:?}",
+            deltas
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::RProfileChanged)),
+            "batch must include an RProfileChanged delta from the rescan: {:?}",
+            deltas
+        );
+
+        // The prelude rescan picked up the helper edit.
+        assert!(
+            inputs.rprofile_symbols.contains("helper_b"),
+            "rescan must harvest the new helper symbol, got {:?}",
+            inputs.rprofile_symbols
+        );
+        assert!(
+            !inputs.rprofile_symbols.contains("helper_a"),
+            "rescan must drop the old helper symbol, got {:?}",
+            inputs.rprofile_symbols
+        );
+    }
+
+    #[test]
+    fn editing_a_non_source_sourced_helper_rescans_the_prelude() {
+        // `.Rprofile` sources `scripts/setup.R`, a helper that is NOT a tracked
+        // package R-source file (`is_r_source_path` → None), so the
+        // is_r_source_path rescan branch never fires for it. The dedicated
+        // sourced-helper arm must still re-scan the prelude (Task 12) so a
+        // `scripts/` helper edit is reflected in rprofile_symbols.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let helper = scripts.join("setup.R");
+
+        std::fs::write(root.join(".Rprofile"), "source(\"scripts/setup.R\")\n").unwrap();
+        std::fs::write(&helper, "helper_a <- function() 1\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.model_rprofile = true;
+
+        // Seed the prelude (records the sourced helper + harvests helper_a).
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        inputs.rprofile_symbols = scan.symbols;
+        inputs.rprofile_attached_packages = scan.attached_packages;
+        inputs.rprofile_sourced_files = scan.sourced_files;
+        assert!(
+            inputs.rprofile_symbols.contains("helper_a"),
+            "precondition: prelude harvests helper_a from scripts/setup.R"
+        );
+        // Sanity: the helper is genuinely not a package R-source path, so this
+        // test exercises the dedicated arm rather than the is_r_source_path one.
+        assert!(is_r_source_path(&helper, root).is_none());
+
+        // Edit the helper to define a different symbol.
+        std::fs::write(&helper, "helper_b <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        // A non-source helper yields RProfileChanged alone (no base RFileChanged,
+        // since it is not tracked package state).
+        assert_eq!(
+            delta,
+            Some(PackageInputDelta::RProfileChanged),
+            "scripts/ helper edit must emit RProfileChanged, got {:?}",
+            delta
+        );
+        assert!(
+            inputs.rprofile_symbols.contains("helper_b"),
+            "rescan must harvest the new helper symbol, got {:?}",
+            inputs.rprofile_symbols
+        );
+        assert!(
+            !inputs.rprofile_symbols.contains("helper_a"),
+            "rescan must drop the old helper symbol, got {:?}",
+            inputs.rprofile_symbols
+        );
+    }
+
+    #[test]
+    fn watched_rprofile_delete_emits_delta_even_when_already_cleared() {
+        // The watched-files handler may translate a `.Rprofile` deletion twice:
+        // the early DELETED pre-pass clears the prelude, then the manifest block
+        // translates it again and relies on the *second* translate still
+        // returning RProfileChanged so its `scripts/` fanout fires. Guard that
+        // the delete arm is unconditional, not gated on "had symbols".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+        // Prelude already empty, as if a prior pre-pass cleared it.
+        assert!(inputs.rprofile_symbols.is_empty());
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+        assert_eq!(
+            delta,
+            Some(PackageInputDelta::RProfileChanged),
+            "delete must emit RProfileChanged unconditionally so the manifest \
+             block's script fanout fires even after the pre-pass already cleared"
+        );
+    }
+
+    #[test]
+    fn sourced_helper_under_data_raw_refreshes_both_sysdata_and_prelude() {
+        // A file can be BOTH a `data-raw/` sysdata script AND a `.Rprofile`
+        // sourced helper. A watched change must refresh both concerns — the
+        // prelude rescan must NOT preempt the sysdata rescan (or vice versa).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let data_raw = root.join("data-raw");
+        std::fs::create_dir_all(&data_raw).unwrap();
+        let helper = data_raw.join("setup.R");
+        std::fs::write(
+            &helper,
+            "helper_a <- function() 1\nusethis::use_data(my_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".Rprofile"), "source(\"data-raw/setup.R\")\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.model_rprofile = true;
+        // Seed the prelude (records data-raw/setup.R as a sourced helper).
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        inputs.rprofile_symbols = scan.symbols;
+        inputs.rprofile_attached_packages = scan.attached_packages;
+        inputs.rprofile_sourced_files = scan.sourced_files;
+        assert!(inputs.rprofile_symbols.contains("helper_a"));
+
+        // Edit the helper: change BOTH the prelude symbol and the sysdata symbol.
+        std::fs::write(
+            &helper,
+            "helper_b <- function() 1\nusethis::use_data(other_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        let Some(PackageInputDelta::Batch(deltas)) = delta else {
+            panic!("expected a Batch carrying both refreshes, got {:?}", delta);
+        };
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::DataDirChanged)),
+            "sysdata rescan must still fire: {:?}",
+            deltas
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, PackageInputDelta::RProfileChanged)),
+            "prelude rescan must also fire: {:?}",
+            deltas
+        );
+        assert!(
+            inputs.sysdata_names.contains("other_internal"),
+            "sysdata names must be refreshed: {:?}",
+            inputs.sysdata_names
+        );
+        assert!(
+            inputs.rprofile_symbols.contains("helper_b"),
+            "prelude must be refreshed: {:?}",
+            inputs.rprofile_symbols
+        );
     }
 
     #[test]

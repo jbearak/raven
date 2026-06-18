@@ -6666,6 +6666,7 @@ where
             .map(|a| a.calls_dev_load_all)
             .unwrap_or(false);
         append_package_contribution(&mut scope, uri, contrib, dev_load_all);
+        append_rprofile_prelude(&mut scope, uri, contrib);
     }
 
     // Issue #483 (WI2b): populate the persistent standalone cache. Only the
@@ -6753,6 +6754,18 @@ fn compute_contribution_symbol_names(
     let Some(contrib) = contribution else {
         return out;
     };
+    // `.Rprofile` prelude names — independent of the package workspace, so this
+    // runs before the `workspace_root` early-return below (script mode has no
+    // workspace_root but still gets the prelude). Mirrors `append_rprofile_prelude`'s
+    // applicability gate. Attached packages contribute no symbol NAMES here
+    // (their exports resolve via the package library), so only `rprofile_symbols`.
+    if let Ok(qpath) = queried_uri.to_file_path()
+        && rprofile_prelude_applies(&qpath, contrib)
+    {
+        for sym in contrib.rprofile_symbols.iter() {
+            out.insert(Arc::from(sym.as_str()));
+        }
+    }
     let Some(root) = contrib.workspace_root.as_ref() else {
         return out;
     };
@@ -7154,6 +7167,75 @@ pub(crate) fn append_package_contribution(
                 scope.inherited_packages.insert(pkg.clone());
             }
         }
+    }
+}
+
+/// Returns `true` when the `.Rprofile` prelude applies to `path` given the
+/// current [`PackageScopeContribution`].
+///
+/// Conditions (all must hold):
+/// - `contrib.rprofile_root` is `Some` (a prelude was found);
+/// - `path` is under that root;
+/// - in package mode (`workspace_root.is_some()`), the path is NOT withheld by
+///   [`crate::package_state::rprofile_withheld_in_package_mode`].
+///
+/// The empty-sets early-return in [`append_rprofile_prelude`] is kept separate
+/// (it short-circuits before URI→path conversion and belongs to that fn only).
+fn rprofile_prelude_applies(
+    path: &std::path::Path,
+    contrib: &crate::package_state::PackageScopeContribution,
+) -> bool {
+    let Some(root) = contrib.rprofile_root.as_ref() else {
+        return false;
+    };
+    if path.strip_prefix(root).is_err() {
+        return false;
+    }
+    let package_mode_active = contrib.workspace_root.is_some();
+    !(package_mode_active && crate::package_state::rprofile_withheld_in_package_mode(path, root))
+}
+
+/// Inject the `.Rprofile` prelude (issue: script-scope prelude) into a queried
+/// file's scope at Phase 5a. Independent of the package-mode contribution:
+/// applies in BOTH package and script mode, gated by
+/// [`crate::package_state::rprofile_withheld_in_package_mode`] in package mode
+/// only. Additive / suppressive only — never overwrites an existing binding (so
+/// local and cross-file defs win), and the attached packages flow to
+/// `inherited_packages` exactly like a helper-file `library()` attach.
+pub(crate) fn append_rprofile_prelude(
+    scope: &mut ScopeAtPosition,
+    uri: &Url,
+    contrib: &crate::package_state::PackageScopeContribution,
+) {
+    if contrib.rprofile_symbols.is_empty() && contrib.rprofile_attached_packages.is_empty() {
+        return;
+    }
+    let Ok(path) = uri.to_file_path() else {
+        return;
+    };
+    if !rprofile_prelude_applies(&path, contrib) {
+        return;
+    }
+    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
+        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
+    for sym in contrib.rprofile_symbols.iter() {
+        let name: Arc<str> = Arc::from(sym.as_str());
+        scope
+            .symbols
+            .entry(name.clone())
+            .or_insert_with(|| ScopedSymbol {
+                name,
+                kind: SymbolKind::Variable,
+                source_uri: pkg_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
+                signature: None,
+                is_declared: false,
+            });
+    }
+    for pkg in contrib.rprofile_attached_packages.iter() {
+        scope.inherited_packages.insert(pkg.clone());
     }
 }
 
@@ -8090,6 +8172,7 @@ where
                 contrib,
                 self.artifacts.calls_dev_load_all,
             );
+            append_rprofile_prelude(&mut scope, self.queried_uri, contrib);
         }
 
         scope
@@ -25739,6 +25822,7 @@ mod package_contribution_tests {
             dataset_symbols: Arc::new(BTreeSet::new()),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),
+            ..PackageScopeContribution::default()
         }
     }
 
@@ -26962,6 +27046,7 @@ mod package_contribution_tests {
             dataset_symbols: Arc::new(dataset_symbols),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),
+            ..PackageScopeContribution::default()
         }
     }
 
@@ -27081,6 +27166,88 @@ mod package_contribution_tests {
             scope.symbols.contains_key("mpg"),
             "dataset 'mpg' must be visible in R/. visible: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // .Rprofile prelude injection tests (Task 8)
+    // ------------------------------------------------------------------
+
+    fn prelude_contrib(root: &std::path::Path, package_mode: bool) -> PackageScopeContribution {
+        let mut c = PackageScopeContribution::default();
+        if package_mode {
+            c.workspace_root = Some(root.to_path_buf());
+            c.package_name = Some("pkg".into());
+        }
+        c.rprofile_root = Some(root.to_path_buf());
+        c.rprofile_symbols = Arc::new(["r_bind".to_string()].into_iter().collect());
+        c.rprofile_attached_packages = Arc::new(["stringr".to_string()].into_iter().collect());
+        c
+    }
+
+    #[test]
+    fn rprofile_prelude_injects_into_scripts_in_package_mode() {
+        let root = std::path::Path::new("/work/pkg");
+        let uri = Url::parse("file:///work/pkg/scripts/a.R").unwrap();
+        let contrib = prelude_contrib(root, true);
+        let scope = resolve_with_contrib(&uri, "x <- 1\n", &contrib);
+        assert!(
+            scope.symbols.contains_key("r_bind"),
+            "scripts/ must get prelude in package mode; symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scope.inherited_packages.contains("stringr"),
+            "scripts/ must inherit stringr from prelude"
+        );
+    }
+
+    #[test]
+    // `R_dir` names the package R/ directory (capital R is R's convention).
+    #[allow(non_snake_case)]
+    fn rprofile_prelude_withheld_from_package_R_dir() {
+        let root = std::path::Path::new("/work/pkg");
+        let uri = Url::parse("file:///work/pkg/R/uses_zz.R").unwrap();
+        let contrib = prelude_contrib(root, true);
+        let scope = resolve_with_contrib(&uri, "x <- 1\n", &contrib);
+        assert!(
+            !scope.symbols.contains_key("r_bind"),
+            "namespace R/ must not get the prelude in package mode; symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    // `R_dir` names the package R/ directory (capital R is R's convention).
+    #[allow(non_snake_case)]
+    fn rprofile_prelude_applies_to_R_dir_in_script_mode() {
+        let root = std::path::Path::new("/work/proj");
+        let uri = Url::parse("file:///work/proj/R/uses_zz.R").unwrap();
+        let contrib = prelude_contrib(root, false);
+        let scope = resolve_with_contrib(&uri, "x <- 1\n", &contrib);
+        assert!(
+            scope.symbols.contains_key("r_bind"),
+            "script-mode R/ is ordinary scripts → prelude applies; symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rprofile_prelude_does_not_overwrite_local_definition() {
+        let root = std::path::Path::new("/work/pkg");
+        // r_bind is defined locally in the file itself
+        let uri = Url::parse("file:///work/pkg/scripts/a.R").unwrap();
+        let contrib = prelude_contrib(root, true);
+        // Local definition comes first — the prelude must not overwrite it.
+        let scope = resolve_with_contrib(&uri, "r_bind <- function() 42\n", &contrib);
+        let sym = scope
+            .symbols
+            .get("r_bind")
+            .expect("r_bind must be in scope (local def)");
+        assert!(
+            !crate::cross_file::scope::is_package_internal_uri(&sym.source_uri),
+            "local definition must win over prelude; source_uri: {}",
+            sym.source_uri
         );
     }
 

@@ -36,14 +36,8 @@ pub fn derive_package_state(
     } else {
         None
     };
-    let scope_contribution = build_scope_contribution(
-        &workspace,
-        &namespace_model,
-        &r_file_facts,
-        inputs.description.as_ref(),
-        &inputs.dataset_names,
-        &inputs.sysdata_names,
-    );
+    let scope_contribution =
+        build_scope_contribution(&workspace, &namespace_model, &r_file_facts, inputs);
     PackageState {
         workspace,
         namespace_model,
@@ -56,12 +50,21 @@ fn build_scope_contribution(
     workspace: &Option<PackageWorkspace>,
     namespace_model: &Option<PackageNamespaceModel>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
-    description: Option<&DescriptionInput>,
-    dataset_names: &BTreeSet<String>,
-    sysdata_names: &BTreeSet<String>,
+    inputs: &PackageInputs,
 ) -> PackageScopeContribution {
+    let description = inputs.description.as_ref();
+    let dataset_names = &inputs.dataset_names;
+    let sysdata_names = &inputs.sysdata_names;
+    let rprofile_symbols = &inputs.rprofile_symbols;
+    let rprofile_attached_packages = &inputs.rprofile_attached_packages;
+    let rprofile_root = inputs.workspace_root.clone();
     let Some(ws) = workspace else {
-        return PackageScopeContribution::default();
+        return PackageScopeContribution {
+            rprofile_symbols: Arc::new(rprofile_symbols.clone()),
+            rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
+            rprofile_root,
+            ..PackageScopeContribution::default()
+        };
     };
     // r_internal_symbols: union of top_level_defs from Source files only
     // (exclude tests/testthat/* — those are kind == Test). Partition is
@@ -166,6 +169,9 @@ fn build_scope_contribution(
         dataset_symbols: Arc::new(dataset_names.clone()),
         sysdata_symbols: Arc::new(sysdata_names.clone()),
         onload_symbols: Arc::new(onload_all),
+        rprofile_symbols: Arc::new(rprofile_symbols.clone()),
+        rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
+        rprofile_root,
     }
 }
 
@@ -298,19 +304,20 @@ fn effective_workspace(inputs: &PackageInputs) -> Option<PackageWorkspace> {
         .as_ref()
         .and_then(|d| parse_dcf_field_pub(&d.text, "Package"))
         .filter(|s| !s.is_empty());
-    let has_namespace_and_sources = inputs.namespace.is_some()
-        && inputs
-            .r_files
-            .values()
-            .any(|file| file.kind == RFileKind::Source);
+    // `Auto` activates on a single authoritative signal: a workspace-root
+    // DESCRIPTION with a non-empty `Package:` field — exactly R's own definition
+    // of a package. NAMESPACE/roxygen/`R/` presence is deliberately NOT an
+    // activation heuristic (a NAMESPACE without a DESCRIPTION is not an
+    // installable package). Non-standard layouts opt in via `Enabled`.
+    //
+    // This is deliberate, not an oversight: do NOT re-add a NAMESPACE-based
+    // `Auto` branch (it was tried, drifted from the design, and was reverted).
+    // See docs/superpowers/specs/2026-05-10-r-package-mode-architecture-design.md
+    // §6.1 (the 2026-06-17 decision note) for the rationale and history.
     match (inputs.package_mode, parsed_name.as_deref()) {
         (PackageMode::Disabled, _) => None,
         (PackageMode::Auto, Some(name)) => Some(PackageWorkspace {
             name: name.to_string(),
-            root: root.clone(),
-        }),
-        (PackageMode::Auto, None) if has_namespace_and_sources => Some(PackageWorkspace {
-            name: "unknown".to_string(),
             root: root.clone(),
         }),
         (PackageMode::Auto, None) => None,
@@ -338,6 +345,10 @@ mod tests {
             r_files: BTreeMap::new(),
             dataset_names: BTreeSet::new(),
             sysdata_names: BTreeSet::new(),
+            model_rprofile: false,
+            rprofile_symbols: BTreeSet::new(),
+            rprofile_attached_packages: BTreeSet::new(),
+            rprofile_sourced_files: BTreeSet::new(),
         }
     }
 
@@ -366,8 +377,13 @@ mod tests {
         );
         assert!(s.workspace.is_none());
     }
+    /// Single-signal activation: NAMESPACE + R sources without a DESCRIPTION
+    /// `Package:` field does NOT activate package mode in `Auto`. A NAMESPACE
+    /// is not an activation heuristic; non-package workspaces stay in script
+    /// mode regardless of NAMESPACE presence (see `docs/r-package-dev.md`).
+    /// Use `Enabled` to force package mode on such layouts.
     #[test]
-    fn auto_with_namespace_and_source_yields_workspace() {
+    fn auto_with_namespace_and_source_no_description_yields_no_workspace() {
         let mut inputs = empty_inputs(PackageMode::Auto);
         inputs.namespace = Some(NamespaceInput {
             text: "export(foo)\n".into(),
@@ -388,7 +404,12 @@ mod tests {
             &PackageInputDelta::Initial,
         );
 
-        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
+        assert!(
+            s.workspace.is_none(),
+            "Auto mode with NAMESPACE + sources but no DESCRIPTION Package: must not activate"
+        );
+        assert!(s.scope_contribution.workspace_root.is_none());
+        assert!(s.scope_contribution.r_internal_symbols.is_empty());
     }
 
     #[test]
@@ -727,11 +748,9 @@ mod tests {
         // r_internal_symbols (confirmed by test_files_get_rfile_facts_but_dont_contribute_internal_symbols).
     }
 
-    /// Phase 5b behavior change: a workspace with NAMESPACE but no DESCRIPTION
-    /// and no R source files does NOT activate package mode in Auto mode.
-    /// However, if both a NAMESPACE and R source files exist (even without
-    /// DESCRIPTION), package mode activates with name "unknown" to support
-    /// `raven check --workspace` on minimal package directories.
+    /// A workspace with a NAMESPACE but no DESCRIPTION `Package:` field does NOT
+    /// activate package mode in `Auto` — with or without R source files (see
+    /// `auto_with_namespace_and_source_no_description_yields_no_workspace`).
     #[test]
     fn namespace_alone_without_sources_does_not_produce_scope_contribution() {
         // Auto mode with NAMESPACE but no DESCRIPTION and no R source files.
@@ -754,42 +773,6 @@ mod tests {
         assert!(s.scope_contribution.workspace_root.is_none());
         assert!(s.scope_contribution.imported_symbols.is_empty());
         assert!(s.scope_contribution.full_imports.is_empty());
-    }
-
-    /// When both NAMESPACE and R source files exist (but no DESCRIPTION),
-    /// Auto mode activates package mode with name "unknown".
-    #[test]
-    fn namespace_with_sources_activates_package_mode_without_description() {
-        let mut inputs = empty_inputs(PackageMode::Auto);
-        inputs.namespace = Some(NamespaceInput {
-            text: "importFrom(dplyr, filter)\nimport(ggplot2)\n".into(),
-        });
-        let r_path: PathBuf = "/work/pkg/R/utils.R".into();
-        let text: Arc<str> = "helper <- function() 1\n".into();
-        inputs.r_files.insert(
-            r_path,
-            RFileInput {
-                kind: RFileKind::Source,
-                text: text.clone(),
-                content_digest: ContentDigest::of(&text),
-            },
-        );
-
-        let s = derive_package_state(
-            &PackageState::default(),
-            &inputs,
-            &PackageInputDelta::Initial,
-        );
-
-        assert!(
-            s.workspace.is_some(),
-            "Auto mode with NAMESPACE + source files should produce a workspace"
-        );
-        assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
-        assert!(
-            s.scope_contribution.r_internal_symbols.contains("helper"),
-            "internal symbols should be injected"
-        );
     }
 
     // ------------------------------------------------------------------
@@ -1405,6 +1388,47 @@ foo <- function() 1
             "subdir helper attaches must NOT be collected: {:?}",
             s.scope_contribution.test_helper_attached_packages,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // .Rprofile prelude carry-through (Task 6)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn contribution_carries_rprofile_symbols_in_package_mode() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.rprofile_symbols.insert("r_bind".to_string());
+        inputs
+            .rprofile_attached_packages
+            .insert("stringr".to_string());
+        let s = derive_package_state(&PackageState::new(), &inputs, &PackageInputDelta::Initial);
+        let c = s.scope_contribution();
+        assert!(c.rprofile_symbols.contains("r_bind"));
+        assert!(c.rprofile_attached_packages.contains("stringr"));
+        assert_eq!(c.rprofile_root, inputs.workspace_root);
+        // package mode active → workspace_root is Some
+        assert!(c.workspace_root.is_some());
+    }
+
+    #[test]
+    fn contribution_carries_rprofile_symbols_in_script_mode() {
+        // No DESCRIPTION + Auto → no package workspace, but the prelude must
+        // still be carried (script-mode R/ inclusion depends on this).
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.workspace_root = Some(std::path::PathBuf::from("/work"));
+        inputs.rprofile_symbols.insert("zz".to_string());
+        let s = derive_package_state(&PackageState::new(), &inputs, &PackageInputDelta::Initial);
+        let c = s.scope_contribution();
+        assert!(
+            c.rprofile_symbols.contains("zz"),
+            "prelude must survive in script mode"
+        );
+        assert_eq!(
+            c.rprofile_root.as_deref(),
+            Some(std::path::Path::new("/work"))
+        );
+        // script mode → no package workspace
+        assert!(c.workspace_root.is_none());
     }
 
     // ------------------------------------------------------------------

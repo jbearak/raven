@@ -432,6 +432,10 @@ fn build_indexed_state(
         desc_text,
         ns_text,
         Default::default(),
+        // `raven check` is a single-pass batch with no concurrent writers, so
+        // it lets the helper scan `.Rprofile` inline (no off-lock precompute
+        // needed). See `initialize_package_inputs_from_state`.
+        None,
     );
 
     Ok(state)
@@ -1442,12 +1446,17 @@ mod tests {
         assert_eq!(run_blocking(args), EXIT_OK);
     }
     #[test]
-    fn namespace_only_package_root_gets_package_internal_scope() {
-        // R's base-priority package sources use package-like roots with
-        // NAMESPACE and R/ but no generated DESCRIPTION. Auto package mode must
-        // still inject package-internal symbols for those workspaces, otherwise
-        // sibling helpers in R/*.R are reported as undefined throughout the
-        // corpus.
+    fn namespace_only_package_root_does_not_get_package_internal_scope() {
+        // Single-signal `Auto` activation (commit ecb8c19a; r-package-mode
+        // architecture spec §6.1) requires a workspace-root DESCRIPTION with a
+        // non-empty `Package:` field — R's own definition of a package.
+        // NAMESPACE / R/ presence is NOT an activation heuristic (a NAMESPACE
+        // without `Package:` is meaningless to R itself, and broadening
+        // activation biases toward wrongly suppressing real diagnostics in
+        // non-packages). So a NAMESPACE-only root runs in SCRIPT mode: R/*.R
+        // files do not share a package-internal scope, and a sibling helper
+        // referenced without an explicit source()/import reads as undefined —
+        // exactly the Phase 5 behavior §6.1/§11.1 prescribes.
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("R")).unwrap();
         fs::write(tmp.path().join("NAMESPACE"), "export(helper_fn)\n").unwrap();
@@ -1461,11 +1470,12 @@ mod tests {
         let args = base_args(tmp.path());
         let diags = collect_diagnostics_blocking(&args);
         assert!(
-            !diags
+            diags
                 .iter()
-                .any(|(_, d)| d.message.contains("Undefined variable: helper_fn")),
-            "NAMESPACE + R/ without DESCRIPTION should still enable package-internal \
-             scope. Diagnostics: {:?}",
+                .any(|(_, d)| d.message == "Undefined variable: helper_fn"),
+            "NAMESPACE-only root (no DESCRIPTION) must NOT activate package mode: \
+             the cross-file helper must read as undefined in script mode. \
+             Diagnostics: {:?}",
             diags
                 .iter()
                 .map(|(_, d)| d.message.clone())
@@ -2465,5 +2475,247 @@ mod tests {
         );
         // The synthetic package is still not "installed" (Tier-1-only).
         assert!(!state.package_library.package_exists(pkg));
+    }
+
+    // ── .Rprofile prelude acceptance tests ──────────────────────────────────
+    //
+    // Cases 1-8, 10, 11 from the `.Rprofile` prelude spec.  Case 10 (raven
+    // check parity) is inherently satisfied by using `collect_diagnostics_blocking`
+    // throughout — this IS the `raven check` pipeline.  Case 9 (live update) is
+    // a later task.  Case 3 (library() export resolution) is left as a
+    // contribution-level comment below; end-to-end export resolution requires an
+    // installed package in the harness, which is unavailable in CI.
+
+    /// True if any diagnostic on any target is an "Undefined variable" for `name`.
+    fn has_undefined(diags: &[(PathBuf, Diagnostic)], name: &str) -> bool {
+        diags
+            .iter()
+            .any(|(_, d)| d.message == format!("Undefined variable: {name}"))
+    }
+
+    fn args_for(root: &Path, target: &Path) -> CheckArgs {
+        let mut a = base_args(root);
+        a.paths = vec![target.to_path_buf()];
+        a
+    }
+
+    // ── Case 1: resolution via .Rprofile source() ───────────────────────────
+
+    #[test]
+    fn acceptance_1_resolution_via_rprofile_source() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        fs::write(
+            root.join("R").join("functions.r"),
+            "r_bind <- function(...) 1\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"R/functions.r\")\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "r_bind(1, 2)\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &foo));
+        assert!(
+            !has_undefined(&diags, "r_bind"),
+            "prelude must resolve r_bind: {:?}",
+            diags
+        );
+    }
+
+    // ── Case 2: resolution via .Rprofile assignment ─────────────────────────
+
+    #[test]
+    fn acceptance_2_resolution_via_rprofile_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(root.join(".Rprofile"), "my_helper <- function() {}\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "my_helper()\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &foo));
+        assert!(!has_undefined(&diags, "my_helper"), "{:?}", diags);
+    }
+
+    // ── Case 3: library() suppression — contribution-level only ─────────────
+    //
+    // End-to-end export resolution for `library(stringr)` → `str_to_sentence()`
+    // requires `stringr` to be installed in the test environment's R library,
+    // which is unavailable in CI.  The deterministic invariant — that `.Rprofile`
+    // `library(pkg)` lines are captured and propagated to
+    // `rprofile_attached_packages` — is covered by
+    // `package_state::rprofile::tests::harvests_attached_packages` (scanner) and
+    // `cross_file::scope::package_contribution_tests::rprofile_prelude_injects_into_scripts_in_package_mode`
+    // (scope injection: asserts prelude adds attached packages to `inherited_packages`).
+    // No end-to-end test is added here to avoid flakiness.
+
+    // ── Case 11: conditional top-level assignment ────────────────────────────
+
+    #[test]
+    fn acceptance_11_conditional_top_level_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join(".Rprofile"),
+            "if (interactive()) helper <- function() {}\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "helper()\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &foo));
+        assert!(!has_undefined(&diags, "helper"), "{:?}", diags);
+    }
+
+    // ── Case 4: package-mode R/ excluded (prelude must NOT apply) ───────────
+
+    #[test]
+    fn acceptance_4_package_mode_excludes_r_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(root.join(".Rprofile"), "zz <- 1\n").unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        let uses = root.join("R").join("uses_zz.R");
+        fs::write(&uses, "f <- function() zz\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &uses));
+        assert!(
+            has_undefined(&diags, "zz"),
+            "namespace R/ must NOT get the prelude: {:?}",
+            diags
+        );
+    }
+
+    // ── Case 5: package-mode tests/ excluded (prelude must NOT apply) ────────
+
+    #[test]
+    fn acceptance_5_package_mode_excludes_tests() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(root.join(".Rprofile"), "zz <- 1\n").unwrap();
+        fs::create_dir_all(root.join("tests").join("testthat")).unwrap();
+        let testf = root.join("tests").join("testthat").join("test-x.R");
+        // Bare reference to avoid test_that() diagnostic interference.
+        fs::write(&testf, "zz\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &testf));
+        assert!(
+            has_undefined(&diags, "zz"),
+            "tests must NOT get the prelude: {:?}",
+            diags
+        );
+    }
+
+    // ── Case 4b applicability: data-raw/ applies, vignettes/ withholds ───────
+
+    #[test]
+    fn acceptance_applicability_data_raw_gets_prelude() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(root.join(".Rprofile"), "zz <- 1\n").unwrap();
+        fs::create_dir(root.join("data-raw")).unwrap();
+        let prep = root.join("data-raw").join("prep.R");
+        fs::write(&prep, "f <- function() zz\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &prep));
+        assert!(
+            !has_undefined(&diags, "zz"),
+            "data-raw/ must get the prelude (dev-only, run from root): {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn acceptance_applicability_vignettes_withholds_prelude() {
+        // vignettes/*.R is classified as a workspace R file by the harness, so
+        // the full end-to-end diagnostic path runs and the prelude-withhold
+        // assertion is meaningful.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(root.join(".Rprofile"), "zz <- 1\n").unwrap();
+        fs::create_dir(root.join("vignettes")).unwrap();
+        let vig = root.join("vignettes").join("intro.R");
+        fs::write(&vig, "f <- function() zz\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &vig));
+        assert!(
+            has_undefined(&diags, "zz"),
+            "vignettes/ must NOT get the prelude (rebuilt under R CMD check): {:?}",
+            diags
+        );
+    }
+
+    // ── Case 6: script-mode R/ included (prelude MUST apply) ─────────────────
+
+    #[test]
+    fn acceptance_6_script_mode_includes_r_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // NO DESCRIPTION → script mode.  R/ is ordinary scripts here.
+        fs::write(root.join(".Rprofile"), "zz <- 1\n").unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        let uses = root.join("R").join("uses_zz.R");
+        fs::write(&uses, "f <- function() zz\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &uses));
+        assert!(
+            !has_undefined(&diags, "zz"),
+            "script-mode R/ must get the prelude: {:?}",
+            diags
+        );
+    }
+
+    // ── Case 7: renv no-op ────────────────────────────────────────────────────
+
+    #[test]
+    fn acceptance_7_renv_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("renv")).unwrap();
+        // `secret_from_renv` exists ONLY in renv/activate.R; if the prelude
+        // wrongly harvested that file, referencing it would resolve and the
+        // assertion below would fail. Using a name unique to activate.R makes
+        // the test actually prove renv is skipped (not merely that some
+        // genuinely-undefined name still flags).
+        fs::write(
+            root.join("renv").join("activate.R"),
+            "secret_from_renv <- 1\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"renv/activate.R\")\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "secret_from_renv\n").unwrap();
+        let diags = collect_diagnostics_blocking(&args_for(root, &foo));
+        assert!(
+            has_undefined(&diags, "secret_from_renv"),
+            "renv must be a no-op (activate.R not harvested): {:?}",
+            diags
+        );
+    }
+
+    // ── Case 8: no fabricated diagnostics ────────────────────────────────────
+
+    #[test]
+    fn acceptance_8_no_fabricated_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "ok <- 1\nok\n").unwrap();
+        // Baseline: no .Rprofile.
+        let baseline = collect_diagnostics_blocking(&args_for(root, &foo));
+        // Add a .Rprofile; the diagnostic set must not GAIN anything.
+        fs::write(root.join(".Rprofile"), "helper <- function() 1\n").unwrap();
+        let with_profile = collect_diagnostics_blocking(&args_for(root, &foo));
+        assert!(
+            with_profile.len() <= baseline.len(),
+            "prelude is suppressive-only; must not add diagnostics. baseline={:?} with={:?}",
+            baseline,
+            with_profile
+        );
     }
 }
