@@ -150,6 +150,10 @@ pub struct CrossFileConfig {
     pub max_transitive_dependents_visited: usize,
     /// Package mode: auto (detect DESCRIPTION), enabled (always), disabled (never).
     pub package_mode: PackageMode,
+    /// Model a workspace-root `.Rprofile` as a script-scope prelude
+    /// (suppressive-only). See `docs/r-package-dev.md` and
+    /// `crates/raven/src/package_state/rprofile.rs`.
+    pub model_rprofile: bool,
 }
 
 /// Controls whether R package workspace mode is active.
@@ -223,6 +227,7 @@ impl Default for CrossFileConfig {
             backward_dependencies: BackwardDependencyMode::Auto,
             max_transitive_dependents_visited: 50_000,
             package_mode: PackageMode::Auto,
+            model_rprofile: true,
         }
     }
 }
@@ -238,6 +243,7 @@ impl CrossFileConfig {
             || self.backward_dependencies != other.backward_dependencies
             || self.max_transitive_dependents_visited != other.max_transitive_dependents_visited
             || self.package_mode != other.package_mode
+            || self.model_rprofile != other.model_rprofile
     }
 }
 
@@ -320,6 +326,11 @@ mod tests {
         // Reset and change max_transitive_dependents_visited
         config2 = CrossFileConfig::default();
         config2.max_transitive_dependents_visited = 500;
+        assert!(config1.scope_settings_changed(&config2));
+
+        // Reset and change model_rprofile
+        config2 = CrossFileConfig::default();
+        config2.model_rprofile = false;
         assert!(config1.scope_settings_changed(&config2));
     }
 

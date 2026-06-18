@@ -432,6 +432,9 @@ pub(crate) fn parse_cross_file_config(
                 _ => crate::cross_file::config::PackageMode::Auto,
             };
         }
+        if let Some(v) = packages.get("modelRprofile").and_then(|v| v.as_bool()) {
+            config.model_rprofile = v;
+        }
     }
 
     log::info!("Cross-file configuration loaded from LSP settings:");
@@ -9228,6 +9231,26 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(cfg.max_transitive_dependents_visited, 1234);
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_model_rprofile() {
+            let settings = json!({
+                "packages": { "modelRprofile": false }
+            });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert!(!config.model_rprofile, "modelRprofile=false must parse");
+        }
+
+        #[test]
+        fn parse_cross_file_config_model_rprofile_defaults_true() {
+            let settings = json!({ "packages": {} });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert!(config.model_rprofile, "modelRprofile must default to true");
         }
 
         #[test]
