@@ -288,7 +288,9 @@ that is **not** an R package, an `R/` directory is just scripts, so the prelude
 applies to it like any other directory. Raven never models `~/.Rprofile`, and
 it recognizes `renv`'s `source("renv/activate.R")` line and does not follow it.
 
-> **Live-update note:** Editing `.Rprofile` itself updates the prelude live; editing a helper file it `source()`s refreshes live only when that helper lives in a directory Raven tracks as package R source — `R/`, `tests/`, or the installed test suites `inst/tinytest`/`inst/unitTests`. A helper elsewhere (e.g. `scripts/`) is still harvested at startup, but an edit to it is picked up on the next full rebuild (editor restart, a config change, or a `.Rprofile` edit).
+`.Rprofile` is recognized as an R file, so it gets R syntax highlighting and its own diagnostics like any other R script.
+
+> **Live-update note:** Editing `.Rprofile` in the editor refreshes the prelude **as you type** — open files that consume it (e.g. `scripts/`) re-resolve immediately, without a save. (Closing `.Rprofile` with unsaved edits reverts the prelude to the on-disk content, since those edits are discarded.) Editing a *helper* that `.Rprofile` `source()`s re-harvests the prelude when that helper changes on disk (i.e. on save, or an external edit), regardless of where the helper lives — `R/`, `tests/`, `scripts/`, `inst/`, etc. An unsaved open helper's edits reach the prelude on its next save.
 
 ### Configuration
 

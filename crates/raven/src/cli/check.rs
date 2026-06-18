@@ -432,6 +432,10 @@ fn build_indexed_state(
         desc_text,
         ns_text,
         Default::default(),
+        // `raven check` is a single-pass batch with no concurrent writers, so
+        // it lets the helper scan `.Rprofile` inline (no off-lock precompute
+        // needed). See `initialize_package_inputs_from_state`.
+        None,
     );
 
     Ok(state)
@@ -1442,12 +1446,17 @@ mod tests {
         assert_eq!(run_blocking(args), EXIT_OK);
     }
     #[test]
-    fn namespace_only_package_root_gets_package_internal_scope() {
-        // R's base-priority package sources use package-like roots with
-        // NAMESPACE and R/ but no generated DESCRIPTION. Auto package mode must
-        // still inject package-internal symbols for those workspaces, otherwise
-        // sibling helpers in R/*.R are reported as undefined throughout the
-        // corpus.
+    fn namespace_only_package_root_does_not_get_package_internal_scope() {
+        // Single-signal `Auto` activation (commit ecb8c19a; r-package-mode
+        // architecture spec §6.1) requires a workspace-root DESCRIPTION with a
+        // non-empty `Package:` field — R's own definition of a package.
+        // NAMESPACE / R/ presence is NOT an activation heuristic (a NAMESPACE
+        // without `Package:` is meaningless to R itself, and broadening
+        // activation biases toward wrongly suppressing real diagnostics in
+        // non-packages). So a NAMESPACE-only root runs in SCRIPT mode: R/*.R
+        // files do not share a package-internal scope, and a sibling helper
+        // referenced without an explicit source()/import reads as undefined —
+        // exactly the Phase 5 behavior §6.1/§11.1 prescribes.
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("R")).unwrap();
         fs::write(tmp.path().join("NAMESPACE"), "export(helper_fn)\n").unwrap();
@@ -1461,11 +1470,12 @@ mod tests {
         let args = base_args(tmp.path());
         let diags = collect_diagnostics_blocking(&args);
         assert!(
-            !diags
+            diags
                 .iter()
-                .any(|(_, d)| d.message.contains("Undefined variable: helper_fn")),
-            "NAMESPACE + R/ without DESCRIPTION should still enable package-internal \
-             scope. Diagnostics: {:?}",
+                .any(|(_, d)| d.message == "Undefined variable: helper_fn"),
+            "NAMESPACE-only root (no DESCRIPTION) must NOT activate package mode: \
+             the cross-file helper must read as undefined in script mode. \
+             Diagnostics: {:?}",
             diags
                 .iter()
                 .map(|(_, d)| d.message.clone())
@@ -2480,7 +2490,7 @@ mod tests {
     fn has_undefined(diags: &[(PathBuf, Diagnostic)], name: &str) -> bool {
         diags
             .iter()
-            .any(|(_, d)| d.message.starts_with("Undefined variable") && d.message.contains(name))
+            .any(|(_, d)| d.message == format!("Undefined variable: {name}"))
     }
 
     fn args_for(root: &Path, target: &Path) -> CheckArgs {
@@ -2664,15 +2674,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir(root.join("renv")).unwrap();
-        fs::write(root.join("renv").join("activate.R"), "x <- 1\n").unwrap();
+        // `secret_from_renv` exists ONLY in renv/activate.R; if the prelude
+        // wrongly harvested that file, referencing it would resolve and the
+        // assertion below would fail. Using a name unique to activate.R makes
+        // the test actually prove renv is skipped (not merely that some
+        // genuinely-undefined name still flags).
+        fs::write(
+            root.join("renv").join("activate.R"),
+            "secret_from_renv <- 1\n",
+        )
+        .unwrap();
         fs::write(root.join(".Rprofile"), "source(\"renv/activate.R\")\n").unwrap();
         fs::create_dir(root.join("scripts")).unwrap();
         let foo = root.join("scripts").join("foo.R");
-        fs::write(&foo, "genuinely_undefined\n").unwrap();
+        fs::write(&foo, "secret_from_renv\n").unwrap();
         let diags = collect_diagnostics_blocking(&args_for(root, &foo));
         assert!(
-            has_undefined(&diags, "genuinely_undefined"),
-            "renv must be a no-op; real bugs still flag: {:?}",
+            has_undefined(&diags, "secret_from_renv"),
+            "renv must be a no-op (activate.R not harvested): {:?}",
             diags
         );
     }

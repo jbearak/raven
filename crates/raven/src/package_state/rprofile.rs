@@ -37,11 +37,37 @@ const RPROFILE_MAX_SOURCE_FILES: usize = 1000;
 /// Synchronously scan `<workspace_root>/.Rprofile` (never executing it) into a
 /// script-scope prelude. Returns empty when the file is absent or unreadable.
 pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
+    let rprofile_path = workspace_root.join(".Rprofile");
+    // Decode through the shared BOM-aware seam so a UTF-8 BOM at the start of
+    // `.Rprofile` does not make the first harvested declaration/source call
+    // differ from normal source ingestion (`crate::state::read_source`).
+    let Ok(text) = crate::state::read_source(&rprofile_path) else {
+        return RprofileScan::default();
+    };
+    scan_rprofile_worklist(workspace_root, text)
+}
+
+/// Like [`scan_workspace_rprofile`], but seeds the scan with the GIVEN root
+/// `.Rprofile` text instead of reading it from disk. Used by the live-buffer
+/// path (an open, possibly-unsaved `.Rprofile`) so the prelude reflects
+/// in-memory edits before they hit disk. Transitively-`source()`d helpers are
+/// still read from disk — the rarer case of an unsaved open helper is not
+/// overlaid here (documented save-time gap).
+pub fn scan_workspace_rprofile_with_root_text(
+    workspace_root: &Path,
+    root_text: &str,
+) -> RprofileScan {
+    scan_rprofile_worklist(workspace_root, root_text.to_string())
+}
+
+/// Shared worklist runner: harvest top-level defs + attached packages from the
+/// root `.Rprofile` text (`root_text`), then follow its transitive literal
+/// `source()` targets from disk. Both public entry points differ only in where
+/// the root text comes from (disk vs. in-memory buffer).
+fn scan_rprofile_worklist(workspace_root: &Path, root_text: String) -> RprofileScan {
     let mut scan = RprofileScan::default();
     let rprofile_path = workspace_root.join(".Rprofile");
-    let Ok(text) = std::fs::read_to_string(&rprofile_path) else {
-        return scan;
-    };
+    let text = root_text;
     let workspace_url = Url::from_file_path(workspace_root).ok();
     let renv_activate = workspace_root.join("renv").join("activate.R");
     // Hoist the canonicalization outside the inner loop — computed once instead of N×M times.
@@ -98,7 +124,7 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
             if visited.len() >= RPROFILE_MAX_SOURCE_FILES {
                 break;
             }
-            if let Ok(sourced_text) = std::fs::read_to_string(&resolved) {
+            if let Ok(sourced_text) = crate::state::read_source(&resolved) {
                 // Record the canonical path so a later edit to this helper can
                 // trigger a prelude rescan (Task 12 transitive freshness).
                 scan.sourced_files.insert(canonical_resolved.clone());
@@ -230,6 +256,44 @@ mod tests {
         fs::write(tmp.path().join(".Rprofile"), "source(\"R/functions.r\")\n").unwrap();
         let scan = scan_workspace_rprofile(tmp.path());
         assert!(scan.symbols.contains("r_bind"), "got {:?}", scan.symbols);
+    }
+
+    #[test]
+    fn with_root_text_uses_buffer_not_disk_and_follows_source() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("R").join("functions.r"),
+            "r_bind <- function() 1\n",
+        )
+        .unwrap();
+        // Disk `.Rprofile` defines `disk_only` and sources the helper.
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "disk_only <- 1\nsource(\"R/functions.r\")\n",
+        )
+        .unwrap();
+        // The in-memory buffer (unsaved) instead defines `buffer_only` and still
+        // sources the helper. The scan must reflect the BUFFER, not disk.
+        let scan = scan_workspace_rprofile_with_root_text(
+            tmp.path(),
+            "buffer_only <- 1\nsource(\"R/functions.r\")\n",
+        );
+        assert!(
+            scan.symbols.contains("buffer_only"),
+            "must harvest from the in-memory root text: {:?}",
+            scan.symbols
+        );
+        assert!(
+            !scan.symbols.contains("disk_only"),
+            "must NOT harvest the stale disk root text: {:?}",
+            scan.symbols
+        );
+        assert!(
+            scan.symbols.contains("r_bind"),
+            "transitive source() helpers still resolve from disk: {:?}",
+            scan.symbols
+        );
     }
 
     #[test]

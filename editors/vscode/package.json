@@ -637,6 +637,9 @@
           ".r",
           ".R"
         ],
+        "filenames": [
+          ".Rprofile"
+        ],
         "configuration": "./language-configuration.json"
       },
       {

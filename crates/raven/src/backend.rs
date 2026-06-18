@@ -1671,6 +1671,20 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
     })
 }
 
+/// True if `p` (or its canonical form) is one of the files `.Rprofile`
+/// transitively `source()`s. The static scanner records *canonical* paths in
+/// `rprofile_sourced_files`, but watcher URIs are not necessarily canonical
+/// (symlinked roots like macOS `/tmp` → `/private/tmp`), so fall back to
+/// canonicalizing `p` before giving up. Used to route an edit to a sourced
+/// helper that lives outside the package's tracked R dirs (e.g. `scripts/`,
+/// `inst/`) into the package-state update so the prelude is re-scanned (Task 12).
+fn path_in_rprofile_sourced_set(
+    p: &std::path::Path,
+    sourced: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> bool {
+    sourced.contains(p) || p.canonicalize().ok().is_some_and(|c| sourced.contains(&c))
+}
+
 /// Returns `true` when any delta in `deltas` is `RProfileChanged`, or when any
 /// nested [`PackageInputDelta::Batch`] recursively contains one.
 fn batch_contains_rprofile_changed(deltas: &[crate::package_state::PackageInputDelta]) -> bool {
@@ -1781,6 +1795,7 @@ pub(crate) fn initialize_package_inputs_from_state(
     desc_text: Option<Arc<str>>,
     ns_text: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+    precomputed_rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
 ) {
     state.package_inputs.workspace_root = Some(root.clone());
     state.package_inputs.package_mode = state.cross_file_config.package_mode;
@@ -1797,8 +1812,16 @@ pub(crate) fn initialize_package_inputs_from_state(
     state.package_inputs.sysdata_names =
         crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
 
+    // The `.Rprofile` prelude scan follows transitive `source()` chains, so it
+    // must NOT run while the `WorldState` write lock is held (locking-discipline
+    // invariant). Callers that hold the lock under contention (LSP startup /
+    // `packageMode` rebuild) precompute the scan OFF-lock and pass it in via
+    // `precomputed_rprofile_scan`; the non-contended callers (`raven check`,
+    // unit tests) pass `None` and let it scan inline. When modeling is disabled
+    // the prelude is cleared regardless of what was passed.
     let rprofile_scan = if state.package_inputs.model_rprofile {
-        crate::package_state::rprofile::scan_workspace_rprofile(&root)
+        precomputed_rprofile_scan
+            .unwrap_or_else(|| crate::package_state::rprofile::scan_workspace_rprofile(&root))
     } else {
         crate::package_state::rprofile::RprofileScan::default()
     };
@@ -2432,17 +2455,24 @@ impl LanguageServer for Backend {
                         // an in-flight `did_change`) for the duration of disk
                         // I/O. Files were already touched during the blocking
                         // scan above, so the read is typically a warm cache hit.
-                        let (desc_text, ns_text) = if let Some(ref root) = root_for_pkg_inputs {
-                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
-                                .ok()
-                                .map(|t| std::sync::Arc::from(t.as_str()));
-                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
-                                .ok()
-                                .map(|t| std::sync::Arc::from(t.as_str()));
-                            (desc, ns)
-                        } else {
-                            (None, None)
-                        };
+                        // Also precompute the `.Rprofile` prelude scan here,
+                        // OFF the write lock — it follows transitive source()
+                        // chains and must not run under the lock (see
+                        // `initialize_package_inputs_from_state`).
+                        let (desc_text, ns_text, rprofile_scan) =
+                            if let Some(ref root) = root_for_pkg_inputs {
+                                let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                    .ok()
+                                    .map(|t| std::sync::Arc::from(t.as_str()));
+                                let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                    .ok()
+                                    .map(|t| std::sync::Arc::from(t.as_str()));
+                                let scan =
+                                    crate::package_state::rprofile::scan_workspace_rprofile(root);
+                                (desc, ns, Some(scan))
+                            } else {
+                                (None, None, None)
+                            };
 
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
@@ -2462,6 +2492,7 @@ impl LanguageServer for Backend {
                                     desc_text,
                                     ns_text,
                                     Default::default(),
+                                    rprofile_scan,
                                 );
                             } else {
                                 state.apply_package_event(
@@ -2563,10 +2594,20 @@ impl LanguageServer for Backend {
                             .ok()
                             .map(|s| Arc::from(s.as_str()));
                         let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
-                        (desc, ns, disk_r_files)
+                        // Precompute the `.Rprofile` prelude scan OFF the write
+                        // lock (it follows transitive source(); see
+                        // `initialize_package_inputs_from_state`).
+                        let rprofile_scan =
+                            crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                        (desc, ns, disk_r_files, rprofile_scan)
                     })
                     .await
-                    .unwrap_or((None, None, Default::default())),
+                    .unwrap_or((
+                        None,
+                        None,
+                        Default::default(),
+                        Default::default(),
+                    )),
                 ))
             } else {
                 None
@@ -2577,13 +2618,14 @@ impl LanguageServer for Backend {
             // with a derived state.
             let mut state = self.state.write().await;
             state.workspace_scan_complete = true;
-            if let Some((root, (desc_text, ns_text, disk_r_files))) = package_seed {
+            if let Some((root, (desc_text, ns_text, disk_r_files, rprofile_scan))) = package_seed {
                 initialize_package_inputs_from_state(
                     &mut state,
                     root,
                     desc_text,
                     ns_text,
                     disk_r_files,
+                    Some(rprofile_scan),
                 );
             }
         }
@@ -3927,6 +3969,14 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         let changes = params.content_changes;
 
+        // When the edited document is the workspace-root `.Rprofile`, capture
+        // its (post-change) in-memory text so we can refresh the prelude from
+        // the live buffer AFTER releasing the lock (see
+        // `refresh_rprofile_prelude_from_buffer`). `.Rprofile` is a live R
+        // document, but its prelude is package-state rather than a graph edge,
+        // so the normal dependent fanout below does not cover it.
+        let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+
         // Compute affected files and debounce config while holding write lock
         let (
             work_items,
@@ -3959,6 +4009,18 @@ impl LanguageServer for Backend {
             }
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
+
+            // Snapshot the post-change buffer text if this is the workspace-root
+            // `.Rprofile`, for the off-lock prelude refresh after this block.
+            if let Some(root) = state.package_inputs.workspace_root.clone()
+                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
+                && let Some(text) = state
+                    .documents
+                    .get(&uri)
+                    .map(|d| Arc::<str>::from(d.text()))
+            {
+                rprofile_live_edit = Some((root, text));
+            }
 
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
@@ -4303,6 +4365,12 @@ impl LanguageServer for Backend {
             )
         };
 
+        // Live `.Rprofile` edit: refresh the prelude from the in-memory buffer
+        // (off-lock scan + apply + fanout) so open scripts/ update as you type.
+        if let Some((root, text)) = rprofile_live_edit {
+            self.refresh_rprofile_prelude_from_buffer(root, text).await;
+        }
+
         // Background prefetch package exports (without holding WorldState lock)
         // After prefetch completes, schedule diagnostic revalidation so newly
         // cached exports clear false-positive "undefined variable" diagnostics.
@@ -4475,6 +4543,11 @@ impl LanguageServer for Backend {
             close_text
         };
 
+        // If the closed document is the workspace-root `.Rprofile`, its prelude
+        // must be re-scanned from disk after this block: closing discards any
+        // unsaved buffer edits the live did_change refresh folded in.
+        let mut rprofile_close_root: Option<std::path::PathBuf> = None;
+
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
 
@@ -4517,6 +4590,17 @@ impl LanguageServer for Backend {
                 }
             }
 
+            // Workspace-root `.Rprofile` is not a `package_close_path` (it is
+            // neither an R-source path nor a manifest), so the close above does
+            // not touch the prelude. Schedule a disk re-scan after the lock to
+            // revert any unsaved buffer edits (off-lock; the scan follows
+            // transitive source()).
+            if let Some(root) = state.package_inputs.workspace_root.clone()
+                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
+            {
+                rprofile_close_root = Some(root);
+            }
+
             // Detect package-mode visibility changes triggered by the close.
             // When an unsaved buffer with buffer-only symbols (e.g. a freshly
             // added function) closes, those symbols leave `r_internal_symbols`
@@ -4555,6 +4639,11 @@ impl LanguageServer for Backend {
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (sibling_fanout, debounce_ms)
         };
+
+        // Revert the prelude to on-disk `.Rprofile` after a close (off-lock).
+        if let Some(root) = rprofile_close_root {
+            self.refresh_rprofile_prelude_from_disk(root).await;
+        }
 
         // Schedule revalidation for affected open siblings outside the write
         // lock. The debounce window collapses bursts (e.g. "close all" closing
@@ -5026,40 +5115,84 @@ impl LanguageServer for Backend {
         // For each changed manifest file, read content outside the lock then
         // translate into package input mutations and re-derive state.
         if !pkg_manifest_changes.is_empty() {
-            let mut manifest_contents: Vec<(Url, Option<std::sync::Arc<str>>, bool)> = Vec::new();
+            // Snapshot the root + modeling flag so the `.Rprofile` prelude scan
+            // can run OFF-lock below (it follows transitive source(); the
+            // locking-discipline invariant forbids that scan under the write
+            // lock — see `initialize_package_inputs_from_state`).
+            let (ws_root, model_rprofile) = {
+                let state = self.state.read().await;
+                (
+                    state.package_inputs.workspace_root.clone(),
+                    state.package_inputs.model_rprofile,
+                )
+            };
+            let rprofile_path = ws_root.as_ref().map(|r| r.join(".Rprofile"));
+
+            // DESCRIPTION/NAMESPACE carry on-disk text for `translate`; the
+            // `.Rprofile` payload is a prelude scan precomputed off-lock (None
+            // when deleted or modeling disabled — both clear the prelude).
+            enum ManifestPayload {
+                Text(Option<std::sync::Arc<str>>),
+                Rprofile(Option<crate::package_state::rprofile::RprofileScan>),
+            }
+
+            let mut manifest_contents: Vec<(Url, ManifestPayload, bool)> = Vec::new();
             for (uri, deleted) in &pkg_manifest_changes {
-                let on_disk_text = if *deleted {
-                    None
-                } else {
-                    let path = uri.to_file_path().ok();
-                    if let Some(path) = path {
-                        let path_clone = path.clone();
+                let is_rprofile = uri.to_file_path().ok().as_deref() == rprofile_path.as_deref();
+                let payload = if is_rprofile {
+                    let scan = if *deleted || !model_rprofile {
+                        None
+                    } else if let Some(root) = ws_root.clone() {
                         tokio::task::spawn_blocking(move || {
-                            std::fs::read_to_string(path_clone)
-                                .ok()
-                                .map(|s| std::sync::Arc::from(s.as_str()))
+                            crate::package_state::rprofile::scan_workspace_rprofile(&root)
                         })
                         .await
-                        .unwrap_or(None)
+                        .ok()
                     } else {
                         None
-                    }
+                    };
+                    ManifestPayload::Rprofile(scan)
+                } else if *deleted {
+                    ManifestPayload::Text(None)
+                } else if let Ok(path) = uri.to_file_path() {
+                    let on_disk_text = tokio::task::spawn_blocking(move || {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .map(|s| std::sync::Arc::from(s.as_str()))
+                    })
+                    .await
+                    .unwrap_or(None);
+                    ManifestPayload::Text(on_disk_text)
+                } else {
+                    ManifestPayload::Text(None)
                 };
-                manifest_contents.push((uri.clone(), on_disk_text, *deleted));
+                manifest_contents.push((uri.clone(), payload, *deleted));
             }
 
             // Apply manifest events under write lock
             let mut state = self.state.write().await;
             let mut deltas = Vec::new();
-            for (uri, on_disk_text, deleted) in manifest_contents {
-                let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri,
-                    on_disk_text,
-                    deleted,
+            for (uri, payload, deleted) in manifest_contents {
+                let delta = match payload {
+                    ManifestPayload::Text(on_disk_text) => {
+                        let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                            uri,
+                            on_disk_text,
+                            deleted,
+                        };
+                        crate::package_state::event::translate(&mut state.package_inputs, event)
+                    }
+                    // Apply the off-lock prelude scan via the lock-safe seam.
+                    // `None` (delete/disabled) clears; the deletion delta is
+                    // still emitted when enabled so the script fanout fires.
+                    ManifestPayload::Rprofile(scan) => {
+                        crate::package_state::event::apply_rprofile_scan(
+                            &mut state.package_inputs,
+                            scan,
+                        )
+                    }
                 };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
+                if let Some(delta) = delta {
                     deltas.push(delta);
                 }
             }
@@ -5344,6 +5477,8 @@ impl LanguageServer for Backend {
                     // files (e.g. `git checkout` on a topic branch) would
                     // leave their RFileFacts stale in `package_state`.
                     let root_for_check = state.package_inputs.workspace_root.clone();
+                    let model_rprofile = state.package_inputs.model_rprofile;
+                    let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
                     let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
                         uris_to_update.iter().any(|u| {
                             u.to_file_path().ok().is_some_and(|p| {
@@ -5353,6 +5488,15 @@ impl LanguageServer for Backend {
                                     // also have dedicated translate() handlers
                                     // (dataset_names / sysdata_names rescans).
                                     || is_package_data_path(&p, root)
+                                    // A helper that `.Rprofile` transitively
+                                    // source()s can live outside the package's
+                                    // tracked R dirs (e.g. scripts/, inst/).
+                                    // Editing it isn't an RFileChanged, but it
+                                    // must still reach translate() so the prelude
+                                    // is re-scanned and its symbols/packages reach
+                                    // open `scripts/` files (Task 12).
+                                    || (model_rprofile
+                                        && path_in_rprofile_sourced_set(&p, rprofile_sourced))
                             })
                         })
                     });
@@ -6346,18 +6490,24 @@ impl Backend {
         // did_open/did_change/scan events). Then derive package state.
         if let Some(root) = pkg_mode_io_needed {
             let root_clone = root.clone();
-            let (desc_text, ns_text, disk_r_files) = tokio::task::spawn_blocking(move || {
-                let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                    .ok()
-                    .map(|s| std::sync::Arc::from(s.as_str()));
-                let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
-                (desc, ns, disk_r_files)
-            })
-            .await
-            .unwrap_or((None, None, Default::default()));
+            let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+                tokio::task::spawn_blocking(move || {
+                    let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                        .ok()
+                        .map(|s| std::sync::Arc::from(s.as_str()));
+                    let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                        .ok()
+                        .map(|s| std::sync::Arc::from(s.as_str()));
+                    let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                    // Precompute the `.Rprofile` prelude scan OFF the write lock
+                    // (it follows transitive source(); see
+                    // `initialize_package_inputs_from_state`).
+                    let rprofile_scan =
+                        crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                    (desc, ns, disk_r_files, rprofile_scan)
+                })
+                .await
+                .unwrap_or((None, None, Default::default(), Default::default()));
 
             // Re-acquire write lock to apply results. Route through the same
             // seeding helper the startup paths use, so config-reload and startup
@@ -6375,6 +6525,7 @@ impl Backend {
                 desc_text,
                 ns_text,
                 disk_r_files,
+                Some(rprofile_scan),
             );
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
@@ -7188,6 +7339,102 @@ impl Backend {
     async fn publish_diagnostics(&self, uri: &Url) {
         publish_diagnostics_inner(&self.state, &self.client, uri).await;
         self.check_and_warn_traversal_truncation().await;
+    }
+
+    /// Live `.Rprofile` prelude refresh from the in-memory buffer
+    /// (`did_change`). `.Rprofile` is a live R document, but the prelude it
+    /// feeds into open `scripts/` and other non-namespace workspace R files is
+    /// package-state, not a cross-file graph edge — so an unsaved `.Rprofile`
+    /// edit is not picked up by the normal dependent fanout. Scans the prelude
+    /// from the buffer `text` OFF the write lock (the scan follows transitive
+    /// `source()` from disk), then applies + fans out. Mirrors the watched-file
+    /// (`did_change_watched_files`) `.Rprofile` fanout, but sourced from the
+    /// buffer instead of disk so the prelude tracks edits as you type.
+    async fn refresh_rprofile_prelude_from_buffer(&self, root: std::path::PathBuf, text: Arc<str>) {
+        let root_for_scan = root.clone();
+        let Ok(scan) = tokio::task::spawn_blocking(move || {
+            crate::package_state::rprofile::scan_workspace_rprofile_with_root_text(
+                &root_for_scan,
+                &text,
+            )
+        })
+        .await
+        else {
+            return;
+        };
+        self.apply_rprofile_prelude_rescan(scan).await;
+    }
+
+    /// Revert the `.Rprofile` prelude to the on-disk content (`did_close`). When
+    /// an open `.Rprofile` is closed WITHOUT saving, the live buffer edits that
+    /// `refresh_rprofile_prelude_from_buffer` folded into the prelude must be
+    /// discarded — the disk file is authoritative again. Re-scans from disk
+    /// OFF-lock and applies + fans out, mirroring how `did_close` reverts open
+    /// package R files from buffer to disk.
+    async fn refresh_rprofile_prelude_from_disk(&self, root: std::path::PathBuf) {
+        let root_for_scan = root.clone();
+        let Ok(scan) = tokio::task::spawn_blocking(move || {
+            crate::package_state::rprofile::scan_workspace_rprofile(&root_for_scan)
+        })
+        .await
+        else {
+            return;
+        };
+        self.apply_rprofile_prelude_rescan(scan).await;
+    }
+
+    /// Shared tail of the live `.Rprofile` refresh: apply the already-scanned
+    /// (off-lock) prelude under the write lock via the lock-safe seam
+    /// ([`apply_rprofile_scan`]), then republish every open workspace R file
+    /// that consumes the prelude.
+    ///
+    /// [`apply_rprofile_scan`]: crate::package_state::event::apply_rprofile_scan
+    async fn apply_rprofile_prelude_rescan(
+        &self,
+        scan: crate::package_state::rprofile::RprofileScan,
+    ) {
+        let affected: Vec<Url> = {
+            let mut state = self.state.write().await;
+            // Pure in-memory apply — safe under the lock. `None` means modeling
+            // is disabled and nothing was cleared, so there's no re-derive or
+            // fanout to do.
+            let Some(delta) = crate::package_state::event::apply_rprofile_scan(
+                &mut state.package_inputs,
+                Some(scan),
+            ) else {
+                return;
+            };
+            state.apply_package_event(&delta);
+            // Fan out to every open workspace R file that consumes the prelude
+            // (scripts/, data-raw/, non-package R/, …). `.Rprofile` itself has
+            // no `.R` extension, so `is_package_workspace_r_file` excludes it,
+            // and the edited buffer's own diagnostics are republished by the
+            // normal did_change/did_close flow.
+            let Some(ws_root) = state.package_inputs.workspace_root.clone() else {
+                return;
+            };
+            let affected: Vec<Url> = state
+                .documents
+                .keys()
+                .filter(|u| {
+                    u.to_file_path().ok().is_some_and(|p| {
+                        crate::package_state::is_package_workspace_r_file(&p, &ws_root)
+                    })
+                })
+                .cloned()
+                .collect();
+            // Same-version republish requires force-marking (diagnostics publish
+            // monotonically by version; this is the documented force-republish
+            // escape hatch).
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter());
+            affected
+        };
+
+        for u in affected {
+            self.publish_diagnostics(&u).await;
+        }
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -8561,7 +8808,7 @@ mod tests {
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
             initialize_package_inputs_from_state, is_package_data_path,
-            is_package_relevant_open_uri, is_package_source_dir,
+            is_package_relevant_open_uri, is_package_source_dir, path_in_rprofile_sourced_set,
         };
         use crate::state::{Document, WorldState};
         use std::path::PathBuf;
@@ -8762,6 +9009,7 @@ mod tests {
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
             );
 
             assert_eq!(state.package_inputs.workspace_root.as_deref(), Some(root));
@@ -8795,12 +9043,15 @@ mod tests {
             let mut state = WorldState::new();
             // model_rprofile defaults true in CrossFileConfig.
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            // `None` → the helper scans `.Rprofile` inline (the non-contended
+            // path); this asserts that inline scan still harvests the prelude.
             initialize_package_inputs_from_state(
                 &mut state,
                 root.to_path_buf(),
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
             );
 
             assert!(state.package_inputs.model_rprofile);
@@ -8823,16 +9074,21 @@ mod tests {
             std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
             let mut state = WorldState::new();
             state.cross_file_config.model_rprofile = false;
+            // Pass a non-empty precomputed scan: when modeling is disabled the
+            // prelude must be cleared regardless of what the caller supplies.
+            let mut precomputed = crate::package_state::rprofile::RprofileScan::default();
+            precomputed.symbols.insert("my_helper".to_string());
             initialize_package_inputs_from_state(
                 &mut state,
                 root.to_path_buf(),
                 None,
                 None,
                 Default::default(),
+                Some(precomputed),
             );
             assert!(
                 state.package_inputs.rprofile_symbols.is_empty(),
-                "disabled → no scan"
+                "disabled → prelude cleared even when a scan is passed"
             );
         }
 
@@ -8887,6 +9143,38 @@ mod tests {
                     && is_package_data_path(&data_path, &root),
                 "data-raw/*.R is reached only via the data-path branch"
             );
+        }
+
+        #[test]
+        fn rprofile_sourced_set_membership_is_canonical_aware() {
+            use std::collections::BTreeSet;
+            // The watched-files gate routes a `.Rprofile` sourced helper into
+            // translate() even when it lives outside the tracked R dirs. The set
+            // stores canonical paths; a watcher path that already matches must
+            // hit directly. Use a real tempdir so canonicalize() succeeds.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let helper = tmp.path().join("scripts").join("setup.R");
+            std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            std::fs::write(&helper, "x <- 1\n").unwrap();
+            let canonical = helper.canonicalize().unwrap();
+
+            let mut sourced: BTreeSet<PathBuf> = BTreeSet::new();
+            sourced.insert(canonical.clone());
+
+            // Canonical path is a member.
+            assert!(path_in_rprofile_sourced_set(&canonical, &sourced));
+            // A non-canonical sibling path (`scripts/../scripts/setup.R`)
+            // resolves via the canonicalize fallback.
+            let non_canonical = tmp
+                .path()
+                .join("scripts")
+                .join("..")
+                .join("scripts")
+                .join("setup.R");
+            assert!(path_in_rprofile_sourced_set(&non_canonical, &sourced));
+            // An unrelated file is not a member.
+            let other = tmp.path().join("scripts").join("other.R");
+            assert!(!path_in_rprofile_sourced_set(&other, &sourced));
         }
 
         #[test]
@@ -12043,6 +12331,132 @@ mod project_config_initialize_tests {
             .await;
 
         assert_eq!(backend.state.read().await.lint_config.line_length, 140);
+    }
+
+    /// `.Rprofile` is a live R document: editing it in an open buffer must
+    /// refresh the prelude AS YOU TYPE (not only on save), and closing it
+    /// WITHOUT saving must revert the prelude to the on-disk content. Uses
+    /// `crossFile.indexWorkspace = false` so initialize seeds package inputs
+    /// synchronously (no racy background scan task).
+    #[tokio::test]
+    async fn live_rprofile_buffer_edit_and_close_refresh_prelude() {
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+            TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+            VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        // Disk `.Rprofile` defines helper_a; the disk file is never changed.
+        fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        let root = Url::from_file_path(&root_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                // `indexWorkspace: false` prevents a background workspace-scan
+                // task that would otherwise race this test's prelude assertions.
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Seed the package inputs the live refresh depends on, then establish
+        // the baseline prelude from the disk `.Rprofile` (helper_a). (initialize
+        // seeds package inputs via its background scan in real use; here we set
+        // them directly so the test isolates the live-refresh behavior.)
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(root_path.clone());
+            state.package_inputs.model_rprofile = true;
+            let scan = crate::package_state::rprofile::scan_workspace_rprofile(&root_path);
+            state.package_inputs.rprofile_symbols = scan.symbols;
+            state.package_inputs.rprofile_attached_packages = scan.attached_packages;
+            state.package_inputs.rprofile_sourced_files = scan.sourced_files;
+        }
+
+        // Sanity: baseline prelude reflects the disk `.Rprofile`.
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("helper_a"),
+                "baseline prelude must harvest the disk .Rprofile: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+        }
+
+        let rprofile_uri = Url::from_file_path(root_path.join(".Rprofile")).unwrap();
+
+        // Open `.Rprofile` as a live R document (content == disk).
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: rprofile_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: "helper_a <- function() 1\n".into(),
+                },
+            })
+            .await;
+
+        // Edit the buffer (unsaved) to define helper_b instead of helper_a.
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: rprofile_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "helper_b <- function() 1\n".into(),
+                }],
+            })
+            .await;
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("helper_b"),
+                "live buffer edit must refresh the prelude: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+            assert!(
+                !state.package_inputs.rprofile_symbols.contains("helper_a"),
+                "stale buffer symbol must be dropped: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+        }
+
+        // Close without saving: the prelude must revert to the on-disk helper_a.
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: rprofile_uri },
+            })
+            .await;
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("helper_a"),
+                "close must revert the prelude to disk: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+            assert!(
+                !state.package_inputs.rprofile_symbols.contains("helper_b"),
+                "discarded buffer symbol must not linger: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+        }
     }
 
     /// A live reload of `raven.toml` must reapply `packages.enabled` —

@@ -86,6 +86,29 @@ test("VS Code package metadata registers mixed-case JAGS and Stan extensions", (
   expect(stan?.extensions).toEqual([".stan", ".Stan", ".STAN"]);
 });
 
+test("VS Code package metadata associates .Rprofile with the r language", () => {
+  // `.Rprofile` is R code with no `.R` extension, so VS Code only treats it as
+  // R (live text-sync + highlighting + diagnostics) if the `r` language claims
+  // it by filename. The server's live `.Rprofile` prelude refresh
+  // (refresh_rprofile_prelude_from_buffer) depends on the editor sending
+  // did_open/did_change/did_close for `.Rprofile` — which only happens when it
+  // matches the LSP documentSelector's `{ language: 'r' }`.
+  const packageJsonPath = path.join(
+    import.meta.dir,
+    "..",
+    "..",
+    "editors",
+    "vscode",
+    "package.json",
+  );
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  const r = (
+    pkg.contributes.languages as Array<{ id: string; filenames?: string[] }>
+  ).find((language) => language.id === "r");
+
+  expect(r?.filenames).toContain(".Rprofile");
+});
+
 test("VS Code package metadata activates on r/jags/stan via contributes.languages", () => {
   // VS Code >= 1.74 auto-generates onLanguage:* activation events from
   // contributes.languages, so Raven declares no explicit onLanguage entries
