@@ -746,8 +746,9 @@ pub struct PackageScopeContribution {
     /// set used for standard-eval export resolution — so a self-package verb
     /// with no known policy stays conservatively arg-suppressed rather than
     /// being newly checked. `None` when no package workspace is detected, and
-    /// `"unknown"` for a package-mode workspace whose DESCRIPTION omits
-    /// `Package:` (harmless — no policy is keyed on `"unknown"`).
+    /// `"unknown"` for an `Enabled`-mode workspace with no DESCRIPTION
+    /// `Package:` field (harmless — no policy is keyed on `"unknown"`). In
+    /// `Auto` mode a missing/empty `Package:` yields no workspace at all.
     pub package_name: Option<String>,
     pub r_internal_symbols: Arc<BTreeSet<String>>,
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
