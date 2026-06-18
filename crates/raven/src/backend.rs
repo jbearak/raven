@@ -1772,6 +1772,7 @@ pub(crate) fn initialize_package_inputs_from_state(
 ) {
     state.package_inputs.workspace_root = Some(root.clone());
     state.package_inputs.package_mode = state.cross_file_config.package_mode;
+    state.package_inputs.model_rprofile = state.cross_file_config.model_rprofile;
 
     state.package_inputs.description =
         desc_text.map(|text| crate::package_state::DescriptionInput { text });
@@ -1783,6 +1784,16 @@ pub(crate) fn initialize_package_inputs_from_state(
     state.package_inputs.dataset_names = crate::package_state::scan_own_package_data_dir(&root);
     state.package_inputs.sysdata_names =
         crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
+
+    let rprofile_scan = if state.package_inputs.model_rprofile {
+        crate::package_state::rprofile::scan_workspace_rprofile(&root)
+    } else {
+        crate::package_state::rprofile::RprofileScan::default()
+    };
+    state.package_inputs.rprofile_symbols = rprofile_scan.symbols;
+    state.package_inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
+    state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
+
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
     // Resolve system.file() sources in workspace index now that package state
@@ -8705,6 +8716,66 @@ mod tests {
                     .r_internal_symbols
                     .contains("helper"),
                 "initial package input seeding must derive package state"
+            );
+        }
+
+        #[tokio::test]
+        async fn initialize_package_inputs_scans_rprofile() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("R")).unwrap();
+            std::fs::write(
+                root.join("R").join("functions.r"),
+                "r_bind <- function() 1\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".Rprofile"),
+                "source(\"R/functions.r\")\nmy_helper <- function() 1\n",
+            )
+            .unwrap();
+
+            let mut state = WorldState::new();
+            // model_rprofile defaults true in CrossFileConfig.
+            let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            initialize_package_inputs_from_state(
+                &mut state,
+                root.to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+            );
+
+            assert!(state.package_inputs.model_rprofile);
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("my_helper"),
+                "got {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("r_bind"),
+                "got {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+        }
+
+        #[tokio::test]
+        async fn initialize_package_inputs_skips_rprofile_when_disabled() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
+            let mut state = WorldState::new();
+            state.cross_file_config.model_rprofile = false;
+            initialize_package_inputs_from_state(
+                &mut state,
+                root.to_path_buf(),
+                None,
+                None,
+                Default::default(),
+            );
+            assert!(
+                state.package_inputs.rprofile_symbols.is_empty(),
+                "disabled → no scan"
             );
         }
 
