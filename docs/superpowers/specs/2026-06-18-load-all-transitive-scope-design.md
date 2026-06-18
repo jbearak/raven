@@ -249,11 +249,60 @@ in the consuming handlers.
 - **Hover** — *improves*. Today load_all internals sit in `scope.symbols` with
   `PACKAGE_INTERNAL_URI` and lose help text; via the package path they resolve
   through `find_package_owner_for_symbol` and render real help.
-- **Go-to-definition** — no regression. Today goto no-ops on `PACKAGE_INTERNAL_URI`
-  scope symbols (`handlers.rs` ~20448); package exports are likewise
-  non-navigable. (Optional future improvement: map the sentinel's symbols to their
-  real `R/` source URIs to make goto jump to source — out of scope here.)
+- **Go-to-definition** — *improves*, and is now in scope (see §7). Today goto
+  no-ops on `PACKAGE_INTERNAL_URI` scope symbols (`handlers.rs` ~20448); under the
+  pivot those symbols leave `scope.symbols`, so the reject gate no longer fires and
+  goto can resolve them to their real `R/` source via the workspace index.
 - **Find-references** — unaffected (textual, not scope-symbol based).
+
+### 7. Go-to-definition for `load_all()` internals → `R/` source
+
+Goto on an internal function exposed by `load_all()` (e.g. `my_func()` in a
+caller, callee, or the `load_all()` file itself) should navigate to its real
+definition in the package's `R/` source. This works **without adding any location
+data to `PackageScopeContribution`** — the package's `R/` files are already in the
+workspace index (`workspace_index_new`) with real `ScopedSymbol` locations (file
+URI + line + column, `scope.rs` ~587-608), and the goto handler already has a
+workspace-index fallback (`handlers.rs` ~20516).
+
+Design:
+
+- The contribution names the internal symbols (`r_internal_symbols`,
+  `onload_symbols`); the **workspace index supplies the location**. Keep that
+  separation — no `(file,line)` map on the contribution.
+- In the goto handler, when the cursor identifier `name` is in scope via the
+  load_all sentinel (resolved through the overlay) and `name ∈ r_internal_symbols
+  ∪ onload_symbols`, resolve its definition by querying the workspace index
+  **restricted to the package's source tree** (`<workspace_root>/R`, and the test
+  tree for test helpers) and return that `Location`. Restricting to the package
+  tree avoids navigating to an unrelated workspace file that happens to define the
+  same name.
+- If multiple `R/` files define the name (rare), return all locations (LSP allows
+  an array).
+- `sysdata_symbols` and `imported_symbols` have **no navigable workspace source**
+  (sysdata are data objects; imports come from *other* installed packages), so
+  goto on them no-ops — the same outcome as external-package symbols (§ future
+  work).
+- The existing `starts_with("package:")` reject gate (`handlers.rs` ~20448/~20505/
+  ~20530) is unaffected: under the pivot these internals are no longer
+  `scope.symbols` entries carrying a `package:` URI, so the gate simply does not
+  apply to them.
+
+Where practical, extend the existing workspace-index fallback rather than adding a
+parallel path; the only load_all-specific logic is the "is this a sentinel
+internal?" test and the package-tree restriction.
+
+### Future work: go-to-definition into external/installed packages
+
+Out of scope for this spec (per design decision). Navigating from a `library()`
+symbol (e.g. `dplyr::mutate`) into the package's `.R` source is **infeasible with
+current data**: installed packages in `.libPaths()` ship a compiled lazy-load
+database, not readable source; `PackageInfo` stores only export *names* and
+rendered help text — no source paths or line locations. Supporting it would
+require a separate subsystem: fetch/extract upstream sources (CRAN/Bioc/GitHub),
+parse and index them to symbol→location, invalidate on package upgrade, and budget
+disk for cached sources. Documented here as a future feature; the goto handler's
+behavior for installed-package symbols is unchanged (no-op) in the meantime.
 
 ## Testing
 
@@ -321,12 +370,28 @@ end-to-end, not just a single recompute.
 - **NSE call sites** resolve owners through the overlay without a contribution
   parameter (`NseAnalysis::build` signature unchanged).
 
+### D. Go-to-definition (§7)
+
+- Goto on `my_func()` in the **load_all caller**, in a **callee**, and in a
+  **caller** (all with the sentinel in scope) navigates to its `R/` definition
+  with the correct file URI + line.
+- Goto picks the `R/` definition, not an unrelated workspace file that defines the
+  same name (package-tree restriction).
+- Goto on a `sysdata`/imported symbol no-ops (no navigable workspace source).
+- Regression: goto on a normal `library()` symbol still no-ops (external-package
+  goto unchanged).
+- Goto still works for R/-defined symbols referenced within `R/` itself
+  (dev-context path unaffected).
+
 ## Docs to update
 
 - `docs/cross-file.md` — `load_all()` modeled as a virtual attached package;
   propagation parallel to `library()`.
-- `docs/r-package-dev.md` — transitive `load_all()` behavior and R/-change
-  diagnostics refresh.
+- `docs/r-package-dev.md` — transitive `load_all()` behavior, R/-change
+  diagnostics refresh, and go-to-definition into `R/` source for load_all
+  internals.
+- `docs/go-to-definition.md` — goto for `load_all()`-exposed internals; note the
+  external/installed-package case is not yet supported.
 - `docs/rprofile.md` — `.Rprofile` `load_all()` behavior and package-mode
   withholding.
 
@@ -347,3 +412,7 @@ end-to-end, not just a single recompute.
 - The dev-context internals path stays independent of the `load_all()` sentinel
   path; removing the `dev_load_all` branch from `append_package_contribution` must
   not alter dev-context behavior.
+- Go-to-definition for load_all internals derives locations from the **workspace
+  index**, not from `PackageScopeContribution` (which stays location-free). Goto
+  must restrict resolution to the package's source tree so a same-named symbol in
+  an unrelated workspace file is not chosen.
