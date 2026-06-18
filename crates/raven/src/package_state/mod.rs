@@ -274,6 +274,39 @@ pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     matches!(first, "demo" | "data-raw" | "vignettes" | "man")
 }
 
+/// True when `path` is an R file under the package's built/checked doc dirs
+/// (`vignettes/`, `man/`, `demo/`) — rebuilt by `R CMD build` / run by
+/// `R CMD check` with the user profile suppressed. Used (in package mode only)
+/// to withhold the `.Rprofile` prelude. DELIBERATELY NARROWER than
+/// [`is_dev_context_path`]: `data-raw/` is dev-only, `.Rbuildignore`d, and run
+/// interactively from the root, so the prelude APPLIES there.
+pub fn is_built_doc_dir_path(path: &Path, workspace_root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(workspace_root) else {
+        return false;
+    };
+    let is_r_extension = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
+    );
+    if !is_r_extension {
+        return false;
+    }
+    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    matches!(first, "vignettes" | "man" | "demo")
+}
+
+/// In package mode, the `.Rprofile` prelude is withheld from files whose
+/// canonical run context is a profile-suppressed `R CMD check` / `build`
+/// session: namespace `R/` (Source) and all test files (via
+/// [`is_r_source_path`]), plus built doc dirs (via [`is_built_doc_dir_path`]).
+/// Callers apply this ONLY when a package workspace is active — in script mode
+/// the prelude applies everywhere, including `R/`.
+pub fn rprofile_withheld_in_package_mode(path: &Path, workspace_root: &Path) -> bool {
+    is_r_source_path(path, workspace_root).is_some() || is_built_doc_dir_path(path, workspace_root)
+}
+
 /// Returns `true` when `path` is an R file anywhere under the workspace root
 /// that should see the package's own dataset symbols. This is broader than
 /// `is_r_source_path`: datasets are visible in R/, tests/, vignettes/, inst/,
@@ -714,6 +747,56 @@ mod path_tests {
         // Random dir
         assert!(!is_dev_context_path(
             Path::new("/work/pkg/src/code.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn built_doc_dir_path_matches_vignettes_man_demo_only() {
+        let root = Path::new("/work/pkg");
+        assert!(is_built_doc_dir_path(
+            Path::new("/work/pkg/vignettes/v.R"),
+            root
+        ));
+        assert!(is_built_doc_dir_path(Path::new("/work/pkg/man/ex.R"), root));
+        assert!(is_built_doc_dir_path(Path::new("/work/pkg/demo/d.R"), root));
+        // data-raw is APPLIED to (not a built doc dir) — narrower than is_dev_context_path.
+        assert!(!is_built_doc_dir_path(
+            Path::new("/work/pkg/data-raw/prep.R"),
+            root
+        ));
+        assert!(!is_built_doc_dir_path(
+            Path::new("/work/pkg/scripts/a.R"),
+            root
+        ));
+    }
+
+    #[test]
+    fn rprofile_withheld_covers_namespace_tests_built_dirs() {
+        let root = Path::new("/work/pkg");
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/R/f.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/tests/testthat/test-x.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/tests/foo.R"),
+            root
+        ));
+        assert!(rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/vignettes/v.R"),
+            root
+        ));
+        // applied-to dirs are NOT withheld
+        assert!(!rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/scripts/a.R"),
+            root
+        ));
+        assert!(!rprofile_withheld_in_package_mode(
+            Path::new("/work/pkg/data-raw/prep.R"),
             root
         ));
     }
