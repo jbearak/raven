@@ -1446,29 +1446,32 @@ where
             })
             .or_else(|| super::path_resolve::PathContext::new(child_uri, workspace_root))
     } else {
-        let child_path = child_uri.to_file_path().ok();
-        child_path.as_ref().and_then(|cp| {
-            let ctx = parent_ctx?;
-            // Child has its own metadata: use it, but inherit a working dir if it
-            // declares none. Otherwise build the context from the parent's, per chdir.
-            if let Some(cm) = get_metadata(child_uri) {
-                let mut child_ctx = super::path_resolve::PathContext::from_metadata(
-                    child_uri,
-                    &cm,
-                    workspace_root,
-                )?;
-                if child_ctx.working_directory.is_none() {
-                    child_ctx.inherited_working_directory = if chdir {
-                        Some(cp.parent()?.to_path_buf())
-                    } else {
-                        Some(ctx.effective_working_directory())
-                    };
-                }
-                Some(child_ctx)
-            } else {
-                Some(ctx.child_context_for_source(cp, chdir))
+        let ctx = parent_ctx?;
+        // Start from the child's own context: its metadata when indexed, else a
+        // bare context rooted at its own directory. Both constructors parse the
+        // child URI's path (and return None if it isn't a file path), so reuse the
+        // parsed `child_ctx.file_path` below instead of parsing the URI again.
+        let mut child_ctx = match get_metadata(child_uri) {
+            Some(cm) => {
+                super::path_resolve::PathContext::from_metadata(child_uri, &cm, workspace_root)?
             }
-        })
+            None => super::path_resolve::PathContext::new(child_uri, workspace_root)?,
+        };
+        // Decide the inherited working directory via the shared seam that the
+        // on-demand index walk (`index_forward_chain`) also uses, so the live scope
+        // path and the dependency-graph edge cannot drift: a working directory
+        // propagates only under `chdir` or a `# raven: cd` in effect; with no cd the
+        // child resolves via its own directory + workspace-root fallback (matching
+        // `build_dependency_graph_from_workspace`). This branch is the residual seam
+        // consulted when no resolved graph edge is available. Apply the in-effect WD
+        // only when one propagates and the child declares no own `# raven: cd`;
+        // otherwise the child keeps its own context (its own cd, its own
+        // backward-directive-inherited WD, or none → own dir + fallback).
+        let inherited = ctx.forward_child_inherited_wd(&child_ctx.file_path, chdir);
+        if child_ctx.working_directory.is_none() && inherited.is_some() {
+            child_ctx.inherited_working_directory = inherited;
+        }
+        Some(child_ctx)
     }
 }
 /// Finds the innermost function-scope interval that contains the given position.
@@ -6213,11 +6216,19 @@ where
                         })
                         .map(|edge| edge.to.clone())
                         .or_else(|| {
-                            // Fallback: use pre-resolved URI or resolve path directly
+                            // Fallback: use pre-resolved URI or resolve path
+                            // directly. Forward source()/directive paths use the
+                            // workspace-root fallback variant so this last-resort
+                            // seam honors the same fallback invariant as the graph
+                            // edge it stands in for (CLAUDE.md: the fallback must
+                            // hold uniformly across scope resolution).
                             source.resolved_uri.clone().or_else(|| {
                                 path_ctx.as_ref().and_then(|ctx| {
                                     let resolved =
-                                        super::path_resolve::resolve_path(&source.path, ctx)?;
+                                        super::path_resolve::resolve_path_with_workspace_fallback(
+                                            &source.path,
+                                            ctx,
+                                        )?;
                                     super::path_resolve::path_to_uri(&resolved)
                                 })
                             })
@@ -8360,7 +8371,13 @@ where
             .or_else(|| {
                 source.resolved_uri.clone().or_else(|| {
                     self.path_ctx.as_ref().and_then(|ctx| {
-                        let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
+                        // Forward source()/directive paths use the workspace-root
+                        // fallback variant so this last-resort seam honors the same
+                        // fallback invariant as the graph edge it stands in for.
+                        let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
+                            &source.path,
+                            ctx,
+                        )?;
                         super::path_resolve::path_to_uri(&resolved)
                     })
                 })

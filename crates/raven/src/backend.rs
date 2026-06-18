@@ -6789,7 +6789,6 @@ impl Backend {
             ) else {
                 continue;
             };
-            let parent_effective_wd = forward_ctx.effective_working_directory();
 
             for source in &meta.sources {
                 if let Some(resolved) =
@@ -6803,29 +6802,67 @@ impl Backend {
                         source.path,
                         resolved.display()
                     );
-                    if let Ok(child_uri) = Url::from_file_path(resolved) {
-                        let inherited_wd = if source.chdir {
-                            child_uri
-                                .to_file_path()
-                                .ok()
-                                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                                .unwrap_or_else(|| parent_effective_wd.clone())
-                        } else {
-                            parent_effective_wd.clone()
-                        };
+                    // `resolved` is the child's filesystem path; borrow it for both
+                    // the child URI and the inherited-WD decision (no round-trip).
+                    if let Ok(child_uri) = Url::from_file_path(&resolved) {
+                        // Propagate a working directory to the child only when one
+                        // is in effect (`chdir`, or a `# raven: cd` on this file —
+                        // explicit or inherited). With no cd, leave it unset so the
+                        // child resolves its own source() paths relative to its own
+                        // directory WITH the workspace-root fallback — matching the
+                        // workspace scan (`build_dependency_graph_from_workspace`).
+                        // The decision lives in `forward_child_inherited_wd`, the
+                        // same seam scope resolution uses, so the on-demand edge
+                        // and the scope path cannot drift.
+                        let inherited_wd =
+                            forward_ctx.forward_child_inherited_wd(&resolved, source.chdir);
                         let should_index = {
                             let state = self.state.read().await;
-                            !state.documents.contains_key(&child_uri)
-                                && (!state.cross_file_workspace_index.contains(&child_uri)
-                                    || state
-                                        .get_enriched_metadata(&child_uri)
-                                        .and_then(|m| m.inherited_working_directory.clone())
-                                        .is_none())
+                            if state.documents.contains_key(&child_uri) {
+                                false
+                            } else if !state.cross_file_workspace_index.contains(&child_uri) {
+                                // Not indexed yet → index it. (Same "indexed?"
+                                // predicate the pop-time `needs_indexing` check uses.)
+                                true
+                            } else {
+                                // Already indexed. A child that declares its own
+                                // `# raven: cd` keeps its own working directory
+                                // regardless of the caller, so no inherited WD is ever
+                                // stored for it (see `index_file_on_demand_with_inherited_wd`)
+                                // — never re-index it for WD reasons. Otherwise re-index
+                                // only when the WD now in effect differs from the stored
+                                // one: converges a plain (no-cd) child to the scan's
+                                // no-WD baseline, and lets a later no-cd path clear a
+                                // stale WD left by an earlier cd path to a shared child
+                                // (and vice versa), instead of keying on mere WD presence.
+                                match state.get_enriched_metadata(&child_uri) {
+                                    Some(child_meta) if child_meta.working_directory.is_some() => {
+                                        false
+                                    }
+                                    Some(child_meta) => {
+                                        child_meta
+                                            .inherited_working_directory
+                                            .as_deref()
+                                            .map(std::path::Path::new)
+                                            != inherited_wd.as_deref()
+                                    }
+                                    // Indexed but metadata unavailable (shouldn't
+                                    // happen) → re-index defensively.
+                                    None => true,
+                                }
+                            }
                         };
                         if should_index {
-                            let _ = self
-                                .index_file_on_demand_with_inherited_wd(&child_uri, &inherited_wd)
-                                .await;
+                            match inherited_wd {
+                                Some(ref wd) => {
+                                    let _ = self
+                                        .index_file_on_demand_with_inherited_wd(&child_uri, wd)
+                                        .await;
+                                }
+                                None => {
+                                    let _ = self.index_file_on_demand(&child_uri).await;
+                                }
+                            }
                         }
                         queue.push_back((child_uri, depth.saturating_add(1)));
                     }
@@ -10196,6 +10233,36 @@ mod refresh_packages_tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    /// Minimal stub `LanguageServer` and a no-R `Backend`, shared by the
+    /// submodules below that drive `Backend` methods directly. Fully qualified so
+    /// it needs no extra `use` imports at this module level.
+    struct StubServer;
+    #[tower_lsp::async_trait]
+    impl tower_lsp::LanguageServer for StubServer {
+        async fn initialize(
+            &self,
+            _: tower_lsp::lsp_types::InitializeParams,
+        ) -> tower_lsp::jsonrpc::Result<tower_lsp::lsp_types::InitializeResult> {
+            Ok(tower_lsp::lsp_types::InitializeResult::default())
+        }
+        async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_test_backend() -> Arc<Backend> {
+        let (client_tx, client_rx) = std::sync::mpsc::channel();
+        let (_service, _socket) = tower_lsp::LspService::new(|client| {
+            client_tx.send(client).expect("capture client");
+            StubServer
+        });
+        let client = client_rx.recv().expect("client captured");
+        Arc::new(Backend::new_with_request_cancellation(
+            client,
+            Arc::new(RequestCancellationRegistry::new()),
+        ))
+    }
+
     #[tokio::test]
     async fn refresh_clears_package_cache_and_returns_count() {
         use crate::package_library::{PackageInfo, PackageLibrary};
@@ -10991,45 +11058,238 @@ mod refresh_packages_tests {
     }
 
     // ============================================================================
+    // Regression: transitive (>=2-hop) forward source() resolution under the
+    // on-demand `did_open` indexing walk (`index_forward_chain`).
+    // ============================================================================
+    mod forward_chain_inherited_wd {
+        use super::make_test_backend;
+        use tower_lsp::lsp_types::Url;
+
+        /// A 2-hop forward `source()` chain where the consumer lives in a
+        /// DIFFERENT directory than the sourced files (`scripts/` → `R/`), so
+        /// each hop's path (`source("R/...")`) resolves only via the
+        /// workspace-root fallback.
+        ///
+        /// The on-demand `index_forward_chain` walk used to propagate the
+        /// consumer's effective working directory (`scripts/`) as the
+        /// *inherited* working directory of every non-`chdir` forward child,
+        /// even though no `# raven: cd` was in effect anywhere. That inherited
+        /// WD both (a) re-based the deep hop's `source("R/leaf.R")` under
+        /// `scripts/` and (b) suppressed the workspace-root fallback (see
+        /// `resolve_path_impl`), so the dependency edge for `R/mid.R` pointed at
+        /// the nonexistent `scripts/R/leaf.R` instead of the real `R/leaf.R`.
+        /// The workspace scan (`build_dependency_graph_from_workspace`) never
+        /// injects an inherited WD for non-directive sources, so it built the
+        /// correct edge — hence the LSP-vs-CLI divergence this guards.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn deep_forward_source_edge_uses_workspace_fallback_not_inherited_wd() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(
+                root.join("DESCRIPTION"),
+                "Package: probe\nTitle: T\nVersion: 0.1.0\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("scripts")).unwrap();
+            std::fs::create_dir_all(root.join("R")).unwrap();
+            std::fs::write(
+                root.join("scripts").join("use.R"),
+                "source(\"R/mid.R\")\nleaf_fn(1)\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("R").join("mid.R"), "source(\"R/leaf.R\")\n").unwrap();
+            std::fs::write(
+                root.join("R").join("leaf.R"),
+                "leaf_fn <- function(x) x + 1\n",
+            )
+            .unwrap();
+
+            let ws_uri = Url::from_file_path(root).unwrap();
+            let use_uri = Url::from_file_path(root.join("scripts").join("use.R")).unwrap();
+            let mid_uri = Url::from_file_path(root.join("R").join("mid.R")).unwrap();
+            let leaf_uri = Url::from_file_path(root.join("R").join("leaf.R")).unwrap();
+
+            let backend = make_test_backend();
+            backend.state.write().await.workspace_folders = vec![ws_uri.clone()];
+
+            // Drive the exact on-demand walk `did_open` runs for the consumer.
+            backend
+                .index_forward_chain(&use_uri, 10, Some(&ws_uri))
+                .await;
+
+            let state = backend.state.read().await;
+
+            // Hop 1: consumer -> mid (always worked; sanity check).
+            let use_deps: Vec<_> = state
+                .cross_file_graph
+                .get_dependencies(&use_uri)
+                .iter()
+                .map(|e| e.to.clone())
+                .collect();
+            assert!(
+                use_deps.contains(&mid_uri),
+                "consumer should source R/mid.R; got {use_deps:?}"
+            );
+
+            // Hop 2: mid -> leaf. This is the regression. The edge MUST point at
+            // the real R/leaf.R (resolved via the workspace-root fallback), not
+            // at the consumer-dir-rebased scripts/R/leaf.R.
+            let mid_deps: Vec<_> = state
+                .cross_file_graph
+                .get_dependencies(&mid_uri)
+                .iter()
+                .map(|e| e.to.clone())
+                .collect();
+            assert!(
+                !mid_deps.is_empty(),
+                "R/mid.R must have a resolved forward edge for source(\"R/leaf.R\")"
+            );
+            let to_path = mid_deps[0].to_file_path().unwrap();
+            assert!(
+                to_path.exists(),
+                "deep edge target must be a real file, got {to_path:?} (consumer dir leaked in?)"
+            );
+            assert_eq!(
+                mid_deps[0], leaf_uri,
+                "R/mid.R's source(\"R/leaf.R\") must resolve to {leaf_uri} via the \
+                 workspace-root fallback, not under the consumer's scripts/ dir; got {mid_deps:?}"
+            );
+        }
+
+        /// Guard the cd-in-effect branch the deep-source fix gates on: when a
+        /// `# raven: cd` IS active on the consumer, the on-demand walk MUST still
+        /// propagate the resolved working directory to its non-`chdir` children
+        /// (which also keeps the workspace-root fallback disabled under it), so a
+        /// transitive `# raven: cd` chain keeps resolving relative to the cd dir.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cd_in_effect_still_propagates_inherited_wd_to_children() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            // main.R changes wd to data/ then sources helper.R (resolved under
+            // data/ thanks to the cd; NOT via the workspace-root fallback).
+            std::fs::write(
+                root.join("main.R"),
+                "# raven: cd data\nsource(\"helper.R\")\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("data").join("helper.R"), "h <- function() 1\n").unwrap();
+
+            let ws_uri = Url::from_file_path(root).unwrap();
+            let main_uri = Url::from_file_path(root.join("main.R")).unwrap();
+            let helper_uri = Url::from_file_path(root.join("data").join("helper.R")).unwrap();
+
+            let backend = make_test_backend();
+            backend.state.write().await.workspace_folders = vec![ws_uri.clone()];
+            backend
+                .index_forward_chain(&main_uri, 10, Some(&ws_uri))
+                .await;
+
+            let state = backend.state.read().await;
+            let main_deps: Vec<_> = state
+                .cross_file_graph
+                .get_dependencies(&main_uri)
+                .iter()
+                .map(|e| e.to.clone())
+                .collect();
+            assert!(
+                main_deps.contains(&helper_uri),
+                "cd-resolved source must point at data/helper.R; got {main_deps:?}"
+            );
+            let helper_meta = state
+                .get_enriched_metadata(&helper_uri)
+                .expect("helper.R must be indexed by the walk");
+            assert_eq!(
+                helper_meta.inherited_working_directory.as_deref(),
+                Some(root.join("data").to_string_lossy().as_ref()),
+                "an in-effect `# raven: cd` must propagate as the child's inherited \
+                 working directory"
+            );
+        }
+
+        /// Exercise the `should_index` convergence arm: a child first indexed by a
+        /// no-cd consumer (stored inherited WD = None) must be RE-indexed when a
+        /// later `# raven: cd` consumer reaches the same file, so its stored
+        /// inherited WD reflects the cd now in effect. This is the "diamond"
+        /// shared-child case the value-based re-index check (`stored != computed`)
+        /// was written for — the prior `cd_in_effect_*` test only hits the
+        /// fresh-index (`!contains`) arm, never this one.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cd_walk_reindexes_shared_child_indexed_plain_first() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            // A no-cd consumer that sources the shared file by its workspace path.
+            std::fs::write(root.join("plain.R"), "source(\"data/shared.R\")\n").unwrap();
+            // A cd consumer whose `# raven: cd data` resolves source("shared.R")
+            // to the SAME data/shared.R file.
+            std::fs::write(
+                root.join("main.R"),
+                "# raven: cd data\nsource(\"shared.R\")\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("data").join("shared.R"), "s <- function() 1\n").unwrap();
+
+            let ws_uri = Url::from_file_path(root).unwrap();
+            let plain_uri = Url::from_file_path(root.join("plain.R")).unwrap();
+            let main_uri = Url::from_file_path(root.join("main.R")).unwrap();
+            let shared_uri = Url::from_file_path(root.join("data").join("shared.R")).unwrap();
+
+            let backend = make_test_backend();
+            backend.state.write().await.workspace_folders = vec![ws_uri.clone()];
+
+            // Pass 1 (no cd): shared.R is indexed fresh with NO inherited WD.
+            backend
+                .index_forward_chain(&plain_uri, 10, Some(&ws_uri))
+                .await;
+            {
+                let state = backend.state.read().await;
+                let shared_meta = state
+                    .get_enriched_metadata(&shared_uri)
+                    .expect("shared.R indexed by the plain (no-cd) walk");
+                assert_eq!(
+                    shared_meta.inherited_working_directory, None,
+                    "a no-cd consumer must index the shared child with no inherited WD"
+                );
+            }
+
+            // Pass 2 (cd in effect): shared.R is already indexed with a stale
+            // `None`, while the cd walk computes `Some(data/)`. This drives the
+            // `stored != computed` re-index arm, updating the stored WD.
+            backend
+                .index_forward_chain(&main_uri, 10, Some(&ws_uri))
+                .await;
+            {
+                let state = backend.state.read().await;
+                let shared_meta = state
+                    .get_enriched_metadata(&shared_uri)
+                    .expect("shared.R still indexed after the cd walk");
+                assert_eq!(
+                    shared_meta.inherited_working_directory.as_deref(),
+                    Some(root.join("data").to_string_lossy().as_ref()),
+                    "the cd walk must re-index the already-indexed shared child so its \
+                     stored inherited working directory reflects the cd now in effect"
+                );
+            }
+        }
+    }
+
+    // ============================================================================
     // Unit tests for raven.getHelpHtml execute_command handler.
     // ============================================================================
     mod get_help_html_command {
         use std::sync::Arc;
-        use std::sync::mpsc;
-        use tower_lsp::lsp_types::{ExecuteCommandParams, InitializeParams, InitializeResult};
-        use tower_lsp::{LanguageServer, LspService};
+        use tower_lsp::LanguageServer;
+        use tower_lsp::lsp_types::ExecuteCommandParams;
 
-        use super::super::{Backend, RequestCancellationRegistry};
+        use super::super::Backend;
+        use super::make_test_backend;
 
-        /// Minimal stub language server required by `LspService::new`.
-        struct StubServer;
-
-        #[tower_lsp::async_trait]
-        impl LanguageServer for StubServer {
-            async fn initialize(
-                &self,
-                _: InitializeParams,
-            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
-                Ok(InitializeResult::default())
-            }
-            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
-                Ok(())
-            }
-        }
-
-        /// Build a `Backend` whose `packages_r_path` is left as `None` (the default).
-        /// Returns an `Arc<Backend>` ready for direct `LanguageServer` method calls.
+        /// Build a `Backend` whose `packages_r_path` is left as `None` (the default,
+        /// shared with the other test submodules). Thin alias for the call sites
+        /// below that read better as "no R configured".
         fn make_backend_no_r() -> Arc<Backend> {
-            let (client_tx, client_rx) = mpsc::channel();
-            let (_service, _socket) = LspService::new(|client| {
-                client_tx.send(client).expect("capture client");
-                StubServer
-            });
-            let client = client_rx.recv().expect("client captured");
-            Arc::new(Backend::new_with_request_cancellation(
-                client,
-                Arc::new(RequestCancellationRegistry::new()),
-            ))
+            make_test_backend()
         }
 
         /// Build a `Backend` and set `packages_r_path` to the given path.
@@ -11240,42 +11500,11 @@ mod refresh_packages_tests {
     // ============================================================================
     mod package_enabled_gates {
         use std::sync::Arc;
-        use std::sync::mpsc;
-        use tower_lsp::lsp_types::{
-            DidChangeConfigurationParams, ExecuteCommandParams, InitializeParams, InitializeResult,
-        };
-        use tower_lsp::{LanguageServer, LspService};
+        use tower_lsp::LanguageServer;
+        use tower_lsp::lsp_types::{DidChangeConfigurationParams, ExecuteCommandParams};
 
-        use super::super::{Backend, RequestCancellationRegistry};
+        use super::make_test_backend;
         use crate::package_library::PackageLibrary;
-
-        struct StubServer;
-
-        #[tower_lsp::async_trait]
-        impl LanguageServer for StubServer {
-            async fn initialize(
-                &self,
-                _: InitializeParams,
-            ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
-                Ok(InitializeResult::default())
-            }
-            async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
-                Ok(())
-            }
-        }
-
-        fn make_backend() -> Arc<Backend> {
-            let (client_tx, client_rx) = mpsc::channel();
-            let (_service, _socket) = LspService::new(|client| {
-                client_tx.send(client).expect("capture client");
-                StubServer
-            });
-            let client = client_rx.recv().expect("client captured");
-            Arc::new(Backend::new_with_request_cancellation(
-                client,
-                Arc::new(RequestCancellationRegistry::new()),
-            ))
-        }
 
         /// Build a populated, ready library so a clobber is observable.
         fn ready_library(path: std::path::PathBuf) -> Arc<PackageLibrary> {
@@ -11290,7 +11519,7 @@ mod refresh_packages_tests {
         /// `rebuild_package_library` call still produces the disabled outcome.
         #[tokio::test]
         async fn settings_reload_disabled_yields_empty_not_ready() {
-            let backend = make_backend();
+            let backend = make_test_backend();
             {
                 let mut state = backend.state.write().await;
                 state.package_library = ready_library(std::path::PathBuf::from("/tmp/libs"));
@@ -11324,7 +11553,7 @@ mod refresh_packages_tests {
         /// libpath-watcher restart, republish) is skipped entirely.
         #[tokio::test]
         async fn refresh_packages_disabled_keeps_existing_library() {
-            let backend = make_backend();
+            let backend = make_test_backend();
             let original = ready_library(std::path::PathBuf::from("/tmp/libs"));
             // Seed a cache entry so a stray `clear_cache()` would be observable.
             original
