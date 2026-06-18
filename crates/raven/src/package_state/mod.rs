@@ -12,6 +12,7 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 pub mod event;
+pub mod rprofile;
 pub mod sysdata;
 
 #[cfg(test)]
