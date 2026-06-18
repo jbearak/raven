@@ -155,12 +155,70 @@ impl PathContext {
         }
     }
 
-    /// Create a child context for a sourced file, respecting chdir flag
+    /// Create a child context for a sourced file, respecting chdir flag.
+    ///
+    /// NOTE: these `child_context*` methods are unconditional WD-inheritance
+    /// primitives — `child_context` always pins the parent's effective directory.
+    /// They are NOT the forward-`source()` policy: a forward child inherits a WD
+    /// only when a cd is in effect. Decide propagation with
+    /// [`Self::forward_child_inherited_wd`]; reach for these primitives only once
+    /// that has said a WD applies (or for the explicit `chdir = TRUE` case).
     pub fn child_context_for_source(&self, child_path: &Path, chdir: bool) -> Self {
         if chdir {
             self.child_context_with_chdir(child_path)
         } else {
             self.child_context(child_path)
+        }
+    }
+
+    /// Whether a `# raven: cd` working directory is in effect for this context —
+    /// either declared explicitly on the file or inherited from an ancestor cd.
+    /// This is the precondition that keeps a directory pinned across a forward
+    /// `source()` hop and that disables the workspace-root fallback in
+    /// [`resolve_path_with_workspace_fallback`]; see [`Self::forward_child_inherited_wd`].
+    pub fn cd_in_effect(&self) -> bool {
+        self.working_directory.is_some() || self.inherited_working_directory.is_some()
+    }
+
+    /// The working directory a non-standalone forward `source()` child inherits
+    /// from this (caller) context, or `None` when none is in effect.
+    ///
+    /// - `chdir == true` → the child's own directory (R changes the working
+    ///   directory to the sourced file's directory).
+    /// - else a `# raven: cd` in effect here ([`Self::cd_in_effect`]) → this
+    ///   context's effective working directory.
+    /// - else → `None`, so the child resolves its own `source()` paths relative
+    ///   to its own directory WITH the workspace-root fallback — matching how
+    ///   the dependency-graph build (`build_dependency_graph_from_workspace`)
+    ///   resolves the same edge.
+    ///
+    /// This is the single source of truth for forward-source working-directory
+    /// propagation across the two LIVE-LSP consumers that thread a caller context
+    /// into a child: the on-demand index walk (`index_forward_chain`) and scope
+    /// resolution (`build_forward_child_path_context`). They share this method so
+    /// they cannot disagree. The dependency-graph build
+    /// (`build_dependency_graph_from_workspace` → `update_file`) does NOT call
+    /// this — it resolves each file from that file's own metadata with no caller
+    /// context, and stays consistent by a separate invariant: the workspace scan
+    /// only ever enriches *backward*-directive (`sourced_by`) files with an
+    /// inherited WD, never forward-source children, so a plain forward hop has no
+    /// baked-in WD there either. Keep that invariant if extending scan enrichment.
+    ///
+    /// Injecting the caller's plain directory for a non-cd hop would re-base a
+    /// deep hop and suppress the fallback (see `resolve_path_impl`'s gate, which
+    /// reuses [`Self::cd_in_effect`]) — the bug this rule prevents.
+    pub fn forward_child_inherited_wd(&self, child_path: &Path, chdir: bool) -> Option<PathBuf> {
+        if chdir {
+            Some(
+                child_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.effective_working_directory()),
+            )
+        } else if self.cd_in_effect() {
+            Some(self.effective_working_directory())
+        } else {
+            None
         }
     }
 }
@@ -265,18 +323,16 @@ fn resolve_path_impl(
             return Some(canonical);
         }
 
-        // File doesn't exist at the resolved path
-        // Try workspace-root fallback if:
-        // 1. Fallback is enabled (for source() statements)
-        // 2. No explicit `# raven: cd` directive (working_directory is None)
-        // 3. No inherited working directory
-        // 4. Workspace root is available
-        let has_explicit_wd = context.working_directory.is_some();
-        let has_inherited_wd = context.inherited_working_directory.is_some();
-
+        // File doesn't exist at the resolved path. Try the workspace-root
+        // fallback when it is enabled (forward source()/directives) AND no
+        // `# raven: cd` is in effect (explicit or inherited) AND a workspace root
+        // is available. `cd_in_effect` is the single definition of "a cd pins the
+        // working directory"; the callers that decide whether to PROPAGATE a
+        // working directory across a hop ([`PathContext::forward_child_inherited_wd`])
+        // use the same predicate, so a context that suppresses this fallback is
+        // exactly one that carried a cd forward.
         if try_workspace_fallback
-            && !has_explicit_wd
-            && !has_inherited_wd
+            && !context.cd_in_effect()
             && let Some(ref workspace_root) = context.workspace_root
         {
             let workspace_resolved = workspace_root.join(path);
