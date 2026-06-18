@@ -6759,17 +6759,11 @@ fn compute_contribution_symbol_names(
     // workspace_root but still gets the prelude). Mirrors `append_rprofile_prelude`'s
     // applicability gate. Attached packages contribute no symbol NAMES here
     // (their exports resolve via the package library), so only `rprofile_symbols`.
-    if let Some(rprofile_root) = contrib.rprofile_root.as_ref()
-        && let Ok(qpath) = queried_uri.to_file_path()
-        && qpath.strip_prefix(rprofile_root).is_ok()
+    if let Ok(qpath) = queried_uri.to_file_path()
+        && rprofile_prelude_applies(&qpath, contrib)
     {
-        let package_mode_active = contrib.workspace_root.is_some();
-        if !(package_mode_active
-            && crate::package_state::rprofile_withheld_in_package_mode(&qpath, rprofile_root))
-        {
-            for sym in contrib.rprofile_symbols.iter() {
-                out.insert(Arc::from(sym.as_str()));
-            }
+        for sym in contrib.rprofile_symbols.iter() {
+            out.insert(Arc::from(sym.as_str()));
         }
     }
     let Some(root) = contrib.workspace_root.as_ref() else {
@@ -7176,6 +7170,31 @@ pub(crate) fn append_package_contribution(
     }
 }
 
+/// Returns `true` when the `.Rprofile` prelude applies to `path` given the
+/// current [`PackageScopeContribution`].
+///
+/// Conditions (all must hold):
+/// - `contrib.rprofile_root` is `Some` (a prelude was found);
+/// - `path` is under that root;
+/// - in package mode (`workspace_root.is_some()`), the path is NOT withheld by
+///   [`crate::package_state::rprofile_withheld_in_package_mode`].
+///
+/// The empty-sets early-return in [`append_rprofile_prelude`] is kept separate
+/// (it short-circuits before URI→path conversion and belongs to that fn only).
+fn rprofile_prelude_applies(
+    path: &std::path::Path,
+    contrib: &crate::package_state::PackageScopeContribution,
+) -> bool {
+    let Some(root) = contrib.rprofile_root.as_ref() else {
+        return false;
+    };
+    if path.strip_prefix(root).is_err() {
+        return false;
+    }
+    let package_mode_active = contrib.workspace_root.is_some();
+    !(package_mode_active && crate::package_state::rprofile_withheld_in_package_mode(path, root))
+}
+
 /// Inject the `.Rprofile` prelude (issue: script-scope prelude) into a queried
 /// file's scope at Phase 5a. Independent of the package-mode contribution:
 /// applies in BOTH package and script mode, gated by
@@ -7188,21 +7207,13 @@ pub(crate) fn append_rprofile_prelude(
     uri: &Url,
     contrib: &crate::package_state::PackageScopeContribution,
 ) {
-    let Some(root) = contrib.rprofile_root.as_ref() else {
-        return;
-    };
     if contrib.rprofile_symbols.is_empty() && contrib.rprofile_attached_packages.is_empty() {
         return;
     }
     let Ok(path) = uri.to_file_path() else {
         return;
     };
-    if path.strip_prefix(root).is_err() {
-        return; // only files under the .Rprofile's root (rprofile_root — set in both package and script mode)
-    }
-    // `workspace_root.is_some()` ⇔ a package workspace is active (package mode).
-    let package_mode_active = contrib.workspace_root.is_some();
-    if package_mode_active && crate::package_state::rprofile_withheld_in_package_mode(&path, root) {
+    if !rprofile_prelude_applies(&path, contrib) {
         return;
     }
     let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
@@ -27192,6 +27203,7 @@ mod package_contribution_tests {
     }
 
     #[test]
+    // `R_dir` names the package R/ directory (capital R is R's convention).
     #[allow(non_snake_case)]
     fn rprofile_prelude_withheld_from_package_R_dir() {
         let root = std::path::Path::new("/work/pkg");
@@ -27206,6 +27218,7 @@ mod package_contribution_tests {
     }
 
     #[test]
+    // `R_dir` names the package R/ directory (capital R is R's convention).
     #[allow(non_snake_case)]
     fn rprofile_prelude_applies_to_R_dir_in_script_mode() {
         let root = std::path::Path::new("/work/proj");

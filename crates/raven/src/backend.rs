@@ -1671,6 +1671,18 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
     })
 }
 
+/// Returns `true` when any delta in `deltas` is `RProfileChanged`, or when any
+/// nested [`PackageInputDelta::Batch`] recursively contains one.
+fn batch_contains_rprofile_changed(deltas: &[crate::package_state::PackageInputDelta]) -> bool {
+    deltas.iter().any(|d| match d {
+        crate::package_state::PackageInputDelta::RProfileChanged => true,
+        crate::package_state::PackageInputDelta::Batch(inner) => {
+            batch_contains_rprofile_changed(inner)
+        }
+        _ => false,
+    })
+}
+
 fn collect_package_r_file_inputs_from_disk(
     root: &std::path::Path,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
@@ -5052,9 +5064,7 @@ impl LanguageServer for Backend {
                 }
             }
             if !deltas.is_empty() {
-                let rprofile_changed = deltas
-                    .iter()
-                    .any(|d| matches!(d, crate::package_state::PackageInputDelta::RProfileChanged));
+                let rprofile_changed = batch_contains_rprofile_changed(&deltas);
                 let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                 state.apply_package_event(&batch);
                 // A `Package:` rename changes which `system.file()` references
@@ -5386,17 +5396,7 @@ impl LanguageServer for Backend {
                         // RProfileChanged delta may appear top-level or nested in
                         // the per-file Batch built by `translate_watched`, so check
                         // both. Computed BEFORE `deltas` is moved into `Batch`.
-                        let rprofile_changed = deltas.iter().any(|d| {
-                            matches!(d, crate::package_state::PackageInputDelta::RProfileChanged)
-                                || matches!(
-                                    d,
-                                    crate::package_state::PackageInputDelta::Batch(inner)
-                                        if inner.iter().any(|d| matches!(
-                                            d,
-                                            crate::package_state::PackageInputDelta::RProfileChanged
-                                        ))
-                                )
-                        });
+                        let rprofile_changed = batch_contains_rprofile_changed(&deltas);
                         if !deltas.is_empty() {
                             let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                             state.apply_package_event(&batch);

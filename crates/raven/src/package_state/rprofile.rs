@@ -44,6 +44,10 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
     };
     let workspace_url = Url::from_file_path(workspace_root).ok();
     let renv_activate = workspace_root.join("renv").join("activate.R");
+    // Hoist the canonicalization outside the inner loop — computed once instead of N×M times.
+    let canonical_renv_activate = renv_activate
+        .canonicalize()
+        .unwrap_or_else(|_| renv_activate.clone());
 
     // Worklist of (file_path, file_text, depth). Visited is keyed by the
     // canonicalized path so cycles and re-sources collapse to one visit.
@@ -61,6 +65,13 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
         let Some(file_uri) = Url::from_file_path(&path).ok() else {
             continue;
         };
+        // DELIBERATE EXCEPTION: `# raven: cd` is intentionally NOT honored here.
+        // `.Rprofile` and its transitively-sourced helpers are resolved relative to
+        // the file's directory with the workspace-root fallback, matching how R sources
+        // the profile from the project root. Honoring `# raven: cd` is skipped because
+        // (a) it is essentially never used in R startup files, and (b) the prelude is
+        // suppressive-only — a mis-resolved source() target merely under-harvests
+        // (a real diagnostic survives), never fabricates one.
         let Some(ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
             &file_uri,
             &crate::cross_file::types::CrossFileMetadata::default(),
@@ -78,10 +89,7 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
             };
             // Skip renv's activate.R (defines internal machinery, no user globals).
             let canonical_resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-            let canonical_renv = renv_activate
-                .canonicalize()
-                .unwrap_or_else(|_| renv_activate.clone());
-            if canonical_resolved == canonical_renv || resolved == renv_activate {
+            if canonical_resolved == canonical_renv_activate || resolved == renv_activate {
                 continue;
             }
             if !visited.insert(canonical_resolved.clone()) {
