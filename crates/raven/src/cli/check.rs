@@ -2535,9 +2535,11 @@ mod tests {
     // requires `stringr` to be installed in the test environment's R library,
     // which is unavailable in CI.  The deterministic invariant — that `.Rprofile`
     // `library(pkg)` lines are captured and propagated to
-    // `rprofile_attached_packages` — is covered by the unit tests on
-    // `rprofile_prelude::compute_contribution_symbol_names` (and the path-helper
-    // tests in Task 8).  No end-to-end test is added here to avoid flakiness.
+    // `rprofile_attached_packages` — is covered by
+    // `package_state::rprofile::tests::harvests_attached_packages` (scanner) and
+    // `cross_file::scope::package_contribution_tests::rprofile_prelude_injects_into_scripts_in_package_mode`
+    // (scope injection: asserts prelude adds attached packages to `inherited_packages`).
+    // No end-to-end test is added here to avoid flakiness.
 
     // ── Case 11: conditional top-level assignment ────────────────────────────
 

@@ -7198,7 +7198,7 @@ pub(crate) fn append_rprofile_prelude(
         return;
     };
     if path.strip_prefix(root).is_err() {
-        return; // only files under the workspace root
+        return; // only files under the .Rprofile's root (rprofile_root — set in both package and script mode)
     }
     // `workspace_root.is_some()` ⇔ a package workspace is active (package mode).
     let package_mode_active = contrib.workspace_root.is_some();

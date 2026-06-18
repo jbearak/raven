@@ -161,7 +161,8 @@ fn translate_watched(
         if !inputs.model_rprofile {
             // Modeling disabled: ensure no stale prelude lingers, no rescan.
             let had = !inputs.rprofile_symbols.is_empty()
-                || !inputs.rprofile_attached_packages.is_empty();
+                || !inputs.rprofile_attached_packages.is_empty()
+                || !inputs.rprofile_sourced_files.is_empty();
             inputs.rprofile_symbols.clear();
             inputs.rprofile_attached_packages.clear();
             inputs.rprofile_sourced_files.clear();

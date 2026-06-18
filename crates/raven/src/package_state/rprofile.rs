@@ -12,7 +12,7 @@
 //! never executes anything.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::Url;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub struct RprofileScan {
     /// `source()` (the `.Rprofile` file itself is NOT included). Used by the
     /// optional transitive-freshness wiring (Task 12) to rescan when one of
     /// these helper files is edited. Empty in the single-file harvest.
-    pub sourced_files: std::collections::BTreeSet<std::path::PathBuf>,
+    pub sourced_files: BTreeSet<PathBuf>,
 }
 
 /// Maximum depth of `source()` chains followed out of `.Rprofile`. Mirrors the
@@ -57,18 +57,18 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
         if depth >= RPROFILE_MAX_SOURCE_DEPTH || visited.len() >= RPROFILE_MAX_SOURCE_FILES {
             continue;
         }
+        // PathContext is invariant for all targets within a single file; build it once.
+        let Some(file_uri) = Url::from_file_path(&path).ok() else {
+            continue;
+        };
+        let Some(ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
+            &file_uri,
+            &crate::cross_file::types::CrossFileMetadata::default(),
+            workspace_url.as_ref(),
+        ) else {
+            continue;
+        };
         for target in literal_source_targets(&text) {
-            let Some(file_uri) = Url::from_file_path(&path).ok() else {
-                continue;
-            };
-            let ctx = match crate::cross_file::path_resolve::PathContext::from_metadata(
-                &file_uri,
-                &crate::cross_file::types::CrossFileMetadata::default(),
-                workspace_url.as_ref(),
-            ) {
-                Some(c) => c,
-                None => continue,
-            };
             let Some(resolved) =
                 crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                     &target, &ctx,
@@ -87,7 +87,7 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
             if !visited.insert(canonical_resolved.clone()) {
                 continue;
             }
-            if visited.len() > RPROFILE_MAX_SOURCE_FILES {
+            if visited.len() >= RPROFILE_MAX_SOURCE_FILES {
                 break;
             }
             if let Ok(sourced_text) = std::fs::read_to_string(&resolved) {

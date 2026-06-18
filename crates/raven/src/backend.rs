@@ -5061,7 +5061,7 @@ impl LanguageServer for Backend {
                 // are self-package (branch 1), so re-resolve retained entries
                 // against the new workspace name.
                 let system_file_changed = state.resolve_system_file_in_workspace();
-                log::info!("Updated package state after DESCRIPTION/NAMESPACE change");
+                log::info!("Updated package state after DESCRIPTION/NAMESPACE/.Rprofile change");
                 // Force republish for all open R files so namespace model
                 // changes propagate (they're not dependency-graph neighbors of
                 // DESCRIPTION/NAMESPACE so the sync pass didn't add them).
