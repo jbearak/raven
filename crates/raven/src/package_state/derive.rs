@@ -36,14 +36,8 @@ pub fn derive_package_state(
     } else {
         None
     };
-    let scope_contribution = build_scope_contribution(
-        &workspace,
-        &namespace_model,
-        &r_file_facts,
-        inputs.description.as_ref(),
-        &inputs.dataset_names,
-        &inputs.sysdata_names,
-    );
+    let scope_contribution =
+        build_scope_contribution(&workspace, &namespace_model, &r_file_facts, inputs);
     PackageState {
         workspace,
         namespace_model,
@@ -56,12 +50,21 @@ fn build_scope_contribution(
     workspace: &Option<PackageWorkspace>,
     namespace_model: &Option<PackageNamespaceModel>,
     r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
-    description: Option<&DescriptionInput>,
-    dataset_names: &BTreeSet<String>,
-    sysdata_names: &BTreeSet<String>,
+    inputs: &PackageInputs,
 ) -> PackageScopeContribution {
+    let description = inputs.description.as_ref();
+    let dataset_names = &inputs.dataset_names;
+    let sysdata_names = &inputs.sysdata_names;
+    let rprofile_symbols = &inputs.rprofile_symbols;
+    let rprofile_attached_packages = &inputs.rprofile_attached_packages;
+    let rprofile_root = inputs.workspace_root.clone();
     let Some(ws) = workspace else {
-        return PackageScopeContribution::default();
+        return PackageScopeContribution {
+            rprofile_symbols: Arc::new(rprofile_symbols.clone()),
+            rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
+            rprofile_root,
+            ..PackageScopeContribution::default()
+        };
     };
     // r_internal_symbols: union of top_level_defs from Source files only
     // (exclude tests/testthat/* — those are kind == Test). Partition is
@@ -166,6 +169,9 @@ fn build_scope_contribution(
         dataset_symbols: Arc::new(dataset_names.clone()),
         sysdata_symbols: Arc::new(sysdata_names.clone()),
         onload_symbols: Arc::new(onload_all),
+        rprofile_symbols: Arc::new(rprofile_symbols.clone()),
+        rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
+        rprofile_root,
     }
 }
 
@@ -339,6 +345,10 @@ mod tests {
             r_files: BTreeMap::new(),
             dataset_names: BTreeSet::new(),
             sysdata_names: BTreeSet::new(),
+            model_rprofile: false,
+            rprofile_symbols: BTreeSet::new(),
+            rprofile_attached_packages: BTreeSet::new(),
+            rprofile_sourced_files: BTreeSet::new(),
         }
     }
 
@@ -1378,6 +1388,47 @@ foo <- function() 1
             "subdir helper attaches must NOT be collected: {:?}",
             s.scope_contribution.test_helper_attached_packages,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // .Rprofile prelude carry-through (Task 6)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn contribution_carries_rprofile_symbols_in_package_mode() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.rprofile_symbols.insert("r_bind".to_string());
+        inputs
+            .rprofile_attached_packages
+            .insert("stringr".to_string());
+        let s = derive_package_state(&PackageState::new(), &inputs, &PackageInputDelta::Initial);
+        let c = s.scope_contribution();
+        assert!(c.rprofile_symbols.contains("r_bind"));
+        assert!(c.rprofile_attached_packages.contains("stringr"));
+        assert_eq!(c.rprofile_root, inputs.workspace_root);
+        // package mode active → workspace_root is Some
+        assert!(c.workspace_root.is_some());
+    }
+
+    #[test]
+    fn contribution_carries_rprofile_symbols_in_script_mode() {
+        // No DESCRIPTION + Auto → no package workspace, but the prelude must
+        // still be carried (script-mode R/ inclusion depends on this).
+        let mut inputs = empty_inputs(PackageMode::Auto);
+        inputs.workspace_root = Some(std::path::PathBuf::from("/work"));
+        inputs.rprofile_symbols.insert("zz".to_string());
+        let s = derive_package_state(&PackageState::new(), &inputs, &PackageInputDelta::Initial);
+        let c = s.scope_contribution();
+        assert!(
+            c.rprofile_symbols.contains("zz"),
+            "prelude must survive in script mode"
+        );
+        assert_eq!(
+            c.rprofile_root.as_deref(),
+            Some(std::path::Path::new("/work"))
+        );
+        // script mode → no package workspace
+        assert!(c.workspace_root.is_none());
     }
 
     // ------------------------------------------------------------------

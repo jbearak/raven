@@ -95,6 +95,25 @@ pub struct PackageInputs {
     /// `save(..., file="...sysdata.rda")` calls, with an R-subprocess
     /// fallback when AST finds nothing and an R executable is available.
     pub sysdata_names: BTreeSet<String>,
+    /// Whether `.Rprofile` prelude modeling is enabled (mirrors
+    /// `CrossFileConfig.model_rprofile`). Carried here so the watched-file
+    /// `translate` path can gate the scan without reaching for config.
+    /// Set by `initialize_package_inputs_from_state`; `Default` is `false`
+    /// (seeders set the real value from config, which defaults `true`).
+    pub model_rprofile: bool,
+    /// Top-level symbol names introduced by the workspace-root `.Rprofile`
+    /// (and its transitive literal `source()` targets). Populated by
+    /// `rprofile::scan_workspace_rprofile`. Empty when modeling is off or the
+    /// file is absent.
+    pub rprofile_symbols: BTreeSet<String>,
+    /// Packages attached (top-level `library()`/`require()`) by the
+    /// workspace-root `.Rprofile` and its transitive `source()` targets.
+    pub rprofile_attached_packages: BTreeSet<String>,
+    /// Canonical paths of helper files the prelude followed via `source()`
+    /// (from `RprofileScan::sourced_files`). Used by the optional
+    /// transitive-freshness wiring (Task 12) to rescan when a sourced helper is
+    /// edited. Not carried onto the contribution (watch-routing only).
+    pub rprofile_sourced_files: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -825,6 +844,21 @@ pub struct PackageScopeContribution {
     /// `assign("x", ..., envir=ns)` or `ns$x <- ...`. Visible alongside
     /// `r_internal_symbols`.
     pub onload_symbols: Arc<BTreeSet<String>>,
+
+    /// Symbol names contributed by a workspace-root `.Rprofile` prelude
+    /// (assignments + transitive `source()` defs). Injected by
+    /// `append_rprofile_prelude` into files where R would source `.Rprofile`
+    /// (gated by `rprofile_withheld_in_package_mode` in package mode).
+    /// Suppressive-only.
+    pub rprofile_symbols: Arc<BTreeSet<String>>,
+    /// Packages attached by the `.Rprofile` prelude. Added to a file's
+    /// `inherited_packages` under the same applicability rule.
+    pub rprofile_attached_packages: Arc<BTreeSet<String>>,
+    /// Workspace root used for the `.Rprofile` prelude's path-containment and
+    /// applicability checks. Set whenever a workspace root is known (BOTH
+    /// package and script mode) — deliberately distinct from `workspace_root`,
+    /// which is `Some` only in package mode. `None` when no root is known.
+    pub rprofile_root: Option<PathBuf>,
 }
 
 #[cfg(test)]

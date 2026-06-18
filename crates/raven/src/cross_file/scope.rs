@@ -25739,6 +25739,7 @@ mod package_contribution_tests {
             dataset_symbols: Arc::new(BTreeSet::new()),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),
+            ..PackageScopeContribution::default()
         }
     }
 
@@ -26962,6 +26963,7 @@ mod package_contribution_tests {
             dataset_symbols: Arc::new(dataset_symbols),
             sysdata_symbols: Arc::new(BTreeSet::new()),
             onload_symbols: Arc::new(BTreeSet::new()),
+            ..PackageScopeContribution::default()
         }
     }
 

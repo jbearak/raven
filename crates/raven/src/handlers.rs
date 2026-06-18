@@ -25583,6 +25583,7 @@ clean_data <- function(x) {
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
+                            ..PackageScopeContribution::default()
                     },
                     ..Default::default()
                 });
@@ -25667,6 +25668,7 @@ clean_data <- function(x) {
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
+                        ..PackageScopeContribution::default()
                     },
                     ..Default::default()
                 });
@@ -25738,6 +25740,7 @@ clean_data <- function(x) {
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -26119,6 +26122,7 @@ clean_data <- function(x) {
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -28556,6 +28560,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -28642,6 +28647,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -28824,6 +28830,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -28894,6 +28901,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -28971,6 +28979,10 @@ y <- totally_undefined_baseline()
             r_files,
             dataset_names: Default::default(),
             sysdata_names: Default::default(),
+            model_rprofile: false,
+            rprofile_symbols: Default::default(),
+            rprofile_attached_packages: Default::default(),
+            rprofile_sourced_files: Default::default(),
         };
         derive_package_state(
             &PackageState::default(),
@@ -29139,6 +29151,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29234,6 +29247,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29325,6 +29339,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29441,6 +29456,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29566,6 +29582,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29672,6 +29689,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29750,6 +29768,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29843,6 +29862,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29919,6 +29939,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -29989,6 +30010,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -30059,6 +30081,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: std::sync::Arc::new(datasets),
                     sysdata_symbols: Default::default(),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -30309,6 +30332,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: std::sync::Arc::new(sysdata),
                     onload_symbols: Default::default(),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -30381,6 +30405,7 @@ y <- totally_undefined_baseline()
                     dataset_symbols: Default::default(),
                     sysdata_symbols: Default::default(),
                     onload_symbols: std::sync::Arc::new(onload),
+                    ..PackageScopeContribution::default()
                 },
                 ..Default::default()
             });
@@ -34369,6 +34394,7 @@ result <- data %>% filter(x > 0)
                         dataset_symbols: Default::default(),
                         sysdata_symbols: Default::default(),
                         onload_symbols: Default::default(),
+                        ..crate::package_state::PackageScopeContribution::default()
                     },
                     ..Default::default()
                 });
