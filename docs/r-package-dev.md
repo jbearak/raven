@@ -206,6 +206,94 @@ The injection is gated on the call, not the path: the same file *without* a
 `load_all()` call (and outside the dev-context directories above) sees only the
 normal global/`library()` scope.
 
+## Files outside the package directories
+
+Files that live outside a package's standard directories (most commonly a
+`scripts/` or `analysis/` folder) do **not** automatically see your package's
+functions. A diagnostic such as `Undefined variable: my_helper` on a function
+used from `scripts/` is, by default, **correct**: `scripts/` is not a package
+directory, `R CMD check` never runs it, and a clean `Rscript scripts/foo.R`
+session genuinely cannot find `my_helper`.
+
+Readers usually arrive with one of two mental models — name yours:
+
+- **"This is a real R package."** The diagnostic is correct and expected.
+  `scripts/` is not a package directory, `library()` exposes only *exported*
+  symbols, and `R CMD check` never sources `scripts/`. Fix it the way R would:
+  call `library(yourpkg)` (for exports), `devtools::load_all()` (for everything
+  in `R/`), `source()` the file, or add a `# raven: source` directive.
+- **"This is an analysis project that borrows package scaffolding"** (research
+  compendia — `rrtools`, `rcompendium`, ropensci's `rrrpkg`). Here the function
+  genuinely *is* defined at runtime — typically because a workspace-root
+  `.Rprofile` sources your helpers at startup — so the diagnostic reads as a
+  false positive. Raven models a workspace-root `.Rprofile` automatically (see
+  "`.Rprofile` prelude" below); for other loading conventions, use a directive.
+
+### What each loading mechanism makes visible
+
+| How a file outside the package dirs obtains your functions | What becomes visible |
+|---|---|
+| `library(yourpkg)` | **Only exported** symbols (`@export` / `NAMESPACE`). Requires the package installed. Internals need `yourpkg:::name`. |
+| `devtools::load_all()` / `pkgload::load_all()` | **Exported and internal** `R/` symbols — `load_all()`'s `export_all = TRUE` default copies *all* objects into scope. This is why code can pass under `load_all()` but fail under `library()` / `R CMD check`. |
+| `source("R/...")` | **All top-level definitions** become globals — there is no export concept; `source()` has nothing to do with packages. |
+| A `# raven: source R/...` directive | Path-resolution equivalent of `source()` — Raven follows it (and its transitive `source()` chain) to bring those top-level defs into scope. |
+
+### The `load_all` / `library` trap
+
+The most common R packaging surprise: `devtools::load_all()` makes *internal*
+functions usable by bare name (default `export_all = TRUE`), so code that
+"works in development" can fail under `library()` or `R CMD check`. Adding
+`@export` alone does **not** make a function visible to a `scripts/` file — that
+file still needs `library()` (which exposes only exports), or
+`load_all()` / `source()` / a directive.
+
+### Worked recipe (the `.Rprofile` / bootstrap pattern)
+
+Bring helpers into a `scripts/` file with a directive at the top of the file:
+
+```r
+# raven: source R/functions.r      # at the top of a scripts/ file
+```
+
+> If your project loads its helpers via a workspace-root `.Rprofile` (e.g.
+> `source("R/functions.r")`), Raven models that automatically — see
+> "`.Rprofile` prelude" below. The directive remains available for projects
+> that load functions some other way, or when `.Rprofile` modeling is disabled.
+
+### `.Rprofile` prelude
+
+When a workspace-root `.Rprofile` exists, Raven statically reads its top-level
+statements and treats the symbols they introduce as in scope for the files
+where R would actually have sourced `.Rprofile` (an interactive session, or
+`Rscript` launched from the project root). This mirrors R's startup — per
+`?Startup`, R sources `./.Rprofile` before running any script — without
+executing anything. The prelude contributes:
+
+- names assigned at top level (`x <- ...`, `x = ...`, `x <<- ...`, and
+  `assign("x", ...)` with a literal name), including names bound inside
+  top-level `if`/`else` (e.g. `if (interactive()) helper <- function() {}`);
+- packages attached by top-level `library(pkg)` / `require(pkg)` — their
+  exports become available by bare name;
+- top-level definitions reachable through `source("path")` calls whose path is
+  a static literal, resolved with the workspace-root fallback and followed
+  transitively through those files' own `source()` calls.
+
+The model is **suppressive only**: it can silence a false "undefined variable"
+and enrich completion/hover, but it never *introduces* a diagnostic. It is
+**withheld** (in package mode) from files whose canonical run context is a
+clean, profile-suppressed `R CMD check` / `build` session — namespace `R/`,
+tests, and built doc dirs (`vignettes/`, `man/`, `demo/`) — because a symbol
+that exists only because of `.Rprofile` is a genuine bug there. In a project
+that is **not** an R package, an `R/` directory is just scripts, so the prelude
+applies to it like any other directory. Raven never models `~/.Rprofile`, and
+it recognizes `renv`'s `source("renv/activate.R")` line and does not follow it.
+
+### Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `raven.packages.modelRprofile` | `true` | Model a workspace-root `.Rprofile`'s top-level `source()`/`library()`/assignments as a script-scope prelude. |
+
 ### Build commands
 
 When the workspace is detected as an R package (DESCRIPTION with a non-empty
@@ -445,6 +533,8 @@ Run `devtools::document()` to regenerate the NAMESPACE file, or save the file �
 
 **False positives persist after adding `@importFrom`:**
 Ensure the imported package's export names are available to Raven: install the package locally, capture it in `.raven/packages.json` with `raven packages freeze`, or rely on `names.db` coverage (run `raven packages update` to download it). Export resolution is separate from install status. If `--report-uninstalled` or editor missing-package diagnostics are enabled, those still report local install status and require the package to exist on disk.
+
+If the function is loaded at runtime by a workspace-root `.Rprofile` or a bootstrap `source()`, see "Files outside the package directories" — Raven models `.Rprofile` automatically, and a `# raven: source` directive covers other conventions.
 
 **Package mode not activating:**
 Check that `DESCRIPTION` is at the workspace root (the first workspace folder) and contains a `Package:` field. You can also force it with `"raven.packages.packageMode": "enabled"`.
