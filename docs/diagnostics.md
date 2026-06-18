@@ -12,6 +12,7 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 - **Declare a symbol the analyzer can't see** — use [`# raven: var`, `# raven: func`](directives.md#declaration-directives)
 - **Suppress false positives from an uncatalogued NSE helper** — use [`# raven: nse`](non-standard-evaluation.md#when-raven-needs-a-hint) to declare which formals are captured; preferable to a blanket ignore because it keeps checking non-captured arguments
 - **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `# raven: sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
+- **Account for project startup helpers** — Raven models a workspace-root `.Rprofile` for ordinary script scope. See [`.Rprofile` Startup Prelude](rprofile.md)
 - **Turn a category off globally** — set the matching severity to `"off"` (see [Configuration](configuration.md))
 - **Disable everything** — set `raven.diagnostics.enabled` to `false`
 

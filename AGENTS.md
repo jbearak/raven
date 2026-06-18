@@ -15,6 +15,7 @@ User-facing:
 - `README.md`
 - `docs/cross-file.md`
 - `docs/r-package-dev.md`
+- `docs/rprofile.md`
 - `docs/package-database.md`
 - `docs/directives.md`
 - `docs/diagnostics.md`

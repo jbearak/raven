@@ -55,6 +55,10 @@ Raven recognizes `library()`, `require()`, and `loadNamespace()` calls and makes
 > [!TIP]
 > **Developing an R package?** When Raven detects a `DESCRIPTION` file at the workspace root, it switches to package mode — all `R/*.R` files become mutually visible without `source()` calls, and `@import`/`@importFrom` annotations suppress undefined-variable diagnostics. See [R Package Development](r-package-dev.md).
 
+Workspace-root startup files are modeled separately from package mode. If your
+project `.Rprofile` defines helpers, attaches packages, or sources setup files,
+see [`.Rprofile` Startup Prelude](rprofile.md).
+
 ### How It Works
 
 When you write `library(dplyr)`, Raven:

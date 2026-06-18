@@ -80,6 +80,10 @@ const DOC_LINKS = {
   trace: "configuration.md",
 };
 
+const DOC_LINK_OVERRIDES = {
+  "raven.packages.modelRprofile": "rprofile.md",
+};
+
 function escapeCell(text) {
   // Escape backslashes first so the pipe-escape pass doesn't double up an
   // already-escaped sequence (`\|` → `\\|`). Then normalize newlines so a
@@ -159,6 +163,8 @@ function tomlPath(key) {
 }
 
 function docLink(key) {
+  const override = DOC_LINK_OVERRIDES[key];
+  if (override) return `[${override.replace(/\.md$/, "")}](${override})`;
   const section = key.split(".")[1];
   const target = DOC_LINKS[section];
   if (!target) return "—";
