@@ -1812,22 +1812,38 @@ pub(crate) fn initialize_package_inputs_from_state(
     state.package_inputs.sysdata_names =
         crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
 
-    // The `.Rprofile` prelude scan follows transitive `source()` chains, so it
-    // must NOT run while the `WorldState` write lock is held (locking-discipline
-    // invariant). Callers that hold the lock under contention (LSP startup /
-    // `packageMode` rebuild) precompute the scan OFF-lock and pass it in via
-    // `precomputed_rprofile_scan`; the non-contended callers (`raven check`,
-    // unit tests) pass `None` and let it scan inline. When modeling is disabled
-    // the prelude is cleared regardless of what was passed.
-    let rprofile_scan = if state.package_inputs.model_rprofile {
-        precomputed_rprofile_scan
-            .unwrap_or_else(|| crate::package_state::rprofile::scan_workspace_rprofile(&root))
+    // If `.Rprofile` is currently OPEN as a live document, its prelude is owned
+    // by the did_open/did_change path (sourced from the in-memory buffer). A
+    // disk-based (re)seed here — startup background scan completing late, or a
+    // `packageMode`/`modelRprofile` rebuild — must not clobber that buffer
+    // prelude with the on-disk scan and lose unsaved edits. Leave the prelude
+    // inputs untouched in that case (modeling stays enabled). When modeling is
+    // disabled the prelude is cleared regardless (an open buffer can't keep a
+    // prelude that the feature is turned off for).
+    let rprofile_open = state
+        .documents
+        .keys()
+        .any(|u| u.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path()));
+    if state.package_inputs.model_rprofile && rprofile_open {
+        // Buffer-authoritative: keep the live prelude inputs as-is.
     } else {
-        crate::package_state::rprofile::RprofileScan::default()
-    };
-    state.package_inputs.rprofile_symbols = rprofile_scan.symbols;
-    state.package_inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
-    state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
+        // The `.Rprofile` prelude scan follows transitive `source()` chains, so
+        // it must NOT run while the `WorldState` write lock is held
+        // (locking-discipline invariant). Callers that hold the lock under
+        // contention (LSP startup / `packageMode` rebuild) precompute the scan
+        // OFF-lock and pass it in via `precomputed_rprofile_scan`; the
+        // non-contended callers (`raven check`, unit tests) pass `None` and let
+        // it scan inline. When modeling is disabled the prelude is cleared.
+        let rprofile_scan = if state.package_inputs.model_rprofile {
+            precomputed_rprofile_scan
+                .unwrap_or_else(|| crate::package_state::rprofile::scan_workspace_rprofile(&root))
+        } else {
+            crate::package_state::rprofile::RprofileScan::default()
+        };
+        state.package_inputs.rprofile_symbols = rprofile_scan.symbols;
+        state.package_inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
+        state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
+    }
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -3086,6 +3102,10 @@ impl LanguageServer for Backend {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
+        // Captured inside the lock block when the opened doc is the
+        // workspace-root `.Rprofile`; drives an off-lock prelude refresh after.
+        let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+
         // Compute affected files while holding write lock
         let (
             mut work_items,
@@ -3188,6 +3208,18 @@ impl LanguageServer for Backend {
                         != old_ns_model.as_ref()
                         || state.package_state.scope_contribution() != &old_contribution;
                 }
+            }
+
+            // If the opened document is the workspace-root `.Rprofile`, capture
+            // its buffer text for an off-lock prelude refresh after this block.
+            // `did_open` can carry UNSAVED text (e.g. VS Code hot-exit restoring
+            // a dirty buffer), so the prelude must reflect the buffer, not just
+            // the disk seed — without this, open scripts would see a stale
+            // prelude until the first keystroke.
+            if let Some(root) = state.package_inputs.workspace_root.clone()
+                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
+            {
+                rprofile_live_edit = Some((root, text.as_str().into()));
             }
 
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
@@ -3448,6 +3480,13 @@ impl LanguageServer for Backend {
                 packages_enabled,
             )
         };
+
+        // Live `.Rprofile` open: establish the prelude from the (possibly
+        // unsaved) buffer text, off-lock, and fan out to open consumers.
+        if let Some((root, text)) = rprofile_live_edit {
+            self.refresh_rprofile_prelude_from_buffer(root, text).await;
+        }
+
         let needs_open_stabilization =
             !files_to_index.is_empty() || !packages_to_prefetch.is_empty();
 
@@ -5094,6 +5133,19 @@ impl LanguageServer for Backend {
                             .iter()
                             .filter_map(|c| {
                                 let p = c.uri.to_file_path().ok()?;
+                                // Open documents are authoritative: a watcher
+                                // event for an OPEN buffer must not overwrite it
+                                // from disk. The main watcher loop skips open
+                                // docs; mirror that here. This matters for
+                                // `.Rprofile` (now a live R document) — without
+                                // it, an external disk touch (or even the
+                                // editor's own save) would clobber the
+                                // live-buffer prelude with the on-disk scan. The
+                                // live did_open/did_change/did_close paths own
+                                // the prelude while `.Rprofile` is open.
+                                if state.documents.contains_key(&c.uri) {
+                                    return None;
+                                }
                                 if p == root.join("DESCRIPTION")
                                     || p == root.join("NAMESPACE")
                                     || p == root.join(".Rprofile")
@@ -12507,6 +12559,164 @@ mod project_config_initialize_tests {
                 state.package_inputs.rprofile_symbols
             );
         }
+    }
+
+    /// `did_open` can carry UNSAVED `.Rprofile` text (e.g. VS Code hot-exit
+    /// restoring a dirty buffer) with no following `did_change`. The prelude
+    /// must reflect the opened buffer, not just the disk seed.
+    #[tokio::test]
+    async fn live_rprofile_dirty_open_uses_buffer_not_disk() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        // Disk `.Rprofile` defines helper_a.
+        fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        let root = Url::from_file_path(&root_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Baseline: seed the prelude from disk (helper_a).
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(root_path.clone());
+            state.package_inputs.model_rprofile = true;
+            let scan = crate::package_state::rprofile::scan_workspace_rprofile(&root_path);
+            state.package_inputs.rprofile_symbols = scan.symbols;
+            state.package_inputs.rprofile_attached_packages = scan.attached_packages;
+            state.package_inputs.rprofile_sourced_files = scan.sourced_files;
+        }
+
+        // Open `.Rprofile` carrying UNSAVED buffer text (helper_x ≠ disk's helper_a),
+        // with NO following did_change.
+        let rprofile_uri = Url::from_file_path(root_path.join(".Rprofile")).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: rprofile_uri,
+                    language_id: "r".into(),
+                    version: 1,
+                    text: "helper_x <- function() 1\n".into(),
+                },
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.package_inputs.rprofile_symbols.contains("helper_x"),
+            "did_open must refresh the prelude from the (unsaved) buffer: {:?}",
+            state.package_inputs.rprofile_symbols
+        );
+        assert!(
+            !state.package_inputs.rprofile_symbols.contains("helper_a"),
+            "stale disk symbol must be dropped on dirty open: {:?}",
+            state.package_inputs.rprofile_symbols
+        );
+    }
+
+    /// While `.Rprofile` is OPEN with unsaved edits, a file-watcher event for it
+    /// (external disk touch, or the editor's own save) must NOT overwrite the
+    /// live-buffer prelude with the on-disk scan — open documents are
+    /// authoritative. (Regression for the manifest-block open-doc skip.)
+    #[tokio::test]
+    async fn watched_rprofile_event_does_not_clobber_open_buffer_prelude() {
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidOpenTextDocumentParams,
+            FileChangeType, FileEvent, TextDocumentContentChangeEvent, TextDocumentItem,
+            VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        let root = Url::from_file_path(&root_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(root_path.clone());
+            state.package_inputs.model_rprofile = true;
+            let scan = crate::package_state::rprofile::scan_workspace_rprofile(&root_path);
+            state.package_inputs.rprofile_symbols = scan.symbols;
+            state.package_inputs.rprofile_attached_packages = scan.attached_packages;
+            state.package_inputs.rprofile_sourced_files = scan.sourced_files;
+        }
+
+        let rprofile_uri = Url::from_file_path(root_path.join(".Rprofile")).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: rprofile_uri.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: "helper_a <- function() 1\n".into(),
+                },
+            })
+            .await;
+        // Unsaved edit → buffer defines helper_b; disk still says helper_a.
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: rprofile_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "helper_b <- function() 1\n".into(),
+                }],
+            })
+            .await;
+
+        // A watcher event arrives for `.Rprofile` (e.g. external disk touch).
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: rprofile_uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.package_inputs.rprofile_symbols.contains("helper_b"),
+            "open-buffer prelude must survive a watcher event: {:?}",
+            state.package_inputs.rprofile_symbols
+        );
+        assert!(
+            !state.package_inputs.rprofile_symbols.contains("helper_a"),
+            "watcher must not revert an open buffer to disk: {:?}",
+            state.package_inputs.rprofile_symbols
+        );
     }
 
     /// A live reload of `raven.toml` must reapply `packages.enabled` —
