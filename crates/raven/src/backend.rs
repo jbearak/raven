@@ -11206,6 +11206,72 @@ mod refresh_packages_tests {
                  working directory"
             );
         }
+
+        /// Exercise the `should_index` convergence arm: a child first indexed by a
+        /// no-cd consumer (stored inherited WD = None) must be RE-indexed when a
+        /// later `# raven: cd` consumer reaches the same file, so its stored
+        /// inherited WD reflects the cd now in effect. This is the "diamond"
+        /// shared-child case the value-based re-index check (`stored != computed`)
+        /// was written for — the prior `cd_in_effect_*` test only hits the
+        /// fresh-index (`!contains`) arm, never this one.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cd_walk_reindexes_shared_child_indexed_plain_first() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            // A no-cd consumer that sources the shared file by its workspace path.
+            std::fs::write(root.join("plain.R"), "source(\"data/shared.R\")\n").unwrap();
+            // A cd consumer whose `# raven: cd data` resolves source("shared.R")
+            // to the SAME data/shared.R file.
+            std::fs::write(
+                root.join("main.R"),
+                "# raven: cd data\nsource(\"shared.R\")\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("data").join("shared.R"), "s <- function() 1\n").unwrap();
+
+            let ws_uri = Url::from_file_path(root).unwrap();
+            let plain_uri = Url::from_file_path(root.join("plain.R")).unwrap();
+            let main_uri = Url::from_file_path(root.join("main.R")).unwrap();
+            let shared_uri = Url::from_file_path(root.join("data").join("shared.R")).unwrap();
+
+            let backend = make_test_backend();
+            backend.state.write().await.workspace_folders = vec![ws_uri.clone()];
+
+            // Pass 1 (no cd): shared.R is indexed fresh with NO inherited WD.
+            backend
+                .index_forward_chain(&plain_uri, 10, Some(&ws_uri))
+                .await;
+            {
+                let state = backend.state.read().await;
+                let shared_meta = state
+                    .get_enriched_metadata(&shared_uri)
+                    .expect("shared.R indexed by the plain (no-cd) walk");
+                assert_eq!(
+                    shared_meta.inherited_working_directory, None,
+                    "a no-cd consumer must index the shared child with no inherited WD"
+                );
+            }
+
+            // Pass 2 (cd in effect): shared.R is already indexed with a stale
+            // `None`, while the cd walk computes `Some(data/)`. This drives the
+            // `stored != computed` re-index arm, updating the stored WD.
+            backend
+                .index_forward_chain(&main_uri, 10, Some(&ws_uri))
+                .await;
+            {
+                let state = backend.state.read().await;
+                let shared_meta = state
+                    .get_enriched_metadata(&shared_uri)
+                    .expect("shared.R still indexed after the cd walk");
+                assert_eq!(
+                    shared_meta.inherited_working_directory.as_deref(),
+                    Some(root.join("data").to_string_lossy().as_ref()),
+                    "the cd walk must re-index the already-indexed shared child so its \
+                     stored inherited working directory reflects the cd now in effect"
+                );
+            }
+        }
     }
 
     // ============================================================================
