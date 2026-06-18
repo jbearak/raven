@@ -162,6 +162,7 @@ pub enum PackageInputDelta {
     DescriptionChanged,
     SettingChanged,
     DataDirChanged,
+    RProfileChanged,
     Batch(Vec<PackageInputDelta>),
 }
 

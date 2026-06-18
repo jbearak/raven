@@ -4993,7 +4993,10 @@ impl LanguageServer for Backend {
                             .iter()
                             .filter_map(|c| {
                                 let p = c.uri.to_file_path().ok()?;
-                                if p == root.join("DESCRIPTION") || p == root.join("NAMESPACE") {
+                                if p == root.join("DESCRIPTION")
+                                    || p == root.join("NAMESPACE")
+                                    || p == root.join(".Rprofile")
+                                {
                                     Some((c.uri.clone(), c.typ == FileChangeType::DELETED))
                                 } else {
                                     None
@@ -5049,6 +5052,9 @@ impl LanguageServer for Backend {
                 }
             }
             if !deltas.is_empty() {
+                let rprofile_changed = deltas
+                    .iter()
+                    .any(|d| matches!(d, crate::package_state::PackageInputDelta::RProfileChanged));
                 let batch = crate::package_state::PackageInputDelta::Batch(deltas);
                 state.apply_package_event(&batch);
                 // A `Package:` rename changes which `system.file()` references
@@ -5072,7 +5078,19 @@ impl LanguageServer for Backend {
                         state
                             .documents
                             .keys()
-                            .filter(|uri| is_package_relevant_open_uri(uri, root))
+                            .filter(|uri| {
+                                // DESCRIPTION/NAMESPACE: package-relevant files.
+                                // .Rprofile prelude: any workspace R-language
+                                // file (the prelude reaches scripts/, which are
+                                // not "package-relevant").
+                                is_package_relevant_open_uri(uri, root)
+                                    || (rprofile_changed
+                                        && uri.to_file_path().ok().is_some_and(|p| {
+                                            crate::package_state::is_package_workspace_r_file(
+                                                &p, root,
+                                            )
+                                        }))
+                            })
                             .cloned()
                             .collect()
                     })
@@ -6231,6 +6249,19 @@ impl Backend {
             } else {
                 None
             };
+
+            let model_rprofile_changed =
+                state.cross_file_config.model_rprofile != prev.prev_cross_file.model_rprofile;
+            let pkg_mode_io_needed = pkg_mode_io_needed.or_else(|| {
+                if model_rprofile_changed {
+                    state
+                        .workspace_folders
+                        .first()
+                        .and_then(|u| u.to_file_path().ok())
+                } else {
+                    None
+                }
+            });
 
             let new_trigger_on_open_paren = state.completion_config.trigger_on_open_paren;
             let trigger_on_open_paren_changed =

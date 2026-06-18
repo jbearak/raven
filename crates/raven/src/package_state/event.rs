@@ -156,6 +156,30 @@ fn translate_watched(
         return Some(PackageInputDelta::NamespaceChanged);
     }
 
+    let canonical_rprofile = canonical_root.join(".Rprofile");
+    if canonical_path == canonical_rprofile || path == root.join(".Rprofile") {
+        if !inputs.model_rprofile {
+            // Modeling disabled: ensure no stale prelude lingers, no rescan.
+            let had = !inputs.rprofile_symbols.is_empty()
+                || !inputs.rprofile_attached_packages.is_empty();
+            inputs.rprofile_symbols.clear();
+            inputs.rprofile_attached_packages.clear();
+            inputs.rprofile_sourced_files.clear();
+            return had.then_some(PackageInputDelta::RProfileChanged);
+        }
+        if deleted {
+            inputs.rprofile_symbols.clear();
+            inputs.rprofile_attached_packages.clear();
+            inputs.rprofile_sourced_files.clear();
+            return Some(PackageInputDelta::RProfileChanged);
+        }
+        let scan = super::rprofile::scan_workspace_rprofile(root);
+        inputs.rprofile_symbols = scan.symbols;
+        inputs.rprofile_attached_packages = scan.attached_packages;
+        inputs.rprofile_sourced_files = scan.sourced_files;
+        return Some(PackageInputDelta::RProfileChanged);
+    }
+
     if let Some(kind) = is_r_source_path(&path, root) {
         if deleted {
             inputs.r_files.remove(&path);
@@ -788,6 +812,132 @@ mod tests {
         );
         assert!(matches!(delta, Some(PackageInputDelta::SettingChanged)));
         assert_eq!(inputs.package_mode, PackageMode::Disabled);
+    }
+
+    #[test]
+    fn watched_rprofile_change_rescans_and_emits_delta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+        std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(
+            inputs.rprofile_symbols.contains("my_helper"),
+            "got {:?}",
+            inputs.rprofile_symbols
+        );
+    }
+
+    #[test]
+    fn watched_rprofile_delete_clears_symbols() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+        inputs.rprofile_symbols.insert("old".to_string());
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(inputs.rprofile_symbols.is_empty());
+    }
+
+    #[test]
+    fn watched_rprofile_change_is_noop_when_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = false;
+        std::fs::write(root.join(".Rprofile"), "my_helper <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        // Disabled: no rescan, no symbols. (Delta may be None.)
+        assert!(inputs.rprofile_symbols.is_empty());
+        let _ = delta;
+    }
+
+    #[test]
+    fn acceptance_9_live_update_redrives_contribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.model_rprofile = true;
+
+        // Initial: helper_a defined.
+        std::fs::write(root.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let _ = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: uri.clone(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        let s1 = crate::package_state::derive_package_state(
+            &crate::package_state::PackageState::new(),
+            &inputs,
+            &PackageInputDelta::RProfileChanged,
+        );
+        assert!(
+            s1.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_a")
+        );
+
+        // Edit: helper_b instead.
+        std::fs::write(root.join(".Rprofile"), "helper_b <- function() 1\n").unwrap();
+        let _ = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        let s2 = crate::package_state::derive_package_state(
+            &s1,
+            &inputs,
+            &PackageInputDelta::RProfileChanged,
+        );
+        assert!(
+            s2.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_b")
+        );
+        assert!(
+            !s2.scope_contribution()
+                .rprofile_symbols
+                .contains("helper_a"),
+            "live edit must drop the old symbol"
+        );
     }
 
     #[test]
