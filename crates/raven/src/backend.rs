@@ -7432,9 +7432,22 @@ impl Backend {
             affected
         };
 
-        for u in affected {
-            self.publish_diagnostics(&u).await;
+        if affected.is_empty() {
+            return;
         }
+        // Publish via the bounded, concurrency-capped fanout — and SPAWN it
+        // rather than await, so this live-edit refresh does not block the
+        // sequentially-processed LSP message queue (a serial per-file publish
+        // here would stall subsequent edits on large workspaces).
+        let state_arc = self.state.clone();
+        let client = self.client.clone();
+        let traversal_truncation = self.traversal_truncation.clone();
+        tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+            state_arc,
+            client,
+            affected,
+            Some(traversal_truncation),
+        ));
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -9433,6 +9446,43 @@ mod tests {
                 config.diagnostics_enabled,
                 "diagnostics_enabled should default to true when enabled key is absent"
             );
+        }
+
+        #[test]
+        fn parse_cross_file_config_model_rprofile_defaults_on_and_reads_explicit() {
+            // Default-on: a client that omits `packages.modelRprofile` still
+            // gets the `.Rprofile` prelude — `CrossFileConfig::default()` has
+            // `model_rprofile = true` and the parser only overrides when the
+            // key is present. This is the value the package seed (in
+            // `initialized()`) copies into `package_inputs.model_rprofile`, so
+            // the feature is on by default even when the client sends nothing
+            // for it. (The earlier "off by default?" worry was a test artifact:
+            // the integration test never ran `initialized()`, so its seed never
+            // executed — not a default-propagation gap.)
+            let absent = json!({ "crossFile": {}, "packages": { "enabled": true } });
+            let config = crate::backend::parse_cross_file_config(&absent)
+                .unwrap()
+                .expect("packages section present → Some");
+            assert!(
+                config.model_rprofile,
+                "modelRprofile must default to true when the client omits it"
+            );
+
+            // Explicit values are honored.
+            let off = json!({ "packages": { "modelRprofile": false } });
+            let config = crate::backend::parse_cross_file_config(&off)
+                .unwrap()
+                .expect("packages section present → Some");
+            assert!(
+                !config.model_rprofile,
+                "explicit modelRprofile=false must be honored"
+            );
+
+            let on = json!({ "packages": { "modelRprofile": true } });
+            let config = crate::backend::parse_cross_file_config(&on)
+                .unwrap()
+                .expect("packages section present → Some");
+            assert!(config.model_rprofile);
         }
 
         #[test]
