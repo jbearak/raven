@@ -1,4 +1,4 @@
-# Transitive `load_all()` scope: across `source()` and from `.Rprofile`
+# Transitive `load_all()` scope: model as a virtual attached package
 
 **Date:** 2026-06-18
 **Status:** Design — approved, pending spec review
@@ -23,292 +23,248 @@ executed code — including files pulled in via `source()` and scripts started f
   ```
 
   `parent.R` sees `my_func` (completion, no undefined-variable diagnostic), but
-  `child.R` emits an undefined-variable diagnostic. The package contribution is
-  injected only into the root query file.
+  `child.R` emits an undefined-variable diagnostic.
 
 - **From `.Rprofile`.** A `load_all()` call in the workspace-root `.Rprofile`
   does not add the package's internal symbols to other scripts' scopes.
 
 By contrast, `library(pkg)` **does** propagate transitively across `source()`
-chains (position-aware: only `library()` calls *before* a `source()` call flow
-to that child), and `.Rprofile` `library()` attachments propagate via
+chains (position-aware), and `.Rprofile` `library()` attachments propagate via
 `inherited_packages`. The asymmetry is the bug.
 
 ## Root cause
 
-The package contribution (`PackageScopeContribution`: `r_internal_symbols`,
-`sysdata_symbols`, `onload_symbols`, `imported_symbols`, …) is injected by
-`append_package_contribution` / `append_rprofile_prelude` in
-`crates/raven/src/cross_file/scope.rs`, but **only at `current_depth == 0`** (the
-root query file). Every recursive walk into a sourced child passes
-`package_contribution = None`, so `load_all()` internals never cross a `source()`
-edge. `library()` avoids this because it propagates *package names*
-(`packages_for_child`) through the recursion, position-aware via the per-file
-`ScopeEvent::PackageLoad` timeline; `load_all()` injects a *fixed symbol set* and
-was never threaded.
+`load_all()` internals are injected directly into `scope.symbols` by
+`append_package_contribution` (`cross_file/scope.rs` ~6889), using the synthetic
+`PACKAGE_INTERNAL_URI`, and **only at the root query file** (`current_depth == 0`).
+Recursive walks into sourced children pass `package_contribution = None`, so the
+symbols never cross a `source()` edge in either direction. `library()` avoids this
+because it attaches a *package name* into `inherited_packages` via the
+`ScopeEvent::PackageLoad` timeline, and that name propagates through all the
+existing cross-file machinery.
 
-## Approved decisions
+## Core design decision (revised after adversarial review)
 
-1. **Position-aware across `source()`** — only a `load_all()` call that precedes
-   the `source()` call (and is in the same-or-ancestor function scope) propagates
-   to that child. Mirrors `library()` and R runtime semantics.
-2. **Child location is irrelevant** — when an in-root parent calls `load_all()`
-   and sources a child, the child sees the internals regardless of its own
-   location (even outside the package tree). The parent established package
-   identity. The `under_package_root` gate stays for **direct** `load_all()`
-   callers only.
-3. **`.Rprofile` `load_all()` follows prelude gating** — surfaced through the
-   same prelude path, withheld from `R/` and `tests/` in package mode (same as
-   `rprofile_prelude_applies`); `R/` and `tests/` already get internals via
-   dev-context, so nothing is lost there.
-4. **Precise revalidation closure** — when `R/` changes and package visibility
-   changes, the force-republish set is widened to the exact `load_all()` reach
-   (see below), not a blunt "all docs under root".
+**Model `load_all()` as attaching a synthetic "virtual package" rather than
+injecting symbols directly.** A `load_all()` call emits a
+`ScopeEvent::PackageLoad` event with a reserved sentinel package name; the
+package-name → symbols resolution chokepoints special-case that sentinel to
+resolve against the workspace-local `PackageScopeContribution` internal symbol
+set (rather than the installed-package database).
 
-## Which code path (corrected after adversarial review)
+This was option B in the first draft and was wrongly rejected as "leaky." It is
+in fact the cleanest approach: the propagation machinery for attached packages is
+a clean abstraction with a small number of resolution chokepoints. By reusing it,
+the following all come for **free** (no new code), each previously a bespoke
+mechanism or an open bug:
 
-The reported bug is observed when `child.R` is **opened directly** and its
-diagnostics flag `my_func()`. Verified against the code: a directly-opened
-sourced file gets its inherited scope through the **backward parent-prefix walk**
-(`scope.rs` ~5234 / parent-edges loop ~5494 / parent `PackageLoad` propagation
-~5653-5705), which collects each parent's pre-`source()` `library()` attachments
-into `prefix.inherited_packages`. The **forward** child-resolution block
-(`~6246-6320`, where `extra_packages` is computed from the `PackageLoad` timeline)
-only runs for `source()` calls *within the queried file* — it never fires for a
-directly-opened child. The backward parent-prefix recursive call passes
-`package_contribution = None` (`~5599-5600`).
+- **Backward propagation to a directly-opened child** (the reported bug) — a
+  directly-opened sourced file collects its parents' pre-`source()` `PackageLoad`
+  attachments via the backward parent-prefix walk (`scope.rs` ~5653-5705). The
+  forward child-resolution block never fires for a directly-opened child; the
+  first draft targeted it and would not have fixed the bug.
+- **Forward child→parent attachment hoist** — a parent that `source()`s the
+  load_all caller sees the package *after* the call, because child attachments
+  already hoist back into the parent's later scope (`scope.loaded_packages` from
+  sourced files). The bespoke approach would not have handled this.
+- **Position-awareness** (`(line,col)` comparison + function-scope gate).
+- **Multi-parent union** (a child sourced by two parents gets the union; safe
+  over-approximation, identical to `library()`).
+- **Transitivity** across `a.R → b.R → c.R`.
+- **Interface hashing** — `compute_interface_hash` already folds in `PackageLoad`
+  name + line + column + function scope (`scope.rs` ~4823-4830), so adding /
+  moving / removing a `load_all()` call revalidates dependents.
+- **`ForwardChildMemo` cache key** — `pkg_fp` hashes attached-package *names*
+  (`scope.rs` ~1265-1280), so a child resolved with vs. without the sentinel gets
+  distinct keys. (This was Codex's Item 8 blocker against the bespoke forward
+  approach; it disappears here.)
+- **`.Rprofile`** — add the sentinel to `rprofile_attached_packages`; the existing
+  prelude gating (`rprofile_prelude_applies`, including built-doc / `R/` / `tests/`
+  withholding) and injection then apply unchanged.
 
-**Therefore the fix must live in the backward parent-prefix path**, mirroring how
-`library()` already reaches a directly-opened child. The forward child-resolution
-path is intentionally **left unchanged**: a child's hoisted *definitions* (what
-the forward path computes and merges back into the parent's scope) do not depend
-on `load_all` internals being in scope, so forward propagation is not needed for
-the reported bug — and avoiding it sidesteps the `ForwardChildMemo` cache-key
-problem entirely (see §7).
+## Approved sub-decisions
 
-## Approach (chosen over alternatives)
-
-**A — backward "load_all in effect" propagation + `.Rprofile` prelude.** Record
-`load_all()` calls in the per-file timeline (`ScopeEvent::DevLoadAll`). In the
-backward parent-prefix walk, alongside the existing parent `PackageLoad`
-propagation, scan each parent's timeline for a pre-`source()`-call-site
-`DevLoadAll` event (same position + function-scope gates). When found (or when a
-parent is itself transitively under load_all), mark the prefix
-`load_all_in_effect` and inject the package contribution's internal symbols into
-the prefix. The `.Rprofile` case sets the same flag "from (0,0)".
-
-Rejected:
-
-- **B — model `load_all()` as a synthetic package in `inherited_packages`.** The
-  internals are not a real namespace; every consumer of `inherited_packages`
-  would need to special-case the pseudo-package, and symbol injection (synthetic
-  URI, kinds) does not match how packages resolve. Leaky, invasive.
-- **C — thread `package_contribution` into all forward descendants, gate at
-  injection only.** Not position-aware (fails decision 1) and forces a
-  `ForwardChildMemo` cache-key change for no benefit to the reported bug.
-- **D — forward child-resolution propagation (the original draft).** Targets the
-  wrong path: it never fires for a directly-opened child, which is the reported
-  bug. Rejected after verifying the backward/forward split in the code.
+1. **Position-aware** — only a `load_all()` call preceding a `source()` call (and
+   in the same-or-ancestor function scope) propagates. Free with `PackageLoad`.
+2. **Child location irrelevant; gate on the caller** — the sentinel
+   `PackageLoad` is emitted **only when the `load_all()` caller is
+   `under_package_root`** (the file that establishes package identity). Once
+   attached, it flows to children regardless of *their* location.
+3. **`.Rprofile` `load_all()` follows prelude gating** — surfaced by adding the
+   sentinel to `rprofile_attached_packages`, subject to the existing
+   `rprofile_prelude_applies` withholding (`R/`, `tests/`, built-doc dirs in
+   package mode; those already get internals via dev-context).
+4. **R/-change revalidation reuses the libpath-consumer probe** — treat the
+   sentinel as a changed package and reuse the existing "which open docs have
+   package P attached" intersection.
+5. **Resolution backing: thread the contribution into the chokepoints** (option
+   (b)), keeping workspace-local internals out of the installed-package database.
 
 ## Design
 
-### 1. Detection & artifacts
+### 1. Sentinel name & detection
 
-`call_is_dev_load_all()` already identifies the calls. Emit a new
-`ScopeEvent::DevLoadAll { line, column, function_scope }` into `timeline` at the
-same point `collect_definitions` sets `calls_dev_load_all`. Keep the
-`calls_dev_load_all` bool — still used by the root-file injection path and by the
-revalidation closure.
+- Define a reserved sentinel package name (a constant that cannot collide with a
+  real R package, e.g. containing a character illegal in package names). One
+  workspace = one package, so a single sentinel suffices.
+- `call_is_dev_load_all()` already detects the calls. In `collect_definitions`,
+  when it matches **and the file is `under_package_root`** (sub-decision 2), emit
+  `ScopeEvent::PackageLoad { line, column, package: SENTINEL, function_scope }`
+  into the timeline — exactly as a `library()` call would, at the call's
+  position. Drop the now-redundant `calls_dev_load_all` bool from the scope path
+  (retain only if still needed by the revalidation trigger; see §4).
 
-### 2. Backward parent-prefix propagation (decisions 1 + 2)
+### 2. Resolution at the chokepoints (sub-decision 5)
 
-In the parent-edges loop of the backward parent-prefix walk — exactly where the
-parent's `PackageLoad` events are already propagated into
-`prefix.inherited_packages` (`~5653-5705`) — add a parallel scan of each parent's
-timeline for `DevLoadAll` events, using the identical gates already applied to
-`PackageLoad`:
+The sentinel must resolve to the contribution's internal symbol set
+(`r_internal_symbols ∪ sysdata_symbols ∪ onload_symbols ∪ imported_symbols`).
+Thread the active `PackageScopeContribution` into the three resolution methods in
+`package_library.rs` and special-case the sentinel:
 
-- position: the `load_all()` call is at-or-before the effective `source()`
-  call-site position in the parent (`(load_line, load_col) <= (call_line, call_col)`,
-  matching the existing `PackageLoad` comparison);
-- function scope: `is_same_or_descendant_function_scope(...)`.
+- `is_symbol_from_loaded_packages` (~668) — undefined-variable suppression.
+- `find_package_owner_for_symbol` (~1287) — hover attribution.
+- `get_owned_exports_for_completions` (~607) — completion enumeration.
 
-A qualifying `DevLoadAll` is honored **only when the parent is a valid direct
-caller** — i.e. the parent file is `under_package_root` (decision 2 puts the gate
-on the parent that establishes package identity, never on the child). When the
-condition holds, set a new `load_all_in_effect: bool` on the `ParentPrefix`.
+Each, when it encounters the sentinel in the attached-package list, consults the
+threaded contribution's internal set instead of the installed cache. Their call
+sites in `handlers.rs` (completion ~17890, hover ~19470, undefined-var ~15317 /
+owner ~14691) pass the contribution (already available in the snapshot).
 
-Transitivity reuses the existing "propagate packages the parent inherited from
-*its* parents" step (`~5707-5729`): the parent's own `load_all_in_effect`
-(computed by its recursive scope resolution) ORs into the child's, so
-`a.R → b.R → c.R` with `load_all()` in `a.R` reaches `c.R`.
+Suppress the `PACKAGE_NOT_INSTALLED` diagnostic for the sentinel
+(`handlers.rs` ~5103 / ~5119): `package_exists` returns false for it, so add an
+explicit skip.
 
-### 3. Injecting internals into the prefix
+### 3. Remove the bespoke load_all injection; keep dev-context
 
-`package_contribution` is available at the depth-0 entry (`~5288`) where the
-prefix is built. When the assembled `ParentPrefix` has `load_all_in_effect`,
-inject the contribution's internal symbols (`r_internal_symbols`,
-`sysdata_symbols`, `onload_symbols`, `imported_symbols`) into `prefix.symbols`
-with `PACKAGE_INTERNAL_URI` and `or_insert_with` — the same symbol set and
-injection style `append_package_contribution` uses, but **bypassing the
-`under_package_root` gate on the child** (decision 2; the gate was already
-enforced on the parent in §2). The existing `current_depth == 0` direct-caller
-injection (gated by `calls_dev_load_all && under_package_root`) is unchanged and
-runs independently for files that call `load_all()` themselves.
+In `append_package_contribution` (`scope.rs` ~6889), remove the `dev_load_all`
+branch (the `(dev_load_all && under_package_root)` arm). The direct `load_all()`
+caller now gets internals via its own timeline's sentinel `PackageLoad` →
+`inherited_packages`/`loaded_packages` → resolution, identical to how a sourced
+child gets them. The independent **dev-context** path
+(`is_dev_context_path` — editing `R/`/`tests/` etc. with no `load_all()` call) is
+**unchanged**; the two conditions were already decoupled booleans.
 
-### 3a. Multi-parent over-approximation (decision: accept, consistent with library())
+`.Rprofile`: when the workspace-root `.Rprofile` calls `load_all()` (detected with
+`call_is_dev_load_all` during the `.Rprofile` scan), add the sentinel to
+`rprofile_attached_packages` in `PackageScopeContribution`. The existing
+`append_rprofile_prelude` path (gating + injection into `inherited_packages`) then
+handles it with no further change — and because `rprofile_attached_packages` is no
+longer empty, the existing early-return guard passes naturally.
 
-A child sourced by two parents already receives the **union** of both parents'
-`library()` attachments, path-agnostic (`~5716-5729`). `load_all` follows the
-same semantics: if *any* parent had a pre-`source()` `load_all()` in effect, the
-child sees internals — even on an execution path through a parent that did not.
-This is a safe false-negative direction (a suppressed diagnostic, never a
-fabricated one) and matches existing `library()` behavior, so it is accepted and
-documented rather than special-cased.
+### 4. R/-change revalidation (sub-decision 4)
 
-### 3b. Forward child-resolution path (intentionally unchanged)
+When `R/` changes and the recomputed `PackageScopeContribution` differs
+(`pkg_visibility_changed`), every doc that has the sentinel in its resolved
+attached set must be re-diagnosed — that is exactly the load_all caller, the files
+it `source()`s (callees), and the files that `source()` it (callers).
 
-The forward child-resolution block (`~6246-6320`) is **not** modified. It computes
-a child's definitions to hoist back into the *parent's* scope after a `source()`
-call; those definitions do not depend on `load_all` internals being in scope.
-Leaving it unchanged means `ForwardChildKey` / `ForwardChildMemo` need no new
-key field (see §7).
+Reuse the libpath-consumer affected-docs probe (`backend.rs` ~8294-8310:
+`scope_hit = inherited_packages ∩ trigger_set`) with `trigger_set = {SENTINEL}`.
+That path **snapshots inputs under the lock, drops the guard, then resolves scope
+per open doc** — satisfying the locking invariant (unlike a synchronous closure
+inside the write-lock handler). It covers caller, callees, and callers uniformly
+because all three carry the sentinel in their resolved attached set.
 
-### 4. `.Rprofile` `load_all()` (decision 3)
+Replace the original draft's bespoke `extend_with_open_package_docs` widening with
+this reuse. (The pre-existing gap — a root-level `analysis.R` calling `load_all()`
+not refreshed on `R/` change — is closed by the same mechanism, since it now
+carries the sentinel.)
 
-- Add `rprofile_calls_load_all: bool` to `PackageScopeContribution`, set when the
-  workspace-root `.Rprofile` contains a `load_all()` call (detected with the same
-  `call_is_dev_load_all` logic during prelude derivation). This requires plumbing
-  the flag through the `.Rprofile` scan **and** `derive_package_state` /
-  `build_scope_contribution` that populate the contribution — adding the struct
-  field alone is insufficient (it must actually be set for
-  `PackageScopeContribution` equality, and thus `pkg_visibility_changed`, to
-  react).
-- `append_rprofile_prelude`'s early-return guard currently bails when
-  `rprofile_symbols.is_empty() && rprofile_attached_packages.is_empty()`
-  (`~7210`). A `.Rprofile` that *only* calls `load_all()` has neither, so the
-  guard must be extended to also stay live when `rprofile_calls_load_all` is set;
-  otherwise the prelude no-ops.
-- When the flag is set and `rprofile_prelude_applies` passes, inject the package
-  internals (same symbol set as `append_package_contribution`). Note the
-  withholding via `rprofile_withheld_in_package_mode` covers `R/`, `tests/`,
-  **and built-doc dirs** (`package_state/mod.rs` ~307-308) — all three are
-  excluded in package mode, and all three already get internals via dev-context.
-- Model it as "load_all in effect from position (0,0)" for any file the prelude
-  reaches: set `prefix.load_all_in_effect` (or the depth-0 equivalent) so it both
-  injects into that file and, through the §2 transitivity, reaches files that
-  `source()` it (parallel to how `rprofile_attached_packages` already flow via
-  `inherited_packages`).
+### 5. Precedence (unchanged in spirit)
 
-### 5. Precedence (unchanged)
+Internals resolve at the attached-package-export tier — below local definitions,
+own directives, and the built-in policy tables — which is the correct, and
+arguably more-correct, tier for them (they are "from a package", not local). The
+direct-caller behavior is preserved: a local definition of the same name still
+wins because local `scope.symbols` resolution precedes package-export resolution
+in the consuming handlers.
 
-All injected internals use `or_insert_with`, so local definitions and all
-higher-precedence tiers win. Internals carry `PACKAGE_INTERNAL_URI`.
+### 6. LSP-feature parity (verified)
 
-### 6. Revalidation closure (decision 4)
-
-`extend_with_open_package_docs` (in `backend.rs`) currently marks only open docs
-matching `is_r_source_path` (`R/`, `tests/`) for force-republish when
-`pkg_visibility_changed`. This misses every `load_all()` consumer outside `R/` and
-`tests/` — a **pre-existing gap** (a root-level `analysis.R` calling `load_all()`
-already goes stale today) that this feature widens (out-of-root sourced children,
-`.Rprofile`-reached scripts).
-
-Widen the package-state affected-set to the existing `is_r_source_path` docs
-**plus the exact `load_all()` reach**:
-
-- every open doc whose artifacts have `calls_dev_load_all` and is under the root
-  (direct callers — closes the pre-existing gap);
-- their position-aware `source()`-graph descendants (reuse the existing
-  dependency-graph descendant walk; catches out-of-root children);
-- if `rprofile_calls_load_all`, every open doc for which `rprofile_prelude_applies`,
-  plus *their* source-graph descendants.
-
-Computing this set from the same gating predicates and graph primitives the
-injection uses keeps the "what sees the symbols" set and the "what gets
-revalidated" set from drifting.
-
-**Lock discipline (must hold).** `extend_with_open_package_docs` runs while the
-`WorldState` write lock is held (`backend.rs` ~4923 / ~5077-5114). The widened
-closure must use **only** the lock-safe primitives already used in that block:
-dependency-graph reachability (the same `compute_affected_dependents_after_edit`
-descendant walk) and `calls_dev_load_all` / `rprofile_calls_load_all` boolean
-checks read from already-snapshotted artifacts/contribution. It must **not**
-perform cross-file scope resolution under the lock — that would violate the
-documented locking invariant. (Path-based reachability + bool checks are cheap and
-match what the existing source-graph revalidation already does here.)
-
-### 7. Caching and interface-hash inputs
-
-- **`ForwardChildMemo` is not affected.** Because the forward child-resolution
-  path is left unchanged (§3b), `ForwardChildKey` (`{child_uri, path_fp, pkg_fp,
-  provider_fp}`, `~1236`; `pkg_fp` hashes package *names* only) needs no new field.
-  Had we propagated `load_all` forward, the key would have silently conflated a
-  child resolved with vs. without `load_all` in effect — the original draft's
-  latent bug, avoided by construction.
-- **Parent-prefix caching.** Verify that whatever caches/reuses the
-  `ParentPrefix` (`pre_computed_prefix`, standalone scope cache) keys on the
-  inputs that now determine `load_all_in_effect`. Since the prefix is recomputed
-  from parent artifacts and `load_all_in_effect` is derived from parent
-  `DevLoadAll` timeline events (covered by the interface hash below), prefix
-  reuse must invalidate when those events change. Confirm during implementation
-  that no prefix cache key omits this.
-- **`compute_interface_hash`** must include the new `DevLoadAll` timeline events
-  (line + column + function scope) so adding/removing/moving a `load_all()`
-  relative to a `source()` call revalidates dependents — mirroring how
-  `PackageLoad` events already feed the hash.
-- **`rprofile_calls_load_all`** must be populated in the contribution (see §4) so
-  `PackageScopeContribution` equality (used for `pkg_visibility_changed`) reacts;
-  the struct field alone, unpopulated, would never trip revalidation.
+- **Completion** — unchanged path; sentinel exports surface via
+  `get_owned_exports_for_completions`.
+- **Hover** — *improves*. Today load_all internals sit in `scope.symbols` with
+  `PACKAGE_INTERNAL_URI` and lose help text; via the package path they resolve
+  through `find_package_owner_for_symbol` and render real help.
+- **Go-to-definition** — no regression. Today goto no-ops on `PACKAGE_INTERNAL_URI`
+  scope symbols (`handlers.rs` ~20448); package exports are likewise
+  non-navigable. (Optional future improvement: map the sentinel's symbols to their
+  real `R/` source URIs to make goto jump to source — out of scope here.)
+- **Find-references** — unaffected (textual, not scope-symbol based).
 
 ## Testing
 
-Mirror the existing `library()`-across-`source()` and load_all tests
-(`state_tests.rs`, `cross_file/scope.rs`). The primary scenario is a
-**directly-opened child** (the reported bug), exercising the backward path:
+### A. Scope / diagnostics propagation (mirror existing `library()` tests)
 
-- **Reported bug:** `child.R` opened directly; `parent.R` does `load_all(); source("child.R")`
-  → `child.R` sees internals, no undefined-var diagnostic.
-- Position-aware: `parent.R` does `source("child.R"); load_all()` → `child.R` does
-  **not** see internals.
+- **Reported bug:** `child.R` opened directly; `parent.R` does
+  `load_all(); source("child.R")` → `child.R` sees internals, no undefined-var
+  diagnostic.
+- Position-aware: `source("child.R"); load_all()` → `child.R` does **not** see
+  internals.
 - Transitive: `a.R` (`load_all(); source("b.R")`) → `b.R` (`source("c.R")`); open
-  `c.R` directly → sees internals (§2 transitivity).
-- Decision 2: in-root parent → **out-of-root** child → child sees internals; gate
-  enforced on the parent (an out-of-root parent calling bare `load_all()` does not
-  propagate).
-- Function-scoped `load_all()` in the parent: child sourced within that scope sees
-  internals; sourced outside it does not.
-- Multi-parent (§3a): `child.R` sourced by `pA.R` (pre-source `load_all()`) and
-  `pB.R` (none) → child sees internals (documented union over-approximation).
-- `.Rprofile` `load_all()` → directly-opened script sees internals; **withheld**
-  from `R/`, `tests/`, and built-doc dirs in package mode (decision 3);
-  a `.Rprofile` that *only* calls `load_all()` still triggers injection (guard fix, §4);
-  propagates to that script's sourced children.
-- Revalidation: with `child.R` (out-of-root, sourced after `load_all()` in
-  `parent.R`) open, adding a symbol to `R/` force-republishes `child.R`'s
-  diagnostics (decision 4). Same for a root-level direct `load_all()` caller and a
-  `.Rprofile`-reached script.
+  `c.R` → sees internals.
+- Forward child→parent hoist: `main.R` does `source("loader.R"); my_func()` where
+  `loader.R` calls `load_all()` → `main.R` sees `my_func` after the `source()`.
+- Sub-decision 2: in-root parent → **out-of-root** child → child sees internals;
+  an out-of-root file calling bare `load_all()` does **not** attach the sentinel.
+- Function-scoped `load_all()`: child sourced within that scope sees internals;
+  sourced outside it does not.
+- Multi-parent: `child.R` sourced by `pA.R` (pre-source `load_all()`) and `pB.R`
+  (none) → child sees internals (documented union over-approximation).
+- `.Rprofile` `load_all()`: directly-opened script sees internals; **withheld**
+  from `R/`, `tests/`, built-doc dirs in package mode; a `.Rprofile` that *only*
+  calls `load_all()` still attaches; propagates to that script's sourced children.
+
+### B. R/ lifecycle → diagnostics (REQUIRED — explicit user requirement)
+
+For each mutation, assert diagnostics update correctly in **all three roles**:
+the file calling `load_all()` (`L`), files that `source()` `L` (callers, incl.
+the post-`source()` continuation), and files `L` `source()`s (callees). Use the
+`did_change_watched_files` / package-state path so revalidation (§4) is exercised
+end-to-end, not just a single recompute.
+
+- **ADD** a file to `R/` defining `new_func`:
+  - before: `new_func()` in `L`, in a caller (after sourcing `L`), and in a callee
+    each emit an undefined-variable diagnostic;
+  - after add: all three diagnostics are **suppressed** (cleared) without editing
+    those files — i.e. force-republish fires for all three.
+- **DELETE** a file from `R/` that defined `my_func`:
+  - before: `my_func()` is suppressed in `L`, caller, callee;
+  - after delete: the undefined-variable diagnostic **reappears** in all three.
+- **EDIT** a file in `R/` renaming `old_func` → `new_func`:
+  - after edit: `old_func()` becomes **unsuppressed** (diagnostic appears) and
+    `new_func()` becomes **suppressed** (diagnostic clears) in `L`, caller, callee.
+- **Negative / scoping controls:**
+  - a `load_all()` placed *after* a `source(callee)` call does **not** suppress the
+    callee's diagnostics (position-aware revalidation);
+  - an out-of-root file with a bare `load_all()` is **not** affected by `R/`
+    changes (sentinel never attached);
+  - in package mode, `R/` and `tests/` files are governed by dev-context, not the
+    `.Rprofile` sentinel (withholding holds).
+- **Monotonicity:** republished diagnostics respect document-version
+  monotonicity / the force-republish gate (no older-version publish).
 
 ## Docs to update
 
-- `docs/cross-file.md` — `load_all()` propagation across `source()`, parallel to
-  the existing `library()` section.
-- `docs/r-package-dev.md` — transitive `load_all()` behavior.
+- `docs/cross-file.md` — `load_all()` modeled as a virtual attached package;
+  propagation parallel to `library()`.
+- `docs/r-package-dev.md` — transitive `load_all()` behavior and R/-change
+  diagnostics refresh.
 - `docs/rprofile.md` — `.Rprofile` `load_all()` behavior and package-mode
   withholding.
 
 ## Invariants touched
 
-- Backward `load_all` propagation reuses the parent `PackageLoad` propagation in
-  the parent-prefix walk — keep the `DevLoadAll` scan structurally identical to
-  the `PackageLoad` scan (same position/function-scope gates) so they cannot
-  drift.
-- The injection reach and the revalidation closure must be computed from the same
-  predicates (`calls_dev_load_all`, `under_package_root` on the **parent/direct
-  caller**, `rprofile_prelude_applies`, source-graph descendants).
-- The revalidation closure runs under the `WorldState` write lock and must use
-  only graph reachability + artifact/contribution bool checks — never cross-file
-  scope resolution under the lock (§6).
-- The forward child-resolution path and `ForwardChildMemo` key are intentionally
-  unchanged; if a future change does propagate `load_all` forward, the cache key
-  must gain a `load_all_in_effect` discriminator (§7).
+- The sentinel `PackageLoad` must be emitted **only** when the `load_all()` caller
+  is `under_package_root` (sub-decision 2 gate sits on the caller, never the
+  child).
+- Sentinel resolution lives behind the three `package_library` chokepoints only;
+  no other consumer of `inherited_packages` may assume entries are installed
+  packages (the `PACKAGE_NOT_INSTALLED` diagnostic is the one exception, explicitly
+  skipped).
+- R/-change revalidation reuses the libpath-consumer probe and therefore inherits
+  its locking discipline: snapshot inputs under the lock, drop the guard, then
+  resolve scope per doc — never resolve cross-file scope while holding the lock.
+- The dev-context internals path stays independent of the `load_all()` sentinel
+  path; removing the `dev_load_all` branch from `append_package_contribution` must
+  not alter dev-context behavior.
