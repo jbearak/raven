@@ -1304,6 +1304,11 @@
           ],
           "description": "Controls R package workspace mode. When active, all R/*.R files are treated as mutually visible (flat namespace), and imports from NAMESPACE/roxygen suppress undefined-variable diagnostics."
         },
+        "raven.packages.modelRprofile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Model a workspace-root .Rprofile's top-level source()/library()/assignments as a script-scope prelude, so files where R would source .Rprofile (scripts, data-raw, non-package R/) resolve the helpers it provides. Suppressive only: never introduces a diagnostic."
+        },
         "raven.symbols.workspaceMaxResults": {
           "type": "number",
           "default": 1000,

@@ -114,6 +114,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'packages.watchLibraryPaths', jsonPath: ['packages', 'watchLibraryPaths'], type: 'boolean' },
     { vsCodeKey: 'packages.watchDebounceMs', jsonPath: ['packages', 'watchDebounceMs'], type: 'number' },
     { vsCodeKey: 'packages.packageMode', jsonPath: ['packages', 'packageMode'], type: 'enum', enumValues: ['auto', 'enabled', 'disabled'] as const },
+    { vsCodeKey: 'packages.modelRprofile', jsonPath: ['packages', 'modelRprofile'], type: 'boolean' },
     // Symbol settings
     { vsCodeKey: 'symbols.workspaceMaxResults', jsonPath: ['symbols', 'workspaceMaxResults'], type: 'number' },
     // Completion settings
