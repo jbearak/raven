@@ -839,6 +839,10 @@ impl PackageLibrary {
     /// `load()` (no promotion, no locking), matching the hot-path discipline of
     /// [`is_cached_sync`] / [`is_symbol_from_loaded_packages`].
     pub fn data_objects_for_stem_sync(&self, package: &str, stem: &str) -> Vec<String> {
+        // The load_all sentinel is not an installed package and has no datasets.
+        if is_load_all_sentinel(package) {
+            return Vec::new();
+        }
         let cache = self.packages.load();
         cache
             .get(package)

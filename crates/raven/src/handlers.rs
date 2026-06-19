@@ -14708,6 +14708,7 @@ fn table_verb_policy(
     //      has a policy, rather than wrongly checking it as a standard-eval arg.
     if let Some(lib) = analysis.package_library
         && let Some(owner) = lib.find_package_owner_for_symbol(name, &analysis.in_play_packages)
+        && !crate::package_library::is_load_all_sentinel(&owner)
         && let Some(policy) = crate::nse::package_policy(&owner, name)
     {
         return Some(policy);
@@ -20634,28 +20635,30 @@ pub fn goto_definition_with_cancel(
             .iter()
             .chain(scope.inherited_packages.iter())
             .any(|p| crate::package_library::is_load_all_sentinel(p));
-        // For a genuine package internal this block is AUTHORITATIVE — we do NOT
-        // fall through to the general `exported_interface` fallback below, which
-        // is scope-blind and would otherwise resurrect a function-local / rm'd /
-        // sentinel-stripped binding of the same name as a phantom goto target:
-        //   * sentinel in scope  -> resolve via the rm-aware `top_level_interface`
-        //     (Some R/ location, or None for a name with no live top-level def —
-        //     sysdata/imported/rm'd).
-        //   * sentinel NOT in scope -> None. The internal is not visible here, so
-        //     no jump (consistent with the undefined-variable diagnostic).
-        if is_contributed_internal {
-            if sentinel_in_scope {
-                return resolve_package_internal_goto(
-                    name,
-                    scope_key,
-                    root,
-                    &content_provider,
-                    &state.document_store.uris(),
-                    &state.workspace_index_new,
-                    cancel,
-                );
-            }
-            return None;
+        // The rm-aware, package-tree-restricted resolver fires ONLY with the
+        // load_all sentinel actually in scope. That precise path is authoritative
+        // for the load_all() overlay — it resolves via the rm-aware
+        // `top_level_interface` (Some R/ location, or None for a name with no live
+        // top-level def — sysdata/imported/rm'd) and we do NOT fall through to the
+        // scope-blind general fallback, which would otherwise resurrect a
+        // function-local / rm'd / sentinel-stripped binding as a phantom target.
+        //
+        // When the sentinel is NOT in scope we must NOT short-circuit to None:
+        // doing so would be MORE restrictive than the pre-feature behavior and
+        // silently swallow goto for a name that has a legitimate workspace
+        // definition. Instead we fall through to the general open-docs +
+        // workspace-index `exported_interface` fallback below (ordinary goto
+        // resolution — e.g. the R/ definition in a package workspace).
+        if is_contributed_internal && sentinel_in_scope {
+            return resolve_package_internal_goto(
+                name,
+                scope_key,
+                root,
+                &content_provider,
+                &state.document_store.uris(),
+                &state.workspace_index_new,
+                cancel,
+            );
         }
     }
 
@@ -65418,28 +65421,35 @@ mod load_all_internal_goto_tests {
         assert_eq!(l.range.start.line, 2);
     }
 
-    /// Negative: a package-workspace script that references an internal name but
-    /// does NOT call `load_all()` (so the sentinel is not attached in scope) must
-    /// NOT jump to the R/ definition. The redirect models the load_all overlay
-    /// path, which only applies when the sentinel is in scope; otherwise the name
-    /// is undefined here (diagnostics flag it) and goto must not contradict that.
+    /// Without a `load_all()` sentinel in scope, the rm-aware,
+    /// package-tree-restricted resolver must NOT fire — but goto must also NOT be
+    /// silently swallowed (returning `None`) for a name that has a legitimate
+    /// workspace definition. The special resolver is gated on the sentinel; when
+    /// it is absent we fall THROUGH to the pre-feature general fallback (the
+    /// open-docs + workspace-index `exported_interface` scan). In a package
+    /// workspace the `R/` file is indexed and exports `my_func`, so the general
+    /// fallback resolves to that R/ definition. The key guarantee is that goto is
+    /// not regressed to `None` for a name with a workspace definition.
     #[test]
-    fn goto_internal_without_load_all_does_not_jump() {
+    fn goto_internal_without_load_all_falls_through_to_general_fallback() {
         let mut state = state_with_internals(&["my_func"]);
         // Real def lives under R/.
-        index_closed_file(
+        let r_uri = index_closed_file(
             &mut state,
             "file:///work/pkg/R/real.R",
             "my_func <- function() 1\n",
         );
         // A script UNDER the package root (so the query-file gate would keep a
         // sentinel if one were attached) that references `my_func` but never
-        // calls load_all(). No sentinel in scope → no redirect.
+        // calls load_all(). No sentinel in scope → the special resolver does NOT
+        // fire; instead goto falls through to the general fallback.
         let caller = add_legacy_doc(&mut state, "file:///work/pkg/dev/script.R", "my_func()\n");
-        assert!(
-            goto(&state, &caller, Position::new(0, 1)).is_none(),
-            "without a load_all() sentinel in scope, goto on a package internal must not jump to R/ source"
+        let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+        assert_eq!(
+            l.uri, r_uri,
+            "without a sentinel, goto must NOT be swallowed — it falls through to the general fallback and resolves the R/ definition"
         );
+        assert_eq!(l.range.start.line, 0, "lands on the def line in R/real.R");
     }
 
     /// Dev-context path: an internal referenced from WITHIN an `R/` file (and a test
