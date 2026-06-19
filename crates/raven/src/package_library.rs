@@ -83,6 +83,31 @@ fn meta_package_fields(name: &str) -> (bool, Vec<String>) {
     (!attached_packages.is_empty(), attached_packages)
 }
 
+/// Reserved package name used to model `devtools::load_all()` / `pkgload::load_all()`
+/// as a synthetic attached package. Contains `_`, which is illegal in real R package
+/// names, so it can never collide with an installed/attached package.
+pub const LOAD_ALL_SENTINEL: &str = "__raven_load_all__";
+
+/// True iff `name` is the reserved `load_all()` sentinel package name.
+///
+/// Every consumer that iterates attached package *names* and feeds them to
+/// installed-package machinery or the R subprocess MUST skip the sentinel via this
+/// predicate (the sentinel resolves only through the local-dev overlay chokepoints).
+#[inline]
+pub fn is_load_all_sentinel(name: &str) -> bool {
+    name == LOAD_ALL_SENTINEL
+}
+
+/// Workspace-local internal symbol set exposed by a `load_all()` virtual attached
+/// package. Built from the active `PackageScopeContribution`; refreshed by the single
+/// contribution writer (`apply_package_event`). Holds names only — go-to-definition
+/// derives locations from the workspace index, never from here.
+#[derive(Debug, Clone, Default)]
+pub struct LocalDevPackage {
+    /// Union of r_internal ∪ sysdata ∪ onload ∪ imported symbol names.
+    pub symbols: std::collections::HashSet<String>,
+}
+
 /// True when `path` is a regular file whose contents can actually be opened
 /// for reading.
 ///
@@ -351,6 +376,10 @@ pub struct PackageLibrary {
     /// package. Empty by default; populated by `build_package_library`. These
     /// feed export resolution only — never `package_exists()` (install status).
     providers: Vec<Box<dyn PackageMetadataProvider>>,
+    /// Local-dev overlay: sentinel -> workspace-local internal symbols.
+    /// Consulted by the three resolution chokepoints before the installed caches.
+    /// Refreshed by `apply_package_event` (the single contribution writer).
+    local_dev_overlay: ArcSwap<Option<Arc<LocalDevPackage>>>,
 }
 
 impl PackageLibrary {
@@ -371,6 +400,7 @@ impl PackageLibrary {
             base_exports: Arc::new(HashSet::new()),
             r_subprocess: None,
             providers: Vec::new(),
+            local_dev_overlay: ArcSwap::from_pointee(None),
         }
     }
 
@@ -393,6 +423,7 @@ impl PackageLibrary {
             base_exports: Arc::new(HashSet::new()),
             r_subprocess,
             providers: Vec::new(),
+            local_dev_overlay: ArcSwap::from_pointee(None),
         }
     }
 
@@ -441,6 +472,24 @@ impl PackageLibrary {
     /// common Tier-1-only case).
     pub fn has_providers(&self) -> bool {
         !self.providers.is_empty()
+    }
+
+    /// Replace the local-dev overlay (single writer: `apply_package_event`).
+    pub fn set_local_dev_overlay(&self, overlay: Option<Arc<LocalDevPackage>>) {
+        self.local_dev_overlay.store(Arc::new(overlay));
+    }
+
+    /// True iff the load_all sentinel is in `loaded_packages` and the overlay
+    /// contains `name`. (Chokepoints wire to this in Task 2.)
+    #[allow(dead_code)] // wired up in Task 2
+    fn overlay_has_symbol(&self, name: &str, loaded_packages: &[String]) -> bool {
+        if !loaded_packages.iter().any(|p| is_load_all_sentinel(p)) {
+            return false;
+        }
+        match self.local_dev_overlay.load().as_ref() {
+            Some(pkg) => pkg.symbols.contains(name),
+            None => false,
+        }
     }
 
     /// Publish a new per-package cache snapshot after applying `f` to a clone of
@@ -6188,5 +6237,23 @@ mod tests {
             .await
             .expect("datasets cached");
         assert!(datasets.lazy_data.contains(&"mtcars".to_string()));
+    }
+
+    #[test]
+    fn load_all_sentinel_is_recognized_and_non_colliding() {
+        assert!(is_load_all_sentinel(LOAD_ALL_SENTINEL));
+        assert!(!is_load_all_sentinel("dplyr"));
+        assert!(!is_load_all_sentinel("load_all"));
+        assert!(LOAD_ALL_SENTINEL.contains('_'));
+    }
+
+    #[test]
+    fn empty_overlay_resolution_is_unchanged() {
+        let lib = PackageLibrary::new_empty();
+        assert!(!lib.is_symbol_from_loaded_packages("anything", &[LOAD_ALL_SENTINEL.to_string()]));
+        assert_eq!(
+            lib.find_package_owner_for_symbol("anything", &[LOAD_ALL_SENTINEL.to_string()]),
+            None
+        );
     }
 }
