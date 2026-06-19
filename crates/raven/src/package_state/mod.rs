@@ -946,19 +946,32 @@ pub struct PackageScopeContribution {
 }
 
 impl PackageScopeContribution {
-    /// True iff `name` is a symbol exposed by this package as a load_all() internal
-    /// (the local-dev overlay's contents): an R/ internal, sysdata object, .onLoad/
-    /// .onAttach binding, or a NAMESPACE-imported name. Single source of truth for
-    /// the overlay build (`WorldState::refresh_local_dev_overlay` in state.rs) and
-    /// the goto contributed-internal gate (handlers.rs) so they cannot drift.
+    /// Every symbol this package exposes as a `load_all()` internal — the exact
+    /// contents of the local-dev overlay: R/ internals, sysdata objects,
+    /// `.onLoad`/`.onAttach` bindings, and NAMESPACE-imported names.
     ///
-    /// The overlay build in state.rs enumerates these same four sets to populate the
-    /// `LocalDevPackage` symbol set; keep that union in lockstep with this predicate.
+    /// This is the SINGLE enumeration of those four sources. Both consumers go
+    /// through it so they cannot drift: `WorldState::refresh_local_dev_overlay`
+    /// (state.rs) collects it into the `LocalDevPackage` symbol set, and
+    /// [`Self::is_local_dev_internal`] (the goto contributed-internal gate in
+    /// handlers.rs) tests membership against it. Add a new internal-symbol source
+    /// here and both pick it up automatically.
+    pub fn local_dev_internal_symbols(&self) -> impl Iterator<Item = &str> {
+        self.r_internal_symbols
+            .iter()
+            .map(String::as_str)
+            .chain(self.sysdata_symbols.iter().map(String::as_str))
+            .chain(self.onload_symbols.iter().map(String::as_str))
+            .chain(self.imported_symbols.keys().map(String::as_str))
+    }
+
+    /// True iff `name` is exposed by this package as a `load_all()` internal.
+    /// Delegates to [`Self::local_dev_internal_symbols`] so it can never disagree
+    /// with the overlay build about which sources count. Called O(1) times per
+    /// go-to-definition (not per diagnostics symbol), so the linear scan over the
+    /// internal set is not on a hot path.
     pub fn is_local_dev_internal(&self, name: &str) -> bool {
-        self.r_internal_symbols.contains(name)
-            || self.sysdata_symbols.contains(name)
-            || self.onload_symbols.contains(name)
-            || self.imported_symbols.contains_key(name)
+        self.local_dev_internal_symbols().any(|s| s == name)
     }
 }
 

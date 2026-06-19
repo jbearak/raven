@@ -634,17 +634,15 @@ impl WorldState {
     pub fn refresh_local_dev_overlay(&self) {
         let contrib = self.package_state.scope_contribution();
         let overlay = if contrib.workspace_root.is_some() {
-            // The overlay needs the actual set, so we build it by union here rather
-            // than via a predicate. This union MUST stay in lockstep with
-            // `PackageScopeContribution::is_local_dev_internal` (the goto
-            // contributed-internal gate in handlers.rs) — the four sets below are
-            // exactly the membership tests that predicate performs. If you add a
-            // set to one, add it to the other.
-            let mut symbols = std::collections::HashSet::new();
-            symbols.extend(contrib.r_internal_symbols.iter().cloned());
-            symbols.extend(contrib.sysdata_symbols.iter().cloned());
-            symbols.extend(contrib.onload_symbols.iter().cloned());
-            symbols.extend(contrib.imported_symbols.keys().cloned());
+            // Build the overlay from the single shared enumeration of internal
+            // sources (`local_dev_internal_symbols`), the same one
+            // `PackageScopeContribution::is_local_dev_internal` (the goto gate in
+            // handlers.rs) tests against — so the overlay's contents and that
+            // predicate cannot drift on which sources count.
+            let symbols: std::collections::HashSet<String> = contrib
+                .local_dev_internal_symbols()
+                .map(str::to_string)
+                .collect();
             Some(std::sync::Arc::new(
                 crate::package_library::LocalDevPackage { symbols },
             ))

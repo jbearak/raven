@@ -5542,6 +5542,39 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 continue;
             }
 
+            // Package-availability guard — parity with the undefined-variable
+            // collector's position-aware `is_package_export` check at this
+            // position. A name provided by a package attached at/before this
+            // usage is genuinely in scope, so a later `source()` that happens to
+            // re-export it must NOT be blamed. Covers `library()`/`require()`
+            // attaches, DESCRIPTION imports, and — the motivating case — a
+            // `devtools::load_all()` exposing the package's own internals via the
+            // `LOAD_ALL_SENTINEL` local-dev overlay. `ScopeStream::is_visible`
+            // (the `in_scope` check above) consults only the symbol set, and a
+            // load_all internal resolves through the overlay rather than as an
+            // injected symbol, so without this the out-of-scope collector would
+            // emit a false "used before available" that the undefined-variable
+            // collector already suppresses. Resolved lazily here — only at the
+            // rare would-fire point, not per usage — so the streaming fast path
+            // stays cheap; `get_scope` is memoized in `scope_cache`.
+            // Position-awareness AND the load_all out-of-root sentinel gate both
+            // come for free from `get_scope`'s `append_package_contribution`.
+            if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
+                let scope = scope_cache
+                    .entry((*usage_line, *usage_col))
+                    .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+                let pkgs: Vec<String> = scope
+                    .inherited_packages
+                    .iter()
+                    .chain(scope.loaded_packages.iter())
+                    .chain(snapshot.scope_contribution.full_imports.iter())
+                    .cloned()
+                    .collect();
+                if !pkgs.is_empty() && is_package_export(name, &pkgs, &snapshot.package_library) {
+                    break;
+                }
+            }
+
             let line_text = get_line(usage_node.start_position().row);
             let start_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
@@ -20617,10 +20650,10 @@ pub fn goto_definition_with_cancel(
         .as_ref()
     {
         let contrib = state.package_state.scope_contribution();
-        // Mirror the local-dev overlay's FOUR sets exactly
-        // (`refresh_local_dev_overlay` in state.rs:
-        // r_internal_symbols ∪ sysdata_symbols ∪ onload_symbols ∪
-        // imported_symbols.keys()). A sentinel-owned sysdata or imported name must
+        // `is_local_dev_internal` tests the same shared enumeration
+        // (`local_dev_internal_symbols`: R/ internals ∪ sysdata ∪ onload ∪
+        // imported names) that builds the local-dev overlay, so this gate and the
+        // overlay cannot disagree. A sentinel-owned sysdata or imported name must
         // route through the precise `resolve_package_internal_goto` (rm-aware
         // `top_level_interface`, `is_r_source_path`-restricted) so it cleanly
         // no-ops — otherwise it would fall through to the scope-blind general
@@ -20884,8 +20917,23 @@ fn resolve_package_internal_goto(
         let Some(artifacts) = content_provider.get_artifacts(file_uri) else {
             return true;
         };
-        let interface = scope::top_level_interface(&artifacts);
-        if let Some(symbol) = interface.get(name).or_else(|| interface.get(scope_key)) {
+        // Gate on the rm-aware live top-level NAME set (cheap: a single timeline
+        // walk, no per-symbol clones) before touching the symbol map. This is
+        // equivalent to `top_level_interface(&artifacts).get(name)` — that map is
+        // exactly `exported_interface` filtered by `live_top_level_exports` — but
+        // avoids materializing the whole per-file `HashMap<_, ScopedSymbol>` just
+        // to read one entry (this runs for EVERY R/ file in the open set + index).
+        let live = scope::live_top_level_exports(&artifacts);
+        let hit = if live.contains(name) {
+            Some(name)
+        } else if live.contains(scope_key) {
+            Some(scope_key)
+        } else {
+            None
+        };
+        // The symbol comes from `exported_interface` (rm-awareness already enforced
+        // by the `live` gate above), matching `top_level_interface`'s contents.
+        if let Some(symbol) = hit.and_then(|n| artifacts.exported_interface.get(n)) {
             // Pick the lexicographically smallest URI string for a stable result
             // when several R/ files define the same top-level name.
             let replace = match best {
@@ -56035,6 +56083,98 @@ source(\"helpers.R\")
             diagnostics
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A `load_all()` caller that uses one of the package's own internals —
+    /// made available position-aware via the `LOAD_ALL_SENTINEL` local-dev
+    /// overlay — must NOT get a false "used before it's available" diagnostic
+    /// when a later `source()` target happens to export the same name.
+    ///
+    /// `ScopeStream::is_visible` only consults the symbol set, and a load_all()
+    /// internal resolves through the overlay (NOT as an injected symbol), so it
+    /// is invisible to `is_visible`. The undefined-variable collector already
+    /// suppresses such a use via its position-aware `is_package_export` check
+    /// over `scope.loaded_packages`; the out-of-scope collector must agree, or
+    /// the two collectors disagree on the same name (regression).
+    #[test]
+    fn load_all_internal_not_flagged_used_before_sourced_by_later_source() {
+        let mut state = create_test_state();
+        state.workspace_folders = vec![Url::parse("file:///work/pkg").unwrap()];
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        // The package owns an internal `helper`; the local-dev overlay exposes it
+        // under the load_all sentinel.
+        let mut internals = std::collections::BTreeSet::new();
+        internals.insert("helper".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: crate::package_state::PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: Some("mypkg".to_string()),
+                    r_internal_symbols: std::sync::Arc::new(internals.clone()),
+                    ..crate::package_state::PackageScopeContribution::default()
+                },
+                ..Default::default()
+            });
+        state
+            .package_library
+            .set_local_dev_overlay(Some(std::sync::Arc::new(
+                crate::package_library::LocalDevPackage {
+                    symbols: internals.into_iter().collect(),
+                },
+            )));
+
+        // explore.R is UNDER the package root but NOT under R/ or a dev-context
+        // dir, so the package's internals are NOT in `contribution_symbol_names`
+        // — `helper` becomes visible only AFTER the load_all() call, via the
+        // overlay. A later source() target also exports a top-level `helper`.
+        let explore_uri = Url::parse("file:///work/pkg/explore.R").unwrap();
+        let helpers_uri = Url::parse("file:///work/pkg/helpers.R").unwrap();
+        let explore_code = "\
+pkgload::load_all()
+helper()
+source(\"helpers.R\")
+";
+        let helpers_code = "helper <- function() 1\n";
+
+        for (uri, code) in [(&explore_uri, explore_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &explore_uri).expect("snapshot for explore.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &explore_uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+
+        let helper_used_before: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'helper'")
+            })
+            .collect();
+        assert!(
+            helper_used_before.is_empty(),
+            "load_all() internal `helper` must not be flagged 'used before available' by a \
+             later source() that re-exports it. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
         );
     }

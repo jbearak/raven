@@ -296,7 +296,9 @@ pub fn resolve(
         // which is not installed and must never be sent to the R subprocess
         // (`get_function_formals` already rejects it as an invalid package
         // name, but short-circuit here so we never build a sentinel cache key
-        // or attempt the query). Fall through to local/fallback resolution.
+        // or attempt the query). Local/cross-file resolution already ran above,
+        // so returning None here simply declines package-formal resolution (the
+        // caller then falls back to generic signature help).
         if crate::package_library::is_load_all_sentinel(pkg_name) {
             return None;
         }

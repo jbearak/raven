@@ -1558,6 +1558,22 @@ fn extend_affected_for_load_all_revalidation_from_state(
     let rprofile_attaches_sentinel = contrib
         .rprofile_attached_packages
         .contains(crate::package_library::LOAD_ALL_SENTINEL);
+    // Fast path: in a workspace with no `.Rprofile` sentinel attach and no open
+    // load_all carrier — the overwhelmingly common case — there is nothing to
+    // seed. Detecting a carrier needs the cache peek anyway, but skipping the
+    // per-doc `to_file_path()` allocation and the `open_docs` Vec build below is
+    // free on every R/-change. (When we DO proceed, the carrier peek is repeated
+    // in the Vec build; that path only runs when load_all is actually in play.)
+    if !rprofile_attaches_sentinel
+        && !state.documents.keys().any(|u| {
+            state
+                .document_store
+                .get_without_touch(u)
+                .is_some_and(|doc| doc.artifacts.calls_dev_load_all)
+        })
+    {
+        return;
+    }
     // Snapshot open docs with their load_all-carrier flag (cache peek, no scope
     // resolution) and on-disk path.
     let open_docs: Vec<(Url, bool, std::path::PathBuf)> = state

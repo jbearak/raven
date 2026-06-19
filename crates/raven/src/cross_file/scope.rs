@@ -766,13 +766,19 @@ pub struct ScopeArtifacts {
     pub interface_hash: u64,
     /// Interval tree for O(log n) function scope queries
     pub function_scope_tree: FunctionScopeTree,
-    /// `true` when this file contains a `devtools::load_all()` /
-    /// `pkgload::load_all()` / bare `load_all()` call. Such a call attaches the
-    /// package under development — exposing its internal and exported symbols —
-    /// so in package mode the file is granted the package's own
-    /// `r_internal_symbols` (plus sysdata/onload/imported) regardless of where
-    /// it sits in the source tree (`internal/`, `tools/`, `debug/`, …). See
-    /// [`append_package_contribution`].
+    /// `true` when this file contains a non-quoted `devtools::load_all()` /
+    /// `pkgload::load_all()` / bare `load_all()` call site (including one that
+    /// lives only inside a function body).
+    ///
+    /// This is a *carrier* flag for R/-change revalidation: `backend.rs` reads it
+    /// to decide whether an open doc (and its source-graph neighborhood) must be
+    /// re-diagnosed when the package's `R/` symbols change. The actual symbol
+    /// exposure is NOT driven by this bool — each call site in
+    /// [`Self::dev_load_all_sites`] emits a position-aware `LOAD_ALL_SENTINEL`
+    /// `PackageLoad` event whose internals resolve through the package library's
+    /// local-dev overlay (so internals are visible only AFTER the call, and a
+    /// function-scoped site never attaches at top level). It is exactly
+    /// `!dev_load_all_sites.is_empty()`; the two are set together.
     pub calls_dev_load_all: bool,
     /// Every detected devtools/pkgload::load_all() call site (line, column), in
     /// document order. Each is emitted as a sentinel PackageLoad event in the
@@ -1756,6 +1762,30 @@ fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
     }
 }
 
+/// Emit one sentinel `PackageLoad` event per recorded `load_all()` call site,
+/// each carrying the function scope that contains it (so a function-body-only
+/// call attaches only inside that body, never at top level), modelling
+/// `devtools::load_all()` / `pkgload::load_all()` as attaching the package under
+/// development. Mirrors how `library()` calls are emitted (see
+/// [`ScopeArtifacts::dev_load_all_sites`]). The out-of-root gate is applied
+/// later, at resolution (the package root is unknown here).
+///
+/// Shared by both artifact-build paths ([`compute_artifacts`] and
+/// [`compute_artifacts_with_metadata`]) so the two cannot drift on load_all
+/// attachment semantics.
+fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts) {
+    for site in &artifacts.dev_load_all_sites {
+        let function_scope =
+            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
+        artifacts.timeline.push(ScopeEvent::PackageLoad {
+            line: site.line,
+            column: site.column,
+            package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
+            function_scope,
+        });
+    }
+}
+
 /// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
 ///
 /// The returned ScopeArtifacts contains a document-ordered timeline of scope events (definitions,
@@ -1879,22 +1909,9 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         });
     }
 
-    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
-    // emitted through the same path as library() so it inherits position +
-    // function-scope treatment (and thus all attached-package propagation). Emit
-    // one event per call site (each with its own function scope) so a later
-    // top-level call still attaches even if an earlier call was function-scoped.
-    // The out-of-root gate is applied later, at resolution (root is unknown here).
-    for site in &artifacts.dev_load_all_sites {
-        let function_scope =
-            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
-        artifacts.timeline.push(ScopeEvent::PackageLoad {
-            line: site.line,
-            column: site.column,
-            package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
-            function_scope,
-        });
-    }
+    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
+    // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
+    push_dev_load_all_events(&mut artifacts);
 
     // Re-sort timeline to include PackageLoad events in effect-position order.
     artifacts.timeline.sort_by_key(event_effect_position);
@@ -2229,22 +2246,9 @@ pub fn compute_artifacts_with_metadata(
         });
     }
 
-    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
-    // emitted through the same path as library() so it inherits position +
-    // function-scope treatment (and thus all attached-package propagation). Emit
-    // one event per call site (each with its own function scope) so a later
-    // top-level call still attaches even if an earlier call was function-scoped.
-    // The out-of-root gate is applied later, at resolution (root is unknown here).
-    for site in &artifacts.dev_load_all_sites {
-        let function_scope =
-            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
-        artifacts.timeline.push(ScopeEvent::PackageLoad {
-            line: site.line,
-            column: site.column,
-            package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
-            function_scope,
-        });
-    }
+    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
+    // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
+    push_dev_load_all_events(&mut artifacts);
 
     // Re-sort timeline (now includes PackageLoad events) by effect position.
     artifacts.timeline.sort_by_key(event_effect_position);

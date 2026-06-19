@@ -548,6 +548,16 @@ async fn maybe_init_r(
     let status = outcome.status;
     let shipped_db_load = outcome.shipped_db_load;
     state.package_library = outcome.library;
+    // A freshly built `PackageLibrary` starts with a `None` local-dev overlay, so
+    // replacing `state.package_library` here drops the overlay that
+    // `build_indexed_state`'s `apply_package_event(Initial)` installed. Rebuild it
+    // from the (already-derived) package contribution, exactly as the LSP's
+    // library-replacing paths do (see `refresh_local_dev_overlay`'s doc). Without
+    // this, a `raven check` on a package whose in-root script calls
+    // `devtools::load_all()` loses sentinel resolution and reports every package
+    // internal as an undefined variable. Runs before `maybe_load_sysdata_fallback`,
+    // which may refresh the overlay again after adding R-loaded sysdata names.
+    state.refresh_local_dev_overlay();
     match status {
         Ready | Disabled => {}
         RNotFound => eprintln!(
@@ -2475,6 +2485,60 @@ mod tests {
         );
         // The synthetic package is still not "installed" (Tier-1-only).
         assert!(!state.package_library.package_exists(pkg));
+    }
+
+    /// `maybe_init_r` swaps in a freshly built `PackageLibrary`, which starts
+    /// with a `None` local-dev overlay. Like every other library-replacing path
+    /// (see `refresh_local_dev_overlay`'s doc and backend.rs's four call sites),
+    /// it MUST rebuild that overlay afterward. Without it, a `raven check` run on
+    /// a package whose in-root script calls `devtools::load_all()` loses sentinel
+    /// resolution and flags every package internal as an undefined variable.
+    /// R-independent: the overlay is built from the workspace-derived
+    /// contribution, not from R.
+    #[tokio::test]
+    async fn maybe_init_r_preserves_load_all_overlay() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
+        let workspace = TempDir::new().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        std::fs::write(
+            root.join("DESCRIPTION"),
+            "Package: testpkg\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("NAMESPACE"), "export(exported_fn)\n").unwrap();
+        // `my_internal` is non-exported, so outside `R/` it is reachable only via
+        // the load_all() overlay.
+        std::fs::write(
+            root.join("R/internal.R"),
+            "my_internal <- function() 1\nexported_fn <- function() my_internal()\n",
+        )
+        .unwrap();
+
+        let workspace_url = Url::from_file_path(root).unwrap();
+        let mut state =
+            build_indexed_state(root, &workspace_url, true, None).expect("build_indexed_state");
+
+        // Precondition: build_indexed_state's `apply_package_event(Initial)`
+        // populated the overlay, so the internal resolves under the sentinel.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("my_internal", &[LOAD_ALL_SENTINEL.to_string()]),
+            "precondition: build_indexed_state should populate the load_all overlay"
+        );
+
+        // Swapping in the R-built library must NOT silently drop the overlay.
+        maybe_init_r(&mut state, root).await;
+
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("my_internal", &[LOAD_ALL_SENTINEL.to_string()]),
+            "maybe_init_r must rebuild the load_all overlay after replacing the package \
+             library; otherwise `raven check` flags load_all() internals as undefined"
+        );
     }
 
     // ── .Rprofile prelude acceptance tests ──────────────────────────────────
