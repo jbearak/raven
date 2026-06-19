@@ -18067,10 +18067,11 @@ x <- 1"#;
         };
         graph.update_file(parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
-        let parent_uri = parent_uri.clone();
+        let parent_uri_for_artifacts = parent_uri.clone();
+        let parent_uri_for_metadata = parent_uri.clone();
         let child_uri_owned = child_uri.clone();
         let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
-            if uri == &parent_uri {
+            if uri == &parent_uri_for_artifacts {
                 Some(Arc::new(parent_artifacts.clone()))
             } else if uri == &child_uri_owned {
                 Some(Arc::new(child_artifacts.clone()))
@@ -18078,9 +18079,8 @@ x <- 1"#;
                 None
             }
         };
-        let parent_uri2 = Url::parse("file:///project/parent.R").unwrap();
         let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
-            if uri == &parent_uri2 {
+            if uri == &parent_uri_for_metadata {
                 Some(std::sync::Arc::new(parent_meta.clone()))
             } else {
                 None
