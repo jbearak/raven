@@ -480,8 +480,9 @@ impl PackageLibrary {
     }
 
     /// True iff the load_all sentinel is in `loaded_packages` and the overlay
-    /// contains `name`. (Chokepoints wire to this in Task 2.)
-    #[allow(dead_code)] // wired up in Task 2
+    /// contains `name`. Consulted at the three resolution chokepoints
+    /// (`is_symbol_from_loaded_packages`, `find_package_owner_for_symbol`,
+    /// `get_owned_exports_for_completions`).
     fn overlay_has_symbol(&self, name: &str, loaded_packages: &[String]) -> bool {
         if !loaded_packages.iter().any(|p| is_load_all_sentinel(p)) {
             return false;
@@ -692,6 +693,17 @@ impl PackageLibrary {
             }
         }
 
+        // Fold in workspace-local internals attached via `devtools::load_all()`,
+        // owned by the synthetic sentinel package. Only when the sentinel is in
+        // `loaded_packages` and the overlay is present.
+        if loaded_packages.iter().any(|p| is_load_all_sentinel(p))
+            && let Some(pkg) = self.local_dev_overlay.load().as_ref()
+        {
+            for symbol in &pkg.symbols {
+                push_unique(symbol, LOAD_ALL_SENTINEL);
+            }
+        }
+
         result
     }
 
@@ -717,6 +729,13 @@ impl PackageLibrary {
     pub fn is_symbol_from_loaded_packages(&self, symbol: &str, loaded_packages: &[String]) -> bool {
         // First check base exports (always available)
         if self.is_base_export(symbol) {
+            return true;
+        }
+
+        // Workspace-local internals attached via `devtools::load_all()`. Short-
+        // circuits on the sentinel NOT being in `loaded_packages`, so resolution
+        // is byte-identical when no `load_all()` is in play.
+        if self.overlay_has_symbol(symbol, loaded_packages) {
             return true;
         }
 
@@ -1338,6 +1357,13 @@ impl PackageLibrary {
         symbol: &str,
         loaded_packages: &[String],
     ) -> Option<String> {
+        // Workspace-local internals attached via `devtools::load_all()` are owned
+        // by the synthetic sentinel package. Short-circuits unless the sentinel is
+        // attached, so attribution is unchanged when no `load_all()` is in play.
+        if self.overlay_has_symbol(symbol, loaded_packages) {
+            return Some(LOAD_ALL_SENTINEL.to_string());
+        }
+
         // Consult the per-aggregate snapshot first. For each loaded package, if
         // the cached aggregate entry records this symbol's owner, that value is
         // the true contributor (e.g. `dplyr` for a `mutate` made visible through
@@ -6254,6 +6280,41 @@ mod tests {
         assert_eq!(
             lib.find_package_owner_for_symbol("anything", &[LOAD_ALL_SENTINEL.to_string()]),
             None
+        );
+    }
+
+    #[test]
+    fn overlay_resolves_sentinel_symbols_only_when_sentinel_attached() {
+        let lib = PackageLibrary::new_empty();
+        let mut syms = std::collections::HashSet::new();
+        syms.insert("my_func".to_string());
+        lib.set_local_dev_overlay(Some(std::sync::Arc::new(LocalDevPackage { symbols: syms })));
+
+        // Sentinel attached => resolves at all three chokepoints.
+        assert!(lib.is_symbol_from_loaded_packages("my_func", &[LOAD_ALL_SENTINEL.to_string()]));
+        assert_eq!(
+            lib.find_package_owner_for_symbol("my_func", &[LOAD_ALL_SENTINEL.to_string()]),
+            Some(LOAD_ALL_SENTINEL.to_string())
+        );
+        assert!(
+            lib.get_owned_exports_for_completions(&[LOAD_ALL_SENTINEL.to_string()])
+                .contains_key("my_func")
+        );
+
+        // Sentinel NOT attached => overlay contributes nothing (isolation guard).
+        assert!(!lib.is_symbol_from_loaded_packages("my_func", &["dplyr".to_string()]));
+        assert_eq!(
+            lib.find_package_owner_for_symbol("my_func", &["dplyr".to_string()]),
+            None
+        );
+        assert!(
+            !lib.get_owned_exports_for_completions(&["dplyr".to_string()])
+                .contains_key("my_func")
+        );
+
+        // Unknown symbol not resolved even with sentinel attached.
+        assert!(
+            !lib.is_symbol_from_loaded_packages("not_a_symbol", &[LOAD_ALL_SENTINEL.to_string()])
         );
     }
 }

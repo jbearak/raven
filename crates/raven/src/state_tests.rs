@@ -819,6 +819,42 @@ mod package_testthat_visibility_tests {
         );
     }
 
+    /// End-to-end refresh: after `apply_package_event` derives the package
+    /// contribution, the package library's local-dev overlay resolves the
+    /// workspace's R/ internal symbols under the load_all sentinel. With no
+    /// package, the overlay is absent and resolution returns false.
+    #[test]
+    fn apply_package_event_refreshes_local_dev_overlay() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        // Overlay populated from the freshly-derived contribution.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "load_all overlay must resolve R/ internal symbol after apply_package_event"
+        );
+
+        // No package => overlay is None => sentinel resolves nothing.
+        let empty = WorldState::new();
+        assert!(
+            !empty
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "a fresh WorldState (no package) must have no local-dev overlay"
+        );
+    }
+
     /// Negative: the SAME `internal/` script WITHOUT a `load_all()` call does
     /// NOT see the package's internal symbols — the injection is gated on the
     /// call, not the path.

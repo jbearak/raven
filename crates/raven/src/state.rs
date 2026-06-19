@@ -611,6 +611,29 @@ impl WorldState {
             delta,
         );
         self.package_state.set_from(new_package_state);
+
+        // Refresh the package library's local-dev overlay from the freshly-set
+        // contribution. `apply_package_event` is the single writer that recomputes
+        // the contribution, so this is the one correct refresh point. The overlay
+        // collects the workspace-local internal symbol set that a
+        // `devtools::load_all()` call attaches via the sentinel. It is built
+        // whenever a package workspace exists (not only when load_all is in play);
+        // that is safe because the resolution chokepoints short-circuit on the
+        // sentinel not being attached, leaving non-load_all resolution unchanged.
+        let contrib = self.package_state.scope_contribution();
+        let overlay = if contrib.workspace_root.is_some() {
+            let mut symbols = std::collections::HashSet::new();
+            symbols.extend(contrib.r_internal_symbols.iter().cloned());
+            symbols.extend(contrib.sysdata_symbols.iter().cloned());
+            symbols.extend(contrib.onload_symbols.iter().cloned());
+            symbols.extend(contrib.imported_symbols.keys().cloned());
+            Some(std::sync::Arc::new(
+                crate::package_library::LocalDevPackage { symbols },
+            ))
+        } else {
+            None
+        };
+        self.package_library.set_local_dev_overlay(overlay);
     }
 
     /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
