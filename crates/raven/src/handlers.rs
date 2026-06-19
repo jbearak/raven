@@ -20620,22 +20620,42 @@ pub fn goto_definition_with_cancel(
             || contrib.r_internal_symbols.contains(scope_key)
             || contrib.onload_symbols.contains(name)
             || contrib.onload_symbols.contains(scope_key);
-        // For a genuine package internal the rm-aware top_level_interface is
-        // AUTHORITATIVE: return whatever the resolver decides (Some R/ location, or
-        // None for a name with no live top-level def — sysdata/imported/rm'd). We do
-        // NOT fall through to the general `exported_interface` fallback below, which
-        // would otherwise resurrect a function-local or rm'd binding of the same name
-        // as a phantom goto target.
+        // The redirect models the load_all() overlay path, so it must only fire
+        // when the load_all sentinel is actually attached in the computed scope:
+        // a `load_all()` is reachable from here AND the query file was not
+        // stripped by the out-of-root query-file gate. A file with no
+        // `load_all()` call, or an out-of-root file where the gate stripped the
+        // sentinel, references the internal in a context where it is undefined
+        // (diagnostics flag it), so goto must not jump there. The dev-context R/
+        // path is unaffected: there the internal lands in `scope.symbols` and is
+        // handled by the cursor-hit branch above, not here.
+        let sentinel_in_scope = scope
+            .loaded_packages
+            .iter()
+            .chain(scope.inherited_packages.iter())
+            .any(|p| crate::package_library::is_load_all_sentinel(p));
+        // For a genuine package internal this block is AUTHORITATIVE — we do NOT
+        // fall through to the general `exported_interface` fallback below, which
+        // is scope-blind and would otherwise resurrect a function-local / rm'd /
+        // sentinel-stripped binding of the same name as a phantom goto target:
+        //   * sentinel in scope  -> resolve via the rm-aware `top_level_interface`
+        //     (Some R/ location, or None for a name with no live top-level def —
+        //     sysdata/imported/rm'd).
+        //   * sentinel NOT in scope -> None. The internal is not visible here, so
+        //     no jump (consistent with the undefined-variable diagnostic).
         if is_contributed_internal {
-            return resolve_package_internal_goto(
-                name,
-                scope_key,
-                root,
-                &content_provider,
-                &state.document_store.uris(),
-                &state.workspace_index_new,
-                cancel,
-            );
+            if sentinel_in_scope {
+                return resolve_package_internal_goto(
+                    name,
+                    scope_key,
+                    root,
+                    &content_provider,
+                    &state.document_store.uris(),
+                    &state.workspace_index_new,
+                    cancel,
+                );
+            }
+            return None;
         }
     }
 
@@ -65353,8 +65373,9 @@ mod load_all_internal_goto_tests {
     }
 
     /// Sentinel path: the internal is exposed via the overlay (NOT in `scope.symbols`)
-    /// for a caller OUTSIDE the package source tree. Goto must fall through to the
-    /// package-internal resolver and land on the `R/` definition.
+    /// for a caller OUTSIDE the package `R/` source tree but UNDER the package root
+    /// that calls `load_all()` (so the sentinel survives the query-file gate). Goto
+    /// must fall through to the package-internal resolver and land on the `R/` def.
     #[test]
     fn goto_load_all_internal_sentinel_path_to_r_source() {
         // R/ source defines `my_func` on line 2.
@@ -65362,9 +65383,15 @@ mod load_all_internal_goto_tests {
         let mut state = state_with_internals(&["my_func"]);
         let r_uri = index_closed_file(&mut state, "file:///work/pkg/R/util.R", src);
 
-        // CALLER outside the package tree (a load_all() script).
-        let caller = add_legacy_doc(&mut state, "file:///elsewhere/script.R", "my_func(1)\n");
-        let l = scalar(goto(&state, &caller, Position::new(0, 2)));
+        // CALLER: a dev script under the package root that calls load_all() (the
+        // sentinel is attached and kept by the in-root query-file gate). `my_func`
+        // is referenced AFTER the load_all() line.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func(1)\n",
+        );
+        let l = scalar(goto(&state, &caller, Position::new(1, 2)));
         assert_eq!(l.uri, r_uri, "caller goto lands on R/ def file");
         assert_eq!(l.range.start.line, 2, "lands on the def line in R/util.R");
 
@@ -65389,6 +65416,30 @@ mod load_all_internal_goto_tests {
         let l = scalar(goto(&state, &load_all_file, Position::new(0, 21)));
         assert_eq!(l.uri, r_uri);
         assert_eq!(l.range.start.line, 2);
+    }
+
+    /// Negative: a package-workspace script that references an internal name but
+    /// does NOT call `load_all()` (so the sentinel is not attached in scope) must
+    /// NOT jump to the R/ definition. The redirect models the load_all overlay
+    /// path, which only applies when the sentinel is in scope; otherwise the name
+    /// is undefined here (diagnostics flag it) and goto must not contradict that.
+    #[test]
+    fn goto_internal_without_load_all_does_not_jump() {
+        let mut state = state_with_internals(&["my_func"]);
+        // Real def lives under R/.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/real.R",
+            "my_func <- function() 1\n",
+        );
+        // A script UNDER the package root (so the query-file gate would keep a
+        // sentinel if one were attached) that references `my_func` but never
+        // calls load_all(). No sentinel in scope → no redirect.
+        let caller = add_legacy_doc(&mut state, "file:///work/pkg/dev/script.R", "my_func()\n");
+        assert!(
+            goto(&state, &caller, Position::new(0, 1)).is_none(),
+            "without a load_all() sentinel in scope, goto on a package internal must not jump to R/ source"
+        );
     }
 
     /// Dev-context path: an internal referenced from WITHIN an `R/` file (and a test
@@ -65445,8 +65496,13 @@ mod load_all_internal_goto_tests {
             "my_func <- function() 999\n",
         );
 
-        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "my_func()\n");
-        let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+        // In-root load_all() dev script (sentinel attached); reference on line 1.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func()\n",
+        );
+        let l = scalar(goto(&state, &caller, Position::new(1, 1)));
         assert_eq!(
             l.uri, r_uri,
             "resolver must pick the R/ def, not the unrelated (data-raw) file"
@@ -65474,9 +65530,15 @@ mod load_all_internal_goto_tests {
             "my_func <- function() 1\nrm(my_func)\n",
         );
 
-        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "my_func()\n");
+        // In-root load_all() dev script (sentinel attached) so the redirect path
+        // is exercised; the rm-aware resolver must still return None.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func()\n",
+        );
         assert!(
-            goto(&state, &caller, Position::new(0, 1)).is_none(),
+            goto(&state, &caller, Position::new(1, 1)).is_none(),
             "no LIVE top-level def of `my_func` exists in the package tree → None"
         );
     }
@@ -65499,9 +65561,9 @@ mod load_all_internal_goto_tests {
             "dup <- function() 1\n",
         );
 
-        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "dup()\n");
-        let l1 = scalar(goto(&state, &caller, Position::new(0, 1)));
-        let l2 = scalar(goto(&state, &caller, Position::new(0, 1)));
+        let caller = add_legacy_doc(&mut state, "file:///work/pkg/dev.R", "load_all()\ndup()\n");
+        let l1 = scalar(goto(&state, &caller, Position::new(1, 1)));
+        let l2 = scalar(goto(&state, &caller, Position::new(1, 1)));
         assert_eq!(l1.uri, l2.uri, "stable across runs");
         assert_eq!(l1.range.start, l2.range.start);
         assert_eq!(
@@ -65523,9 +65585,15 @@ mod load_all_internal_goto_tests {
             "other <- function() 1\n",
         );
 
-        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "secret_blob\n");
+        // In-root load_all() dev script (sentinel attached) so the redirect path
+        // is exercised; an internal with no navigable R/ source → None.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nsecret_blob\n",
+        );
         assert!(
-            goto(&state, &caller, Position::new(0, 2)).is_none(),
+            goto(&state, &caller, Position::new(1, 2)).is_none(),
             "an internal with no R/ source is a no-op"
         );
     }
@@ -65583,8 +65651,12 @@ mod load_all_internal_goto_tests {
                 "file:///work/pkg/R/closed.R",
                 "closed_fn <- function() 1\n",
             );
-            let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "closed_fn()\n");
-            let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+            let caller = add_legacy_doc(
+                &mut state,
+                "file:///work/pkg/dev.R",
+                "load_all()\nclosed_fn()\n",
+            );
+            let l = scalar(goto(&state, &caller, Position::new(1, 1)));
             assert_eq!(l.uri, def, "resolves via the workspace index (closed file)");
         }
         // OPEN defining file.
@@ -65595,8 +65667,12 @@ mod load_all_internal_goto_tests {
                 "file:///work/pkg/R/open.R",
                 "open_fn <- function() 1\n",
             );
-            let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "open_fn()\n");
-            let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+            let caller = add_legacy_doc(
+                &mut state,
+                "file:///work/pkg/dev.R",
+                "load_all()\nopen_fn()\n",
+            );
+            let l = scalar(goto(&state, &caller, Position::new(1, 1)));
             assert_eq!(l.uri, def, "resolves via the DocumentStore (open file)");
         }
     }
