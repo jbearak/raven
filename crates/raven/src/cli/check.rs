@@ -2501,16 +2501,16 @@ mod tests {
 
         let workspace = TempDir::new().unwrap();
         let root = workspace.path();
-        std::fs::create_dir(root.join("R")).unwrap();
-        std::fs::write(
+        fs::create_dir(root.join("R")).unwrap();
+        fs::write(
             root.join("DESCRIPTION"),
             "Package: testpkg\nVersion: 0.1.0\n",
         )
         .unwrap();
-        std::fs::write(root.join("NAMESPACE"), "export(exported_fn)\n").unwrap();
+        fs::write(root.join("NAMESPACE"), "export(exported_fn)\n").unwrap();
         // `my_internal` is non-exported, so outside `R/` it is reachable only via
         // the load_all() overlay.
-        std::fs::write(
+        fs::write(
             root.join("R/internal.R"),
             "my_internal <- function() 1\nexported_fn <- function() my_internal()\n",
         )
