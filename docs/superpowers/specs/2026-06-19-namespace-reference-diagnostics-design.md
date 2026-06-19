@@ -46,17 +46,26 @@ Phase 1:
 
 Phase 2:
 
-- Add a package-library API that can say whether the direct `pkg::member` member
-  set is complete enough for absence diagnostics.
-- Add a suppressible `namespace-member-not-found` diagnostic for `pkg::member`
-  when complete metadata says the member is absent.
+- Add a synchronous package-library API (`namespace_member_status_sync`) that says
+  whether a `pkg::member` is `Present` / `Absent` / `Partial` / `Unknown`, with
+  `Absent` returned only from a *complete exports set*.
+- Add a suppressible `namespace-member-not-found` diagnostic for `pkg::member` when
+  that API returns `Absent`. Member validation is **exports-authoritative**; data
+  objects are positive-only (they can confirm-present but never prove absent). The
+  fully `::`-accurate data-member authority is deferred to issue #505.
 - Continue to skip member validation for `pkg:::member`.
 
 Package install status and export/member metadata stay independent. If `pkg` is
 not installed but Tier 2 or Tier 3 metadata is complete and says `member` is
 absent, Raven should emit both diagnostics when both severities are enabled:
 `package-not-installed` on the package token and `namespace-member-not-found` on
-the member token.
+the member token. This is gated by the *existing* missing-package precondition:
+`collect_missing_package_diagnostics_from_snapshot` early-returns when install
+status is unknowable (no libpaths and no R subprocess — `handlers.rs:5089`), so in
+that environment `package-not-installed` does not fire and "both" reduces to
+whichever diagnostics the install-status-known gate permits. The member diagnostic
+is independent of install status and may still fire from complete provider
+metadata.
 
 ## Components
 
@@ -73,12 +82,17 @@ should be a deliberate choice, not incidental.
 
 Recommended model:
 
+`SourceRange` columns are **LSP UTF-16 code units**, not tree-sitter byte
+offsets (`Point.column` is bytes). Convert at extraction time, mirroring the
+existing loader-call conversion (`source_detect.rs:1099`); add a regression test
+with multibyte text before `pkg::member` so squiggles land correctly.
+
 ```rust
 pub struct SourceRange {
     pub start_line: u32,
-    pub start_column: u32,
+    pub start_column: u32, // UTF-16 code units
     pub end_line: u32,
-    pub end_column: u32,
+    pub end_column: u32,   // UTF-16 code units
 }
 
 pub struct NamespaceReference {
@@ -95,6 +109,13 @@ pub struct NamespaceMember {
 }
 ```
 
+The flat `internal: bool` + `member: Option<…>` shape makes invalid combinations
+representable (e.g. `internal: true` with a member is a valid `pkg:::x`, but a
+collector that forgets the `internal` check will mis-handle it). Either model it as
+an enum (`Exported { member }`, `Internal { member }`, `Incomplete { internal }`)
+or treat "every member-diagnostic site MUST check `!internal`" as a hard invariant
+with a test. The member diagnostic applies to `Exported` only.
+
 `CrossFileMetadata` gains:
 
 ```rust
@@ -106,7 +127,12 @@ Extraction rules:
 
 - Use tree-sitter `namespace_operator` nodes and field names, not child indexes.
 - Accept identifier, string, and backtick package qualifiers where R accepts them.
-- Strip string/backtick delimiters from package and member names before storage.
+- Unquoting is **delimiter-stripping only**, not full R literal unescaping (matching
+  the existing completion-side `unquote_package`). Document this limit: a quoted
+  name containing R escape sequences (e.g. `` `a\`b` ``) is stored verbatim minus
+  the outer delimiters and may not round-trip to the true object name. This is an
+  accepted edge case; if it ever drives a false member diagnostic, restrict the
+  member diagnostic to simple (escape-free) quoted forms rather than guessing.
 - Preserve source ranges for the whole expression, package token, and member token.
 - Store `member: None` for incomplete `pkg::` / `pkg:::` when the parser exposes
   a `namespace_operator` node with a present LHS and a missing RHS. Incomplete
@@ -131,27 +157,46 @@ allowed but not required for this feature.
 Namespace references should warm package metadata, but they must not attach the
 package to scope.
 
-Warm-set source (decided): store namespace-reference package names on the
-`Document` in a new `namespace_packages` field, populated when metadata is
-extracted, alongside the existing `loaded_packages` and `data_packages`. This
-keeps the open-document warmup (`prefetch_packages_for_open_documents` →
-`collect_open_document_packages`) reading from one consistent place — `Document`
-fields — rather than mixing in a `metadata_map` lookup. The `did_open` /
-`did_change` paths, which build their warm set from freshly extracted metadata,
-add namespace-reference packages from that same metadata directly.
+Warm-set source (decided): a **single shared "warmable namespace-ref packages"
+extractor**, derived from the same artifact every lifecycle path already uses, to
+avoid the drift hazard both reviewers flagged. Note that today's warm sets come
+from two *different* extraction systems: `Document.loaded_packages` /
+`data_packages` are computed in `Document::new_with_kind` / `update` from
+`(tree, text)` (`state.rs:257`, `:316`) — **not** from `CrossFileMetadata`, which
+is produced separately by `extract_metadata_with_tree`. Namespace references are
+defined to live in `CrossFileMetadata.namespace_references`, so the warm-set must
+read from there, not from a new `Document` field populated "alongside
+loaded_packages" (which would be a false premise — those fields do not come from
+metadata).
 
-Extend the existing backend warm-set builders:
+Provide one helper, e.g. `namespace_warm_packages(meta: &CrossFileMetadata) ->
+Vec<String>` (validated, sentinel-filtered names, deduped), and call it from every
+warm path so they cannot diverge:
 
-- `did_open`: include namespace-reference packages in the synchronous
-  `prefetch_packages()` before diagnostics (extend the `library_calls`-derived
-  set built via `extract_loaded_packages_from_library_calls`).
-- `did_change`: include namespace-reference packages in the background prefetch
-  that force-republishes diagnostics after warming (extend
-  `edited_document_warm_packages`).
-- Open-document warmup: include `doc.namespace_packages` from every open document
-  in `collect_open_document_packages`.
-- Config and libpath rebuild paths: rely on the open-document warmup plus the
-  existing force-republish behavior.
+- `did_open`: union it with the `library_calls`-derived set
+  (`extract_loaded_packages_from_library_calls`) before the synchronous
+  `prefetch_packages()`.
+- `did_change`: union it into `edited_document_warm_packages` so the background
+  prefetch (which force-republishes after warming) includes namespace-ref packages.
+- Open-document warmup (`prefetch_packages_for_open_documents` →
+  `collect_open_document_packages`): pull namespace-ref packages from each open
+  document's metadata (`metadata_map`) via the same helper.
+- Config and libpath rebuild paths: rely on the open-document warmup plus
+  force-republish.
+
+Add **parity tests** across `did_open`, `did_change`, and the open-document rebuild
+warmup asserting all three warm the same namespace-ref packages for the same
+document — this is the regression guard against the drift the reviewers identified.
+
+**Cross-document force-republish (fix).** Today `did_change`'s background prefetch
+marks only the *edited* URI for force-republish. But warming `dplyr` can change the
+`namespace-member-not-found` / `package-not-installed` verdict in *any other* open
+document that references `dplyr::`. After a namespace-driven prefetch completes,
+mark for force-republish every open document whose namespace-reference packages
+intersect the just-warmed set — not only the edited file — so stale "unknown
+metadata → no diagnostic" results in sibling files refresh. This stays within the
+existing version-monotonic force-republish model (same-version republish allowed,
+never older).
 
 The diagnostic collectors stay pure. They may inspect the package cache and
 metadata snapshot, but they must not call `prefetch_packages()`, spawn work, or
@@ -178,9 +223,19 @@ The diagnostic keeps the existing code and setting:
 - Install-state policy: Tier 1 only, via `PackageLibrary::package_exists()`
 - Suppression: existing line/code suppression behavior
 
-For namespace references, anchor the diagnostic to `package_range`, not the whole
+For namespace references, anchor the squiggle to `package_range`, not the whole
 `pkg::member` expression. `pkg::member` and `pkg:::member` both qualify for this
 diagnostic when the package is missing.
+
+Suppression keying with sub-line anchors (the existing loader-call diagnostic
+anchors at column 0 and suppression is line-keyed via `is_line_ignored_for_code`):
+key `package-not-installed` suppression and `suppressed_out` on
+`package_range.start_line`, and `namespace-member-not-found` on
+`member.range.start_line`. When both diagnostics land on the same line they are two
+distinct codes and must be independently suppressible; when multiple namespace refs
+share a line, each (line, code) pair is accounted once (the `suppressed_out` channel
+dedups by pair). Specify and test these so an implementer does not key off the
+wrong range field.
 
 ### 4. Namespace member diagnostics
 
@@ -190,9 +245,14 @@ Add a new diagnostic:
   module next to `PACKAGE_NOT_INSTALLED`.
 - Setting: `raven.packages.namespaceMemberSeverity`
 - Default: `warning`
-- Suppressible: yes. Wire through the same machinery as `package-not-installed`:
-  `# nolint` / `# raven: ignore` code matching, unused-suppression accounting via
-  the `suppressed_out` channel, and the code table in `docs/diagnostics.md`.
+- Suppressible: yes. Inline `# nolint` / `# raven: ignore` matching alone is not
+  enough — register the code in the analyzer/suppressible code lists so block,
+  file, and chunk suppression and `expect` accounting all work. Concretely: add to
+  `SUPPRESSIBLE_ANALYZER_CODES` (`diagnostic_code.rs:66`), ensure the final
+  suppression filter in `handlers.rs` (~`:718`) covers it, and key
+  unused-suppression accounting through the `suppressed_out` channel on
+  `member.range.start_line`. Add tests for inline, ignore-next, block, file, chunk,
+  and `expect`. Update the code table in `docs/diagnostics.md`.
 - Applies to: `pkg::member` only, never `pkg:::member`
 
 The message should avoid implying that only functions are valid:
@@ -205,21 +265,35 @@ The collector emits this diagnostic only when all of the following are true:
 
 - Package awareness is enabled.
 - The package library is ready enough to answer package metadata questions.
-- The reference is `::`, not `:::`.
-- A member token is present.
+- The reference is `::`, not `:::` (every member-diagnostic site MUST check
+  `!reference.internal`).
+- A member token is present (`member: Some`).
 - The configured severity is not `off`.
-- The package-library member query returns a complete direct-member set.
-- The member is absent from that set.
+- `namespace_member_status_sync(package, member)` returns `Absent`.
 
-The direct-member set is `PackageInfo.exports ∪ PackageInfo.lazy_data` for the
-package named on the left of `::`. Use only that package's own `exports` and
-`lazy_data` — never the separate combined/attached cache (`combined_entries`),
-`Depends`, or meta-package attached exports: `tidyverse::mutate` should be judged
-against what `tidyverse` itself exposes through `::`, not what
-`library(tidyverse)` attaches.
+**Authority model — exports-authoritative, data positive-only (v1, decided).**
+Absence is judged against the package's own *complete* exports set. Data objects
+are consulted **positive-only**: they can confirm a member is present (and suppress
+the diagnostic), but the diagnostic is never gated on data-set completeness. This
+ships the headline value (`dplyr::mutatee`-style typos) without the false positives
+that a strict "data must be complete too" rule would create for the many real
+packages whose `data/` directory is never enumerated. It is conservative in the
+safe direction: it accepts the false *negative* of never flagging a misspelled
+data reference (e.g. `datasets::mtcarss`). The fully `::`-accurate data-member
+authority is tracked separately as a follow-up (GitHub issue #505) and is a strict
+tightening of this rule — no rework of the exports path.
 
-When member metadata is partial or unknown, emit no member diagnostic. Absence
-from partial metadata is not evidence of absence.
+The present-check (suppression) set is the named package's own `PackageInfo.exports`
+∪ `PackageInfo.lazy_data`, **plus `base_exports` when the package is a
+base/recommended package** — base-package datasets such as `datasets::mtcars` are
+merged into `base_exports` (`package_library.rs:170`), not the per-package
+`lazy_data`, so omitting `base_exports` would falsely flag them. Never use the
+separate combined/attached cache (`combined_entries`), `Depends`, or meta-package
+attached exports: `tidyverse::mutate` is judged against what `tidyverse` itself
+exposes through `::`, not what `library(tidyverse)` attaches.
+
+When the exports set is partial or unknown, emit no member diagnostic. Absence
+from a non-complete exports set is not evidence of absence.
 
 ### 5. Package-library member authority
 
@@ -250,19 +324,12 @@ pub fn namespace_member_status_sync(
 ) -> NamespaceMemberStatus;
 ```
 
-`Absent` must be returned only from complete direct-member metadata. `Partial` is
-positive-only: it may prove that a member is present, but it cannot prove that a
-member is missing.
+`Absent` must be returned only from a **complete exports set**. `Partial` is
+positive-only: it may prove that a member is present, but it can never prove a
+member missing.
 
-**Two independent completeness axes (decided).** A package's `exports` and its
-`lazy_data` are sourced separately and can have different completeness at the same
-time. The clearest example: a non-pattern package with a clean NAMESPACE
-(`exports` complete) plus a `data/` directory that R never enumerated (`lazy_data`
-partial). For `pkg::foo` where `foo` is neither a known export nor a known data
-object, exports say "absent" but data says "partial" — so the only sound answer is
-`Partial`, **not** `Absent`. A single whole-package completeness value cannot
-express this and would produce the very false positives this design exists to
-prevent. Therefore track completeness per axis:
+**Completeness lives on the exports set (v1).** Carry a `MemberCompleteness` (and,
+for provenance/debugging, a `MemberSource`) describing the *exports* set:
 
 ```rust
 pub enum MemberCompleteness {
@@ -281,44 +348,66 @@ pub enum MemberSource {
 }
 ```
 
-Carry `MemberCompleteness` (and, for debugging/provenance, `MemberSource`)
-**separately for exports and for lazy_data**. `namespace_member_status_sync`
-reconciles the two axes conservatively:
+`namespace_member_status_sync(package, member)` resolves as:
 
-- If the member is present in `exports` **or** `lazy_data` → `Present`.
-- Else if **both** the `exports` axis and the `lazy_data` axis are `Complete` →
-  `Absent`.
-- Else if either relevant axis is `Partial` (and the member was not found) →
-  `Partial`.
-- Else → `Unknown`.
+1. If `member` is present in the present-check set (the named package's `exports`
+   ∪ `lazy_data`, plus `base_exports` for base/recommended packages) → `Present`.
+   The data sources here are positive-only; their completeness is irrelevant.
+2. Else if the exports set is `Complete` → `Absent`.
+3. Else if the exports set is `Partial` → `Partial`.
+4. Else → `Unknown`.
 
-In short: `Absent` requires the member to be missing from *both* a complete
-exports set and a complete data set. Any incompleteness on either axis degrades
-the answer away from `Absent`.
+(Data completeness intentionally does not enter the `Absent` decision in v1; issue
+#505 tightens this by adding a `::`-accurate, completable data-member set.)
 
-This can live on `PackageInfo` (two completeness fields) or on a derived query
-result, as long as production load paths can distinguish complete, partial, and
-unknown member sets per axis. Existing `PackageInfo::new` and
-`PackageInfo::with_details` should remain available for tests and legacy
-construction (defaulting both axes to `Unknown` so they are never
-absence-authoritative); production chokepoints should assign explicit per-axis
-completeness.
+**Synchronous contract (no R, no mutation).** `namespace_member_status_sync` is a
+hot-path diagnostic call and MUST be cache/provider/static-only — it must not spawn
+the R subprocess and must not mutate the cache. Two consequences the implementer
+must honor:
 
-Source mapping:
+- Completeness can only be as good as what warming has already produced. For
+  `exportPattern()` packages, a `Complete` exports set requires the async R
+  namespace expansion to have *already run* (via prefetch); until then the sync
+  query returns `Partial`/`Unknown` and no member diagnostic fires. This is the
+  expected cold→warm transition, resolved by the force-republish path.
+- It may do a bounded synchronous static NAMESPACE parse (as `get_exports_sync`'s
+  Tier-2 branch already does) but should memoize rather than re-parse on every
+  diagnostic pass.
 
-- Static NAMESPACE parse with no `exportPattern()` / `exportClassPattern()`:
-  complete exports.
-- R subprocess namespace expansion: complete exports.
-- INDEX fallback for pattern packages: partial exports.
+**Cache authority must be monotonic.** `prefetch_packages()` skips any package
+already in the cache (`package_library.rs:1123`), and existing paths can cache
+failed/empty or INDEX-fallback (`Partial`) `PackageInfo`s. A weaker cached entry
+must never shadow stronger metadata for member purposes: never overwrite a
+`Complete` exports set with a `Partial`/`Unknown` one, allow upgrade from
+`Unknown`/`Partial` to `Complete`, and ensure a failed-load placeholder is treated
+as `Unknown` (never absence-authoritative), not as an empty `Complete` set.
+
+This completeness can live on `PackageInfo` (one completeness field for the exports
+set) or on a derived query result. `PackageInfo::new` / `PackageInfo::with_details`
+remain for tests and legacy construction and **default exports completeness to
+`Unknown`** — so any production path that does not explicitly stamp completeness is
+silently non-authoritative (safe direction, but the feature does nothing until the
+stamping paths below are updated). The provider boundary needs explicit support:
+`PackageMetadataProvider::lookup()` / `PackageRecord::into_info()`
+(`package_db/model.rs:90`) currently build via `with_details`, so add an explicit
+constructor or query-result type that lets providers assign `Complete`, otherwise
+all Tier 2/Tier 3 member diagnostics silently never fire.
+
+Exports-completeness stamping (every construction site that feeds the cache must be
+audited; defaulting to `Unknown` is safe but inert):
+
+- Static NAMESPACE parse with no `exportPattern()` / `exportClassPattern()` and no
+  re-export indirection: `Complete`. **Caveat (M3):** the static parser is not a
+  full `getNamespaceExports()` — re-export idioms and S3-method emission can
+  diverge. If the parse cannot be shown equivalent for the package's directives,
+  stamp `Partial`. Only the R-subprocess expansion is unconditionally `Complete`.
+- R subprocess namespace expansion: `Complete`.
+- INDEX fallback for pattern packages: `Partial`.
 - Provider records from `.raven/packages.json`, `names.db`, or embedded base:
-  complete for the captured package version, with the existing Tier 2/Tier 3
-  version-skew caveat.
-- Static data-file discovery without R enumeration: partial data metadata when a
-  data directory exists; complete empty data metadata when no data directory
-  exists.
-- R `data(package=)` enumeration or provider `lazy_data`: complete known data
-  metadata for diagnostic purposes.
-- Empty failed-load placeholders: unknown, never absence-authoritative.
+  `Complete` for the captured package version, with the existing Tier 2/Tier 3
+  version-skew caveat — *provided the provider record actually carries a full
+  export list* (verify the record shape; a name-only index is `Partial`).
+- Empty failed-load placeholders: `Unknown`, never absence-authoritative.
 
 `get_exports_sync()` may continue to serve completion by discarding completeness
 and returning whatever member names are useful for suggestions.
@@ -377,26 +466,34 @@ Missing packages:
 
 Namespace members:
 
-- Complete metadata plus absent member emits `namespace-member-not-found`.
-- Complete metadata plus present export emits no diagnostic.
-- Complete metadata plus present `lazy_data` object emits no diagnostic.
-- Partial or unknown metadata emits no member diagnostic.
-- Two-axis reconciliation: exports `Complete` but `lazy_data` `Partial`, member
-  absent from both → no diagnostic (the data axis is not absence-authoritative).
-- Two-axis reconciliation: exports `Complete` and `lazy_data` `Complete`, member
-  absent from both → diagnostic emitted.
-- `namespace_member_status_sync` returns `Present` when the member is a known
-  export even if the data axis is `Partial`/`Unknown` (and vice versa for a known
-  data object).
+- Complete exports + absent member emits `namespace-member-not-found`.
+- Complete exports + present export emits no diagnostic.
+- Present `lazy_data` object suppresses the diagnostic regardless of data
+  completeness (data is positive-only).
+- Present `base_exports` member of a base/recommended package suppresses the
+  diagnostic (`datasets::mtcars` — the C1 fix; the per-package `lazy_data` is empty
+  for base packages).
+- Partial or unknown *exports* emits no member diagnostic.
+- `namespace_member_status_sync` returns `Present` for a known export even when the
+  exports set is otherwise `Partial`/`Unknown` (present short-circuit wins).
+- Monotonic authority: a `Partial`/failed cached entry does not shadow a later
+  `Complete` exports set; `Complete` is never downgraded by a weaker entry; a
+  failed-load placeholder yields `Unknown`, never `Absent`.
+- Sync contract: an `exportPattern()` package returns `Partial`/`Unknown` (no
+  member diagnostic) until R namespace expansion has warmed it; after warm +
+  force-republish, the diagnostic appears.
 - `pkg:::x` never emits the member diagnostic.
 - Direct package membership is used; combined `Depends` or meta-package attached
   exports do not suppress the diagnostic.
-- If package is uninstalled but complete provider metadata says the member is
-  absent, both diagnostics are emitted when enabled.
+- If package is uninstalled but complete provider metadata (with a full export
+  list) says the member is absent, both diagnostics are emitted when enabled and
+  install status is knowable.
 
 Configuration and docs:
 
-- Add Rust config parsing for `packages.namespaceMemberSeverity`.
+- Add Rust config parsing for `packages.namespaceMemberSeverity`, reusing
+  `parse_severity` and the `Option<DiagnosticSeverity>` convention where `None`
+  means `off` (mirroring `packages_missing_package_severity`).
 - Add VS Code schema, initialization options, and settings tests.
 - Regenerate `docs/settings-reference.md`.
 - Update `docs/diagnostics.md`, `docs/completion.md`, `docs/package-database.md`,
@@ -405,10 +502,14 @@ Configuration and docs:
 ## Risks
 
 - **False positives from partial metadata.** Mitigated by emitting member absence
-  only when *both* the exports axis and the data axis are complete. The two-axis
-  reconciliation in `namespace_member_status_sync` is the single chokepoint for
-  this; a single whole-package completeness value would mask the
-  complete-exports / partial-data case and reintroduce false positives.
+  only from a `Complete` exports set, judged in the single chokepoint
+  `namespace_member_status_sync`. Residual risk under the v1 exports-authoritative
+  model: a LazyData package whose `lazy_data` we captured only partially, where the
+  user references a genuine LazyData object that is not in the export set — it could
+  be flagged. Bounded and tracked by issue #505 (dedicated data-member authority).
+- **Cache shadowing.** A weaker cached `PackageInfo` (failed/empty/INDEX-partial)
+  could otherwise shadow stronger metadata and either suppress a real diagnostic or
+  fire from non-authoritative data. Mitigated by the monotonic-authority rule.
 - **Tier 3 version skew.** Existing package-database caveat applies: complete
   metadata is complete for the captured version, not necessarily the user's exact
   intended version when the package is uninstalled.
@@ -428,11 +529,12 @@ Configuration and docs:
   requiring `library(dplyr)`.
 - A file containing `missingpkg::foo` reports `package-not-installed` under the
   same conditions and setting as `library(missingpkg)`.
-- A file containing `dplyr::mutatee` reports `namespace-member-not-found` when
-  complete `dplyr` metadata is available.
+- A file containing `dplyr::mutatee` reports `namespace-member-not-found` when a
+  complete `dplyr` exports set is available.
 - A file containing `dplyr::mutatee` does not report the member diagnostic while
-  metadata is partial or unknown.
-- `datasets::mtcars` is accepted when known lazy-data metadata is available.
+  the exports set is partial or unknown.
+- `datasets::mtcars` is accepted: `mtcars` resolves via `base_exports` for the
+  base/recommended `datasets` package (not the per-package `lazy_data`).
 - `dplyr:::internal_name` may report a missing package, but never reports the
   member diagnostic.
 - No package referenced only through `pkg::` becomes visible as a bare-name
