@@ -211,6 +211,46 @@ The injection is gated on the call, not the path: the same file *without* a
 `load_all()` call (and outside the dev-context directories above) sees only the
 normal global/`library()` scope.
 
+#### Transitive propagation through `source()` chains
+
+The `load_all()` injection propagates exactly like `library()` — forward through
+`source()` chains, position-aware, and across multiple parents:
+
+```r
+# internal/setup.R
+devtools::load_all()
+source("run.R")      # run.R inherits the package internals
+
+# internal/run.R  (no load_all() here)
+result <- my_internal_helper(data)  # No diagnostic — inherited from setup.R
+```
+
+A file in the chain that is reached **before** the `load_all()` call (or only
+through parents that never call `load_all()`) does not inherit the internals.
+
+#### R/ source changes trigger diagnostics refresh
+
+When you add, delete, or edit a file under `R/`, Raven automatically re-publishes
+diagnostics for:
+
+- the file that called `load_all()`,
+- every file it `source()`s (forward chain), and
+- every file that `source()`s the `load_all()` caller (backward chain).
+
+This keeps the "is this function defined in the package?" check in sync as you
+work on the package source, without restarting the editor.
+
+#### Go-to-definition for load_all() internals
+
+Cmd-click (or F12) on a symbol made available by `load_all()` navigates to its
+real definition in the package's `R/` source — whether the target file is open or
+not. This works for the same files that benefit from `R/`→`R/` mutual-visibility
+navigation in package mode.
+
+Goto into external/installed packages (e.g. a dependency's unexported function
+referenced after `load_all()` via `:::`) is not yet supported; see
+[Go-to-Definition — Package Exports](go-to-definition.md#package-exports).
+
 ## Ordinary scripts in package workspaces
 
 Directories such as `scripts/`, `analysis/`, `tools/`, `debug/`, and plain

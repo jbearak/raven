@@ -82,6 +82,20 @@ Inside `source()` strings and path-taking directives, cmd-click navigates to the
 
 See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Directives](directives.md#working-directory-directives) for details.
 
+## load_all() Internals
+
+When a file calls `devtools::load_all()` / `pkgload::load_all()`, Raven models this as attaching the package under development. Cmd-click on any symbol that `load_all()` exposes — including non-exported helpers defined in `R/` — navigates to its real definition in the package source, whether that file is currently open or not.
+
+```r
+# internal/scratch.R
+devtools::load_all()
+my_helper(data)   # Cmd-click → jumps to R/helpers.R where my_helper is defined
+```
+
+This also fixes `R/`→`R/` navigation in package mode: a function defined in `R/utils.R` and called from `R/main.R` is directly navigable via cmd-click without any `source()` call.
+
+Goto into **external/installed** packages (e.g. a dependency's source after a `library()` or `:::` call) is not yet supported — installed packages ship compiled lazy-load databases rather than readable source. Use hover to see the `{package}` attribution and look up the function in its own documentation or source repository.
+
 ## Package Exports
 
 Cmd-click on a symbol that comes from an installed package (e.g. `dplyr::mutate` after `library(dplyr)`) does **not** navigate. Package exports are tracked for completions, diagnostics, and hover, but Raven doesn't currently open installed package sources. Use hover to see the `{package}` attribution instead.
