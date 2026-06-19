@@ -974,7 +974,7 @@ fn visit_node_for_top_level_library(
 /// matching. This is deliberately limited to statically recognizable quoting
 /// wrappers; expressions built dynamically (e.g. `eval(parse(text = …))`) are
 /// out of scope.
-fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
+pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
     if node.kind() != "call" {
         return false;
     }

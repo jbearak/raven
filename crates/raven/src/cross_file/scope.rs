@@ -15,6 +15,7 @@ use tree_sitter::{Node, Tree};
 
 use super::source_detect::{
     detect_exists_calls, detect_library_calls, detect_rm_calls, detect_source_calls,
+    is_nonevaluating_quote_call,
 };
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
@@ -1970,10 +1971,14 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
 /// `.Rprofile` scan to decide whether the profile attaches the package under
 /// development (modeled via [`crate::package_library::LOAD_ALL_SENTINEL`]).
 ///
-/// Mirrors the function-body exclusion that [`extract_attached_packages`] uses
-/// for `library()`/`require()`: a `load_all()` lexically inside a
-/// `function_definition` only runs when that function is invoked, so it does
-/// not attach at profile-load time. The per-call recognition reuses
+/// Mirrors the exclusions that [`extract_attached_packages`] applies to
+/// `library()`/`require()`. A `load_all()` lexically inside a
+/// `function_definition` only runs when that function is invoked, and a
+/// `load_all()` inside a non-evaluating quoting call (`quote`/`bquote`/
+/// `substitute`/`expression`, rlang's `expr`/`quo`/…) captures code without
+/// ever evaluating it; neither attaches at profile-load time. The quoting
+/// predicate is shared with `extract_attached_packages` via
+/// [`is_nonevaluating_quote_call`]. The per-call recognition reuses
 /// [`call_is_dev_load_all`]. Returns `false` on unparseable input.
 ///
 /// [`extract_attached_packages`]: crate::cross_file::source_detect::extract_attached_packages
@@ -1989,21 +1994,25 @@ pub(crate) fn text_calls_dev_load_all(text: &str) -> bool {
     let Some(tree) = parser.parse(text, None) else {
         return false;
     };
-    fn walk(node: Node, content: &str, inside_fn: bool) -> bool {
-        // A call lexically inside a function body does not run at load time.
-        if !inside_fn && call_is_dev_load_all(node, content) {
+    fn walk(node: Node, content: &str, inside_fn: bool, inside_quote: bool) -> bool {
+        // A call inside a function body or a non-evaluating quoting wrapper does
+        // not run at load time.
+        if !inside_fn && !inside_quote && call_is_dev_load_all(node, content) {
             return true;
         }
         let entering_fn = inside_fn || node.kind() == "function_definition";
+        // Latch once an ancestor quoting call is entered, so all descendants are
+        // likewise excluded (mirrors `visit_node_for_top_level_library`).
+        let entering_quote = inside_quote || is_nonevaluating_quote_call(node, content);
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if walk(child, content, entering_fn) {
+            if walk(child, content, entering_fn, entering_quote) {
                 return true;
             }
         }
         false
     }
-    walk(tree.root_node(), text, false)
+    walk(tree.root_node(), text, false, false)
 }
 
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.

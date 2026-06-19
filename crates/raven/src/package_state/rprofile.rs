@@ -491,6 +491,27 @@ mod tests {
     }
 
     #[test]
+    fn rprofile_load_all_in_quote_does_not_attach() {
+        // A load_all() lexically inside a non-evaluating quoting call (e.g.
+        // `quote(...)`) captures code without running it, so it must not attach
+        // at profile-load time.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "quote(devtools::load_all())\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            !scan
+                .attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "quoted load_all() must not attach the sentinel: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
     fn rprofile_load_all_followed_through_source() {
         // load_all() in a transitively-sourced helper also attaches the sentinel.
         let tmp = TempDir::new().unwrap();
