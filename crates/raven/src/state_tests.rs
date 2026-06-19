@@ -1036,6 +1036,46 @@ mod package_testthat_visibility_tests {
         );
     }
 
+    /// Swapping `state.package_library` for a fresh library (as backend.rs does
+    /// on libpath rebuild / init) drops the overlay, but
+    /// `refresh_local_dev_overlay` must re-install it so sentinel resolution
+    /// survives the swap. Without the refresh call the fresh empty library would
+    /// NOT resolve `helper`.
+    #[test]
+    fn swapped_package_library_keeps_local_dev_overlay() {
+        use crate::package_library::{LOAD_ALL_SENTINEL, PackageLibrary};
+
+        let root = "/work/pkg";
+        let mut state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        // Sanity: the original library's overlay resolves the internal symbol.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "precondition: overlay resolves helper before the swap"
+        );
+
+        // Simulate a backend libpath rebuild / init that replaces the library
+        // with a fresh one (whose overlay is None), then re-applies the overlay.
+        state.package_library = Arc::new(PackageLibrary::new_empty());
+        state.refresh_local_dev_overlay();
+
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "after a library swap, refresh_local_dev_overlay must re-install the overlay so the sentinel still resolves helper"
+        );
+    }
+
     /// Negative: the SAME `internal/` script WITHOUT a `load_all()` call does
     /// NOT see the package's internal symbols — the injection is gated on the
     /// call, not the path.

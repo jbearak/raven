@@ -1345,6 +1345,9 @@ impl Backend {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
                 state.package_library = library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = ready;
                 state.bump_package_config_generation();
                 (true, ready)
@@ -3072,6 +3075,9 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
                 state.package_library = new_package_library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = package_library_ready;
                 state.bump_package_config_generation();
                 true
@@ -3265,6 +3271,9 @@ impl LanguageServer for Backend {
                 {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
+                    // The fresh library starts with no local-dev overlay; re-install
+                    // it so load_all sentinel resolution survives the libpath rebuild.
+                    state.refresh_local_dev_overlay();
                     state.package_library_ready = ready;
                     state.bump_package_config_generation();
                     // Swapping the library may have changed `lib_paths`
@@ -7070,6 +7079,9 @@ impl Backend {
             {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = package_library_ready;
                 state.bump_package_config_generation();
                 // The new library may carry different `lib_paths` (the user
