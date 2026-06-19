@@ -20446,6 +20446,29 @@ pub fn goto_definition_with_cancel(
         // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
         // Validates: Requirements 11.1, 11.2
         if symbol.source_uri.as_str().starts_with("package:") {
+            // The user's OWN package internals (injected under the synthetic
+            // PACKAGE_INTERNAL_URI by the dev-context / load_all overlay) DO have
+            // navigable source under <root>/R/ — redirect to it. The injected symbol
+            // itself is location-free (defined_line 0), so we resolve the real
+            // location from the workspace index. Other `package:` URIs are real
+            // installed-package exports with no navigable source: keep returning None.
+            if crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri)
+                && let Some(root) = state
+                    .package_state
+                    .scope_contribution()
+                    .workspace_root
+                    .as_ref()
+            {
+                return resolve_package_internal_goto(
+                    name,
+                    scope_key,
+                    root,
+                    &content_provider,
+                    &state.document_store.uris(),
+                    &state.workspace_index_new,
+                    cancel,
+                );
+            }
             log::trace!(
                 "Symbol '{}' is from package '{}', no navigable source available",
                 name,
@@ -20485,6 +20508,45 @@ pub fn goto_definition_with_cancel(
             uri: symbol.source_uri.clone(),
             range: scoped_symbol_range(symbol),
         }));
+    }
+
+    // Sentinel path (script / callee / caller in a load_all() neighborhood): the
+    // internal resolves through the package overlay rather than `scope.symbols`, so
+    // the cursor lookup above misses. Before the general cross-file fallback, try to
+    // resolve it as a package internal — but only when the name is genuinely a
+    // contributed internal (else an ordinary cross-file symbol that happens to be
+    // defined in an R/ file would be diverted here and resolved by the same logic,
+    // which is harmless but we keep the general fallback authoritative for non-package
+    // names). The contribution's internal/imported/dataset/onload sets are the source
+    // of truth for "this is a package-internal name".
+    if let Some(root) = state
+        .package_state
+        .scope_contribution()
+        .workspace_root
+        .as_ref()
+    {
+        let contrib = state.package_state.scope_contribution();
+        let is_contributed_internal = contrib.r_internal_symbols.contains(name)
+            || contrib.r_internal_symbols.contains(scope_key)
+            || contrib.onload_symbols.contains(name)
+            || contrib.onload_symbols.contains(scope_key);
+        // For a genuine package internal the rm-aware top_level_interface is
+        // AUTHORITATIVE: return whatever the resolver decides (Some R/ location, or
+        // None for a name with no live top-level def — sysdata/imported/rm'd). We do
+        // NOT fall through to the general `exported_interface` fallback below, which
+        // would otherwise resurrect a function-local or rm'd binding of the same name
+        // as a phantom goto target.
+        if is_contributed_internal {
+            return resolve_package_internal_goto(
+                name,
+                scope_key,
+                root,
+                &content_provider,
+                &state.document_store.uris(),
+                &state.workspace_index_new,
+                cancel,
+            );
+        }
     }
 
     // Search all open documents using ContentProvider
@@ -20655,6 +20717,87 @@ fn scoped_symbol_range(symbol: &ScopedSymbol) -> Range {
 /// (a literal `0 + _` would lint; a `0` *argument* does not).
 fn scoped_symbol_default_end(defined_column: u32, name: &str) -> u32 {
     defined_column + crate::utf16::utf16_len(name)
+}
+
+/// Resolve a package-internal symbol name (exposed via `load_all()` / dev-context
+/// injection) to its real definition in the package's `R/` source tree.
+///
+/// The dev-context and `load_all()` overlays inject such symbols under the synthetic
+/// [`scope::PACKAGE_INTERNAL_URI`] (or omit them from `scope.symbols` entirely, leaving
+/// the cursor lookup to miss). Neither carries a navigable `(file, line)` — by design
+/// `PackageScopeContribution` is location-free. This resolver recovers the location
+/// purely from the workspace index / open documents: it scans every cached file whose
+/// path [`is_r_source_path`](crate::package_state::is_r_source_path) under
+/// `workspace_root` (so an unrelated workspace file that happens to define the same
+/// name is never chosen), and looks the name up in that file's rm-aware
+/// [`top_level_interface`](scope::top_level_interface) — NOT `exported_interface`,
+/// which also carries function-local and `rm()`-removed bindings and would yield
+/// phantom targets.
+///
+/// Determinism: the document store and workspace index iterate in an unspecified
+/// order, so candidates are collected and the one with the lexicographically smallest
+/// source-file URI string is returned. A package with two top-level defs of the same
+/// name is itself a load-time error in R; we deterministically return one of them
+/// rather than panicking or returning an arbitrary one. Returns `None` when no R/
+/// source file defines the name (e.g. sysdata / imported internals have no navigable
+/// source) — the caller then treats that as a no-op.
+fn resolve_package_internal_goto(
+    name: &str,
+    scope_key: &str,
+    workspace_root: &std::path::Path,
+    content_provider: &impl ContentProvider,
+    document_store_uris: &[Url],
+    workspace_index: &crate::workspace_index::WorkspaceIndex,
+    cancel: &DiagCancelToken,
+) -> Option<GotoDefinitionResponse> {
+    let mut best: Option<(Url, ScopedSymbol)> = None;
+    let consider = |file_uri: &Url, best: &mut Option<(Url, ScopedSymbol)>| -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let Ok(path) = file_uri.to_file_path() else {
+            return true;
+        };
+        if crate::package_state::is_r_source_path(&path, workspace_root).is_none() {
+            return true;
+        }
+        let Some(artifacts) = content_provider.get_artifacts(file_uri) else {
+            return true;
+        };
+        let interface = scope::top_level_interface(&artifacts);
+        if let Some(symbol) = interface.get(name).or_else(|| interface.get(scope_key)) {
+            // Pick the lexicographically smallest URI string for a stable result
+            // when several R/ files define the same top-level name.
+            let replace = match best {
+                Some((cur_uri, _)) => file_uri.as_str() < cur_uri.as_str(),
+                None => true,
+            };
+            if replace {
+                *best = Some((file_uri.clone(), symbol.clone()));
+            }
+        }
+        true
+    };
+
+    // Open documents (DocumentStore) then closed files (workspace index): a single
+    // sweep over both covers the open + closed cases the spec requires.
+    for file_uri in document_store_uris {
+        if !consider(file_uri, &mut best) {
+            return None;
+        }
+    }
+    for (file_uri, _) in workspace_index.iter() {
+        if !consider(&file_uri, &mut best) {
+            return None;
+        }
+    }
+
+    best.map(|(uri, sym)| {
+        GotoDefinitionResponse::Scalar(Location {
+            range: scoped_symbol_range(&sym),
+            uri,
+        })
+    })
 }
 
 // ============================================================================
@@ -64985,5 +65128,364 @@ mod issue_459_backtick_navigation_tests {
             text.contains("fruit <- list(`macintosh apple` = 1)"),
             "hover should show the construction statement; got: {text}"
         );
+    }
+}
+
+/// Go-to-definition for `load_all()`-exposed package internals → their real `R/`
+/// source. The dev-context / `load_all` overlay either injects an internal under the
+/// synthetic `PACKAGE_INTERNAL_URI` (so the cursor lookup hits a location-free symbol)
+/// or omits it from `scope.symbols` entirely (so the cursor lookup misses and the
+/// sentinel-path fallback runs). Both routes must navigate to the rm-aware top-level
+/// definition in the package's `R/` tree, resolved purely from the workspace index /
+/// open documents — `PackageScopeContribution` stays location-free.
+#[cfg(test)]
+mod load_all_internal_goto_tests {
+    use crate::package_state::{PackageScopeContribution, PackageState};
+    use crate::state::{Document, WorldState};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Url};
+
+    const ROOT_PATH: &str = "/work/pkg";
+    const ROOT_URL: &str = "file:///work/pkg";
+
+    /// Build a `WorldState` whose package contribution declares `internals` as the
+    /// package's own internal (R/) symbols, rooted at `/work/pkg`.
+    fn state_with_internals(internals: &[&str]) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+
+        let mut r_internal = BTreeSet::new();
+        for s in internals {
+            r_internal.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from(ROOT_PATH)),
+                r_internal_symbols: Arc::new(r_internal),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        state
+    }
+
+    /// Insert `content` as an OPEN document (DocumentStore) — open docs are
+    /// authoritative for artifacts.
+    fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            state.document_store.open(uri.clone(), content, 1).await;
+        });
+        uri
+    }
+
+    /// Insert `content` as a CLOSED file in the workspace index, with computed
+    /// artifacts — mirrors the indexed-file goto fixtures elsewhere in this file.
+    fn index_closed_file(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        use crate::workspace_index::IndexEntry;
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        let doc = Document::new_with_uri(content, None, &uri);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(content));
+        let artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &uri,
+            doc.tree.as_ref().expect("parses"),
+            content,
+            Some(&metadata),
+        ));
+        let entry = IndexEntry {
+            contents: doc.contents.clone(),
+            tree: doc.tree.clone(),
+            loaded_packages: doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: content.len() as u64,
+                content_hash: None,
+            },
+            metadata,
+            artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        uri
+    }
+
+    /// Insert `content` as a plain legacy open document (state.documents). Used for
+    /// the using file in a sentinel-path scenario — it is parsed for the cursor token
+    /// but its own artifacts are irrelevant to the resolver.
+    fn add_legacy_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        state
+            .documents
+            .insert(uri.clone(), Document::new(content, None));
+        uri
+    }
+
+    fn scalar(result: Option<GotoDefinitionResponse>) -> Location {
+        match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar location, got {other:?}"),
+        }
+    }
+
+    fn goto(state: &WorldState, uri: &Url, pos: Position) -> Option<GotoDefinitionResponse> {
+        super::goto_definition_with_cancel(
+            state,
+            uri,
+            pos,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+    }
+
+    /// Sentinel path: the internal is exposed via the overlay (NOT in `scope.symbols`)
+    /// for a caller OUTSIDE the package source tree. Goto must fall through to the
+    /// package-internal resolver and land on the `R/` definition.
+    #[test]
+    fn goto_load_all_internal_sentinel_path_to_r_source() {
+        // R/ source defines `my_func` on line 2.
+        let src = "# header\n\nmy_func <- function(x) x + 1\n";
+        let mut state = state_with_internals(&["my_func"]);
+        let r_uri = index_closed_file(&mut state, "file:///work/pkg/R/util.R", src);
+
+        // CALLER outside the package tree (a load_all() script).
+        let caller = add_legacy_doc(&mut state, "file:///elsewhere/script.R", "my_func(1)\n");
+        let l = scalar(goto(&state, &caller, Position::new(0, 2)));
+        assert_eq!(l.uri, r_uri, "caller goto lands on R/ def file");
+        assert_eq!(l.range.start.line, 2, "lands on the def line in R/util.R");
+
+        // CALLEE: a sibling R/ file that also calls `my_func` but does not define it.
+        // The querying file lives in `state.documents` (what the handler's entry
+        // lookup reads); the def lives in the closed index above.
+        let callee = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/other.R",
+            "other <- function() my_func(2)\n",
+        );
+        let l = scalar(goto(&state, &callee, Position::new(0, 22)));
+        assert_eq!(l.uri, r_uri, "callee goto lands on R/ def file");
+        assert_eq!(l.range.start.line, 2);
+
+        // The load_all FILE itself (the defining R/ file): goto on a self-call.
+        let load_all_file = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/main.R",
+            "main <- function() my_func(3)\n",
+        );
+        let l = scalar(goto(&state, &load_all_file, Position::new(0, 21)));
+        assert_eq!(l.uri, r_uri);
+        assert_eq!(l.range.start.line, 2);
+    }
+
+    /// Dev-context path: an internal referenced from WITHIN an `R/` file (and a test
+    /// file) — here the symbol IS injected into `scope.symbols` under
+    /// PACKAGE_INTERNAL_URI, so the cursor lookup hits and the redirect runs. This
+    /// also closes the pre-existing R/→R/ goto gap.
+    #[test]
+    fn goto_load_all_internal_dev_context_path_r_to_r() {
+        let src = "helper <- function() 42\n";
+        let mut state = state_with_internals(&["helper"]);
+        let def_uri = index_closed_file(&mut state, "file:///work/pkg/R/defs.R", src);
+
+        // Reference from another R/ file. `helper` is injected via the overlay
+        // (PACKAGE_INTERNAL_URI), so the cursor lookup hits the synthetic symbol and
+        // the redirect resolves the real def.
+        let r_user = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/use.R",
+            "go <- function() helper()\n",
+        );
+        let l = scalar(goto(&state, &r_user, Position::new(0, 17)));
+        assert_eq!(l.uri, def_uri, "R/ reference lands on R/ definition");
+        assert_eq!(l.range.start.line, 0);
+
+        // Reference from a testthat test file (also gets the internal injection).
+        let test_user = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/tests/testthat/test-x.R",
+            "test_that('x', { helper() })\n",
+        );
+        let l = scalar(goto(&state, &test_user, Position::new(0, 18)));
+        assert_eq!(l.uri, def_uri, "test reference lands on R/ definition");
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// An unrelated workspace file OUTSIDE the package source tree that defines the
+    /// same name must NOT be chosen — `is_r_source_path` restricts candidates.
+    #[test]
+    fn goto_load_all_internal_picks_package_tree_not_unrelated_file() {
+        let mut state = state_with_internals(&["my_func"]);
+        // Real def lives under R/.
+        let r_uri = index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/real.R",
+            "my_func <- function() 1\n",
+        );
+        // A decoy defining the same name OUTSIDE the package tree (a vignette R
+        // file is dev-context, not is_r_source_path; also choose a non-R/ path).
+        // Use an alphabetically-smaller URI so a naive "smallest URI" without the
+        // is_r_source_path filter would wrongly pick it.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/data-raw/aaa.R",
+            "my_func <- function() 999\n",
+        );
+
+        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "my_func()\n");
+        let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+        assert_eq!(
+            l.uri, r_uri,
+            "resolver must pick the R/ def, not the unrelated (data-raw) file"
+        );
+    }
+
+    /// A function-local or `rm()`-removed name of the same spelling is NOT a goto
+    /// target — the resolver uses the rm-aware `top_level_interface`, not the
+    /// scope-blind `exported_interface`.
+    #[test]
+    fn goto_load_all_internal_uses_top_level_not_exported() {
+        let mut state = state_with_internals(&["my_func"]);
+        // R/ file where `my_func` is ONLY a function-local binding (never a live
+        // top-level def) — exported_interface would carry it, top_level_interface
+        // must not.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/locals.R",
+            "wrapper <- function() {\n  my_func <- function() 1\n  my_func()\n}\n",
+        );
+        // And an R/ file where it IS defined top-level then rm()'d.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/removed.R",
+            "my_func <- function() 1\nrm(my_func)\n",
+        );
+
+        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "my_func()\n");
+        assert!(
+            goto(&state, &caller, Position::new(0, 1)).is_none(),
+            "no LIVE top-level def of `my_func` exists in the package tree → None"
+        );
+    }
+
+    /// Two R/ files defining the same top-level name → a single, deterministic
+    /// Location (smallest URI string). Running the resolver path twice must yield
+    /// the identical answer and never panic.
+    #[test]
+    fn goto_load_all_internal_duplicate_defs_deterministic() {
+        let mut state = state_with_internals(&["dup"]);
+        // Two R/ files, both with a live top-level `dup` def at different lines.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/b_second.R",
+            "\n\ndup <- function() 2\n",
+        );
+        let first_uri = index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/a_first.R",
+            "dup <- function() 1\n",
+        );
+
+        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "dup()\n");
+        let l1 = scalar(goto(&state, &caller, Position::new(0, 1)));
+        let l2 = scalar(goto(&state, &caller, Position::new(0, 1)));
+        assert_eq!(l1.uri, l2.uri, "stable across runs");
+        assert_eq!(l1.range.start, l2.range.start);
+        assert_eq!(
+            l1.uri, first_uri,
+            "smallest URI string (R/a_first.R) wins deterministically"
+        );
+        assert_eq!(l1.range.start.line, 0);
+    }
+
+    /// A sysdata / imported internal name with no navigable `R/` source → None.
+    #[test]
+    fn goto_load_all_internal_sysdata_or_imported_noops() {
+        // `secret_blob` is declared an internal (e.g. from sysdata.rda) but no R/
+        // file defines it.
+        let mut state = state_with_internals(&["secret_blob"]);
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/unrelated.R",
+            "other <- function() 1\n",
+        );
+
+        let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "secret_blob\n");
+        assert!(
+            goto(&state, &caller, Position::new(0, 2)).is_none(),
+            "an internal with no R/ source is a no-op"
+        );
+    }
+
+    /// Regression guard: goto on a normal `library()` (installed-package) symbol
+    /// still no-ops — external-package goto is unchanged. The cursor-hit branch sees
+    /// a real `package:<name>` URI (NOT PACKAGE_INTERNAL_URI) and returns None.
+    #[test]
+    fn goto_library_symbol_still_noops() {
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        // Directly exercise the gate's classification: a real installed-package
+        // export URI must not be treated as a package internal.
+        let pkg_export = Url::parse("package:dplyr").unwrap();
+        assert!(pkg_export.as_str().starts_with("package:"));
+        assert!(
+            !crate::cross_file::scope::is_package_internal_uri(&pkg_export),
+            "a real installed-package URI is not the internal sentinel URI"
+        );
+        let internal = Url::parse(crate::cross_file::scope::PACKAGE_INTERNAL_URI).unwrap();
+        assert!(crate::cross_file::scope::is_package_internal_uri(&internal));
+
+        // And end-to-end: a `library(dplyr); mutate()` call with no R/ def for
+        // `mutate` resolves to nothing (no package internal contributes it).
+        let mut state = state_with_internals(&[]);
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///elsewhere/s.R",
+            "library(dplyr)\nmutate(df)\n",
+        );
+        let _ = ScopedSymbol {
+            name: Arc::from("mutate"),
+            kind: SymbolKind::Function,
+            source_uri: pkg_export,
+            defined_line: 0,
+            defined_column: 0,
+            defined_end_column: 6,
+            signature: None,
+            is_declared: false,
+        };
+        assert!(
+            goto(&state, &caller, Position::new(1, 1)).is_none(),
+            "external-package symbol goto stays a no-op"
+        );
+    }
+
+    /// The resolver works whether the defining R/ file is OPEN (DocumentStore) or
+    /// CLOSED (workspace index) — both reachable via the ContentProvider.
+    #[test]
+    fn goto_load_all_internal_open_and_closed() {
+        // CLOSED defining file.
+        {
+            let mut state = state_with_internals(&["closed_fn"]);
+            let def = index_closed_file(
+                &mut state,
+                "file:///work/pkg/R/closed.R",
+                "closed_fn <- function() 1\n",
+            );
+            let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "closed_fn()\n");
+            let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+            assert_eq!(l.uri, def, "resolves via the workspace index (closed file)");
+        }
+        // OPEN defining file.
+        {
+            let mut state = state_with_internals(&["open_fn"]);
+            let def = open_doc(
+                &mut state,
+                "file:///work/pkg/R/open.R",
+                "open_fn <- function() 1\n",
+            );
+            let caller = add_legacy_doc(&mut state, "file:///elsewhere/s.R", "open_fn()\n");
+            let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+            assert_eq!(l.uri, def, "resolves via the DocumentStore (open file)");
+        }
     }
 }
