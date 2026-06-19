@@ -624,13 +624,13 @@ mod package_testthat_visibility_tests {
         Arc::new(compute_artifacts(uri, &tree, code))
     }
 
-    /// Resolve visible symbols at EOF in `uri` using the given contribution.
-    fn resolve_symbols(
+    /// Resolve the full scope at EOF in `uri` using the given contribution.
+    fn resolve_scope(
         uri: &Url,
         artifacts: Arc<ScopeArtifacts>,
         workspace_root: &Url,
         contribution: &crate::package_state::PackageScopeContribution,
-    ) -> std::collections::HashMap<Arc<str>, crate::cross_file::scope::ScopedSymbol> {
+    ) -> crate::cross_file::scope::ScopeAtPosition {
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
             if u == uri { Some(artifacts.clone()) } else { None }
         };
@@ -638,7 +638,7 @@ mod package_testthat_visibility_tests {
             |_u: &Url| -> Option<Arc<crate::cross_file::types::CrossFileMetadata>> { None };
         let graph = DependencyGraph::new();
 
-        let scope = scope_at_position_with_graph(
+        scope_at_position_with_graph(
             uri,
             u32::MAX,
             u32::MAX,
@@ -653,8 +653,17 @@ mod package_testthat_visibility_tests {
             &|| false,
             Some(contribution),
             None,
-        );
-        scope.symbols
+        )
+    }
+
+    /// Resolve visible symbols at EOF in `uri` using the given contribution.
+    fn resolve_symbols(
+        uri: &Url,
+        artifacts: Arc<ScopeArtifacts>,
+        workspace_root: &Url,
+        contribution: &crate::package_state::PackageScopeContribution,
+    ) -> std::collections::HashMap<Arc<str>, crate::cross_file::scope::ScopedSymbol> {
+        resolve_scope(uri, artifacts, workspace_root, contribution).symbols
     }
 
     /// Build a `WorldState` pre-populated with DESCRIPTION + the given R files,
@@ -738,8 +747,18 @@ mod package_testthat_visibility_tests {
     /// End-to-end: a script under `internal/` (neither R/ nor a dev-context
     /// dir) that calls `devtools::load_all()` sees the package's own R/
     /// internal symbols, modeling the attach of the package under development.
+    ///
+    /// Post-Task-3 the internals are NO LONGER injected into `scope.symbols`
+    /// (the old bespoke whole-file injection branch was removed). Instead the
+    /// `load_all()` call attaches the package via the `LOAD_ALL_SENTINEL`
+    /// package-load event (Task 1), and the symbol resolves position-aware
+    /// through the package library's local-dev overlay (Task 2). So we assert
+    /// the sentinel reaches `loaded_packages` at the post-call cursor AND that
+    /// the overlay resolves `drive_find` under that sentinel.
     #[test]
-    fn load_all_script_sees_package_internal_symbols() {
+    fn load_all_caller_sees_internals_via_overlay_after_call() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
         let root = "/work/pkg";
         let state = build_state_with_files(
             root,
@@ -759,22 +778,184 @@ mod package_testthat_visibility_tests {
 
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
         let script_uri = Url::parse("file:///work/pkg/internal/demo.R").unwrap();
-        let script_code = "devtools::load_all()\ndrive_find()\n";
+        let script_code = "pkgload::load_all()\ndrive_find()\n";
         let script_arts = make_artifacts(&script_uri, script_code);
         assert!(
             script_arts.calls_dev_load_all,
             "compute_artifacts must flag the load_all() call"
         );
 
-        let symbols = resolve_symbols(
+        // The internals are NOT in scope.symbols any more (the old injection is gone).
+        let scope = resolve_scope(
             &script_uri,
             script_arts,
             &workspace_root,
             state.package_state.scope_contribution(),
         );
         assert!(
+            !scope.symbols.contains_key("drive_find"),
+            "post-Task-3 the internal is resolved via the sentinel/overlay, not scope.symbols"
+        );
+
+        // After the load_all() call, the sentinel is attached.
+        assert!(
+            scope.loaded_packages.contains(LOAD_ALL_SENTINEL)
+                || scope.inherited_packages.contains(LOAD_ALL_SENTINEL),
+            "the load_all sentinel must be attached after the call. loaded: {:?}, inherited: {:?}",
+            scope.loaded_packages,
+            scope.inherited_packages
+        );
+
+        // And the overlay resolves the R/ internal symbol under that sentinel,
+        // so the symbol is NOT reported undefined.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("drive_find", &[LOAD_ALL_SENTINEL.to_string()]),
+            "the local-dev overlay must resolve drive_find under the load_all sentinel"
+        );
+    }
+
+    /// Completion (deferred from Task 2, now meaningful): in the same caller,
+    /// after the `load_all()` line, completion offers the package's R/ internal
+    /// `helper`. This mirrors the completion handler, which builds the package
+    /// list from the resolved scope's inherited+loaded packages and feeds it to
+    /// `get_owned_exports_for_completions`.
+    #[test]
+    fn load_all_caller_completion_offers_internal_after_call() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let script_uri = Url::parse("file:///work/pkg/internal/demo.R").unwrap();
+        let script_arts = make_artifacts(&script_uri, "pkgload::load_all()\nhel\n");
+        let scope = resolve_scope(
+            &script_uri,
+            script_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+
+        // Mirror the completion handler's package-list construction.
+        let pkgs: Vec<String> = scope
+            .inherited_packages
+            .iter()
+            .chain(scope.loaded_packages.iter())
+            .cloned()
+            .collect();
+        assert!(
+            pkgs.iter().any(|p| p == LOAD_ALL_SENTINEL),
+            "the load_all sentinel must be among the attached packages: {pkgs:?}"
+        );
+        let owned = state
+            .package_library
+            .get_owned_exports_for_completions(&pkgs);
+        assert!(
+            owned.contains_key("helper"),
+            "completion must offer the R/ internal `helper` after load_all(); offered: {:?}",
+            owned.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Hover (deferred from Task 2): the R/ internal `helper` used after a
+    /// `load_all()` call resolves to an owner (the sentinel) rather than the
+    /// bare/undefined fallback. NOTE: the sentinel is workspace-local with no
+    /// installed help text, so real package help does NOT render; we assert the
+    /// weaker TRUE property — the symbol's owner resolves to the sentinel — which
+    /// is what stops hover from showing the undefined fallback.
+    #[test]
+    fn load_all_caller_hover_resolves_internal_owner() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        assert_eq!(
+            state
+                .package_library
+                .find_package_owner_for_symbol("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            Some(LOAD_ALL_SENTINEL.to_string()),
+            "hover owner-resolution must map the internal to the load_all sentinel, \
+             not the undefined fallback"
+        );
+    }
+
+    /// Regression: removing the bespoke load_all injection must NOT change the
+    /// dev-context (`vignettes/`) behavior — such files still see the package's
+    /// own R/ internals via the `is_dev_context` branch (unchanged), surfaced
+    /// directly into `scope.symbols`.
+    #[test]
+    fn dev_context_vignette_still_sees_internals_after_injection_removal() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // A vignette never calls load_all() but is dev-context.
+        let vign_uri = Url::parse("file:///work/pkg/vignettes/intro.R").unwrap();
+        let vign_arts = make_artifacts(&vign_uri, "drive_find()\n");
+        let symbols = resolve_symbols(
+            &vign_uri,
+            vign_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
             symbols.contains_key("drive_find"),
-            "package internal symbol must be visible after devtools::load_all(). visible: {:?}",
+            "dev-context vignette must still see R/ internals. visible: {:?}",
+            symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression: an R/ file still sees the package's internals via the
+    /// `is_r_source_path` branch (unchanged by the injection removal).
+    #[test]
+    fn r_source_file_still_sees_internals_after_injection_removal() {
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "drive_find <- function() 1\n",
+            )],
+        );
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        // A different R/ file uses drive_find (it lives in another R/ file).
+        let r_uri = Url::parse("file:///work/pkg/R/other.R").unwrap();
+        let r_arts = make_artifacts(&r_uri, "use <- function() drive_find()\n");
+        let symbols = resolve_symbols(
+            &r_uri,
+            r_arts,
+            &workspace_root,
+            state.package_state.scope_contribution(),
+        );
+        assert!(
+            symbols.contains_key("drive_find"),
+            "R/ file must still see sibling R/ internals. visible: {:?}",
             symbols.keys().collect::<Vec<_>>()
         );
     }
@@ -816,6 +997,82 @@ mod package_testthat_visibility_tests {
             !symbols.contains_key("drive_find"),
             "an out-of-root file calling load_all() must not see package internals. visible: {:?}",
             symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// End-to-end refresh: after `apply_package_event` derives the package
+    /// contribution, the package library's local-dev overlay resolves the
+    /// workspace's R/ internal symbols under the load_all sentinel. With no
+    /// package, the overlay is absent and resolution returns false.
+    #[test]
+    fn apply_package_event_refreshes_local_dev_overlay() {
+        use crate::package_library::LOAD_ALL_SENTINEL;
+
+        let root = "/work/pkg";
+        let state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        // Overlay populated from the freshly-derived contribution.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "load_all overlay must resolve R/ internal symbol after apply_package_event"
+        );
+
+        // No package => overlay is None => sentinel resolves nothing.
+        let empty = WorldState::new();
+        assert!(
+            !empty
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "a fresh WorldState (no package) must have no local-dev overlay"
+        );
+    }
+
+    /// Swapping `state.package_library` for a fresh library (as backend.rs does
+    /// on libpath rebuild / init) drops the overlay, but
+    /// `refresh_local_dev_overlay` must re-install it so sentinel resolution
+    /// survives the swap. Without the refresh call the fresh empty library would
+    /// NOT resolve `helper`.
+    #[test]
+    fn swapped_package_library_keeps_local_dev_overlay() {
+        use crate::package_library::{LOAD_ALL_SENTINEL, PackageLibrary};
+
+        let root = "/work/pkg";
+        let mut state = build_state_with_files(
+            root,
+            vec![(
+                PathBuf::from(format!("{}/R/utils.R", root)),
+                RFileKind::Source,
+                "helper <- function() 1\n",
+            )],
+        );
+
+        // Sanity: the original library's overlay resolves the internal symbol.
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "precondition: overlay resolves helper before the swap"
+        );
+
+        // Simulate a backend libpath rebuild / init that replaces the library
+        // with a fresh one (whose overlay is None), then re-applies the overlay.
+        state.package_library = Arc::new(PackageLibrary::new_empty());
+        state.refresh_local_dev_overlay();
+
+        assert!(
+            state
+                .package_library
+                .is_symbol_from_loaded_packages("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            "after a library swap, refresh_local_dev_overlay must re-install the overlay so the sentinel still resolves helper"
         );
     }
 

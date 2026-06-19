@@ -143,6 +143,16 @@ fn harvest_file(text: &str, scan: &mut RprofileScan) {
     for pkg in crate::cross_file::source_detect::extract_attached_packages(text) {
         scan.attached_packages.insert(pkg);
     }
+    // A `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()` call
+    // in the profile (or a transitively-sourced helper) attaches the package
+    // under development. Model it like an attached package via the load_all
+    // sentinel; the package library's local-dev overlay then resolves the
+    // package's own internal symbols (the `rprofile_prelude_applies` gate still
+    // withholds it in R/, tests/, and built-doc dirs in package mode).
+    if crate::cross_file::scope::text_calls_dev_load_all(text) {
+        scan.attached_packages
+            .insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
+    }
 }
 
 /// Literal `source()` target paths in `text` that contribute to the GLOBAL /
@@ -430,6 +440,90 @@ mod tests {
             scan.symbols
         );
         assert!(scan.symbols.contains("f"));
+    }
+
+    #[test]
+    fn rprofile_load_all_attaches_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".Rprofile"), "pkgload::load_all()\n").unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            scan.attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "a load_all() in .Rprofile must attach the load_all sentinel: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
+    fn rprofile_only_load_all_still_attaches() {
+        // A profile whose ONLY content is a bare load_all() must still produce a
+        // non-empty attached set so the prelude early-return guard passes.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".Rprofile"), "load_all()\n").unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            scan.attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "bare load_all() must attach the sentinel: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
+    fn rprofile_load_all_in_function_body_does_not_attach() {
+        // A load_all() lexically inside a function body only runs when the
+        // function is called, so it must not attach at profile-load time.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "f <- function() pkgload::load_all()\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            !scan
+                .attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "function-body load_all() must not attach the sentinel: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
+    fn rprofile_load_all_in_quote_does_not_attach() {
+        // A load_all() lexically inside a non-evaluating quoting call (e.g.
+        // `quote(...)`) captures code without running it, so it must not attach
+        // at profile-load time.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "quote(devtools::load_all())\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            !scan
+                .attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "quoted load_all() must not attach the sentinel: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
+    fn rprofile_load_all_followed_through_source() {
+        // load_all() in a transitively-sourced helper also attaches the sentinel.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("setup.R"), "pkgload::load_all()\n").unwrap();
+        fs::write(tmp.path().join(".Rprofile"), "source(\"setup.R\")\n").unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            scan.attached_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "transitively-sourced load_all() must attach the sentinel: {:?}",
+            scan.attached_packages
+        );
     }
 
     #[test]

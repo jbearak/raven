@@ -1345,6 +1345,9 @@ impl Backend {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
                 state.package_library = library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = ready;
                 state.bump_package_config_generation();
                 (true, ready)
@@ -1448,6 +1451,154 @@ fn extend_with_open_package_docs(
             affected.push(open_uri.clone());
         }
     }
+}
+
+/// Widen `affected` with every open doc whose scope may include the
+/// `load_all()` sentinel package, so an `R/`-change-driven recompute of the
+/// [`crate::package_state::PackageScopeContribution`] re-diagnoses them.
+///
+/// The package-visibility fanout in `did_change_watched_files`
+/// ([`extend_with_open_package_docs`] / its async-path twin) only force-marks
+/// open files that are `is_r_source_path` (under `R/` or `tests/testthat/`).
+/// A `devtools::load_all()` *carrier* — e.g. a root-level `analysis.R` or a
+/// `scripts/` file — is not `is_r_source_path`, so a change to the loaded
+/// package's `R/` would silently leave the carrier (and its source-graph
+/// neighborhood) stale. This helper closes that gap.
+///
+/// The affected set is widened with, restricted to OPEN docs that exist in
+/// `open_docs`:
+/// 1. **Carriers**: every open doc whose artifacts have
+///    `calls_dev_load_all == true` AND whose path is under the package root
+///    (`path.strip_prefix(pkg_root).is_ok()`) — matching the query-file gate
+///    that activates the sentinel overlay. An out-of-root `load_all()` caller
+///    is NOT a carrier (its sentinel would not resolve).
+/// 2. For each carrier, its source-graph ancestors (callers, via the
+///    child→parent scope hoist) and descendants (callees), via the shared
+///    [`crate::cross_file::dependency::DependencyGraph::revalidation_consistent_set`]
+///    primitive.
+/// 3. When the workspace `.Rprofile` attaches the sentinel
+///    (`rprofile_attaches_sentinel`), every open doc for which the rprofile
+///    prelude applies (`rprofile_applies`), plus that doc's graph
+///    neighborhood.
+///
+/// Conservative superset: position-aware suppress/unsuppress correctness and
+/// version monotonicity are enforced later at diagnosis-time scope resolution
+/// and by the force-republish gate — this closure's only contract is "the
+/// right docs get force-marked". Lock-safe: it touches only graph reachability
+/// and per-doc booleans, never cross-file scope resolution.
+///
+/// `open_docs` is `(uri, calls_dev_load_all, path)` per open document; the
+/// caller reads `calls_dev_load_all` via the artifact cache peek
+/// (`document_store.get_without_touch`). `max_depth` / `max_visited` must match
+/// the budgets the surrounding handler uses for its other graph walks
+/// (`max_chain_depth` / `max_transitive_dependents_visited`).
+// Deliberate: this mirrors the inputs `DependencyGraph::revalidation_consistent_set`
+// needs (graph + per-doc carrier facts + matching budgets); bundling them into a
+// struct would only relocate the argument list without improving clarity.
+#[allow(clippy::too_many_arguments)]
+fn extend_affected_for_load_all_revalidation(
+    affected: &mut Vec<Url>,
+    affected_set: &mut std::collections::HashSet<Url>,
+    open_docs: &[(Url, bool, std::path::PathBuf)],
+    pkg_root: &std::path::Path,
+    rprofile_attaches_sentinel: bool,
+    rprofile_applies: impl Fn(&std::path::Path) -> bool,
+    graph: &crate::cross_file::dependency::DependencyGraph,
+    max_depth: usize,
+    max_visited: usize,
+) {
+    let open_set: std::collections::HashSet<&Url> = open_docs.iter().map(|(u, _, _)| u).collect();
+
+    let push =
+        |uri: &Url, affected: &mut Vec<Url>, affected_set: &mut std::collections::HashSet<Url>| {
+            if affected_set.insert(uri.clone()) {
+                affected.push(uri.clone());
+            }
+        };
+
+    // Seed roots: load_all carriers (open + calls_dev_load_all + under root)
+    // and — when the workspace .Rprofile attaches the sentinel — every open
+    // doc the prelude applies to.
+    let mut roots: Vec<Url> = Vec::new();
+    for (uri, calls_load_all, path) in open_docs {
+        let is_carrier = *calls_load_all && path.strip_prefix(pkg_root).is_ok();
+        let via_rprofile = rprofile_attaches_sentinel && rprofile_applies(path);
+        if is_carrier || via_rprofile {
+            push(uri, affected, affected_set);
+            roots.push(uri.clone());
+        }
+    }
+
+    // Each seed's source-graph neighborhood: ancestors (callers, child→parent
+    // hoist) and descendants (callees). Only OPEN docs are added.
+    for root in &roots {
+        for neighbor in graph.revalidation_consistent_set(root, max_depth, max_visited) {
+            if open_set.contains(&neighbor) {
+                push(&neighbor, affected, affected_set);
+            }
+        }
+    }
+}
+
+/// Lock-held adapter over [`extend_affected_for_load_all_revalidation`]:
+/// gathers the open-doc carrier flags (via the artifact cache peek
+/// `document_store.get_without_touch`, NOT scope resolution), the workspace
+/// `.Rprofile`'s sentinel-attachment bool, and the source graph from `state`,
+/// then widens `affected` / `affected_set`. Lock-safe — touches only cache
+/// peeks, graph reachability, and per-doc booleans. Called from the
+/// package-visibility-change blocks of `did_change_watched_files` alongside
+/// the existing `R/`+`tests/` fanout.
+fn extend_affected_for_load_all_revalidation_from_state(
+    affected: &mut Vec<Url>,
+    affected_set: &mut std::collections::HashSet<Url>,
+    state: &WorldState,
+    pkg_root: &std::path::Path,
+) {
+    let contrib = state.package_state.scope_contribution();
+    let rprofile_attaches_sentinel = contrib
+        .rprofile_attached_packages
+        .contains(crate::package_library::LOAD_ALL_SENTINEL);
+    // Fast path: in a workspace with no `.Rprofile` sentinel attach and no open
+    // load_all carrier — the overwhelmingly common case — there is nothing to
+    // seed. Detecting a carrier needs the cache peek anyway, but skipping the
+    // per-doc `to_file_path()` allocation and the `open_docs` Vec build below is
+    // free on every R/-change. (When we DO proceed, the carrier peek is repeated
+    // in the Vec build; that path only runs when load_all is actually in play.)
+    if !rprofile_attaches_sentinel
+        && !state.documents.keys().any(|u| {
+            state
+                .document_store
+                .get_without_touch(u)
+                .is_some_and(|doc| doc.artifacts.calls_dev_load_all)
+        })
+    {
+        return;
+    }
+    // Snapshot open docs with their load_all-carrier flag (cache peek, no scope
+    // resolution) and on-disk path.
+    let open_docs: Vec<(Url, bool, std::path::PathBuf)> = state
+        .documents
+        .keys()
+        .filter_map(|u| {
+            let path = u.to_file_path().ok()?;
+            let calls_load_all = state
+                .document_store
+                .get_without_touch(u)
+                .is_some_and(|doc| doc.artifacts.calls_dev_load_all);
+            Some((u.clone(), calls_load_all, path))
+        })
+        .collect();
+    extend_affected_for_load_all_revalidation(
+        affected,
+        affected_set,
+        &open_docs,
+        pkg_root,
+        rprofile_attaches_sentinel,
+        |p| crate::cross_file::scope::rprofile_prelude_applies(p, contrib),
+        &state.cross_file_graph,
+        state.cross_file_config.max_chain_depth,
+        state.cross_file_config.max_transitive_dependents_visited,
+    );
 }
 
 /// Whether the DELETED-only branch of `did_change_watched_files` should
@@ -1626,6 +1777,242 @@ mod manifest_extend_tests {
             assert!(
                 !gate.can_publish(u, 1),
                 "URI {u} dropped by cap retained an orphan force-republish marker"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_all_revalidation_tests {
+    use super::*;
+    use crate::cross_file::dependency::DependencyGraph;
+    use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
+    use crate::cross_file::{CrossFileMetadata, ForwardSource};
+
+    fn uri(rel: &str) -> Url {
+        Url::parse(&format!("file:///project/{rel}")).unwrap()
+    }
+
+    fn root() -> std::path::PathBuf {
+        std::path::PathBuf::from("/project")
+    }
+
+    fn ws_url() -> Url {
+        Url::parse("file:///project").unwrap()
+    }
+
+    fn meta_sourcing(rel: &str) -> CrossFileMetadata {
+        CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: rel.to_string(),
+                line: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// `caller.R --source--> L.R --source--> callee.R`, with `L.R` the
+    /// load_all carrier. All three files live at the workspace root.
+    fn chain_graph() -> DependencyGraph {
+        let mut g = DependencyGraph::new();
+        g.update_file(
+            &uri("caller.R"),
+            &meta_sourcing("L.R"),
+            Some(&ws_url()),
+            |_| None,
+        );
+        g.update_file(
+            &uri("L.R"),
+            &meta_sourcing("callee.R"),
+            Some(&ws_url()),
+            |_| None,
+        );
+        g.update_file(
+            &uri("callee.R"),
+            &CrossFileMetadata::default(),
+            Some(&ws_url()),
+            |_| None,
+        );
+        g
+    }
+
+    fn path_of(rel: &str) -> std::path::PathBuf {
+        root().join(rel)
+    }
+
+    // Section B: all three roles (carrier, caller, callee) get re-diagnosed.
+    #[test]
+    fn load_all_revalidation_marks_carrier_callers_and_callees() {
+        let graph = chain_graph();
+        let open_docs = vec![
+            (uri("caller.R"), false, path_of("caller.R")),
+            (uri("L.R"), true, path_of("L.R")), // carrier
+            (uri("callee.R"), false, path_of("callee.R")),
+        ];
+        let mut affected: Vec<Url> = Vec::new();
+        let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+
+        extend_affected_for_load_all_revalidation(
+            &mut affected,
+            &mut affected_set,
+            &open_docs,
+            &root(),
+            false,
+            |_| false,
+            &graph,
+            64,
+            50_000,
+        );
+
+        assert!(affected_set.contains(&uri("L.R")), "carrier must be marked");
+        assert!(
+            affected_set.contains(&uri("caller.R")),
+            "ancestor (caller) must be marked via child->parent hoist"
+        );
+        assert!(
+            affected_set.contains(&uri("callee.R")),
+            "descendant (callee) must be marked"
+        );
+        // No duplicates between Vec and set.
+        assert_eq!(affected.len(), affected_set.len());
+    }
+
+    // The gap the spec calls out: a root-level carrier (NOT under R/).
+    #[test]
+    fn load_all_revalidation_closes_root_level_carrier_gap() {
+        let graph = DependencyGraph::new();
+        let open_docs = vec![(uri("analysis.R"), true, path_of("analysis.R"))];
+        let mut affected: Vec<Url> = Vec::new();
+        let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+
+        extend_affected_for_load_all_revalidation(
+            &mut affected,
+            &mut affected_set,
+            &open_docs,
+            &root(),
+            false,
+            |_| false,
+            &graph,
+            64,
+            50_000,
+        );
+
+        assert!(
+            affected_set.contains(&uri("analysis.R")),
+            "root-level (non-R/) load_all carrier must be seeded"
+        );
+    }
+
+    // Matches the query-file gate: a carrier OUTSIDE the package root is not seeded.
+    #[test]
+    fn load_all_revalidation_skips_out_of_root_carrier() {
+        let graph = DependencyGraph::new();
+        let outside = Url::parse("file:///elsewhere/script.R").unwrap();
+        let open_docs = vec![(
+            outside.clone(),
+            true,
+            std::path::PathBuf::from("/elsewhere/script.R"),
+        )];
+        let mut affected: Vec<Url> = Vec::new();
+        let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+
+        extend_affected_for_load_all_revalidation(
+            &mut affected,
+            &mut affected_set,
+            &open_docs,
+            &root(),
+            false,
+            |_| false,
+            &graph,
+            64,
+            50_000,
+        );
+
+        assert!(
+            !affected_set.contains(&outside),
+            "out-of-root load_all caller must NOT be seeded as a carrier"
+        );
+        assert!(affected.is_empty());
+    }
+
+    // When .Rprofile attaches the sentinel, an open doc the prelude applies to
+    // is added; one for which it does not is withheld via this route.
+    #[test]
+    fn load_all_revalidation_rprofile_reach() {
+        let graph = DependencyGraph::new();
+        let reachable = uri("scripts/a.R");
+        let withheld = uri("R/internal.R");
+        let open_docs = vec![
+            (reachable.clone(), false, path_of("scripts/a.R")),
+            (withheld.clone(), false, path_of("R/internal.R")),
+        ];
+        let mut affected: Vec<Url> = Vec::new();
+        let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+
+        // Prelude applies to scripts/a.R but not to the R/ file (modeling the
+        // package-mode withholding of the prelude from R/).
+        let applies = |p: &std::path::Path| p.ends_with("scripts/a.R");
+
+        extend_affected_for_load_all_revalidation(
+            &mut affected,
+            &mut affected_set,
+            &open_docs,
+            &root(),
+            true, // .Rprofile attaches the sentinel
+            applies,
+            &graph,
+            64,
+            50_000,
+        );
+
+        assert!(
+            affected_set.contains(&reachable),
+            "prelude-reachable open doc must be added via the rprofile route"
+        );
+        assert!(
+            !affected_set.contains(&withheld),
+            "prelude-withheld open doc must NOT be added via the rprofile route"
+        );
+    }
+
+    // Handler-level: after running the marking on the affected set, the gate
+    // reports force-republish for carrier + caller + callee. Mirrors
+    // `sync_path_marks_new_uris_only`'s gate usage.
+    #[test]
+    fn load_all_revalidation_marks_force_republish_gate() {
+        let graph = chain_graph();
+        let open_docs = vec![
+            (uri("caller.R"), false, path_of("caller.R")),
+            (uri("L.R"), true, path_of("L.R")),
+            (uri("callee.R"), false, path_of("callee.R")),
+        ];
+        let mut affected: Vec<Url> = Vec::new();
+        let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+
+        extend_affected_for_load_all_revalidation(
+            &mut affected,
+            &mut affected_set,
+            &open_docs,
+            &root(),
+            false,
+            |_| false,
+            &graph,
+            64,
+            50_000,
+        );
+
+        // Handler step (mirrors the sync path): cap then bulk-mark.
+        let gate = CrossFileDiagnosticsGate::new();
+        for u in &affected {
+            gate.record_publish(u, 1);
+        }
+        gate.mark_force_republish_many(affected.iter());
+
+        for u in [uri("L.R"), uri("caller.R"), uri("callee.R")] {
+            assert!(
+                gate.force_republish_count_for_test(&u) > 0,
+                "force-republish must fire for {u}"
             );
         }
     }
@@ -2707,6 +3094,9 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             if !state.package_library_ready {
                 state.package_library = new_package_library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = package_library_ready;
                 state.bump_package_config_generation();
                 true
@@ -2900,6 +3290,9 @@ impl LanguageServer for Backend {
                 {
                     let mut state = self.state.write().await;
                     state.package_library = new_lib;
+                    // The fresh library starts with no local-dev overlay; re-install
+                    // it so load_all sentinel resolution survives the libpath rebuild.
+                    state.refresh_local_dev_overlay();
                     state.package_library_ready = ready;
                     state.bump_package_config_generation();
                     // Swapping the library may have changed `lib_paths`
@@ -3902,9 +4295,14 @@ impl LanguageServer for Backend {
                 // are not pre-validated) cannot reach the R subprocess /
                 // filesystem path. Mirrors the validation applied to direct
                 // library_calls via extract_loaded_packages_from_library_calls.
+                // `is_valid_package_name` already rejects the underscore-prefixed
+                // load_all() sentinel; the explicit guard is defense-in-depth so
+                // the sentinel can never reach prefetch / the R subprocess.
                 let pkgs: Vec<String> = pkgs
                     .into_iter()
-                    .filter(|p| is_valid_package_name(p))
+                    .filter(|p| {
+                        is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p)
+                    })
                     .collect();
 
                 (pkg_lib, ready, pkgs)
@@ -4476,9 +4874,13 @@ impl LanguageServer for Backend {
                 // entries through scope resolution). Mirrors the
                 // `prefetch_packages_for_open_documents` filter so every
                 // prefetch call site applies the same validation.
+                // `is_valid_package_name` already rejects the underscore-prefixed
+                // load_all() sentinel; the explicit guard is defense-in-depth.
                 let packages_vec: Vec<String> = all_packages
                     .into_iter()
-                    .filter(|p| is_valid_package_name(p))
+                    .filter(|p| {
+                        is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p)
+                    })
                     .collect();
                 if packages_vec.is_empty() {
                     return;
@@ -5080,6 +5482,15 @@ impl LanguageServer for Backend {
                             &state,
                             &root,
                         );
+                        // R/+tests/ fanout above misses arbitrary load_all
+                        // carriers (e.g. root-level analysis.R / scripts/) and
+                        // their source-graph neighborhood; widen for them too.
+                        extend_affected_for_load_all_revalidation_from_state(
+                            &mut affected,
+                            &mut affected_set,
+                            &state,
+                            &root,
+                        );
                     }
                 }
 
@@ -5112,6 +5523,12 @@ impl LanguageServer for Backend {
                     && let Some(root) = state.package_inputs.workspace_root.clone()
                 {
                     extend_with_open_package_docs(&mut affected, &mut affected_set, &state, &root);
+                    extend_affected_for_load_all_revalidation_from_state(
+                        &mut affected,
+                        &mut affected_set,
+                        &state,
+                        &root,
+                    );
                 }
             }
             // Watched-file deletions can drop edges that put a closed neighbor
@@ -5622,6 +6039,16 @@ impl LanguageServer for Backend {
                                         affected_for_async.push(open_uri.clone());
                                     }
                                 }
+                                // The fanout above misses arbitrary load_all
+                                // carriers (root-level analysis.R / scripts/)
+                                // and their source-graph neighborhood; widen
+                                // for them on the async path too.
+                                extend_affected_for_load_all_revalidation_from_state(
+                                    &mut affected_for_async,
+                                    &mut affected_for_async_set,
+                                    &state,
+                                    root,
+                                );
                             }
                         }
                     }
@@ -6671,6 +7098,9 @@ impl Backend {
             {
                 let mut state = self.state.write().await;
                 state.package_library = new_package_library;
+                // The fresh library starts with no local-dev overlay; re-install
+                // it so load_all sentinel resolution survives the swap.
+                state.refresh_local_dev_overlay();
                 state.package_library_ready = package_library_ready;
                 state.bump_package_config_generation();
                 // The new library may carry different `lib_paths` (the user
@@ -7909,9 +8339,11 @@ pub(crate) async fn prefetch_packages_for_open_documents(
         }
     }
 
+    // `is_valid_package_name` already rejects the underscore-prefixed load_all()
+    // sentinel; the explicit guard is defense-in-depth.
     let packages: Vec<String> = all_pkgs
         .into_iter()
-        .filter(|p| is_valid_package_name(p))
+        .filter(|p| is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p))
         .collect();
     if !packages.is_empty() {
         log::trace!(

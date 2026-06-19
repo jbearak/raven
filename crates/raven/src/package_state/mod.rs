@@ -945,6 +945,36 @@ pub struct PackageScopeContribution {
     pub rprofile_root: Option<PathBuf>,
 }
 
+impl PackageScopeContribution {
+    /// Every symbol this package exposes as a `load_all()` internal — the exact
+    /// contents of the local-dev overlay: R/ internals, sysdata objects,
+    /// `.onLoad`/`.onAttach` bindings, and NAMESPACE-imported names.
+    ///
+    /// This is the SINGLE enumeration of those four sources. Both consumers go
+    /// through it so they cannot drift: `WorldState::refresh_local_dev_overlay`
+    /// (state.rs) collects it into the `LocalDevPackage` symbol set, and
+    /// [`Self::is_local_dev_internal`] (the goto contributed-internal gate in
+    /// handlers.rs) tests membership against it. Add a new internal-symbol source
+    /// here and both pick it up automatically.
+    pub fn local_dev_internal_symbols(&self) -> impl Iterator<Item = &str> {
+        self.r_internal_symbols
+            .iter()
+            .map(String::as_str)
+            .chain(self.sysdata_symbols.iter().map(String::as_str))
+            .chain(self.onload_symbols.iter().map(String::as_str))
+            .chain(self.imported_symbols.keys().map(String::as_str))
+    }
+
+    /// True iff `name` is exposed by this package as a `load_all()` internal.
+    /// Delegates to [`Self::local_dev_internal_symbols`] so it can never disagree
+    /// with the overlay build about which sources count. Called O(1) times per
+    /// go-to-definition (not per diagnostics symbol), so the linear scan over the
+    /// internal set is not on a hot path.
+    pub fn is_local_dev_internal(&self, name: &str) -> bool {
+        self.local_dev_internal_symbols().any(|s| s == name)
+    }
+}
+
 #[cfg(test)]
 mod scan_data_tests {
     use super::*;

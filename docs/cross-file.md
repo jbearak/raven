@@ -102,6 +102,23 @@ Base-package datasets are always available (auto-attached at startup); a non-bas
 
 > **Parent-file `data()` scope limit.** When a child file inherits its parent's scope via `# raven: sourced-by` (or auto-inferred backward dependency), `data()` alias expansion — the mapping from file stem to the individual object names — is not propagated through the backward parent-prefix walk. The literal stem bound by the `data()` call in the parent *does* flow to the child, so the most commonly used name resolves. Only the expanded aliases (e.g. `apiclus1` / `apistrat` from `data(api)`) may be missing in the child's scope view. Forward `source()` children receive full expansion. To work around this in a child file, repeat the `data()` call there, or use a [`# raven: var` directive](directives.md#declaration-directives) to declare the alias names explicitly.
 
+### `devtools::load_all()` — Virtual Attached Package
+
+`devtools::load_all()` / `pkgload::load_all()` (and a bare `load_all()`) is modeled as attaching the package under development. Raven makes the package's internal symbols — exported and non-exported `R/` definitions, `R/sysdata.rda` objects, names bound in `.onLoad`/`.onAttach`, and NAMESPACE imports — available from the call onward, exactly as `library()` makes installed-package exports available.
+
+The propagation follows the same rules as `library()`:
+
+- **Position-aware** — symbols surface only after the `load_all()` call.
+- **Forward-propagating** — a `source()` child whose parent calls `load_all()` inherits the internals; a parent does not pick them up from a child's `load_all()`.
+- **Transitive** — propagates through multi-hop `source()` chains.
+- **Multi-parent union** — when a file has multiple parents and at least one calls `load_all()`, the internals are available in the child too.
+
+A workspace-root `.Rprofile` that calls `load_all()` surfaces the package internals in ordinary scripts. In package mode, `R/` source files, package tests, and built-documentation directories do not receive the `.Rprofile`-route internals (they already get them through the package-mode dev context). See [`.Rprofile` Startup Prelude](rprofile.md).
+
+A file **outside the package workspace root** that calls `load_all()` does NOT pick up the package internals — this avoids muting real diagnostics in unrelated scratch files.
+
+Unlike `library(yourpkg)`, `load_all()` exposes internals even when they are not exported, matching `load_all()`'s own `export_all = TRUE` default. See [R Package Development](r-package-dev.md#scripts-that-call-devtoolsload_all) for more.
+
 ### Position-Aware Loading
 
 Package exports are only available after the `library()` call:

@@ -38,6 +38,29 @@ and calls that do not put symbols into the global script scope, such as
 `source("renv/activate.R")` line and does not follow it, since that file
 activates the project library rather than defining user globals.
 
+## `devtools::load_all()` in `.Rprofile`
+
+A `devtools::load_all()` / `pkgload::load_all()` call in the workspace-root
+`.Rprofile` is recognized as attaching the package under development. Raven then
+makes the package's internal symbols — exported and non-exported `R/` definitions,
+`R/sysdata.rda` objects, names bound in `.onLoad`/`.onAttach`, and NAMESPACE
+imports — available by bare name in ordinary scripts, the same way as an explicit
+`load_all()` call inside the script itself.
+
+```r
+# .Rprofile
+devtools::load_all()   # package internals available in scripts/ and analysis/
+```
+
+This is useful for package authors who want all internal helpers in scope during
+interactive work without repeating `load_all()` in every script.
+
+The package-mode withholding below applies here too: files under `R/`,
+`tests/`, and built-documentation directories (`vignettes/`, `man/`, `demo/`) do
+not receive the `.Rprofile`-route internals. Those files already get package
+internals through the package-mode dev context, so withholding avoids duplicating
+them through a separate prelude path.
+
 ## Where It Applies
 
 The prelude applies to analyzed `.R`, `.Rmd`, and `.qmd` files under the

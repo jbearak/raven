@@ -5542,6 +5542,39 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 continue;
             }
 
+            // Package-availability guard — parity with the undefined-variable
+            // collector's position-aware `is_package_export` check at this
+            // position. A name provided by a package attached at/before this
+            // usage is genuinely in scope, so a later `source()` that happens to
+            // re-export it must NOT be blamed. Covers `library()`/`require()`
+            // attaches, DESCRIPTION imports, and — the motivating case — a
+            // `devtools::load_all()` exposing the package's own internals via the
+            // `LOAD_ALL_SENTINEL` local-dev overlay. `ScopeStream::is_visible`
+            // (the `in_scope` check above) consults only the symbol set, and a
+            // load_all internal resolves through the overlay rather than as an
+            // injected symbol, so without this the out-of-scope collector would
+            // emit a false "used before available" that the undefined-variable
+            // collector already suppresses. Resolved lazily here — only at the
+            // rare would-fire point, not per usage — so the streaming fast path
+            // stays cheap; `get_scope` is memoized in `scope_cache`.
+            // Position-awareness AND the load_all out-of-root sentinel gate both
+            // come for free from `get_scope`'s `append_package_contribution`.
+            if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
+                let scope = scope_cache
+                    .entry((*usage_line, *usage_col))
+                    .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
+                let pkgs: Vec<String> = scope
+                    .inherited_packages
+                    .iter()
+                    .chain(scope.loaded_packages.iter())
+                    .chain(snapshot.scope_contribution.full_imports.iter())
+                    .cloned()
+                    .collect();
+                if !pkgs.is_empty() && is_package_export(name, &pkgs, &snapshot.package_library) {
+                    break;
+                }
+            }
+
             let line_text = get_line(usage_node.start_position().row);
             let start_col =
                 byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
@@ -6449,10 +6482,7 @@ fn collect_undefined_variables_from_snapshot(
             // Using package_exists() guards against treating a permanently-missing
             // package as one that will eventually be cached.
             let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
-                if snapshot.package_library.is_cached_sync(pkg) {
-                    return false;
-                }
-                package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
+                package_is_cache_pending(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
             if (has_prior_library_call
                 || has_cross_file_packages
@@ -12979,6 +13009,28 @@ fn package_exists_memoized(
     v
 }
 
+/// True when a package named in the at-position attached set is "pending": it
+/// exists (installed) but its exports are not yet in cache, so a usage of one of
+/// its exports should be suppressed rather than flagged undefined.
+///
+/// Short-circuits the `load_all()` sentinel: it is a synthetic attached package
+/// that resolves only through the local-dev overlay, is never an installed
+/// package, and must never be fed to `package_exists` (which can reach
+/// installed-package lookups / the R subprocess). It is never "pending".
+fn package_is_cache_pending(
+    pkg: &str,
+    lib: &crate::package_library::PackageLibrary,
+    memo: &mut HashMap<String, bool>,
+) -> bool {
+    if crate::package_library::is_load_all_sentinel(pkg) {
+        return false;
+    }
+    if lib.is_cached_sync(pkg) {
+        return false;
+    }
+    package_exists_memoized(pkg, lib, memo)
+}
+
 /// Context for tracking NSE-related state during AST traversal (issue #398).
 #[derive(Clone, Default)]
 struct UsageContext {
@@ -14689,6 +14741,7 @@ fn table_verb_policy(
     //      has a policy, rather than wrongly checking it as a standard-eval arg.
     if let Some(lib) = analysis.package_library
         && let Some(owner) = lib.find_package_owner_for_symbol(name, &analysis.in_play_packages)
+        && !crate::package_library::is_load_all_sentinel(&owner)
         && let Some(policy) = crate::nse::package_policy(&owner, name)
     {
         return Some(policy);
@@ -17898,6 +17951,29 @@ pub fn completion(
 
             // Requirement 9.3: Show all packages that export this symbol
             for package_name in package_names {
+                // A load_all() internal is owned by the synthetic sentinel
+                // package. The raw sentinel name must never appear in the detail
+                // field nor in `data.package` (which `completionItem/resolve`
+                // would feed to the R help system). Show the friendly
+                // dev-package label and omit `package` so resolve does no R
+                // lookup for it.
+                if crate::package_library::is_load_all_sentinel(&package_name) {
+                    let owner_display = crate::package_library::load_all_owner_display(
+                        state
+                            .package_state
+                            .scope_contribution()
+                            .package_name
+                            .as_deref(),
+                    );
+                    items.push(CompletionItem {
+                        label: export_name.clone(),
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        detail: Some(owner_display),
+                        sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
+                        ..Default::default()
+                    });
+                    continue;
+                }
                 // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
                 items.push(CompletionItem {
                     label: export_name.clone(),
@@ -19471,6 +19547,22 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             .package_library
             .find_package_owner_for_symbol(name, &all_packages)
         {
+            // A symbol owned by the load_all() sentinel is a workspace-local
+            // internal with no installed help. The raw sentinel name must never
+            // reach the R help system or the UI — render a friendly dev-package
+            // label and skip the help lookup entirely.
+            if crate::package_library::is_load_all_sentinel(&pkg_name) {
+                let owner_display = crate::package_library::load_all_owner_display(
+                    state
+                        .package_state
+                        .scope_contribution()
+                        .package_name
+                        .as_deref(),
+                );
+                let value = format!("```r\n{}\n```\n\nfrom {}", name, owner_display);
+                return Some(markdown_hover(value, node_range));
+            }
+
             let mut value = String::new();
 
             let help_text =
@@ -20101,12 +20193,19 @@ pub fn prepare_signature_help(
             .package_library
             .find_package_owner_for_symbol(func_name, &all_packages)
         {
-            SignatureResolution::Package {
-                help_cache: state.help_cache.clone(),
-                func_name: func_name.to_string(),
-                package_name: pkg_name,
-                fallback: build_fallback_signature(func_name, &scope, uri, state),
-                r_path,
+            if crate::package_library::is_load_all_sentinel(&pkg_name) {
+                // load_all() internal: no installed help, and the raw sentinel
+                // must never reach the R subprocess. Resolve to a ready fallback
+                // signature attributed to the dev package, skipping the help path.
+                SignatureResolution::Ready(build_load_all_signature(func_name, &scope, uri, state))
+            } else {
+                SignatureResolution::Package {
+                    help_cache: state.help_cache.clone(),
+                    func_name: func_name.to_string(),
+                    package_name: pkg_name,
+                    fallback: build_fallback_signature(func_name, &scope, uri, state),
+                    r_path,
+                }
             }
         } else {
             resolve_user_or_fallback(state, func_name, uri, position, &scope)
@@ -20193,6 +20292,31 @@ fn build_fallback_signature(
         parameters: None,
         active_parameter: None,
     }
+}
+
+/// Build a `SignatureInformation` for a `load_all()` internal. Reuses the local
+/// fallback label (the symbol's own signature when known) but always attributes
+/// it to the friendly dev-package label — never the raw sentinel name, which
+/// must never reach the R subprocess or the UI.
+fn build_load_all_signature(
+    func_name: &str,
+    scope: &scope::ScopeAtPosition,
+    uri: &Url,
+    state: &WorldState,
+) -> SignatureInformation {
+    let mut sig = build_fallback_signature(func_name, scope, uri, state);
+    let owner_display = crate::package_library::load_all_owner_display(
+        state
+            .package_state
+            .scope_contribution()
+            .package_name
+            .as_deref(),
+    );
+    sig.documentation = Some(Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: format!("from {}", owner_display),
+    }));
+    sig
 }
 
 // ============================================================================
@@ -20446,6 +20570,29 @@ pub fn goto_definition_with_cancel(
         // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
         // Validates: Requirements 11.1, 11.2
         if symbol.source_uri.as_str().starts_with("package:") {
+            // The user's OWN package internals (injected under the synthetic
+            // PACKAGE_INTERNAL_URI by the dev-context / load_all overlay) DO have
+            // navigable source under <root>/R/ — redirect to it. The injected symbol
+            // itself is location-free (defined_line 0), so we resolve the real
+            // location from the workspace index. Other `package:` URIs are real
+            // installed-package exports with no navigable source: keep returning None.
+            if crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri)
+                && let Some(root) = state
+                    .package_state
+                    .scope_contribution()
+                    .workspace_root
+                    .as_ref()
+            {
+                return resolve_package_internal_goto(
+                    name,
+                    scope_key,
+                    root,
+                    &content_provider,
+                    &state.document_store.uris(),
+                    &state.workspace_index_new,
+                    cancel,
+                );
+            }
             log::trace!(
                 "Symbol '{}' is from package '{}', no navigable source available",
                 name,
@@ -20485,6 +20632,74 @@ pub fn goto_definition_with_cancel(
             uri: symbol.source_uri.clone(),
             range: scoped_symbol_range(symbol),
         }));
+    }
+
+    // Sentinel path (script / callee / caller in a load_all() neighborhood): the
+    // internal resolves through the package overlay rather than `scope.symbols`, so
+    // the cursor lookup above misses. Before the general cross-file fallback, try to
+    // resolve it as a package internal — but only when the name is genuinely a
+    // contributed internal (else an ordinary cross-file symbol that happens to be
+    // defined in an R/ file would be diverted here and resolved by the same logic,
+    // which is harmless but we keep the general fallback authoritative for non-package
+    // names). The contribution's internal/imported/dataset/onload sets are the source
+    // of truth for "this is a package-internal name".
+    if let Some(root) = state
+        .package_state
+        .scope_contribution()
+        .workspace_root
+        .as_ref()
+    {
+        let contrib = state.package_state.scope_contribution();
+        // `is_local_dev_internal` tests the same shared enumeration
+        // (`local_dev_internal_symbols`: R/ internals ∪ sysdata ∪ onload ∪
+        // imported names) that builds the local-dev overlay, so this gate and the
+        // overlay cannot disagree. A sentinel-owned sysdata or imported name must
+        // route through the precise `resolve_package_internal_goto` (rm-aware
+        // `top_level_interface`, `is_r_source_path`-restricted) so it cleanly
+        // no-ops — otherwise it would fall through to the scope-blind general
+        // `exported_interface` fallback below and land on a PHANTOM target (a
+        // function-local / rm'd binding of the same spelling).
+        let is_contributed_internal =
+            contrib.is_local_dev_internal(name) || contrib.is_local_dev_internal(scope_key);
+        // The redirect models the load_all() overlay path, so it must only fire
+        // when the load_all sentinel is actually attached in the computed scope:
+        // a `load_all()` is reachable from here AND the query file was not
+        // stripped by the out-of-root query-file gate. A file with no
+        // `load_all()` call, or an out-of-root file where the gate stripped the
+        // sentinel, references the internal in a context where it is undefined
+        // (diagnostics flag it), so goto must not jump there. The dev-context R/
+        // path is unaffected: there the internal lands in `scope.symbols` and is
+        // handled by the cursor-hit branch above, not here.
+        let sentinel_in_scope = scope
+            .loaded_packages
+            .iter()
+            .chain(scope.inherited_packages.iter())
+            .any(|p| crate::package_library::is_load_all_sentinel(p));
+        // The rm-aware, package-tree-restricted resolver fires ONLY with the
+        // load_all sentinel actually in scope. That precise path is authoritative
+        // for the load_all() overlay — it resolves via the rm-aware
+        // `top_level_interface` (Some R/ location, or None for a name with no live
+        // top-level def — sysdata/imported/rm'd) and we do NOT fall through to the
+        // scope-blind general fallback, which would otherwise resurrect a
+        // function-local / rm'd / sentinel-stripped binding as a phantom target.
+        //
+        // When the sentinel is NOT in scope we must NOT short-circuit to None:
+        // doing so would be MORE restrictive than the pre-feature behavior and
+        // silently swallow goto for a name that has a legitimate workspace
+        // definition. Instead we fall through to the general open-docs +
+        // workspace-index `exported_interface` fallback below (ordinary goto
+        // resolution — e.g. the R/ definition in a package workspace).
+        if is_contributed_internal && sentinel_in_scope {
+            return resolve_package_internal_goto(
+                name,
+                scope_key,
+                root,
+                &content_provider,
+                &state.document_store.uris(),
+                &state.workspace_index_new,
+                cancel,
+            );
+        }
     }
 
     // Search all open documents using ContentProvider
@@ -20655,6 +20870,102 @@ fn scoped_symbol_range(symbol: &ScopedSymbol) -> Range {
 /// (a literal `0 + _` would lint; a `0` *argument* does not).
 fn scoped_symbol_default_end(defined_column: u32, name: &str) -> u32 {
     defined_column + crate::utf16::utf16_len(name)
+}
+
+/// Resolve a package-internal symbol name (exposed via `load_all()` / dev-context
+/// injection) to its real definition in the package's `R/` source tree.
+///
+/// The dev-context and `load_all()` overlays inject such symbols under the synthetic
+/// [`scope::PACKAGE_INTERNAL_URI`] (or omit them from `scope.symbols` entirely, leaving
+/// the cursor lookup to miss). Neither carries a navigable `(file, line)` — by design
+/// `PackageScopeContribution` is location-free. This resolver recovers the location
+/// purely from the workspace index / open documents: it scans every cached file whose
+/// path [`is_r_source_path`](crate::package_state::is_r_source_path) under
+/// `workspace_root` (so an unrelated workspace file that happens to define the same
+/// name is never chosen), and looks the name up in that file's rm-aware
+/// [`top_level_interface`](scope::top_level_interface) — NOT `exported_interface`,
+/// which also carries function-local and `rm()`-removed bindings and would yield
+/// phantom targets.
+///
+/// Determinism: the document store and workspace index iterate in an unspecified
+/// order, so candidates are collected and the one with the lexicographically smallest
+/// source-file URI string is returned. A package with two top-level defs of the same
+/// name is itself a load-time error in R; we deterministically return one of them
+/// rather than panicking or returning an arbitrary one. Returns `None` when no R/
+/// source file defines the name (e.g. sysdata / imported internals have no navigable
+/// source) — the caller then treats that as a no-op.
+fn resolve_package_internal_goto(
+    name: &str,
+    scope_key: &str,
+    workspace_root: &std::path::Path,
+    content_provider: &impl ContentProvider,
+    document_store_uris: &[Url],
+    workspace_index: &crate::workspace_index::WorkspaceIndex,
+    cancel: &DiagCancelToken,
+) -> Option<GotoDefinitionResponse> {
+    let mut best: Option<(Url, ScopedSymbol)> = None;
+    let consider = |file_uri: &Url, best: &mut Option<(Url, ScopedSymbol)>| -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let Ok(path) = file_uri.to_file_path() else {
+            return true;
+        };
+        if crate::package_state::is_r_source_path(&path, workspace_root).is_none() {
+            return true;
+        }
+        let Some(artifacts) = content_provider.get_artifacts(file_uri) else {
+            return true;
+        };
+        // Gate on the rm-aware live top-level NAME set (cheap: a single timeline
+        // walk, no per-symbol clones) before touching the symbol map. This is
+        // equivalent to `top_level_interface(&artifacts).get(name)` — that map is
+        // exactly `exported_interface` filtered by `live_top_level_exports` — but
+        // avoids materializing the whole per-file `HashMap<_, ScopedSymbol>` just
+        // to read one entry (this runs for EVERY R/ file in the open set + index).
+        let live = scope::live_top_level_exports(&artifacts);
+        let hit = if live.contains(name) {
+            Some(name)
+        } else if live.contains(scope_key) {
+            Some(scope_key)
+        } else {
+            None
+        };
+        // The symbol comes from `exported_interface` (rm-awareness already enforced
+        // by the `live` gate above), matching `top_level_interface`'s contents.
+        if let Some(symbol) = hit.and_then(|n| artifacts.exported_interface.get(n)) {
+            // Pick the lexicographically smallest URI string for a stable result
+            // when several R/ files define the same top-level name.
+            let replace = match best {
+                Some((cur_uri, _)) => file_uri.as_str() < cur_uri.as_str(),
+                None => true,
+            };
+            if replace {
+                *best = Some((file_uri.clone(), symbol.clone()));
+            }
+        }
+        true
+    };
+
+    // Open documents (DocumentStore) then closed files (workspace index): a single
+    // sweep over both covers the open + closed cases the spec requires.
+    for file_uri in document_store_uris {
+        if !consider(file_uri, &mut best) {
+            return None;
+        }
+    }
+    for (file_uri, _) in workspace_index.iter() {
+        if !consider(&file_uri, &mut best) {
+            return None;
+        }
+    }
+
+    best.map(|(uri, sym)| {
+        GotoDefinitionResponse::Scalar(Location {
+            range: scoped_symbol_range(&sym),
+            uri,
+        })
+    })
 }
 
 // ============================================================================
@@ -22683,6 +22994,28 @@ mod tests {
             was_collected(&used, "undefined_sym"),
             "the local standard-eval shadow of `filter` must be honored through \
              redundant backticks, so the wrapper is not upgraded and its arg is checked"
+        );
+    }
+
+    /// The pending-cache predicate must short-circuit the load_all() sentinel:
+    /// it is never an installed package and must never be fed to
+    /// `package_exists` (which can reach installed-package lookups / R). A real
+    /// uncached-but-existing package stays "pending"; the sentinel never is.
+    #[test]
+    fn package_exists_loop_skips_sentinel() {
+        use crate::package_library::{LOAD_ALL_SENTINEL, PackageLibrary};
+        use std::collections::HashMap;
+
+        let lib = PackageLibrary::new_empty();
+        let mut memo: HashMap<String, bool> = HashMap::new();
+        assert!(
+            !package_is_cache_pending(LOAD_ALL_SENTINEL, &lib, &mut memo),
+            "the load_all sentinel must never be treated as a pending package"
+        );
+        // It must not have been probed via package_exists either.
+        assert!(
+            !memo.contains_key(LOAD_ALL_SENTINEL),
+            "the sentinel must short-circuit before package_exists_memoized"
         );
     }
 
@@ -55754,6 +56087,98 @@ source(\"helpers.R\")
         );
     }
 
+    /// A `load_all()` caller that uses one of the package's own internals —
+    /// made available position-aware via the `LOAD_ALL_SENTINEL` local-dev
+    /// overlay — must NOT get a false "used before it's available" diagnostic
+    /// when a later `source()` target happens to export the same name.
+    ///
+    /// `ScopeStream::is_visible` only consults the symbol set, and a load_all()
+    /// internal resolves through the overlay (NOT as an injected symbol), so it
+    /// is invisible to `is_visible`. The undefined-variable collector already
+    /// suppresses such a use via its position-aware `is_package_export` check
+    /// over `scope.loaded_packages`; the out-of-scope collector must agree, or
+    /// the two collectors disagree on the same name (regression).
+    #[test]
+    fn load_all_internal_not_flagged_used_before_sourced_by_later_source() {
+        let mut state = create_test_state();
+        state.workspace_folders = vec![Url::parse("file:///work/pkg").unwrap()];
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+
+        // The package owns an internal `helper`; the local-dev overlay exposes it
+        // under the load_all sentinel.
+        let mut internals = std::collections::BTreeSet::new();
+        internals.insert("helper".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: crate::package_state::PackageScopeContribution {
+                    workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                    package_name: Some("mypkg".to_string()),
+                    r_internal_symbols: std::sync::Arc::new(internals.clone()),
+                    ..crate::package_state::PackageScopeContribution::default()
+                },
+                ..Default::default()
+            });
+        state
+            .package_library
+            .set_local_dev_overlay(Some(std::sync::Arc::new(
+                crate::package_library::LocalDevPackage {
+                    symbols: internals.into_iter().collect(),
+                },
+            )));
+
+        // explore.R is UNDER the package root but NOT under R/ or a dev-context
+        // dir, so the package's internals are NOT in `contribution_symbol_names`
+        // — `helper` becomes visible only AFTER the load_all() call, via the
+        // overlay. A later source() target also exports a top-level `helper`.
+        let explore_uri = Url::parse("file:///work/pkg/explore.R").unwrap();
+        let helpers_uri = Url::parse("file:///work/pkg/helpers.R").unwrap();
+        let explore_code = "\
+pkgload::load_all()
+helper()
+source(\"helpers.R\")
+";
+        let helpers_code = "helper <- function() 1\n";
+
+        for (uri, code) in [(&explore_uri, explore_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &explore_uri).expect("snapshot for explore.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &explore_uri, &DiagCancelToken::never())
+                .expect("diagnostics");
+
+        let helper_used_before: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available")
+                    && d.message.contains("'helper'")
+            })
+            .collect();
+        assert!(
+            helper_used_before.is_empty(),
+            "load_all() internal `helper` must not be flagged 'used before available' by a \
+             later source() that re-exports it. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Regression mirroring `test_extract_operator_rhs_does_not_emit_used_before_sourced`
     /// for the right-assignment target gap. `1 -> x` (and `1 ->> x`) parses
     /// as a `binary_operator` whose third child `x` is the *target* of the
@@ -64984,6 +65409,648 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             text.contains("fruit <- list(`macintosh apple` = 1)"),
             "hover should show the construction statement; got: {text}"
+        );
+    }
+}
+
+/// Go-to-definition for `load_all()`-exposed package internals → their real `R/`
+/// source. The dev-context / `load_all` overlay either injects an internal under the
+/// synthetic `PACKAGE_INTERNAL_URI` (so the cursor lookup hits a location-free symbol)
+/// or omits it from `scope.symbols` entirely (so the cursor lookup misses and the
+/// sentinel-path fallback runs). Both routes must navigate to the rm-aware top-level
+/// definition in the package's `R/` tree, resolved purely from the workspace index /
+/// open documents — `PackageScopeContribution` stays location-free.
+#[cfg(test)]
+mod load_all_internal_goto_tests {
+    use crate::package_state::{PackageScopeContribution, PackageState};
+    use crate::state::{Document, WorldState};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Url};
+
+    const ROOT_PATH: &str = "/work/pkg";
+    const ROOT_URL: &str = "file:///work/pkg";
+
+    /// Build a `WorldState` whose package contribution declares `internals` as the
+    /// package's own internal (R/) symbols, rooted at `/work/pkg`.
+    fn state_with_internals(internals: &[&str]) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+
+        let mut r_internal = BTreeSet::new();
+        for s in internals {
+            r_internal.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from(ROOT_PATH)),
+                r_internal_symbols: Arc::new(r_internal),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        state
+    }
+
+    /// Like `state_with_internals`, but declares `names` as the package's own
+    /// `sysdata` internals (and NOTHING in `r_internal_symbols`). A sysdata name
+    /// has no navigable R/ top-level def, so the precise resolver must no-op on it;
+    /// before the overlay-mirroring predicate fix it failed the
+    /// `is_contributed_internal` check (which only saw r_internal/onload) and fell
+    /// through to the scope-blind general fallback.
+    fn state_with_sysdata(names: &[&str]) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+
+        let mut sysdata = BTreeSet::new();
+        for s in names {
+            sysdata.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from(ROOT_PATH)),
+                sysdata_symbols: Arc::new(sysdata),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        state
+    }
+
+    /// Insert `content` as an OPEN document (DocumentStore) — open docs are
+    /// authoritative for artifacts.
+    fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            state.document_store.open(uri.clone(), content, 1).await;
+        });
+        uri
+    }
+
+    /// Insert `content` as a CLOSED file in the workspace index, with computed
+    /// artifacts — mirrors the indexed-file goto fixtures elsewhere in this file.
+    fn index_closed_file(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        use crate::workspace_index::IndexEntry;
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        let doc = Document::new_with_uri(content, None, &uri);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(content));
+        let artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+            &uri,
+            doc.tree.as_ref().expect("parses"),
+            content,
+            Some(&metadata),
+        ));
+        let entry = IndexEntry {
+            contents: doc.contents.clone(),
+            tree: doc.tree.clone(),
+            loaded_packages: doc.loaded_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: SystemTime::UNIX_EPOCH,
+                size: content.len() as u64,
+                content_hash: None,
+            },
+            metadata,
+            artifacts,
+            indexed_at_version: state.workspace_index_new.version(),
+        };
+        assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        uri
+    }
+
+    /// Insert `content` as a plain legacy open document (state.documents). Used for
+    /// the using file in a sentinel-path scenario — it is parsed for the cursor token
+    /// but its own artifacts are irrelevant to the resolver.
+    fn add_legacy_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        state
+            .documents
+            .insert(uri.clone(), Document::new(content, None));
+        uri
+    }
+
+    fn scalar(result: Option<GotoDefinitionResponse>) -> Location {
+        match result {
+            Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+            other => panic!("expected Scalar location, got {other:?}"),
+        }
+    }
+
+    fn goto(state: &WorldState, uri: &Url, pos: Position) -> Option<GotoDefinitionResponse> {
+        super::goto_definition_with_cancel(
+            state,
+            uri,
+            pos,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+    }
+
+    /// Sentinel path: the internal is exposed via the overlay (NOT in `scope.symbols`)
+    /// for a caller OUTSIDE the package `R/` source tree but UNDER the package root
+    /// that calls `load_all()` (so the sentinel survives the query-file gate). Goto
+    /// must fall through to the package-internal resolver and land on the `R/` def.
+    #[test]
+    fn goto_load_all_internal_sentinel_path_to_r_source() {
+        // R/ source defines `my_func` on line 2.
+        let src = "# header\n\nmy_func <- function(x) x + 1\n";
+        let mut state = state_with_internals(&["my_func"]);
+        let r_uri = index_closed_file(&mut state, "file:///work/pkg/R/util.R", src);
+
+        // CALLER: a dev script under the package root that calls load_all() (the
+        // sentinel is attached and kept by the in-root query-file gate). `my_func`
+        // is referenced AFTER the load_all() line.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func(1)\n",
+        );
+        let l = scalar(goto(&state, &caller, Position::new(1, 2)));
+        assert_eq!(l.uri, r_uri, "caller goto lands on R/ def file");
+        assert_eq!(l.range.start.line, 2, "lands on the def line in R/util.R");
+
+        // CALLEE: a sibling R/ file that also calls `my_func` but does not define it.
+        // The querying file lives in `state.documents` (what the handler's entry
+        // lookup reads); the def lives in the closed index above.
+        let callee = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/other.R",
+            "other <- function() my_func(2)\n",
+        );
+        let l = scalar(goto(&state, &callee, Position::new(0, 22)));
+        assert_eq!(l.uri, r_uri, "callee goto lands on R/ def file");
+        assert_eq!(l.range.start.line, 2);
+
+        // The load_all FILE itself (the defining R/ file): goto on a self-call.
+        let load_all_file = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/main.R",
+            "main <- function() my_func(3)\n",
+        );
+        let l = scalar(goto(&state, &load_all_file, Position::new(0, 21)));
+        assert_eq!(l.uri, r_uri);
+        assert_eq!(l.range.start.line, 2);
+    }
+
+    /// Without a `load_all()` sentinel in scope, the rm-aware,
+    /// package-tree-restricted resolver must NOT fire — but goto must also NOT be
+    /// silently swallowed (returning `None`) for a name that has a legitimate
+    /// workspace definition. The special resolver is gated on the sentinel; when
+    /// it is absent we fall THROUGH to the pre-feature general fallback (the
+    /// open-docs + workspace-index `exported_interface` scan). In a package
+    /// workspace the `R/` file is indexed and exports `my_func`, so the general
+    /// fallback resolves to that R/ definition. The key guarantee is that goto is
+    /// not regressed to `None` for a name with a workspace definition.
+    #[test]
+    fn goto_internal_without_load_all_falls_through_to_general_fallback() {
+        let mut state = state_with_internals(&["my_func"]);
+        // Real def lives under R/.
+        let r_uri = index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/real.R",
+            "my_func <- function() 1\n",
+        );
+        // A script UNDER the package root (so the query-file gate would keep a
+        // sentinel if one were attached) that references `my_func` but never
+        // calls load_all(). No sentinel in scope → the special resolver does NOT
+        // fire; instead goto falls through to the general fallback.
+        let caller = add_legacy_doc(&mut state, "file:///work/pkg/dev/script.R", "my_func()\n");
+        let l = scalar(goto(&state, &caller, Position::new(0, 1)));
+        assert_eq!(
+            l.uri, r_uri,
+            "without a sentinel, goto must NOT be swallowed — it falls through to the general fallback and resolves the R/ definition"
+        );
+        assert_eq!(l.range.start.line, 0, "lands on the def line in R/real.R");
+    }
+
+    /// Dev-context path: an internal referenced from WITHIN an `R/` file (and a test
+    /// file) — here the symbol IS injected into `scope.symbols` under
+    /// PACKAGE_INTERNAL_URI, so the cursor lookup hits and the redirect runs. This
+    /// also closes the pre-existing R/→R/ goto gap.
+    #[test]
+    fn goto_load_all_internal_dev_context_path_r_to_r() {
+        let src = "helper <- function() 42\n";
+        let mut state = state_with_internals(&["helper"]);
+        let def_uri = index_closed_file(&mut state, "file:///work/pkg/R/defs.R", src);
+
+        // Reference from another R/ file. `helper` is injected via the overlay
+        // (PACKAGE_INTERNAL_URI), so the cursor lookup hits the synthetic symbol and
+        // the redirect resolves the real def.
+        let r_user = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/R/use.R",
+            "go <- function() helper()\n",
+        );
+        let l = scalar(goto(&state, &r_user, Position::new(0, 17)));
+        assert_eq!(l.uri, def_uri, "R/ reference lands on R/ definition");
+        assert_eq!(l.range.start.line, 0);
+
+        // Reference from a testthat test file (also gets the internal injection).
+        let test_user = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/tests/testthat/test-x.R",
+            "test_that('x', { helper() })\n",
+        );
+        let l = scalar(goto(&state, &test_user, Position::new(0, 18)));
+        assert_eq!(l.uri, def_uri, "test reference lands on R/ definition");
+        assert_eq!(l.range.start.line, 0);
+    }
+
+    /// An unrelated workspace file OUTSIDE the package source tree that defines the
+    /// same name must NOT be chosen — `is_r_source_path` restricts candidates.
+    #[test]
+    fn goto_load_all_internal_picks_package_tree_not_unrelated_file() {
+        let mut state = state_with_internals(&["my_func"]);
+        // Real def lives under R/.
+        let r_uri = index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/real.R",
+            "my_func <- function() 1\n",
+        );
+        // A decoy defining the same name OUTSIDE the package tree (a vignette R
+        // file is dev-context, not is_r_source_path; also choose a non-R/ path).
+        // Use an alphabetically-smaller URI so a naive "smallest URI" without the
+        // is_r_source_path filter would wrongly pick it.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/data-raw/aaa.R",
+            "my_func <- function() 999\n",
+        );
+
+        // In-root load_all() dev script (sentinel attached); reference on line 1.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func()\n",
+        );
+        let l = scalar(goto(&state, &caller, Position::new(1, 1)));
+        assert_eq!(
+            l.uri, r_uri,
+            "resolver must pick the R/ def, not the unrelated (data-raw) file"
+        );
+    }
+
+    /// A function-local or `rm()`-removed name of the same spelling is NOT a goto
+    /// target — the resolver uses the rm-aware `top_level_interface`, not the
+    /// scope-blind `exported_interface`.
+    #[test]
+    fn goto_load_all_internal_uses_top_level_not_exported() {
+        let mut state = state_with_internals(&["my_func"]);
+        // R/ file where `my_func` is ONLY a function-local binding (never a live
+        // top-level def) — exported_interface would carry it, top_level_interface
+        // must not.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/locals.R",
+            "wrapper <- function() {\n  my_func <- function() 1\n  my_func()\n}\n",
+        );
+        // And an R/ file where it IS defined top-level then rm()'d.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/removed.R",
+            "my_func <- function() 1\nrm(my_func)\n",
+        );
+
+        // In-root load_all() dev script (sentinel attached) so the redirect path
+        // is exercised; the rm-aware resolver must still return None.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nmy_func()\n",
+        );
+        assert!(
+            goto(&state, &caller, Position::new(1, 1)).is_none(),
+            "no LIVE top-level def of `my_func` exists in the package tree → None"
+        );
+    }
+
+    /// Two R/ files defining the same top-level name → a single, deterministic
+    /// Location (smallest URI string). Running the resolver path twice must yield
+    /// the identical answer and never panic.
+    #[test]
+    fn goto_load_all_internal_duplicate_defs_deterministic() {
+        let mut state = state_with_internals(&["dup"]);
+        // Two R/ files, both with a live top-level `dup` def at different lines.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/b_second.R",
+            "\n\ndup <- function() 2\n",
+        );
+        let first_uri = index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/a_first.R",
+            "dup <- function() 1\n",
+        );
+
+        let caller = add_legacy_doc(&mut state, "file:///work/pkg/dev.R", "load_all()\ndup()\n");
+        let l1 = scalar(goto(&state, &caller, Position::new(1, 1)));
+        let l2 = scalar(goto(&state, &caller, Position::new(1, 1)));
+        assert_eq!(l1.uri, l2.uri, "stable across runs");
+        assert_eq!(l1.range.start, l2.range.start);
+        assert_eq!(
+            l1.uri, first_uri,
+            "smallest URI string (R/a_first.R) wins deterministically"
+        );
+        assert_eq!(l1.range.start.line, 0);
+    }
+
+    /// A sysdata / imported internal name with no navigable `R/` source → None.
+    #[test]
+    fn goto_load_all_internal_sysdata_or_imported_noops() {
+        // `secret_blob` is declared an internal (e.g. from sysdata.rda) but no R/
+        // file defines it.
+        let mut state = state_with_internals(&["secret_blob"]);
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/unrelated.R",
+            "other <- function() 1\n",
+        );
+
+        // In-root load_all() dev script (sentinel attached) so the redirect path
+        // is exercised; an internal with no navigable R/ source → None.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nsecret_blob\n",
+        );
+        assert!(
+            goto(&state, &caller, Position::new(1, 2)).is_none(),
+            "an internal with no R/ source is a no-op"
+        );
+    }
+
+    /// PHANTOM AVOIDANCE: a sysdata-owned name `S` that ALSO has a same-spelling
+    /// binding the scope-blind `exported_interface` fallback WOULD wrongly resolve
+    /// (here: a top-level def that is `rm()`'d, so it lives in `exported_interface`
+    /// but NOT in the rm-aware `top_level_interface`). With the sentinel attached
+    /// and the overlay-mirroring predicate fix, `S` is recognized as
+    /// contributed-internal and routes through `resolve_package_internal_goto`,
+    /// which uses `top_level_interface` → None. WITHOUT the fix, the predicate
+    /// (r_internal/onload only) misses `S`, it falls through to the general
+    /// `exported_interface` fallback, and jumps to the phantom rm'd def.
+    #[test]
+    fn goto_load_all_sysdata_does_not_resolve_phantom_via_fallback() {
+        let mut state = state_with_sysdata(&["secret_blob"]);
+        // An R/ file with a top-level `secret_blob` def that is immediately rm()'d:
+        // rm-blind `exported_interface` still carries it (the phantom target),
+        // rm-aware `top_level_interface` does not.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/removed.R",
+            "secret_blob <- function() 1\nrm(secret_blob)\n",
+        );
+
+        // In-root load_all() dev script (sentinel attached); reference on line 1.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nsecret_blob\n",
+        );
+        assert!(
+            goto(&state, &caller, Position::new(1, 2)).is_none(),
+            "a sysdata internal must route through the precise resolver (no live \
+             top-level def → None), not the scope-blind fallback that resurrects \
+             the rm'd phantom"
+        );
+    }
+
+    /// Regression guard: goto on a normal `library()` (installed-package) symbol
+    /// still no-ops — external-package goto is unchanged. The cursor-hit branch sees
+    /// a real `package:<name>` URI (NOT PACKAGE_INTERNAL_URI) and returns None.
+    #[test]
+    fn goto_library_symbol_still_noops() {
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        // Directly exercise the gate's classification: a real installed-package
+        // export URI must not be treated as a package internal.
+        let pkg_export = Url::parse("package:dplyr").unwrap();
+        assert!(pkg_export.as_str().starts_with("package:"));
+        assert!(
+            !crate::cross_file::scope::is_package_internal_uri(&pkg_export),
+            "a real installed-package URI is not the internal sentinel URI"
+        );
+        let internal = Url::parse(crate::cross_file::scope::PACKAGE_INTERNAL_URI).unwrap();
+        assert!(crate::cross_file::scope::is_package_internal_uri(&internal));
+
+        // And end-to-end: a `library(dplyr); mutate()` call with no R/ def for
+        // `mutate` resolves to nothing (no package internal contributes it).
+        let mut state = state_with_internals(&[]);
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///elsewhere/s.R",
+            "library(dplyr)\nmutate(df)\n",
+        );
+        let _ = ScopedSymbol {
+            name: Arc::from("mutate"),
+            kind: SymbolKind::Function,
+            source_uri: pkg_export,
+            defined_line: 0,
+            defined_column: 0,
+            defined_end_column: 6,
+            signature: None,
+            is_declared: false,
+        };
+        assert!(
+            goto(&state, &caller, Position::new(1, 1)).is_none(),
+            "external-package symbol goto stays a no-op"
+        );
+    }
+
+    /// The resolver works whether the defining R/ file is OPEN (DocumentStore) or
+    /// CLOSED (workspace index) — both reachable via the ContentProvider.
+    #[test]
+    fn goto_load_all_internal_open_and_closed() {
+        // CLOSED defining file.
+        {
+            let mut state = state_with_internals(&["closed_fn"]);
+            let def = index_closed_file(
+                &mut state,
+                "file:///work/pkg/R/closed.R",
+                "closed_fn <- function() 1\n",
+            );
+            let caller = add_legacy_doc(
+                &mut state,
+                "file:///work/pkg/dev.R",
+                "load_all()\nclosed_fn()\n",
+            );
+            let l = scalar(goto(&state, &caller, Position::new(1, 1)));
+            assert_eq!(l.uri, def, "resolves via the workspace index (closed file)");
+        }
+        // OPEN defining file.
+        {
+            let mut state = state_with_internals(&["open_fn"]);
+            let def = open_doc(
+                &mut state,
+                "file:///work/pkg/R/open.R",
+                "open_fn <- function() 1\n",
+            );
+            let caller = add_legacy_doc(
+                &mut state,
+                "file:///work/pkg/dev.R",
+                "load_all()\nopen_fn()\n",
+            );
+            let l = scalar(goto(&state, &caller, Position::new(1, 1)));
+            assert_eq!(l.uri, def, "resolves via the DocumentStore (open file)");
+        }
+    }
+}
+
+/// Hover / signature / completion must NEVER surface the raw `load_all()`
+/// sentinel name nor send it to the R help system. They map a sentinel owner to
+/// a friendly dev-package label instead.
+#[cfg(test)]
+mod load_all_owner_display_tests {
+    use crate::package_library::LOAD_ALL_SENTINEL;
+    use crate::package_state::{PackageScopeContribution, PackageState};
+    use crate::state::WorldState;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::{Position, Url};
+
+    const ROOT_URL: &str = "file:///work/pkg";
+
+    /// `WorldState` modeling a package whose own internal `helper` is exposed via
+    /// the load_all() overlay, with a known package name for the friendly label.
+    fn state_with_named_pkg(internals: &[&str], pkg_name: &str) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+
+        let mut r_internal = BTreeSet::new();
+        for s in internals {
+            r_internal.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                package_name: Some(pkg_name.to_string()),
+                r_internal_symbols: Arc::new(r_internal.clone()),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        // The overlay is normally refreshed by `apply_package_event`; the goto
+        // fixtures bypass that, so set it directly here (mirrors the chokepoint
+        // unit tests) — hover resolves the internal through it.
+        state.package_library.set_local_dev_overlay(Some(Arc::new(
+            crate::package_library::LocalDevPackage {
+                symbols: r_internal.into_iter().collect(),
+            },
+        )));
+        state
+    }
+
+    async fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        // `hover` reads the document text via `state.get_document` (the legacy
+        // `state.documents` map), while cross-file scope reads artifacts via the
+        // content provider (the document store). Populate both.
+        state.document_store.open(uri.clone(), content, 1).await;
+        state.documents.insert(
+            uri.clone(),
+            crate::state::Document::new_with_uri(content, None, &uri),
+        );
+        uri
+    }
+
+    /// A `load_all()` caller hovering an internal must render the friendly
+    /// dev-package label, never the raw sentinel, and not reach the R help path.
+    #[tokio::test]
+    async fn hover_load_all_internal_does_not_leak_sentinel() {
+        let mut state = state_with_named_pkg(&["helper"], "mypkg");
+        // Caller UNDER the package tree (a load_all() exploration script): attaches
+        // the sentinel via load_all(), then uses the internal `helper`. The
+        // out-of-root gate keeps the sentinel only for files under the package root.
+        let caller = open_doc(
+            &mut state,
+            "file:///work/pkg/explore.R",
+            "pkgload::load_all()\nhelper\n",
+        )
+        .await;
+
+        // Sanity: the owner resolves to the sentinel internally.
+        assert_eq!(
+            state
+                .package_library
+                .find_package_owner_for_symbol("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            Some(LOAD_ALL_SENTINEL.to_string())
+        );
+
+        let hover = super::hover(&state, &caller, Position::new(1, 2))
+            .await
+            .expect("hover should resolve the load_all internal");
+        let value = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            !value.contains(LOAD_ALL_SENTINEL),
+            "hover must NOT leak the raw sentinel: {value}"
+        );
+        assert!(
+            value.contains("package under development"),
+            "hover must show the friendly dev-package label: {value}"
+        );
+        assert!(
+            value.contains("mypkg"),
+            "hover should name the dev package when known: {value}"
+        );
+        // It must not have been rendered via the R help panel link.
+        assert!(
+            !value.contains("openHelpPanel"),
+            "sentinel hover must not build an R help panel link: {value}"
+        );
+    }
+
+    /// Completion for a load_all() internal must show the friendly dev-package
+    /// label in `detail` and must NOT store the raw sentinel in `data.package`
+    /// (which `completionItem/resolve` would feed to the R help system).
+    #[tokio::test]
+    async fn completion_load_all_internal_detail_shows_friendly_label() {
+        use tower_lsp::lsp_types::CompletionResponse;
+
+        let mut state = state_with_named_pkg(&["helper_fn"], "mypkg");
+        let caller = open_doc(
+            &mut state,
+            "file:///work/pkg/explore.R",
+            "pkgload::load_all()\nhelper_\n",
+        )
+        .await;
+
+        let resp = super::completion(&state, &caller, Position::new(1, 7), None)
+            .expect("completion should produce items");
+        let items = match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .iter()
+            .find(|i| i.label == "helper_fn")
+            .expect("the load_all internal must be offered as a completion");
+
+        let detail = item.detail.as_deref().unwrap_or("");
+        assert!(
+            !detail.contains(LOAD_ALL_SENTINEL),
+            "completion detail must NOT leak the raw sentinel: {detail}"
+        );
+        assert!(
+            detail.contains("package under development"),
+            "completion detail must show the friendly dev-package label: {detail}"
+        );
+        // No `data.package` carrying the sentinel into completionItem/resolve.
+        let leaks_via_data = item
+            .data
+            .as_ref()
+            .and_then(|d| d.get("package"))
+            .and_then(|v| v.as_str())
+            .map(|p| p == LOAD_ALL_SENTINEL)
+            .unwrap_or(false);
+        assert!(
+            !leaks_via_data,
+            "completion must not carry the sentinel in data.package: {:?}",
+            item.data
         );
     }
 }

@@ -611,6 +611,45 @@ impl WorldState {
             delta,
         );
         self.package_state.set_from(new_package_state);
+
+        // Refresh the package library's local-dev overlay from the freshly-set
+        // contribution. `apply_package_event` is the single writer that recomputes
+        // the contribution, so this is the one correct refresh point.
+        self.refresh_local_dev_overlay();
+    }
+
+    /// (Re)build the package library's local-dev overlay from the current
+    /// package-state contribution and install it on the *current*
+    /// `package_library`. The overlay collects the workspace-local internal
+    /// symbol set that a `devtools::load_all()` call attaches via the sentinel.
+    /// It is built whenever a package workspace exists (not only when load_all
+    /// is in play); that is safe because the resolution chokepoints
+    /// short-circuit on the sentinel not being attached, leaving non-load_all
+    /// resolution unchanged.
+    ///
+    /// Because a fresh `PackageLibrary` starts with a `None` overlay, every code
+    /// path that *replaces* `self.package_library` (libpath rebuild, init) must
+    /// call this afterward, otherwise sentinel resolution silently reverts until
+    /// the next package event. `apply_package_event` also calls it.
+    pub fn refresh_local_dev_overlay(&self) {
+        let contrib = self.package_state.scope_contribution();
+        let overlay = if contrib.workspace_root.is_some() {
+            // Build the overlay from the single shared enumeration of internal
+            // sources (`local_dev_internal_symbols`), the same one
+            // `PackageScopeContribution::is_local_dev_internal` (the goto gate in
+            // handlers.rs) tests against — so the overlay's contents and that
+            // predicate cannot drift on which sources count.
+            let symbols: std::collections::HashSet<String> = contrib
+                .local_dev_internal_symbols()
+                .map(str::to_string)
+                .collect();
+            Some(std::sync::Arc::new(
+                crate::package_library::LocalDevPackage { symbols },
+            ))
+        } else {
+            None
+        };
+        self.package_library.set_local_dev_overlay(overlay);
     }
 
     /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
