@@ -1973,6 +1973,24 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
     }
 }
 
+/// True if `node` has an ancestor that is a non-evaluating quoting call
+/// (`quote`/`bquote`/`substitute`/`expression`, rlang's `expr`/`quo`/…), in
+/// which code is captured but never evaluated. A `load_all()` so captured never
+/// runs, so it must not attach the package under development. Mirrors the
+/// `inside_quote` exclusion in [`text_calls_dev_load_all`] /
+/// `visit_node_for_top_level_library`, but walks UP the tree because
+/// `collect_definitions` visits each node individually (no top-down latch).
+fn has_nonevaluating_quote_ancestor(node: Node, content: &str) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(n) = ancestor {
+        if is_nonevaluating_quote_call(n, content) {
+            return true;
+        }
+        ancestor = n.parent();
+    }
+    false
+}
+
 /// True when `text` contains a top-level `devtools::load_all()` /
 /// `pkgload::load_all()` / bare `load_all()` call — used by the workspace-root
 /// `.Rprofile` scan to decide whether the profile attaches the package under
@@ -1986,7 +2004,11 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
 /// ever evaluating it; neither attaches at profile-load time. The quoting
 /// predicate is shared with `extract_attached_packages` via
 /// [`is_nonevaluating_quote_call`]. The per-call recognition reuses
-/// [`call_is_dev_load_all`]. Returns `false` on unparseable input.
+/// [`call_is_dev_load_all`]. Detection is error-tolerant: tree-sitter recovers
+/// from syntax errors, so a recognizable top-level `load_all()` is still found
+/// amid unrelated errors (matching the AST timeline path, which likewise
+/// tolerates `ERROR` nodes); the function only returns `false` outright if the
+/// parser yields no tree at all.
 ///
 /// [`extract_attached_packages`]: crate::cross_file::source_detect::extract_attached_packages
 pub(crate) fn text_calls_dev_load_all(text: &str) -> bool {
@@ -2804,7 +2826,10 @@ fn collect_definitions(
     // call site (not just the first) so the emission loops can push one sentinel
     // PackageLoad event per site, each with its own function scope — matching
     // how `library()` calls are emitted (see `dev_load_all_sites`).
-    if call_callee == Some("load_all") && call_is_dev_load_all(node, line_index.text) {
+    if call_callee == Some("load_all")
+        && call_is_dev_load_all(node, line_index.text)
+        && !has_nonevaluating_quote_ancestor(node, line_index.text)
+    {
         artifacts.calls_dev_load_all = true;
         let (line, column) = node_start_position_utf16(node, line_index);
         artifacts
@@ -18593,6 +18618,31 @@ x <- 1"#;
                 .contains(crate::package_library::LOAD_ALL_SENTINEL),
             "child must inherit the TOP-LEVEL load_all() that precedes the source(), even though an earlier load_all() was function-scoped; inherited: {:?}",
             scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_in_nonevaluating_quote_is_not_recorded() {
+        // A `load_all()` captured inside a non-evaluating quoting call
+        // (`quote`/`expr`/…) is never evaluated, so it must NOT record a
+        // dev_load_all_site (and thus emits no sentinel PackageLoad). A bare
+        // top-level call is the positive control.
+        let uri = Url::parse("file:///project/a.R").unwrap();
+        let quoted = "quote(devtools::load_all())\n";
+        let arts = compute_artifacts(&uri, &parse_r(quoted), quoted);
+        assert!(
+            arts.dev_load_all_sites.is_empty(),
+            "quoted load_all() must not be recorded; got {:?}",
+            arts.dev_load_all_sites,
+        );
+        assert!(!arts.calls_dev_load_all);
+
+        let bare = "load_all()\n";
+        let arts2 = compute_artifacts(&uri, &parse_r(bare), bare);
+        assert_eq!(
+            arts2.dev_load_all_sites.len(),
+            1,
+            "bare top-level load_all() is recorded",
         );
     }
 

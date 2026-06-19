@@ -1492,6 +1492,9 @@ fn extend_with_open_package_docs(
 /// (`document_store.get_without_touch`). `max_depth` / `max_visited` must match
 /// the budgets the surrounding handler uses for its other graph walks
 /// (`max_chain_depth` / `max_transitive_dependents_visited`).
+// Deliberate: this mirrors the inputs `DependencyGraph::revalidation_consistent_set`
+// needs (graph + per-doc carrier facts + matching budgets); bundling them into a
+// struct would only relocate the argument list without improving clarity.
 #[allow(clippy::too_many_arguments)]
 fn extend_affected_for_load_all_revalidation(
     affected: &mut Vec<Url>,
