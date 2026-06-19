@@ -945,6 +945,23 @@ pub struct PackageScopeContribution {
     pub rprofile_root: Option<PathBuf>,
 }
 
+impl PackageScopeContribution {
+    /// True iff `name` is a symbol exposed by this package as a load_all() internal
+    /// (the local-dev overlay's contents): an R/ internal, sysdata object, .onLoad/
+    /// .onAttach binding, or a NAMESPACE-imported name. Single source of truth for
+    /// the overlay build (`WorldState::refresh_local_dev_overlay` in state.rs) and
+    /// the goto contributed-internal gate (handlers.rs) so they cannot drift.
+    ///
+    /// The overlay build in state.rs enumerates these same four sets to populate the
+    /// `LocalDevPackage` symbol set; keep that union in lockstep with this predicate.
+    pub fn is_local_dev_internal(&self, name: &str) -> bool {
+        self.r_internal_symbols.contains(name)
+            || self.sysdata_symbols.contains(name)
+            || self.onload_symbols.contains(name)
+            || self.imported_symbols.contains_key(name)
+    }
+}
+
 #[cfg(test)]
 mod scan_data_tests {
     use super::*;

@@ -501,13 +501,18 @@ impl PackageLibrary {
     /// (`is_symbol_from_loaded_packages`, `find_package_owner_for_symbol`,
     /// `get_owned_exports_for_completions`).
     fn overlay_has_symbol(&self, name: &str, loaded_packages: &[String]) -> bool {
+        // Hot path (per-symbol via `is_symbol_from_loaded_packages`): in the common
+        // no-`load_all` case the overlay is `None`, so load it first (an O(1)
+        // ArcSwap load) and early-return before scanning `loaded_packages` for the
+        // sentinel.
+        let overlay = self.local_dev_overlay.load();
+        let Some(pkg) = overlay.as_ref().as_ref() else {
+            return false;
+        };
         if !loaded_packages.iter().any(|p| is_load_all_sentinel(p)) {
             return false;
         }
-        match self.local_dev_overlay.load().as_ref() {
-            Some(pkg) => pkg.symbols.contains(name),
-            None => false,
-        }
+        pkg.symbols.contains(name)
     }
 
     /// Publish a new per-package cache snapshot after applying `f` to a clone of

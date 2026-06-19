@@ -20626,14 +20626,8 @@ pub fn goto_definition_with_cancel(
         // no-ops — otherwise it would fall through to the scope-blind general
         // `exported_interface` fallback below and land on a PHANTOM target (a
         // function-local / rm'd binding of the same spelling).
-        let is_contributed_internal = contrib.r_internal_symbols.contains(name)
-            || contrib.r_internal_symbols.contains(scope_key)
-            || contrib.onload_symbols.contains(name)
-            || contrib.onload_symbols.contains(scope_key)
-            || contrib.sysdata_symbols.contains(name)
-            || contrib.sysdata_symbols.contains(scope_key)
-            || contrib.imported_symbols.contains_key(name)
-            || contrib.imported_symbols.contains_key(scope_key);
+        let is_contributed_internal =
+            contrib.is_local_dev_internal(name) || contrib.is_local_dev_internal(scope_key);
         // The redirect models the load_all() overlay path, so it must only fire
         // when the load_all sentinel is actually attached in the computed scope:
         // a `load_all()` is reachable from here AND the query file was not
