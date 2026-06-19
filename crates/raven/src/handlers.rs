@@ -17583,7 +17583,7 @@ fn is_r_identifier_start_byte(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'.' || byte == b'_'
 }
 
-fn is_r_identifier_continue_byte(byte: u8) -> bool {
+pub(crate) fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
@@ -25972,10 +25972,10 @@ clean_data <- function(x) {
     fn pkg_double_colon_backtick_quotes_non_syntactic_export() {
         // End-to-end through `completion()`: a non-syntactic export (operator
         // `%>%`, as real packages declare via `export("%>%")`) must be offered
-        // with backtick-quoted insert text so accepting it yields valid R
+        // with a backtick-quoted edit so accepting it yields valid R
         // (`magrittr::`%>%``), while the label/filter stay the bare name. A
-        // syntactic sibling export needs no insert override. This guards the
-        // handler-seam wiring of `insert_text`/`filter_text`, not just the unit.
+        // syntactic sibling export inserts its bare name. This guards the
+        // handler-seam wiring of `text_edit`/`filter_text`, not just the unit.
         use crate::package_library::{PackageInfo, PackageLibrary};
         use crate::state::{Document, WorldState};
 
@@ -26003,15 +26003,22 @@ clean_data <- function(x) {
                 other => panic!("expected array, got {:?}", other),
             };
 
+            // The cursor sits right after `::` (col 10), so the member range is
+            // an empty insert there; accepting edits the backtick-quoted text in.
+            let empty_at_cursor = Range::new(Position::new(0, 10), Position::new(0, 10));
             let op = items
                 .iter()
                 .find(|i| i.label == "%>%")
                 .expect("magrittr::%>% offered");
             assert_eq!(
-                op.insert_text.as_deref(),
-                Some("`%>%`"),
-                "non-syntactic export inserts backtick-quoted text"
+                op.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit {
+                    range: empty_at_cursor,
+                    new_text: "`%>%`".to_string(),
+                })),
+                "non-syntactic export edits in backtick-quoted text"
             );
+            assert_eq!(op.insert_text, None, "edit supersedes insert_text");
             assert_eq!(
                 op.filter_text.as_deref(),
                 Some("%>%"),
@@ -26028,9 +26035,14 @@ clean_data <- function(x) {
                 .find(|i| i.label == "set_names")
                 .expect("magrittr::set_names offered");
             assert_eq!(
-                plain.insert_text, None,
-                "syntactic export inserts its label verbatim"
+                plain.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit {
+                    range: empty_at_cursor,
+                    new_text: "set_names".to_string(),
+                })),
+                "syntactic export edits in its bare name"
             );
+            assert_eq!(plain.insert_text, None);
         });
     }
 

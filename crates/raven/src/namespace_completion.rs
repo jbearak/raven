@@ -23,7 +23,9 @@
 // symbols are not stored in the package library and would need an R subprocess.
 // The flag is the seam to add them later without touching the handler wiring.
 
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Position, Range, TextEdit,
+};
 use tree_sitter::{Node, Point, Tree};
 
 use crate::handlers::SORT_PREFIX_PACKAGE;
@@ -34,7 +36,13 @@ use crate::package_library::PackageLibrary;
 pub enum NamespaceCompletionContext {
     /// Cursor on the member (RHS) side — offer `package`'s exported symbols.
     /// `internal` is true for `:::` (deferred, so it yields no items).
-    Member { package: String, internal: bool },
+    /// `replace_range` is the already-typed member token the accepted completion
+    /// must overwrite (see [`member_replace_range`]).
+    Member {
+        package: String,
+        internal: bool,
+        replace_range: Range,
+    },
     /// Cursor on the package (LHS) side of a `::`, including the operator
     /// boundary (`dplyr|::x`). Members are wrong here and keywords/locals are
     /// invalid around `::`, so the handler short-circuits with no completions —
@@ -143,7 +151,56 @@ fn classify_namespace_cursor(
     Some(NamespaceCompletionContext::Member {
         package: package.to_string(),
         internal: node_text(op, text) == ":::",
+        replace_range: member_replace_range(op_end, point, text),
     })
+}
+
+/// The text range an accepted member completion must replace: the member token
+/// already typed after the `::`/`:::` operator.
+///
+/// Emitting an explicit range (consumed as a `text_edit`) rather than relying on
+/// the client's word-range default makes the overwrite independent of the
+/// client's `wordPattern`, and mirrors the `$`/`@` member path so both
+/// member-completion seams behave identically. For a non-syntactic operator
+/// member (`%>%`) the range is the empty insert at the operator boundary —
+/// detection never forms a context for a half-typed `pkg::%`, so the only way to
+/// reach such a member is incremental typing after `pkg::`, and the client
+/// extends the overwrite back over the typed `%` on accept (`overwriteBefore =
+/// cursor − range.start`), exactly as it would have under the word-range default.
+///
+/// `op_end` is the end of the `::`/`:::` operator and `point` the cursor (both
+/// tree-sitter points with byte columns). The range starts just past the
+/// operator — skipping any horizontal whitespace, but never advancing past the
+/// cursor — and ends at the cursor, extended rightward over a partially typed
+/// *syntactic* identifier (`pkg::fil|ter` replaces all of `filter`). Operator
+/// members are only ever typed up to the cursor, so they need no right
+/// extension. For the exotic `pkg::`-then-newline split the range is anchored at
+/// the cursor instead.
+fn member_replace_range(op_end: Point, point: Point, text: &str) -> Range {
+    let line = text.lines().nth(point.row).unwrap_or("");
+    let bytes = line.as_bytes();
+    let cursor = point.column.min(line.len());
+
+    let mut start = if op_end.row == point.row {
+        op_end.column.min(cursor)
+    } else {
+        cursor
+    };
+    while start < cursor && matches!(bytes.get(start), Some(b' ' | b'\t')) {
+        start += 1;
+    }
+
+    let mut end = cursor;
+    while end < bytes.len() && crate::handlers::is_r_identifier_continue_byte(bytes[end]) {
+        end += 1;
+    }
+
+    let start_char = crate::utf16::byte_offset_to_utf16_column(line, start);
+    let end_char = crate::utf16::byte_offset_to_utf16_column(line, end);
+    Range {
+        start: Position::new(point.row as u32, start_char),
+        end: Position::new(point.row as u32, end_char),
+    }
 }
 
 /// Build completion items for a detected `pkg::` context.
@@ -159,7 +216,12 @@ pub fn namespace_completion_items(
     ctx: &NamespaceCompletionContext,
     library: &PackageLibrary,
 ) -> Vec<CompletionItem> {
-    let NamespaceCompletionContext::Member { package, internal } = ctx else {
+    let NamespaceCompletionContext::Member {
+        package,
+        internal,
+        replace_range,
+    } = ctx
+    else {
         return Vec::new();
     };
     if *internal {
@@ -169,16 +231,15 @@ pub fn namespace_completion_items(
         return Vec::new();
     };
     let package = package.clone();
+    let replace_range = *replace_range;
     exports
         .into_iter()
         .map(move |symbol| {
             // A package can export non-syntactic names (operators like `%>%`,
             // exported S3 methods). Accepting `pkg::%>%` would be invalid R, so
             // the inserted text is backtick-quoted (`pkg::`%>%``) via the shared
-            // completion rule, while the label/filter stay the bare name. A
-            // syntactic name needs no override (the label inserts verbatim).
-            let insert = crate::handlers::accessor_member_insert_text(&symbol);
-            let needs_quoting = insert != symbol;
+            // completion rule; a syntactic name inserts verbatim.
+            let new_text = crate::handlers::accessor_member_insert_text(&symbol);
             CompletionItem {
                 label: symbol.clone(),
                 // FUNCTION for every export — the same kind the bare-identifier
@@ -188,8 +249,16 @@ pub fn namespace_completion_items(
                 kind: Some(CompletionItemKind::FUNCTION),
                 detail: Some(format!("{{{package}}}")),
                 sort_text: Some(format!("{SORT_PREFIX_PACKAGE}{symbol}")),
-                insert_text: needs_quoting.then(|| insert.clone()),
-                filter_text: needs_quoting.then(|| symbol.clone()),
+                // An explicit edit (not `insert_text`) so the typed member prefix
+                // is always overwritten — even a non-syntactic `%` the client's
+                // wordPattern doesn't treat as a word. `filter_text` stays the
+                // bare name so a typed prefix (including a leading `%`) matches
+                // even when `new_text` is backtick-quoted.
+                filter_text: Some(symbol.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text,
+                })),
                 data: Some(serde_json::json!({
                     "topic": symbol,
                     "package": package.clone(),
@@ -255,11 +324,37 @@ mod tests {
         detect_namespace_completion_context(&tree, node, point, &code)
     }
 
-    fn member(package: &str, internal: bool) -> Option<NamespaceCompletionContext> {
-        Some(NamespaceCompletionContext::Member {
-            package: package.to_string(),
-            internal,
-        })
+    /// Assert a detected context is a member side for `package` with the given
+    /// `internal` flag, ignoring the replace range (covered by its own tests).
+    fn assert_member(ctx: Option<NamespaceCompletionContext>, package: &str, internal: bool) {
+        match ctx {
+            Some(NamespaceCompletionContext::Member {
+                package: p,
+                internal: i,
+                ..
+            }) => {
+                assert_eq!(p, package, "package");
+                assert_eq!(i, internal, "internal");
+            }
+            other => panic!("expected Member({package}, {internal}), got {other:?}"),
+        }
+    }
+
+    /// The member replace range a marked snippet detects, as the `[start, end)`
+    /// substring of its line — i.e. the text an accepted completion overwrites.
+    fn member_replaced_text(marked: &str) -> String {
+        let (code, _) = at(marked);
+        let line = code.lines().next().unwrap_or("");
+        match detect(marked) {
+            Some(NamespaceCompletionContext::Member { replace_range, .. }) => {
+                let start =
+                    crate::utf16::utf16_column_to_byte_offset(line, replace_range.start.character);
+                let end =
+                    crate::utf16::utf16_column_to_byte_offset(line, replace_range.end.character);
+                line[start..end].to_string()
+            }
+            other => panic!("expected Member, got {other:?}"),
+        }
     }
 
     // ----- detection ------------------------------------------------------
@@ -285,25 +380,25 @@ mod tests {
 
     #[test]
     fn detects_complete_ast_member_side() {
-        assert_eq!(detect("dplyr::fil|ter"), member("dplyr", false));
+        assert_member(detect("dplyr::fil|ter"), "dplyr", false);
     }
 
     #[test]
     fn unquotes_string_package_qualifier() {
         // `"pkg"::name` is valid R; the package name must drop its quotes.
-        assert_eq!(detect("\"dplyr\"::fil|ter"), member("dplyr", false));
+        assert_member(detect("\"dplyr\"::fil|ter"), "dplyr", false);
     }
 
     #[test]
     fn unquotes_backtick_package_qualifier() {
-        assert_eq!(detect("`dplyr`::fil|ter"), member("dplyr", false));
+        assert_member(detect("`dplyr`::fil|ter"), "dplyr", false);
     }
 
     #[test]
     fn unquotes_incomplete_string_package_qualifier() {
         // Incomplete quoted qualifier (no member yet) still resolves — the
         // `namespace_operator` forms with a `string` lhs.
-        assert_eq!(detect("\"dplyr\"::|"), member("dplyr", false));
+        assert_member(detect("\"dplyr\"::|"), "dplyr", false);
     }
 
     #[test]
@@ -321,17 +416,17 @@ mod tests {
 
     #[test]
     fn detects_incomplete_double_colon() {
-        assert_eq!(detect("dplyr::|"), member("dplyr", false));
+        assert_member(detect("dplyr::|"), "dplyr", false);
     }
 
     #[test]
     fn detects_incomplete_triple_colon_as_internal() {
-        assert_eq!(detect("dplyr:::|"), member("dplyr", true));
+        assert_member(detect("dplyr:::|"), "dplyr", true);
     }
 
     #[test]
     fn detects_complete_triple_colon_as_internal() {
-        assert_eq!(detect("dplyr:::int|ernal"), member("dplyr", true));
+        assert_member(detect("dplyr:::int|ernal"), "dplyr", true);
     }
 
     #[test]
@@ -351,9 +446,45 @@ mod tests {
         // whitespace, so the fallback must step back over the space to reach the
         // `::` token. (`stats::x` already works because the rhs node spans the
         // cursor; the no-member-yet form is the gap.)
-        assert_eq!(detect("stats:: |"), member("stats", false));
-        assert_eq!(detect("stats::  |"), member("stats", false));
-        assert_eq!(detect("stats:::  |"), member("stats", true));
+        assert_member(detect("stats:: |"), "stats", false);
+        assert_member(detect("stats::  |"), "stats", false);
+        assert_member(detect("stats:::  |"), "stats", true);
+    }
+
+    // ----- member replace range -------------------------------------------
+
+    #[test]
+    fn no_context_for_partial_operator_member() {
+        // tree-sitter does not form a `namespace_operator` for a half-typed
+        // non-syntactic member (`pkg::%`, `pkg::%>`), so a *fresh* request there
+        // yields no context (and no completions) — never a wrong insert. The
+        // operator member is reachable only by incremental typing after `pkg::`,
+        // where the request fired at the operator boundary with an empty range
+        // and the client extends the overwrite back over the typed `%` on accept.
+        assert_eq!(detect("magrittr::%|"), None);
+        assert_eq!(detect("magrittr::%>|"), None);
+        assert_eq!(detect("magrittr::%>%|"), None);
+    }
+
+    #[test]
+    fn replace_range_covers_partial_syntactic_name_both_sides() {
+        // A cursor mid-identifier replaces the whole token, not just the prefix.
+        assert_eq!(member_replaced_text("dplyr::fil|ter"), "filter");
+        assert_eq!(member_replaced_text("dplyr::fil|"), "fil");
+    }
+
+    #[test]
+    fn replace_range_empty_when_no_member_typed() {
+        // Nothing typed after `::` → an empty range at the cursor (pure insert).
+        assert_eq!(member_replaced_text("dplyr::|"), "");
+    }
+
+    #[test]
+    fn replace_range_skips_leading_whitespace() {
+        // `stats:: ` — the range must not swallow the space before the cursor;
+        // it stays an empty insert at the cursor.
+        assert_eq!(member_replaced_text("stats:: |"), "");
+        assert_eq!(member_replaced_text("stats:: med|ian"), "median");
     }
 
     #[test]
@@ -412,9 +543,11 @@ mod tests {
             ))
             .await;
 
+        let range = Range::new(Position::new(0, 7), Position::new(0, 10));
         let ctx = NamespaceCompletionContext::Member {
             package: "dplyr".to_string(),
             internal: false,
+            replace_range: range,
         };
         let items = namespace_completion_items(&ctx, &library);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
@@ -424,6 +557,16 @@ mod tests {
         assert_eq!(filter.kind, Some(CompletionItemKind::FUNCTION));
         assert_eq!(filter.detail.as_deref(), Some("{dplyr}"));
         assert_eq!(filter.sort_text.as_deref(), Some("4-filter"));
+        // A syntactic export inserts its bare name through an edit over the
+        // detected member range; `insert_text` is unused.
+        assert_eq!(filter.insert_text, None);
+        assert_eq!(
+            filter.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "filter".to_string(),
+            }))
+        );
         assert_eq!(
             filter.data,
             Some(serde_json::json!({ "topic": "filter", "package": "dplyr" }))
@@ -445,26 +588,39 @@ mod tests {
             ))
             .await;
 
+        let range = Range::new(Position::new(0, 10), Position::new(0, 11));
         let ctx = NamespaceCompletionContext::Member {
             package: "magrittr".to_string(),
             internal: false,
+            replace_range: range,
         };
         let items = namespace_completion_items(&ctx, &library);
 
         let op = items.iter().find(|i| i.label == "%>%").unwrap();
         assert_eq!(
-            op.insert_text.as_deref(),
-            Some("`%>%`"),
-            "non-syntactic export must insert backtick-quoted text"
+            op.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "`%>%`".to_string(),
+            })),
+            "non-syntactic export edits in backtick-quoted text over the member range"
         );
+        assert_eq!(op.insert_text, None, "edit supersedes insert_text");
         assert_eq!(
             op.filter_text.as_deref(),
             Some("%>%"),
             "filter text stays the bare name so typing `%` still matches"
         );
 
-        // A syntactic export needs no insert override (label is inserted as-is).
+        // A syntactic export inserts its bare name verbatim through the edit.
         let plain = items.iter().find(|i| i.label == "set_names").unwrap();
+        assert_eq!(
+            plain.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "set_names".to_string(),
+            }))
+        );
         assert_eq!(plain.insert_text, None);
     }
 
@@ -474,6 +630,7 @@ mod tests {
         let ctx = NamespaceCompletionContext::Member {
             package: "dplyr".to_string(),
             internal: true,
+            replace_range: Range::default(),
         };
         assert!(namespace_completion_items(&ctx, &library).is_empty());
     }
@@ -493,6 +650,7 @@ mod tests {
         let ctx = NamespaceCompletionContext::Member {
             package: "nopkg".to_string(),
             internal: false,
+            replace_range: Range::default(),
         };
         assert!(namespace_completion_items(&ctx, &library).is_empty());
     }
