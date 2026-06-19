@@ -98,6 +98,23 @@ pub fn is_load_all_sentinel(name: &str) -> bool {
     name == LOAD_ALL_SENTINEL
 }
 
+/// User-facing display label for a symbol owned by the `load_all()` sentinel
+/// package. The raw [`LOAD_ALL_SENTINEL`] string must NEVER reach the UI or the
+/// R subprocess; every owner-consumer (hover, signature help, completion detail)
+/// maps a sentinel owner through this helper instead.
+///
+/// `contrib_package_name` is the dev package's real DESCRIPTION `Package:` name
+/// when known (`state.package_state.scope_contribution().package_name`); falls
+/// back to a generic label when absent.
+pub(crate) fn load_all_owner_display(contrib_package_name: Option<&str>) -> String {
+    match contrib_package_name {
+        Some(name) if !name.is_empty() && name != "unknown" => {
+            format!("package under development ({})", name)
+        }
+        _ => "package under development".to_string(),
+    }
+}
+
 /// Workspace-local internal symbol set exposed by a `load_all()` virtual attached
 /// package. Built from the active `PackageScopeContribution`; refreshed by the single
 /// contribution writer (`apply_package_event`). Holds names only — go-to-definition
@@ -6263,6 +6280,22 @@ mod tests {
             .await
             .expect("datasets cached");
         assert!(datasets.lazy_data.contains(&"mtcars".to_string()));
+    }
+
+    #[test]
+    fn load_all_owner_display_never_leaks_sentinel() {
+        // With a known dev-package name, show it; otherwise a generic label.
+        // Never the raw sentinel string, in any case.
+        let with_name = load_all_owner_display(Some("mypkg"));
+        assert!(with_name.contains("mypkg"));
+        assert!(with_name.contains("package under development"));
+        assert!(!with_name.contains(LOAD_ALL_SENTINEL));
+
+        for fallback in [None, Some(""), Some("unknown")] {
+            let label = load_all_owner_display(fallback);
+            assert_eq!(label, "package under development");
+            assert!(!label.contains(LOAD_ALL_SENTINEL));
+        }
     }
 
     #[test]

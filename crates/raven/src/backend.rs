@@ -4267,9 +4267,14 @@ impl LanguageServer for Backend {
                 // are not pre-validated) cannot reach the R subprocess /
                 // filesystem path. Mirrors the validation applied to direct
                 // library_calls via extract_loaded_packages_from_library_calls.
+                // `is_valid_package_name` already rejects the underscore-prefixed
+                // load_all() sentinel; the explicit guard is defense-in-depth so
+                // the sentinel can never reach prefetch / the R subprocess.
                 let pkgs: Vec<String> = pkgs
                     .into_iter()
-                    .filter(|p| is_valid_package_name(p))
+                    .filter(|p| {
+                        is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p)
+                    })
                     .collect();
 
                 (pkg_lib, ready, pkgs)
@@ -4841,9 +4846,13 @@ impl LanguageServer for Backend {
                 // entries through scope resolution). Mirrors the
                 // `prefetch_packages_for_open_documents` filter so every
                 // prefetch call site applies the same validation.
+                // `is_valid_package_name` already rejects the underscore-prefixed
+                // load_all() sentinel; the explicit guard is defense-in-depth.
                 let packages_vec: Vec<String> = all_packages
                     .into_iter()
-                    .filter(|p| is_valid_package_name(p))
+                    .filter(|p| {
+                        is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p)
+                    })
                     .collect();
                 if packages_vec.is_empty() {
                     return;
@@ -8299,9 +8308,11 @@ pub(crate) async fn prefetch_packages_for_open_documents(
         }
     }
 
+    // `is_valid_package_name` already rejects the underscore-prefixed load_all()
+    // sentinel; the explicit guard is defense-in-depth.
     let packages: Vec<String> = all_pkgs
         .into_iter()
-        .filter(|p| is_valid_package_name(p))
+        .filter(|p| is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p))
         .collect();
     if !packages.is_empty() {
         log::trace!(

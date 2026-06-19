@@ -5085,7 +5085,14 @@ fn expand_data_load(
             None => {
                 // Sorted attached packages first, then sorted base packages;
                 // first package providing the stem wins (see doc comment).
-                let mut attached: Vec<&String> = attached_packages.iter().collect();
+                // The load_all() sentinel is a synthetic attached package with
+                // no datasets and must never be fed into installed-package
+                // dataset lookup — skip it here, the single chokepoint every
+                // bare-`data()` attached-set construction funnels through.
+                let mut attached: Vec<&String> = attached_packages
+                    .iter()
+                    .filter(|p| !crate::package_library::is_load_all_sentinel(p))
+                    .collect();
                 attached.sort_unstable();
                 let mut base: Vec<&String> = provider.base_packages.iter().collect();
                 base.sort_unstable();
@@ -25979,6 +25986,40 @@ y <- filter(df)"#;
         assert!(
             scope.symbols.contains_key("apistrat"),
             "data(api) must bind every object survey's `api` stem provides"
+        );
+    }
+
+    #[test]
+    fn data_alias_skips_load_all_sentinel() {
+        // The load_all() sentinel package has no datasets and must NEVER be
+        // queried by the data() alias expander (it would otherwise feed the
+        // raw sentinel name into installed-package dataset lookup). With the
+        // sentinel in the attached set, `expand_data_load` must skip it.
+        use crate::package_library::LOAD_ALL_SENTINEL;
+        use std::cell::RefCell;
+
+        let queried: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let recording_lookup = |pkg: &str, stem: &str| -> Vec<String> {
+            queried.borrow_mut().push(pkg.to_string());
+            fake_alias_lookup(pkg, stem)
+        };
+        let base = HashSet::new();
+        let provider = DataAliasProvider {
+            lookup: &recording_lookup,
+            base_packages: &base,
+        };
+        let mut attached: HashSet<String> = HashSet::new();
+        attached.insert(LOAD_ALL_SENTINEL.to_string());
+        attached.insert("survey".to_string());
+
+        let out = expand_data_load(&["api".to_string()], &None, &attached, &provider);
+        // survey still resolves api -> apiclus1/apistrat.
+        assert!(out.iter().any(|(n, _)| &**n == "apiclus1"));
+        // The sentinel was never passed to the dataset lookup.
+        assert!(
+            !queried.borrow().iter().any(|p| p == LOAD_ALL_SENTINEL),
+            "the load_all sentinel must never be queried for datasets: {:?}",
+            queried.borrow()
         );
     }
 

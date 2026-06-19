@@ -292,6 +292,14 @@ pub fn resolve(
     };
 
     if let Some(ref pkg_name) = resolved_package {
+        // A load_all() internal resolves to the synthetic sentinel package,
+        // which is not installed and must never be sent to the R subprocess
+        // (`get_function_formals` already rejects it as an invalid package
+        // name, but short-circuit here so we never build a sentinel cache key
+        // or attempt the query). Fall through to local/fallback resolution.
+        if crate::package_library::is_load_all_sentinel(pkg_name) {
+            return None;
+        }
         let cache_key = format!("{}::{}", pkg_name, function_name);
         if let Some(sig) = cache.get_package(&cache_key) {
             return Some(sig);

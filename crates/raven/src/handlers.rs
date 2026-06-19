@@ -6449,10 +6449,7 @@ fn collect_undefined_variables_from_snapshot(
             // Using package_exists() guards against treating a permanently-missing
             // package as one that will eventually be cached.
             let package_cache_pending = position_aware_packages_buf.iter().any(|pkg| {
-                if snapshot.package_library.is_cached_sync(pkg) {
-                    return false;
-                }
-                package_exists_memoized(pkg, &snapshot.package_library, &mut package_exists_memo)
+                package_is_cache_pending(pkg, &snapshot.package_library, &mut package_exists_memo)
             });
             if (has_prior_library_call
                 || has_cross_file_packages
@@ -12979,6 +12976,28 @@ fn package_exists_memoized(
     v
 }
 
+/// True when a package named in the at-position attached set is "pending": it
+/// exists (installed) but its exports are not yet in cache, so a usage of one of
+/// its exports should be suppressed rather than flagged undefined.
+///
+/// Short-circuits the `load_all()` sentinel: it is a synthetic attached package
+/// that resolves only through the local-dev overlay, is never an installed
+/// package, and must never be fed to `package_exists` (which can reach
+/// installed-package lookups / the R subprocess). It is never "pending".
+fn package_is_cache_pending(
+    pkg: &str,
+    lib: &crate::package_library::PackageLibrary,
+    memo: &mut HashMap<String, bool>,
+) -> bool {
+    if crate::package_library::is_load_all_sentinel(pkg) {
+        return false;
+    }
+    if lib.is_cached_sync(pkg) {
+        return false;
+    }
+    package_exists_memoized(pkg, lib, memo)
+}
+
 /// Context for tracking NSE-related state during AST traversal (issue #398).
 #[derive(Clone, Default)]
 struct UsageContext {
@@ -17898,6 +17917,29 @@ pub fn completion(
 
             // Requirement 9.3: Show all packages that export this symbol
             for package_name in package_names {
+                // A load_all() internal is owned by the synthetic sentinel
+                // package. The raw sentinel name must never appear in the detail
+                // field nor in `data.package` (which `completionItem/resolve`
+                // would feed to the R help system). Show the friendly
+                // dev-package label and omit `package` so resolve does no R
+                // lookup for it.
+                if crate::package_library::is_load_all_sentinel(&package_name) {
+                    let owner_display = crate::package_library::load_all_owner_display(
+                        state
+                            .package_state
+                            .scope_contribution()
+                            .package_name
+                            .as_deref(),
+                    );
+                    items.push(CompletionItem {
+                        label: export_name.clone(),
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        detail: Some(owner_display),
+                        sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
+                        ..Default::default()
+                    });
+                    continue;
+                }
                 // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
                 items.push(CompletionItem {
                     label: export_name.clone(),
@@ -19471,6 +19513,22 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             .package_library
             .find_package_owner_for_symbol(name, &all_packages)
         {
+            // A symbol owned by the load_all() sentinel is a workspace-local
+            // internal with no installed help. The raw sentinel name must never
+            // reach the R help system or the UI — render a friendly dev-package
+            // label and skip the help lookup entirely.
+            if crate::package_library::is_load_all_sentinel(&pkg_name) {
+                let owner_display = crate::package_library::load_all_owner_display(
+                    state
+                        .package_state
+                        .scope_contribution()
+                        .package_name
+                        .as_deref(),
+                );
+                let value = format!("```r\n{}\n```\n\nfrom {}", name, owner_display);
+                return Some(markdown_hover(value, node_range));
+            }
+
             let mut value = String::new();
 
             let help_text =
@@ -20101,12 +20159,19 @@ pub fn prepare_signature_help(
             .package_library
             .find_package_owner_for_symbol(func_name, &all_packages)
         {
-            SignatureResolution::Package {
-                help_cache: state.help_cache.clone(),
-                func_name: func_name.to_string(),
-                package_name: pkg_name,
-                fallback: build_fallback_signature(func_name, &scope, uri, state),
-                r_path,
+            if crate::package_library::is_load_all_sentinel(&pkg_name) {
+                // load_all() internal: no installed help, and the raw sentinel
+                // must never reach the R subprocess. Resolve to a ready fallback
+                // signature attributed to the dev package, skipping the help path.
+                SignatureResolution::Ready(build_load_all_signature(func_name, &scope, uri, state))
+            } else {
+                SignatureResolution::Package {
+                    help_cache: state.help_cache.clone(),
+                    func_name: func_name.to_string(),
+                    package_name: pkg_name,
+                    fallback: build_fallback_signature(func_name, &scope, uri, state),
+                    r_path,
+                }
             }
         } else {
             resolve_user_or_fallback(state, func_name, uri, position, &scope)
@@ -20193,6 +20258,31 @@ fn build_fallback_signature(
         parameters: None,
         active_parameter: None,
     }
+}
+
+/// Build a `SignatureInformation` for a `load_all()` internal. Reuses the local
+/// fallback label (the symbol's own signature when known) but always attributes
+/// it to the friendly dev-package label — never the raw sentinel name, which
+/// must never reach the R subprocess or the UI.
+fn build_load_all_signature(
+    func_name: &str,
+    scope: &scope::ScopeAtPosition,
+    uri: &Url,
+    state: &WorldState,
+) -> SignatureInformation {
+    let mut sig = build_fallback_signature(func_name, scope, uri, state);
+    let owner_display = crate::package_library::load_all_owner_display(
+        state
+            .package_state
+            .scope_contribution()
+            .package_name
+            .as_deref(),
+    );
+    sig.documentation = Some(Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: format!("from {}", owner_display),
+    }));
+    sig
 }
 
 // ============================================================================
@@ -22826,6 +22916,28 @@ mod tests {
             was_collected(&used, "undefined_sym"),
             "the local standard-eval shadow of `filter` must be honored through \
              redundant backticks, so the wrapper is not upgraded and its arg is checked"
+        );
+    }
+
+    /// The pending-cache predicate must short-circuit the load_all() sentinel:
+    /// it is never an installed package and must never be fed to
+    /// `package_exists` (which can reach installed-package lookups / R). A real
+    /// uncached-but-existing package stays "pending"; the sentinel never is.
+    #[test]
+    fn package_exists_loop_skips_sentinel() {
+        use crate::package_library::{LOAD_ALL_SENTINEL, PackageLibrary};
+        use std::collections::HashMap;
+
+        let lib = PackageLibrary::new_empty();
+        let mut memo: HashMap<String, bool> = HashMap::new();
+        assert!(
+            !package_is_cache_pending(LOAD_ALL_SENTINEL, &lib, &mut memo),
+            "the load_all sentinel must never be treated as a pending package"
+        );
+        // It must not have been probed via package_exists either.
+        assert!(
+            !memo.contains_key(LOAD_ALL_SENTINEL),
+            "the sentinel must short-circuit before package_exists_memoized"
         );
     }
 
@@ -65487,5 +65599,164 @@ mod load_all_internal_goto_tests {
             let l = scalar(goto(&state, &caller, Position::new(0, 1)));
             assert_eq!(l.uri, def, "resolves via the DocumentStore (open file)");
         }
+    }
+}
+
+/// Hover / signature / completion must NEVER surface the raw `load_all()`
+/// sentinel name nor send it to the R help system. They map a sentinel owner to
+/// a friendly dev-package label instead.
+#[cfg(test)]
+mod load_all_owner_display_tests {
+    use crate::package_library::LOAD_ALL_SENTINEL;
+    use crate::package_state::{PackageScopeContribution, PackageState};
+    use crate::state::WorldState;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::{Position, Url};
+
+    const ROOT_URL: &str = "file:///work/pkg";
+
+    /// `WorldState` modeling a package whose own internal `helper` is exposed via
+    /// the load_all() overlay, with a known package name for the friendly label.
+    fn state_with_named_pkg(internals: &[&str], pkg_name: &str) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+
+        let mut r_internal = BTreeSet::new();
+        for s in internals {
+            r_internal.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from("/work/pkg")),
+                package_name: Some(pkg_name.to_string()),
+                r_internal_symbols: Arc::new(r_internal.clone()),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        // The overlay is normally refreshed by `apply_package_event`; the goto
+        // fixtures bypass that, so set it directly here (mirrors the chokepoint
+        // unit tests) — hover resolves the internal through it.
+        state.package_library.set_local_dev_overlay(Some(Arc::new(
+            crate::package_library::LocalDevPackage {
+                symbols: r_internal.into_iter().collect(),
+            },
+        )));
+        state
+    }
+
+    async fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
+        let uri = Url::parse(uri_str).expect("invalid URI");
+        // `hover` reads the document text via `state.get_document` (the legacy
+        // `state.documents` map), while cross-file scope reads artifacts via the
+        // content provider (the document store). Populate both.
+        state.document_store.open(uri.clone(), content, 1).await;
+        state.documents.insert(
+            uri.clone(),
+            crate::state::Document::new_with_uri(content, None, &uri),
+        );
+        uri
+    }
+
+    /// A `load_all()` caller hovering an internal must render the friendly
+    /// dev-package label, never the raw sentinel, and not reach the R help path.
+    #[tokio::test]
+    async fn hover_load_all_internal_does_not_leak_sentinel() {
+        let mut state = state_with_named_pkg(&["helper"], "mypkg");
+        // Caller UNDER the package tree (a load_all() exploration script): attaches
+        // the sentinel via load_all(), then uses the internal `helper`. The
+        // out-of-root gate keeps the sentinel only for files under the package root.
+        let caller = open_doc(
+            &mut state,
+            "file:///work/pkg/explore.R",
+            "pkgload::load_all()\nhelper\n",
+        )
+        .await;
+
+        // Sanity: the owner resolves to the sentinel internally.
+        assert_eq!(
+            state
+                .package_library
+                .find_package_owner_for_symbol("helper", &[LOAD_ALL_SENTINEL.to_string()]),
+            Some(LOAD_ALL_SENTINEL.to_string())
+        );
+
+        let hover = super::hover(&state, &caller, Position::new(1, 2))
+            .await
+            .expect("hover should resolve the load_all internal");
+        let value = match hover.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(
+            !value.contains(LOAD_ALL_SENTINEL),
+            "hover must NOT leak the raw sentinel: {value}"
+        );
+        assert!(
+            value.contains("package under development"),
+            "hover must show the friendly dev-package label: {value}"
+        );
+        assert!(
+            value.contains("mypkg"),
+            "hover should name the dev package when known: {value}"
+        );
+        // It must not have been rendered via the R help panel link.
+        assert!(
+            !value.contains("openHelpPanel"),
+            "sentinel hover must not build an R help panel link: {value}"
+        );
+    }
+
+    /// Completion for a load_all() internal must show the friendly dev-package
+    /// label in `detail` and must NOT store the raw sentinel in `data.package`
+    /// (which `completionItem/resolve` would feed to the R help system).
+    #[tokio::test]
+    async fn completion_load_all_internal_detail_shows_friendly_label() {
+        use tower_lsp::lsp_types::CompletionResponse;
+
+        let mut state = state_with_named_pkg(&["helper_fn"], "mypkg");
+        let caller = open_doc(
+            &mut state,
+            "file:///work/pkg/explore.R",
+            "pkgload::load_all()\nhelper_\n",
+        )
+        .await;
+
+        let resp = super::completion(&state, &caller, Position::new(1, 7), None)
+            .expect("completion should produce items");
+        let items = match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .iter()
+            .find(|i| i.label == "helper_fn")
+            .expect("the load_all internal must be offered as a completion");
+
+        let detail = item.detail.as_deref().unwrap_or("");
+        assert!(
+            !detail.contains(LOAD_ALL_SENTINEL),
+            "completion detail must NOT leak the raw sentinel: {detail}"
+        );
+        assert!(
+            detail.contains("package under development"),
+            "completion detail must show the friendly dev-package label: {detail}"
+        );
+        // No `data.package` carrying the sentinel into completionItem/resolve.
+        let leaks_via_data = item
+            .data
+            .as_ref()
+            .and_then(|d| d.get("package"))
+            .and_then(|v| v.as_str())
+            .map(|p| p == LOAD_ALL_SENTINEL)
+            .unwrap_or(false);
+        assert!(
+            !leaks_via_data,
+            "completion must not carry the sentinel in data.package: {:?}",
+            item.data
+        );
     }
 }
