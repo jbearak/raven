@@ -107,7 +107,7 @@ git commit -m "feat(cross-file): add NamespaceReference metadata types"
 
 - [ ] **Step 1: Make `unquote_package` crate-visible**
 
-Change the signature at line 206 from `fn unquote_package` to:
+Change the signature of `fn unquote_package` (currently `namespace_completion.rs:275`) to:
 
 ```rust
 pub(crate) fn unquote_package(raw: &str) -> &str {
@@ -718,7 +718,7 @@ git commit -m "feat(diagnostics): report package-not-installed for namespace ref
 
 - [ ] **Step 1: Add the regression test**
 
-Mirror the existing `check_predicate` helper used by `test_is_structural_non_reference_namespace_operator_both_sides` (search for it; ~line 56691):
+Mirror the existing `check_predicate` helper used by `test_is_structural_non_reference_namespace_operator_both_sides` (`handlers.rs:56703`):
 
 ```rust
     #[test]
@@ -836,14 +836,14 @@ The on-disk loads route through `package_info_from_dir`. Stamp completeness base
 At the static branch (~1268), after constructing `info`:
 
 ```rust
-        info.exports_completeness = if parse_result.has_pattern {
+        info.exports_completeness = if parse_result.has_export_pattern {
             MemberCompleteness::Partial
         } else {
             MemberCompleteness::Complete
         };
 ```
 
-> Verify the field name on `parse_result` that signals an export pattern (the disk parse returns a `has_pattern`-style flag; `get_exports_sync` destructures `(exports, _has_pattern)`). Use the actual field. If a static parse with a pattern reaches this branch, exports are not fully enumerable from disk → `Partial`.
+The field is `NamespaceParseResult.has_export_pattern` (`package_library.rs:314`, confirmed). When a static parse uses `exportPattern()`, exports are not fully enumerable from disk → `Partial`.
 
 - [ ] **Step 2: Stamp the pattern/R branch**
 
