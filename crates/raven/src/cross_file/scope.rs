@@ -1965,6 +1965,47 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
     }
 }
 
+/// True when `text` contains a top-level `devtools::load_all()` /
+/// `pkgload::load_all()` / bare `load_all()` call — used by the workspace-root
+/// `.Rprofile` scan to decide whether the profile attaches the package under
+/// development (modeled via [`crate::package_library::LOAD_ALL_SENTINEL`]).
+///
+/// Mirrors the function-body exclusion that [`extract_attached_packages`] uses
+/// for `library()`/`require()`: a `load_all()` lexically inside a
+/// `function_definition` only runs when that function is invoked, so it does
+/// not attach at profile-load time. The per-call recognition reuses
+/// [`call_is_dev_load_all`]. Returns `false` on unparseable input.
+///
+/// [`extract_attached_packages`]: crate::cross_file::source_detect::extract_attached_packages
+pub(crate) fn text_calls_dev_load_all(text: &str) -> bool {
+    use tree_sitter::Parser;
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return false;
+    };
+    fn walk(node: Node, content: &str, inside_fn: bool) -> bool {
+        // A call lexically inside a function body does not run at load time.
+        if !inside_fn && call_is_dev_load_all(node, content) {
+            return true;
+        }
+        let entering_fn = inside_fn || node.kind() == "function_definition";
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if walk(child, content, entering_fn) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(tree.root_node(), text, false)
+}
+
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
 ///
 /// This is an extended version of `compute_artifacts` that also includes forward directive sources
@@ -6713,10 +6754,7 @@ where
     if current_depth == 0
         && let Some(contrib) = package_contribution
     {
-        let dev_load_all = get_artifacts(uri)
-            .map(|a| a.calls_dev_load_all)
-            .unwrap_or(false);
-        append_package_contribution(&mut scope, uri, contrib, dev_load_all);
+        append_package_contribution(&mut scope, uri, contrib);
         append_rprofile_prelude(&mut scope, uri, contrib);
     }
 
@@ -6799,7 +6837,6 @@ fn visible_preamble_entries<'a, V>(
 fn compute_contribution_symbol_names(
     queried_uri: &Url,
     contribution: Option<&crate::package_state::PackageScopeContribution>,
-    dev_load_all: bool,
 ) -> HashSet<Arc<str>> {
     let mut out: HashSet<Arc<str>> = HashSet::new();
     let Some(contrib) = contribution else {
@@ -6832,13 +6869,14 @@ fn compute_contribution_symbol_names(
     }
 
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
-    // See `append_package_contribution`: `load_all()` exposes internals only to
-    // files inside the package source tree, never to an out-of-root sibling.
-    let under_package_root = path.strip_prefix(root).is_ok();
+    // See `append_package_contribution`: a `load_all()` caller now receives
+    // internals via the `LOAD_ALL_SENTINEL` attached-package route (resolved
+    // position-aware through the package library's local-dev overlay), NOT via
+    // this name set — so there is no bespoke `dev_load_all` branch here.
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs and any in-tree file that calls `devtools::load_all()`
-        // see the package's own internal/exported/sysdata/onload/imported symbols.
-        if is_dev_context || (dev_load_all && under_package_root) {
+        // Dev-context dirs see the package's own
+        // internal/exported/sysdata/onload/imported symbols.
+        if is_dev_context {
             for sym in contrib.r_internal_symbols.iter() {
                 out.insert(Arc::from(sym.as_str()));
             }
@@ -6941,7 +6979,6 @@ pub(crate) fn append_package_contribution(
     scope: &mut ScopeAtPosition,
     uri: &Url,
     contrib: &crate::package_state::PackageScopeContribution,
-    dev_load_all: bool,
 ) {
     let Some(root) = contrib.workspace_root.as_ref() else {
         return;
@@ -6993,18 +7030,19 @@ pub(crate) fn append_package_contribution(
     // <root>/R/, <root>/tests/, or dev-context dirs (demo/, data-raw/,
     // vignettes/, man/).
     let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
-    // `devtools::load_all()` only models attaching THIS package, so it may only
-    // expose internals to files inside the package source tree. A scratch/
-    // sibling file outside the root that happens to call `load_all()` must not
-    // pull in this package's internals (it would mute real diagnostics there).
-    // `under_package_root` is bound once near the top of this function (it also
-    // drives the load_all() sentinel query-file gate).
+    // A file that calls `devtools::load_all()` no longer gets internals through a
+    // bespoke whole-file injection here. Instead it attaches the package under
+    // development via the `LOAD_ALL_SENTINEL` `PackageLoad` event (Task 1), which
+    // resolves its internals through the package library's local-dev overlay
+    // (Task 2) — position-aware, so internals are visible only AFTER the
+    // `load_all()` call, matching R's runtime semantics. `under_package_root` is
+    // still bound near the top of this function to drive the sentinel query-file
+    // gate.
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs and any in-tree file that calls `devtools::load_all()`
-        // (modeled as attaching the package under development) see
+        // Dev-context dirs (demo/, data-raw/, vignettes/, man/) see
         // r_internal_symbols + sysdata + onload + imported_symbols but NOT
         // test_helper_symbols or test_attached_packages.
-        if !(is_dev_context || (dev_load_all && under_package_root)) {
+        if !is_dev_context {
             return;
         }
         for sym in contrib.r_internal_symbols.iter() {
@@ -7711,11 +7749,8 @@ where
         // `queried_uri`. Doing it once at construction keeps
         // `is_visible`/`symbol_for` O(1) hash lookups instead of repeatedly
         // walking the BTreeMap of helper files.
-        let contribution_symbol_names = compute_contribution_symbol_names(
-            queried_uri,
-            package_contribution,
-            artifacts.calls_dev_load_all,
-        );
+        let contribution_symbol_names =
+            compute_contribution_symbol_names(queried_uri, package_contribution);
 
         Some(Self {
             queried_uri,
@@ -8231,12 +8266,7 @@ where
         // visibility check route through `parent_symbol_names` (computed via
         // the recursive path at position (0, 0)).
         if let Some(contrib) = self.package_contribution {
-            append_package_contribution(
-                &mut scope,
-                self.queried_uri,
-                contrib,
-                self.artifacts.calls_dev_load_all,
-            );
+            append_package_contribution(&mut scope, self.queried_uri, contrib);
             append_rprofile_prelude(&mut scope, self.queried_uri, contrib);
         }
 
@@ -27969,6 +27999,62 @@ mod package_contribution_tests {
             "local definition must win over prelude; source_uri: {}",
             sym.source_uri
         );
+    }
+
+    /// A `.Rprofile` whose attached set carries the load_all sentinel (because
+    /// it called `load_all()`) propagates that sentinel into a directly-opened
+    /// in-root script's `inherited_packages`, exactly like a normal attached
+    /// package. The package library's local-dev overlay then resolves the
+    /// package's internals under it.
+    #[test]
+    fn rprofile_load_all_propagates_to_script() {
+        let root = std::path::Path::new("/work/pkg");
+        let uri = Url::parse("file:///work/pkg/scripts/a.R").unwrap();
+        let mut contrib = prelude_contrib(root, true);
+        contrib.rprofile_attached_packages = Arc::new(
+            [crate::package_library::LOAD_ALL_SENTINEL.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let scope = resolve_with_contrib(&uri, "x <- 1\n", &contrib);
+        assert!(
+            scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "an in-root script must inherit the load_all sentinel from .Rprofile; inherited: {:?}",
+            scope.inherited_packages
+        );
+    }
+
+    /// In package mode the `.Rprofile` prelude — including the load_all sentinel
+    /// route — is withheld from `R/` and `tests/` files (the existing
+    /// `rprofile_withheld_in_package_mode` gate). They may still see internals
+    /// via the package-mode contribution; this asserts SPECIFICALLY that the
+    /// `.Rprofile`-sentinel route does not deliver it.
+    #[test]
+    // `R_dir` names the package R/ directory (capital R is R's convention).
+    #[allow(non_snake_case)]
+    fn rprofile_load_all_withheld_in_package_dirs() {
+        let root = std::path::Path::new("/work/pkg");
+        let mut contrib = prelude_contrib(root, true);
+        contrib.rprofile_attached_packages = Arc::new(
+            [crate::package_library::LOAD_ALL_SENTINEL.to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        for rel in ["R/uses_zz.R", "tests/testthat/test-a.R"] {
+            let uri = Url::parse(&format!("file:///work/pkg/{rel}")).unwrap();
+            let scope = resolve_with_contrib(&uri, "x <- 1\n", &contrib);
+            assert!(
+                !scope
+                    .inherited_packages
+                    .contains(crate::package_library::LOAD_ALL_SENTINEL),
+                "{rel}: the .Rprofile load_all sentinel route must be withheld in package mode; \
+                 inherited: {:?}",
+                scope.inherited_packages
+            );
+        }
     }
 
     /// Dataset symbols are NOT visible outside the workspace root.
