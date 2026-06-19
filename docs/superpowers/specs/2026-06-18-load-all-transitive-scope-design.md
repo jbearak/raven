@@ -94,6 +94,16 @@ consumers, §2a Item 1 — so this is "reuse the machinery", not "zero code".)
    `PackageLoad` is emitted **only when the `load_all()` caller is
    `under_package_root`** (the file that establishes package identity). Once
    attached, it flows to children regardless of *their* location.
+
+   > **Implementation deviation (2026-06-18, user decision):** the implementation
+   > uses a cheaper **query-file** gate rather than the caller-origin gate above.
+   > The sentinel is emitted unconditionally; at resolution,
+   > `append_package_contribution` strips it when the **query file** is not
+   > `under_package_root`. This avoids origin tracking (the riskiest code in the
+   > feature). Accepted divergence: an out-of-root *child* sourced by an in-root
+   > parent will not see internals. The reported bug (in-root → in-root child),
+   > the out-of-root scratch-file protection, and the directly-opened out-of-root
+   > `load_all()` file are all still handled correctly.
 3. **`.Rprofile` `load_all()` follows prelude gating** — surfaced by adding the
    sentinel to `rprofile_attached_packages`, subject to the existing
    `rprofile_prelude_applies` withholding (`R/`, `tests/`, built-doc dirs in
@@ -432,9 +442,12 @@ end-to-end, not just a single recompute.
 
 ## Invariants touched
 
-- The sentinel `PackageLoad` must be emitted **only** when the `load_all()` caller
-  is `under_package_root` (sub-decision 2 gate sits on the caller, never the
-  child).
+- The sentinel `PackageLoad` must not expose internals to a file outside the
+  package root. Per the 2026-06-18 implementation deviation (see sub-decision 2),
+  this is enforced by a **query-file** gate: `append_package_contribution` strips
+  the sentinel from the attached-package set when the query file is not
+  `under_package_root`. (The original sub-decision 2 gated on the caller via origin
+  tracking; the query-file gate is the accepted simpler equivalent.)
 - Sentinel symbol resolution lives behind the three `package_library` chokepoints
   (via the local-dev overlay) only. Every *other* consumer that iterates attached
   package **names** and feeds them to installed-package machinery or the R
