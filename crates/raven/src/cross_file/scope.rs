@@ -734,9 +734,10 @@ pub enum ScopeEvent {
     },
 }
 
-/// First detected `devtools::load_all()` / `pkgload::load_all()` call site
+/// A detected `devtools::load_all()` / `pkgload::load_all()` call site
 /// (UTF-16 line, column), recorded by [`collect_definitions`] and consumed by
-/// the artifact emission loops to push a sentinel `PackageLoad` event.
+/// the artifact emission loops to push a sentinel `PackageLoad` event. Every
+/// detected site is recorded (see `ScopeArtifacts::dev_load_all_sites`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevLoadAllSite {
     pub line: u32,
@@ -773,9 +774,13 @@ pub struct ScopeArtifacts {
     /// it sits in the source tree (`internal/`, `tools/`, `debug/`, …). See
     /// [`append_package_contribution`].
     pub calls_dev_load_all: bool,
-    /// First detected devtools/pkgload::load_all() call site (line, column).
-    /// Emitted as a sentinel PackageLoad event in the artifact emission loops.
-    pub dev_load_all_site: Option<DevLoadAllSite>,
+    /// Every detected devtools/pkgload::load_all() call site (line, column), in
+    /// document order. Each is emitted as a sentinel PackageLoad event in the
+    /// artifact emission loops (one per site, each with its own function scope),
+    /// mirroring how `library()` calls are emitted. Recording every site (not
+    /// just the first) matters when an earlier call is function-scoped but a
+    /// later top-level call must still attach for files sourced after it.
+    pub dev_load_all_sites: Vec<DevLoadAllSite>,
 }
 
 impl Default for ScopeArtifacts {
@@ -800,7 +805,7 @@ impl Default for ScopeArtifacts {
             interface_hash: 0,
             function_scope_tree: FunctionScopeTree::default(),
             calls_dev_load_all: false,
-            dev_load_all_site: None,
+            dev_load_all_sites: Vec::new(),
         }
     }
 }
@@ -1876,9 +1881,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 
     // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
     // emitted through the same path as library() so it inherits position +
-    // function-scope treatment (and thus all attached-package propagation).
+    // function-scope treatment (and thus all attached-package propagation). Emit
+    // one event per call site (each with its own function scope) so a later
+    // top-level call still attaches even if an earlier call was function-scoped.
     // The out-of-root gate is applied later, at resolution (root is unknown here).
-    if let Some(site) = artifacts.dev_load_all_site {
+    for site in &artifacts.dev_load_all_sites {
         let function_scope =
             find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
         artifacts.timeline.push(ScopeEvent::PackageLoad {
@@ -2202,9 +2209,11 @@ pub fn compute_artifacts_with_metadata(
 
     // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
     // emitted through the same path as library() so it inherits position +
-    // function-scope treatment (and thus all attached-package propagation).
+    // function-scope treatment (and thus all attached-package propagation). Emit
+    // one event per call site (each with its own function scope) so a later
+    // top-level call still attaches even if an earlier call was function-scoped.
     // The out-of-root gate is applied later, at resolution (root is unknown here).
-    if let Some(site) = artifacts.dev_load_all_site {
+    for site in &artifacts.dev_load_all_sites {
         let function_scope =
             find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
         artifacts.timeline.push(ScopeEvent::PackageLoad {
@@ -2791,22 +2800,16 @@ fn collect_definitions(
     }
 
     // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
-    // (see the field doc on `ScopeArtifacts::calls_dev_load_all`). Folded into
-    // this traversal rather than run as a separate full-tree walk; the
-    // `!already-set` guard makes every node after the first hit a no-op.
-    if !artifacts.calls_dev_load_all
-        && call_callee == Some("load_all")
-        && call_is_dev_load_all(node, line_index.text)
-    {
+    // (see the field doc on `ScopeArtifacts::calls_dev_load_all`). Record EVERY
+    // call site (not just the first) so the emission loops can push one sentinel
+    // PackageLoad event per site, each with its own function scope — matching
+    // how `library()` calls are emitted (see `dev_load_all_sites`).
+    if call_callee == Some("load_all") && call_is_dev_load_all(node, line_index.text) {
         artifacts.calls_dev_load_all = true;
-        // Record the FIRST call site so the emission loops can push a sentinel
-        // PackageLoad event (see the field doc on `dev_load_all_site`). The
-        // `!calls_dev_load_all` guard above already restricts this to the first
-        // hit; record the position the same way other call recognizers do.
-        if artifacts.dev_load_all_site.is_none() {
-            let (line, column) = node_start_position_utf16(node, line_index);
-            artifacts.dev_load_all_site = Some(DevLoadAllSite { line, column });
-        }
+        let (line, column) = node_start_position_utf16(node, line_index);
+        artifacts
+            .dev_load_all_sites
+            .push(DevLoadAllSite { line, column });
     }
 
     // Check for delayedAssign("name", expr) calls. The promise binds `name` in
@@ -18519,6 +18522,77 @@ x <- 1"#;
                 .contains(crate::package_library::LOAD_ALL_SENTINEL),
             "child sourced outside the function-scoped load_all() must NOT inherit the sentinel; inherited: {:?}",
             scope_outside.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_top_level_after_function_scoped_propagates() {
+        // The FIRST load_all() call is function-scoped (inside `f`), but a LATER
+        // top-level load_all() precedes the source("child.R"). The top-level
+        // attachment must reach the child. With the old Option-first behavior
+        // only the function-scoped site was recorded and this FAILED.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let parent_code = "f <- function() load_all()\nload_all()\nsource(\"child.R\")\n";
+        let child_code = "x <- 1\n";
+
+        let parent_arts = compute_artifacts(&parent_uri, &parse_r(parent_code), parent_code);
+        let child_arts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_arts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &parent_uri {
+                Some(std::sync::Arc::new(parent_meta.clone()))
+            } else {
+                None
+            }
+        };
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child must inherit the TOP-LEVEL load_all() that precedes the source(), even though an earlier load_all() was function-scoped; inherited: {:?}",
+            scope.inherited_packages,
         );
     }
 
