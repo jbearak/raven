@@ -7293,7 +7293,7 @@ pub(crate) fn append_package_contribution(
 ///
 /// The empty-sets early-return in [`append_rprofile_prelude`] is kept separate
 /// (it short-circuits before URI→path conversion and belongs to that fn only).
-fn rprofile_prelude_applies(
+pub(crate) fn rprofile_prelude_applies(
     path: &std::path::Path,
     contrib: &crate::package_state::PackageScopeContribution,
 ) -> bool {
