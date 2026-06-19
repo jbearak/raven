@@ -733,6 +733,15 @@ pub enum ScopeEvent {
     },
 }
 
+/// First detected `devtools::load_all()` / `pkgload::load_all()` call site
+/// (UTF-16 line, column), recorded by [`collect_definitions`] and consumed by
+/// the artifact emission loops to push a sentinel `PackageLoad` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevLoadAllSite {
+    pub line: u32,
+    pub column: u32,
+}
+
 /// Per-file scope artifacts
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
@@ -763,6 +772,9 @@ pub struct ScopeArtifacts {
     /// it sits in the source tree (`internal/`, `tools/`, `debug/`, …). See
     /// [`append_package_contribution`].
     pub calls_dev_load_all: bool,
+    /// First detected devtools/pkgload::load_all() call site (line, column).
+    /// Emitted as a sentinel PackageLoad event in the artifact emission loops.
+    pub dev_load_all_site: Option<DevLoadAllSite>,
 }
 
 impl Default for ScopeArtifacts {
@@ -787,6 +799,7 @@ impl Default for ScopeArtifacts {
             interface_hash: 0,
             function_scope_tree: FunctionScopeTree::default(),
             calls_dev_load_all: false,
+            dev_load_all_site: None,
         }
     }
 }
@@ -1860,6 +1873,21 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         });
     }
 
+    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
+    // emitted through the same path as library() so it inherits position +
+    // function-scope treatment (and thus all attached-package propagation).
+    // The out-of-root gate is applied later, at resolution (root is unknown here).
+    if let Some(site) = artifacts.dev_load_all_site {
+        let function_scope =
+            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
+        artifacts.timeline.push(ScopeEvent::PackageLoad {
+            line: site.line,
+            column: site.column,
+            package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
+            function_scope,
+        });
+    }
+
     // Re-sort timeline to include PackageLoad events in effect-position order.
     artifacts.timeline.sort_by_key(event_effect_position);
 
@@ -2118,6 +2146,21 @@ pub fn compute_artifacts_with_metadata(
             line: lib_call.line,
             column: lib_call.column,
             package: lib_call.package,
+            function_scope,
+        });
+    }
+
+    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package,
+    // emitted through the same path as library() so it inherits position +
+    // function-scope treatment (and thus all attached-package propagation).
+    // The out-of-root gate is applied later, at resolution (root is unknown here).
+    if let Some(site) = artifacts.dev_load_all_site {
+        let function_scope =
+            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
+        artifacts.timeline.push(ScopeEvent::PackageLoad {
+            line: site.line,
+            column: site.column,
+            package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
             function_scope,
         });
     }
@@ -2706,6 +2749,14 @@ fn collect_definitions(
         && call_is_dev_load_all(node, line_index.text)
     {
         artifacts.calls_dev_load_all = true;
+        // Record the FIRST call site so the emission loops can push a sentinel
+        // PackageLoad event (see the field doc on `dev_load_all_site`). The
+        // `!calls_dev_load_all` guard above already restricts this to the first
+        // hit; record the position the same way other call recognizers do.
+        if artifacts.dev_load_all_site.is_none() {
+            let (line, column) = node_start_position_utf16(node, line_index);
+            artifacts.dev_load_all_site = Some(DevLoadAllSite { line, column });
+        }
     }
 
     // Check for delayedAssign("name", expr) calls. The promise binds `name` in
@@ -6899,6 +6950,19 @@ pub(crate) fn append_package_contribution(
         return;
     };
 
+    // Cheap query-file gate for the load_all() sentinel: a file outside the package
+    // root must not attach this package's internals via load_all(). (Deliberately
+    // simpler than gating on the original caller; see the load_all design spec.)
+    let under_package_root = path.strip_prefix(root).is_ok();
+    if !under_package_root {
+        scope
+            .loaded_packages
+            .remove(crate::package_library::LOAD_ALL_SENTINEL);
+        scope
+            .inherited_packages
+            .remove(crate::package_library::LOAD_ALL_SENTINEL);
+    }
+
     // Use a synthetic URI scheme for package-internal symbols so consumers
     // can distinguish them from real file-backed definitions.
     let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
@@ -6933,7 +6997,8 @@ pub(crate) fn append_package_contribution(
     // expose internals to files inside the package source tree. A scratch/
     // sibling file outside the root that happens to call `load_all()` must not
     // pull in this package's internals (it would mute real diagnostics there).
-    let under_package_root = path.strip_prefix(root).is_ok();
+    // `under_package_root` is bound once near the top of this function (it also
+    // drives the load_all() sentinel query-file gate).
     let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
         // Dev-context dirs and any in-tree file that calls `devtools::load_all()`
         // (modeled as attaching the package under development) see
@@ -17944,6 +18009,661 @@ x <- 1"#;
         assert!(
             scope.inherited_packages.contains("dplyr"),
             "Child should inherit dplyr when a nested local source() call runs inside an outer function that loaded it"
+        );
+    }
+
+    // ============================================================================
+    // load_all() sentinel virtual-package propagation (Task 1)
+    //
+    // A `devtools::load_all()` / `pkgload::load_all()` call is modeled as
+    // attaching a synthetic virtual package whose NAME is
+    // `crate::package_library::LOAD_ALL_SENTINEL`. These tests assert the
+    // sentinel NAME's presence/absence in the resolved scope's package set
+    // (`inherited_packages` / `loaded_packages`) — NOT that any concrete symbol
+    // resolves (the overlay isn't wired into resolution until a later task).
+    // ============================================================================
+
+    /// Helper: parent registered as the source-parent of `child`. Query the
+    /// child directly at the given position and return its scope. Mirrors the
+    /// `library()` cross-file propagation tests' setup exactly.
+    fn resolve_child_with_source_parent(
+        parent_uri: &Url,
+        parent_code: &str,
+        source_line: u32,
+        child_uri: &Url,
+        child_code: &str,
+        query_line: u32,
+        query_col: u32,
+    ) -> ScopeAtPosition {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(parent_uri, &parent_tree, parent_code);
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(child_uri, &child_tree, child_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let child_path = child_uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "child.R".to_string());
+
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: child_path,
+                line: source_line,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let parent_uri = parent_uri.clone();
+        let child_uri_owned = child_uri.clone();
+        let get_artifacts = move |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri_owned {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+        let parent_uri2 = Url::parse("file:///project/parent.R").unwrap();
+        let get_metadata = move |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &parent_uri2 {
+                Some(std::sync::Arc::new(parent_meta.clone()))
+            } else {
+                None
+            }
+        };
+
+        scope_at_position_with_graph(
+            child_uri,
+            query_line,
+            query_col,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn load_all_sentinel_propagates_to_directly_opened_child() {
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let scope = resolve_child_with_source_parent(
+            &parent_uri,
+            "pkgload::load_all()\nsource(\"child.R\")\n",
+            1,
+            &child_uri,
+            "x <- 1\n",
+            0,
+            0,
+        );
+        assert!(
+            scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child should inherit the load_all() sentinel from its source-parent; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_is_position_aware() {
+        // load_all() comes AFTER the source() call, so the child must not see it.
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let scope = resolve_child_with_source_parent(
+            &parent_uri,
+            "source(\"child.R\")\nload_all()\n",
+            0,
+            &child_uri,
+            "x <- 1\n",
+            0,
+            0,
+        );
+        assert!(
+            !scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child must NOT inherit a load_all() that runs after the source() call; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_propagates_transitively() {
+        // a.R: load_all() then source(b.R); b.R: source(c.R). Resolve c.R.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let b_uri = Url::parse("file:///project/b.R").unwrap();
+        let c_uri = Url::parse("file:///project/c.R").unwrap();
+
+        let a_code = "load_all()\nsource(\"b.R\")\n";
+        let b_code = "source(\"c.R\")\n";
+        let c_code = "x <- 1\n";
+
+        let a_arts = compute_artifacts(&a_uri, &parse_r(a_code), a_code);
+        let b_arts = compute_artifacts(&b_uri, &parse_r(b_code), b_code);
+        let c_arts = compute_artifacts(&c_uri, &parse_r(c_code), c_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let a_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "b.R".to_string(),
+                line: 1,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let b_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "c.R".to_string(),
+                line: 0,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&a_uri, &a_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&b_uri, &b_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &a_uri {
+                Some(Arc::new(a_arts.clone()))
+            } else if uri == &b_uri {
+                Some(Arc::new(b_arts.clone()))
+            } else if uri == &c_uri {
+                Some(Arc::new(c_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &a_uri {
+                Some(std::sync::Arc::new(a_meta.clone()))
+            } else if uri == &b_uri {
+                Some(std::sync::Arc::new(b_meta.clone()))
+            } else {
+                None
+            }
+        };
+
+        let scope = scope_at_position_with_graph(
+            &c_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "load_all() sentinel must propagate transitively a -> b -> c; inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_forward_child_to_parent_hoist() {
+        // main.R sources loader.R (which calls load_all()); querying main.R AFTER
+        // the source() line must hoist the sentinel into main's loaded_packages.
+        // Mirrors `test_package_propagation_child_packages_in_parent`.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let main_uri = Url::parse("file:///project/main.R").unwrap();
+        let loader_uri = Url::parse("file:///project/loader.R").unwrap();
+
+        let main_code = "source(\"loader.R\")\ny <- 1\n";
+        let loader_code = "load_all()\n";
+
+        let main_arts = compute_artifacts(&main_uri, &parse_r(main_code), main_code);
+        let loader_arts = compute_artifacts(&loader_uri, &parse_r(loader_code), loader_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let main_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "loader.R".to_string(),
+                line: 0,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &main_uri {
+                Some(Arc::new(main_arts.clone()))
+            } else if uri == &loader_uri {
+                Some(Arc::new(loader_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &main_uri {
+                Some(std::sync::Arc::new(main_meta.clone()))
+            } else {
+                None
+            }
+        };
+
+        // Query main.R AFTER the source() line (line 1).
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            scope
+                .loaded_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "main.R should have the load_all() sentinel hoisted from the sourced loader.R; loaded: {:?}",
+            scope.loaded_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_function_scoped() {
+        // load_all() inside a function: a child sourced WITHIN that function sees
+        // the sentinel; a child sourced OUTSIDE does not. Mirrors
+        // `test_cross_file_package_propagation_function_scoped_not_propagated`
+        // and `..._nested_local_source_inherits_outer_package`.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        // inside.R is sourced (local) within the function that called load_all().
+        let parent_inside_uri = Url::parse("file:///project/parent_inside.R").unwrap();
+        let inside_child_uri = Url::parse("file:///project/inside.R").unwrap();
+        let parent_inside_code =
+            "f <- function() {\n  load_all()\n  source(\"inside.R\", local = TRUE)\n}\n";
+        let inside_child_code = "x <- 1\n";
+
+        let parent_inside_arts = compute_artifacts(
+            &parent_inside_uri,
+            &parse_r(parent_inside_code),
+            parent_inside_code,
+        );
+        let inside_child_arts = compute_artifacts(
+            &inside_child_uri,
+            &parse_r(inside_child_code),
+            inside_child_code,
+        );
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_inside_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "inside.R".to_string(),
+                line: 2,
+                column: 2,
+                local: true,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &parent_inside_uri,
+            &parent_inside_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_inside_uri {
+                Some(Arc::new(parent_inside_arts.clone()))
+            } else if uri == &inside_child_uri {
+                Some(Arc::new(inside_child_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &parent_inside_uri {
+                Some(std::sync::Arc::new(parent_inside_meta.clone()))
+            } else {
+                None
+            }
+        };
+        let scope_inside = scope_at_position_with_graph(
+            &inside_child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            scope_inside
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child sourced inside the function that called load_all() should inherit the sentinel; inherited: {:?}",
+            scope_inside.inherited_packages,
+        );
+
+        // outside.R is sourced OUTSIDE the function; must NOT inherit the sentinel.
+        let parent_outside_uri = Url::parse("file:///project/parent_outside.R").unwrap();
+        let outside_child_uri = Url::parse("file:///project/outside.R").unwrap();
+        let parent_outside_code = "f <- function() {\n  load_all()\n}\nsource(\"outside.R\")\n";
+        let outside_child_code = "x <- 1\n";
+
+        let parent_outside_arts = compute_artifacts(
+            &parent_outside_uri,
+            &parse_r(parent_outside_code),
+            parent_outside_code,
+        );
+        let outside_child_arts = compute_artifacts(
+            &outside_child_uri,
+            &parse_r(outside_child_code),
+            outside_child_code,
+        );
+        let parent_outside_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "outside.R".to_string(),
+                line: 3,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph2 = DependencyGraph::new();
+        graph2.update_file(
+            &parent_outside_uri,
+            &parent_outside_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+        let get_artifacts2 = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_outside_uri {
+                Some(Arc::new(parent_outside_arts.clone()))
+            } else if uri == &outside_child_uri {
+                Some(Arc::new(outside_child_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata2 = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &parent_outside_uri {
+                Some(std::sync::Arc::new(parent_outside_meta.clone()))
+            } else {
+                None
+            }
+        };
+        let scope_outside = scope_at_position_with_graph(
+            &outside_child_uri,
+            0,
+            0,
+            &get_artifacts2,
+            &get_metadata2,
+            &graph2,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            !scope_outside
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child sourced outside the function-scoped load_all() must NOT inherit the sentinel; inherited: {:?}",
+            scope_outside.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_multi_parent_union() {
+        // child.R is sourced by pA.R (load_all() before its source) and pB.R
+        // (no load_all). The child's inherited set is the union, so the sentinel
+        // is present (over-approximation).
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let pa_uri = Url::parse("file:///project/pA.R").unwrap();
+        let pb_uri = Url::parse("file:///project/pB.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+
+        let pa_code = "load_all()\nsource(\"child.R\")\n";
+        let pb_code = "source(\"child.R\")\n";
+        let child_code = "x <- 1\n";
+
+        let pa_arts = compute_artifacts(&pa_uri, &parse_r(pa_code), pa_code);
+        let pb_arts = compute_artifacts(&pb_uri, &parse_r(pb_code), pb_code);
+        let child_arts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let pa_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pb_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&pa_uri, &pa_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&pb_uri, &pb_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &pa_uri {
+                Some(Arc::new(pa_arts.clone()))
+            } else if uri == &pb_uri {
+                Some(Arc::new(pb_arts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_arts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &pa_uri {
+                Some(std::sync::Arc::new(pa_meta.clone()))
+            } else if uri == &pb_uri {
+                Some(std::sync::Arc::new(pb_meta.clone()))
+            } else {
+                None
+            }
+        };
+
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            scope
+                .inherited_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "child sourced by multiple parents (one of which load_all()s) should inherit the sentinel (union); inherited: {:?}",
+            scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_out_of_root_query_file_gated() {
+        // Query file is OUTSIDE the package root and itself calls load_all().
+        // The cheap query-file gate in `append_package_contribution` strips the
+        // sentinel from the resolved package set.
+        let contrib = crate::package_state::PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from("/pkg")),
+            ..Default::default()
+        };
+        let query_uri = Url::parse("file:///other/scratch.R").unwrap();
+        let code = "load_all()\nx <- 1\n";
+        let arts = Arc::new(compute_artifacts(&query_uri, &parse_r(code), code));
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &query_uri {
+                Some(arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///pkg").unwrap();
+        let scope = scope_at_position_with_graph(
+            &query_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+            None,
+        );
+        assert!(
+            !scope
+                .loaded_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL)
+                && !scope
+                    .inherited_packages
+                    .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "out-of-root query file must have the load_all() sentinel stripped; loaded: {:?}, inherited: {:?}",
+            scope.loaded_packages,
+            scope.inherited_packages,
+        );
+    }
+
+    #[test]
+    fn load_all_sentinel_in_root_query_file_kept() {
+        // Query file is IN-root (under /pkg) and calls load_all(); the gate keeps
+        // the sentinel.
+        let contrib = crate::package_state::PackageScopeContribution {
+            workspace_root: Some(std::path::PathBuf::from("/pkg")),
+            ..Default::default()
+        };
+        let query_uri = Url::parse("file:///pkg/R/foo.R").unwrap();
+        let code = "load_all()\nx <- 1\n";
+        let arts = Arc::new(compute_artifacts(&query_uri, &parse_r(code), code));
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &query_uri {
+                Some(arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let workspace_root = Url::parse("file:///pkg").unwrap();
+        let scope = scope_at_position_with_graph(
+            &query_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+            None,
+        );
+        assert!(
+            scope
+                .loaded_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL),
+            "in-root query file calling load_all() must keep the sentinel; loaded: {:?}",
+            scope.loaded_packages,
         );
     }
 
