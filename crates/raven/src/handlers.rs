@@ -20617,10 +20617,23 @@ pub fn goto_definition_with_cancel(
         .as_ref()
     {
         let contrib = state.package_state.scope_contribution();
+        // Mirror the local-dev overlay's FOUR sets exactly
+        // (`refresh_local_dev_overlay` in state.rs:
+        // r_internal_symbols ∪ sysdata_symbols ∪ onload_symbols ∪
+        // imported_symbols.keys()). A sentinel-owned sysdata or imported name must
+        // route through the precise `resolve_package_internal_goto` (rm-aware
+        // `top_level_interface`, `is_r_source_path`-restricted) so it cleanly
+        // no-ops — otherwise it would fall through to the scope-blind general
+        // `exported_interface` fallback below and land on a PHANTOM target (a
+        // function-local / rm'd binding of the same spelling).
         let is_contributed_internal = contrib.r_internal_symbols.contains(name)
             || contrib.r_internal_symbols.contains(scope_key)
             || contrib.onload_symbols.contains(name)
-            || contrib.onload_symbols.contains(scope_key);
+            || contrib.onload_symbols.contains(scope_key)
+            || contrib.sysdata_symbols.contains(name)
+            || contrib.sysdata_symbols.contains(scope_key)
+            || contrib.imported_symbols.contains_key(name)
+            || contrib.imported_symbols.contains_key(scope_key);
         // The redirect models the load_all() overlay path, so it must only fire
         // when the load_all sentinel is actually attached in the computed scope:
         // a `load_all()` is reachable from here AND the query file was not
@@ -65307,6 +65320,32 @@ mod load_all_internal_goto_tests {
         state
     }
 
+    /// Like `state_with_internals`, but declares `names` as the package's own
+    /// `sysdata` internals (and NOTHING in `r_internal_symbols`). A sysdata name
+    /// has no navigable R/ top-level def, so the precise resolver must no-op on it;
+    /// before the overlay-mirroring predicate fix it failed the
+    /// `is_contributed_internal` check (which only saw r_internal/onload) and fell
+    /// through to the scope-blind general fallback.
+    fn state_with_sysdata(names: &[&str]) -> WorldState {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse(ROOT_URL).unwrap()];
+        state.workspace_scan_complete = true;
+
+        let mut sysdata = BTreeSet::new();
+        for s in names {
+            sysdata.insert((*s).to_string());
+        }
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(std::path::PathBuf::from(ROOT_PATH)),
+                sysdata_symbols: Arc::new(sysdata),
+                ..PackageScopeContribution::default()
+            },
+            ..Default::default()
+        });
+        state
+    }
+
     /// Insert `content` as an OPEN document (DocumentStore) — open docs are
     /// authoritative for artifacts.
     fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
@@ -65605,6 +65644,41 @@ mod load_all_internal_goto_tests {
         assert!(
             goto(&state, &caller, Position::new(1, 2)).is_none(),
             "an internal with no R/ source is a no-op"
+        );
+    }
+
+    /// PHANTOM AVOIDANCE: a sysdata-owned name `S` that ALSO has a same-spelling
+    /// binding the scope-blind `exported_interface` fallback WOULD wrongly resolve
+    /// (here: a top-level def that is `rm()`'d, so it lives in `exported_interface`
+    /// but NOT in the rm-aware `top_level_interface`). With the sentinel attached
+    /// and the overlay-mirroring predicate fix, `S` is recognized as
+    /// contributed-internal and routes through `resolve_package_internal_goto`,
+    /// which uses `top_level_interface` → None. WITHOUT the fix, the predicate
+    /// (r_internal/onload only) misses `S`, it falls through to the general
+    /// `exported_interface` fallback, and jumps to the phantom rm'd def.
+    #[test]
+    fn goto_load_all_sysdata_does_not_resolve_phantom_via_fallback() {
+        let mut state = state_with_sysdata(&["secret_blob"]);
+        // An R/ file with a top-level `secret_blob` def that is immediately rm()'d:
+        // rm-blind `exported_interface` still carries it (the phantom target),
+        // rm-aware `top_level_interface` does not.
+        index_closed_file(
+            &mut state,
+            "file:///work/pkg/R/removed.R",
+            "secret_blob <- function() 1\nrm(secret_blob)\n",
+        );
+
+        // In-root load_all() dev script (sentinel attached); reference on line 1.
+        let caller = add_legacy_doc(
+            &mut state,
+            "file:///work/pkg/dev.R",
+            "load_all()\nsecret_blob\n",
+        );
+        assert!(
+            goto(&state, &caller, Position::new(1, 2)).is_none(),
+            "a sysdata internal must route through the precise resolver (no live \
+             top-level def → None), not the scope-blind fallback that resurrects \
+             the rm'd phantom"
         );
     }
 
