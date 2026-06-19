@@ -13,9 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::namespace_parser::{
-    parse_data_symbols, parse_description_depends, parse_index_exports, parse_namespace_exports,
-};
+use crate::namespace_parser::{parse_data_symbols, parse_description_depends, parse_index_exports};
 use crate::package_db::PackageMetadataProvider;
 use crate::r_subprocess::RSubprocess;
 
@@ -235,6 +233,14 @@ async fn package_info_from_dir(
 ) -> PackageInfo {
     let lazy_data = parse_data_symbols(pkg_dir).await;
     PackageInfo::with_details(name, exports, depends, lazy_data)
+}
+
+/// Collect borrowed symbol names into a sorted, de-duplicated owned `Vec`.
+fn sorted_unique_symbols<'a>(symbols: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut names: Vec<String> = symbols.cloned().collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Fold R's `data(package=)` enumeration into a freshly-built `PackageInfo`.
@@ -727,6 +733,77 @@ impl PackageLibrary {
         }
 
         result
+    }
+
+    /// Synchronously fetch a single package's exported symbol names for `pkg::`
+    /// completion, without ever touching the R subprocess.
+    ///
+    /// Returns the first **non-empty** export set across these tiers, else
+    /// `None`. Each tier is consulted only as a fallback when the prior one
+    /// yields nothing, so a stale or partial source never shadows a better one:
+    /// 1. **Cache** — an already-loaded `PackageInfo` (its `exports` plus
+    ///    `lazy_data` datasets, both of which `pkg::name` resolves). An *empty*
+    ///    cached entry is NOT trusted: `get_package`/`prefetch_packages` cache an
+    ///    empty-export placeholder when a package's namespace fails to load,
+    ///    which is exactly why [`package_exists`] ignores the cache. So an empty
+    ///    entry falls through to disk rather than suppressing completions.
+    /// 2. **Installed on disk** — when the package is in `lib_paths`, its
+    ///    `NAMESPACE` is parsed directly for `export()` entries (no DESCRIPTION
+    ///    read; `Depends` is irrelevant here). Datasets (under `data/`) and
+    ///    `exportPattern()`-only packages (~6%) yield nothing statically and
+    ///    fall through; both gaps close once the async `get_package` path has
+    ///    run (e.g. via `prefetch_packages` on `did_open`) and Tier 1 hits.
+    /// 3. **Metadata providers** — the repo / shipped package DB.
+    ///
+    /// For the caller, an empty result and `None` are equivalent (both suppress
+    /// the popup), so this returns `None` rather than `Some(vec![])` when no
+    /// tier yields exports. Names are sorted and de-duplicated.
+    ///
+    /// Blocking file reads on the request thread are acceptable here for the
+    /// same reason file-path completion reads directories synchronously:
+    /// NAMESPACE files are small and the completion handler runs off the main
+    /// loop. Unlike `get_package`, this does not populate the cache — a package
+    /// referenced only through `::` (never attached) is re-parsed each request;
+    /// the reads are cheap and the alternative (a sync write path) is not worth
+    /// the added locking.
+    pub fn get_exports_sync(&self, name: &str) -> Option<Vec<String>> {
+        // The load_all() sentinel is a synthetic package name, never a real
+        // installed package; its internals are served through the overlay path,
+        // never as `sentinel::name` completions.
+        if is_load_all_sentinel(name) {
+            return None;
+        }
+
+        // Tier 1: already-loaded cache snapshot (lock-free read). Trust only a
+        // non-empty entry; an empty one may be a failed-load placeholder.
+        if let Some(info) = self.packages.load().get(name) {
+            let syms = sorted_unique_symbols(info.exports.iter().chain(info.lazy_data.iter()));
+            if !syms.is_empty() {
+                return Some(syms);
+            }
+        }
+
+        // Tier 2: installed on disk — parse NAMESPACE for its explicit exports
+        // (no DESCRIPTION read; `Depends` is irrelevant here).
+        if let Some(pkg_dir) = self.find_package_directory(name) {
+            let (exports, _has_pattern) = crate::namespace_parser::parse_namespace_explicit_exports(
+                &pkg_dir.join("NAMESPACE"),
+            );
+            let syms = sorted_unique_symbols(exports.iter());
+            if !syms.is_empty() {
+                return Some(syms);
+            }
+        }
+
+        // Tier 3: repo / shipped package DB.
+        if let Some(info) = self.resolve_from_providers(name) {
+            let syms = sorted_unique_symbols(info.exports.iter().chain(info.lazy_data.iter()));
+            if !syms.is_empty() {
+                return Some(syms);
+            }
+        }
+
+        None
     }
 
     /// Check if a symbol is exported by any of the given packages (synchronous, cached-only)
@@ -1454,37 +1531,14 @@ impl PackageLibrary {
     /// - `Some(NamespaceParseResult)` with exports, pattern flag, and dependencies
     /// - `None` if the package directory doesn't exist
     pub fn parse_package_static(&self, pkg_dir: &Path) -> Option<NamespaceParseResult> {
-        let namespace_path = pkg_dir.join("NAMESPACE");
-
-        // Parse NAMESPACE file if it exists
-        let (explicit_exports, has_export_pattern) = if namespace_path.exists() {
-            match parse_namespace_exports(&namespace_path) {
-                Ok(raw_exports) => {
-                    let has_pattern = raw_exports.iter().any(|e| e.starts_with("__PATTERN__:"));
-                    let explicit: Vec<String> = raw_exports
-                        .into_iter()
-                        .filter(|e| !e.starts_with("__PATTERN__:"))
-                        .collect();
-                    (explicit, has_pattern)
-                }
-                Err(e) => {
-                    log::trace!("Failed to parse NAMESPACE at {:?}: {}", namespace_path, e);
-                    // NAMESPACE exists but failed to parse - treat as having pattern
-                    (Vec::new(), true)
-                }
-            }
-        } else {
-            // No NAMESPACE file (e.g., `base` package) - needs INDEX fallback
-            log::trace!(
-                "No NAMESPACE file at {:?}, treating as pattern package",
-                namespace_path
-            );
-            (Vec::new(), true)
-        };
+        // Explicit exports + pattern flag from NAMESPACE (a missing NAMESPACE,
+        // e.g. `base`, yields no explicit exports and the pattern flag → INDEX
+        // fallback). Shared with the sync `pkg::` completion path.
+        let (explicit_exports, has_export_pattern) =
+            crate::namespace_parser::parse_namespace_explicit_exports(&pkg_dir.join("NAMESPACE"));
 
         // Parse DESCRIPTION for Depends
-        let description_path = pkg_dir.join("DESCRIPTION");
-        let depends = parse_description_depends(&description_path).unwrap_or_default();
+        let depends = parse_description_depends(&pkg_dir.join("DESCRIPTION")).unwrap_or_default();
 
         Some(NamespaceParseResult {
             explicit_exports,
@@ -6358,5 +6412,111 @@ mod tests {
         assert!(
             !lib.is_symbol_from_loaded_packages("not_a_symbol", &[LOAD_ALL_SENTINEL.to_string()])
         );
+    }
+
+    // ========================================================================
+    // get_exports_sync: on-demand synchronous export fetch for `pkg::`
+    // completions (cache -> on-disk NAMESPACE -> providers).
+    // ========================================================================
+
+    #[tokio::test]
+    async fn get_exports_sync_returns_cached_exports_and_data_sorted() {
+        let lib = PackageLibrary::new_empty();
+        let info = PackageInfo::with_details(
+            "dplyr".to_string(),
+            HashSet::from(["mutate".to_string(), "filter".to_string()]),
+            Vec::new(),
+            vec!["starwars".to_string()],
+        );
+        lib.insert_package(info).await;
+
+        let exports = lib
+            .get_exports_sync("dplyr")
+            .expect("cached package resolves");
+        // Functions and datasets are folded together, sorted, deduped.
+        assert_eq!(exports, vec!["filter", "mutate", "starwars"]);
+    }
+
+    #[test]
+    fn get_exports_sync_unknown_package_returns_none() {
+        let lib = PackageLibrary::new_empty();
+        assert_eq!(lib.get_exports_sync("nopkg"), None);
+    }
+
+    #[test]
+    fn get_exports_sync_skips_load_all_sentinel() {
+        let lib = PackageLibrary::new_empty();
+        assert_eq!(lib.get_exports_sync(LOAD_ALL_SENTINEL), None);
+    }
+
+    #[test]
+    fn get_exports_sync_parses_namespace_from_disk() {
+        let lib_root = tempfile::tempdir().unwrap();
+        let pkg_dir = lib_root.path().join("mypkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: mypkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), "export(foo)\nexport(bar)\n").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+
+        // Never library()-loaded, never prefetched, not cached — still resolves
+        // by parsing the installed NAMESPACE synchronously.
+        let exports = lib
+            .get_exports_sync("mypkg")
+            .expect("installed package resolves from disk");
+        assert_eq!(exports, vec!["bar", "foo"]);
+    }
+
+    #[test]
+    fn get_exports_sync_resolves_from_providers_when_not_on_disk() {
+        use crate::package_db::PackageMetadataProvider;
+
+        struct Fake;
+        impl PackageMetadataProvider for Fake {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "repopkg").then(|| {
+                    PackageInfo::with_details(
+                        "repopkg".to_string(),
+                        HashSet::from(["alpha".to_string(), "beta".to_string()]),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                })
+            }
+        }
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_providers(vec![Box::new(Fake)]);
+
+        let exports = lib
+            .get_exports_sync("repopkg")
+            .expect("provider-known package resolves");
+        assert_eq!(exports, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn get_exports_sync_empty_cache_entry_falls_through_to_disk() {
+        // A failed-load placeholder (empty exports) was cached for an installed
+        // package — `get_package`/`prefetch` do this when a namespace fails to
+        // load. The empty entry must NOT shadow the real on-disk NAMESPACE.
+        let lib_root = tempfile::tempdir().unwrap();
+        let pkg_dir = lib_root.path().join("fallpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), "export(real_fn)\n").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.insert_package(PackageInfo::new("fallpkg".to_string(), HashSet::new()))
+            .await;
+
+        let exports = lib
+            .get_exports_sync("fallpkg")
+            .expect("empty cache entry falls through to the on-disk NAMESPACE");
+        assert_eq!(exports, vec!["real_fn"]);
     }
 }

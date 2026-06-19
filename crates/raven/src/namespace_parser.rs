@@ -51,6 +51,33 @@ pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
     Ok(parse_namespace_content(&content))
 }
 
+/// Split a package's NAMESPACE into its explicit exports and whether it uses any
+/// pattern export (`exportPattern` / `exportClassPattern`).
+///
+/// "Explicit" exports are the `export()` / `S3method()` / `exportClasses()` /
+/// `exportMethods()` names, with the internal `__PATTERN__:` markers removed.
+/// The bool is `true` when any pattern marker was present (those need INDEX or R
+/// to expand). A missing or unreadable NAMESPACE yields `(vec![], true)` — the
+/// same "treat as pattern, fall back to INDEX/R" stance the async loader takes —
+/// so callers never mistake "couldn't read" for "exports nothing".
+///
+/// Single source of truth for the explicit-vs-pattern split, shared by
+/// [`crate::package_library::PackageLibrary::parse_package_static`] (async load)
+/// and `PackageLibrary::get_exports_sync` (sync `pkg::` completion).
+pub fn parse_namespace_explicit_exports(namespace_path: &Path) -> (Vec<String>, bool) {
+    match parse_namespace_exports(namespace_path) {
+        Ok(raw) => {
+            let has_pattern = raw.iter().any(|e| e.starts_with("__PATTERN__:"));
+            let explicit = raw
+                .into_iter()
+                .filter(|e| !e.starts_with("__PATTERN__:"))
+                .collect();
+            (explicit, has_pattern)
+        }
+        Err(_) => (Vec::new(), true),
+    }
+}
+
 /// Parse NAMESPACE file content to extract exported symbols and pattern markers.
 ///
 /// This function scans normalized NAMESPACE directives and collects:

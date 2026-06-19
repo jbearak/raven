@@ -811,7 +811,10 @@ const R_CONSTANTS: &[&str] = &[
 const SORT_PREFIX_PARAM: &str = "0-";
 const SORT_PREFIX_SCOPE: &str = "1-";
 const SORT_PREFIX_WORKSPACE: &str = "2-";
-const SORT_PREFIX_PACKAGE: &str = "4-";
+/// Sort bucket for package globals. `pub(crate)` so `namespace_completion`
+/// orders `pkg::` exports identically to bare-identifier package exports
+/// without duplicating the literal.
+pub(crate) const SORT_PREFIX_PACKAGE: &str = "4-";
 const SORT_PREFIX_KEYWORD: &str = "5-";
 
 // ============================================================================
@@ -17584,7 +17587,12 @@ fn is_r_identifier_continue_byte(byte: u8) -> bool {
     is_r_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
-fn accessor_member_insert_text(name: &str) -> String {
+/// Completion insert text for a member name: the name verbatim when it is a
+/// syntactic R name (or already carries backticks), otherwise backtick-quoted so
+/// the accepted completion is valid R (`obj$`my var``, `pkg::`%>%``). Shared by
+/// the `$`/`@` member path and the `pkg::` namespace path (`namespace_completion`)
+/// so both quote non-syntactic names by the one [`crate::r_names`] rule.
+pub(crate) fn accessor_member_insert_text(name: &str) -> String {
     if crate::r_names::is_syntactic_r_name(name) || name.contains('`') {
         name.to_string()
     } else {
@@ -17825,17 +17833,41 @@ pub fn completion(
         let items = dollar_member_completion_items(state, uri, position, &member_context);
         return Some(CompletionResponse::Array(items));
     }
+
+    // A cursor with no node in the parsed tree — e.g. a stale request whose
+    // position no longer exists in the current text — has no completions.
     let point = lsp_position_to_ts_point(&text, position);
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
+    // Namespace-qualified completion: inside `pkg::` / `pkg:::`, offer that
+    // package's exported symbols and nothing else — keywords, scope symbols,
+    // and other packages are irrelevant here. Covers both the complete-AST case
+    // (`pkg::name`) and the incomplete case (`pkg::` with no member typed yet).
+    // A detected context ALWAYS short-circuits (even when it yields no items:
+    // `:::`, the package/LHS side, or an unknown package) because
+    // keywords/locals/params are syntactically invalid around `::`.
+    //
+    // Entered only when package awareness is on: with it off the whole feature
+    // is disabled, so `::` gets no special handling and falls through to general
+    // completion (matching the pre-feature behavior). Deliberately NOT gated on
+    // `package_library_ready` (unlike the bare-identifier package path below):
+    // `get_exports_sync` resolves from the on-disk NAMESPACE as soon as lib
+    // paths are set, so gating on readiness would only delay startup-window
+    // `pkg::` completions.
+    if state.cross_file_config.packages_enabled
+        && let Some(ns_ctx) = crate::namespace_completion::detect_namespace_completion_context(
+            tree, node, point, &text,
+        )
+    {
+        let ns_items = crate::namespace_completion::namespace_completion_items(
+            &ns_ctx,
+            &state.package_library,
+        );
+        return Some(CompletionResponse::Array(ns_items));
+    }
+
     let mut items = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
-
-    // Check if we're in a namespace context (pkg::)
-    if find_namespace_context(&node, &text).is_some() {
-        // TODO: Get package exports from library
-        return Some(CompletionResponse::Array(items));
-    }
 
     // Add R keywords (control flow and common functions)
     let keywords = [
@@ -18020,11 +18052,12 @@ pub fn completion(
     });
 
     // Check if inside function call — if so, prepend parameter completions.
-    // Token detection (namespace accessor check via find_namespace_context above)
-    // happens BEFORE this point — if accessor is present, we already returned early,
-    // so parameter completions are naturally suppressed for namespace-qualified tokens.
-    // For incomplete namespace expressions (e.g., `pkg::` with no RHS), the AST check
-    // may fail, so we also do a text-based check here as a fallback.
+    // Real `pkg::` / `pkg:::` contexts already short-circuited above (via
+    // `detect_namespace_completion_context`, which covers both the complete-AST
+    // and the incomplete-text cases), so we never reach here inside one. The
+    // `has_namespace_accessor_at_cursor` text check below remains a cheap guard
+    // for degenerate prefixes the detector treats as "not a namespace" (e.g.
+    // `::` with no package), where parameter completions would still be noise.
     //
     // When trigger_on_open_paren is false, suppress parameter completions triggered by `(`.
     // Manual invocation (Ctrl+Space) still shows them regardless of config.
@@ -18061,12 +18094,12 @@ pub fn completion(
 
 /// Check if the text before the cursor contains a namespace accessor (`::` or `:::`).
 ///
-/// This is a text-based fallback for the AST-based `find_namespace_context` check.
-/// When the namespace expression is incomplete (e.g., `pkg::` with no RHS), tree-sitter
-/// may not produce a `namespace_operator` node, so the AST check fails. This function
-/// scans the line text backward from the cursor to detect `::` or `:::` in the token
-/// being typed, ensuring parameter completions are suppressed for namespace-qualified
-/// tokens even when the AST is incomplete.
+/// Real `pkg::` contexts are handled (and short-circuited) earlier in
+/// `completion()` by `namespace_completion::detect_namespace_completion_context`,
+/// so this is only a residual guard for degenerate prefixes that detector treats
+/// as "not a namespace" (e.g. `::` with no package). It scans the line text
+/// backward from the cursor to detect a trailing `::` / `:::`, ensuring parameter
+/// completions are still suppressed for such namespace-qualified tokens.
 fn has_namespace_accessor_at_cursor(text: &str, position: Position) -> bool {
     let line_idx = position.line as usize;
     let line = match text.lines().nth(line_idx) {
@@ -25869,6 +25902,275 @@ clean_data <- function(x) {
                 panic!("Expected CompletionResponse::Array");
             }
         });
+    }
+
+    // ========================================================================
+    // `pkg::` namespace-qualified completion (issue: function completions after
+    // a package name). End-to-end through the `completion()` handler.
+    // ========================================================================
+
+    /// Seed a one-package library, drop a single-line R document, and run
+    /// `completion()` with the cursor at the END of `line` (after any `::`).
+    fn namespace_completion_labels(
+        line: &str,
+        package: &str,
+        exports: &[&str],
+        packages_enabled: bool,
+    ) -> Vec<String> {
+        let eol = Position::new(0, line.encode_utf16().count() as u32);
+        namespace_completion_labels_at(line, eol, package, exports, packages_enabled)
+    }
+
+    #[test]
+    fn pkg_double_colon_offers_package_exports() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use crate::state::{Document, WorldState};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new();
+            state.cross_file_config.packages_enabled = true;
+            state.package_library = std::sync::Arc::new(PackageLibrary::new_empty());
+            state
+                .package_library
+                .insert_package(PackageInfo::new(
+                    "dplyr".to_string(),
+                    std::collections::HashSet::from(["mutate".to_string(), "filter".to_string()]),
+                ))
+                .await;
+            state.package_library_ready = true;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new("dplyr::", None));
+
+            let position = Position::new(0, 7);
+            let items = match completion(&state, &uri, position, None) {
+                Some(CompletionResponse::Array(items)) => items,
+                other => panic!("expected array, got {:?}", other),
+            };
+
+            let filter = items
+                .iter()
+                .find(|i| i.label == "filter")
+                .expect("dplyr::filter offered");
+            assert_eq!(filter.kind, Some(CompletionItemKind::FUNCTION));
+            assert_eq!(filter.detail.as_deref(), Some("{dplyr}"));
+            assert!(filter.data.is_some(), "carries resolve data for help docs");
+            assert!(items.iter().any(|i| i.label == "mutate"));
+
+            // Inside `pkg::`, no general completions leak in.
+            assert!(
+                !items.iter().any(|i| i.label == "if"),
+                "keywords must not appear in a namespace completion list"
+            );
+        });
+    }
+
+    #[test]
+    fn pkg_double_colon_backtick_quotes_non_syntactic_export() {
+        // End-to-end through `completion()`: a non-syntactic export (operator
+        // `%>%`, as real packages declare via `export("%>%")`) must be offered
+        // with backtick-quoted insert text so accepting it yields valid R
+        // (`magrittr::`%>%``), while the label/filter stay the bare name. A
+        // syntactic sibling export needs no insert override. This guards the
+        // handler-seam wiring of `insert_text`/`filter_text`, not just the unit.
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use crate::state::{Document, WorldState};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new();
+            state.cross_file_config.packages_enabled = true;
+            state.package_library = std::sync::Arc::new(PackageLibrary::new_empty());
+            state
+                .package_library
+                .insert_package(PackageInfo::new(
+                    "magrittr".to_string(),
+                    std::collections::HashSet::from(["%>%".to_string(), "set_names".to_string()]),
+                ))
+                .await;
+            state.package_library_ready = true;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new("magrittr::", None));
+
+            let items = match completion(&state, &uri, Position::new(0, 10), None) {
+                Some(CompletionResponse::Array(items)) => items,
+                other => panic!("expected array, got {:?}", other),
+            };
+
+            let op = items
+                .iter()
+                .find(|i| i.label == "%>%")
+                .expect("magrittr::%>% offered");
+            assert_eq!(
+                op.insert_text.as_deref(),
+                Some("`%>%`"),
+                "non-syntactic export inserts backtick-quoted text"
+            );
+            assert_eq!(
+                op.filter_text.as_deref(),
+                Some("%>%"),
+                "filter text stays the bare name so typing `%` still matches"
+            );
+            // Resolve data still uses the bare topic for the help lookup.
+            assert_eq!(
+                op.data,
+                Some(serde_json::json!({ "topic": "%>%", "package": "magrittr" }))
+            );
+
+            let plain = items
+                .iter()
+                .find(|i| i.label == "set_names")
+                .expect("magrittr::set_names offered");
+            assert_eq!(
+                plain.insert_text, None,
+                "syntactic export inserts its label verbatim"
+            );
+        });
+    }
+
+    #[test]
+    fn pkg_double_colon_trailing_whitespace_still_offers_exports() {
+        // `dplyr:: ` (a space after the operator, no member yet) is valid R.
+        // The handler must short-circuit to the package's exports and NOT leak
+        // general completions (keywords), honoring the namespace suppression
+        // contract even when the cursor sits past trailing whitespace.
+        let labels = namespace_completion_labels_at(
+            "dplyr:: ",
+            Position::new(0, 8),
+            "dplyr",
+            &["mutate", "filter"],
+            true,
+        );
+        assert!(
+            labels.contains(&"mutate".to_string()) && labels.contains(&"filter".to_string()),
+            "exports offered after `pkg:: `, got: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"if".to_string()),
+            "keywords must not leak after `pkg:: `, got: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn pkg_double_colon_cursor_on_package_suppresses_completions() {
+        // Cursor on the package identifier itself (`dpl|yr::filter`): only
+        // package names are valid there, so the popup is suppressed entirely —
+        // not the package's members, and not keyword/scope noise (keywords
+        // cannot precede `::`).
+        let labels = namespace_completion_labels_at(
+            "dplyr::filter",
+            Position::new(0, 3),
+            "dplyr",
+            &["mutate", "filter"],
+            true,
+        );
+        assert!(
+            labels.is_empty(),
+            "package-side cursor must suppress completions, got: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn pkg_triple_colon_offers_nothing() {
+        // `:::` (internal access) is detected but deferred — empty list, and
+        // crucially NOT a fall-through to keywords.
+        let labels = namespace_completion_labels("dplyr:::", "dplyr", &["mutate"], true);
+        assert!(labels.is_empty(), "internal access yields no completions");
+    }
+
+    #[test]
+    fn pkg_double_colon_disabled_falls_through_to_general() {
+        // With package awareness off, `::` gets no special handling: the request
+        // falls through to general completion (keywords) rather than an empty
+        // popup, and the package's members are not offered.
+        let labels = namespace_completion_labels("dplyr::", "dplyr", &["mutate"], false);
+        assert!(
+            labels.contains(&"if".to_string()),
+            "disabled `pkg::` falls through to general completion, got: {labels:?}"
+        );
+        assert!(!labels.contains(&"mutate".to_string()));
+    }
+
+    #[test]
+    fn pkg_double_colon_resolves_from_disk_before_library_ready() {
+        // The namespace path is deliberately NOT gated on `package_library_ready`
+        // (unlike the bare-identifier package path): an installed package's
+        // exports resolve from its on-disk NAMESPACE during the startup window,
+        // before the cache is warmed. A future readiness gate would break this.
+        use crate::package_library::PackageLibrary;
+        use crate::state::{Document, WorldState};
+
+        let lib_root = tempfile::tempdir().unwrap();
+        let pkg_dir = lib_root.path().join("diskpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("NAMESPACE"), "export(disk_fn)\n").unwrap();
+
+        let mut state = WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        state.package_library = std::sync::Arc::new(lib);
+        // Crucially NOT ready, and the package was never library()-loaded.
+        state.package_library_ready = false;
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new("diskpkg::", None));
+
+        let labels = match completion(&state, &uri, Position::new(0, 9), None) {
+            Some(CompletionResponse::Array(items)) => {
+                items.into_iter().map(|i| i.label).collect::<Vec<_>>()
+            }
+            other => panic!("expected array, got {:?}", other),
+        };
+        assert_eq!(labels, vec!["disk_fn"]);
+    }
+
+    /// Variant of [`namespace_completion_labels`] with an explicit cursor
+    /// position (for cursor-on-package-side cases).
+    fn namespace_completion_labels_at(
+        text: &str,
+        position: Position,
+        package: &str,
+        exports: &[&str],
+        packages_enabled: bool,
+    ) -> Vec<String> {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use crate::state::{Document, WorldState};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new();
+            state.cross_file_config.packages_enabled = packages_enabled;
+            state.package_library = std::sync::Arc::new(PackageLibrary::new_empty());
+            state
+                .package_library
+                .insert_package(PackageInfo::new(
+                    package.to_string(),
+                    exports.iter().map(|s| s.to_string()).collect(),
+                ))
+                .await;
+            state.package_library_ready = true;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(text, None));
+
+            match completion(&state, &uri, position, None) {
+                Some(CompletionResponse::Array(items)) => {
+                    items.into_iter().map(|i| i.label).collect()
+                }
+                other => panic!("expected array, got {:?}", other),
+            }
+        })
     }
 
     // ========================================================================

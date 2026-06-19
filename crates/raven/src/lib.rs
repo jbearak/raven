@@ -35,6 +35,7 @@ pub mod indentation;
 pub mod jags_builtins;
 pub mod libpath_watcher;
 pub mod linting;
+pub mod namespace_completion;
 pub mod namespace_parser;
 pub mod nse;
 pub mod package_db;

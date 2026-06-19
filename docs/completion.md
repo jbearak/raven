@@ -9,6 +9,7 @@ Raven offers context-aware completions for R symbols, package exports, function 
 | **Local definitions** | Symbols defined in the current file, above the cursor |
 | **Cross-file symbols** | Symbols from sourced files, available after the `source()` call / `# raven: source` directive |
 | **Package exports** | Functions and variables from loaded packages, with `{pkg}` attribution |
+| **Namespace-qualified exports** | A package's exported symbols after `pkg::` (e.g. `dplyr::`) |
 | **Function parameters** | Parameter names when inside a function call |
 | **File paths** | `.R`/`.r` files and directories inside `source()` strings and path directives |
 | **$ members** | Known members after `$` (from assignments and constructors) |
@@ -37,6 +38,20 @@ mut  # Offers: mutate {dplyr}, mutate_all {dplyr}, ...
 ```
 
 Package completions are position-aware — they only appear after the `library()` call. Packages loaded in parent files (before the `source()` call to the current file) are also available. They require package awareness (`raven.packages.enabled`, on by default); base-package symbols additionally wait until the package library has finished loading.
+
+### Namespace-Qualified Completions (`pkg::`)
+
+After a `::` namespace qualifier, Raven completes the package's **exported** symbols:
+
+```r
+dplyr::  # Offers: mutate {dplyr}, filter {dplyr}, select {dplyr}, ...
+```
+
+Each item is attributed `{package}` and resolves to that topic's help, exactly like ordinary package completions, and covers the package's `NAMESPACE` exports. Non-syntactic exports — operators such as `%>%`, or exported names that are not valid bare identifiers — are inserted backtick-quoted (so accepting `magrittr::%>%` produces `` magrittr::`%>%` ``) and the accepted completion is valid R.
+
+Unlike the position-aware completions above, `pkg::` does **not** require a prior `library(pkg)` call: any installed package resolves on demand by reading its `NAMESPACE` (the same way `pkg::name` works in R without attaching the package). Two refinements arrive once a package has been loaded (in the background, or by an earlier `library()`/`pkg::` use in the session): exported **datasets** (which live in `data/`, not the `NAMESPACE`), and the complete export set for the ~6% of packages that export via `exportPattern()` — those offer their explicitly-exported names immediately.
+
+Inside a `pkg::` expression no other completions are offered (keywords, local symbols, and other packages are irrelevant there). Internal access via `pkg:::` (non-exported symbols) is not yet completed. Like the other package completions, this requires `raven.packages.enabled`.
 
 ## Function Parameter Completions
 
