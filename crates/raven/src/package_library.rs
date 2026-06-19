@@ -1531,6 +1531,13 @@ impl PackageLibrary {
     /// - `Some(NamespaceParseResult)` with exports, pattern flag, and dependencies
     /// - `None` if the package directory doesn't exist
     pub fn parse_package_static(&self, pkg_dir: &Path) -> Option<NamespaceParseResult> {
+        // A non-existent package directory yields nothing to parse (see contract
+        // above). Callers normally pass a directory from `find_package_directory`
+        // (which guarantees existence), so this guards only direct/foreign calls.
+        if !pkg_dir.is_dir() {
+            return None;
+        }
+
         // Explicit exports + pattern flag from NAMESPACE (a missing NAMESPACE,
         // e.g. `base`, yields no explicit exports and the pattern flag → INDEX
         // fallback). Shared with the sync `pkg::` completion path.
