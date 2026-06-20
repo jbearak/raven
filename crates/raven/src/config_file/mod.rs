@@ -79,6 +79,38 @@ fn lintr_auto_enable_allowed(raw_client: &serde_json::Value) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether a discovered `.lintr` actually expresses linting configuration, as
+/// opposed to being blank/empty.
+///
+/// A `.lintr` auto-enables Raven's native linting only when it carries linting
+/// intent — a recognized `linters:` or `exclusions:` directive (including a
+/// bare `linters_with_defaults()`, which sets no individual keys). The `.lintr`
+/// loader emits a `linting` object exactly when such a directive is present
+/// (see `lintr_loader::load_str`), so the presence of that object in the raw
+/// `.lintr` layer is the intent signal. A blank, whitespace-only, or
+/// unknown-fields-only `.lintr` carries no opt-in and must not flip linting on.
+///
+/// Note: lintr itself has no enable/disable switch tied to `.lintr` presence —
+/// it lints whenever invoked and treats an empty `.lintr` as "use defaults".
+/// Raven's presence-based opt-in is a Raven design choice (#281); gating it on
+/// expressed intent keeps a stray empty `.lintr` from silently enabling lints.
+pub(crate) fn lintr_expresses_linting(raw_project: Option<&serde_json::Value>) -> bool {
+    raw_project.and_then(|s| s.get("linting")).is_some()
+}
+
+/// The single source of truth for "does this config file opt a project into
+/// linting via the `.lintr` path?": it must be a `.lintr` file AND express
+/// linting config (see [`lintr_expresses_linting`]). Used by both the LSP server
+/// gate ([`recompute_parsed_configs`]) and the CLI
+/// (`cli::lint::resolve_lint_config`) so the two surfaces cannot drift on the
+/// opt-in rule — if the policy ever tightens, both follow automatically.
+pub(crate) fn lintr_path_opts_in(
+    path: &std::path::Path,
+    raw_project: Option<&serde_json::Value>,
+) -> bool {
+    ConfigFileKind::is_lintr_path(path) && lintr_expresses_linting(raw_project)
+}
+
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
@@ -101,10 +133,12 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     state.completion_config = crate::backend::parse_completion_config(&merged).unwrap_or_default();
     state.indentation_config =
         crate::backend::parse_indentation_config(&merged).unwrap_or_default();
+    // A discovered `.lintr` auto-enables only when it actually expresses
+    // linting config (not a blank/empty file) — see `lintr_expresses_linting`.
     let lintr_discovered = state
         .project_config_path
         .as_deref()
-        .is_some_and(ConfigFileKind::is_lintr_path);
+        .is_some_and(|p| lintr_path_opts_in(p, state.raw_project_settings.as_ref()));
     // Gate ONLY the `.lintr` auto-enable path on the client environment signal
     // (#337). An explicit client `on`/`off` and `raven.toml enabled = true`
     // flow through `merged` independently and are unaffected, because they
@@ -153,15 +187,23 @@ mod tests {
         state
     }
 
+    /// The settings a *configured* `.lintr` contributes — the `linting` object
+    /// the loader emits when the file expresses linting intent (e.g. a bare
+    /// `linters_with_defaults()`). Used by the #337 gate tests, which are about
+    /// a real `.lintr`, not the empty-file case.
+    fn configured_lintr_project() -> serde_json::Value {
+        json!({ "linting": {} })
+    }
+
     #[test]
     fn dot_lintr_auto_enable_gated_off_disables_lint() {
-        // #337: a `.lintr` is discovered, but the client signals that
+        // #337: a configured `.lintr` is discovered, but the client signals that
         // REditorSupport's lintr path is live (or we're in Positron). The
         // dormant `.lintr` must not flip Raven's lints on.
         let mut state = state_with(
             json!({ "linting": { "enabled": "auto", "autoEnableFromDotLintr": false } }),
             "/ws/.lintr",
-            None,
+            Some(configured_lintr_project()),
         );
         recompute_parsed_configs(&mut state);
         assert!(!state.lint_config.enabled);
@@ -173,7 +215,7 @@ mod tests {
         let mut state = state_with(
             json!({ "linting": { "enabled": "auto", "autoEnableFromDotLintr": true } }),
             "/ws/.lintr",
-            None,
+            Some(configured_lintr_project()),
         );
         recompute_parsed_configs(&mut state);
         assert!(state.lint_config.enabled);
@@ -186,10 +228,52 @@ mod tests {
         let mut state = state_with(
             json!({ "linting": { "enabled": "auto" } }),
             "/ws/.lintr",
-            None,
+            Some(configured_lintr_project()),
         );
         recompute_parsed_configs(&mut state);
         assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn blank_dot_lintr_does_not_auto_enable() {
+        // A discovered but content-free `.lintr` (loader contributes no
+        // `linting` object) carries no opt-in: Auto must resolve to off.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "auto", "autoEnableFromDotLintr": true } }),
+            "/ws/.lintr",
+            Some(json!({})),
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(
+            !state.lint_config.enabled,
+            "a blank .lintr must not auto-enable linting"
+        );
+    }
+
+    #[test]
+    fn configured_dot_lintr_with_only_exclusions_auto_enables() {
+        // An `exclusions:`-only `.lintr` still expresses linting config.
+        let mut state = state_with(
+            json!({ "linting": { "enabled": "auto" } }),
+            "/ws/.lintr",
+            Some(
+                json!({ "linting": { "overrides": [ { "files": ["x/**"], "enabled": false } ] } }),
+            ),
+        );
+        recompute_parsed_configs(&mut state);
+        assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn lintr_expresses_linting_reads_marker() {
+        // Present `linting` object (incl. empty, the linters_with_defaults()
+        // marker) → intent; absent → none.
+        assert!(lintr_expresses_linting(Some(&json!({ "linting": {} }))));
+        assert!(lintr_expresses_linting(Some(
+            &json!({ "linting": { "lineLength": 80 } })
+        )));
+        assert!(!lintr_expresses_linting(Some(&json!({}))));
+        assert!(!lintr_expresses_linting(None));
     }
 
     #[test]

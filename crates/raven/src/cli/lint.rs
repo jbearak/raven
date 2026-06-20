@@ -156,31 +156,29 @@ fn resolve_lint_config_with_options(
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
-                let lintr_discovered =
-                    crate::config_file::ConfigFileKind::is_lintr_path(&explicit_abs);
+                let is_lintr = crate::config_file::ConfigFileKind::is_lintr_path(&explicit_abs);
                 // `raven.toml` and project-local `.lintr` files are
                 // project-root configs, so an explicit path anchors the lint
                 // root at the config parent. Literal home `.lintr` is the
                 // exception: `--config ~/.lintr` is a user-level opt-in, so keep
                 // paths relative to the invocation cwd and lint that project
                 // rather than `$HOME`.
-                let base = if lintr_discovered
-                    && discovery_options.is_home_lintr_path(explicit_abs.as_path())
-                {
-                    cwd.to_path_buf()
-                } else {
-                    // Resolve the parent so `root` is absolute even when
-                    // `--config` points at a relative path. Without this,
-                    // `resolve_lint_for_document`'s `strip_prefix(root)` check
-                    // fails for the absolute URIs produced by `walk` — silently
-                    // dropping every per-file `[[linting.overrides]]` patch
-                    // (same failure mode as commit 81978f0 fixed for the
-                    // non-explicit root).
-                    explicit_abs
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| cwd.to_path_buf())
-                };
+                let base =
+                    if is_lintr && discovery_options.is_home_lintr_path(explicit_abs.as_path()) {
+                        cwd.to_path_buf()
+                    } else {
+                        // Resolve the parent so `root` is absolute even when
+                        // `--config` points at a relative path. Without this,
+                        // `resolve_lint_for_document`'s `strip_prefix(root)` check
+                        // fails for the absolute URIs produced by `walk` — silently
+                        // dropping every per-file `[[linting.overrides]]` patch
+                        // (same failure mode as commit 81978f0 fixed for the
+                        // non-explicit root).
+                        explicit_abs
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| cwd.to_path_buf())
+                    };
                 // Normalize away `.`/`..`: `strip_prefix(root)` is purely
                 // lexical, so a `..` left in `root` (e.g. `--config
                 // ../pkg/raven.toml`) wouldn't prefix-match a file given by its
@@ -188,6 +186,11 @@ fn resolve_lint_config_with_options(
                 // its overrides. Normalize lexically (not via `canonicalize`)
                 // so a non-existent root still resolves predictably.
                 let root = crate::cross_file::normalize_path_public(&base).unwrap_or(base);
+                // A `.lintr` (even one passed explicitly) opts into linting only
+                // when it expresses linting config; a blank one must not. Shared
+                // policy with the server gate (see `lintr_path_opts_in`).
+                let lintr_discovered =
+                    crate::config_file::lintr_path_opts_in(&explicit_abs, Some(&l.settings));
                 Ok((root, Some(l.settings), lintr_discovered))
             }
             None => {
@@ -206,7 +209,10 @@ fn resolve_lint_config_with_options(
             for w in warnings {
                 eprintln!("{w}");
             }
-            let lintr_discovered = crate::config_file::ConfigFileKind::is_lintr_path(&path);
+            // A discovered `.lintr` opts into linting only when it expresses
+            // linting config; a blank/empty one must not (shared policy with the
+            // server's `recompute_parsed_configs` gate, see `lintr_path_opts_in`).
+            let lintr_discovered = crate::config_file::lintr_path_opts_in(&path, Some(&settings));
             let root = path.parent().unwrap_or(cwd).to_path_buf();
             Ok((root, Some(settings), lintr_discovered))
         }
@@ -518,6 +524,27 @@ mod tests {
         assert!(
             lintr_discovered,
             "a discovered .lintr must set lintr_discovered so Auto resolution opts in"
+        );
+    }
+
+    #[test]
+    fn resolve_lint_config_reads_column_zero_lintr_file() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(\n    line_length_linter(120),\n    trailing_whitespace_linter = NULL\n)\n",
+        )
+        .unwrap();
+        let (_root, settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
+        let settings = settings.expect("a discovered .lintr yields project settings");
+        assert!(lintr_discovered, "a configured .lintr opts in");
+        assert_eq!(settings["linting"]["lineLength"], serde_json::json!(120));
+        assert_eq!(
+            settings["linting"]["trailingWhitespaceSeverity"],
+            serde_json::json!("off")
         );
     }
 
