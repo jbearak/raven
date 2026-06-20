@@ -233,8 +233,14 @@ fn apply_linters(
 
 fn strip_linters_with_defaults(body: &str) -> &str {
     let trimmed = body.trim();
-    if let Some(inner) = strip_named_call(trimmed, "linters_with_defaults") {
-        return inner.trim();
+    // `linters_with_defaults` is the canonical (lintr >= 3.0) name; `with_defaults`
+    // is the removed pre-3.0 alias, accepted leniently for older `.lintr` files.
+    // Try the canonical name first (it is not a prefix of the alias, so ordering
+    // is not load-bearing — but this keeps the common case first).
+    for name in ["linters_with_defaults", "with_defaults"] {
+        if let Some(inner) = strip_named_call(trimmed, name) {
+            return inner.trim();
+        }
     }
     trimmed
 }
@@ -752,6 +758,37 @@ mod tests {
         let l = &out.settings["linting"];
         assert_eq!(l["lineLength"], json!(120));
         assert_eq!(l["objectLength"], json!(40));
+    }
+
+    #[test]
+    fn reported_column_zero_file_resolves_to_expected_lint_config() {
+        // Exactly the file from the bug report (closing ')' at column 0).
+        let input = "linters: linters_with_defaults(\n\
+            line_length_linter(120),\n\
+            commented_code_linter(),\n\
+            object_length_linter(40),\n\
+            indentation_linter(4),\n\
+            trailing_blank_lines_linter = NULL,\n\
+            trailing_whitespace_linter = NULL\n\
+            )\n";
+        let out = load_str(input);
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.line_length, 120);
+        assert_eq!(cfg.object_length, 40);
+        assert_eq!(cfg.indentation_unit, 4);
+        assert_eq!(cfg.trailing_blank_lines_severity, None);
+        assert_eq!(cfg.trailing_whitespace_severity, None);
+        // commented_code stays at its default (recognized, not disabled).
+        assert!(cfg.commented_code_severity.is_some());
+    }
+
+    #[test]
+    fn legacy_with_defaults_alias_is_accepted() {
+        // lintr removed `with_defaults` after 3.0; Raven accepts it leniently as
+        // an alias for `linters_with_defaults`.
+        let out = load_str("linters: with_defaults(line_length_linter(120))\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
     }
 
     #[test]

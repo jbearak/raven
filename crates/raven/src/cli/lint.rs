@@ -528,6 +528,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_lint_config_reads_column_zero_lintr_file() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(\n    line_length_linter(120),\n    trailing_whitespace_linter = NULL\n)\n",
+        )
+        .unwrap();
+        let (_root, settings, lintr_discovered) =
+            resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
+        let settings = settings.expect("a discovered .lintr yields project settings");
+        assert!(lintr_discovered, "a configured .lintr opts in");
+        assert_eq!(
+            settings["linting"]["lineLength"],
+            serde_json::json!(120)
+        );
+        assert_eq!(
+            settings["linting"]["trailingWhitespaceSeverity"],
+            serde_json::json!("off")
+        );
+    }
+
+    #[test]
     fn resolve_lint_config_ignores_literal_home_lintr_by_default() {
         use std::fs;
         use tempfile::TempDir;
