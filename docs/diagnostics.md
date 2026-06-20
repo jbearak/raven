@@ -33,7 +33,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `unresolved-source-path` | A forward-directive path (`source()`, `# raven: source` / `# raven: run` / `# raven: include`) that does not resolve to a file | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
 | `package-not-installed` | `library()` / `require()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
-| `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported member or data object (never for `pkg:::member`) | Yes |
+| `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported object (never for `pkg:::member`) | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
 
 The opt-in style/lint rules contribute their own codes (`line-length`,
@@ -173,7 +173,7 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
 | Missing package | warning | `library()`/`require()`, or `pkg::member` / `pkg:::member`, references a package not installed on the system |
-| Namespace member not found | warning | `pkg::member` where `pkg`'s *complete* export set has no such exported member or data object (never for `pkg:::member`) |
+| Namespace member not found | warning | `pkg::member` where `pkg`'s *complete* export set has no such exported object (never for `pkg:::member`) |
 
 ### Package names vs. install status
 
@@ -199,7 +199,7 @@ With missing-package off by default in `raven check`, a genuine typo such as `li
 
 Writing `pkg::member` (or `pkg:::member`) makes Raven aware of `pkg` even without a `library(pkg)` call: it **warms `pkg`'s metadata** into the package cache (export names, datasets) so completion and hover work, but it deliberately does **not** attach `pkg` to bare-name scope — only `library()`/`require()` do that. A `pkg:::member` (internal access) warms the package too but yields no completions and is never member-validated.
 
-The `namespace-member-not-found` diagnostic (`raven.packages.namespaceMemberSeverity`, default `warning`) is **exports-authoritative**: it reports `pkg::member` only when Raven holds a *complete* export set for `pkg` and that set has no such exported member or data object. The completeness signal is per source:
+The `namespace-member-not-found` diagnostic (`raven.packages.namespaceMemberSeverity`, default `warning`) is **exports-authoritative**: it reports `pkg::member` only when Raven holds a *complete* export set for `pkg` and that set has no such exported object. The message reads `'member' is not an exported object of package 'pkg'`. The completeness signal is per source:
 
 - **Complete** — a static NAMESPACE parse without `exportPattern()`, R's `getNamespaceExports()`, the committed package database, or the embedded base table. Absence is conclusive, so the diagnostic fires.
 - **Partial** — exports recovered only from the `INDEX` file (documented topics, not the full export list). The diagnostic stays **silent** to avoid false positives.

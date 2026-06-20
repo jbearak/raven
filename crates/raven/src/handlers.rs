@@ -5136,7 +5136,7 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 end: Position::new(lib_call.line, lib_call.column),
             },
             severity: Some(severity),
-            message: format!("Package '{}' is not installed", lib_call.package),
+            message: format!("No installed package named '{}'", lib_call.package),
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
             )),
@@ -5172,7 +5172,7 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 ),
             },
             severity: Some(severity),
-            message: format!("Package '{}' is not installed", ns_ref.package),
+            message: format!("No installed package named '{}'", ns_ref.package),
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
             )),
@@ -5240,8 +5240,8 @@ fn collect_namespace_member_diagnostics_from_snapshot(
             },
             severity: Some(severity),
             message: format!(
-                "Package '{}' has no known exported member or data object named '{}'",
-                ns_ref.package, member.name
+                "'{}' is not an exported object of package '{}'",
+                member.name, ns_ref.package
             ),
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string(),
@@ -18416,16 +18416,18 @@ fn namespace_operator_is_internal(node: Node, text: &str) -> bool {
 }
 
 /// Build the hover markdown for the package side of `pkg::name` — the package's
-/// `Title`/`Description` from its installed DESCRIPTION, or a "not installed"
-/// note when no library path contains the package.
+/// `Title`/`Description` from its installed DESCRIPTION.
+///
+/// Returns `None` when no library path contains the package: there is no
+/// metadata to show, and the `package-not-installed` diagnostic already reports
+/// the missing package on this same token, so a "not installed" hover note would
+/// just duplicate it inside the hover popup (resolve-or-suppress).
 ///
 /// Session-free: reads DESCRIPTION off disk (no R subprocess), mirroring
 /// `parse_description_depends`'s consumers. This replaces the old `pkg::pkg`
 /// help-lookup artifact that rendered an awkward `from {pkg}` for the LHS.
-fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
-    let Some(pkg_dir) = state.package_library.find_package_directory(pkg) else {
-        return format!("Package `{}` is not installed.", pkg);
-    };
+fn package_metadata_hover(state: &WorldState, pkg: &str) -> Option<String> {
+    let pkg_dir = state.package_library.find_package_directory(pkg)?;
 
     let meta = crate::namespace_parser::parse_description_metadata(&pkg_dir.join("DESCRIPTION"))
         .unwrap_or_default();
@@ -18443,7 +18445,7 @@ fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
         value.push_str("\n\n");
         value.push_str(&escape_markdown(&description));
     }
-    value
+    Some(value)
 }
 
 /// True when `node` is the NAME of a function parameter at a definition site —
@@ -19420,12 +19422,13 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
         // Package side (`pkg` in `pkg::name`): show the package's DESCRIPTION
         // Title/Description instead of a `pkg::pkg` help artifact (#382 step 1).
-        // The member (RHS) side keeps the qualified help-topic behavior below.
+        // When the package is not installed there is no metadata to show, and
+        // the package-not-installed diagnostic already reports it on this token,
+        // so hover stays silent rather than duplicating the diagnostic. The
+        // member (RHS) side keeps the qualified help-topic behavior below.
         if node.kind() == "identifier" && is_namespace_package_side(node) {
-            return Some(markdown_hover(
-                package_metadata_hover(state, name),
-                node_range,
-            ));
+            return package_metadata_hover(state, name)
+                .map(|value| markdown_hover(value, node_range));
         }
 
         let pkg_owned = qualifier_pkg.to_string();
@@ -50650,9 +50653,11 @@ result <- my_func(1, 2)"#;
     }
 
     #[test]
-    fn test_hover_namespace_package_side_not_installed() {
-        // The package side of an uninstalled `pkg::fn` shows a clear note rather
-        // than nothing or a misattribution.
+    fn test_hover_namespace_package_side_not_installed_is_suppressed() {
+        // The package side of an uninstalled `pkg::fn` has no metadata to show,
+        // and the package-not-installed diagnostic already reports it on this
+        // token — so hover stays silent rather than duplicating that message
+        // inside the hover popup (issue #503 review feedback).
         let mut state = WorldState::new();
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![std::path::PathBuf::from(
@@ -50667,13 +50672,12 @@ result <- my_func(1, 2)"#;
             .insert(uri.clone(), Document::new(code, None));
 
         let position = Position::new(0, 2);
-        let hover =
-            hover_blocking(&state, &uri, position).expect("package-side hover even when missing");
-        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
-            assert_eq!(value, "Package `nosuchpkg` is not installed.");
-        } else {
-            panic!("expected markup content");
-        }
+        let hover = hover_blocking(&state, &uri, position);
+        assert!(
+            hover.is_none(),
+            "package-side hover must be suppressed when not installed (the \
+             package-not-installed diagnostic reports it); got: {hover:?}"
+        );
     }
 
     #[test]
@@ -52030,7 +52034,7 @@ result <- helper_with_spaces(42)"#;
                 .message
                 .contains("__nonexistent_package_xyz__")
         );
-        assert!(diagnostics[0].message.contains("not installed"));
+        assert!(diagnostics[0].message.contains("No installed package"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     }
 
@@ -52332,7 +52336,7 @@ result <- helper_with_spaces(42)"#;
             "Should emit missing-package diagnostic when lib_paths are populated even if r_subprocess is None"
         );
         assert!(diagnostics[0].message.contains("__raven_not_installed__"));
-        assert!(diagnostics[0].message.contains("not installed"));
+        assert!(diagnostics[0].message.contains("No installed package"));
     }
 
     // ============================================================================

@@ -7,7 +7,7 @@ Hovering over an identifier shows what the symbol is, where it's defined, and �
 | At the cursor | Hover shows |
 |---|---|
 | Member side of `pkg::name` / `pkg:::name` | Bold `pkg::name` help-panel link + R help text for that topic (nothing if `name` is not in the package's *complete* export set — see below) |
-| Package side of `pkg::name` (the `pkg`) | The package's `Title` — `Description` from its installed `DESCRIPTION` (or `Package \`pkg\` is not installed.`) |
+| Package side of `pkg::name` (the `pkg`) | The package's `Title` — `Description` from its installed `DESCRIPTION` (nothing when the package is not installed — the [`package-not-installed`](diagnostics.md#package-diagnostics) diagnostic already reports that on the same token) |
 | Local or cross-file definition | A code block with the definition statement and a file-location line |
 | Named-argument label resolving to a user-defined function's formal (`param` in `f(param = …)`) | A code block with the formal (and its default), *parameter of* `f`, and the formal's `@param` doc when documented |
 | Function-parameter name at a definition site (`x` in `f <- function(x)`) | The parameter's `@param` roxygen — when the enclosing *named* function is documented |
@@ -22,7 +22,7 @@ Hover returns nothing for symbols R doesn't recognize and that aren't in scope, 
 
 Hover tries sources in this order and stops at the first match. This matches the logic in `crates/raven/src/handlers.rs::hover`:
 
-1. **Namespace qualifier.** If the cursor is inside a `pkg::name` or `pkg:::name` expression, the qualifier wins — even if the file-local scope would resolve `name` to something else. Without this rule, hovering `filter` inside `dplyr::filter(...)` could show `stats::filter` whenever the workspace happened to surface that one first. The two sides differ: hovering the **member** (`filter`) shows that topic's help, while hovering the **package** (`dplyr`) shows the package's `Title`/`Description` from its installed `DESCRIPTION` (or a "not installed" note) — not a `dplyr::dplyr` help artifact.
+1. **Namespace qualifier.** If the cursor is inside a `pkg::name` or `pkg:::name` expression, the qualifier wins — even if the file-local scope would resolve `name` to something else. Without this rule, hovering `filter` inside `dplyr::filter(...)` could show `stats::filter` whenever the workspace happened to surface that one first. The two sides differ: hovering the **member** (`filter`) shows that topic's help, while hovering the **package** (`dplyr`) shows the package's `Title`/`Description` from its installed `DESCRIPTION` (and nothing when it is not installed, since the `package-not-installed` diagnostic already reports that) — not a `dplyr::dplyr` help artifact.
 2. **Structural labels: resolve where possible, otherwise suppress.** An identifier that never refers to a value at runtime — a named-argument label (`title` in `labs(title = ...)`), a function-parameter name, or the member name in `obj$name` — is not a plain value lookup, so hover must never attribute it to a definition or package (the misleading `from {base}` bug). But where Raven has something *correct* to show, it resolves rather than suppressing:
    - a named-argument label that maps to a **user-defined** function's exact formal → that formal (+ default, + `@param` doc);
    - a parameter name at a definition site → its `@param` roxygen, when the enclosing *named* function is documented;
