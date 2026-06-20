@@ -36,16 +36,28 @@ pub fn load_str(text: &str) -> LoadedLintr {
     let mut linting = serde_json::Map::new();
     let mut overrides: Vec<Value> = Vec::new();
     let mut unrecognized_constructs = 0usize;
+    // Whether the file contained a recognized linting-config field (`linters:`
+    // or `exclusions:`). This is the "expresses linting intent" signal that
+    // gates auto-enable: a recognized field is present even for
+    // `linters_with_defaults()`, which sets no individual keys, but NOT for a
+    // blank/whitespace-only file or one with only unknown fields.
+    let mut expresses_config = false;
 
     for (key, value) in fields {
         match key.as_str() {
-            "linters" => apply_linters(
-                &value,
-                &mut linting,
-                &mut warnings,
-                &mut unrecognized_constructs,
-            ),
-            "exclusions" => apply_exclusions(&value, &mut overrides, &mut unrecognized_constructs),
+            "linters" => {
+                expresses_config = true;
+                apply_linters(
+                    &value,
+                    &mut linting,
+                    &mut warnings,
+                    &mut unrecognized_constructs,
+                );
+            }
+            "exclusions" => {
+                expresses_config = true;
+                apply_exclusions(&value, &mut overrides, &mut unrecognized_constructs);
+            }
             other => {
                 warnings.push(format!(".lintr: unknown field '{}'; ignoring", other));
             }
@@ -61,12 +73,19 @@ pub fn load_str(text: &str) -> LoadedLintr {
         linting.insert("overrides".into(), Value::Array(overrides));
     }
     let mut settings = serde_json::Map::new();
-    if !linting.is_empty() {
-        // `.lintr` does not contribute the `enabled` master switch. The
-        // enable signal is derived from discovery state (see #281): when
+    if !linting.is_empty() || expresses_config {
+        // `.lintr` does not contribute the `enabled` master switch. The enable
+        // signal is derived from discovery state (see #281): when
         // `parse_lint_config` is called with `lintr_discovered = true`, the
-        // default `"auto"` resolves to on. This keeps "drop a .lintr to opt
-        // in" working without overriding an explicit client `false`.
+        // default `"auto"` resolves to on. This keeps "drop a configured .lintr
+        // to opt in" working without overriding an explicit client `false`.
+        //
+        // We emit the `linting` object whenever the file expressed linting
+        // config — even when that config sets no individual keys (a bare
+        // `linters_with_defaults()`) — so the presence of this object is the
+        // single signal callers use to tell a *configured* `.lintr` (which
+        // opts in) from a blank/empty one (which must NOT). See
+        // `config_file::lintr_expresses_linting`.
         settings.insert("linting".into(), Value::Object(linting));
     }
     LoadedLintr {
@@ -827,13 +846,33 @@ mod tests {
     // --- Task 5: combination & no-override coverage ---
 
     #[test]
-    fn empty_linters_with_defaults_yields_no_settings_no_warnings() {
+    fn empty_linters_with_defaults_expresses_intent_via_empty_linting_object() {
+        // `linters_with_defaults()` sets no individual keys, but it IS a
+        // recognized `linters:` directive — so the loader emits an (empty)
+        // `linting` object as the "expresses linting intent" marker that
+        // distinguishes it from a blank file. See `config_file`.
         let out = load_str("linters: linters_with_defaults()\n");
-        assert!(
-            out.settings.get("linting").is_none(),
-            "no overrides means no linting object is contributed"
-        );
+        let linting = out
+            .settings
+            .get("linting")
+            .expect("a linters: directive must contribute the intent marker");
+        assert_eq!(linting, &json!({}), "no overrides means an empty object");
         assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn blank_lintr_contributes_no_linting_object() {
+        // A blank / whitespace-only / unknown-fields-only file expresses no
+        // linting intent, so no `linting` object is emitted (the signal a
+        // discovered .lintr uses to decide auto-enable).
+        assert!(load_str("").settings.get("linting").is_none());
+        assert!(load_str("\n  \n").settings.get("linting").is_none());
+        let unknown = load_str("encoding: UTF-8\n");
+        assert!(unknown.settings.get("linting").is_none());
+        assert!(
+            unknown.warnings.iter().any(|w| w.contains("unknown field")),
+            "an unknown field still warns, but does not express linting intent"
+        );
     }
 
     #[test]
