@@ -34,7 +34,7 @@ pub fn load_str(text: &str) -> LoadedLintr {
     let mut warnings = Vec::new();
     let FoldResult {
         fields,
-        column0_continuations,
+        column0_continuation_count,
     } = dcf_fold(text);
     let mut linting = serde_json::Map::new();
     let mut overrides: Vec<Value> = Vec::new();
@@ -66,13 +66,13 @@ pub fn load_str(text: &str) -> LoadedLintr {
             }
         }
     }
-    if !column0_continuations.is_empty() {
+    if column0_continuation_count > 0 {
         // Reversible UX knob (see docs/superpowers plan): Raven accepts the
         // column-0 continuation that lintr's read.dcf rejects, but flags it so a
         // user who also runs lintr learns the file is not lintr-portable.
         warnings.push(format!(
             ".lintr: accepted {} continuation line(s) beginning at column 0; lintr's read.dcf requires every continuation line (including the closing `)`) to be indented (\"Regular lines must have a tag\"). Indent them for lintr compatibility.",
-            column0_continuations.len(),
+            column0_continuation_count,
         ));
     }
     if unrecognized_constructs > 0 {
@@ -110,11 +110,12 @@ pub fn load_str(text: &str) -> LoadedLintr {
 struct FoldResult {
     /// `(key, value)` pairs in file order.
     fields: Vec<(String, String)>,
-    /// Continuation lines that began at **column 0** (no leading whitespace).
-    /// lintr's `read.dcf` rejects these ("Regular lines must have a tag");
-    /// Raven accepts them leniently and surfaces one informational note so a
-    /// user who also runs lintr learns the file is not lintr-portable.
-    column0_continuations: Vec<String>,
+    /// Count of continuation lines that began at **column 0** (no leading
+    /// whitespace). lintr's `read.dcf` rejects these ("Regular lines must have a
+    /// tag"); Raven accepts them leniently and surfaces one informational note
+    /// (using this count) so a user who also runs lintr learns the file is not
+    /// lintr-portable.
+    column0_continuation_count: usize,
 }
 
 /// Fold a `.lintr` into per-field values.
@@ -134,7 +135,7 @@ struct FoldResult {
 /// the rest of the folded value.
 fn dcf_fold(text: &str) -> FoldResult {
     let mut fields: Vec<(String, String)> = Vec::new();
-    let mut column0_continuations: Vec<String> = Vec::new();
+    let mut column0_continuation_count = 0usize;
     let mut current: Option<(String, String)> = None;
     for raw_line in text.lines() {
         // Mid-expression: brackets are still open, so this physical line is a
@@ -147,7 +148,7 @@ fn dcf_fold(text: &str) -> FoldResult {
                 continue;
             }
             if !raw_line.starts_with(|c: char| c.is_whitespace()) {
-                column0_continuations.push(raw_line.trim().to_string());
+                column0_continuation_count += 1;
             }
             val.push('\n');
             val.push_str(raw_line.trim());
@@ -181,7 +182,7 @@ fn dcf_fold(text: &str) -> FoldResult {
     }
     FoldResult {
         fields,
-        column0_continuations,
+        column0_continuation_count,
     }
 }
 
