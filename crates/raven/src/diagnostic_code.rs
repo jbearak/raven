@@ -39,6 +39,10 @@ pub const UNRESOLVED_SOURCE_PATH: &str = "unresolved-source-path";
 pub const ASSIGN_TO_STRING_LITERAL: &str = "assign-to-string-literal";
 /// A `library()`/`require()` of a package that is not installed / not found.
 pub const PACKAGE_NOT_INSTALLED: &str = "package-not-installed";
+/// A `pkg::member` reference where a *complete* package export set has no such
+/// exported member or data object. Never emitted for `pkg:::member` (internal
+/// access) or from partial/unknown metadata. See `namespace_member_status_sync`.
+pub const NAMESPACE_MEMBER_NOT_FOUND: &str = "namespace-member-not-found";
 /// A `# raven: expect[...]` (or, under the global sweep, any suppression)
 /// that suppressed nothing. Hint severity. F2.
 pub const UNUSED_SUPPRESSION: &str = "unused-suppression";
@@ -60,6 +64,7 @@ pub const ANALYZER_CODES: &[&str] = &[
     UNRESOLVED_SOURCE_PATH,
     ASSIGN_TO_STRING_LITERAL,
     PACKAGE_NOT_INSTALLED,
+    NAMESPACE_MEMBER_NOT_FOUND,
     UNUSED_SUPPRESSION,
 ];
 
@@ -75,6 +80,7 @@ pub const SUPPRESSIBLE_ANALYZER_CODES: &[&str] = &[
     UNDEFINED_VARIABLE,
     ASSIGN_TO_STRING_LITERAL,
     PACKAGE_NOT_INSTALLED,
+    NAMESPACE_MEMBER_NOT_FOUND,
 ];
 
 /// Canonical lint codes, kebab-case (the suppression spelling of the

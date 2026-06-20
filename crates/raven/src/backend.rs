@@ -441,6 +441,12 @@ pub(crate) fn parse_cross_file_config(
         {
             config.packages_missing_package_severity = parse_severity(sev);
         }
+        if let Some(sev) = packages
+            .get("namespaceMemberSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.packages_namespace_member_severity = parse_severity(sev);
+        }
         if let Some(v) = packages.get("watchLibraryPaths").and_then(|v| v.as_bool()) {
             config.packages_watch_library_paths = v;
         }
@@ -10240,6 +10246,34 @@ mod tests {
             assert!(
                 config.model_rprofile,
                 "rprofilePrelude must default to true"
+            );
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_namespace_member_severity() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+            let settings = json!({
+                "packages": { "namespaceMemberSeverity": "error" }
+            });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.packages_namespace_member_severity,
+                Some(DiagnosticSeverity::ERROR)
+            );
+        }
+
+        #[test]
+        fn parse_cross_file_config_namespace_member_severity_defaults_to_warning() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+            let settings = json!({ "packages": {} });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.packages_namespace_member_severity,
+                Some(DiagnosticSeverity::WARNING)
             );
         }
 

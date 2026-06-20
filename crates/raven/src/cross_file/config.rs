@@ -99,6 +99,10 @@ pub struct CrossFileConfig {
     pub packages_r_path: Option<PathBuf>,
     /// Severity for missing package diagnostics (None = disabled)
     pub packages_missing_package_severity: Option<DiagnosticSeverity>,
+    /// Severity for `namespace-member-not-found` diagnostics (None = disabled).
+    /// Fires only when a package's *complete* export set lacks the referenced
+    /// `pkg::member`. See `namespace_member_status_sync`.
+    pub packages_namespace_member_severity: Option<DiagnosticSeverity>,
     /// Watch R library paths (`.libPaths()`) for package install/remove events.
     /// When true, Raven attaches a filesystem watcher and refreshes package
     /// diagnostics automatically.
@@ -214,6 +218,7 @@ impl Default for CrossFileConfig {
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
             packages_missing_package_severity: Some(DiagnosticSeverity::WARNING),
+            packages_namespace_member_severity: Some(DiagnosticSeverity::WARNING),
             packages_watch_library_paths: true,
             packages_watch_debounce_ms: 500,
             redundant_directive_severity: Some(DiagnosticSeverity::HINT),
