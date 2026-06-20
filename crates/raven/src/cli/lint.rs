@@ -541,10 +541,7 @@ mod tests {
             resolve_lint_config(tmp.path(), &discovery_args()).unwrap();
         let settings = settings.expect("a discovered .lintr yields project settings");
         assert!(lintr_discovered, "a configured .lintr opts in");
-        assert_eq!(
-            settings["linting"]["lineLength"],
-            serde_json::json!(120)
-        );
+        assert_eq!(settings["linting"]["lineLength"], serde_json::json!(120));
         assert_eq!(
             settings["linting"]["trailingWhitespaceSeverity"],
             serde_json::json!("off")
