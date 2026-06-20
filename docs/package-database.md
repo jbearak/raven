@@ -18,6 +18,20 @@ The tiers are a **floor, never a replacement**: whenever a package resolves from
 
 > **Export names, not install status.** The database suppresses undefined-variable noise; it never makes a package count as *installed*. The missing-package diagnostic stays Tier-1-only and is **off by default in `raven check`**. See [Names vs. install status](#names-vs-install-status) below.
 
+### Exports completeness
+
+Each cached `PackageInfo` records how *complete* its export set is — the signal the [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember) diagnostic uses to decide whether absence is conclusive:
+
+| Completeness | Source | Member absence |
+|---|---|---|
+| **Complete** | static `NAMESPACE` parse without `exportPattern()`/`exportClassPattern()`; R's `getNamespaceExports()`; a Tier 2/3 provider record; the embedded base table | Conclusive — a `pkg::member` not in the set is reported |
+| **Partial** | the `INDEX` approximation (used when R is absent for an `exportPattern()` package) | Never concluded — `INDEX` lists only documented topics |
+| **Unknown** | not yet warmed, or unresolvable without R | Never concluded |
+
+The member authority (`namespace_member_status_sync`) is **synchronous and never spawns R**: it reads the cache, then a static on-disk `NAMESPACE` parse, then the providers, and concludes `Absent` only from a `Complete` set. Data objects (`lazy_data`, and base-package datasets via `base_exports`) are **positive-only** — they confirm a member is present but never prove one absent.
+
+The cache write path (`insert_package`) is **monotonically authoritative**: once a package is cached `Complete`, a later weaker (`Partial`/`Unknown`) load can never downgrade its exports or completeness — it only ever folds in additional positive-only data. This keeps a transient R-less reload from turning a previously-conclusive export set back into "don't know."
+
 ## Tier 2 — the committed `.raven/packages.json`
 
 A repo-specific snapshot, generated on a machine that has R and the project's packages installed, and **committed to the repo**. Because it is produced through Raven's authoritative path, it is effectively *frozen Tier 1*: it captures the full structure — exports (with `exportPattern` correctly expanded), `Depends`, datasets, and meta-package attaches.

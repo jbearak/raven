@@ -27,6 +27,7 @@ Key code entry points:
 - Real-time updates / diagnostics gating: `crates/raven/src/cross_file/revalidation.rs`
 - On-demand indexing (synchronous, in `did_open`): `crates/raven/src/backend.rs` (`index_file_on_demand`, `index_forward_chain`, `index_backward_chain`)
 - Package loading: `crates/raven/src/package_library.rs`
+- Namespace member authority: `crates/raven/src/package_library.rs` (`namespace_member_status_sync`) — the single source of truth for the `namespace-member-not-found` diagnostic. **Not** `get_exports_sync` (which powers `pkg::` completion). It is synchronous and never spawns R or mutates the cache, so a not-yet-warmed package returns `Unknown` and the diagnostic surfaces only after background warming republishes. Exports-completeness is stamped at every load path and never downgraded by `insert_package` (see `docs/package-database.md`). Because warming `pkg` can change `pkg::member` diagnostics in *other* open docs, the `did_change` background prefetch force-republishes siblings found via `open_docs_referencing_packages` (`backend.rs`, issue #503).
 - Package state: `crates/raven/src/package_state/` (`PackageState`, `derive_package_state()`)
 - Package namespace: `crates/raven/src/package_namespace.rs` (workspace detection, namespace model)
 - Help rendering: `crates/raven/src/help/` (Rd2txt, Rd2HTML)

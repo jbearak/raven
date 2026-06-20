@@ -32,7 +32,8 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
 | `unresolved-source-path` | A forward-directive path (`source()`, `# raven: source` / `# raven: run` / `# raven: include`) that does not resolve to a file | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
-| `package-not-installed` | `library()` / `require()` of a package that is not installed | Yes |
+| `package-not-installed` | `library()` / `require()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
+| `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported member or data object (never for `pkg:::member`) | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
 
 The opt-in style/lint rules contribute their own codes (`line-length`,
@@ -171,7 +172,8 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Missing package | warning | `library()` references a package not installed on the system |
+| Missing package | warning | `library()`/`require()`, or `pkg::member` / `pkg:::member`, references a package not installed on the system |
+| Namespace member not found | warning | `pkg::member` where `pkg`'s *complete* export set has no such exported member or data object (never for `pkg:::member`) |
 
 ### Package names vs. install status
 
@@ -192,6 +194,18 @@ When enabled, `--report-uninstalled` reports `library()` calls **not present in 
 #### Accepted gap
 
 With missing-package off by default in `raven check`, a genuine typo such as `library(dpylr)` — unknown to every tier — is **silent** unless `--report-uninstalled` is passed. This is documented behavior: the default avoids nagging about known-but-uninstalled dependencies in CI. Pass the flag (e.g. in a pipeline that runs `renv::restore()`) to catch packages that failed to install. The language server still flags such a call interactively whenever install state is known.
+
+### Namespace member references (`pkg::member`)
+
+Writing `pkg::member` (or `pkg:::member`) makes Raven aware of `pkg` even without a `library(pkg)` call: it **warms `pkg`'s metadata** into the package cache (export names, datasets) so completion and hover work, but it deliberately does **not** attach `pkg` to bare-name scope — only `library()`/`require()` do that. A `pkg:::member` (internal access) warms the package too but yields no completions and is never member-validated.
+
+The `namespace-member-not-found` diagnostic (`raven.packages.namespaceMemberSeverity`, default `warning`) is **exports-authoritative**: it reports `pkg::member` only when Raven holds a *complete* export set for `pkg` and that set has no such exported member or data object. The completeness signal is per source:
+
+- **Complete** — a static NAMESPACE parse without `exportPattern()`, R's `getNamespaceExports()`, the committed package database, or the embedded base table. Absence is conclusive, so the diagnostic fires.
+- **Partial** — exports recovered only from the `INDEX` file (documented topics, not the full export list). The diagnostic stays **silent** to avoid false positives.
+- **Unknown** — the package has not been warmed yet (or could not be resolved without R). Silent. Because the member authority is synchronous and never spawns R, the diagnostic appears only **after** background warming republishes diagnostics — including across other open documents that reference the same `pkg::` (issue #503).
+
+Data objects (a package's `lazy_data`, and base-package datasets such as `datasets::mtcars`) are **positive-only**: they can confirm a member is present but never prove one absent, so a `pkg::dataset` reference is never flagged as missing. `pkg:::member` is never validated at all. A `::`-accurate data-member authority is tracked as a follow-up (issue #505). Suppress an individual false positive with `# raven: ignore[namespace-member-not-found]`.
 
 ### Cross-File Diagnostics
 
