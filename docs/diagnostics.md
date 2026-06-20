@@ -251,28 +251,28 @@ Always-on diagnostics that flag likely-wrong code — not style preferences. Act
 
 ### Style Lints
 
-Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default rules). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in, except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr` is true or the CLI receives `--config ~/.lintr`, and a `.lintr` is ignored when REditorSupport's `lintr` path is live or you're in Positron); tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `hint` so they don't crowd the Problems pane. For a user-facing guide — master-switch matrix, quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
+Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default rules). Implemented in Rust against the tree-sitter AST — no R or `lintr` install required. Gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in, except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr` is true or the CLI receives `--config ~/.lintr`, and a `.lintr` is ignored when REditorSupport's `lintr` path is live or you're in Positron); tune per rule via the `raven.linting.*` severities. All style lint rules default to severity `information`, matching REditorSupport `languageserver`'s mapping for `lintr` style findings. For a user-facing guide — master-switch matrix, quick-start config, `.lintr` migration, gaps vs `lintr`, and how to run `lintr` alongside Raven — see [Linting](linting.md).
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Line length | hint | Line exceeds `raven.linting.lineLength` (default 80 UTF-16 code units) |
-| Trailing whitespace | hint | Spaces or tabs at end of line |
-| Tab character | hint | Tab character anywhere in source |
-| Trailing blank lines | hint | Blank lines at end of file, or missing final newline |
-| Assignment operator | hint | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
-| Object name | hint | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
-| Object length | hint | Identifier name exceeds `raven.linting.objectLength` characters (default 30; leading `.` not counted) |
-| Infix spaces | hint | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
-| Commented code | hint | A standalone comment whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
-| Quotes | hint | String literal not using the preferred delimiter (`raven.linting.stringDelimiter`; default `"`). Raw strings are exempt |
-| Commas | hint | Whitespace before `,` (`a , b`) or missing whitespace after `,` (`c(1,2)`). Newline after comma is fine |
-| `T` / `F` symbol | hint | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`). Skipped at assignment targets, named arguments, formal parameters, and `$`/`@` field names |
-| Semicolon | hint | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
-| Equals NA | hint | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
-| Vector logic | hint | `&` or `\|` in an `if` / `while` condition (use `&&` / `\|\|` for scalars). Scan stops at call boundaries |
-| Function left parentheses | hint | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
-| Spaces inside | hint | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
-| Indentation | hint | Leading whitespace doesn't match the expected indent for the line's AST scope (braced blocks, multi-line argument lists, continuation lines). Configurable indent unit via `raven.linting.indentationUnit` (default `"auto"` in VS Code, tracking each file's resolved `editor.tabSize`) |
+| Line length | information | Line exceeds `raven.linting.lineLength` (default 80 UTF-16 code units) |
+| Trailing whitespace | information | Spaces or tabs at end of line |
+| Tab character | information | Tab character anywhere in source |
+| Trailing blank lines | information | Blank lines at end of file, or missing final newline |
+| Assignment operator | information | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
+| Object name | information | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
+| Object length | information | Identifier name exceeds `raven.linting.objectLength` characters (default 30; leading `.` not counted) |
+| Infix spaces | information | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
+| Commented code | information | A standalone comment whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
+| Quotes | information | String literal not using the preferred delimiter (`raven.linting.stringDelimiter`; default `"`). Raw strings are exempt |
+| Commas | information | Whitespace before `,` (`a , b`) or missing whitespace after `,` (`c(1,2)`). Newline after comma is fine |
+| `T` / `F` symbol | information | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`). Skipped at assignment targets, named arguments, formal parameters, and `$`/`@` field names |
+| Semicolon | information | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
+| Equals NA | information | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
+| Vector logic | information | `&` or `\|` in an `if` / `while` condition (use `&&` / `\|\|` for scalars). Scan stops at call boundaries |
+| Function left parentheses | information | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
+| Spaces inside | information | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
+| Indentation | information | Leading whitespace doesn't match the expected indent for the line's AST scope (braced blocks, multi-line argument lists, continuation lines). Configurable indent unit via `raven.linting.indentationUnit` (default `"auto"` in VS Code, tracking each file's resolved `editor.tabSize`) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
 

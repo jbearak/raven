@@ -192,7 +192,7 @@ See [Smart Indentation](indentation.md) for details.
 
 ## Linting Settings
 
-Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` or `raven.toml` opts in — except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled (or the CLI receives `--config ~/.lintr`), and any `.lintr` is ignored when REditorSupport's own `lintr` diagnostics are live or you're in Positron ([details](linting.md#auto-and-reditorsupport--positron)) — set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
+Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` or `raven.toml` opts in — except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled (or the CLI receives `--config ~/.lintr`), and any `.lintr` is ignored when REditorSupport's own `lintr` diagnostics are live or you're in Positron ([details](linting.md#auto-and-reditorsupport--positron)) — set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `information`, matching REditorSupport `languageserver`'s mapping for `lintr` style findings. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -203,27 +203,27 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
 | `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
-| `raven.linting.lineLengthSeverity` | `"hint"` | Severity for over-long lines (or `"off"`) |
-| `raven.linting.trailingWhitespaceSeverity` | `"hint"` | Severity for trailing whitespace |
-| `raven.linting.noTabSeverity` | `"hint"` | Severity for tab characters |
-| `raven.linting.trailingBlankLinesSeverity` | `"hint"` | Severity for blank lines or missing newline at end of file |
-| `raven.linting.assignmentOperatorSeverity` | `"hint"` | Severity for mismatched assignment operator |
+| `raven.linting.lineLengthSeverity` | `"information"` | Severity for over-long lines (or `"off"`) |
+| `raven.linting.trailingWhitespaceSeverity` | `"information"` | Severity for trailing whitespace |
+| `raven.linting.noTabSeverity` | `"information"` | Severity for tab characters |
+| `raven.linting.trailingBlankLinesSeverity` | `"information"` | Severity for blank lines or missing newline at end of file |
+| `raven.linting.assignmentOperatorSeverity` | `"information"` | Severity for mismatched assignment operator |
 | `raven.linting.objectNameStyleFunction` | `"snake_case"` | Naming scheme for functions (`"snake_case" \| "camelCase" \| "dotted.case" \| "UPPER_CASE" \| "lowercase" \| "any"`) |
 | `raven.linting.objectNameStyleVariable` | `"snake_case"` | Naming scheme for variables (same enum as above) |
 | `raven.linting.objectNameStyleArgument` | `"snake_case"` | Naming scheme for function formal arguments (same enum as above) |
-| `raven.linting.objectNameSeverity` | `"hint"` | Severity for the object-name lint (set to `"off"` to disable entirely; set a specific style to `"any"` to disable just that kind) |
-| `raven.linting.infixSpacesSeverity` | `"hint"` | Severity for the infix-spaces lint (whitespace around operators) |
-| `raven.linting.commentedCodeSeverity` | `"hint"` | Severity for the commented-code lint (standalone comments whose body parses as R code) |
-| `raven.linting.quotesSeverity` | `"hint"` | Severity for the quotes lint (string-literal delimiter style) |
-| `raven.linting.commasSeverity` | `"hint"` | Severity for the commas lint (spacing around `,`) |
-| `raven.linting.tAndFSymbolSeverity` | `"hint"` | Severity for the T/F-symbol lint (bare `T` / `F` used as `TRUE` / `FALSE`) |
-| `raven.linting.semicolonSeverity` | `"hint"` | Severity for the semicolon lint (`;` separators in source) |
-| `raven.linting.equalsNaSeverity` | `"hint"` | Severity for the equals-NA lint (`x == NA`, `x != NA`, typed-`NA` variants) |
-| `raven.linting.objectLengthSeverity` | `"hint"` | Severity for the object-length lint |
-| `raven.linting.vectorLogicSeverity` | `"hint"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
-| `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
-| `raven.linting.spacesInsideSeverity` | `"hint"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
-| `raven.linting.indentationSeverity` | `"hint"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
+| `raven.linting.objectNameSeverity` | `"information"` | Severity for the object-name lint (set to `"off"` to disable entirely; set a specific style to `"any"` to disable just that kind) |
+| `raven.linting.infixSpacesSeverity` | `"information"` | Severity for the infix-spaces lint (whitespace around operators) |
+| `raven.linting.commentedCodeSeverity` | `"information"` | Severity for the commented-code lint (standalone comments whose body parses as R code) |
+| `raven.linting.quotesSeverity` | `"information"` | Severity for the quotes lint (string-literal delimiter style) |
+| `raven.linting.commasSeverity` | `"information"` | Severity for the commas lint (spacing around `,`) |
+| `raven.linting.tAndFSymbolSeverity` | `"information"` | Severity for the T/F-symbol lint (bare `T` / `F` used as `TRUE` / `FALSE`) |
+| `raven.linting.semicolonSeverity` | `"information"` | Severity for the semicolon lint (`;` separators in source) |
+| `raven.linting.equalsNaSeverity` | `"information"` | Severity for the equals-NA lint (`x == NA`, `x != NA`, typed-`NA` variants) |
+| `raven.linting.objectLengthSeverity` | `"information"` | Severity for the object-length lint |
+| `raven.linting.vectorLogicSeverity` | `"information"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
+| `raven.linting.functionLeftParenthesesSeverity` | `"information"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
+| `raven.linting.spacesInsideSeverity` | `"information"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
+| `raven.linting.indentationSeverity` | `"information"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
 
 To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
 

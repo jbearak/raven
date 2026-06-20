@@ -92,26 +92,26 @@ const LINTING_GROUPS: LintingGroup[] = [
         comment: 'lintr: line_length_linter(length = N)',
         entries: [
             { key: 'raven.linting.lineLength', value: 120 },
-            { key: 'raven.linting.lineLengthSeverity', value: 'hint' },
+            { key: 'raven.linting.lineLengthSeverity', value: 'information' },
         ],
     },
     {
         comment: 'lintr: trailing_whitespace_linter()',
-        entries: [{ key: 'raven.linting.trailingWhitespaceSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.trailingWhitespaceSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: whitespace_linter() (no-tab portion)',
-        entries: [{ key: 'raven.linting.noTabSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.noTabSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: trailing_blank_lines_linter()',
-        entries: [{ key: 'raven.linting.trailingBlankLinesSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.trailingBlankLinesSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: assignment_linter()',
         entries: [
             { key: 'raven.linting.assignmentOperator', value: '<-' },
-            { key: 'raven.linting.assignmentOperatorSeverity', value: 'hint' },
+            { key: 'raven.linting.assignmentOperatorSeverity', value: 'information' },
         ],
     },
     {
@@ -120,64 +120,64 @@ const LINTING_GROUPS: LintingGroup[] = [
             { key: 'raven.linting.objectNameStyleFunction', value: 'snake_case' },
             { key: 'raven.linting.objectNameStyleVariable', value: 'snake_case' },
             { key: 'raven.linting.objectNameStyleArgument', value: 'snake_case' },
-            { key: 'raven.linting.objectNameSeverity', value: 'hint' },
+            { key: 'raven.linting.objectNameSeverity', value: 'information' },
         ],
     },
     {
         comment: 'lintr: infix_spaces_linter()',
-        entries: [{ key: 'raven.linting.infixSpacesSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.infixSpacesSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: commented_code_linter()',
-        entries: [{ key: 'raven.linting.commentedCodeSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.commentedCodeSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: quotes_linter() / single_quotes_linter()',
         entries: [
             { key: 'raven.linting.stringDelimiter', value: '"' },
-            { key: 'raven.linting.quotesSeverity', value: 'hint' },
+            { key: 'raven.linting.quotesSeverity', value: 'information' },
         ],
     },
     {
         comment: 'lintr: commas_linter()',
-        entries: [{ key: 'raven.linting.commasSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.commasSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: T_and_F_symbol_linter()',
-        entries: [{ key: 'raven.linting.tAndFSymbolSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.tAndFSymbolSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: semicolon_linter()',
-        entries: [{ key: 'raven.linting.semicolonSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.semicolonSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: equals_na_linter()',
-        entries: [{ key: 'raven.linting.equalsNaSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.equalsNaSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: object_length_linter(length = N)',
         entries: [
             { key: 'raven.linting.objectLength', value: 30 },
-            { key: 'raven.linting.objectLengthSeverity', value: 'hint' },
+            { key: 'raven.linting.objectLengthSeverity', value: 'information' },
         ],
     },
     {
         comment: 'lintr: vector_logic_linter()',
-        entries: [{ key: 'raven.linting.vectorLogicSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.vectorLogicSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: function_left_parentheses_linter()',
-        entries: [{ key: 'raven.linting.functionLeftParenthesesSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.functionLeftParenthesesSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: spaces_inside_linter()',
-        entries: [{ key: 'raven.linting.spacesInsideSeverity', value: 'hint' }],
+        entries: [{ key: 'raven.linting.spacesInsideSeverity', value: 'information' }],
     },
     {
         comment: 'lintr: indentation_linter(indent = N)',
         entries: [
             { key: 'raven.linting.indentationUnit', value: 2 },
-            { key: 'raven.linting.indentationSeverity', value: 'hint' },
+            { key: 'raven.linting.indentationSeverity', value: 'information' },
         ],
     },
 ];

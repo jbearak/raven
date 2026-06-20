@@ -1556,7 +1556,7 @@
             "Report long lines as hints",
             "Disable the line-length lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the line-length lint. Set to \"off\" to disable the rule."
         },
         "raven.linting.trailingWhitespaceSeverity": {
@@ -1575,7 +1575,7 @@
             "Report trailing whitespace as hints",
             "Disable the trailing-whitespace lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for trailing whitespace at end of line. Set to \"off\" to disable the rule."
         },
         "raven.linting.noTabSeverity": {
@@ -1594,7 +1594,7 @@
             "Report tab characters as hints",
             "Disable the no-tab lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for tab characters in source. Set to \"off\" to disable the rule."
         },
         "raven.linting.trailingBlankLinesSeverity": {
@@ -1613,7 +1613,7 @@
             "Report trailing blank lines as hints",
             "Disable the trailing-blank-lines lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for trailing blank lines and missing final newline at end of file. Set to \"off\" to disable the rule."
         },
         "raven.linting.assignmentOperatorSeverity": {
@@ -1632,7 +1632,7 @@
             "Report mismatched assignment operator as hints",
             "Disable the assignment-operator lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the assignment-operator lint. Set to \"off\" to disable the rule."
         },
         "raven.linting.objectNameStyleFunction": {
@@ -1748,7 +1748,7 @@
             "Report object-name violations as hints",
             "Disable the object-name lint entirely"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the object-name lint. Set to \"off\" to disable the rule entirely, or set individual styles to \"any\" to disable specific symbol kinds."
         },
         "raven.linting.infixSpacesSeverity": {
@@ -1767,7 +1767,7 @@
             "Report infix-spacing violations as hints",
             "Disable the infix-spaces lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the infix-spaces lint. Flags missing spaces around binary operators (`+`, `==`, `<-`, `|>`, `%>%`, etc.) and stray whitespace around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`). Alignment whitespace (multiple spaces) and line-continuations are not flagged."
         },
         "raven.linting.commentedCodeSeverity": {
@@ -1786,7 +1786,7 @@
             "Report commented-out code as hints",
             "Disable the commented-code lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the commented-code lint. Flags standalone comment blocks whose body parses as R code (calls, assignments, operators). Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, ...), and `# nolint` / `# @lsp-*` directives are never flagged."
         },
         "raven.linting.stringDelimiter": {
@@ -1818,7 +1818,7 @@
             "Report quote-style violations as hints",
             "Disable the quotes lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the quotes lint. Flags string literals not using the configured `raven.linting.stringDelimiter`. Raw strings are exempt."
         },
         "raven.linting.commasSeverity": {
@@ -1837,7 +1837,7 @@
             "Report comma-spacing violations as hints",
             "Disable the commas lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the commas lint. Flags whitespace before `,` and missing whitespace after `,`. A newline after `,` is fine."
         },
         "raven.linting.tAndFSymbolSeverity": {
@@ -1856,7 +1856,7 @@
             "Report `T`/`F` usage as hints",
             "Disable the T/F symbol lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets, named arguments, formal parameters, and `$`/`@` field names are exempt."
         },
         "raven.linting.semicolonSeverity": {
@@ -1875,7 +1875,7 @@
             "Report `;` separators as hints",
             "Disable the semicolon lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the semicolon lint. Flags `;` statement separators in source (outside strings and comments)."
         },
         "raven.linting.equalsNaSeverity": {
@@ -1894,7 +1894,7 @@
             "Report `== NA` / `!= NA` as hints",
             "Disable the equals-NA lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the equals-NA lint. Flags `x == NA`, `x != NA` (and the typed `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_` variants). Use `is.na(x)` instead."
         },
         "raven.linting.objectLength": {
@@ -1920,7 +1920,7 @@
             "Report overlong identifiers as hints",
             "Disable the object-length lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the object-length lint. Flags assignment targets and formal parameters whose names exceed `raven.linting.objectLength` characters."
         },
         "raven.linting.vectorLogicSeverity": {
@@ -1939,7 +1939,7 @@
             "Report `&`/`|` in `if`/`while` conditions as hints",
             "Disable the vector-logic lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar form). Function-call boundaries stop the scan, so `if (any(x & y))` is left alone."
         },
         "raven.linting.functionLeftParenthesesSeverity": {
@@ -1958,7 +1958,7 @@
             "Report space between `function` and `(` as hints",
             "Disable the function-left-parens lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`."
         },
         "raven.linting.spacesInsideSeverity": {
@@ -1977,7 +1977,7 @@
             "Report whitespace inside brackets as hints",
             "Disable the spaces-inside lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
         },
         "raven.linting.indentationUnit": {
@@ -2011,7 +2011,7 @@
             "Report mis-indented lines as hints",
             "Disable the indentation lint"
           ],
-          "default": "hint",
+          "default": "information",
           "description": "Severity for the indentation lint. Flags lines whose leading whitespace doesn't match the expected indent given their AST scope (braced blocks, multi-line argument lists, continuation lines)."
         }
       }

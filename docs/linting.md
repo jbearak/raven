@@ -17,7 +17,7 @@ By default (`"auto"`), Raven turns linting on when it discovers a workspace or n
 }
 ```
 
-All style lint rules default to severity `hint` so they don't crowd the Problems pane. To raise a rule (e.g. line length) to `warning`, or to disable an individual rule, set its severity:
+All style lint rules default to severity `information`, matching REditorSupport `languageserver`'s mapping for `lintr` style findings. To raise a rule (e.g. line length) to `warning`, lower it to `hint`, or disable an individual rule, set its severity:
 
 ```json
 {
@@ -103,110 +103,110 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 ### Line length
 
-- **Raven:** `raven.linting.lineLength` (default `80`), `raven.linting.lineLengthSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.lineLength` (default `80`), `raven.linting.lineLengthSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::line_length_linter(length = 80L)`.
 - Line length is measured in UTF-16 code units to match how LSP positions are reported.
 
 ### Trailing whitespace
 
-- **Raven:** `raven.linting.trailingWhitespaceSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.trailingWhitespaceSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::trailing_whitespace_linter()`.
 
 ### Tab characters
 
-- **Raven:** `raven.linting.noTabSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.noTabSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::whitespace_linter()` (the no-tab portion).
 - One diagnostic per line containing a tab, anchored at the first tab on that line.
 
 ### Trailing blank lines
 
-- **Raven:** `raven.linting.trailingBlankLinesSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.trailingBlankLinesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::trailing_blank_lines_linter()`.
 - Also fires when the file is missing a final newline.
 - Does not apply to `.Rmd` / `.qmd` documents: the rule describes the file's shape, and a chunk document's shape is Markdown, not R.
 
 ### Assignment operator
 
-- **Raven:** `raven.linting.assignmentOperator` (default `"<-"`, alternative `"="`), `raven.linting.assignmentOperatorSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.assignmentOperator` (default `"<-"`, alternative `"="`), `raven.linting.assignmentOperatorSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::assignment_linter()`.
 - Named-argument `=` inside function calls (`f(name = value)`) is never flagged. Assignments inside nested expressions — function bodies, braced blocks, control flow — are checked even when they appear inside an argument list.
 
 ### Object names
 
-- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `"snake_case"`), `raven.linting.objectNameSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `"snake_case"`), `raven.linting.objectNameSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::object_name_linter(styles = ...)`.
 - Each kind accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, or `"any"` (disable that kind).
 - Carve-outs: an optional leading `.` is always valid, but the rest of the name must still match the configured style (so `.helper` is fine under `snake_case`, but `.onLoad` is not — pick `camelCase` for that kind, or suppress it); S3-method names of the form `<known-base-generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`) are exempt; backtick-quoted names and non-ASCII identifiers are skipped.
 
 ### Infix spaces
 
-- **Raven:** `raven.linting.infixSpacesSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.infixSpacesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::infix_spaces_linter()`.
 - Spaces required on both sides of arithmetic, comparison, logical, assignment, pipe (`|>`, `%>%`, and any `%...%` user-defined operator), and binary `~`. No spaces on either side of `:`, `::`, `:::`, `$`, `@`. No space between a unary `-`, `+`, `!`, or `?` and its operand (the gap after the operator is checked; no constraint on what precedes it). Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped.
 
 ### Commented code
 
-- **Raven:** `raven.linting.commentedCodeSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.commentedCodeSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::commented_code_linter()`.
 - Flags a standalone comment block (consecutive `#` lines) whose body parses as R and contains a call, assignment, operator, or function definition. Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged.
 
 ### Quotes
 
-- **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::quotes_linter()` / `lintr::single_quotes_linter()` (the two map to the two settings above).
 - Raw strings (`r"(...)"`, `R'(...)'`, `r"---(...)---"`) are exempt — the outer quote is constrained by the body.
 
 ### Commas
 
-- **Raven:** `raven.linting.commasSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.commasSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::commas_linter()`.
 - Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. Matches `lintr`'s default `allow_trailing = FALSE` — a comma directly against a closing bracket (`a[1,]`) is still flagged.
 
 ### T / F symbol
 
-- **Raven:** `raven.linting.tAndFSymbolSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.tAndFSymbolSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::T_and_F_symbol_linter()`.
 - Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets (`T <- 0`), named arguments (`foo(T = TRUE)`), formal parameters (`function(T) ...`), and `$` / `@` field names (`obj$T`) are exempt — those positions don't read the boolean.
 
 ### Semicolon
 
-- **Raven:** `raven.linting.semicolonSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.semicolonSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::semicolon_linter()`.
 - Flags `;` separators in source. `;` inside string literals or comments is left alone. One diagnostic per `;`.
 
 ### Equals NA
 
-- **Raven:** `raven.linting.equalsNaSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.equalsNaSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::equals_na_linter()`.
 - Flags `x == NA`, `x != NA`, and the typed variants (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`) on either side. The comparison always returns `NA`; use `is.na(x)` instead.
 
 ### Object length
 
-- **Raven:** `raven.linting.objectLength` (default `30`), `raven.linting.objectLengthSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.objectLength` (default `30`), `raven.linting.objectLengthSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::object_length_linter(length = 30)`.
 - Flags assignment targets and formal parameters whose names exceed the configured length. An optional leading `.` (hidden identifier convention) is not counted. Backtick-quoted and non-ASCII names are exempt, matching `object_name`'s carve-outs.
 
 ### Vector logic
 
-- **Raven:** `raven.linting.vectorLogicSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.vectorLogicSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::vector_logic_linter()`.
 - Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar short-circuit form). The scan recurses through nested logical operators but stops at call boundaries — `if (any(x & y))` is left alone because the `&` is evaluated on a vector inside `any()`.
 
 ### Function left parentheses
 
-- **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::function_left_parentheses_linter()`.
 - Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`. The community convention is tight: `function(x)` and `\(x)`.
 
 ### Spaces inside
 
-- **Raven:** `raven.linting.spacesInsideSeverity` (default `"hint"`).
+- **Raven:** `raven.linting.spacesInsideSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
 - Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Empty groupings (`f()`, `f( )`, `mat[]`) and multi-line wrapping are exempt — only single-line interior whitespace is flagged.
 
 ### Indentation
 
-- **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.indentationSeverity` (default `"hint"`). When set to `"auto"` (the default), each R file is linted against VS Code's `editor.tabSize` for that specific file, so files with different tab-size settings in the same workspace are each linted correctly. Set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files regardless of editor settings. Note: if a `[[linting.overrides]]` entry explicitly sets `indentationUnit` for a file, it takes precedence over the per-file `editor.tabSize`.
+- **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.indentationSeverity` (default `"information"`). When set to `"auto"` (the default), each R file is linted against VS Code's `editor.tabSize` for that specific file, so files with different tab-size settings in the same workspace are each linted correctly. Set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files regardless of editor settings. Note: if a `[[linting.overrides]]` entry explicitly sets `indentationUnit` for a file, it takes precedence over the per-file `editor.tabSize`.
 - **`lintr` equivalent:** `lintr::indentation_linter()` with its tidy-default hanging style.
 - Flags lines whose leading whitespace doesn't match the indent expected by the AST scope the line sits in: braced blocks (one unit deeper than the line of `{`); multi-line argument lists (either aligned with the column after the opener — `foo(a,\n    b)` — or hanging one unit deeper than the opener's line); continuation lines under a binary operator (one unit deeper than the line where the chain starts). A closing delimiter (`)`, `]`, `]]`, `}`) that begins its own line aligns with the line of its opener.
 - Skipped without checks: blank lines, lines whose leading whitespace contains any tab (left to the `no_tab` rule), and lines that start strictly inside a multi-line string. Suppression markers behave as on every other rule.
@@ -238,7 +238,7 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 | `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
 | `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |
 
-To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"hint"` to `"warning"`.
+To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
 
 > **Note:** `mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints — they are always-on semantic warnings configured under `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Diagnostics § Semantic Warnings](diagnostics.md#semantic-warnings).
 

@@ -57,7 +57,7 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 - `--config PATH` — explicit path to a `raven.toml` or `.lintr` (default: walk upward from the workspace root, discovering a `raven.toml` or non-home `.lintr`; literal `~/.lintr` is not auto-discovered, but can be used with `--config ~/.lintr`).
 - `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
 - `--format text|json|sarif` — default `text`.
-- `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold.
+- `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold. Native style lints default to `information` (below `warning`), so they pass at `info` but gate at `--max-severity hint` or `off`.
 - `--report-uninstalled` (see [Missing-package reporting in CI](#missing-package-reporting-in-ci)) — re-enable missing-package warnings, which `raven check` otherwise suppresses by default.
 - `--quiet` — suppress the trailing summary line.
 - `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
@@ -138,7 +138,7 @@ raven lint [OPTIONS] [PATHS...]
 - `--config PATH` — explicit path to a `raven.toml` or `.lintr` (default: walk upward from CWD, discovering a `raven.toml` or non-home `.lintr`; literal `~/.lintr` is not auto-discovered, but can be used with `--config ~/.lintr`).
 - `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
 - `--format text|json|sarif` — default `text`.
-- `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). Linting is opt-in: with no `raven.toml` / `.lintr` discovered (or under `--no-config`) the linter is disabled and emits no diagnostics, so `raven lint .` exits 0. A discovered config enables rules; raising any to `warning` or `error` is what then gates CI.
+- `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). Linting is opt-in: with no `raven.toml` / `.lintr` discovered (or under `--no-config`) the linter is disabled and emits no diagnostics, so `raven lint .` exits 0. A discovered config enables rules; raising any to `warning` or `error` is what then gates CI. Native style lints default to `information`, so they pass at the default threshold but **do** gate at `--max-severity hint` or `off` — pin a lower threshold than `info` only if you intend style findings to fail the build.
 - `--quiet` — suppress the trailing summary line.
 - `--color auto|always|never` — when to colorize `text` output (default `auto`). See [Color output](#color-output).
 - `--no-color` — alias for `--color never`.

@@ -411,6 +411,31 @@ mod tests {
     }
 
     #[test]
+    fn default_native_lint_severities_are_information() {
+        let config = LintConfig::default();
+        let expected = Some(DiagnosticSeverity::INFORMATION);
+
+        assert_eq!(config.line_length_severity, expected);
+        assert_eq!(config.trailing_whitespace_severity, expected);
+        assert_eq!(config.no_tab_severity, expected);
+        assert_eq!(config.trailing_blank_lines_severity, expected);
+        assert_eq!(config.assignment_operator_severity, expected);
+        assert_eq!(config.object_name_severity, expected);
+        assert_eq!(config.infix_spaces_severity, expected);
+        assert_eq!(config.commented_code_severity, expected);
+        assert_eq!(config.quotes_severity, expected);
+        assert_eq!(config.commas_severity, expected);
+        assert_eq!(config.t_and_f_symbol_severity, expected);
+        assert_eq!(config.semicolon_severity, expected);
+        assert_eq!(config.equals_na_severity, expected);
+        assert_eq!(config.object_length_severity, expected);
+        assert_eq!(config.vector_logic_severity, expected);
+        assert_eq!(config.function_left_parentheses_severity, expected);
+        assert_eq!(config.spaces_inside_severity, expected);
+        assert_eq!(config.indentation_severity, expected);
+    }
+
+    #[test]
     fn line_length_flags_only_overlong_lines() {
         let config = LintConfig {
             line_length: 10,
