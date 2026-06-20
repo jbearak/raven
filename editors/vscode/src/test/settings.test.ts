@@ -126,6 +126,7 @@ const SETTINGS_MAPPING: Array<{
     // so that resetting a key propagates to the server instead of leaving
     // stale state active. Defaults below mirror package.json.
     { vsCodeKey: 'linting.enabled', jsonPath: ['linting', 'enabled'], type: 'enum', enumValues: ['auto', 'on', 'off', true, false] as const, defaultWhenUnconfigured: 'auto' },
+    { vsCodeKey: 'linting.readHomeLintr', jsonPath: ['linting', 'readHomeLintr'], type: 'boolean', defaultWhenUnconfigured: false },
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
     { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
     { vsCodeKey: 'linting.indentationUnit', jsonPath: ['linting', 'indentationUnit'], type: 'number', defaultWhenUnconfigured: 2 },
@@ -392,6 +393,7 @@ suite('Settings Transmission Property Tests', () => {
                 infixSpacesSeverity: 'hint',
                 commentedCodeSeverity: 'hint',
                 quotesSeverity: 'hint',
+                readHomeLintr: false,
                 commasSeverity: 'hint',
                 tAndFSymbolSeverity: 'hint',
                 semicolonSeverity: 'hint',
@@ -549,6 +551,7 @@ suite('Settings Transmission Unit Tests', () => {
         // Whole linting block populated with package.json defaults.
         assert.deepStrictEqual(options.linting, {
             enabled: 'auto',
+            readHomeLintr: false,
             lineLength: 80,
             objectLength: 30,
             indentationUnit: 2,
@@ -581,6 +584,7 @@ suite('Settings Transmission Unit Tests', () => {
     test('lint settings forward explicit values', () => {
         const configuredSettings = new Map<string, unknown>([
             ['linting.enabled', true],
+            ['linting.readHomeLintr', true],
             ['linting.lineLength', 120],
             ['linting.assignmentOperator', '='],
             ['linting.lineLengthSeverity', 'warning'],
@@ -594,6 +598,7 @@ suite('Settings Transmission Unit Tests', () => {
         const mockConfig = createMockConfig(configuredSettings);
         const options = getInitializationOptions(mockConfig);
         assert.strictEqual(options.linting?.enabled, true);
+        assert.strictEqual(options.linting?.readHomeLintr, true);
         assert.strictEqual(options.linting?.lineLength, 120);
         assert.strictEqual(options.linting?.assignmentOperator, '=');
         assert.strictEqual(options.linting?.lineLengthSeverity, 'warning');

@@ -1257,6 +1257,8 @@ pub struct Backend {
     state: Arc<RwLock<WorldState>>,
     request_cancellation: Arc<RequestCancellationRegistry>,
     traversal_truncation: Arc<TraversalTruncationState>,
+    #[cfg(test)]
+    test_home_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1424,7 +1426,28 @@ impl Backend {
             state,
             request_cancellation,
             traversal_truncation: Arc::new(TraversalTruncationState::default()),
+            #[cfg(test)]
+            test_home_dir: std::sync::Mutex::new(None),
         }
+    }
+
+    fn discovery_options_from_client_settings(
+        &self,
+        raw_client: &serde_json::Value,
+    ) -> crate::config_file::DiscoveryOptions {
+        let options = crate::config_file::DiscoveryOptions::from_client_settings(raw_client);
+        #[cfg(test)]
+        {
+            if let Some(home_dir) = self.test_home_dir.lock().unwrap().clone() {
+                return options.with_home_dir(&home_dir);
+            }
+        }
+        options
+    }
+
+    #[cfg(test)]
+    fn set_test_home_dir(&self, home_dir: &std::path::Path) {
+        *self.test_home_dir.lock().unwrap() = Some(home_dir.to_path_buf());
     }
 }
 
@@ -2581,11 +2604,9 @@ impl tower_lsp::lsp_types::notification::Notification for RavenProjectConfigLoad
 fn build_project_config_loaded_payload(path: Option<&std::path::Path>) -> serde_json::Value {
     match path {
         Some(p) => {
-            let source = if p.file_name() == Some(std::ffi::OsStr::new(".lintr")) {
-                ".lintr"
-            } else {
-                "raven.toml"
-            };
+            let source = crate::config_file::ConfigFileKind::from_path(p)
+                .unwrap_or(crate::config_file::ConfigFileKind::RavenToml)
+                .source_name();
             serde_json::json!({
                 "path": p.display().to_string(),
                 "source": source,
@@ -2596,6 +2617,157 @@ fn build_project_config_loaded_payload(path: Option<&std::path::Path>) -> serde_
             "source": serde_json::Value::Null,
         }),
     }
+}
+
+fn log_project_config_warnings(layer: &crate::config_file::DiscoveredLoad) {
+    if let crate::config_file::DiscoveredLoad::Loaded { warnings, .. } = layer {
+        for warning in warnings {
+            log::warn!("{warning}");
+        }
+    }
+}
+
+fn apply_project_config_layer(state: &mut WorldState, layer: crate::config_file::DiscoveredLoad) {
+    let loaded_project = match layer {
+        crate::config_file::DiscoveredLoad::Loaded { path, settings, .. } => Some((path, settings)),
+        crate::config_file::DiscoveredLoad::LoadFailed { .. }
+        | crate::config_file::DiscoveredLoad::None => None,
+    };
+
+    state.raw_project_settings = None;
+    state.project_config_path = None;
+    if let Some((path, settings)) = loaded_project {
+        state.raw_project_settings = Some(settings);
+        state.project_config_path = Some(path);
+    }
+}
+
+fn is_project_config_file(path: &std::path::Path) -> bool {
+    crate::config_file::ConfigFileKind::from_path(path).is_some()
+}
+
+enum ProjectConfigWatcherPolicy<'a> {
+    WorkspaceRoot,
+    Discovery(&'a crate::config_file::DiscoveryOptions),
+}
+
+fn project_config_watchers_for_dir(
+    dir: &std::path::Path,
+    policy: ProjectConfigWatcherPolicy<'_>,
+) -> Vec<FileSystemWatcher> {
+    let Ok(parent_uri) = Url::from_file_path(dir) else {
+        return Vec::new();
+    };
+
+    crate::config_file::ConfigFileKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let file_name = kind.file_name();
+            let candidate = dir.join(file_name);
+            match policy {
+                ProjectConfigWatcherPolicy::WorkspaceRoot => {}
+                ProjectConfigWatcherPolicy::Discovery(options)
+                    if !options.allows_config_path(&candidate) =>
+                {
+                    return None;
+                }
+                ProjectConfigWatcherPolicy::Discovery(_) => {}
+            }
+            Some(FileSystemWatcher {
+                glob_pattern: GlobPattern::Relative(RelativePattern {
+                    base_uri: OneOf::Right(parent_uri.clone()),
+                    pattern: file_name.into(),
+                }),
+                kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+            })
+        })
+        .collect()
+}
+
+fn build_workspace_project_config_watchers(workspace_folders: &[Url]) -> Vec<FileSystemWatcher> {
+    let mut dirs = std::collections::BTreeSet::new();
+
+    for workspace in workspace_folders.iter().take(1) {
+        let Ok(root) = workspace.to_file_path() else {
+            continue;
+        };
+        dirs.insert(root);
+    }
+
+    dirs.into_iter()
+        .flat_map(|dir| {
+            project_config_watchers_for_dir(&dir, ProjectConfigWatcherPolicy::WorkspaceRoot)
+        })
+        .collect()
+}
+
+fn is_inside_active_project_workspace(path: &std::path::Path, workspace_folders: &[Url]) -> bool {
+    workspace_folders.iter().take(1).any(|workspace| {
+        workspace
+            .to_file_path()
+            .map(|root| path.starts_with(root))
+            .unwrap_or(false)
+    })
+}
+
+fn external_project_config_watch_dirs(workspace_folders: &[Url]) -> Vec<std::path::PathBuf> {
+    let mut dirs = std::collections::BTreeSet::new();
+
+    for workspace in workspace_folders.iter().take(1) {
+        let Ok(root) = workspace.to_file_path() else {
+            continue;
+        };
+        for dir in crate::config_file::discovery::ancestor_dirs(&root) {
+            if !is_inside_active_project_workspace(dir, workspace_folders) {
+                dirs.insert(dir.to_path_buf());
+            }
+        }
+    }
+
+    dirs.into_iter().collect()
+}
+
+fn build_external_project_config_watchers(
+    workspace_folders: &[Url],
+    discovery_options: &crate::config_file::DiscoveryOptions,
+) -> Vec<FileSystemWatcher> {
+    external_project_config_watch_dirs(workspace_folders)
+        .into_iter()
+        .flat_map(|dir| {
+            project_config_watchers_for_dir(
+                &dir,
+                ProjectConfigWatcherPolicy::Discovery(discovery_options),
+            )
+        })
+        .collect()
+}
+
+fn config_file_event_affects_project_config(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    discovery_options: &crate::config_file::DiscoveryOptions,
+) -> bool {
+    if !is_project_config_file(path) || !discovery_options.allows_config_path(path) {
+        return false;
+    }
+
+    let Some(project_root) = project_root else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    crate::config_file::discovery::ancestor_dirs(project_root).any(|dir| dir == parent)
+}
+
+fn external_project_config_watch_changed(
+    workspace_folders: &[Url],
+    old_options: &crate::config_file::DiscoveryOptions,
+    new_options: &crate::config_file::DiscoveryOptions,
+) -> bool {
+    build_external_project_config_watchers(workspace_folders, old_options)
+        != build_external_project_config_watchers(workspace_folders, new_options)
 }
 
 /// Pre-recompute snapshot of the parsed configs that drive change-detection
@@ -2692,24 +2864,14 @@ impl LanguageServer for Backend {
             .initialization_options
             .clone()
             .unwrap_or(serde_json::Value::Null);
-        let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
-        if let Some(root) = &project_root {
-            // Discovery + load is shared with `raven check` via
-            // `discover_and_load`. The server treats a discovered-but-unloadable
-            // config as "no project layer" (collapse `LoadFailed`/`None`), since
-            // a startup config error should degrade gracefully, not abort.
-            if let crate::config_file::DiscoveredLoad::Loaded {
-                path,
-                settings,
-                warnings,
-            } = crate::config_file::discover_and_load(root)
-            {
-                for w in &warnings {
-                    log::warn!("{w}");
-                }
-                loaded_project = Some((path, settings));
-            }
-        }
+        let discovery_options = self.discovery_options_from_client_settings(&raw_client);
+        let project_layer = project_root
+            .as_deref()
+            .map(|root| {
+                crate::config_file::discover_and_load_with_options(root, &discovery_options)
+            })
+            .unwrap_or(crate::config_file::DiscoveredLoad::None);
+        log_project_config_warnings(&project_layer);
 
         // Second lock window: store raw layers, recompute parsed configs,
         // compile overrides. No I/O in this scope. The discovered path
@@ -2719,10 +2881,7 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             state.raw_client_settings = raw_client;
-            if let Some((p, settings)) = loaded_project {
-                state.raw_project_settings = Some(settings);
-                state.project_config_path = Some(p);
-            }
+            apply_project_config_layer(&mut state, project_layer);
             // `recompute_parsed_configs` now also recompiles
             // `state.lint_overrides` — callers no longer need a
             // separate `compile_lint_overrides` step.
@@ -3229,39 +3388,37 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Register dynamic file watches for raven.toml / .lintr. VS Code also
-        // covers these via its synchronize.fileEvents glob, so this is a no-op
-        // there; non-VS Code clients that honor dynamic registration pick up
-        // live reload from here.
+        // Register dynamic file watches for raven.toml / .lintr along the
+        // same workspace-root/ancestor paths that project-config discovery
+        // may consult. VS Code also sends broad synchronize.fileEvents for
+        // these names; the handler below filters those events back to the
+        // same discovery walk before reloading.
         {
-            use tower_lsp::lsp_types::{
-                DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
-                Registration, WatchKind,
+            use tower_lsp::lsp_types::Registration;
+            let (workspace_folders, raw_client) = {
+                let state = self.state.read().await;
+                (
+                    state.workspace_folders.clone(),
+                    state.raw_client_settings.clone(),
+                )
             };
-            let watchers = vec![
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/raven.toml".into()),
-                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
-                },
-                FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/.lintr".into()),
-                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
-                },
-            ];
-            let reg = Registration {
-                id: "raven-config-files".into(),
-                method: "workspace/didChangeWatchedFiles".into(),
-                register_options: Some(
-                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
-                        .unwrap(),
-                ),
-            };
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client.register_capability(vec![reg]).await {
+            let discovery_options = self.discovery_options_from_client_settings(&raw_client);
+            let watchers = build_workspace_project_config_watchers(&workspace_folders);
+            if !watchers.is_empty() {
+                let reg = Registration {
+                    id: "raven-config-files".into(),
+                    method: "workspace/didChangeWatchedFiles".into(),
+                    register_options: Some(
+                        serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                            .unwrap(),
+                    ),
+                };
+                if let Err(e) = self.client.register_capability(vec![reg]).await {
                     log::warn!("dynamic watch registration failed: {e}");
                 }
-            });
+            }
+            self.register_external_project_config_watch(workspace_folders, discovery_options)
+                .await;
         }
 
         let init_duration = init_start.elapsed();
@@ -5220,11 +5377,48 @@ impl LanguageServer for Backend {
             self.client.show_message(MessageType::WARNING, err).await;
         }
 
+        let new_raw_client = params.settings.clone();
+        let (project_root, previous_project_config_path, workspace_folders, old_raw_client): (
+            Option<std::path::PathBuf>,
+            Option<std::path::PathBuf>,
+            Vec<Url>,
+            serde_json::Value,
+        ) = {
+            let state = self.state.read().await;
+            (
+                state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok()),
+                state.project_config_path.clone(),
+                state.workspace_folders.clone(),
+                state.raw_client_settings.clone(),
+            )
+        };
+        let old_discovery_options = self.discovery_options_from_client_settings(&old_raw_client);
+        let new_discovery_options = self.discovery_options_from_client_settings(&new_raw_client);
+        // Any discovery-affecting setting change triggers rediscovery. Today
+        // that's only `read_home_lintr`, but comparing the whole struct keeps
+        // this correct if `DiscoveryOptions` grows another field.
+        let rediscover_project_config = old_discovery_options != new_discovery_options;
+        let project_layer = if rediscover_project_config {
+            let layer = project_root
+                .as_deref()
+                .map(|root| {
+                    crate::config_file::discover_and_load_with_options(root, &new_discovery_options)
+                })
+                .unwrap_or(crate::config_file::DiscoveredLoad::None);
+            log_project_config_warnings(&layer);
+            Some(layer)
+        } else {
+            None
+        };
+
         // Lock-only window: snapshot pre-change configs, store the new raw
         // client settings, recompute parsed configs, recompile lint
         // overrides. NO I/O — the helper handles every blocking action
         // outside the lock.
-        let snapshot = {
+        let (snapshot, project_config_path) = {
             let mut state = self.state.write().await;
 
             let prev = ConfigChangeSnapshot {
@@ -5237,12 +5431,15 @@ impl LanguageServer for Backend {
             // Store the new raw client settings and re-merge with the project
             // file (if any). recompute_parsed_configs() overwrites every
             // parsed config; absent sections reset to defaults.
-            state.raw_client_settings = params.settings.clone();
+            state.raw_client_settings = new_raw_client;
+            if let Some(layer) = project_layer {
+                apply_project_config_layer(&mut state, layer);
+            }
             // `recompute_parsed_configs` now also recompiles
             // `state.lint_overrides` from the merged settings.
             crate::config_file::recompute_parsed_configs(&mut state);
 
-            prev
+            (prev, state.project_config_path.clone())
         };
 
         // Helper drives change detection, package rebuilds, watcher
@@ -5250,6 +5447,23 @@ impl LanguageServer for Backend {
         // marking. Returns the URIs to publish (empty when only the
         // watcher-lifecycle settings flipped).
         let to_publish = self.reconcile_after_config_recompute(snapshot).await;
+
+        if rediscover_project_config {
+            if external_project_config_watch_changed(
+                &workspace_folders,
+                &old_discovery_options,
+                &new_discovery_options,
+            ) {
+                self.refresh_external_project_config_watch(
+                    workspace_folders,
+                    new_discovery_options,
+                )
+                .await;
+            }
+            if previous_project_config_path != project_config_path {
+                self.notify_project_config_loaded(project_config_path.as_deref());
+            }
+        }
 
         for uri in to_publish {
             self.publish_diagnostics(&uri).await;
@@ -5262,53 +5476,58 @@ impl LanguageServer for Backend {
             params.changes.len()
         );
 
-        // Detect raven.toml / .lintr events. These are not part of the
-        // source-file flow — they trigger a config-layer reload instead.
-        let config_file_changes: Vec<FileEvent> = params
+        let (project_root, raw_client): (Option<std::path::PathBuf>, serde_json::Value) = {
+            let state = self.state.read().await;
+            (
+                state
+                    .workspace_folders
+                    .first()
+                    .and_then(|u| u.to_file_path().ok()),
+                state.raw_client_settings.clone(),
+            )
+        };
+        let discovery_options = self.discovery_options_from_client_settings(&raw_client);
+
+        // Detect raven.toml / .lintr events. These files are never part of
+        // the source-file flow; only the subset that lies on the active
+        // discovery walk triggers a config-layer reload.
+        let config_file_change_uris: std::collections::HashSet<Url> = params
             .changes
             .iter()
             .filter(|c| {
                 let Ok(p) = c.uri.to_file_path() else {
                     return false;
                 };
-                let Some(name) = p.file_name() else {
-                    return false;
-                };
-                name == std::ffi::OsStr::new("raven.toml") || name == std::ffi::OsStr::new(".lintr")
+                is_project_config_file(&p)
             })
-            .cloned()
+            .map(|c| c.uri.clone())
             .collect();
+        let project_config_changed = params.changes.iter().any(|c| {
+            if !config_file_change_uris.contains(&c.uri) {
+                return false;
+            }
+            let Ok(p) = c.uri.to_file_path() else {
+                return false;
+            };
+            config_file_event_affects_project_config(
+                &p,
+                project_root.as_deref(),
+                &discovery_options,
+            )
+        });
 
-        if !config_file_changes.is_empty() {
+        if project_config_changed {
             // Step 1 (lock-free I/O): snapshot the workspace root, then run
-            // discovery + load_toml off-lock. Holding the write lock across
+            // discovery + config-file loading off-lock. Holding the write lock across
             // disk I/O violates the locking-discipline invariant in
             // CLAUDE.md.
-            let project_root: Option<std::path::PathBuf> = {
-                let state = self.state.read().await;
-                state
-                    .workspace_folders
-                    .first()
-                    .and_then(|u| u.to_file_path().ok())
-            };
-
-            let mut loaded_project: Option<(std::path::PathBuf, serde_json::Value)> = None;
-            if let Some(root) = &project_root {
-                // Same shared discovery+load seam as startup (`discover_and_load`);
-                // a discovered-but-unloadable config collapses to "no project
-                // layer" so a bad edit degrades gracefully rather than aborting.
-                if let crate::config_file::DiscoveredLoad::Loaded {
-                    path,
-                    settings,
-                    warnings,
-                } = crate::config_file::discover_and_load(root)
-                {
-                    for w in &warnings {
-                        log::warn!("{w}");
-                    }
-                    loaded_project = Some((path, settings));
-                }
-            }
+            let project_layer = project_root
+                .as_deref()
+                .map(|root| {
+                    crate::config_file::discover_and_load_with_options(root, &discovery_options)
+                })
+                .unwrap_or(crate::config_file::DiscoveredLoad::None);
+            log_project_config_warnings(&project_layer);
 
             // Step 2 (under write lock, no I/O): apply the reload —
             // snapshot prev configs for downstream rebuild gating, swap
@@ -5326,12 +5545,7 @@ impl LanguageServer for Backend {
 
                 // Re-run discovery from the workspace root. Order matters:
                 // raven.toml beats .lintr (DiscoveredConfig embodies that).
-                state.raw_project_settings = None;
-                state.project_config_path = None;
-                if let Some((p, settings)) = loaded_project {
-                    state.raw_project_settings = Some(settings);
-                    state.project_config_path = Some(p);
-                }
+                apply_project_config_layer(&mut state, project_layer);
 
                 // `recompute_parsed_configs` now also recompiles
                 // `state.lint_overrides` from the merged settings.
@@ -5339,7 +5553,6 @@ impl LanguageServer for Backend {
 
                 prev
             };
-
             // Helper drives change detection, package rebuilds, watcher
             // restart, completion re-registration, and force-republish
             // marking. Returns the URIs to publish (empty when only the
@@ -5354,7 +5567,10 @@ impl LanguageServer for Backend {
             // old — so consumers can treat it as the authoritative
             // "what's in effect now" signal. `path: null` means the
             // config file was removed.
-            let new_path = self.state.read().await.project_config_path.clone();
+            let new_path = {
+                let state = self.state.read().await;
+                state.project_config_path.clone()
+            };
             self.notify_project_config_loaded(new_path.as_deref());
 
             // Re-publish diagnostics for every open document. The
@@ -5393,7 +5609,7 @@ impl LanguageServer for Backend {
         let remaining_changes: Vec<FileEvent> = params
             .changes
             .iter()
-            .filter(|c| !config_file_changes.iter().any(|cc| cc.uri == c.uri))
+            .filter(|c| !config_file_change_uris.contains(&c.uri))
             .cloned()
             .collect();
         if remaining_changes.is_empty() {
@@ -6833,13 +7049,57 @@ fn help_html_to_json(
 }
 
 impl Backend {
+    async fn register_external_project_config_watch(
+        &self,
+        workspace_folders: Vec<Url>,
+        discovery_options: crate::config_file::DiscoveryOptions,
+    ) {
+        use tower_lsp::lsp_types::Registration;
+
+        let watchers =
+            build_external_project_config_watchers(&workspace_folders, &discovery_options);
+        let client = self.client.clone();
+        if watchers.is_empty() {
+            return;
+        }
+        let registration = Registration {
+            id: "raven-active-project-config-file".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                    .unwrap(),
+            ),
+        };
+        if let Err(e) = client.register_capability(vec![registration]).await {
+            log::warn!("external project-config watch registration failed: {e}");
+        }
+    }
+
+    async fn refresh_external_project_config_watch(
+        &self,
+        workspace_folders: Vec<Url>,
+        discovery_options: crate::config_file::DiscoveryOptions,
+    ) {
+        use tower_lsp::lsp_types::Unregistration;
+
+        let client = self.client.clone();
+        let unregistration = Unregistration {
+            id: "raven-active-project-config-file".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+        };
+        let _ = client.unregister_capability(vec![unregistration]).await;
+        self.register_external_project_config_watch(workspace_folders, discovery_options)
+            .await;
+    }
+
     /// Send the `raven/projectConfigLoaded` notification reflecting the
     /// current project-config state.
     ///
-    /// Fires from both [`initialize`] and the `did_change_watched_files`
-    /// `raven.toml` / `.lintr` reload branch — so clients see a fresh
-    /// payload every time the on-disk config is re-discovered (created,
-    /// edited, or deleted), not just at session start.
+    /// Fires from [`initialize`], the `did_change_watched_files`
+    /// `raven.toml` / `.lintr` reload branch, and `did_change_configuration`
+    /// rediscovery after client settings alter config discovery. Clients see a
+    /// fresh payload when the active project config changes, not just at
+    /// session start.
     ///
     /// Spawns the send on a detached tokio task so callers never hold a
     /// state lock across `client.send_notification`.
@@ -8936,6 +9196,50 @@ mod tests {
             assert_eq!(super::super::normalize_document_indent_unit(0), 1);
             assert_eq!(super::super::normalize_document_indent_unit(4), 4);
             assert_eq!(super::super::normalize_document_indent_unit(99), 8);
+        }
+    }
+
+    mod config_file_watches {
+        use tempfile::TempDir;
+        use tower_lsp::lsp_types::{GlobPattern, OneOf, Url, WatchKind};
+
+        #[test]
+        fn adds_exact_watches_for_external_config_directory() {
+            let home = TempDir::new().unwrap();
+            let workspace = home.path().join("project");
+            std::fs::create_dir(&workspace).unwrap();
+
+            let workspace_roots = vec![Url::from_file_path(&workspace).unwrap()];
+            let watchers = super::super::build_external_project_config_watchers(
+                &workspace_roots,
+                &crate::config_file::DiscoveryOptions::default(),
+            );
+            let parent_uri = Url::from_file_path(home.path()).unwrap();
+
+            for watcher in &watchers {
+                assert_eq!(
+                    watcher.kind,
+                    Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete)
+                );
+            }
+            assert!(
+                watchers.iter().any(|watcher| matches!(
+                    &watcher.glob_pattern,
+                    GlobPattern::Relative(pattern)
+                        if pattern.base_uri == OneOf::Right(parent_uri.clone())
+                            && pattern.pattern == "raven.toml"
+                )),
+                "expected exact watched-file pattern for external raven.toml, got {watchers:?}"
+            );
+            assert!(
+                watchers.iter().any(|watcher| matches!(
+                    &watcher.glob_pattern,
+                    GlobPattern::Relative(pattern)
+                        if pattern.base_uri == OneOf::Right(parent_uri.clone())
+                            && pattern.pattern == ".lintr"
+                )),
+                "expected exact watched-file pattern for external .lintr, got {watchers:?}"
+            );
         }
     }
 
@@ -12788,6 +13092,182 @@ mod project_config_initialize_tests {
         DidChangeConfigurationParams, InitializeParams, Url, WorkspaceFolder,
     };
 
+    async fn initialized_registrations(initialize_params: InitializeParams) -> Vec<Registration> {
+        initialized_registrations_with_home(initialize_params, None).await
+    }
+
+    async fn initialized_registrations_with_home(
+        initialize_params: InitializeParams,
+        test_home_dir: Option<&std::path::Path>,
+    ) -> Vec<Registration> {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{InitializedParams, RegistrationParams};
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        if let Some(home_dir) = test_home_dir {
+            svc.inner().set_test_home_dir(home_dir);
+        }
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::to_value(initialize_params).unwrap())
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let initialized = svc.inner().initialized(InitializedParams {});
+        tokio::pin!(initialized);
+        let mut registrations = Vec::new();
+        let mut initialized_done = false;
+
+        loop {
+            let request = if initialized_done {
+                match tokio::time::timeout(Duration::from_millis(100), request_stream.next()).await
+                {
+                    Ok(request) => request,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    () = &mut initialized => {
+                        initialized_done = true;
+                        continue;
+                    }
+                    request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                        request.expect("initialized should send dynamic registration requests")
+                    }
+                }
+            }
+            .expect("client socket should remain open");
+
+            if request.method() == "client/registerCapability" {
+                let params: RegistrationParams =
+                    serde_json::from_value(request.params().expect("registration params").clone())
+                        .unwrap();
+                registrations.extend(params.registrations);
+            }
+
+            if let Some(id) = request.id().cloned() {
+                response_sink
+                    .send(Response::from_ok(id, serde_json::Value::Null))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        registrations
+    }
+
+    fn watcher_options(registration: Registration) -> DidChangeWatchedFilesRegistrationOptions {
+        assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
+        serde_json::from_value(
+            registration
+                .register_options
+                .expect("watch registration options"),
+        )
+        .unwrap()
+    }
+
+    fn assert_has_exact_watcher(watchers: &[FileSystemWatcher], base_uri: &Url, pattern: &str) {
+        assert!(
+            watchers.iter().any(|watcher| matches!(
+                &watcher.glob_pattern,
+                GlobPattern::Relative(relative)
+                    if relative.base_uri == OneOf::Right(base_uri.clone())
+                        && relative.pattern == pattern
+            )),
+            "expected exact external {pattern} watcher at {base_uri}, got {watchers:?}",
+        );
+    }
+
+    fn assert_lacks_exact_watcher(watchers: &[FileSystemWatcher], base_uri: &Url, pattern: &str) {
+        assert!(
+            !watchers.iter().any(|watcher| matches!(
+                &watcher.glob_pattern,
+                GlobPattern::Relative(relative)
+                    if relative.base_uri == OneOf::Right(base_uri.clone())
+                        && relative.pattern == pattern
+            )),
+            "unexpected exact {pattern} watcher at {base_uri}, got {watchers:?}",
+        );
+    }
+
+    fn assert_all_watchers_cover_config_file_events(watchers: &[FileSystemWatcher]) {
+        for watcher in watchers {
+            assert_eq!(
+                watcher.kind,
+                Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initialized_external_project_config_watch_does_not_unregister_before_first_register() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::InitializedParams;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&workspace).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let initialized = svc.inner().initialized(InitializedParams {});
+        tokio::pin!(initialized);
+        let mut methods = Vec::new();
+
+        loop {
+            tokio::select! {
+                () = &mut initialized => break,
+                request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                    let request = request
+                        .expect("initialized should send dynamic registration requests")
+                        .expect("client socket should remain open");
+                    methods.push(request.method().to_string());
+                    if let Some(id) = request.id().cloned() {
+                        response_sink
+                            .send(Response::from_ok(id, serde_json::Value::Null))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !methods
+                .iter()
+                .any(|method| method == "client/unregisterCapability"),
+            "initial registration path must not unregister a capability id that was never registered; got {methods:?}"
+        );
+    }
+
     /// Regression for #281: an explicit client `enabled = false` must
     /// remain off even when discovery picks up a `.lintr` from the
     /// workspace (or an ancestor — same code path). Pre-fix, the `.lintr`
@@ -12930,11 +13410,8 @@ mod project_config_initialize_tests {
     #[tokio::test]
     async fn initialize_loads_raven_toml_from_workspace_root() {
         let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("raven.toml"),
-            "[linting]\nenabled = true\nlineLength = 123\n",
-        )
-        .unwrap();
+        let toml_path = tmp.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 123\n").unwrap();
         let root = Url::from_file_path(tmp.path()).unwrap();
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
@@ -12950,7 +13427,38 @@ mod project_config_initialize_tests {
         let state = backend.state.read().await;
         assert!(state.lint_config.enabled);
         assert_eq!(state.lint_config.line_length, 123);
-        assert!(state.project_config_path.is_some());
+        assert_eq!(
+            state.project_config_path.as_deref(),
+            Some(toml_path.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_ignores_malformed_ancestor_raven_toml() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(home.path().join("raven.toml"), "not valid = = toml [[[\n").unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let state = backend.state.read().await;
+        assert!(
+            state.project_config_path.is_none(),
+            "malformed raven.toml must not become the active project config"
+        );
     }
 
     #[tokio::test]
@@ -12975,6 +13483,303 @@ mod project_config_initialize_tests {
         assert!(state.lint_config.enabled);
         assert_eq!(state.lint_config.line_length, 90);
         assert!(state.project_config_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn did_change_configuration_read_home_lintr_toggle_loads_and_clears_home_lintr() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend.set_test_home_dir(home.path());
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&workspace).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.project_config_path.is_none(),
+                "literal home .lintr should be ignored before opt-in"
+            );
+            assert!(!state.lint_config.enabled);
+        }
+
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": true }
+                }),
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.project_config_path.as_deref(), Some(lintr.as_path()));
+            assert!(state.lint_config.enabled);
+            assert_eq!(state.lint_config.line_length, 120);
+        }
+
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": false }
+                }),
+            })
+            .await;
+        let state = backend.state.read().await;
+        assert!(
+            state.project_config_path.is_none(),
+            "turning readHomeLintr back off should clear the home .lintr project layer"
+        );
+        assert!(!state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 80);
+    }
+
+    #[tokio::test]
+    async fn did_change_configuration_read_home_lintr_toggle_notifies_project_config_loaded() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        svc.inner().set_test_home_dir(home.path());
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&workspace).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                        "linting": { "enabled": "auto", "readHomeLintr": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        for (read_home_lintr, expected_path, expected_source) in [
+            (
+                true,
+                serde_json::Value::String(lintr.display().to_string()),
+                serde_json::Value::String(".lintr".into()),
+            ),
+            (false, serde_json::Value::Null, serde_json::Value::Null),
+        ] {
+            let changed = svc
+                .inner()
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                        "linting": { "enabled": "auto", "readHomeLintr": read_home_lintr }
+                    }),
+                });
+            tokio::pin!(changed);
+            let mut changed_done = false;
+            let mut saw_notification = false;
+
+            loop {
+                if changed_done && saw_notification {
+                    break;
+                }
+
+                let request = if changed_done {
+                    tokio::time::timeout(Duration::from_secs(5), request_stream.next())
+                        .await
+                        .expect("settings change should send raven/projectConfigLoaded")
+                } else {
+                    tokio::select! {
+                        () = &mut changed => {
+                            changed_done = true;
+                            continue;
+                        }
+                        request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                            request.expect("settings change should send client requests or project config notification")
+                        }
+                    }
+                }
+                .expect("client socket should remain open");
+
+                if request.method() == "raven/projectConfigLoaded" {
+                    let payload = request.params().expect("project config payload");
+                    assert_eq!(payload["path"], expected_path);
+                    assert_eq!(payload["source"], expected_source);
+                    saw_notification = true;
+                }
+
+                if let Some(id) = request.id().cloned() {
+                    response_sink
+                        .send(Response::from_ok(id, serde_json::Value::Null))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn did_change_configuration_reregisters_external_watch_when_read_home_lintr_changes() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{InitializedParams, RegistrationParams, UnregistrationParams};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        svc.inner().set_test_home_dir(home.path());
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: root,
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                        "linting": { "enabled": "auto", "readHomeLintr": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let initialized = svc.inner().initialized(InitializedParams {});
+        tokio::pin!(initialized);
+        loop {
+            tokio::select! {
+                () = &mut initialized => break,
+                request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                    let request = request
+                        .expect("initialized should send dynamic registration requests")
+                        .expect("client socket should remain open");
+                    if let Some(id) = request.id().cloned() {
+                        response_sink
+                            .send(Response::from_ok(id, serde_json::Value::Null))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        let changed = svc
+            .inner()
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": true }
+                }),
+            });
+        tokio::pin!(changed);
+        let home_uri = Url::from_file_path(home.path()).unwrap();
+        let mut saw_unregister = false;
+        let mut saw_register = false;
+
+        loop {
+            tokio::select! {
+                () = &mut changed => break,
+                request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                    let request = request
+                        .expect("settings change should refresh external watchers")
+                        .expect("client socket should remain open");
+                    if request.method() == "client/unregisterCapability" {
+                        let params: UnregistrationParams = serde_json::from_value(
+                            request.params().expect("unregistration params").clone(),
+                        )
+                        .unwrap();
+                        saw_unregister |= params.unregisterations.iter().any(|registration| {
+                            registration.id == "raven-active-project-config-file"
+                                && registration.method == "workspace/didChangeWatchedFiles"
+                        });
+                    } else if request.method() == "client/registerCapability" {
+                        let params: RegistrationParams = serde_json::from_value(
+                            request.params().expect("registration params").clone(),
+                        )
+                        .unwrap();
+                        for registration in params.registrations {
+                            if registration.id != "raven-active-project-config-file" {
+                                continue;
+                            }
+                            let options = watcher_options(registration);
+                            assert_has_exact_watcher(&options.watchers, &home_uri, ".lintr");
+                            saw_register = true;
+                        }
+                    }
+
+                    if let Some(id) = request.id().cloned() {
+                        response_sink
+                            .send(Response::from_ok(id, serde_json::Value::Null))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_unregister,
+            "readHomeLintr watcher changes must unregister the previous exact watcher set"
+        );
+        assert!(
+            saw_register,
+            "readHomeLintr watcher changes must register the new exact watcher set"
+        );
     }
 
     /// When a client clears its linting settings (e.g. user "Reset Setting"
@@ -13075,6 +13880,162 @@ mod project_config_initialize_tests {
             })
             .await;
 
+        assert_eq!(backend.state.read().await.lint_config.line_length, 140);
+    }
+
+    #[tokio::test]
+    async fn watched_files_ignores_home_lintr_event_when_home_lintr_disabled() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let toml_path = workspace.join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 100\n").unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend.set_test_home_dir(home.path());
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&workspace).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto", "readHomeLintr": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.project_config_path.as_deref(),
+                Some(toml_path.as_path())
+            );
+            assert_eq!(state.lint_config.line_length, 100);
+        }
+
+        // Change the active config on disk without sending its event. A too-broad
+        // config reload triggered by the ignored home .lintr event below would
+        // pick this up and expose the bug as lineLength=140.
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 140\n").unwrap();
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(180))\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&lintr).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.project_config_path.as_deref(),
+            Some(toml_path.as_path())
+        );
+        assert_eq!(
+            state.lint_config.line_length, 100,
+            "disabled literal home .lintr events must not trigger project-config rediscovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_files_ignores_second_workspace_config_event() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let first_repo = TempDir::new().unwrap();
+        let second_repo = TempDir::new().unwrap();
+        let first = first_repo.path().join("project");
+        let second = second_repo.path().join("project");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_toml = first.join("raven.toml");
+        let second_toml = second.join("raven.toml");
+        fs::write(&first_toml, "[linting]\nenabled = true\nlineLength = 100\n").unwrap();
+        fs::write(
+            &second_toml,
+            "[linting]\nenabled = true\nlineLength = 180\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![
+                    WorkspaceFolder {
+                        uri: Url::from_file_path(&first).unwrap(),
+                        name: "first".into(),
+                    },
+                    WorkspaceFolder {
+                        uri: Url::from_file_path(&second).unwrap(),
+                        name: "second".into(),
+                    },
+                ]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.project_config_path.as_deref(),
+                Some(first_toml.as_path())
+            );
+            assert_eq!(state.lint_config.line_length, 100);
+        }
+
+        // Mutate the active first-root config without sending its event. If the
+        // second-root event below caused a broad rediscovery, the active config
+        // would change to 140.
+        fs::write(&first_toml, "[linting]\nenabled = true\nlineLength = 140\n").unwrap();
+        fs::write(
+            &second_toml,
+            "[linting]\nenabled = true\nlineLength = 220\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&second_toml).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.project_config_path.as_deref(),
+                Some(first_toml.as_path())
+            );
+            assert_eq!(
+                state.lint_config.line_length, 100,
+                "second workspace config events must not reload the first workspace project config"
+            );
+        }
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&first_toml).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
         assert_eq!(backend.state.read().await.lint_config.line_length, 140);
     }
 
@@ -13532,6 +14493,683 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test]
+    async fn watched_files_reload_picks_up_opted_in_home_dotlintr() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend.set_test_home_dir(home.path());
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&workspace).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto", "readHomeLintr": true }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.project_config_path.as_deref(), Some(lintr.as_path()));
+            assert!(state.lint_config.enabled);
+            assert_eq!(state.lint_config.line_length, 120);
+        }
+
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(180))\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&lintr).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.project_config_path.as_deref(), Some(lintr.as_path()));
+            assert_eq!(state.lint_config.line_length, 180);
+        }
+
+        fs::remove_file(&lintr).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&lintr).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.project_config_path.is_none(),
+            "deleted opted-in home .lintr must clear the active project layer"
+        );
+        assert!(!state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 80);
+    }
+
+    /// Deleting an ancestor `.lintr` must clear the project config layer.
+    /// This is the server-side half of the external `.lintr` live-reload path:
+    /// once the exact external watcher reports the delete event, rediscovery
+    /// from the workspace root must stop treating the deleted ancestor file as
+    /// active and must fall back to built-in lint defaults.
+    #[tokio::test]
+    async fn watched_files_reload_clears_deleted_ancestor_dotlintr() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.project_config_path.as_deref(), Some(lintr.as_path()));
+            assert!(state.lint_config.enabled);
+            assert_eq!(state.lint_config.line_length, 120);
+        }
+
+        fs::remove_file(&lintr).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&lintr).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.project_config_path.is_none(),
+            "deleted ancestor .lintr must clear project_config_path"
+        );
+        assert!(
+            !state.lint_config.enabled,
+            "without a discovered .lintr, auto linting should fall back off"
+        );
+        assert_eq!(state.lint_config.line_length, 80);
+        drop(state);
+
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(180))\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&lintr).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.project_config_path.as_deref(),
+            Some(lintr.as_path()),
+            "recreated ancestor .lintr must become active again"
+        );
+        assert!(state.lint_config.enabled);
+        assert_eq!(state.lint_config.line_length, 180);
+    }
+
+    #[tokio::test]
+    async fn watched_files_reload_picks_up_external_raven_toml_created_next_to_active_dotlintr() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.read().await.project_config_path.as_deref(),
+            Some(lintr.as_path())
+        );
+
+        let toml_path = home.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 160\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.project_config_path.as_deref(),
+            Some(toml_path.as_path()),
+            "external raven.toml created next to active .lintr must take precedence"
+        );
+        assert_eq!(state.lint_config.line_length, 160);
+    }
+
+    #[tokio::test]
+    async fn watched_files_reload_reactivates_external_raven_toml_after_delete_fallback() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let toml_path = home.path().join("raven.toml");
+        let lintr = home.path().join(".lintr");
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 120\n").unwrap();
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(140))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "linting": { "enabled": "auto" }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.read().await.project_config_path.as_deref(),
+            Some(toml_path.as_path())
+        );
+
+        fs::remove_file(&toml_path).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.project_config_path.as_deref(), Some(lintr.as_path()));
+            assert_eq!(state.lint_config.line_length, 140);
+        }
+
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 180\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.project_config_path.as_deref(),
+            Some(toml_path.as_path()),
+            "recreated external raven.toml must take precedence over fallback .lintr"
+        );
+        assert_eq!(state.lint_config.line_length, 180);
+    }
+
+    #[tokio::test]
+    async fn initialized_registers_exact_external_project_config_watcher() {
+        use serde_json::json;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let registrations = initialized_registrations(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root.clone(),
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false },
+                "linting": { "enabled": "auto" }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let parent_uri = Url::from_file_path(home.path()).unwrap();
+        let base_registration = registrations
+            .iter()
+            .find(|registration| registration.id == "raven-config-files")
+            .cloned()
+            .expect("initialized must register exact workspace config-file watchers");
+        let base_options = watcher_options(base_registration);
+        assert_eq!(base_options.watchers.len(), 2);
+        assert_all_watchers_cover_config_file_events(&base_options.watchers);
+        assert_has_exact_watcher(&base_options.watchers, &root, "raven.toml");
+        assert_has_exact_watcher(&base_options.watchers, &root, ".lintr");
+
+        let exact_registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("initialized must register exact external config-file watchers");
+        let exact_options = watcher_options(exact_registration);
+        assert_all_watchers_cover_config_file_events(&exact_options.watchers);
+        assert_has_exact_watcher(&exact_options.watchers, &parent_uri, "raven.toml");
+        assert_has_exact_watcher(&exact_options.watchers, &parent_uri, ".lintr");
+    }
+
+    #[tokio::test]
+    async fn initialized_project_config_watchers_follow_active_first_workspace_only() {
+        use serde_json::json;
+
+        let first_repo = TempDir::new().unwrap();
+        let second_repo = TempDir::new().unwrap();
+        let first = first_repo.path().join("project");
+        let second = second_repo.path().join("project");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_uri = Url::from_file_path(&first).unwrap();
+        let second_uri = Url::from_file_path(&second).unwrap();
+
+        let registrations = initialized_registrations(InitializeParams {
+            workspace_folders: Some(vec![
+                WorkspaceFolder {
+                    uri: first_uri.clone(),
+                    name: "first".into(),
+                },
+                WorkspaceFolder {
+                    uri: second_uri.clone(),
+                    name: "second".into(),
+                },
+            ]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false },
+                "linting": { "enabled": "auto" }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let base_registration = registrations
+            .iter()
+            .find(|registration| registration.id == "raven-config-files")
+            .cloned()
+            .expect("initialized must register exact workspace config-file watchers");
+        let base_options = watcher_options(base_registration);
+        assert_has_exact_watcher(&base_options.watchers, &first_uri, "raven.toml");
+        assert_has_exact_watcher(&base_options.watchers, &first_uri, ".lintr");
+        assert_lacks_exact_watcher(&base_options.watchers, &second_uri, "raven.toml");
+        assert_lacks_exact_watcher(&base_options.watchers, &second_uri, ".lintr");
+
+        let first_parent_uri = Url::from_file_path(first_repo.path()).unwrap();
+        let second_parent_uri = Url::from_file_path(second_repo.path()).unwrap();
+        let exact_registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("initialized must register exact external config-file watchers");
+        let exact_options = watcher_options(exact_registration);
+        assert_has_exact_watcher(&exact_options.watchers, &first_parent_uri, "raven.toml");
+        assert_has_exact_watcher(&exact_options.watchers, &first_parent_uri, ".lintr");
+        assert_lacks_exact_watcher(&exact_options.watchers, &second_parent_uri, "raven.toml");
+        assert_lacks_exact_watcher(&exact_options.watchers, &second_parent_uri, ".lintr");
+    }
+
+    #[tokio::test]
+    async fn initialized_registers_external_ancestor_watchers_without_active_config() {
+        use serde_json::json;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let registrations = initialized_registrations(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false },
+                "linting": { "enabled": "auto" }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let parent_uri = Url::from_file_path(home.path()).unwrap();
+        let registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("absent external configs should still have exact ancestor watchers");
+        let options = watcher_options(registration);
+        assert_all_watchers_cover_config_file_events(&options.watchers);
+        assert_has_exact_watcher(&options.watchers, &parent_uri, "raven.toml");
+        assert_has_exact_watcher(&options.watchers, &parent_uri, ".lintr");
+    }
+
+    #[tokio::test]
+    async fn initialized_keeps_workspace_home_lintr_watcher_when_home_lintr_disabled() {
+        use serde_json::json;
+
+        let home = TempDir::new().unwrap();
+        let root = Url::from_file_path(home.path()).unwrap();
+
+        let registrations = initialized_registrations_with_home(
+            InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "home".into(),
+                }]),
+                initialization_options: Some(json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": false }
+                })),
+                ..Default::default()
+            },
+            Some(home.path()),
+        )
+        .await;
+
+        let base_registration = registrations
+            .iter()
+            .find(|registration| registration.id == "raven-config-files")
+            .cloned()
+            .expect("initialized must register exact workspace config-file watchers");
+        let base_options = watcher_options(base_registration);
+        assert_all_watchers_cover_config_file_events(&base_options.watchers);
+        assert_has_exact_watcher(&base_options.watchers, &root, "raven.toml");
+        assert_has_exact_watcher(&base_options.watchers, &root, ".lintr");
+    }
+
+    #[tokio::test]
+    async fn initialized_skips_external_home_lintr_watcher_when_home_lintr_disabled() {
+        use serde_json::json;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let registrations = initialized_registrations_with_home(
+            InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "project".into(),
+                }]),
+                initialization_options: Some(json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false },
+                    "linting": { "enabled": "auto", "readHomeLintr": false }
+                })),
+                ..Default::default()
+            },
+            Some(home.path()),
+        )
+        .await;
+
+        let home_uri = Url::from_file_path(home.path()).unwrap();
+        let registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("external ancestor raven.toml watcher should still be registered");
+        let options = watcher_options(registration);
+        assert_all_watchers_cover_config_file_events(&options.watchers);
+        assert_has_exact_watcher(&options.watchers, &home_uri, "raven.toml");
+        assert_lacks_exact_watcher(&options.watchers, &home_uri, ".lintr");
+    }
+
+    #[test]
+    fn config_file_event_filter_ignores_nested_configs_outside_discovery_walk() {
+        let tmp = TempDir::new().unwrap();
+        let configured_home = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project");
+        let nested = workspace.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let options =
+            crate::config_file::DiscoveryOptions::default().with_home_dir(configured_home.path());
+        assert!(
+            super::config_file_event_affects_project_config(
+                &workspace.join("raven.toml"),
+                Some(&workspace),
+                &options,
+            ),
+            "workspace-root raven.toml is on the discovery walk"
+        );
+        assert!(
+            !super::config_file_event_affects_project_config(
+                &nested.join("raven.toml"),
+                Some(&workspace),
+                &options,
+            ),
+            "nested raven.toml is not discovered from the workspace root"
+        );
+        assert!(
+            super::config_file_event_affects_project_config(
+                &tmp.path().join(".lintr"),
+                Some(&workspace),
+                &options,
+            ),
+            "non-home ancestor .lintr is on the discovery walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialized_external_watchers_include_closer_ancestor_than_active_config() {
+        use serde_json::json;
+
+        let repo = TempDir::new().unwrap();
+        let nearer = repo.path().join("analysis");
+        let workspace = nearer.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let lintr = repo.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let registrations = initialized_registrations(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false },
+                "linting": { "enabled": "auto" }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let active_parent_uri = Url::from_file_path(repo.path()).unwrap();
+        let nearer_uri = Url::from_file_path(&nearer).unwrap();
+        let registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("external ancestor watchers should be registered");
+        let options = watcher_options(registration);
+        assert_all_watchers_cover_config_file_events(&options.watchers);
+        assert_has_exact_watcher(&options.watchers, &active_parent_uri, "raven.toml");
+        assert_has_exact_watcher(&options.watchers, &active_parent_uri, ".lintr");
+        assert_has_exact_watcher(&options.watchers, &nearer_uri, "raven.toml");
+        assert_has_exact_watcher(&options.watchers, &nearer_uri, ".lintr");
+    }
+
+    #[tokio::test]
+    async fn initialized_registers_external_project_config_watcher_for_load_failed_config() {
+        use serde_json::json;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let toml_path = home.path().join("raven.toml");
+        fs::write(&toml_path, "not valid = = toml [[[\n").unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let registrations = initialized_registrations(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let parent_uri = Url::from_file_path(home.path()).unwrap();
+        let registration = registrations
+            .into_iter()
+            .find(|registration| registration.id == "raven-active-project-config-file")
+            .expect("load-failed external config should still register external watcher");
+        let options = watcher_options(registration);
+
+        assert_all_watchers_cover_config_file_events(&options.watchers);
+        assert_has_exact_watcher(&options.watchers, &parent_uri, "raven.toml");
+        assert_has_exact_watcher(&options.watchers, &parent_uri, ".lintr");
+    }
+
+    /// If an external project config becomes malformed, it must stop being
+    /// active and reset the parsed settings that came from that project layer.
+    /// Separate watcher-registration tests cover keeping external config
+    /// directories watched so a later fix is not missed.
+    #[tokio::test]
+    async fn watched_files_reload_clears_load_failed_external_config_layer() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let toml_path = home.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\nlineLength = 120\n").unwrap();
+        let root = Url::from_file_path(&workspace).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.project_config_path.as_deref(),
+                Some(toml_path.as_path())
+            );
+            assert!(state.lint_config.enabled);
+            assert_eq!(state.lint_config.line_length, 120);
+        }
+
+        fs::write(&toml_path, "not valid = = toml [[[\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&toml_path).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.project_config_path.is_none(),
+            "load failure must clear the active project config"
+        );
+        assert!(state.raw_project_settings.is_none());
+        assert_eq!(state.lint_config.line_length, 80);
+    }
+
     /// The watched-files reload path must update `state.project_config_path`
     /// so the subsequent `raven/projectConfigLoaded` notification carries
     /// the live value (rather than the path captured at initialize time).
@@ -13589,6 +15227,110 @@ mod project_config_initialize_tests {
             })
             .await;
         assert!(backend.state.read().await.project_config_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn watched_files_reload_notifies_project_config_loaded_over_socket() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: root,
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let toml_path = tmp.path().join("raven.toml");
+        fs::write(&toml_path, "[linting]\nenabled = true\n").unwrap();
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        macro_rules! expect_project_config_loaded {
+            ($change_type:expr, $expected_path:expr, $expected_source:expr) => {{
+                let changed = svc
+                    .inner()
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![FileEvent {
+                            uri: Url::from_file_path(&toml_path).unwrap(),
+                            typ: $change_type,
+                        }],
+                    });
+                tokio::pin!(changed);
+                let mut changed_done = false;
+                let mut saw_notification = false;
+
+                loop {
+                    if changed_done && saw_notification {
+                        break;
+                    }
+
+                    let request = if changed_done {
+                        tokio::time::timeout(Duration::from_secs(5), request_stream.next())
+                            .await
+                            .expect("watched-files reload should send raven/projectConfigLoaded")
+                    } else {
+                        tokio::select! {
+                            () = &mut changed => {
+                                changed_done = true;
+                                continue;
+                            }
+                            request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                                request.expect("watched-files reload should send client requests or project config notification")
+                            }
+                        }
+                    }
+                    .expect("client socket should remain open");
+
+                    if request.method() == "raven/projectConfigLoaded" {
+                        let payload = request.params().expect("project config payload");
+                        assert_eq!(payload["path"], $expected_path);
+                        assert_eq!(payload["source"], $expected_source);
+                        saw_notification = true;
+                    }
+
+                    if let Some(id) = request.id().cloned() {
+                        response_sink
+                            .send(Response::from_ok(id, serde_json::Value::Null))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }};
+        }
+
+        expect_project_config_loaded!(
+            FileChangeType::CREATED,
+            serde_json::Value::String(toml_path.display().to_string()),
+            serde_json::Value::String("raven.toml".into())
+        );
+
+        fs::remove_file(&toml_path).unwrap();
+        expect_project_config_loaded!(
+            FileChangeType::DELETED,
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        );
     }
 
     /// `did_change_watched_files` publishes diagnostics for every open

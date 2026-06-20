@@ -13,7 +13,9 @@ import {
     createScaffoldFile,
     detectExistingLintingKeys,
     detectUserManagedLintingKeys,
+    isProjectScopedLintingSettingKey,
 } from '../scaffold';
+import { renderRavenToml } from '../extension';
 import { activate } from './helper';
 
 declare const suite: Mocha.SuiteFunction;
@@ -21,6 +23,11 @@ declare const test: Mocha.TestFunction;
 
 const vscodeRoot = path.resolve(__dirname, '..', '..');
 const packageJsonPath = path.join(vscodeRoot, 'package.json');
+const settingsReferenceGeneratorPath = path.join(
+    vscodeRoot,
+    'scripts',
+    'generate-settings-reference.mjs',
+);
 
 interface CommandContribution {
     command: string;
@@ -40,7 +47,7 @@ function escapeRegex(input: string): string {
     return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function loadLintingSettingKeys(): string[] {
+function loadProjectLintingSettingKeys(): string[] {
     const raw = fs.readFileSync(packageJsonPath, 'utf8');
     const pkg = JSON.parse(raw) as {
         contributes?: {
@@ -49,7 +56,26 @@ function loadLintingSettingKeys(): string[] {
     };
     const properties = pkg.contributes?.configuration?.properties ?? {};
     return Object.keys(properties)
-        .filter((k) => k.startsWith('raven.linting.'))
+        .filter(isProjectScopedLintingSettingKey)
+        .sort();
+}
+
+function loadLintingKeysWithoutTomlPath(): string[] {
+    const source = fs.readFileSync(settingsReferenceGeneratorPath, 'utf8');
+    const match = source.match(/const TOML_PATH_OVERRIDES = \{([\s\S]*?)\};/);
+    assert.ok(match, 'settings-reference generator must declare TOML_PATH_OVERRIDES');
+    return [...match[1].matchAll(/"([^"]+)":\s*null/g)]
+        .map((entry) => entry[1])
+        .filter((key) => key.startsWith('raven.linting.'))
+        .sort();
+}
+
+function renderedRavenTomlLintingKeys(): string[] {
+    return renderRavenToml({})
+        .split(/\r?\n/)
+        .map((line) => line.match(/^\s*(?:#\s*)?([A-Za-z][A-Za-z0-9]*)\s*=/)?.[1])
+        .filter((key): key is string => key !== undefined)
+        .map((key) => `raven.linting.${key}`)
         .sort();
 }
 
@@ -109,14 +135,44 @@ suite('scaffold templates', () => {
         assert.strictEqual(parsed['raven.linting.objectLength'], 30);
     });
 
-    test('linting-settings template covers every raven.linting.* configuration key', () => {
-        const declared = loadLintingSettingKeys();
+    test('linting-settings template covers every project-scoped raven.linting.* key', () => {
+        const declared = loadProjectLintingSettingKeys();
         const present = (detectExistingLintingKeys(LINTING_SETTINGS_TEMPLATE) ?? []).sort();
         assert.deepStrictEqual(
             present,
             declared,
-            'every raven.linting.* configuration key must appear in the scaffold template',
+            'every project-scoped raven.linting.* configuration key must appear in the scaffold template',
         );
+    });
+
+    test('raven.toml scaffold covers every project-scoped raven.linting.* key', () => {
+        assert.deepStrictEqual(
+            renderedRavenTomlLintingKeys(),
+            loadProjectLintingSettingKeys(),
+            'every project-scoped raven.linting.* configuration key must appear in the generated raven.toml scaffold',
+        );
+    });
+
+    test('project-scoped linting predicate agrees with settings-reference TOML overrides', () => {
+        const noTomlPath = new Set(loadLintingKeysWithoutTomlPath());
+        const raw = fs.readFileSync(packageJsonPath, 'utf8');
+        const pkg = JSON.parse(raw) as {
+            contributes?: {
+                configuration?: { properties?: Record<string, unknown> };
+            };
+        };
+        const properties = pkg.contributes?.configuration?.properties ?? {};
+        const lintingKeys = Object.keys(properties)
+            .filter((key) => key.startsWith('raven.linting.'))
+            .sort();
+
+        for (const key of lintingKeys) {
+            assert.strictEqual(
+                isProjectScopedLintingSettingKey(key),
+                !noTomlPath.has(key),
+                `${key} must be project-scoped iff it has a raven.toml path in the settings-reference generator`,
+            );
+        }
     });
 
     test('linting-settings template wraps the block in sentinel comments', () => {
@@ -246,6 +302,27 @@ suite('scaffold linting-settings merge', () => {
             merged.includes('"editor.tabSize": 2'),
             'unrelated keys must survive overwrite',
         );
+    });
+
+    test('preserves client-only linting settings when merging project-scoped block', () => {
+        const existing = `{
+  "raven.linting.readHomeLintr": true,
+  "raven.linting.enabled": false
+}
+`;
+        const merged = mergeOrThrow(existing);
+        const parsed = JSON.parse(
+            merged
+                .replace(/\/\/[^\n]*/g, '')
+                .replace(/,(\s*[}\]])/g, '$1'),
+        ) as Record<string, unknown>;
+
+        assert.strictEqual(
+            parsed['raven.linting.readHomeLintr'],
+            true,
+            'client-only linting setting must not be removed by project-scoped scaffold',
+        );
+        assert.strictEqual(parsed['raven.linting.enabled'], true);
     });
 
     test('inserts comma before a trailing line comment on the last property', () => {
@@ -568,6 +645,13 @@ suite('detectUserManagedLintingKeys', () => {
             'raven.linting.enabled',
             'raven.linting.lineLength',
         ]);
+    });
+
+    test('ignores client-only linting settings when deciding whether to prompt', () => {
+        const text = `{
+  "raven.linting.readHomeLintr": true
+}`;
+        assert.deepStrictEqual(detectUserManagedLintingKeys(text), []);
     });
 });
 

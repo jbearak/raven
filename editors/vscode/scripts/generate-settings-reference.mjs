@@ -84,6 +84,17 @@ const DOC_LINK_OVERRIDES = {
   "raven.packages.rprofilePrelude": "rprofile.md",
 };
 
+const TOML_PATH_OVERRIDES = {
+  "raven.linting.readHomeLintr": null,
+};
+
+const DESCRIPTION_OVERRIDES = {
+  "raven.linting.enabled":
+    '"auto" enables linting when a .lintr or raven.toml opts in, except literal ~/.lintr is ignored unless the LSP-client setting raven.linting.readHomeLintr is true or the CLI receives --config ~/.lintr, and .lintr is ignored when REditorSupport or Positron already owns lintr diagnostics.',
+  "raven.linting.readHomeLintr":
+    "VS Code/LSP-client-only. Read literal ~/.lintr during project-config discovery; the CLI uses literal ~/.lintr only when passed explicitly with --config ~/.lintr.",
+};
+
 function escapeCell(text) {
   // Escape backslashes first so the pipe-escape pass doesn't double up an
   // already-escaped sequence (`\|` → `\\|`). Then normalize newlines so a
@@ -154,6 +165,9 @@ function firstSentence(text) {
 }
 
 function tomlPath(key) {
+  if (Object.prototype.hasOwnProperty.call(TOML_PATH_OVERRIDES, key)) {
+    return TOML_PATH_OVERRIDES[key];
+  }
   // `raven.foo.bar` → `foo` is the first segment.
   const parts = key.split(".");
   if (parts.length < 2 || parts[0] !== "raven") return null;
@@ -173,7 +187,7 @@ function docLink(key) {
 
 function buildRow(key, schema) {
   const description = schema.markdownDescription ?? schema.description ?? "";
-  const oneLine = firstSentence(description);
+  const oneLine = DESCRIPTION_OVERRIDES[key] ?? firstSentence(description);
   const tomlCell = tomlPath(key) ? inlineCode(tomlPath(key)) : "—";
   return [
     inlineCode(key),
@@ -218,7 +232,7 @@ function buildMarkdown(properties) {
   lines.push("");
   lines.push(
     "The **`raven.toml` path** column shows where to set a key in a project's `raven.toml`. " +
-      "A `—` means the setting is VS Code-client-only and is not read from `raven.toml`."
+      "A `—` means the setting is not read from `raven.toml`; most such settings are VS Code-client-only, and LSP-client-only exceptions say so in their descriptions."
   );
   lines.push("");
   lines.push(`| ${header.join(" | ")} |`);

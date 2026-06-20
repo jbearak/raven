@@ -88,7 +88,8 @@ Lints each .R / .r file against the rules configured in raven.toml
 prose and non-R chunks are ignored.
 
 Options:
-  --config PATH               Path to raven.toml (default: search upward)
+  --config PATH               Path to raven.toml or .lintr (default: search upward,
+                              skipping literal ~/.lintr unless passed here)
   --no-config                 Use built-in defaults; ignore raven.toml/.lintr
   --format text|json|sarif    Output format (default: text)
   --max-severity LEVEL        Highest severity that does NOT fail the build
@@ -115,8 +116,7 @@ Exit codes:
 /// process-global current directory.
 ///
 /// Precedence matches the editor: `--no-config` wins, then an explicit
-/// `--config` (raven.toml only — see the tri-state-enabled design spec,
-/// section 7), then auto-discovery via the shared
+/// `--config`, then auto-discovery via the shared
 /// [`crate::config_file::discover_and_load`] seam. Routing `raven lint` through
 /// that seam — the same one the LSP startup path, the watched-files reload, and
 /// `raven check` use — keeps the four from drifting on discovery precedence or
@@ -133,40 +133,62 @@ Exit codes:
 /// unreadable/unparseable config (the explicit `--config` and discovery paths
 /// print a one-line note first); `Ok((root, project_settings, lintr_discovered))`
 /// otherwise.
+#[cfg(test)]
 fn resolve_lint_config(
     cwd: &Path,
     args: &LintArgs,
+) -> Result<(PathBuf, Option<serde_json::Value>, bool), i32> {
+    resolve_lint_config_with_options(cwd, args, &crate::config_file::DiscoveryOptions::default())
+}
+
+fn resolve_lint_config_with_options(
+    cwd: &Path,
+    args: &LintArgs,
+    discovery_options: &crate::config_file::DiscoveryOptions,
 ) -> Result<(PathBuf, Option<serde_json::Value>, bool), i32> {
     if args.no_config {
         return Ok((cwd.to_path_buf(), None, false));
     }
 
     if let Some(explicit) = args.config_path.as_ref() {
-        return match crate::config_file::load_toml(explicit) {
-            Some(l) => {
+        return match crate::config_file::load_explicit_config_from_base(cwd, explicit) {
+            Some((explicit_abs, l)) => {
                 for w in l.warnings {
                     eprintln!("{w}");
                 }
-                // Resolve the parent so `root` is absolute even when `--config`
-                // points at a relative path. Without this,
-                // `resolve_lint_for_document`'s `strip_prefix(root)` check fails
-                // for the absolute URIs produced by `walk` — silently dropping
-                // every per-file `[[linting.overrides]]` patch (same failure
-                // mode as commit 81978f0 fixed for the non-explicit root).
-                let parent = explicit.parent().unwrap_or(cwd).to_path_buf();
-                let absolute = if parent.is_absolute() {
-                    parent
+                let lintr_discovered =
+                    crate::config_file::ConfigFileKind::is_lintr_path(&explicit_abs);
+                // `raven.toml` and project-local `.lintr` files are
+                // project-root configs, so an explicit path anchors the lint
+                // root at the config parent. Literal home `.lintr` is the
+                // exception: `--config ~/.lintr` is a user-level opt-in, so keep
+                // paths relative to the invocation cwd and lint that project
+                // rather than `$HOME`.
+                let base = if lintr_discovered
+                    && discovery_options.is_home_lintr_path(explicit_abs.as_path())
+                {
+                    cwd.to_path_buf()
                 } else {
-                    cwd.join(&parent)
+                    // Resolve the parent so `root` is absolute even when
+                    // `--config` points at a relative path. Without this,
+                    // `resolve_lint_for_document`'s `strip_prefix(root)` check
+                    // fails for the absolute URIs produced by `walk` — silently
+                    // dropping every per-file `[[linting.overrides]]` patch
+                    // (same failure mode as commit 81978f0 fixed for the
+                    // non-explicit root).
+                    explicit_abs
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| cwd.to_path_buf())
                 };
-                // Then normalize away `.`/`..`: `strip_prefix(root)` is purely
+                // Normalize away `.`/`..`: `strip_prefix(root)` is purely
                 // lexical, so a `..` left in `root` (e.g. `--config
                 // ../pkg/raven.toml`) wouldn't prefix-match a file given by its
                 // absolute path under that config root, again silently dropping
-                // its overrides. Normalize lexically (not via `canonicalize`) so
-                // a non-existent root still resolves predictably.
-                let root = crate::cross_file::normalize_path_public(&absolute).unwrap_or(absolute);
-                Ok((root, Some(l.settings), false))
+                // its overrides. Normalize lexically (not via `canonicalize`)
+                // so a non-existent root still resolves predictably.
+                let root = crate::cross_file::normalize_path_public(&base).unwrap_or(base);
+                Ok((root, Some(l.settings), lintr_discovered))
             }
             None => {
                 eprintln!("raven lint: failed to load --config {}", explicit.display());
@@ -175,7 +197,7 @@ fn resolve_lint_config(
         };
     }
 
-    match crate::config_file::discover_and_load(cwd) {
+    match crate::config_file::discover_and_load_with_options(cwd, discovery_options) {
         crate::config_file::DiscoveredLoad::Loaded {
             path,
             settings,
@@ -184,7 +206,7 @@ fn resolve_lint_config(
             for w in warnings {
                 eprintln!("{w}");
             }
-            let lintr_discovered = path.file_name() == Some(std::ffi::OsStr::new(".lintr"));
+            let lintr_discovered = crate::config_file::ConfigFileKind::is_lintr_path(&path);
             let root = path.parent().unwrap_or(cwd).to_path_buf();
             Ok((root, Some(settings), lintr_discovered))
         }
@@ -204,12 +226,24 @@ pub fn run(args: LintArgs) -> i32 {
             return EXIT_OPERATOR_ERROR;
         }
     };
+    run_with_cwd(args, &cwd)
+}
 
+fn run_with_cwd(args: LintArgs, cwd: &Path) -> i32 {
+    run_with_cwd_and_options(args, cwd, &crate::config_file::DiscoveryOptions::default())
+}
+
+fn run_with_cwd_and_options(
+    args: LintArgs,
+    cwd: &Path,
+    discovery_options: &crate::config_file::DiscoveryOptions,
+) -> i32 {
     // Resolve project root + project settings + lintr-discovered signal.
-    let (root, project_settings, lintr_discovered) = match resolve_lint_config(&cwd, &args) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    let (root, project_settings, lintr_discovered) =
+        match resolve_lint_config_with_options(cwd, &args, discovery_options) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
 
     // Parse the base lint config from the (project-only) settings, since the
     // CLI has no LSP client. Merge with an empty client layer for correctness.
@@ -224,9 +258,15 @@ pub fn run(args: LintArgs) -> i32 {
 
     let mut diagnostics: Vec<(PathBuf, Diagnostic)> = Vec::new();
     let mut operator_error = false;
-    for p in &args.paths {
+    for p in args.paths.iter().map(|p| {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        }
+    }) {
         walk(
-            p,
+            &p,
             &root,
             &base_section,
             &lint_config,
@@ -482,6 +522,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_lint_config_ignores_literal_home_lintr_by_default() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            home.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let discovery_options =
+            crate::config_file::DiscoveryOptions::default().with_home_dir(home.path());
+
+        let (root, settings, lintr_discovered) =
+            resolve_lint_config_with_options(&workspace, &discovery_args(), &discovery_options)
+                .unwrap();
+
+        assert_eq!(root, workspace);
+        assert!(
+            settings.is_none(),
+            "CLI auto-discovery should ignore literal home .lintr by default"
+        );
+        assert!(!lintr_discovered);
+    }
+
+    #[test]
     fn resolve_lint_config_honors_discovered_raven_toml() {
         use std::fs;
         use tempfile::TempDir;
@@ -565,6 +633,104 @@ mod tests {
     }
 
     #[test]
+    fn resolve_lint_config_honors_explicit_lintr() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let lintr = tmp.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let mut args = discovery_args();
+        args.config_path = Some(lintr);
+
+        let (root, settings, lintr_discovered) = resolve_lint_config(tmp.path(), &args).unwrap();
+
+        assert_eq!(root, tmp.path().to_path_buf());
+        assert_eq!(settings.unwrap()["linting"]["lineLength"], json!(120));
+        assert!(lintr_discovered);
+    }
+
+    #[test]
+    fn resolve_lint_config_explicit_home_lintr_keeps_cwd_as_root() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let lintr = home.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let mut args = discovery_args();
+        args.config_path = Some(lintr);
+        let discovery_options =
+            crate::config_file::DiscoveryOptions::default().with_home_dir(home.path());
+
+        let (root, settings, lintr_discovered) =
+            resolve_lint_config_with_options(&workspace, &args, &discovery_options).unwrap();
+
+        assert_eq!(
+            root, workspace,
+            "explicit ~/.lintr must not make $HOME the lint root"
+        );
+        assert_eq!(settings.unwrap()["linting"]["lineLength"], json!(120));
+        assert!(lintr_discovered);
+    }
+
+    #[test]
+    fn resolve_lint_config_explicit_non_home_lintr_uses_config_parent_as_root() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let cwd = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let lintr = project.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let mut args = discovery_args();
+        args.config_path = Some(lintr);
+
+        let (root, settings, lintr_discovered) = resolve_lint_config(cwd.path(), &args).unwrap();
+
+        assert_eq!(root, project.path().to_path_buf());
+        assert_eq!(settings.unwrap()["linting"]["lineLength"], json!(120));
+        assert!(lintr_discovered);
+    }
+
+    #[test]
+    fn resolve_lint_config_relative_explicit_lintr_loads_from_cwd() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let cwd = TempDir::new().unwrap();
+        let config_dir = cwd.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let mut args = discovery_args();
+        args.config_path = Some(PathBuf::from("config").join(".lintr"));
+
+        let (root, settings, lintr_discovered) = resolve_lint_config(cwd.path(), &args).unwrap();
+
+        assert_eq!(root, config_dir);
+        assert_eq!(settings.unwrap()["linting"]["lineLength"], json!(120));
+        assert!(lintr_discovered);
+    }
+
+    #[test]
     fn walk_resolves_overrides_for_dotdot_paths_like_clean_paths() {
         use std::fs;
         use tempfile::TempDir;
@@ -640,7 +806,7 @@ mod tests {
         .unwrap();
         fs::write(
             tmp.path().join("over.R"),
-            "x <- 'this line is intentionally way more than twenty characters wide'\n",
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
         )
         .unwrap();
 
@@ -661,6 +827,72 @@ mod tests {
         // suite that runs the binary.
         let code = run(args);
         assert_eq!(code, EXIT_LINT_FAILED); // warning > info default
+    }
+
+    #[test]
+    fn end_to_end_explicit_lintr_finds_line_length_violation() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(20))\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("over.R"),
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let args = LintArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            config_path: Some(tmp.path().join(".lintr")),
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Off,
+            quiet: true,
+            color: ColorChoice::Never,
+        };
+
+        assert_eq!(run(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn end_to_end_explicit_home_lintr_lints_project_cwd_default_path() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            home.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(20))\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("over.R"),
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let args = LintArgs {
+            paths: vec![PathBuf::from(".")],
+            config_path: Some(home.path().join(".lintr")),
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Off,
+            quiet: true,
+            color: ColorChoice::Never,
+        };
+        let discovery_options =
+            crate::config_file::DiscoveryOptions::default().with_home_dir(home.path());
+
+        assert_eq!(
+            run_with_cwd_and_options(args, &workspace, &discovery_options),
+            EXIT_LINT_FAILED
+        );
     }
 
     /// Args that lint one file with `enabled` linting, sharing the boilerplate

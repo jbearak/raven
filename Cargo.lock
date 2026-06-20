@@ -1620,6 +1620,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "env_logger",
+ "futures-util",
  "globset",
  "indexmap",
  "libc",
