@@ -399,19 +399,34 @@ fn parse_named_string(args: &str, name: &str) -> Option<String> {
 fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
     let raw = parse_named_arg(args, "styles").or_else(|| {
         let first = split_top_level_commas(args).into_iter().next()?.trim();
-        if first.is_empty() || first.contains('=') {
-            None
-        } else {
-            Some(first)
+        if first.is_empty() {
+            return None;
         }
+        // A positional `styles` value is a quoted scalar or a `c(...)` vector;
+        // accept those even when their contents contain `=` (e.g. a regex with
+        // a `(?=...)` lookahead). A bare `name = value` token is a *different*
+        // named argument (such as `regexes = ...`) that we don't map, so only
+        // an unquoted, non-`c(...)` token containing `=` is rejected here.
+        let is_quoted = first.starts_with('"') || first.starts_with('\'');
+        let is_vector = first.starts_with("c(");
+        if !is_quoted && !is_vector && first.contains('=') {
+            return None;
+        }
+        Some(first)
     })?;
     let raw = raw.trim();
     if let Some(inner) = raw.strip_prefix("c(").and_then(|r| r.strip_suffix(')')) {
+        // Drop *syntactically* empty tokens (e.g. a trailing comma) before
+        // stripping quotes, so a quoted-empty element `""` survives as a real
+        // (degenerate) style that is later flagged unrepresentable rather than
+        // silently vanishing — which would let `c("", "snake_case")` collapse
+        // to a single recognized style and map instead of warning.
         Some(
             split_top_level_commas(inner)
                 .into_iter()
-                .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
                 .collect(),
         )
     } else {
@@ -654,6 +669,84 @@ mod tests {
             out.warnings.is_empty(),
             "the bare no-arg form must not warn"
         );
+    }
+
+    /// Helper: did the load surface the batch warning for unrepresentable input?
+    fn has_unrecognized_warning(out: &LoadedLintr) -> bool {
+        out.warnings
+            .iter()
+            .any(|w| w.contains("unrecognized construct"))
+    }
+
+    /// Helper: did the load map any object-name style?
+    fn mapped_object_name_style(out: &LoadedLintr) -> bool {
+        out.settings
+            .get("linting")
+            .and_then(|l| l.get("objectNameStyleFunction"))
+            .is_some()
+    }
+
+    #[test]
+    fn object_name_positional_regex_with_equals_still_warns() {
+        // A positional raw regex that contains '=' (e.g. a lookahead) must
+        // still be flagged unrepresentable, not mistaken for a `name = value`
+        // named argument and silently dropped.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(\"^(?=.*[A-Z])[a-z]+$\"))\n",
+        );
+        assert!(!mapped_object_name_style(&out));
+        assert!(
+            has_unrecognized_warning(&out),
+            "a positional regex containing '=' must produce the batch warning"
+        );
+    }
+
+    #[test]
+    fn object_name_positional_regex_with_comma_in_quotes_warns() {
+        // The comma lives inside the quoted string, so split_top_level_commas
+        // must keep it as one entry; the regex is still unrepresentable.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"^[a-z,]+$\"))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(has_unrecognized_warning(&out));
+    }
+
+    #[test]
+    fn object_name_regexes_named_arg_is_ignored_silently() {
+        // `regexes =` has no Raven equivalent and is a no-op (documented as
+        // ignored, not warned).
+        let out =
+            load_str("linters: linters_with_defaults(object_name_linter(regexes = \"^x$\"))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(
+            out.warnings.is_empty(),
+            "regexes = is an ignored no-op, not a warning"
+        );
+    }
+
+    #[test]
+    fn object_name_empty_vector_is_noop() {
+        let out = load_str("linters: linters_with_defaults(object_name_linter(c()))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(out.warnings.is_empty(), "c() resolves to no styles: no-op");
+    }
+
+    #[test]
+    fn object_name_quoted_empty_element_is_unrepresentable() {
+        // A quoted-empty element is a real (degenerate) element: it must not
+        // vanish. `c("")` -> one unrepresentable style -> warn; and
+        // `c("", "snake_case")` must NOT collapse to a single mapped style.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(c(\"\")))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(has_unrecognized_warning(&out));
+
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(c(\"\", \"snake_case\")))\n",
+        );
+        assert!(
+            !mapped_object_name_style(&out),
+            "an empty element must keep the vector multi-element so it warns, not map snake_case"
+        );
+        assert!(has_unrecognized_warning(&out));
     }
 
     // --- Task 4: the full user example (loader JSON layer) ---
