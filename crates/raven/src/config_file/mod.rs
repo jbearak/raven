@@ -98,6 +98,19 @@ pub(crate) fn lintr_expresses_linting(raw_project: Option<&serde_json::Value>) -
     raw_project.and_then(|s| s.get("linting")).is_some()
 }
 
+/// The single source of truth for "does this config file opt a project into
+/// linting via the `.lintr` path?": it must be a `.lintr` file AND express
+/// linting config (see [`lintr_expresses_linting`]). Used by both the LSP server
+/// gate ([`recompute_parsed_configs`]) and the CLI
+/// (`cli::lint::resolve_lint_config`) so the two surfaces cannot drift on the
+/// opt-in rule — if the policy ever tightens, both follow automatically.
+pub(crate) fn lintr_path_opts_in(
+    path: &std::path::Path,
+    raw_project: Option<&serde_json::Value>,
+) -> bool {
+    ConfigFileKind::is_lintr_path(path) && lintr_expresses_linting(raw_project)
+}
+
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
@@ -125,8 +138,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let lintr_discovered = state
         .project_config_path
         .as_deref()
-        .is_some_and(ConfigFileKind::is_lintr_path)
-        && lintr_expresses_linting(state.raw_project_settings.as_ref());
+        .is_some_and(|p| lintr_path_opts_in(p, state.raw_project_settings.as_ref()));
     // Gate ONLY the `.lintr` auto-enable path on the client environment signal
     // (#337). An explicit client `on`/`off` and `raven.toml enabled = true`
     // flow through `merged` independently and are unaffected, because they

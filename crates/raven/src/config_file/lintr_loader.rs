@@ -47,19 +47,21 @@ pub fn load_str(text: &str) -> LoadedLintr {
     let mut expresses_config = false;
 
     for (key, value) in fields {
-        // A recognized field whose brackets do not balance is malformed (a
-        // missing `)`, or a stray extra one). Point at it specifically rather
-        // than letting it dissolve into the generic "unrecognized construct"
-        // batch note, and do not apply a half-parsed value. A malformed field
-        // does NOT count as expressing linting config: a `.lintr` whose only
-        // content is a typo must not silently auto-enable linting at defaults
-        // (the user asked for a specific rule set, not the default one).
+        // A recognized `linters:`/`exclusions:` field expresses linting intent —
+        // so it opts the project in (sets `expresses_config`) and is parsed
+        // best-effort — regardless of whether its value is perfectly formed. A
+        // bracket imbalance (a missing `)`, or a stray extra one) is almost
+        // always a typo, so point at it specifically to help the user locate it;
+        // but we still attempt to parse and still opt in, because the
+        // alternative — dropping the whole field and treating the file as
+        // expressing nothing — would let a single typo silently turn OFF all
+        // linting (the user sees no diagnostics and assumes their code is clean)
+        // or discard the well-formed customizations alongside the broken one.
         if is_lintr_field(&key) && brackets_unbalanced(&value) {
             warnings.push(format!(
-                ".lintr: field '{}' has unbalanced brackets (likely a missing ')'); its value was not applied",
+                ".lintr: field '{}' has unbalanced brackets (likely a stray or missing ')'); parsing it best-effort",
                 key
             ));
-            continue;
         }
         match key.as_str() {
             "linters" => {
@@ -606,27 +608,33 @@ impl ScanState {
     }
 }
 
-/// True if `s`'s brackets are unbalanced in *either* direction — more opens than
-/// closes (an unterminated call: the common missing-`)` typo) OR more closes
-/// than opens (a stray extra `)`). Reuses [`ScanState`] for string/comment-aware
-/// scanning but keeps its own non-floored counter, because [`ScanState::depth`]
-/// floors at 0 and so cannot observe a net-negative imbalance (`linters_with_defaults())`
-/// would read as balanced). Used by [`load_str`] to flag a malformed field
-/// precisely instead of letting it dissolve into generic "unrecognized
-/// construct" noise.
+/// True if `s`'s brackets do not nest into matching pairs — an unclosed opener
+/// (the common missing-`)` typo), a stray closer with nothing to match
+/// (`linters_with_defaults())`), or a closer of the wrong *type*
+/// (`linters_with_defaults[...)`). Reuses [`ScanState`] for string/comment-aware
+/// scanning (brackets inside a string or `#` comment are not structural) but
+/// keeps its own type stack, because [`ScanState::depth`] is a single floored
+/// counter that can see neither a net-negative imbalance nor a type mismatch.
+/// Used by [`load_str`] to flag a malformed field precisely and by
+/// [`strip_named_call`] to confirm a wrapper's parens are a matching pair.
 fn brackets_unbalanced(s: &str) -> bool {
     let mut st = ScanState::default();
-    let mut net: i32 = 0;
+    let mut stack: Vec<char> = Vec::new();
     for c in s.chars() {
-        if st.step(c) {
-            match c {
-                '(' | '[' | '{' => net += 1,
-                ')' | ']' | '}' => net -= 1,
-                _ => {}
-            }
+        if !st.step(c) {
+            continue;
+        }
+        match c {
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            // A closer must match the most recent opener; a wrong type or an
+            // empty stack (a stray closer) means the brackets are unbalanced.
+            ')' | ']' | '}' if stack.pop() != Some(c) => return true,
+            _ => {}
         }
     }
-    net != 0
+    !stack.is_empty()
 }
 
 /// Remove `#`-to-end-of-line comments from an R-ish value, preserving any `#`
@@ -689,12 +697,6 @@ fn parse_r_uint(s: &str) -> Option<u64> {
     body.parse::<u64>().ok()
 }
 
-/// Resolve an unsigned-integer linter argument: the named form `name = N` if
-/// present anywhere in the list, else the first positional integer. Tokenizes
-/// the argument list once (the named lookup and the positional fallback share
-/// the split). The positional fallback considers only the *first* argument: if
-/// that is itself a named argument it yields `None`, matching R, where the first
-/// formal (`length` / `indent`) is what a leading positional integer binds to.
 /// Resolve a linter argument by lintr's binding rules: the named form
 /// `name = value` if present anywhere in the list, else the first *positional*
 /// argument (any named arguments are skipped — they bind by name and leave the
@@ -765,14 +767,19 @@ fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
 
 /// Strip a `name(...)` call wrapper, tolerating whitespace between `name` and
 /// `(` (valid R: `linters_with_defaults (x)`). Returns the inner argument text,
-/// or `None` if `s` is not a `name(...)` call. The required `(` immediately
-/// after the (whitespace-trimmed) name is what prevents a false match on a
+/// or `None` if `s` is not a single `name(...)` call. The required `(`
+/// immediately after the (whitespace-trimmed) name prevents a false match on a
 /// longer identifier: `strip_named_call("listings(x)", "list")` strips the
 /// `list` prefix to `"ings(x)"`, whose next non-space char is not `(`, so it
-/// returns `None`.
+/// returns `None`. The leading `(` and trailing `)` must also be a *matching*
+/// pair that wraps the whole argument list — verified by requiring the inner
+/// text to be bracket-balanced — so a value like `f(a) + g(b)` (where the first
+/// `(` is closed mid-string and the trailing `)` belongs to a different group)
+/// is not mis-unwrapped to the garbage inner `a) + g(b`.
 fn strip_named_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let after = s.trim().strip_prefix(name)?.trim_start();
-    after.strip_prefix('(').and_then(|r| r.strip_suffix(')'))
+    let inner = after.strip_prefix('(')?.strip_suffix(')')?;
+    (!brackets_unbalanced(inner)).then_some(inner)
 }
 
 /// Strip a `c(...)` vector wrapper, tolerating optional whitespace between the
@@ -1818,21 +1825,57 @@ mod tests {
     }
 
     #[test]
-    fn malformed_only_lintr_does_not_auto_enable() {
-        // A `.lintr` whose only field is a typo'd (unbalanced) `linters:` must
-        // not silently auto-enable linting at defaults: it expresses no
-        // applicable config, so no `linting` object is emitted.
+    fn malformed_field_still_opts_in_and_warns() {
+        // A recognized field expresses linting intent even when its value has a
+        // typo: it still opts the project in (so a single missing `)` cannot
+        // silently turn ALL linting off and leave the user thinking their code
+        // is clean), and the imbalance is flagged so they can find the typo.
         let out = load_str("linters: linters_with_defaults(\n");
         assert!(
-            out.settings.get("linting").is_none(),
-            "a malformed-only .lintr must not emit a linting object: {:?}",
+            out.settings.get("linting").is_some(),
+            "a recognized field must opt in even when malformed: {:?}",
             out.settings
         );
         assert!(
             out.warnings.iter().any(|w| w.contains("unbalanced")),
-            "{:?}",
+            "the imbalance must be flagged: {:?}",
             out.warnings
         );
+    }
+
+    #[test]
+    fn well_formed_entries_survive_a_sibling_unbalanced_field() {
+        // An unbalanced field is parsed best-effort, not discarded wholesale: a
+        // following well-formed field still applies. (The unbalanced field here
+        // is recovered as its own field by dcf_fold's header break.)
+        let input = "linters: linters_with_defaults(line_length_linter(120)\n\
+            exclusions: list(\"a.R\")\n";
+        let out = load_str(input);
+        let files = out.settings["linting"]["overrides"][0]["files"]
+            .as_array()
+            .expect("the well-formed exclusions field must still apply");
+        assert!(files.iter().any(|v| v == &json!("a.R")), "{files:?}");
+    }
+
+    #[test]
+    fn mismatched_bracket_type_is_flagged_unbalanced() {
+        // A closer of the wrong type (`}` where `)` was meant) nets to zero with
+        // a plain counter but is still malformed; the type-aware check catches
+        // it instead of silently parsing garbage.
+        assert!(brackets_unbalanced("f[a)"));
+        assert!(brackets_unbalanced(
+            "linters_with_defaults(line_length_linter(120)}"
+        ));
+        assert!(!brackets_unbalanced("f(a[1])"));
+    }
+
+    #[test]
+    fn strip_named_call_rejects_unmatched_paren_pair() {
+        // The leading `(` and trailing `)` must be a matching pair wrapping the
+        // whole call: `f(a) + g(b)` must NOT unwrap to the garbage `a) + g(b`.
+        assert_eq!(strip_named_call("f(a) + g(b)", "f"), None);
+        assert_eq!(strip_named_call("f(a, b)", "f"), Some("a, b"));
+        assert_eq!(strip_named_call("f(g(1), h(2))", "f"), Some("g(1), h(2)"));
     }
 
     #[test]

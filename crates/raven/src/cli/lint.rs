@@ -187,9 +187,10 @@ fn resolve_lint_config_with_options(
                 // so a non-existent root still resolves predictably.
                 let root = crate::cross_file::normalize_path_public(&base).unwrap_or(base);
                 // A `.lintr` (even one passed explicitly) opts into linting only
-                // when it expresses linting config; a blank one must not.
+                // when it expresses linting config; a blank one must not. Shared
+                // policy with the server gate (see `lintr_path_opts_in`).
                 let lintr_discovered =
-                    is_lintr && crate::config_file::lintr_expresses_linting(Some(&l.settings));
+                    crate::config_file::lintr_path_opts_in(&explicit_abs, Some(&l.settings));
                 Ok((root, Some(l.settings), lintr_discovered))
             }
             None => {
@@ -209,10 +210,9 @@ fn resolve_lint_config_with_options(
                 eprintln!("{w}");
             }
             // A discovered `.lintr` opts into linting only when it expresses
-            // linting config; a blank/empty one must not (mirrors the server's
-            // `recompute_parsed_configs` gate).
-            let lintr_discovered = crate::config_file::ConfigFileKind::is_lintr_path(&path)
-                && crate::config_file::lintr_expresses_linting(Some(&settings));
+            // linting config; a blank/empty one must not (shared policy with the
+            // server's `recompute_parsed_configs` gate, see `lintr_path_opts_in`).
+            let lintr_discovered = crate::config_file::lintr_path_opts_in(&path, Some(&settings));
             let root = path.parent().unwrap_or(cwd).to_path_buf();
             Ok((root, Some(settings), lintr_discovered))
         }
