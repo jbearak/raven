@@ -18393,6 +18393,28 @@ fn is_namespace_package_side(node: Node) -> bool {
         .is_some_and(|lhs| lhs.id() == node.id())
 }
 
+/// True when `node` sits under a `:::` (internal) namespace operator, false for
+/// `::`. Walks up to the enclosing `namespace_operator` and inspects the colon
+/// token. Hover uses this to skip member-existence suppression for `:::`:
+/// internal symbols are real members (just unexported), so they are never
+/// member-validated — mirroring the `namespace-member-not-found` diagnostic's
+/// `!internal` gate.
+fn namespace_operator_is_internal(node: Node, text: &str) -> bool {
+    let mut current = node;
+    loop {
+        if current.kind() == "namespace_operator" {
+            let mut cursor = current.walk();
+            return current
+                .children(&mut cursor)
+                .any(|c| node_text(c, text) == ":::");
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+}
+
 /// Build the hover markdown for the package side of `pkg::name` — the package's
 /// `Title`/`Description` from its installed DESCRIPTION, or a "not installed"
 /// note when no library path contains the package.
@@ -19407,6 +19429,26 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         }
 
         let pkg_owned = qualifier_pkg.to_string();
+
+        // Resolve-or-suppress for the member (RHS) side: if `pkg::member`
+        // references a member that a COMPLETE export set authoritatively does not
+        // contain, show NO hover rather than fabricating a `from {pkg}`
+        // attribution for a member that does not exist (the #379 `from {base}`
+        // defect class). This keeps hover in parity with the
+        // `namespace-member-not-found` diagnostic: it suppresses exactly when the
+        // diagnostic fires. Never for `:::` (internal symbols are real members,
+        // just unexported) and never for Partial/Unknown metadata (the package
+        // may not be warmed yet) — `namespace_member_status_sync` returns
+        // `Absent` only from a `Complete` set.
+        if !namespace_operator_is_internal(node, &text)
+            && state
+                .package_library
+                .namespace_member_status_sync(&pkg_owned, name)
+                == crate::package_library::NamespaceMemberStatus::Absent
+        {
+            return None;
+        }
+
         let mut value = build_help_panel_link(name, &pkg_owned);
         if let Some(help_text) =
             get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
@@ -65448,6 +65490,55 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             result.is_some(),
             "hover on a backtick-quoted syntactic call must resolve to the bare definition"
+        );
+    }
+
+    /// Hover on a `pkg::member` whose package has a COMPLETE export set that does
+    /// not contain the member must show NO hover — it must not fabricate a
+    /// `from {pkg}` attribution for a member that does not exist (resolve-or-
+    /// suppress, parity with the `namespace-member-not-found` diagnostic).
+    #[tokio::test]
+    async fn hover_on_absent_namespace_member_is_suppressed() {
+        let mut state = create_state();
+        // pkgload is cached with a Complete export set that lacks `undefined`.
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "pkgload".to_string(),
+            std::collections::HashSet::from(["load_all".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        state.package_library.insert_package(info).await;
+
+        let uri = add_doc(&mut state, "file:///t.R", "pkgload::undefined()\n");
+        // Cursor on `undefined` (RHS), which starts at column 9 (`pkgload::`).
+        let result = super::hover(&state, &uri, Position::new(0, 12)).await;
+        assert!(
+            result.is_none(),
+            "hover on an absent namespace member must be suppressed, got: {result:?}"
+        );
+    }
+
+    /// A real `pkg::member` (present in the cached export set) still hovers — the
+    /// suppression above must not swallow valid members.
+    #[tokio::test]
+    async fn hover_on_present_namespace_member_resolves() {
+        let mut state = create_state();
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "pkgload".to_string(),
+            std::collections::HashSet::from(["load_all".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        state.package_library.insert_package(info).await;
+
+        let uri = add_doc(&mut state, "file:///t.R", "pkgload::load_all()\n");
+        // Cursor on `load_all` (RHS), starting at column 9.
+        let result = super::hover(&state, &uri, Position::new(0, 12)).await;
+        assert!(
+            result.is_some(),
+            "hover on a present namespace member must still resolve"
         );
     }
 

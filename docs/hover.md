@@ -6,7 +6,7 @@ Hovering over an identifier shows what the symbol is, where it's defined, and �
 
 | At the cursor | Hover shows |
 |---|---|
-| Member side of `pkg::name` / `pkg:::name` | Bold `pkg::name` help-panel link + R help text for that topic |
+| Member side of `pkg::name` / `pkg:::name` | Bold `pkg::name` help-panel link + R help text for that topic (nothing if `name` is not in the package's *complete* export set — see below) |
 | Package side of `pkg::name` (the `pkg`) | The package's `Title` — `Description` from its installed `DESCRIPTION` (or `Package \`pkg\` is not installed.`) |
 | Local or cross-file definition | A code block with the definition statement and a file-location line |
 | Named-argument label resolving to a user-defined function's formal (`param` in `f(param = …)`) | A code block with the formal (and its default), *parameter of* `f`, and the formal's `@param` doc when documented |
@@ -63,7 +63,7 @@ When hover resolves to a package export and R has a help topic for it, the first
 
 If R hasn't rendered help text for that topic yet (cold cache, large package, or a symbol R doesn't have a topic for), hover falls back to a shorter form that omits the bold heading and just shows the name or Raven's parsed signature followed by a `from {pkg}` attribution. Subsequent hovers on the same topic hit Raven's help cache and render the full help text with the clickable heading.
 
-Namespace-qualified calls (`dplyr::filter`) always get the bold heading whether or not help text is available — Raven honors the qualifier even when R can't render a topic for it.
+Namespace-qualified calls (`dplyr::filter`) get the bold heading whether or not help text is available — Raven honors the qualifier even when R can't render a topic for it. The one exception is **resolve-or-suppress**: if Raven holds a *complete* export set for the package and the member is not in it (the same condition that raises the [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember) diagnostic), hover shows **nothing** rather than fabricating a `from {pkg}` attribution for a member that does not exist. This never applies to `pkg:::name` (internal symbols are real members, just unexported) or when the package's metadata is incomplete/not-yet-warmed.
 
 ## Scope-Aware Package Attribution
 
