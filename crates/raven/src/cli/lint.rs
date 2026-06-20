@@ -1011,8 +1011,8 @@ mod tests {
     }
 
     /// Settings that enable linting with the `assignment_operator` rule set to
-    /// flag `=` as a warning (default style is `<-`, default severity is HINT,
-    /// but for tests we use WARNING so we can distinguish from no-finding).
+    /// flag `=` as a warning (default style is `<-`; for tests we use WARNING
+    /// so we can distinguish from no-finding).
     fn assignment_warn_settings() -> serde_json::Value {
         serde_json::json!({
             "linting": {

@@ -12178,7 +12178,7 @@ mod semantic_warning_pipeline_tests {
         let (snapshot, _) = build_rmd_snapshot("x <- 1\n", "file:///plain.R", enable_lints);
         assert!(
             snapshot.lint_config.trailing_blank_lines_severity.is_some(),
-            "trailing_blank_lines must stay active for plain .R (default HINT)"
+            "trailing_blank_lines must stay active for plain .R"
         );
     }
 
