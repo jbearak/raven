@@ -897,6 +897,18 @@ impl PackageLibrary {
             if member_present(&info) {
                 return NamespaceMemberStatus::Present;
             }
+            // A provider record is authoritative for ABSENCE only when the
+            // package is NOT installed locally (the CI / no-`.libPaths()` case).
+            // When a local install exists, IT is the source of truth and may be
+            // newer than the provider snapshot (e.g. a dev build exporting a
+            // symbol the captured release lacked). Background warming resolves
+            // the install into Tier 1; until then, defer rather than trust a
+            // possibly-stale provider and risk a false `Absent` on a real local
+            // export. A bare directory probe (no NAMESPACE parse) keeps this
+            // off the keystroke hot path's heavy work.
+            if self.find_package_directory(package).is_some() {
+                return NamespaceMemberStatus::Unknown;
+            }
             return match info.exports_completeness {
                 MemberCompleteness::Complete => NamespaceMemberStatus::Absent,
                 MemberCompleteness::Partial => NamespaceMemberStatus::Partial,
@@ -5030,6 +5042,63 @@ mod tests {
         assert_eq!(
             lib.namespace_member_status_sync("pkg", "bar"),
             NamespaceMemberStatus::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn member_status_defers_to_local_install_over_stale_provider() {
+        use crate::package_db::PackageMetadataProvider;
+        // A provider snapshot that is STALE: it knows `mypkg` but only an old
+        // export, missing `new_fn`.
+        struct StaleProvider;
+        impl PackageMetadataProvider for StaleProvider {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "mypkg").then(|| {
+                    let mut info = PackageInfo::with_details(
+                        "mypkg".to_string(),
+                        HashSet::from(["old_fn".to_string()]),
+                        vec![],
+                        vec![],
+                    );
+                    info.exports_completeness = MemberCompleteness::Complete;
+                    info
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 2.0\n").unwrap();
+        // The LOCAL install is newer: it exports `new_fn`.
+        std::fs::write(pkg.join("NAMESPACE"), "export(new_fn)\n").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![dir.path().to_path_buf()]);
+        lib.set_providers(vec![Box::new(StaleProvider)]);
+
+        // Cache miss + stale provider lacking `new_fn`, but mypkg is installed
+        // locally — must DEFER (Unknown), never a false Absent on a real local
+        // export. (The provider's `old_fn` is also not asserted Absent for the
+        // same reason.)
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "new_fn"),
+            NamespaceMemberStatus::Unknown
+        );
+
+        // A package the provider knows but that is NOT installed locally: the
+        // provider IS authoritative, so a genuine typo is Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("ghostpkg", "anything"),
+            NamespaceMemberStatus::Unknown // provider doesn't know ghostpkg either
+        );
+
+        // After warming from the local install, the authoritative export set
+        // resolves `new_fn` as Present.
+        lib.get_package("mypkg").await;
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "new_fn"),
+            NamespaceMemberStatus::Present
         );
     }
 
