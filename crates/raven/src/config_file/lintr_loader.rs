@@ -350,12 +350,12 @@ fn apply_linter_call(
 ) {
     match name {
         "line_length_linter" => {
-            if let Some(n) = parse_int_arg(args, "length") {
+            if let Some(n) = int_arg_or_note(args, "length", unrecognized_constructs) {
                 linting.insert("lineLength".into(), json!(n));
             }
         }
         "object_length_linter" => {
-            if let Some(n) = parse_int_arg(args, "length") {
+            if let Some(n) = int_arg_or_note(args, "length", unrecognized_constructs) {
                 linting.insert("objectLength".into(), json!(n));
             }
         }
@@ -363,7 +363,7 @@ fn apply_linter_call(
             // lintr's first positional formal is `indent`, so accept both the
             // named `indent = N` and the positional `N` form (mirroring
             // line_length_linter / object_length_linter).
-            if let Some(n) = parse_int_arg(args, "indent") {
+            if let Some(n) = int_arg_or_note(args, "indent", unrecognized_constructs) {
                 linting.insert("indentationUnit".into(), json!(n));
             }
         }
@@ -739,6 +739,20 @@ fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
 /// positional integer). See [`resolve_arg`] for the binding rules.
 fn parse_int_arg(args: &str, name: &str) -> Option<u64> {
     parse_r_uint(resolve_arg(args, name)?)
+}
+
+/// [`parse_int_arg`], but when a parameterized linter is given arguments we
+/// can't interpret (e.g. `line_length_linter(width = 120)` — wrong arg name — or
+/// `line_length_linter(TRUE)`), count it as an unrecognized construct so the
+/// user gets a warning instead of silently falling back to the default limit.
+/// The bare `foo_linter()` form (empty args) is a valid "use the default" and
+/// stays silent.
+fn int_arg_or_note(args: &str, name: &str, unrecognized_constructs: &mut usize) -> Option<u64> {
+    let value = parse_int_arg(args, name);
+    if value.is_none() && !args.trim().is_empty() {
+        *unrecognized_constructs += 1;
+    }
+    value
 }
 
 /// Resolve the `styles` argument of `object_name_linter` into a list of style
@@ -1805,6 +1819,31 @@ mod tests {
             "a column-0 comment line must not be counted: {:?}",
             out.warnings
         );
+    }
+
+    #[test]
+    fn parameterized_linter_with_unparseable_arg_warns() {
+        // A recognized parameterized linter given an arg we can't interpret
+        // (wrong arg name, or a non-integer) must warn rather than silently
+        // applying the default — otherwise the user gets unexpected diagnostics
+        // with no clue why.
+        for input in [
+            "linters: linters_with_defaults(line_length_linter(width = 120))\n",
+            "linters: linters_with_defaults(line_length_linter(TRUE))\n",
+            "linters: linters_with_defaults(indentation_linter(soft = 2))\n",
+        ] {
+            let out = load_str(input);
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("unrecognized construct")),
+                "expected a warning for {input:?}: {:?}",
+                out.warnings
+            );
+        }
+        // The bare no-arg form is a valid "use the default" and stays silent.
+        let out = load_str("linters: linters_with_defaults(line_length_linter())\n");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]
