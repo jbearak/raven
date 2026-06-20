@@ -2044,6 +2044,7 @@
     "vscode-textmate": "^9.3.0"
   },
   "overrides": {
+    "@babel/core": "^7.29.6",
     "serialize-javascript": "^7.0.3",
     "uuid": ">=14.0.0",
     "fast-uri": ">=3.1.2",
