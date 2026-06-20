@@ -299,6 +299,15 @@ fn apply_linters(
                 continue;
             }
             let name = entry[..paren_idx].trim();
+            // A linter call's name is a bare identifier. A top-level `=` before
+            // the `(` means a `lhs = rhs(args)` assignment form (not a linter
+            // call), so count it as unrecognized rather than passing a garbled
+            // `lhs = rhs` name to apply_linter_call (which could then misfire the
+            // per-linter "no Raven equivalent" warning on it).
+            if has_unquoted_eq(name) {
+                *unrecognized_constructs += 1;
+                continue;
+            }
             let args = &entry[paren_idx + 1..entry.len() - 1];
             apply_linter_call(name, args, linting, warnings, unrecognized_constructs);
             continue;
@@ -615,8 +624,7 @@ impl ScanState {
 /// scanning (brackets inside a string or `#` comment are not structural) but
 /// keeps its own type stack, because [`ScanState::depth`] is a single floored
 /// counter that can see neither a net-negative imbalance nor a type mismatch.
-/// Used by [`load_str`] to flag a malformed field precisely and by
-/// [`strip_named_call`] to confirm a wrapper's parens are a matching pair.
+/// Used by [`load_str`] to flag a malformed field precisely.
 fn brackets_unbalanced(s: &str) -> bool {
     let mut st = ScanState::default();
     let mut stack: Vec<char> = Vec::new();
@@ -766,20 +774,41 @@ fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
 }
 
 /// Strip a `name(...)` call wrapper, tolerating whitespace between `name` and
-/// `(` (valid R: `linters_with_defaults (x)`). Returns the inner argument text,
-/// or `None` if `s` is not a single `name(...)` call. The required `(`
-/// immediately after the (whitespace-trimmed) name prevents a false match on a
-/// longer identifier: `strip_named_call("listings(x)", "list")` strips the
-/// `list` prefix to `"ings(x)"`, whose next non-space char is not `(`, so it
-/// returns `None`. The leading `(` and trailing `)` must also be a *matching*
-/// pair that wraps the whole argument list — verified by requiring the inner
-/// text to be bracket-balanced — so a value like `f(a) + g(b)` (where the first
-/// `(` is closed mid-string and the trailing `)` belongs to a different group)
-/// is not mis-unwrapped to the garbage inner `a) + g(b`.
+/// `(` (valid R: `linters_with_defaults (x)`). Returns the argument text between
+/// the opening `(` and the `)` that *matches* it, or `None` if `s` is not such a
+/// call. The required `(` immediately after the (whitespace-trimmed) name
+/// prevents a false match on a longer identifier: `strip_named_call("listings(x)",
+/// "list")` strips the `list` prefix to `"ings(x)"`, whose next non-space char is
+/// not `(`, so it returns `None`.
+///
+/// Returning the text up to the *matching* `)` (string/comment-aware) — rather
+/// than the last `)` — means trailing content is ignored, which is what makes
+/// best-effort parsing of a typo'd wrapper work: a stray extra `)`
+/// (`linters_with_defaults(line_length_linter(120)))`) still yields the real,
+/// balanced argument list, and a value like `f(a) + g(b)` unwraps to `a` (the
+/// first call's args) rather than the garbage `a) + g(b`. If the opening `(`
+/// never closes, the wrapper genuinely can't be unwrapped and we return `None`.
 fn strip_named_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let after = s.trim().strip_prefix(name)?.trim_start();
-    let inner = after.strip_prefix('(')?.strip_suffix(')')?;
-    (!brackets_unbalanced(inner)).then_some(inner)
+    let inner = after.strip_prefix('(')?;
+    let mut st = ScanState::default();
+    let mut depth = 1i32; // the opening `(` we just consumed
+    for (i, c) in inner.char_indices() {
+        if !st.step(c) {
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&inner[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Strip a `c(...)` vector wrapper, tolerating optional whitespace between the
@@ -1870,12 +1899,59 @@ mod tests {
     }
 
     #[test]
-    fn strip_named_call_rejects_unmatched_paren_pair() {
-        // The leading `(` and trailing `)` must be a matching pair wrapping the
-        // whole call: `f(a) + g(b)` must NOT unwrap to the garbage `a) + g(b`.
-        assert_eq!(strip_named_call("f(a) + g(b)", "f"), None);
+    fn strip_named_call_unwraps_to_the_matching_paren() {
+        // Normal calls unwrap to their full argument list.
         assert_eq!(strip_named_call("f(a, b)", "f"), Some("a, b"));
         assert_eq!(strip_named_call("f(g(1), h(2))", "f"), Some("g(1), h(2)"));
+        // Content after the matching `)` is ignored, so a typo'd wrapper still
+        // yields its real argument list: a stray extra `)` and trailing junk.
+        assert_eq!(strip_named_call("f(g(1)))", "f"), Some("g(1)"));
+        assert_eq!(strip_named_call("f(a) + g(b)", "f"), Some("a"));
+        // An opening `(` that never closes can't be unwrapped.
+        assert_eq!(strip_named_call("f(a", "f"), None);
+        // A `)` inside a string is not the matching close.
+        assert_eq!(strip_named_call("f(\")\")", "f"), Some("\")\""));
+    }
+
+    #[test]
+    fn stray_extra_paren_field_recovers_entries_best_effort() {
+        // A stray extra `)` makes the field bracket-unbalanced (warned), but its
+        // real, balanced argument list is still recovered and applied —
+        // best-effort parsing, not wholesale discard.
+        let out = load_str(
+            "linters: linters_with_defaults(line_length_linter(120), object_length_linter(40)))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(120));
+        assert_eq!(l["objectLength"], json!(40));
+        assert!(
+            out.warnings.iter().any(|w| w.contains("unbalanced")),
+            "the stray paren is still flagged: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn assigned_linter_call_is_unrecognized_not_garbled() {
+        // `name = some_linter(args)` is an assignment form, not a linter call;
+        // it must count as an unrecognized construct, not emit a per-linter
+        // warning with the garbled name `name = some_linter`.
+        let out =
+            load_str("linters: linters_with_defaults(x = trailing_whitespace_linter(TRUE))\n");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.contains("no Raven equivalent")),
+            "must not emit a garbled per-linter warning: {:?}",
+            out.warnings
+        );
     }
 
     #[test]
