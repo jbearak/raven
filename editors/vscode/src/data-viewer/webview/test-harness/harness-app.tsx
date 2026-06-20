@@ -245,8 +245,13 @@ export function HarnessApp() {
             toolbarFlexWrap: toolbarStyle.flexWrap,
             chipsOrder: chipsStyle.order,
             chipsFlexBasis: chipsStyle.flexBasis,
+            widthPx,
+            sortChipCount,
+            filterChipCount,
+            hiddenColCount,
+            rowCountText,
         });
-    }, []);
+    }, [widthPx, sortChipCount, filterChipCount, hiddenColCount, rowCountText]);
 
     // Keep a ref to the latest `postSnapshot` so the message handler
     // (subscribed once) can read the live DOM synchronously on an explicit
