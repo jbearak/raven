@@ -78,6 +78,28 @@ fn edited_document_warm_packages(
     packages
 }
 
+/// Package names worth warming from a document's namespace references.
+///
+/// Validated and sentinel-filtered at this boundary (the same guard the
+/// loader-call path uses) because `prefetch_packages()` trusts its callers.
+/// Namespace references warm metadata only — they never attach the package to
+/// bare-name scope.
+fn namespace_warm_packages(meta: &crate::cross_file::CrossFileMetadata) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut packages = Vec::new();
+    for r in &meta.namespace_references {
+        if !is_valid_package_name(&r.package)
+            || crate::package_library::is_load_all_sentinel(&r.package)
+        {
+            continue;
+        }
+        if seen.insert(r.package.clone()) {
+            packages.push(r.package.clone());
+        }
+    }
+    packages
+}
+
 /// Parameters for the raven/activeDocumentsChanged notification
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3620,7 +3642,9 @@ impl LanguageServer for Backend {
 
             // Collect package names from library calls for background prefetch
             let packages_to_prefetch: Vec<String> = if packages_enabled {
-                extract_loaded_packages_from_library_calls(&meta.library_calls)
+                let mut p = extract_loaded_packages_from_library_calls(&meta.library_calls);
+                p.extend(namespace_warm_packages(&meta));
+                p
             } else {
                 Vec::new()
             };
@@ -4511,10 +4535,12 @@ impl LanguageServer for Backend {
                 // Collect package names for prefetch (validate names to
                 // reject suspicious inputs before R subprocess calls)
                 let pkgs: Vec<String> = if packages_enabled {
-                    match state.documents.get(&uri_clone) {
+                    let mut p = match state.documents.get(&uri_clone) {
                         Some(doc) => edited_document_warm_packages(&meta.library_calls, doc),
                         None => extract_loaded_packages_from_library_calls(&meta.library_calls),
-                    }
+                    };
+                    p.extend(namespace_warm_packages(&meta));
+                    p
                 } else {
                     Vec::new()
                 };
@@ -8278,6 +8304,17 @@ fn collect_open_document_packages(
         for p in &doc.data_packages {
             doc_pkgs.insert(p.clone());
         }
+        // Namespace references warm metadata but never attach scope; pull them
+        // from the document's enriched metadata (the shared source of truth).
+        if let Some(meta) = state.get_enriched_metadata(uri) {
+            for r in &meta.namespace_references {
+                if is_valid_package_name(&r.package)
+                    && !crate::package_library::is_load_all_sentinel(&r.package)
+                {
+                    doc_pkgs.insert(r.package.clone());
+                }
+            }
+        }
         let line = doc.text().lines().count().saturating_sub(1) as u32;
         docs.push((uri.clone(), line));
     }
@@ -11307,6 +11344,36 @@ mod refresh_packages_tests {
             "did_change warm set must include data(package=) packages (issue #429); got {:?}",
             pkgs
         );
+    }
+
+    #[test]
+    fn namespace_warm_packages_validates_and_dedups() {
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        let mk = |pkg: &str| crate::cross_file::source_detect::NamespaceReference {
+            package: pkg.to_string(),
+            package_range: crate::cross_file::source_detect::SourceRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            member: None,
+            internal: false,
+            range: crate::cross_file::source_detect::SourceRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+        };
+        meta.namespace_references = vec![
+            mk("dplyr"),
+            mk("dplyr"),                                   // dup
+            mk(crate::package_library::LOAD_ALL_SENTINEL), // sentinel filtered
+            mk("not a package"),                           // invalid filtered
+        ];
+        let pkgs = namespace_warm_packages(&meta);
+        assert_eq!(pkgs, vec!["dplyr".to_string()]);
     }
 
     /// Deterministic (R-free) coverage of the issue #429 sysdata fallback gate
