@@ -78,23 +78,30 @@ fn edited_document_warm_packages(
     packages
 }
 
-/// Package names worth warming from a document's namespace references.
+/// Namespace-reference package names that pass the warm filter: a valid package
+/// name that is not the load-all sentinel.
 ///
-/// Validated and sentinel-filtered at this boundary (the same guard the
-/// loader-call path uses) because `prefetch_packages()` trusts its callers.
-/// Namespace references warm metadata only — they never attach the package to
-/// bare-name scope.
+/// Single source of truth for "which `pkg::` packages may be warmed", shared by
+/// every warm path (`namespace_warm_packages`, `collect_open_document_packages`)
+/// because `prefetch_packages()` trusts its callers. Namespace references warm
+/// metadata only — they never attach the package to bare-name scope.
+fn valid_namespace_ref_packages(
+    meta: &crate::cross_file::CrossFileMetadata,
+) -> impl Iterator<Item = &str> {
+    meta.namespace_references
+        .iter()
+        .map(|r| r.package.as_str())
+        .filter(|p| is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p))
+}
+
+/// Deduplicated package names worth warming from a document's namespace
+/// references, in first-seen order.
 fn namespace_warm_packages(meta: &crate::cross_file::CrossFileMetadata) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut packages = Vec::new();
-    for r in &meta.namespace_references {
-        if !is_valid_package_name(&r.package)
-            || crate::package_library::is_load_all_sentinel(&r.package)
-        {
-            continue;
-        }
-        if seen.insert(r.package.clone()) {
-            packages.push(r.package.clone());
+    for p in valid_namespace_ref_packages(meta) {
+        if seen.insert(p) {
+            packages.push(p.to_string());
         }
     }
     packages
@@ -8359,14 +8366,11 @@ fn collect_open_document_packages(
             doc_pkgs.insert(p.clone());
         }
         // Namespace references warm metadata but never attach scope; pull them
-        // from the document's enriched metadata (the shared source of truth).
+        // from the document's enriched metadata (the shared source of truth),
+        // through the same warm filter every other path uses.
         if let Some(meta) = state.get_enriched_metadata(uri) {
-            for r in &meta.namespace_references {
-                if is_valid_package_name(&r.package)
-                    && !crate::package_library::is_load_all_sentinel(&r.package)
-                {
-                    doc_pkgs.insert(r.package.clone());
-                }
+            for p in valid_namespace_ref_packages(&meta) {
+                doc_pkgs.insert(p.to_string());
             }
         }
         let line = doc.text().lines().count().saturating_sub(1) as u32;
