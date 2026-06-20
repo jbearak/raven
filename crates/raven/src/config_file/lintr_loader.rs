@@ -751,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn portability_note_counts_every_column_zero_continuation_line() {
+        // The note reports the exact number of column-0 continuation lines. Here
+        // all three (the two entries and the closing `)`) sit at column 0, so the
+        // count must be 3 — guarding the "N continuation line(s)" wording against
+        // an off-by-one or a "count once per file" regression.
+        let input = "linters: linters_with_defaults(\n\
+            line_length_linter(120),\n\
+            trailing_whitespace_linter = NULL\n\
+            )\n";
+        let out = load_str(input);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("accepted 3 continuation line(s)")),
+            "expected the note to count all 3 column-0 lines: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
     fn indented_closing_paren_does_not_emit_portability_note() {
         // The valid-lintr form (indented ')') must stay silent.
         let input = "linters: linters_with_defaults(\n    line_length_linter(120)\n    )\n";
