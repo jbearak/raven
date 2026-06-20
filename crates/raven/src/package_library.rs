@@ -1966,6 +1966,16 @@ impl PackageLibrary {
                         all_base_exports.insert(s.to_string());
                     }
                 }
+                // A base-priority package that WAS found on disk owns its cache
+                // entry — Step 5 inserts it with the correct (possibly `Partial`,
+                // when an `exportPattern` package fell back to INDEX without R)
+                // completeness. The embedded floor must not pre-seed a `Complete`
+                // entry that the monotonic `insert_package` guard would then keep,
+                // which would make INDEX-only exports falsely absence-authoritative.
+                // Disk data wins; the embedded floor only covers absent packages.
+                if per_package_exports.contains_key(p.name) {
+                    continue;
+                }
                 let mut info = PackageInfo::with_details(
                     p.name.to_string(),
                     p.exports.iter().map(|s| s.to_string()).collect(),
@@ -6616,6 +6626,53 @@ mod tests {
             "exportPattern base package without R must be Partial, not Complete"
         );
         // Therefore an unknown member is Partial (silent), never a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("grid", "definitely_not_exported"),
+            NamespaceMemberStatus::Partial
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_fallback_does_not_override_disk_partial_base_package() {
+        // Regression (issue #503 re-review blocker): a lib path with a
+        // non-attached base-priority `exportPattern` package (grid) but NO
+        // attached base package leaves `all_base_exports` empty, so the embedded
+        // fallback fires. It must NOT pre-seed a Complete grid entry that the
+        // monotonic insert guard would keep over the disk-derived Partial.
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib_root = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        // Only grid on disk — no attached base package contributes exports, so
+        // the embedded fallback path runs.
+        let grid_dir = lib_root.join("grid");
+        std::fs::create_dir_all(&grid_dir).unwrap();
+        std::fs::write(
+            grid_dir.join("DESCRIPTION"),
+            "Package: grid\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(grid_dir.join("NAMESPACE"), "exportPattern(\"^grid\")\n").unwrap();
+        std::fs::write(
+            grid_dir.join("INDEX"),
+            "grid.ls                 List Grobs\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root]);
+        lib.initialize().await.unwrap();
+
+        let grid = lib.get_package("grid").await.expect("grid cached");
+        assert_eq!(
+            grid.exports_completeness,
+            MemberCompleteness::Partial,
+            "on-disk exportPattern grid (no R) must stay Partial even when the \
+             embedded fallback runs"
+        );
         assert_eq!(
             lib.namespace_member_status_sync("grid", "definitely_not_exported"),
             NamespaceMemberStatus::Partial
