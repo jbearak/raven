@@ -83,6 +83,40 @@ pub struct LibraryCall {
     pub attaches: bool,
 }
 
+/// A source range in LSP coordinates: 0-based line, **UTF-16** column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRange {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// The member (RHS) token of a `pkg::member` / `pkg:::member` reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceMember {
+    pub name: String,
+    pub range: SourceRange,
+}
+
+/// A detected `pkg::member` / `pkg:::member` (or incomplete `pkg::`) reference.
+///
+/// INVARIANT: every member-diagnostic site MUST check `!internal` before using
+/// `member` — `internal: true` is `:::`, which never gets member validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceReference {
+    /// Package name, with any string/backtick delimiters stripped.
+    pub package: String,
+    /// Range of the package (LHS) token.
+    pub package_range: SourceRange,
+    /// Member (RHS) token; `None` for an incomplete `pkg::` with no RHS.
+    pub member: Option<NamespaceMember>,
+    /// `true` for `:::` (internal lookup), `false` for `::`.
+    pub internal: bool,
+    /// Range of the whole `pkg::member` expression.
+    pub range: SourceRange,
+}
+
 /// Locate all top-level `source()` and `sys.source()` calls in an R syntax tree and extract their static parameters.
 ///
 /// This function traverses the given tree-sitter `Tree` of R source code and collects each `source()`
