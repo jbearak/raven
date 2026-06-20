@@ -344,30 +344,94 @@ fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constru
     }
 }
 
-/// Split a token string on commas at depth 0 (ignoring parens / brackets / quotes).
-fn split_top_level_commas(input: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut in_str: Option<char> = None;
-    let mut start = 0usize;
-    let bytes = input.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        let c = b as char;
-        if let Some(q) = in_str {
-            if c == q && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
-                in_str = None;
+/// Shared lexical state for scanning a `.lintr` field value as R-ish text:
+/// tracks whether we are inside a string literal (with backslash-escape
+/// handling), inside a `#` comment, and the net bracket depth. One state
+/// machine so `dcf_fold` (continuation detection), `split_top_level_commas`,
+/// and `strip_comments` cannot drift on what counts as "inside a string /
+/// comment / bracket".
+#[derive(Default)]
+struct ScanState {
+    /// `Some(quote)` while inside a string literal opened by `quote`.
+    in_str: Option<char>,
+    /// Inside a string, `true` when the previous char was an unescaped `\`, so
+    /// the current char is escaped (and a quote does not close the string).
+    escaped: bool,
+    /// `true` while inside a `#` comment (until the next newline).
+    in_comment: bool,
+    /// Net `(`/`[`/`{` minus `)`/`]`/`}`, floored at 0.
+    depth: i32,
+}
+
+impl ScanState {
+    /// Advance over one byte-as-char `c`. Returns `true` when `c` is a
+    /// *structural* character — not inside a string or comment — so callers can
+    /// act on `,` / brackets only when this is `true`. Escape state is tracked
+    /// internally (no `prev` parameter needed), so a string ending in an
+    /// escaped backslash (`"a\\"`) closes correctly.
+    fn step(&mut self, c: char) -> bool {
+        if self.in_comment {
+            if c == '\n' {
+                self.in_comment = false;
             }
-            continue;
+            return false;
+        }
+        if let Some(q) = self.in_str {
+            if self.escaped {
+                self.escaped = false;
+            } else if c == '\\' {
+                self.escaped = true;
+            } else if c == q {
+                self.in_str = None;
+            }
+            return false;
         }
         match c {
-            '"' | '\'' => in_str = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1).max(0),
-            ',' if depth == 0 => {
-                out.push(&input[start..i]);
-                start = i + 1;
+            '"' | '\'' => {
+                self.in_str = Some(c);
+                false
             }
-            _ => {}
+            '#' => {
+                self.in_comment = true;
+                false
+            }
+            '(' | '[' | '{' => {
+                self.depth += 1;
+                true
+            }
+            ')' | ']' | '}' => {
+                self.depth = (self.depth - 1).max(0);
+                true
+            }
+            _ => true,
+        }
+    }
+}
+
+/// Net bracket depth of `s`, ignoring brackets inside string literals and `#`
+/// comments. `> 0` means an unclosed `(`/`[`/`{` — the value is a mid-flight R
+/// expression that continues on the next physical line regardless of DCF
+/// indentation rules.
+fn net_bracket_depth(s: &str) -> i32 {
+    let mut st = ScanState::default();
+    for &b in s.as_bytes() {
+        st.step(b as char);
+    }
+    st.depth
+}
+
+/// Split a token string on commas at depth 0 (ignoring parens / brackets /
+/// quotes / `#` comments).
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut st = ScanState::default();
+    let mut start = 0usize;
+    for (i, &b) in input.as_bytes().iter().enumerate() {
+        let c = b as char;
+        let structural = st.step(c);
+        if structural && c == ',' && st.depth == 0 {
+            out.push(&input[start..i]);
+            start = i + 1;
         }
     }
     if start <= input.len() {
@@ -467,6 +531,36 @@ fn strip_c_vector(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_bracket_depth_respects_strings_and_comments() {
+        assert_eq!(net_bracket_depth("f(a, b)"), 0);
+        assert_eq!(net_bracket_depth("f("), 1);
+        assert_eq!(net_bracket_depth("f(g("), 2);
+        // Brackets inside a string literal are not structural.
+        assert_eq!(net_bracket_depth("f(\"a (b\")"), 0);
+        // Brackets inside a `#` comment are not structural; comment ends at \n.
+        assert_eq!(net_bracket_depth("f( # )(\n)"), 0);
+        // A `#` inside a string is not a comment.
+        assert_eq!(net_bracket_depth("f(\"# (\")"), 0);
+        // A string ending in an escaped backslash closes correctly: this is
+        // R `f("a\\")` (one backslash in the string), so depth returns to 0.
+        assert_eq!(net_bracket_depth("f(\"a\\\\\")"), 0);
+        // An escaped quote does NOT close the string: R `f("a\")` leaves the
+        // string (and thus the `(`) open, so the `)` is inside the string and
+        // depth stays 1.
+        assert_eq!(net_bracket_depth("f(\"a\\\")"), 1);
+    }
+
+    #[test]
+    fn split_top_level_commas_ignores_commas_in_comments() {
+        // The comma in the trailing comment must not create a phantom split.
+        let parts = split_top_level_commas("a # x, y\nb");
+        assert_eq!(parts, vec!["a # x, y\nb"]);
+        // Real top-level comma still splits; nested + quoted commas do not.
+        let parts = split_top_level_commas("f(1, 2), \"x,y\", g()");
+        assert_eq!(parts, vec!["f(1, 2)", " \"x,y\"", " g()"]);
+    }
 
     #[test]
     fn line_length_param_maps() {
