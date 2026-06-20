@@ -238,6 +238,10 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 | `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
 | `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |
 
+Numeric-argument linters accept both the named and the first-positional form: `line_length_linter(80)` and `line_length_linter(length = 80)` are equivalent, as are `object_length_linter(40)` / `object_length_linter(length = 40)` and `indentation_linter(4)` / `indentation_linter(indent = 4)`.
+
+`object_name_linter` accepts a **single** style name — positionally or via `styles =`, as a scalar or a one-element vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case"))`) — applied to functions, variables, and arguments. Style names must be one of `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Forms Raven cannot represent — a raw regex style, or a multi-style vector such as `c("snake_case", "camelCase")` (which `lintr` treats as "matches any of these") — are reported in the batch warning and otherwise ignored, leaving the default `snake_case` checks in place. (`object_name_linter`'s `regexes =` argument is likewise unsupported; it is ignored.)
+
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
 
 > **Note:** `mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints — they are always-on semantic warnings configured under `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Diagnostics § Semantic Warnings](diagnostics.md#semantic-warnings).
