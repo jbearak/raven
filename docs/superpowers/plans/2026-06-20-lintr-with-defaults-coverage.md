@@ -14,7 +14,7 @@
 
 The user's example file. **Two DCF rules matter for the test fixtures** (see `dcf_fold`): `linters:` must be at **column 0** (the leading indentation in the prompt is cosmetic and would be treated as a dropped continuation line), and **every continuation line — including the closing `)` — must begin with whitespace**, or that line terminates the field and the value loses its closing paren (the existing `multi_line_dcf_field_is_folded` test indents its `)` for exactly this reason):
 
-```
+```r
 linters: linters_with_defaults(
     line_length_linter(80),
     commented_code_linter(),
@@ -52,10 +52,10 @@ A bare `object_name_linter()` (no styles) is a no-op that keeps Raven's defaults
 
 ## File Structure
 
-- **Modify** `crates/raven/src/linting/config.rs` — add `ObjectNameStyle::from_config_name` as the single source of truth for the valid style-name set.
-- **Modify** `crates/raven/src/backend.rs` — refactor `parse_object_name_style` to consume `from_config_name` (no behavior change).
-- **Modify** `crates/raven/src/config_file/lintr_loader.rs` — fix `indentation_linter` positional, rewrite `object_name_linter` style resolution + warning, remove now-dead `parse_named_string_vec`, add all new tests.
-- **Modify** `docs/linting.md` — document positional acceptance and the unrepresentable-regex behavior.
+- **Add** to `crates/raven/src/linting/config.rs` — `ObjectNameStyle::from_config_name` as the single source of truth for the valid style-name set.
+- **Refactor** `crates/raven/src/backend.rs` — `parse_object_name_style` to consume `from_config_name` (no behavior change).
+- **Rework** `crates/raven/src/config_file/lintr_loader.rs` — fix `indentation_linter` positional, rewrite `object_name_linter` style resolution + warning, remove now-dead `parse_named_string_vec`, add all new tests.
+- **Document** in `docs/linting.md` — positional acceptance and the unrepresentable-regex behavior.
 
 ---
 

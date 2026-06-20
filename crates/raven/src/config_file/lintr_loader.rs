@@ -408,14 +408,14 @@ fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
         // named argument (such as `regexes = ...`) that we don't map, so only
         // an unquoted, non-`c(...)` token containing `=` is rejected here.
         let is_quoted = first.starts_with('"') || first.starts_with('\'');
-        let is_vector = first.starts_with("c(");
+        let is_vector = strip_c_vector(first).is_some();
         if !is_quoted && !is_vector && first.contains('=') {
             return None;
         }
         Some(first)
     })?;
     let raw = raw.trim();
-    if let Some(inner) = raw.strip_prefix("c(").and_then(|r| r.strip_suffix(')')) {
+    if let Some(inner) = strip_c_vector(raw) {
         // Drop *syntactically* empty tokens (e.g. a trailing comma) before
         // stripping quotes, so a quoted-empty element `""` survives as a real
         // (degenerate) style that is later flagged unrepresentable rather than
@@ -434,6 +434,15 @@ fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
             raw.trim_matches(|c| c == '"' || c == '\'').to_string(),
         ])
     }
+}
+
+/// Strip a `c(...)` vector wrapper, tolerating optional whitespace between the
+/// `c` and the `(` so valid R like `c ("snake_case")` parses identically to
+/// `c("snake_case")`. Returns the inner argument text, or `None` if `s` is not
+/// a `c(...)` call.
+fn strip_c_vector(s: &str) -> Option<&str> {
+    let after_c = s.strip_prefix('c')?.trim_start();
+    after_c.strip_prefix('(').and_then(|r| r.strip_suffix(')'))
 }
 
 #[cfg(test)]
@@ -606,6 +615,28 @@ mod tests {
         assert_eq!(l["objectNameStyleFunction"], json!("lowercase"));
         assert_eq!(l["objectNameStyleVariable"], json!("lowercase"));
         assert_eq!(l["objectNameStyleArgument"], json!("lowercase"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_c_vector_tolerates_space_before_paren() {
+        // Valid R allows whitespace between `c` and `(`.
+        let out =
+            load_str("linters: linters_with_defaults(object_name_linter(c (\"camelCase\")))\n");
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!("camelCase")
+        );
+        assert!(out.warnings.is_empty());
+
+        // Same tolerance on the named-arg path.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = c (\"snake_case\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!("snake_case")
+        );
         assert!(out.warnings.is_empty());
     }
 
