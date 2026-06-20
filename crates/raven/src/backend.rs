@@ -4920,8 +4920,14 @@ impl LanguageServer for Backend {
                 log::trace!("Background prefetching {} packages", packages_vec.len());
                 pkg_lib.prefetch_packages(&packages_vec).await;
 
+                // Warming a package can change `pkg::member` / missing-package
+                // diagnostics in OTHER open documents that reference it but do
+                // not `source()` this file (issue #503), so collect those
+                // siblings and force-republish them alongside the edited file.
+                let warmed: std::collections::HashSet<String> = packages_vec.into_iter().collect();
+
                 // After prefetch completes, trigger diagnostic revalidation
-                let (debounce_ms, trigger_version, trigger_revision) = {
+                let (debounce_ms, trigger_version, trigger_revision, sibling_jobs) = {
                     let state = state_arc.read().await;
                     if !state.documents.contains_key(&revalidation_uri) {
                         return; // Document was closed during prefetch
@@ -4932,8 +4938,39 @@ impl LanguageServer for Backend {
                     let doc = state.documents.get(&revalidation_uri);
                     let ver = doc.and_then(|d| d.version);
                     let rev = doc.map(|d| d.revision);
-                    (state.cross_file_config.revalidation_debounce_ms, ver, rev)
+
+                    // Cross-document sibling republish (issue #503), excluding the
+                    // edited file (revalidated below by its own version bump).
+                    let mut sibling_jobs: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+                    for sib in open_docs_referencing_packages(&state, &warmed) {
+                        if sib == revalidation_uri {
+                            continue;
+                        }
+                        state.diagnostics_gate.mark_force_republish(&sib);
+                        let sdoc = state.documents.get(&sib);
+                        let sver = sdoc.and_then(|d| d.version);
+                        let srev = sdoc.map(|d| d.revision);
+                        sibling_jobs.push((sib, sver, srev));
+                    }
+                    (
+                        state.cross_file_config.revalidation_debounce_ms,
+                        ver,
+                        rev,
+                        sibling_jobs,
+                    )
                 };
+
+                for (sib, sver, srev) in sibling_jobs {
+                    tokio::spawn(run_debounced_diagnostics(
+                        state_arc.clone(),
+                        client.clone(),
+                        sib,
+                        debounce_ms,
+                        sver,
+                        srev,
+                        Some(traversal_truncation.clone()),
+                    ));
+                }
 
                 run_debounced_diagnostics(
                     state_arc,
@@ -8327,6 +8364,30 @@ fn collect_open_document_packages(
     (doc_pkgs, docs)
 }
 
+/// Open documents whose namespace references (`pkg::member`) name any package in
+/// `warmed`. After a background prefetch warms a package, these documents may
+/// gain/lose `namespace-member-not-found` / `package-not-installed` diagnostics
+/// even though they don't `source()` the edited file, so they must be marked
+/// for force-republish (issue #503). Reads each doc's enriched metadata — the
+/// shared source of truth for namespace references.
+fn open_docs_referencing_packages(
+    state: &WorldState,
+    warmed: &std::collections::HashSet<String>,
+) -> Vec<Url> {
+    let mut out = Vec::new();
+    for uri in state.documents.keys() {
+        if let Some(meta) = state.get_enriched_metadata(uri)
+            && meta
+                .namespace_references
+                .iter()
+                .any(|r| warmed.contains(&r.package))
+        {
+            out.push(uri.clone());
+        }
+    }
+    out
+}
+
 /// Collect effective packages for all open documents (direct `library()` calls
 /// plus inherited packages from parent `source()` chains, plus — in package
 /// mode — NAMESPACE whole-package `import(pkg)` directives from
@@ -11408,6 +11469,37 @@ mod refresh_packages_tests {
         ];
         let pkgs = namespace_warm_packages(&meta);
         assert_eq!(pkgs, vec!["dplyr".to_string()]);
+    }
+
+    #[test]
+    fn open_docs_referencing_packages_finds_namespace_users() {
+        use crate::state::{Document, WorldState};
+        let mut state = WorldState::new();
+        let a = Url::parse("file:///ws/a.R").unwrap();
+        let b = Url::parse("file:///ws/b.R").unwrap();
+        let c = Url::parse("file:///ws/c.R").unwrap();
+        // a.R warms `dplyr` via library(); b.R references it via `dplyr::`;
+        // c.R references an unrelated package.
+        state
+            .documents
+            .insert(a.clone(), Document::new("library(dplyr)\n", Some(1)));
+        state
+            .documents
+            .insert(b.clone(), Document::new("dplyr::mutate(x)\n", Some(1)));
+        state
+            .documents
+            .insert(c.clone(), Document::new("tidyr::pivot(x)\n", Some(1)));
+
+        let warmed: std::collections::HashSet<String> =
+            std::iter::once("dplyr".to_string()).collect();
+        let found = open_docs_referencing_packages(&state, &warmed);
+        assert!(found.contains(&b), "b.R references dplyr::; got {found:?}");
+        assert!(
+            !found.contains(&c),
+            "c.R references only tidyr::; got {found:?}"
+        );
+        // a.R has no namespace reference (only a library() call).
+        assert!(!found.contains(&a), "a.R has no pkg:: ref; got {found:?}");
     }
 
     /// Deterministic (R-free) coverage of the issue #429 sysdata fallback gate
