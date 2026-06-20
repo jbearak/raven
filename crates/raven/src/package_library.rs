@@ -1074,10 +1074,17 @@ impl PackageLibrary {
                         info.lazy_data.push(d.clone());
                     }
                 }
+                // Union per stem (not `or_insert_with`, which would keep only the
+                // incoming list for a shared stem and drop the existing object
+                // names — a silent narrowing that could make a real dataset
+                // member falsely Absent). "Can only add" must hold per stem too.
                 for (stem, names) in &existing.data_aliases {
-                    info.data_aliases
-                        .entry(stem.clone())
-                        .or_insert_with(|| names.clone());
+                    let merged = info.data_aliases.entry(stem.clone()).or_default();
+                    for n in names {
+                        if !merged.contains(n) {
+                            merged.push(n.clone());
+                        }
+                    }
                 }
             }
             cache.insert(info.name.clone(), Arc::new(info));
@@ -1367,6 +1374,11 @@ impl PackageLibrary {
         // Each R spawn is 75-350ms, so we batch once up front.
         let mut datasets_map: HashMap<String, Vec<crate::r_subprocess::DataObject>> =
             HashMap::new();
+        // Whether the batched R dataset enumeration ran successfully this round.
+        // A `data/`-bearing static package is only absence-authoritative when its
+        // datasets were enumerated (a binary `data/Rdata.rdb` exposes no object
+        // names to the static parse); otherwise it stays `Partial`.
+        let mut datasets_batch_ok = false;
         if let Some(ref r_subprocess) = self.r_subprocess {
             // Collect names of packages with a data/ dir from both categories.
             let mut data_pkgs: Vec<String> = Vec::new();
@@ -1391,6 +1403,7 @@ impl PackageLibrary {
                             map.len()
                         );
                         datasets_map = map;
+                        datasets_batch_ok = true;
                     }
                     Err(e) => {
                         log::trace!(
@@ -1408,8 +1421,15 @@ impl PackageLibrary {
             let mut info =
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
             // `static_packages` holds only non-`exportPattern` packages, so the
-            // statically-parsed export set is exhaustive.
-            info.exports_completeness = MemberCompleteness::Complete;
+            // statically-parsed EXPORT set is exhaustive. But if the package
+            // ships a `data/` dir whose datasets were not enumerated via R, its
+            // dataset names are unknown to the static parse, so it must not be
+            // absence-authoritative — stay `Partial` (datasets are positive-only).
+            info.exports_completeness = if pkg_dir.join("data").is_dir() && !datasets_batch_ok {
+                MemberCompleteness::Partial
+            } else {
+                MemberCompleteness::Complete
+            };
 
             // Apply dataset enumeration if available for this package.
             apply_enumeration_from(&mut datasets_map, &name, &pkg_dir, &mut info);
@@ -2217,6 +2237,7 @@ impl PackageLibrary {
 
         // Issue #429: enumerate lazy-data objects via R when the package ships data/.
         let data_dir = pkg_dir.join("data");
+        let mut datasets_enumerated = false;
         if data_dir.is_dir()
             && let Some(ref r_subprocess) = self.r_subprocess
         {
@@ -2224,6 +2245,7 @@ impl PackageLibrary {
             match r_subprocess.get_multiple_package_datasets(&pkgs).await {
                 Ok(mut map) => {
                     apply_enumeration_from(&mut map, name, &pkg_dir, &mut info);
+                    datasets_enumerated = true;
                 }
                 Err(e) => {
                     log::trace!(
@@ -2233,6 +2255,19 @@ impl PackageLibrary {
                     );
                 }
             }
+        }
+        // A package that ships a `data/` directory whose datasets were NOT
+        // enumerated via R cannot be absence-authoritative: a binary
+        // `data/Rdata.rdb` without a `datalist` exposes no object names to the
+        // static parse, so a real `pkg::dataset` would otherwise be wrongly
+        // `Absent` (datasets are positive-only). Downgrade an otherwise-`Complete`
+        // export set to `Partial` in that case. Datasets enumerated via R, or no
+        // `data/` dir at all, keep `Complete`.
+        if info.exports_completeness == MemberCompleteness::Complete
+            && data_dir.is_dir()
+            && !datasets_enumerated
+        {
+            info.exports_completeness = MemberCompleteness::Partial;
         }
 
         log::trace!(
@@ -5098,6 +5133,42 @@ mod tests {
         lib.get_package("mypkg").await;
         assert_eq!(
             lib.namespace_member_status_sync("mypkg", "new_fn"),
+            NamespaceMemberStatus::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn data_package_without_r_enumeration_is_partial() {
+        // Regression: a non-exportPattern package that ships a `data/` directory
+        // whose datasets cannot be enumerated without R (a binary Rdata.rdb
+        // exposes no object names to the static parse) must NOT be Complete —
+        // otherwise a real `pkg::dataset` would be falsely Absent. new_empty()
+        // has no R subprocess, so enumeration deterministically cannot run.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("datapkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: datapkg\nVersion: 1.0\n").unwrap();
+        std::fs::write(pkg.join("NAMESPACE"), "export(some_fn)\n").unwrap();
+        std::fs::create_dir_all(pkg.join("data")).unwrap();
+        // Binary lazy-load DB: opaque to the static dataset parse.
+        std::fs::write(pkg.join("data").join("Rdata.rdb"), b"\x00binary").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![dir.path().to_path_buf()]);
+        let info = lib.get_package("datapkg").await.expect("loads");
+        assert_eq!(
+            info.exports_completeness,
+            MemberCompleteness::Partial,
+            "data/-bearing package without R dataset enumeration must be Partial"
+        );
+        // A dataset member is therefore Partial (silent), never a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("datapkg", "some_dataset"),
+            NamespaceMemberStatus::Partial
+        );
+        // The exported function is still confirmed Present.
+        assert_eq!(
+            lib.namespace_member_status_sync("datapkg", "some_fn"),
             NamespaceMemberStatus::Present
         );
     }
