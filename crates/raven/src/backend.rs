@@ -645,10 +645,16 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 /// `Auto` (the default) resolves to `lintr_discovered`; `On` and `Off`
 /// always win. When `linting` is absent or non-object, returns
 /// `Some(LintConfig::default())` with `enabled = lintr_discovered` if a
-/// `.lintr` was the discovered project config (preserves the implicit
-/// opt-in for `.lintr` files with no recognised content) and `None`
-/// otherwise (so callers can fall back to defaults without losing the
-/// "section never seen" signal).
+/// `.lintr` was the discovered project config, and `None` otherwise (so
+/// callers can fall back to defaults without losing the "section never seen"
+/// signal).
+///
+/// This function does not decide *whether* a discovered `.lintr` opts in —
+/// callers compute `lintr_discovered`, and the rule "a content-free `.lintr`
+/// does not auto-enable" is enforced upstream by
+/// [`crate::config_file::lintr_expresses_linting`] (and the `raven lint`
+/// equivalent). A configured `.lintr`, including a bare `linters_with_defaults()`,
+/// always carries a `linting` object by the time it reaches here.
 ///
 /// Recognised keys:
 /// * `enabled` (`"auto"` / `"on"` / `"off"` / `true` / `false`) — master switch.
@@ -10838,10 +10844,12 @@ mod tests {
         }
 
         #[test]
-        fn parse_lint_config_auto_lintr_no_recognized_content_still_on() {
-            // .lintr was discovered but its content yielded no linting fields.
-            // parse_lint_config should still return Some(default config) with
-            // enabled = true so the implicit `.lintr` opt-in survives.
+        fn parse_lint_config_auto_no_section_with_discovered_true_is_on() {
+            // Pure-function contract: given lintr_discovered = true and no
+            // linting section, return Some(default config) with enabled = true.
+            // (End-to-end, a content-free `.lintr` no longer reaches here with
+            // `true` — `config_file::lintr_expresses_linting` gates that — but
+            // the function must remain defensively correct for any caller.)
             let settings = json!({});
             let cfg = crate::backend::parse_lint_config(&settings, true).unwrap();
             assert!(cfg.enabled);

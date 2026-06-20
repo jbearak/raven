@@ -9,7 +9,7 @@ This page is the landing point for users coming from `lintr` or `REditorSupport`
 
 ## Quick start
 
-By default (`"auto"`), Raven turns linting on when it discovers a workspace or non-home ancestor `.lintr`, or a `raven.toml` opt-in, and stays off otherwise. The literal home-directory `~/.lintr` is ignored unless `raven.linting.readHomeLintr` is true in the editor, or the CLI is pointed at it explicitly with `--config ~/.lintr`. A discovered `.lintr` is also *ignored* when [REditorSupport's own `lintr` diagnostics are live or you're running in Positron](#auto-and-reditorsupport--positron) — there the `.lintr` belongs to `lintr` itself, so Raven doesn't pile its native lints on top. To force linting on regardless of project state, set:
+By default (`"auto"`), Raven turns linting on when it discovers a workspace or non-home ancestor `.lintr` **that contains linting configuration**, or a `raven.toml` opt-in, and stays off otherwise. A blank or empty `.lintr` (one with no `linters:` or `exclusions:` directive) carries no opt-in and does **not** turn linting on — unlike `lintr` itself, Raven's native linting is off by default and a `.lintr` enables it only when the file actually configures linting (a `linters:` directive, including a bare `linters_with_defaults()`). The literal home-directory `~/.lintr` is ignored unless `raven.linting.readHomeLintr` is true in the editor, or the CLI is pointed at it explicitly with `--config ~/.lintr`. A discovered `.lintr` is also *ignored* when [REditorSupport's own `lintr` diagnostics are live or you're running in Positron](#auto-and-reditorsupport--positron) — there the `.lintr` belongs to `lintr` itself, so Raven doesn't pile its native lints on top. To force linting on regardless of project state, set:
 
 ```json
 {
@@ -47,7 +47,7 @@ Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to fil
 
 `raven.linting.enabled` is tri-state: `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for backward compatibility with existing settings.
 
-- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` is discovered on the upward walk from the active project root, or when a `raven.toml` sets `[linting] enabled = true`. The active project root is the first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory. The literal home-directory `~/.lintr` is ignored by default; in VS Code and other LSP clients, set `raven.linting.readHomeLintr = true` to include it, while the CLI uses it only when passed explicitly with `--config ~/.lintr`. Otherwise off. The `.lintr` half of this is suppressed when REditorSupport / Positron already owns the `lintr` path — see [`"auto"` and REditorSupport / Positron](#auto-and-reditorsupport--positron) below.
+- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` **that contains linting configuration** (a `linters:` or `exclusions:` directive — a bare `linters_with_defaults()` counts; a blank/empty file does not) is discovered on the upward walk from the active project root, or when a `raven.toml` sets `[linting] enabled = true`. The active project root is the first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory. The literal home-directory `~/.lintr` is ignored by default; in VS Code and other LSP clients, set `raven.linting.readHomeLintr = true` to include it, while the CLI uses it only when passed explicitly with `--config ~/.lintr`. Otherwise off. The `.lintr` half of this is suppressed when REditorSupport / Positron already owns the `lintr` path — see [`"auto"` and REditorSupport / Positron](#auto-and-reditorsupport--positron) below.
 - `true` / `"on"` — force linting on. Discovered rule severities still apply.
 - `false` / `"off"` — disable linting unless a discovered `raven.toml` explicitly sets `enabled = true` (raven.toml always wins at the leaf — the project-policy contract). A discovered `.lintr` alone never re-enables linting.
 
@@ -60,7 +60,8 @@ Resolution by client setting × project state:
 | Client (`raven.linting.enabled`) | Project state | Result |
 |---|---|---|
 | `"auto"` (default) | no `.lintr`, no `raven.toml` | off |
-| `"auto"` | `.lintr` discovered (workspace or non-home ancestor) | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
+| `"auto"` | blank/empty `.lintr` (no `linters:` / `exclusions:` directive) | off — an empty `.lintr` carries no opt-in |
+| `"auto"` | configured `.lintr` discovered (workspace or non-home ancestor) | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
 | `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = false` (default) | off |
 | `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = true` | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
 | `"auto"` | `raven.toml` with `enabled = true` (or `"on"`) | on |
@@ -95,7 +96,7 @@ In those environments, `"auto"` + a discovered `.lintr` resolves to **off**. Thi
 
 To run Raven's native lints *alongside* REditorSupport's `lintr` on purpose, set `raven.linting.enabled` to `true` (or migrate the project to `raven.toml`). See [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both).
 
-> This is a VS Code **environment** signal: it is computed by the extension (from REditorSupport's state and `r.lsp.*`) and is not something a project `raven.toml` can override. Editors other than VS Code, and the bare CLI, don't send it, so they keep the historical "discovered workspace/non-home `.lintr` ⇒ on" behavior. The literal home-directory `~/.lintr` remains default-off unless the editor setting is enabled or the CLI receives it explicitly with `--config ~/.lintr`.
+> This is a VS Code **environment** signal: it is computed by the extension (from REditorSupport's state and `r.lsp.*`) and is not something a project `raven.toml` can override. Editors other than VS Code, and the bare CLI, don't send it, so they keep the historical "discovered workspace/non-home *configured* `.lintr` ⇒ on" behavior (a blank/empty `.lintr` still never opts in). The literal home-directory `~/.lintr` remains default-off unless the editor setting is enabled or the CLI receives it explicitly with `--config ~/.lintr`.
 
 ## Settings reference by rule
 
@@ -216,6 +217,8 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 The recommended path is to configure Raven via `raven.toml` at the project root (see [Configuration § Project config](configuration.md#project-config-raventoml)). The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
 
 > **Runtime support:** When no `raven.toml` is discovered on the upward walk from the active project root (first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory), Raven reads a documented subset of the discovered `.lintr`. In the LSP/editor, that discovered `.lintr` is watched and live-reloaded; the CLI reads it once per command invocation. Workspace and non-home ancestor `.lintr` files are read by default. The literal home-directory `~/.lintr` is read only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled, or when the CLI receives it explicitly with `--config ~/.lintr`. The mapping table below is the supported surface. Forms outside the supported subset log a single batch warning and are otherwise ignored.
+>
+> Multi-line `linters:` / `exclusions:` values are folded by **bracket balance**, so a closing `)` works whether it sits at column 0 or is indented, and `#` comments inside the value are handled. (Real `lintr` reads `.lintr` as strict DCF and *rejects* a column-0 continuation — `read.dcf`: "Regular lines must have a tag" — so Raven logs a one-line note suggesting you indent the closing line if you also run `lintr`.) Numeric arguments accept R integer literals — decimal or hexadecimal, each with an optional `L` suffix (`line_length_linter(120L)`, `line_length_linter(0x50)`) — and whitespace before `(` is tolerated (`linters_with_defaults (...)`). The pre-3.0 `with_defaults(...)` spelling is accepted as an alias for `linters_with_defaults(...)`.
 
 | `.lintr` linter | Raven settings |
 |---|---|
