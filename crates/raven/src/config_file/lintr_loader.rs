@@ -233,9 +233,7 @@ fn apply_linters(
 
 fn strip_linters_with_defaults(body: &str) -> &str {
     let trimmed = body.trim();
-    if let Some(rest) = trimmed.strip_prefix("linters_with_defaults(")
-        && let Some(inner) = rest.strip_suffix(')')
-    {
+    if let Some(inner) = strip_named_call(trimmed, "linters_with_defaults") {
         return inner.trim();
     }
     trimmed
@@ -377,10 +375,7 @@ fn disable_rule(
 fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constructs: &mut usize) {
     let body = strip_comments(body);
     let body = body.trim();
-    let inner = body
-        .strip_prefix("list(")
-        .and_then(|r| r.strip_suffix(')'))
-        .unwrap_or(body);
+    let inner = strip_named_call(body, "list").unwrap_or(body);
     let mut globs = Vec::new();
     for part in split_top_level_commas(inner) {
         let p = part.trim().trim_matches(|c| c == '"' || c == '\'');
@@ -530,16 +525,26 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     out
 }
 
+/// Parse an R unsigned-integer literal: digits with an optional trailing `L`
+/// integer-type suffix (e.g. `120`, `120L`). R only accepts the uppercase `L`
+/// suffix, so we match that exactly. Returns `None` for floats, hex, signed, or
+/// anything else.
+fn parse_r_uint(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let digits = s.strip_suffix('L').unwrap_or(s);
+    digits.parse::<u64>().ok()
+}
+
 fn parse_positional_int(args: &str) -> Option<u64> {
     let first = split_top_level_commas(args).into_iter().next()?.trim();
     if first.contains('=') {
         return None;
     }
-    first.parse::<u64>().ok()
+    parse_r_uint(first)
 }
 
 fn parse_named_int(args: &str, name: &str) -> Option<u64> {
-    parse_named_arg(args, name)?.parse::<u64>().ok()
+    parse_r_uint(parse_named_arg(args, name)?)
 }
 
 fn parse_named_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
@@ -609,13 +614,24 @@ fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Strip a `name(...)` call wrapper, tolerating whitespace between `name` and
+/// `(` (valid R: `linters_with_defaults (x)`). Returns the inner argument text,
+/// or `None` if `s` is not a `name(...)` call. The required `(` immediately
+/// after the (whitespace-trimmed) name is what prevents a false match on a
+/// longer identifier: `strip_named_call("listings(x)", "list")` strips the
+/// `list` prefix to `"ings(x)"`, whose next non-space char is not `(`, so it
+/// returns `None`.
+fn strip_named_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let after = s.trim().strip_prefix(name)?.trim_start();
+    after.strip_prefix('(').and_then(|r| r.strip_suffix(')'))
+}
+
 /// Strip a `c(...)` vector wrapper, tolerating optional whitespace between the
 /// `c` and the `(` so valid R like `c ("snake_case")` parses identically to
 /// `c("snake_case")`. Returns the inner argument text, or `None` if `s` is not
 /// a `c(...)` call.
 fn strip_c_vector(s: &str) -> Option<&str> {
-    let after_c = s.strip_prefix('c')?.trim_start();
-    after_c.strip_prefix('(').and_then(|r| r.strip_suffix(')'))
+    strip_named_call(s, "c")
 }
 
 #[cfg(test)]
@@ -736,6 +752,42 @@ mod tests {
         let l = &out.settings["linting"];
         assert_eq!(l["lineLength"], json!(120));
         assert_eq!(l["objectLength"], json!(40));
+    }
+
+    #[test]
+    fn whitespace_before_paren_on_wrappers_is_tolerated() {
+        // Valid R: space between the function name and '('.
+        let out = load_str("linters: linters_with_defaults (line_length_linter(120))\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+        assert!(
+            out.warnings.is_empty(),
+            "space before '(' must not warn: {:?}",
+            out.warnings
+        );
+
+        let out = load_str("exclusions: list (\"R/legacy.R\")\n");
+        let files = out.settings["linting"]["overrides"][0]["files"]
+            .as_array()
+            .unwrap();
+        assert!(files.iter().any(|v| v == &json!("R/legacy.R")));
+    }
+
+    #[test]
+    fn integer_literal_suffix_maps_positional_and_named() {
+        let out = load_str("linters: linters_with_defaults(line_length_linter(120L))\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+
+        let out =
+            load_str("linters: linters_with_defaults(object_length_linter(length = 40L))\n");
+        assert_eq!(out.settings["linting"]["objectLength"], json!(40));
+
+        let out = load_str("linters: linters_with_defaults(indentation_linter(4L))\n");
+        assert_eq!(out.settings["linting"]["indentationUnit"], json!(4));
+        assert!(
+            out.warnings.is_empty(),
+            "L-suffixed integers must not warn: {:?}",
+            out.warnings
+        );
     }
 
     #[test]
