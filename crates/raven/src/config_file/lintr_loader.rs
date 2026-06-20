@@ -47,9 +47,24 @@ pub fn load_str(text: &str) -> LoadedLintr {
     let mut expresses_config = false;
 
     for (key, value) in fields {
+        // A recognized field whose value never closes its brackets is malformed
+        // (almost always a missing `)`). Point at it specifically rather than
+        // letting it fall through to the generic "unrecognized construct" batch
+        // note, and do not try to apply a half-parsed value. The field still
+        // counts as expressing linting intent (the user clearly meant to
+        // configure linting), so auto-enable is unaffected.
+        if is_lintr_field(&key) {
+            expresses_config = true;
+            if net_bracket_depth(&value) > 0 {
+                warnings.push(format!(
+                    ".lintr: field '{}' has unbalanced brackets (likely a missing ')'); its value was not applied",
+                    key
+                ));
+                continue;
+            }
+        }
         match key.as_str() {
             "linters" => {
-                expresses_config = true;
                 apply_linters(
                     &value,
                     &mut linting,
@@ -58,7 +73,6 @@ pub fn load_str(text: &str) -> LoadedLintr {
                 );
             }
             "exclusions" => {
-                expresses_config = true;
                 apply_exclusions(&value, &mut overrides, &mut unrecognized_constructs);
             }
             other => {
@@ -137,41 +151,66 @@ fn dcf_fold(text: &str) -> FoldResult {
     let mut fields: Vec<(String, String)> = Vec::new();
     let mut column0_continuation_count = 0usize;
     let mut current: Option<(String, String)> = None;
+    // Bracket/string/comment state for `current`'s accumulated value, advanced
+    // incrementally one line at a time. Re-deriving the depth with
+    // `net_bracket_depth(val)` on every physical line would be O(n^2) in the
+    // field's length; carrying it here keeps folding linear. Invariant: whenever
+    // `current` is `Some`, `st` has been fed exactly the characters in its value
+    // (so `st.depth == net_bracket_depth(value)`); it is reset on every new
+    // field.
+    let mut st = ScanState::default();
     for raw_line in text.lines() {
-        // Mid-expression: brackets are still open, so this physical line is a
-        // continuation no matter its indentation.
-        if let Some((_, val)) = current.as_mut()
-            && net_bracket_depth(val) > 0
+        let trimmed = raw_line.trim();
+        // Mid-expression: brackets are still open, so this physical line
+        // continues the value no matter its indentation — UNLESS it is itself a
+        // recognized `.lintr` field header at column 0. A missing `)` would
+        // otherwise fold the rest of the file (including a following
+        // `exclusions:` field) into one value and silently drop it; breaking on
+        // a recognized header instead leaves the unbalanced field for `load_str`
+        // to flag and recovers the following field.
+        if st.depth > 0
+            && !starts_new_field(raw_line)
+            && let Some((_, val)) = current.as_mut()
         {
-            if raw_line.trim().is_empty() {
+            if trimmed.is_empty() {
                 // Blank lines inside an open bracket are insignificant in R.
                 continue;
             }
-            if !raw_line.starts_with(|c: char| c.is_whitespace()) {
+            // A column-0 `#` comment line is valid DCF (read.dcf keeps comment
+            // lines), so it is not a non-portable column-0 continuation and must
+            // not be counted toward the portability note.
+            if !raw_line.starts_with(|c: char| c.is_whitespace()) && !trimmed.starts_with('#') {
                 column0_continuation_count += 1;
             }
             val.push('\n');
-            val.push_str(raw_line.trim());
+            val.push_str(trimmed);
+            feed_line(&mut st, trimmed);
             continue;
         }
-        if raw_line.trim().is_empty() {
+        if trimmed.is_empty() {
             continue;
         }
         if raw_line.starts_with(|c: char| c.is_whitespace()) {
             // DCF continuation: balanced value, indented line.
             if let Some((_, val)) = current.as_mut() {
                 val.push('\n');
-                val.push_str(raw_line.trim());
+                val.push_str(trimmed);
+                feed_line(&mut st, trimmed);
             }
             continue;
         }
-        // Column 0, non-blank, balanced value: a new field.
+        // Column 0, non-blank: a new field (a balanced value, or a recognized
+        // header interrupting an unbalanced one).
         if let Some(kv) = current.take() {
             fields.push(kv);
         }
+        st = ScanState::default();
         if let Some(colon) = raw_line.find(':') {
             let key = raw_line[..colon].trim().to_string();
             let val = raw_line[colon + 1..].trim().to_string();
+            for c in val.chars() {
+                st.step(c);
+            }
             current = Some((key, val));
         }
         // A column-0 line with no colon while balanced is malformed; drop it
@@ -184,6 +223,39 @@ fn dcf_fold(text: &str) -> FoldResult {
         fields,
         column0_continuation_count,
     }
+}
+
+/// Advance `st` over a folded continuation line: the joining `\n` first, then
+/// the line's characters, mirroring exactly what `dcf_fold` appends to the
+/// value so `st.depth` stays equal to the value's true bracket depth.
+fn feed_line(st: &mut ScanState, trimmed: &str) {
+    st.step('\n');
+    for c in trimmed.chars() {
+        st.step(c);
+    }
+}
+
+/// True if `line` begins (at column 0) a recognized `.lintr` field header —
+/// `linters:` or `exclusions:` (see [`is_lintr_field`]). Used by [`dcf_fold`] to
+/// stop a bracket-unbalanced field from swallowing the next field as a
+/// continuation. Restricted to the *recognized* field names so it can never
+/// misfire on an R `a:b` sequence that happens to sit at column 0 inside a
+/// multi-line expression.
+fn starts_new_field(line: &str) -> bool {
+    if line.starts_with(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    match line.find(':') {
+        Some(colon) => is_lintr_field(line[..colon].trim()),
+        None => false,
+    }
+}
+
+/// The `.lintr` field names this reader recognizes. Single source of truth for
+/// the recognized set shared by [`starts_new_field`] and the dispatch in
+/// [`load_str`].
+fn is_lintr_field(key: &str) -> bool {
+    matches!(key, "linters" | "exclusions")
 }
 
 /// Scan the body of `linters: linters_with_defaults(...)` (or a bare expression).
@@ -255,14 +327,12 @@ fn apply_linter_call(
 ) {
     match name {
         "line_length_linter" => {
-            if let Some(n) = parse_named_int(args, "length").or_else(|| parse_positional_int(args))
-            {
+            if let Some(n) = parse_int_arg(args, "length") {
                 linting.insert("lineLength".into(), json!(n));
             }
         }
         "object_length_linter" => {
-            if let Some(n) = parse_named_int(args, "length").or_else(|| parse_positional_int(args))
-            {
+            if let Some(n) = parse_int_arg(args, "length") {
                 linting.insert("objectLength".into(), json!(n));
             }
         }
@@ -270,8 +340,7 @@ fn apply_linter_call(
             // lintr's first positional formal is `indent`, so accept both the
             // named `indent = N` and the positional `N` form (mirroring
             // line_length_linter / object_length_linter).
-            if let Some(n) = parse_named_int(args, "indent").or_else(|| parse_positional_int(args))
-            {
+            if let Some(n) = parse_int_arg(args, "indent") {
                 linting.insert("indentationUnit".into(), json!(n));
             }
         }
@@ -429,14 +498,17 @@ fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constru
     }
 }
 
-/// True if `s` contains an `=` outside any string literal or `#` comment — i.e.
-/// a named argument / line-range form (`"file" = 1:10`) rather than a `=` that
-/// is part of a quoted filename (`"a=b.R"`). Uses the shared [`ScanState`] so it
-/// agrees with [`split_top_level_commas`] on what counts as "inside a string".
+/// True if `s` contains a **top-level** `=` outside any string literal or `#`
+/// comment — i.e. a named argument / line-range form (`"file" = 1:10`,
+/// `regexes = "^x$"`) rather than a `=` that is part of a quoted filename
+/// (`"a=b.R"`) or nested inside a call (`c(a = 1)`). Uses the shared
+/// [`ScanState`] (depth check included) so it agrees with
+/// [`split_top_level_commas`] on what counts as "inside a string" and on bracket
+/// depth.
 fn has_unquoted_eq(s: &str) -> bool {
     let mut st = ScanState::default();
     for c in s.chars() {
-        if st.step(c) && c == '=' {
+        if st.step(c) && c == '=' && st.depth == 0 {
             return true;
         }
     }
@@ -579,16 +651,26 @@ fn parse_r_uint(s: &str) -> Option<u64> {
     body.parse::<u64>().ok()
 }
 
-fn parse_positional_int(args: &str) -> Option<u64> {
-    let first = split_top_level_commas(args).into_iter().next()?.trim();
-    if first.contains('=') {
+/// Resolve an unsigned-integer linter argument: the named form `name = N` if
+/// present anywhere in the list, else the first positional integer. Tokenizes
+/// the argument list once (the named lookup and the positional fallback share
+/// the split). The positional fallback considers only the *first* argument: if
+/// that is itself a named argument it yields `None`, matching R, where the first
+/// formal (`length` / `indent`) is what a leading positional integer binds to.
+fn parse_int_arg(args: &str, name: &str) -> Option<u64> {
+    let tokens = split_top_level_commas(args);
+    for tok in &tokens {
+        if let Some((lhs, rhs)) = tok.split_once('=')
+            && lhs.trim() == name
+        {
+            return parse_r_uint(rhs);
+        }
+    }
+    let first = tokens.first()?.trim();
+    if has_unquoted_eq(first) {
         return None;
     }
     parse_r_uint(first)
-}
-
-fn parse_named_int(args: &str, name: &str) -> Option<u64> {
-    parse_r_uint(parse_named_arg(args, name)?)
 }
 
 fn parse_named_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
@@ -620,21 +702,18 @@ fn parse_named_string(args: &str, name: &str) -> Option<String> {
 /// all (e.g. `object_name_linter()` or `object_name_linter(regexes = ...)`).
 fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
     let raw = parse_named_arg(args, "styles").or_else(|| {
-        let first = split_top_level_commas(args).into_iter().next()?.trim();
-        if first.is_empty() {
-            return None;
-        }
-        // A positional `styles` value is a quoted scalar or a `c(...)` vector;
-        // accept those even when their contents contain `=` (e.g. a regex with
-        // a `(?=...)` lookahead). A bare `name = value` token is a *different*
-        // named argument (such as `regexes = ...`) that we don't map, so only
-        // an unquoted, non-`c(...)` token containing `=` is rejected here.
-        let is_quoted = first.starts_with('"') || first.starts_with('\'');
-        let is_vector = strip_c_vector(first).is_some();
-        if !is_quoted && !is_vector && first.contains('=') {
-            return None;
-        }
-        Some(first)
+        // No named `styles =`: the first *positional* argument binds to lintr's
+        // first formal, `styles`. Skip any named arguments that precede it
+        // (e.g. `object_name_linter(regexes = "^x$", "snake_case")`, where lintr
+        // still fills `styles` from the positional `"snake_case"`). A positional
+        // value is a quoted scalar or a `c(...)` vector — its contents may
+        // contain `=` (a regex lookahead, or `c(a = 1)`), but [`has_unquoted_eq`]
+        // only flags a *top-level* `=`, so such values are correctly treated as
+        // positional rather than misread as a named argument.
+        split_top_level_commas(args)
+            .into_iter()
+            .map(str::trim)
+            .find(|tok| !tok.is_empty() && !has_unquoted_eq(tok))
     })?;
     let raw = raw.trim();
     if let Some(inner) = strip_c_vector(raw) {
@@ -1611,6 +1690,73 @@ mod tests {
         assert_eq!(
             cfg.object_name_style_argument,
             crate::linting::ObjectNameStyle::CamelCase
+        );
+    }
+
+    #[test]
+    fn unbalanced_field_does_not_swallow_following_field() {
+        // A missing `)` in `linters:` must NOT fold the following `exclusions:`
+        // field into the linters value (silent data loss). The `exclusions:`
+        // field is recovered and applied; the malformed `linters:` field is
+        // flagged specifically so the typo is pointed at.
+        let input = "linters: linters_with_defaults(\n\
+            line_length_linter(120)\n\
+            exclusions: list(\"a.R\")\n";
+        let out = load_str(input);
+        // The exclusions field survived the unbalanced linters field.
+        let files = out.settings["linting"]["overrides"][0]["files"]
+            .as_array()
+            .expect("exclusions must survive an unbalanced preceding field");
+        assert!(
+            files.iter().any(|v| v == &json!("a.R")),
+            "exclusions lost: {files:?}"
+        );
+        // The malformed field is called out specifically (not just a generic
+        // "unrecognized construct" batch note).
+        assert!(
+            out.warnings.iter().any(|w| w.contains("unbalanced")),
+            "expected an unbalanced-brackets warning: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn column_zero_comment_line_is_not_counted_as_continuation() {
+        // A column-0 `#` comment line inside an open bracket is valid DCF (lintr
+        // keeps comment lines), so it must NOT inflate the lintr-portability
+        // continuation count: here only the linter entry and the closing `)`
+        // are real column-0 continuations.
+        let input = "linters: linters_with_defaults(\n\
+            # a comment\n\
+            line_length_linter(120)\n\
+            )\n";
+        let out = load_str(input);
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("accepted 2 continuation line(s)")),
+            "a column-0 comment line must not be counted: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn object_name_positional_style_after_named_arg_maps() {
+        // lintr binds `"snake_case"` positionally to the first formal `styles`
+        // even when a different named arg (`regexes =`) precedes it. Raven must
+        // do the same, not silently drop the style.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(regexes = \"^x$\", \"snake_case\"))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!("snake_case")
+        );
+        assert!(
+            out.warnings.is_empty(),
+            "a recognized positional style after a named arg must map cleanly: {:?}",
+            out.warnings
         );
     }
 }
