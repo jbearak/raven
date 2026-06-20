@@ -531,14 +531,19 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     out
 }
 
-/// Parse an R unsigned-integer literal: digits with an optional trailing `L`
-/// integer-type suffix (e.g. `120`, `120L`). R only accepts the uppercase `L`
-/// suffix, so we match that exactly. Returns `None` for floats, hex, signed, or
-/// anything else.
+/// Parse an R unsigned-integer literal: decimal or `0x`/`0X` hexadecimal digits
+/// with an optional trailing `L` integer-type suffix (e.g. `120`, `120L`,
+/// `0x50`, `0x50L`). R only accepts the uppercase `L` suffix, so we match that
+/// exactly. Returns `None` for floats, signed, or anything else.
 fn parse_r_uint(s: &str) -> Option<u64> {
     let s = s.trim();
-    let digits = s.strip_suffix('L').unwrap_or(s);
-    digits.parse::<u64>().ok()
+    let body = s.strip_suffix('L').unwrap_or(s);
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        // Reject an empty hex body (`0x`, `0xL`); `from_str_radix` already
+        // rejects a leading sign and non-hex digits.
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    body.parse::<u64>().ok()
 }
 
 fn parse_positional_int(args: &str) -> Option<u64> {
@@ -824,6 +829,26 @@ mod tests {
             "L-suffixed integers must not warn: {:?}",
             out.warnings
         );
+    }
+
+    #[test]
+    fn hex_integer_literal_maps() {
+        // R hex integer literals (with or without the L suffix) are valid and
+        // lintr accepts them; 0x50 == 80.
+        let out = load_str("linters: linters_with_defaults(line_length_linter(0x50L))\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(80));
+
+        let out = load_str("linters: linters_with_defaults(object_length_linter(0X28))\n");
+        assert_eq!(out.settings["linting"]["objectLength"], json!(40));
+        assert!(
+            out.warnings.is_empty(),
+            "hex integers must not warn: {:?}",
+            out.warnings
+        );
+
+        // A bare/empty hex body must not panic or map.
+        let out = load_str("linters: linters_with_defaults(line_length_linter(0xL))\n");
+        assert!(out.settings["linting"].get("lineLength").is_none());
     }
 
     #[test]
