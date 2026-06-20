@@ -501,12 +501,11 @@ fn strip_comments(s: &str) -> String {
             if c == '\n' {
                 out.push(c);
             }
-        } else if was_str {
-            out.push(c);
-        } else if c != '#' {
+        } else if was_str || c != '#' {
+            // Inside a string, keep everything (incl. the closing quote);
+            // outside, keep everything except a `#` that starts a comment.
             out.push(c);
         }
-        // (`#` while not in a string/comment starts a comment: dropped.)
     }
     out
 }
@@ -814,8 +813,7 @@ mod tests {
         let out = load_str("linters: linters_with_defaults(line_length_linter(120L))\n");
         assert_eq!(out.settings["linting"]["lineLength"], json!(120));
 
-        let out =
-            load_str("linters: linters_with_defaults(object_length_linter(length = 40L))\n");
+        let out = load_str("linters: linters_with_defaults(object_length_linter(length = 40L))\n");
         assert_eq!(out.settings["linting"]["objectLength"], json!(40));
 
         let out = load_str("linters: linters_with_defaults(indentation_linter(4L))\n");
