@@ -272,7 +272,7 @@ pub fn namespace_completion_items(
 /// Strip a single matching pair of surrounding string/backtick delimiters, so a
 /// quoted package qualifier (`"dplyr"`, `'dplyr'`, `` `dplyr` ``) resolves to
 /// the bare package name. Leaves a plain identifier untouched.
-fn unquote_package(raw: &str) -> &str {
+pub(crate) fn unquote_package(raw: &str) -> &str {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2 {
         let first = bytes[0];
