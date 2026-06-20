@@ -49,6 +49,28 @@ pub enum ObjectNameStyle {
     Any,
 }
 
+impl ObjectNameStyle {
+    /// Parse an object-name style name (as written in `.lintr` or
+    /// `raven.toml`) into the enum, returning `None` for any value Raven
+    /// cannot represent (e.g. a raw regex passed to `object_name_linter`).
+    ///
+    /// This is the **single source of truth** for the set of style names
+    /// Raven understands. Both `backend::parse_object_name_style` (the
+    /// JSON/severity path) and the `.lintr` loader's `object_name_linter`
+    /// handling consult it, so the recognized set cannot drift between them.
+    pub fn from_config_name(value: &str) -> Option<Self> {
+        match value {
+            "snake_case" => Some(Self::SnakeCase),
+            "camelCase" => Some(Self::CamelCase),
+            "dotted.case" => Some(Self::DottedCase),
+            "UPPER_CASE" => Some(Self::UpperCase),
+            "lowercase" => Some(Self::Lowercase),
+            "any" => Some(Self::Any),
+            _ => None,
+        }
+    }
+}
+
 /// Lint configuration.
 ///
 /// `enabled` is the master switch (default off). Each rule has its own
@@ -174,4 +196,44 @@ pub enum LintEnabled {
     Auto,
     On,
     Off,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_config_name_maps_known_styles() {
+        assert_eq!(
+            ObjectNameStyle::from_config_name("snake_case"),
+            Some(ObjectNameStyle::SnakeCase)
+        );
+        assert_eq!(
+            ObjectNameStyle::from_config_name("camelCase"),
+            Some(ObjectNameStyle::CamelCase)
+        );
+        assert_eq!(
+            ObjectNameStyle::from_config_name("dotted.case"),
+            Some(ObjectNameStyle::DottedCase)
+        );
+        assert_eq!(
+            ObjectNameStyle::from_config_name("UPPER_CASE"),
+            Some(ObjectNameStyle::UpperCase)
+        );
+        assert_eq!(
+            ObjectNameStyle::from_config_name("lowercase"),
+            Some(ObjectNameStyle::Lowercase)
+        );
+        assert_eq!(
+            ObjectNameStyle::from_config_name("any"),
+            Some(ObjectNameStyle::Any)
+        );
+    }
+
+    #[test]
+    fn from_config_name_rejects_unknown_and_regex() {
+        assert_eq!(ObjectNameStyle::from_config_name("kebab-case"), None);
+        assert_eq!(ObjectNameStyle::from_config_name("^[a-z][a-z0-9_]*$"), None);
+        assert_eq!(ObjectNameStyle::from_config_name(""), None);
+    }
 }

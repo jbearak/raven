@@ -954,20 +954,12 @@ pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
 /// warning so the user can find the offending setting in their config.
 fn parse_object_name_style(value: &str, setting_name: &str) -> crate::linting::ObjectNameStyle {
     use crate::linting::ObjectNameStyle;
-    match value {
-        "snake_case" => ObjectNameStyle::SnakeCase,
-        "camelCase" => ObjectNameStyle::CamelCase,
-        "dotted.case" => ObjectNameStyle::DottedCase,
-        "UPPER_CASE" => ObjectNameStyle::UpperCase,
-        "lowercase" => ObjectNameStyle::Lowercase,
-        "any" => ObjectNameStyle::Any,
-        other => {
-            log::warn!(
-                "Unrecognised linting.{setting_name} '{other}', disabling this kind (treating as 'any')."
-            );
-            ObjectNameStyle::Any
-        }
-    }
+    ObjectNameStyle::from_config_name(value).unwrap_or_else(|| {
+        log::warn!(
+            "Unrecognised linting.{setting_name} '{value}', disabling this kind (treating as 'any')."
+        );
+        ObjectNameStyle::Any
+    })
 }
 
 /// Parse symbol provider configuration from LSP settings.
