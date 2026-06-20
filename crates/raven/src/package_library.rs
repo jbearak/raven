@@ -333,7 +333,14 @@ fn dedup_preserving_order(names: Vec<String>) -> Vec<String> {
 /// from packages that require R subprocess due to `exportPattern()` usage.
 #[derive(Debug)]
 pub struct NamespaceParseResult {
-    /// Explicit exports from export() and S3method() directives
+    /// Explicit exports parsed from NAMESPACE: `export()`, `S3method()`,
+    /// `exportClasses()` and `exportMethods()` names (issue #474 — S4
+    /// classes/generics appear in `getNamespaceExports()` and are captured here
+    /// as plain names). `exportPattern()` / `exportClassPattern()` are NOT
+    /// included; they set [`Self::has_export_pattern`] instead. So when
+    /// `has_export_pattern` is false this set is the package's *complete* export
+    /// list, which is what lets `namespace_member_status_sync` conclude `Absent`
+    /// from a static parse.
     pub explicit_exports: Vec<String>,
     /// Whether the package uses exportPattern() and needs R subprocess for accuracy
     pub has_export_pattern: bool,
@@ -1455,12 +1462,20 @@ impl PackageLibrary {
                                         None
                                     };
                                     from_provider.unwrap_or_else(|| {
-                                        PackageInfo::with_details(
+                                        let mut i = PackageInfo::with_details(
                                             pkg_name.clone(),
                                             exports_set,
                                             Vec::new(),
                                             Vec::new(),
-                                        )
+                                        );
+                                        // A non-empty R `getNamespaceExports()`
+                                        // result is authoritative → Complete; an
+                                        // empty one is a swallowed error and stays
+                                        // Unknown (never absence-authoritative).
+                                        if !i.exports.is_empty() {
+                                            i.exports_completeness = MemberCompleteness::Complete;
+                                        }
+                                        i
                                     })
                                 }
                             };
@@ -1883,6 +1898,14 @@ impl PackageLibrary {
             }
         }
 
+        // Packages whose NAMESPACE uses `exportPattern` — their disk-derived
+        // export set is the INDEX approximation (Partial) UNLESS R's
+        // `getNamespaceExports()` enumerates them authoritatively in Step 4.
+        let pattern_set: HashSet<String> = pattern_packages.iter().cloned().collect();
+        // Pattern packages for which R returned a non-empty authoritative export
+        // set this run. Used in Step 5 to stamp `Complete` vs `Partial`.
+        let mut r_resolved: HashSet<String> = HashSet::new();
+
         // Step 4: If R subprocess is available and we have pattern packages,
         // try to get accurate exports for them
         if !pattern_packages.is_empty()
@@ -1898,6 +1921,12 @@ impl PackageLibrary {
             {
                 Ok(exports_map) => {
                     for (pkg_name, exports) in exports_map {
+                        // A non-empty R enumeration is authoritative; an empty
+                        // one (e.g. a swallowed asNamespace error) is not, so it
+                        // leaves the package on the Partial INDEX fallback.
+                        if !exports.is_empty() {
+                            r_resolved.insert(pkg_name.clone());
+                        }
                         let is_attached_base = attached_base_packages.contains(&pkg_name);
                         let pkg_exports = per_package_exports.entry(pkg_name).or_default();
                         for export in exports {
@@ -1959,13 +1988,21 @@ impl PackageLibrary {
             // `lazy_data` is intentionally empty here: these are base packages,
             // whose datasets are merged into `base_exports` above (issue #276) —
             // so this deliberately does NOT route through `package_info_from_dir`.
+            // A base package whose NAMESPACE uses `exportPattern` is only
+            // `Complete` when R enumerated it this run; otherwise its export set
+            // is the INDEX approximation, so it stays `Partial` and can never
+            // drive a false `namespace-member-not-found`. Non-pattern base
+            // packages parse exhaustively from NAMESPACE → `Complete`. (Member
+            // presence is additionally guarded by the positive-only
+            // `base_exports` check in `namespace_member_status_sync`.)
+            let completeness = if pattern_set.contains(&pkg_name) && !r_resolved.contains(&pkg_name)
+            {
+                MemberCompleteness::Partial
+            } else {
+                MemberCompleteness::Complete
+            };
             let mut info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
-            // Base-package exports are enumerated authoritatively at init (R's
-            // getNamespaceExports for the `exportPattern` ones in Step 4, plus
-            // explicit exports / data / the embedded floor). Member-presence for
-            // base packages is additionally guarded by the positive-only
-            // `base_exports` check in `namespace_member_status_sync`.
-            info.exports_completeness = MemberCompleteness::Complete;
+            info.exports_completeness = completeness;
             self.insert_package(info).await;
         }
 
@@ -6521,6 +6558,67 @@ mod tests {
         assert!(
             grid.exports.contains("gpar"),
             "library(grid) resolves gpar with no R and no names.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_pattern_package_without_r_stays_partial() {
+        // Regression (issue #503 review blocker): a base-priority package whose
+        // NAMESPACE uses exportPattern, initialized with NO R subprocess, must
+        // NOT be stamped Complete — its exports came only from the INDEX
+        // approximation, so member absence is not authoritative.
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib_root = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        // A real base package on disk so the embedded fallback path is skipped.
+        let base_dir = lib_root.join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("DESCRIPTION"),
+            "Package: base\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base_dir.join("INDEX"),
+            "print                   Print Values\n",
+        )
+        .unwrap();
+
+        // grid: base-priority, exportPattern → needs R/INDEX. INDEX lists only
+        // `grid.ls`, so the cached export set is the partial approximation.
+        let grid_dir = lib_root.join("grid");
+        std::fs::create_dir_all(&grid_dir).unwrap();
+        std::fs::write(
+            grid_dir.join("DESCRIPTION"),
+            "Package: grid\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(grid_dir.join("NAMESPACE"), "exportPattern(\"^grid\")\n").unwrap();
+        std::fs::write(
+            grid_dir.join("INDEX"),
+            "grid.ls                 List Grobs\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root]);
+        // No r_subprocess: pattern packages can only use the INDEX fallback.
+        lib.initialize().await.unwrap();
+
+        let grid = lib.get_package("grid").await.expect("grid cached");
+        assert_eq!(
+            grid.exports_completeness,
+            MemberCompleteness::Partial,
+            "exportPattern base package without R must be Partial, not Complete"
+        );
+        // Therefore an unknown member is Partial (silent), never a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("grid", "definitely_not_exported"),
+            NamespaceMemberStatus::Partial
         );
     }
 

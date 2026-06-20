@@ -4850,6 +4850,13 @@ impl LanguageServer for Backend {
             let revalidation_uri = uri.clone();
             let direct_packages = packages_to_prefetch;
             let traversal_truncation = self.traversal_truncation.clone();
+            // URIs already force-marked + scheduled by the synchronous
+            // dependency-graph path above. The sibling republish below must
+            // exclude them: double-marking the force-republish counter would
+            // leak a phantom marker (a later same-URI job cancels an earlier
+            // one before it consumes its mark).
+            let scheduled_uris: std::collections::HashSet<Url> =
+                work_items.iter().map(|(u, _, _)| u.clone()).collect();
             tokio::spawn(async move {
                 // Extend direct library_calls with inherited packages from
                 // parent source() chains. Snapshot under the lock, release it,
@@ -4943,7 +4950,11 @@ impl LanguageServer for Backend {
                     // edited file (revalidated below by its own version bump).
                     let mut sibling_jobs: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
                     for sib in open_docs_referencing_packages(&state, &warmed) {
-                        if sib == revalidation_uri {
+                        // Skip the edited file (revalidated by its own version
+                        // bump) and any URI the synchronous path already marked +
+                        // scheduled — re-marking would leak a phantom force
+                        // counter.
+                        if sib == revalidation_uri || scheduled_uris.contains(&sib) {
                             continue;
                         }
                         state.diagnostics_gate.mark_force_republish(&sib);
