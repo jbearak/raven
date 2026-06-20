@@ -638,6 +638,17 @@ pub(crate) fn diagnostics_from_snapshot(
         },
     );
 
+    // Namespace member-not-found diagnostics
+    collect_namespace_member_diagnostics_from_snapshot(
+        snapshot,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
+
     // Redundant directive diagnostics
     collect_redundant_directive_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
@@ -5164,6 +5175,76 @@ fn collect_missing_package_diagnostics_from_snapshot(
             message: format!("Package '{}' is not installed", ns_ref.package),
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+}
+
+/// Emit `namespace-member-not-found` for `pkg::member` references whose package
+/// has a *complete* export set that does not contain `member`. Exports-
+/// authoritative: a `Partial`/`Unknown` set (or a never-warmed package) stays
+/// silent, and `pkg:::member` (internal access) is never validated. The member
+/// authority (`namespace_member_status_sync`) is sync and never spawns R, so a
+/// not-yet-warmed package yields `Unknown` here and the diagnostic appears only
+/// after warming republishes (see the cross-document force-republish path).
+fn collect_namespace_member_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    if !snapshot.cross_file_config.packages_enabled {
+        return;
+    }
+    if !snapshot.package_library_ready {
+        return;
+    }
+    let Some(severity) = snapshot
+        .cross_file_config
+        .packages_namespace_member_severity
+    else {
+        return;
+    };
+
+    for ns_ref in &snapshot.directive_meta.namespace_references {
+        if ns_ref.internal {
+            continue; // never validate `:::`
+        }
+        let Some(member) = &ns_ref.member else {
+            continue;
+        };
+        let status = snapshot
+            .package_library
+            .namespace_member_status_sync(&ns_ref.package, &member.name);
+        if status != crate::package_library::NamespaceMemberStatus::Absent {
+            continue;
+        }
+        let line = member.range.start_line;
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            line,
+            Some(crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    line,
+                    crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string(),
+                ));
+            }
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, member.range.start_column),
+                end: Position::new(member.range.end_line, member.range.end_column),
+            },
+            severity: Some(severity),
+            message: format!(
+                "Package '{}' has no known exported member or data object named '{}'",
+                ns_ref.package, member.name
+            ),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string(),
             )),
             ..Default::default()
         });
@@ -51973,6 +52054,88 @@ result <- helper_with_spaces(42)"#;
         // Anchored to the package token (columns 0..10), not the whole expr.
         assert_eq!(diags[0].range.start.character, 0);
         assert_eq!(diags[0].range.end.character, 10);
+    }
+
+    /// Build a snapshot for `code` against a package library with a single
+    /// package `mypkg` whose `exports` and `exports_completeness` are exactly as
+    /// given (Tier-1 cache hit, so no disk/R is consulted). Mirrors the
+    /// missing-package collector tests' snapshot assembly.
+    async fn build_member_test_snapshot(
+        code: &str,
+        exports: &[&str],
+        completeness: crate::package_library::MemberCompleteness,
+    ) -> DiagnosticsSnapshot {
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "mypkg".to_string(),
+            exports.iter().map(|s| s.to_string()).collect(),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = completeness;
+        pkg_lib.insert_package(info).await;
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+        DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R")
+    }
+
+    #[tokio::test]
+    async fn member_diag_absent_complete_reports() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::nope\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].message.contains("nope"));
+        assert_eq!(
+            diags[0].code,
+            Some(NumberOrString::String(
+                crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string()
+            ))
+        );
+        // Anchored to the member (RHS) token: `nope` at columns 7..11.
+        assert_eq!(diags[0].range.start.character, 7);
+        assert_eq!(diags[0].range.end.character, 11);
+    }
+
+    #[tokio::test]
+    async fn member_diag_present_export_silent() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::foo\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[tokio::test]
+    async fn member_diag_partial_silent() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::nope\n", &["foo"], MemberCompleteness::Partial)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[tokio::test]
+    async fn member_diag_internal_never_reports() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg:::nope\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
     }
 
     #[test]
