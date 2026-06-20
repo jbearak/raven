@@ -32,7 +32,10 @@ pub fn load(path: &Path) -> Option<LoadedLintr> {
 
 pub fn load_str(text: &str) -> LoadedLintr {
     let mut warnings = Vec::new();
-    let fields = dcf_fold(text);
+    let FoldResult {
+        fields,
+        column0_continuations,
+    } = dcf_fold(text);
     let mut linting = serde_json::Map::new();
     let mut overrides: Vec<Value> = Vec::new();
     let mut unrecognized_constructs = 0usize;
@@ -62,6 +65,15 @@ pub fn load_str(text: &str) -> LoadedLintr {
                 warnings.push(format!(".lintr: unknown field '{}'; ignoring", other));
             }
         }
+    }
+    if !column0_continuations.is_empty() {
+        // Reversible UX knob (see docs/superpowers plan): Raven accepts the
+        // column-0 continuation that lintr's read.dcf rejects, but flags it so a
+        // user who also runs lintr learns the file is not lintr-portable.
+        warnings.push(format!(
+            ".lintr: accepted {} continuation line(s) beginning at column 0; lintr's read.dcf requires every continuation line (including the closing `)`) to be indented (\"Regular lines must have a tag\"). Indent them for lintr compatibility.",
+            column0_continuations.len(),
+        ));
     }
     if unrecognized_constructs > 0 {
         warnings.push(format!(
@@ -94,35 +106,83 @@ pub fn load_str(text: &str) -> LoadedLintr {
     }
 }
 
-/// DCF-style line folding: a field starts with `Name:` at column zero; any
-/// following line beginning with whitespace continues the previous value.
-fn dcf_fold(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// Result of folding a `.lintr` file into per-field values.
+struct FoldResult {
+    /// `(key, value)` pairs in file order.
+    fields: Vec<(String, String)>,
+    /// Continuation lines that began at **column 0** (no leading whitespace).
+    /// lintr's `read.dcf` rejects these ("Regular lines must have a tag");
+    /// Raven accepts them leniently and surfaces one informational note so a
+    /// user who also runs lintr learns the file is not lintr-portable.
+    column0_continuations: Vec<String>,
+}
+
+/// Fold a `.lintr` into per-field values.
+///
+/// A `.lintr` field value is an **R expression**; its continuation is governed
+/// by **bracket balance**, not DCF leading-whitespace. So:
+///
+/// * While the current field's accumulated value has unbalanced brackets
+///   (string/comment-aware, see [`net_bracket_depth`]), the next physical line
+///   continues it **regardless of indentation** — this is what lets a closing
+///   `)` at column 0 still attach to its field.
+/// * Otherwise the classic DCF rule applies: a line starting with whitespace
+///   continues the previous value; a column-0 `Name:` line starts a new field.
+///
+/// Continuation lines are joined with `\n` (matching R's `read.dcf`), so a
+/// trailing `#` comment terminates at its own line instead of commenting out
+/// the rest of the folded value.
+fn dcf_fold(text: &str) -> FoldResult {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut column0_continuations: Vec<String> = Vec::new();
     let mut current: Option<(String, String)> = None;
     for raw_line in text.lines() {
+        // Mid-expression: brackets are still open, so this physical line is a
+        // continuation no matter its indentation.
+        if let Some((_, val)) = current.as_mut()
+            && net_bracket_depth(val) > 0
+        {
+            if raw_line.trim().is_empty() {
+                // Blank lines inside an open bracket are insignificant in R.
+                continue;
+            }
+            if !raw_line.starts_with(|c: char| c.is_whitespace()) {
+                column0_continuations.push(raw_line.trim().to_string());
+            }
+            val.push('\n');
+            val.push_str(raw_line.trim());
+            continue;
+        }
         if raw_line.trim().is_empty() {
             continue;
         }
         if raw_line.starts_with(|c: char| c.is_whitespace()) {
-            if let Some((_, v)) = current.as_mut() {
-                v.push(' ');
-                v.push_str(raw_line.trim());
+            // DCF continuation: balanced value, indented line.
+            if let Some((_, val)) = current.as_mut() {
+                val.push('\n');
+                val.push_str(raw_line.trim());
             }
             continue;
         }
-        if let Some((key, val)) = current.take() {
-            out.push((key, val));
+        // Column 0, non-blank, balanced value: a new field.
+        if let Some(kv) = current.take() {
+            fields.push(kv);
         }
         if let Some(colon) = raw_line.find(':') {
             let key = raw_line[..colon].trim().to_string();
             let val = raw_line[colon + 1..].trim().to_string();
             current = Some((key, val));
         }
+        // A column-0 line with no colon while balanced is malformed; drop it
+        // (it cannot be a continuation — brackets are closed).
     }
-    if let Some((key, val)) = current.take() {
-        out.push((key, val));
+    if let Some(kv) = current.take() {
+        fields.push(kv);
     }
-    out
+    FoldResult {
+        fields,
+        column0_continuations,
+    }
 }
 
 /// Scan the body of `linters: linters_with_defaults(...)` (or a bare expression).
@@ -133,7 +193,8 @@ fn apply_linters(
     warnings: &mut Vec<String>,
     unrecognized_constructs: &mut usize,
 ) {
-    let inner = strip_linters_with_defaults(body);
+    let body = strip_comments(body);
+    let inner = strip_linters_with_defaults(&body);
     let entries = split_top_level_commas(inner);
     for entry in entries {
         let entry = entry.trim();
@@ -314,6 +375,7 @@ fn disable_rule(
 }
 
 fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constructs: &mut usize) {
+    let body = strip_comments(body);
     let body = body.trim();
     let inner = body
         .strip_prefix("list(")
@@ -418,6 +480,34 @@ fn net_bracket_depth(s: &str) -> i32 {
         st.step(b as char);
     }
     st.depth
+}
+
+/// Remove `#`-to-end-of-line comments from an R-ish value, preserving any `#`
+/// inside a string literal. String state is tracked across the whole input (via
+/// the shared [`ScanState`]), so a string spanning multiple newline-joined lines
+/// is handled. The terminating newline of each comment is kept so token
+/// boundaries created by folding survive.
+fn strip_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut st = ScanState::default();
+    for &b in s.as_bytes() {
+        let c = b as char;
+        let was_comment = st.in_comment;
+        let was_str = st.in_str.is_some();
+        st.step(c);
+        if was_comment {
+            // Drop comment body; keep only the newline that ends it.
+            if c == '\n' {
+                out.push(c);
+            }
+        } else if was_str {
+            out.push(c);
+        } else if c != '#' {
+            out.push(c);
+        }
+        // (`#` while not in a string/comment starts a comment: dropped.)
+    }
+    out
 }
 
 /// Split a token string on commas at depth 0 (ignoring parens / brackets /
@@ -560,6 +650,92 @@ mod tests {
         // Real top-level comma still splits; nested + quoted commas do not.
         let parts = split_top_level_commas("f(1, 2), \"x,y\", g()");
         assert_eq!(parts, vec!["f(1, 2)", " \"x,y\"", " g()"]);
+    }
+
+    #[test]
+    fn column_zero_closing_paren_folds_and_applies_all_entries() {
+        // The user's exact real-world file: closing ')' at column 0.
+        let input = "linters: linters_with_defaults(\n\
+            line_length_linter(120),\n\
+            trailing_whitespace_linter = NULL\n\
+            )\n";
+        let out = load_str(input);
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(120));
+        assert_eq!(l["trailingWhitespaceSeverity"], json!("off"));
+        // Nothing was lost: no "unrecognized construct" batch warning.
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "column-0 fold must not drop the field: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn column_zero_continuation_emits_portability_note() {
+        // The one reversible UX knob: accepting a column-0 continuation surfaces
+        // a single informational note about lintr's stricter DCF rule.
+        let input = "linters: linters_with_defaults(\n    line_length_linter(120)\n)\n";
+        let out = load_str(input);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("column 0") && w.contains("lintr")),
+            "expected a lintr-portability note: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn indented_closing_paren_does_not_emit_portability_note() {
+        // The valid-lintr form (indented ')') must stay silent.
+        let input = "linters: linters_with_defaults(\n    line_length_linter(120)\n    )\n";
+        let out = load_str(input);
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("column 0")),
+            "indented continuation must not warn: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn trailing_comment_in_multiline_value_does_not_eat_following_entries() {
+        // A '#' comment after the first linter must not swallow the rest when
+        // folding (folding joins with '\n', matching read.dcf).
+        let input = "linters: linters_with_defaults(\n\
+            line_length_linter(120), # set the limit\n\
+            object_length_linter(40)\n\
+            )\n";
+        let out = load_str(input);
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(120));
+        assert_eq!(
+            l["objectLength"],
+            json!(40),
+            "comment must not drop object_length"
+        );
+    }
+
+    #[test]
+    fn multiline_exclusions_with_column_zero_close_folds() {
+        let input = "exclusions: list(\n    \"R/legacy.R\",\n    \"tests/\"\n)\n";
+        let out = load_str(input);
+        let overrides = out.settings["linting"]["overrides"].as_array().unwrap();
+        let files = overrides[0]["files"].as_array().unwrap();
+        assert!(files.iter().any(|v| v == &json!("R/legacy.R")));
+        assert!(files.iter().any(|v| v == &json!("tests/**")));
+    }
+
+    #[test]
+    fn blank_line_inside_open_brackets_is_insignificant() {
+        let input = "linters: linters_with_defaults(\n    line_length_linter(120),\n\n    object_length_linter(40)\n)\n";
+        let out = load_str(input);
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(120));
+        assert_eq!(l["objectLength"], json!(40));
     }
 
     #[test]
