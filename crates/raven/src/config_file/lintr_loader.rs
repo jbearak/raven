@@ -182,7 +182,11 @@ fn apply_linter_call(
             }
         }
         "indentation_linter" => {
-            if let Some(n) = parse_named_int(args, "indent") {
+            // lintr's first positional formal is `indent`, so accept both the
+            // named `indent = N` and the positional `N` form (mirroring
+            // line_length_linter / object_length_linter).
+            if let Some(n) = parse_named_int(args, "indent").or_else(|| parse_positional_int(args))
+            {
                 linting.insert("indentationUnit".into(), json!(n));
             }
         }
@@ -192,12 +196,30 @@ fn apply_linter_call(
             }
         }
         "object_name_linter" => {
-            if let Some(styles) = parse_named_string_vec(args, "styles")
-                && let Some(first) = styles.first()
-            {
-                linting.insert("objectNameStyleFunction".into(), json!(first));
-                linting.insert("objectNameStyleVariable".into(), json!(first));
-                linting.insert("objectNameStyleArgument".into(), json!(first));
+            // lintr's first positional formal is `styles`; accept positional
+            // and named, scalar and `c(...)` forms. Raven stores one style per
+            // symbol kind, so only a *single* recognized style is
+            // representable: map it to all three kinds. A raw regex, an unknown
+            // name, or a multi-style vector (lintr's OR-semantics, which Raven
+            // can't express) is unrepresentable -> surface it in the batch
+            // warning. A bare `object_name_linter()` resolves to no styles and
+            // keeps Raven's defaults.
+            if let Some(styles) = parse_object_name_styles(args) {
+                match styles.first() {
+                    None => {}
+                    Some(only)
+                        if styles.len() == 1
+                            && crate::linting::ObjectNameStyle::from_config_name(only)
+                                .is_some() =>
+                    {
+                        linting.insert("objectNameStyleFunction".into(), json!(only));
+                        linting.insert("objectNameStyleVariable".into(), json!(only));
+                        linting.insert("objectNameStyleArgument".into(), json!(only));
+                    }
+                    Some(_) => {
+                        *unrecognized_constructs += 1;
+                    }
+                }
             }
         }
         "quotes_linter" if args.trim().is_empty() => {
@@ -369,17 +391,34 @@ fn parse_named_string(args: &str, name: &str) -> Option<String> {
     )
 }
 
-fn parse_named_string_vec(args: &str, name: &str) -> Option<Vec<String>> {
-    let inner = parse_named_arg(args, name)?
-        .strip_prefix("c(")
-        .and_then(|r| r.strip_suffix(')'))?;
-    Some(
-        split_top_level_commas(inner)
-            .into_iter()
-            .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-    )
+/// Resolve the `styles` argument of `object_name_linter` into a list of style
+/// names. Accepts the named form (`styles = ...`) and, failing that, the first
+/// positional argument. Each accepts either a single quoted string or a
+/// `c("a", "b")` vector. Returns `None` when there is no styles argument at
+/// all (e.g. `object_name_linter()` or `object_name_linter(regexes = ...)`).
+fn parse_object_name_styles(args: &str) -> Option<Vec<String>> {
+    let raw = parse_named_arg(args, "styles").or_else(|| {
+        let first = split_top_level_commas(args).into_iter().next()?.trim();
+        if first.is_empty() || first.contains('=') {
+            None
+        } else {
+            Some(first)
+        }
+    })?;
+    let raw = raw.trim();
+    if let Some(inner) = raw.strip_prefix("c(").and_then(|r| r.strip_suffix(')')) {
+        Some(
+            split_top_level_commas(inner)
+                .into_iter()
+                .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    } else {
+        Some(vec![
+            raw.trim_matches(|c| c == '"' || c == '\'').to_string(),
+        ])
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +530,330 @@ mod tests {
             out.warnings
                 .iter()
                 .any(|w| w.contains("unrecognized construct"))
+        );
+    }
+
+    // --- Task 2: indentation_linter positional support ---
+
+    #[test]
+    fn indentation_positional_param_maps() {
+        let out = load_str("linters: linters_with_defaults(indentation_linter(4))\n");
+        assert_eq!(out.settings["linting"]["indentationUnit"], json!(4));
+        assert!(out.warnings.is_empty(), "positional indent must not warn");
+    }
+
+    #[test]
+    fn indentation_named_param_still_maps() {
+        let out = load_str("linters: linters_with_defaults(indentation_linter(indent = 4))\n");
+        assert_eq!(out.settings["linting"]["indentationUnit"], json!(4));
+    }
+
+    // --- Task 3: object_name_linter positional/single styles + warn ---
+
+    #[test]
+    fn object_name_positional_single_style_maps() {
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"camelCase\"))\n");
+        let l = &out.settings["linting"];
+        assert_eq!(l["objectNameStyleFunction"], json!("camelCase"));
+        assert_eq!(l["objectNameStyleVariable"], json!("camelCase"));
+        assert_eq!(l["objectNameStyleArgument"], json!("camelCase"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_named_single_style_maps() {
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = \"UPPER_CASE\"))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["objectNameStyleFunction"], json!("UPPER_CASE"));
+        assert_eq!(l["objectNameStyleVariable"], json!("UPPER_CASE"));
+        assert_eq!(l["objectNameStyleArgument"], json!("UPPER_CASE"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_single_element_vector_maps_named_and_positional() {
+        // Named single-element vector.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = c(\"dotted.case\")))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["objectNameStyleFunction"], json!("dotted.case"));
+        assert_eq!(l["objectNameStyleVariable"], json!("dotted.case"));
+        assert_eq!(l["objectNameStyleArgument"], json!("dotted.case"));
+        assert!(out.warnings.is_empty());
+
+        // Positional single-element vector.
+        let out =
+            load_str("linters: linters_with_defaults(object_name_linter(c(\"lowercase\")))\n");
+        let l = &out.settings["linting"];
+        assert_eq!(l["objectNameStyleFunction"], json!("lowercase"));
+        assert_eq!(l["objectNameStyleVariable"], json!("lowercase"));
+        assert_eq!(l["objectNameStyleArgument"], json!("lowercase"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_multi_style_vector_is_unsupported() {
+        // lintr's c("a", "b") is OR-semantics across styles; Raven has one
+        // style per kind, so a multi-style vector is unrepresentable -> warn,
+        // no mapping.
+        for body in [
+            "object_name_linter(styles = c(\"dotted.case\", \"snake_case\"))",
+            "object_name_linter(c(\"snake_case\", \"camelCase\"))",
+        ] {
+            let out = load_str(&format!("linters: linters_with_defaults({body})\n"));
+            assert!(
+                out.settings
+                    .get("linting")
+                    .and_then(|l| l.get("objectNameStyleFunction"))
+                    .is_none(),
+                "multi-style vector must not map a style ({body})"
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("unrecognized construct")),
+                "multi-style vector must produce the batch warning ({body})"
+            );
+        }
+    }
+
+    #[test]
+    fn object_name_regex_is_unsupported_not_misread() {
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(\"^[a-z][a-z0-9_]*(\\\\.([a-z][a-z0-9_]*))*$\"))\n",
+        );
+        assert!(
+            out.settings
+                .get("linting")
+                .and_then(|l| l.get("objectNameStyleFunction"))
+                .is_none(),
+            "a raw regex style must not be mapped to an object-name style"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "an unrepresentable object_name_linter style must produce the batch warning"
+        );
+    }
+
+    #[test]
+    fn object_name_no_args_keeps_defaults_silently() {
+        let out = load_str("linters: linters_with_defaults(object_name_linter())\n");
+        assert!(
+            out.settings
+                .get("linting")
+                .and_then(|l| l.get("objectNameStyleFunction"))
+                .is_none(),
+            "object_name_linter() with no styles leaves Raven defaults in place"
+        );
+        assert!(
+            out.warnings.is_empty(),
+            "the bare no-arg form must not warn"
+        );
+    }
+
+    // --- Task 4: the full user example (loader JSON layer) ---
+
+    #[test]
+    fn user_example_full_block_maps_each_entry() {
+        let input = "linters: linters_with_defaults(\n    \
+            line_length_linter(80),\n    \
+            commented_code_linter(),\n    \
+            object_length_linter(40),\n    \
+            indentation_linter(4),\n    \
+            object_name_linter(\"^[a-z][a-z0-9_]*(\\\\.([a-z][a-z0-9_]*))*$\"),\n    \
+            trailing_blank_lines_linter = NULL,\n    \
+            trailing_whitespace_linter = NULL\n    )\n";
+        let out = load_str(input);
+        let linting = &out.settings["linting"];
+
+        // Positional numeric params.
+        assert_eq!(linting["lineLength"], json!(80));
+        assert_eq!(linting["objectLength"], json!(40));
+        assert_eq!(linting["indentationUnit"], json!(4));
+
+        // Recognized no-arg linter: default severity left intact (no "off").
+        assert!(linting.get("commentedCodeSeverity").is_none());
+
+        // Unrepresentable regex object-name style: not mapped.
+        assert!(linting.get("objectNameStyleFunction").is_none());
+
+        // `= NULL` disables.
+        assert_eq!(linting["trailingBlankLinesSeverity"], json!("off"));
+        assert_eq!(linting["trailingWhitespaceSeverity"], json!("off"));
+
+        // Exactly one unrepresentable construct (the regex), surfaced once.
+        let batch = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("unrecognized construct"))
+            .count();
+        assert_eq!(batch, 1, "exactly one batch warning, for the regex style");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("1 unrecognized construct(s)"))
+        );
+    }
+
+    // --- Task 5: combination & no-override coverage ---
+
+    #[test]
+    fn empty_linters_with_defaults_yields_no_settings_no_warnings() {
+        let out = load_str("linters: linters_with_defaults()\n");
+        assert!(
+            out.settings.get("linting").is_none(),
+            "no overrides means no linting object is contributed"
+        );
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn all_named_numeric_params_map() {
+        let out = load_str(
+            "linters: linters_with_defaults(line_length_linter(length = 100), object_length_linter(length = 50), indentation_linter(indent = 8))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(100));
+        assert_eq!(l["objectLength"], json!(50));
+        assert_eq!(l["indentationUnit"], json!(8));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn all_positional_numeric_params_map() {
+        let out = load_str(
+            "linters: linters_with_defaults(line_length_linter(100), object_length_linter(50), indentation_linter(8))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(100));
+        assert_eq!(l["objectLength"], json!(50));
+        assert_eq!(l["indentationUnit"], json!(8));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn multiple_null_disables_map_each() {
+        let out = load_str(
+            "linters: linters_with_defaults(commented_code_linter = NULL, trailing_blank_lines_linter = NULL, object_name_linter = NULL)\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["commentedCodeSeverity"], json!("off"));
+        assert_eq!(l["trailingBlankLinesSeverity"], json!("off"));
+        assert_eq!(l["objectNameSeverity"], json!("off"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn assignment_and_quotes_map() {
+        let out = load_str(
+            "linters: linters_with_defaults(assignment_linter(operator = \"=\"), single_quotes_linter())\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["assignmentOperator"], json!("="));
+        assert_eq!(l["stringDelimiter"], json!("'"));
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn mixed_combination_positional_named_null_and_noarg() {
+        let out = load_str(
+            "linters: linters_with_defaults(line_length_linter(120), object_name_linter(styles = \"snake_case\"), infix_spaces_linter(), semicolon_linter = NULL, indentation_linter(indent = 2))\n",
+        );
+        let l = &out.settings["linting"];
+        assert_eq!(l["lineLength"], json!(120));
+        assert_eq!(l["objectNameStyleFunction"], json!("snake_case"));
+        assert_eq!(l["indentationUnit"], json!(2));
+        assert_eq!(l["semicolonSeverity"], json!("off"));
+        // infix_spaces_linter() is recognized no-arg: no severity override.
+        assert!(l.get("infixSpacesSeverity").is_none());
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn bare_linters_with_defaults_without_wrapper_call_still_parses() {
+        // A bare expression (no `linters_with_defaults(...)` wrapper) is also a
+        // documented form; confirm a single linter call still maps.
+        let out = load_str("linters: line_length_linter(90)\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(90));
+    }
+
+    // --- Task 6: end-to-end (.lintr JSON -> LintConfig) ---
+
+    #[test]
+    fn empty_defaults_enable_all_defaults_when_discovered() {
+        // `linters_with_defaults()` with no overrides + a discovered .lintr
+        // means "linting on, every rule at its default" — verify the resolved
+        // LintConfig.
+        let out = load_str("linters: linters_with_defaults()\n");
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
+        let default = crate::linting::LintConfig::default();
+        assert!(cfg.enabled, "a discovered .lintr resolves Auto -> on");
+        assert_eq!(cfg.line_length, default.line_length);
+        assert_eq!(cfg.object_length, default.object_length);
+        assert_eq!(cfg.indentation_unit, default.indentation_unit);
+        assert_eq!(cfg.commented_code_severity, default.commented_code_severity);
+        assert_eq!(
+            cfg.object_name_style_function,
+            default.object_name_style_function
+        );
+    }
+
+    #[test]
+    fn user_example_resolves_to_expected_lint_config() {
+        let input = "linters: linters_with_defaults(\n    \
+            line_length_linter(80),\n    \
+            commented_code_linter(),\n    \
+            object_length_linter(40),\n    \
+            indentation_linter(4),\n    \
+            object_name_linter(\"^[a-z][a-z0-9_]*(\\\\.([a-z][a-z0-9_]*))*$\"),\n    \
+            trailing_blank_lines_linter = NULL,\n    \
+            trailing_whitespace_linter = NULL\n    )\n";
+        let out = load_str(input);
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.line_length, 80);
+        assert_eq!(cfg.object_length, 40);
+        assert_eq!(cfg.indentation_unit, 4);
+
+        // commented_code stays at its default severity (recognized, not
+        // disabled).
+        assert_eq!(
+            cfg.commented_code_severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION)
+        );
+
+        // regex object-name style ignored -> defaults retained.
+        assert_eq!(
+            cfg.object_name_style_function,
+            crate::linting::ObjectNameStyle::SnakeCase
+        );
+
+        // `= NULL` rules disabled (severity None).
+        assert_eq!(cfg.trailing_blank_lines_severity, None);
+        assert_eq!(cfg.trailing_whitespace_severity, None);
+    }
+
+    #[test]
+    fn valid_object_name_style_resolves_into_lint_config() {
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"camelCase\"))\n");
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
+        assert_eq!(
+            cfg.object_name_style_function,
+            crate::linting::ObjectNameStyle::CamelCase
+        );
+        assert_eq!(
+            cfg.object_name_style_variable,
+            crate::linting::ObjectNameStyle::CamelCase
+        );
+        assert_eq!(
+            cfg.object_name_style_argument,
+            crate::linting::ObjectNameStyle::CamelCase
         );
     }
 }
