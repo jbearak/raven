@@ -140,6 +140,16 @@ fn is_readable_file(path: &Path) -> bool {
     path.is_file() && std::fs::File::open(path).is_ok()
 }
 
+/// How complete a package's exported-member set is, for absence diagnostics.
+/// `Absent` may be concluded only from a `Complete` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemberCompleteness {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -178,6 +188,10 @@ pub struct PackageInfo {
     /// cross-file scope — never injected after bare `library()` for
     /// non-LazyData packages.
     pub data_aliases: HashMap<String, Vec<String>>,
+    /// Completeness of `exports` for member-absence diagnostics. Defaults to
+    /// `Unknown` (never absence-authoritative) via every constructor; production
+    /// load paths stamp the real value. See `namespace_member_status_sync`.
+    pub exports_completeness: MemberCompleteness,
 }
 
 impl PackageInfo {
@@ -193,6 +207,7 @@ impl PackageInfo {
             attached_packages,
             lazy_data: Vec::new(),
             data_aliases: HashMap::new(),
+            exports_completeness: MemberCompleteness::Unknown,
         }
     }
 
@@ -213,6 +228,7 @@ impl PackageInfo {
             attached_packages,
             lazy_data,
             data_aliases: HashMap::new(),
+            exports_completeness: MemberCompleteness::Unknown,
         }
     }
 }
@@ -4747,6 +4763,12 @@ mod tests {
     fn test_package_info_data_aliases_default_empty() {
         let info = PackageInfo::new("pkg".to_string(), HashSet::new());
         assert!(info.data_aliases.is_empty());
+    }
+
+    #[test]
+    fn package_info_defaults_exports_completeness_unknown() {
+        let info = PackageInfo::new("p".to_string(), HashSet::new());
+        assert_eq!(info.exports_completeness, MemberCompleteness::Unknown);
     }
 
     #[tokio::test]
