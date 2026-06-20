@@ -198,6 +198,7 @@ pub fn extract_metadata_with_tree(
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
         meta.library_calls = library_calls;
+        meta.namespace_references = source_detect::detect_namespace_references(tree, content);
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
