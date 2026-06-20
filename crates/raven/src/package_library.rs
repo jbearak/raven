@@ -1108,6 +1108,8 @@ impl PackageLibrary {
                     parse_result.depends,
                 )
                 .await;
+                // INDEX fallback lists only documented topics, not every export.
+                info.exports_completeness = MemberCompleteness::Partial;
                 // Preserve any pre-fetched dataset enumeration for this package.
                 apply_enumeration_from(datasets_map, pkg_name, &pkg_dir, &mut info);
                 self.insert_package(info).await;
@@ -1285,6 +1287,9 @@ impl PackageLibrary {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
             let mut info =
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
+            // `static_packages` holds only non-`exportPattern` packages, so the
+            // statically-parsed export set is exhaustive.
+            info.exports_completeness = MemberCompleteness::Complete;
 
             // Apply dataset enumeration if available for this package.
             apply_enumeration_from(&mut datasets_map, &name, &pkg_dir, &mut info);
@@ -1330,6 +1335,9 @@ impl PackageLibrary {
                                         depends,
                                     )
                                     .await;
+                                    // Exports came from R's getNamespaceExports —
+                                    // an exhaustive enumeration.
+                                    i.exports_completeness = MemberCompleteness::Complete;
                                     // Apply dataset enumeration if available.
                                     apply_enumeration_from(
                                         &mut datasets_map,
@@ -1836,12 +1844,15 @@ impl PackageLibrary {
                         all_base_exports.insert(s.to_string());
                     }
                 }
-                let info = PackageInfo::with_details(
+                let mut info = PackageInfo::with_details(
                     p.name.to_string(),
                     p.exports.iter().map(|s| s.to_string()).collect(),
                     p.depends.iter().map(|s| s.to_string()).collect(),
                     p.datasets.iter().map(|s| s.to_string()).collect(),
                 );
+                // The embedded base table ships the full export list for each
+                // base-priority package.
+                info.exports_completeness = MemberCompleteness::Complete;
                 self.insert_package(info).await;
             }
         }
@@ -1855,7 +1866,13 @@ impl PackageLibrary {
             // `lazy_data` is intentionally empty here: these are base packages,
             // whose datasets are merged into `base_exports` above (issue #276) —
             // so this deliberately does NOT route through `package_info_from_dir`.
-            let info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
+            let mut info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
+            // Base-package exports are enumerated authoritatively at init (R's
+            // getNamespaceExports for the `exportPattern` ones in Step 4, plus
+            // explicit exports / data / the embedded floor). Member-presence for
+            // base packages is additionally guarded by the positive-only
+            // `base_exports` check in `namespace_member_status_sync`.
+            info.exports_completeness = MemberCompleteness::Complete;
             self.insert_package(info).await;
         }
 
@@ -1970,55 +1987,73 @@ impl PackageLibrary {
             }
         };
 
-        // Step 4: Determine export loading strategy based on pattern presence
-        let exports: HashSet<String> = if parse_result.has_export_pattern {
-            // Tier 2: Package uses exportPattern - try R subprocess for accuracy
-            log::trace!(
-                "Package '{}' uses exportPattern, trying R subprocess for accuracy",
-                name
-            );
-
-            if let Some(ref r_subprocess) = self.r_subprocess {
-                match r_subprocess.get_package_exports(name).await {
-                    Ok(r_exports) => {
-                        log::trace!(
-                            "Got {} exports for package '{}' from R subprocess",
-                            r_exports.len(),
-                            name
-                        );
-                        r_exports.into_iter().collect()
-                    }
-                    Err(e) => {
-                        // Tier 3: R failed, fall back to INDEX + explicit exports
-                        log::trace!(
-                            "R subprocess failed for package '{}': {}, using INDEX fallback",
-                            name,
-                            e
-                        );
-                        self.load_with_index_fallback(&pkg_dir, &parse_result).await
-                    }
-                }
-            } else {
-                // No R subprocess, use INDEX fallback
+        // Step 4: Determine export loading strategy based on pattern presence.
+        // `completeness` tracks whether the resolved export set is exhaustive:
+        // a static parse without `exportPattern` and a successful R enumeration
+        // are both `Complete`; an INDEX fallback (R failed/absent) is `Partial`
+        // because it lists only documented topics. See `exports_completeness`.
+        let (exports, completeness): (HashSet<String>, MemberCompleteness) =
+            if parse_result.has_export_pattern {
+                // Tier 2: Package uses exportPattern - try R subprocess for accuracy
                 log::trace!(
-                    "No R subprocess available for package '{}', using INDEX fallback",
+                    "Package '{}' uses exportPattern, trying R subprocess for accuracy",
                     name
                 );
-                self.load_with_index_fallback(&pkg_dir, &parse_result).await
-            }
-        } else {
-            // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
-            log::trace!(
-                "Package '{}' uses explicit exports only, loaded {} exports statically",
-                name,
-                parse_result.explicit_exports.len()
-            );
-            parse_result.explicit_exports.into_iter().collect()
-        };
+
+                if let Some(ref r_subprocess) = self.r_subprocess {
+                    match r_subprocess.get_package_exports(name).await {
+                        Ok(r_exports) => {
+                            log::trace!(
+                                "Got {} exports for package '{}' from R subprocess",
+                                r_exports.len(),
+                                name
+                            );
+                            (
+                                r_exports.into_iter().collect(),
+                                MemberCompleteness::Complete,
+                            )
+                        }
+                        Err(e) => {
+                            // Tier 3: R failed, fall back to INDEX + explicit exports
+                            log::trace!(
+                                "R subprocess failed for package '{}': {}, using INDEX fallback",
+                                name,
+                                e
+                            );
+                            (
+                                self.load_with_index_fallback(&pkg_dir, &parse_result).await,
+                                MemberCompleteness::Partial,
+                            )
+                        }
+                    }
+                } else {
+                    // No R subprocess, use INDEX fallback
+                    log::trace!(
+                        "No R subprocess available for package '{}', using INDEX fallback",
+                        name
+                    );
+                    (
+                        self.load_with_index_fallback(&pkg_dir, &parse_result).await,
+                        MemberCompleteness::Partial,
+                    )
+                }
+            } else {
+                // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
+                log::trace!(
+                    "Package '{}' uses explicit exports only, loaded {} exports statically",
+                    name,
+                    parse_result.explicit_exports.len()
+                );
+                (
+                    parse_result.explicit_exports.into_iter().collect(),
+                    MemberCompleteness::Complete,
+                )
+            };
 
         // Step 5: Create PackageInfo (incl. datasets from `data/`) and cache it.
         let mut info =
             package_info_from_dir(name.to_string(), &pkg_dir, exports, parse_result.depends).await;
+        info.exports_completeness = completeness;
 
         // Issue #429: enumerate lazy-data objects via R when the package ships data/.
         let data_dir = pkg_dir.join("data");
@@ -4769,6 +4804,19 @@ mod tests {
     fn package_info_defaults_exports_completeness_unknown() {
         let info = PackageInfo::new("p".to_string(), HashSet::new());
         assert_eq!(info.exports_completeness, MemberCompleteness::Unknown);
+    }
+
+    #[tokio::test]
+    async fn static_namespace_exports_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 1.0\n").unwrap();
+        // No exportPattern() → static parse is exhaustive → Complete.
+        std::fs::write(pkg.join("NAMESPACE"), "export(foo)\nexport(bar)\n").unwrap();
+        let lib = build_package_library_tier1_only(None, &[dir.path().to_path_buf()], None).await;
+        let info = lib.library.get_package("mypkg").await.expect("loads");
+        assert_eq!(info.exports_completeness, MemberCompleteness::Complete);
     }
 
     #[tokio::test]
