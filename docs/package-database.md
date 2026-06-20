@@ -28,7 +28,7 @@ Each cached `PackageInfo` records how *complete* its export set is — the signa
 | **Partial** | the `INDEX` approximation (used when R is absent for an `exportPattern()` package) | Never concluded — `INDEX` lists only documented topics |
 | **Unknown** | not yet warmed, or unresolvable without R | Never concluded |
 
-The member authority (`namespace_member_status_sync`) is **synchronous and never spawns R**: it reads the cache, then a static on-disk `NAMESPACE` parse, then the providers, and concludes `Absent` only from a `Complete` set. Data objects (`lazy_data`, and base-package datasets via `base_exports`) are **positive-only** — they confirm a member is present but never prove one absent.
+The member authority (`namespace_member_status_sync`) is **synchronous, never spawns R, and never touches disk**: it consults the warmed cache, then the providers, and concludes `Absent` only from a `Complete` set. A package referenced via `pkg::` is warmed into the cache in the background, so until that warm completes the authority returns `Unknown` (silent) — it deliberately does not parse the on-disk `NAMESPACE` synchronously, which would block the keystroke path and could not see datasets. Data objects (`lazy_data`, the per-file `data_aliases` object names, and base-package datasets via `base_exports`) are **positive-only** — they confirm a member is present but never prove one absent.
 
 The cache write path (`insert_package`) is **monotonically authoritative**: once a package is cached `Complete`, a later weaker (`Partial`/`Unknown`) load can never downgrade its exports or completeness — it only ever folds in additional positive-only data. This keeps a transient R-less reload from turning a previously-conclusive export set back into "don't know."
 

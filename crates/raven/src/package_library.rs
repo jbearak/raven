@@ -838,10 +838,20 @@ impl PackageLibrary {
         None
     }
 
-    /// Synchronous, cache/provider/static-only `pkg::member` authority. Never
-    /// spawns R and never mutates the cache. `Absent` only from a `Complete`
-    /// exports set. Data objects (`lazy_data`, base exports) are positive-only:
-    /// they confirm-present but never prove absent (issue #505 tightens this).
+    /// Synchronous, cache/provider-only `pkg::member` authority. Never spawns R,
+    /// never touches disk, and never mutates the cache. `Absent` only from a
+    /// `Complete` exports set. Data objects (`lazy_data`, the per-file
+    /// `data_aliases` object names, and base exports) are positive-only: they
+    /// confirm-present but never prove absent (issue #505 tightens this).
+    ///
+    /// Resolution is **cache-or-provider only** by design: a package referenced
+    /// via `pkg::` is warmed into the cache in the background, and this authority
+    /// reports `Unknown` (silent) until that warm completes and republishes — so
+    /// it deliberately does NOT parse the on-disk NAMESPACE here. A synchronous
+    /// disk parse would (a) block the keystroke path with file I/O per reference
+    /// and (b) be unable to see datasets (which never appear in NAMESPACE
+    /// `export()`), risking a false `Absent` on a real `pkg::dataset` before the
+    /// warm populates the full metadata.
     pub fn namespace_member_status_sync(
         &self,
         package: &str,
@@ -856,37 +866,35 @@ impl PackageLibrary {
             return NamespaceMemberStatus::Present;
         }
 
-        // Resolve the best available exports set + completeness without R/mutation.
+        // A member is "present" if it is an exported symbol, a lazy-loaded data
+        // object, OR an object bound by one of the package's data files (the
+        // `data_aliases` VALUES — for a non-LazyData package the real dataset
+        // names live only here, while `lazy_data` keeps file stems). All three
+        // are positive-only signals.
+        let member_present = |info: &PackageInfo| -> bool {
+            info.exports.contains(member)
+                || info.lazy_data.iter().any(|d| d == member)
+                || info
+                    .data_aliases
+                    .values()
+                    .any(|names| names.iter().any(|n| n == member))
+        };
+
         // Tier 1: cache snapshot (already-stamped completeness).
         if let Some(info) = self.packages.load().get(package) {
-            if info.exports.contains(member) || info.lazy_data.contains(&member.to_string()) {
+            if member_present(info) {
                 return NamespaceMemberStatus::Present;
             }
             match info.exports_completeness {
                 MemberCompleteness::Complete => return NamespaceMemberStatus::Absent,
                 MemberCompleteness::Partial => return NamespaceMemberStatus::Partial,
-                MemberCompleteness::Unknown => {} // fall through to other sources
+                MemberCompleteness::Unknown => {} // fall through to providers
             }
         }
 
-        // Tier 2: installed on disk — static NAMESPACE parse (no R).
-        if let Some(pkg_dir) = self.find_package_directory(package) {
-            let (exports, has_pattern) = crate::namespace_parser::parse_namespace_explicit_exports(
-                &pkg_dir.join("NAMESPACE"),
-            );
-            if exports.iter().any(|e| e == member) {
-                return NamespaceMemberStatus::Present;
-            }
-            return if has_pattern {
-                NamespaceMemberStatus::Partial
-            } else {
-                NamespaceMemberStatus::Absent
-            };
-        }
-
-        // Tier 3: providers (Complete export lists).
+        // Tier 2: providers (Complete export lists from Tier 2/3 metadata).
         if let Some(info) = self.resolve_from_providers(package) {
-            if info.exports.contains(member) || info.lazy_data.contains(&member.to_string()) {
+            if member_present(&info) {
                 return NamespaceMemberStatus::Present;
             }
             return match info.exports_completeness {
@@ -5021,6 +5029,45 @@ mod tests {
         assert!(info.exports.contains("foo"));
         assert_eq!(
             lib.namespace_member_status_sync("pkg", "bar"),
+            NamespaceMemberStatus::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn member_status_resolves_data_alias_objects() {
+        // Regression: a non-LazyData data package (e.g. survey) keeps file STEMS
+        // in lazy_data but the real dataset object NAMES in data_aliases values.
+        // The member authority must treat those as Present, not Absent, even when
+        // the package is Complete.
+        let lib = PackageLibrary::new_empty();
+        let mut info = PackageInfo::with_details(
+            "survey".to_string(),
+            HashSet::from(["svymean".to_string()]),
+            vec![],
+            // lazy_data carries only the file stem for a non-LazyData package.
+            vec!["api".to_string()],
+        );
+        info.data_aliases.insert(
+            "api".to_string(),
+            vec!["apiclus1".to_string(), "apistrat".to_string()],
+        );
+        info.exports_completeness = MemberCompleteness::Complete;
+        lib.insert_package(info).await;
+
+        // Exported function: Present.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "svymean"),
+            NamespaceMemberStatus::Present
+        );
+        // Real dataset object bound by a data file (data_aliases value): Present,
+        // NOT a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "apiclus1"),
+            NamespaceMemberStatus::Present
+        );
+        // A genuine typo against a Complete package: Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "apiclusX"),
             NamespaceMemberStatus::Absent
         );
     }
