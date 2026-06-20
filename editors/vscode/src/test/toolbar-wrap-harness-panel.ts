@@ -21,43 +21,16 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import {
+    snapshotReflectsMessage,
+    type LayoutSnapshot,
+} from './toolbar-wrap-protocol';
+
+export type { LayoutSnapshot } from './toolbar-wrap-protocol';
 
 // From `editors/vscode/out/test/toolbar-wrap-harness-panel.js`, the
 // harness bundle lives at `editors/vscode/dist-test/toolbar-wrap-harness/`.
 const HARNESS_DIR = path.resolve(__dirname, '..', '..', 'dist-test', 'toolbar-wrap-harness');
-
-interface PlainRect {
-    top: number;
-    bottom: number;
-    left: number;
-    right: number;
-    width: number;
-    height: number;
-}
-
-export interface LayoutSnapshot {
-    type: 'test:layoutSnapshot';
-    seq: number;
-    isWrapped: boolean;
-    toolbarRect: PlainRect;
-    chipsRect: PlainRect;
-    actionsRect: PlainRect;
-    leadRect: PlainRect;
-    rootRect: PlainRect;
-    /** Intrinsic widths the hook itself uses — see `intrinsicWidthPx`
-     *  in use-toolbar-wrap.ts. Calibration tests rely on these. */
-    leadIntrinsicWidth: number;
-    chipsIntrinsicWidth: number;
-    actionsIntrinsicWidth: number;
-    chipsScrollWidth: number;
-    chipsClientWidth: number;
-    sortStripScrollWidth: number;
-    sortStripClientWidth: number;
-    filterStripScrollWidth: number;
-    toolbarFlexWrap: string;
-    chipsOrder: string;
-    chipsFlexBasis: string;
-}
 
 export interface HarnessController {
     panel: vscode.WebviewPanel;
@@ -187,9 +160,11 @@ export function openHarnessPanel(): HarnessController {
 
     /**
      * Send a control message, then poll snapshots (via test:requestSnapshot)
-     * until `predicate(snap)` holds or the deadline passes. Each requested
-     * snapshot is posted after the change is applied, so it reflects the
-     * settled DOM. With no predicate, returns the first post-change snapshot.
+     * until the snapshot reflects that message and `predicate(snap)` holds,
+     * or the deadline passes. React state updates in the webview are async:
+     * a requested snapshot can report the previous render, and late rAF
+     * snapshots can also arrive after a new control message. Those snapshots
+     * are valid telemetry but not valid answers to the current `apply()`.
      * Returns the last snapshot seen if the predicate never matches (the
      * caller's assertion then reports the mismatch).
      */
@@ -209,7 +184,9 @@ export function openHarnessPanel(): HarnessController {
             } catch {
                 continue;
             }
-            if (!predicate || predicate(snap)) return snap;
+            if (snapshotReflectsMessage(message, snap) && (!predicate || predicate(snap))) {
+                return snap;
+            }
         }
         if (snap) return snap;
         throw new Error('apply: no snapshot received within timeout');
