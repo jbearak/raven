@@ -150,6 +150,15 @@ pub enum MemberCompleteness {
     Unknown,
 }
 
+/// Result of a synchronous `pkg::member` membership query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceMemberStatus {
+    Present,
+    Absent,
+    Partial,
+    Unknown,
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -822,6 +831,67 @@ impl PackageLibrary {
         None
     }
 
+    /// Synchronous, cache/provider/static-only `pkg::member` authority. Never
+    /// spawns R and never mutates the cache. `Absent` only from a `Complete`
+    /// exports set. Data objects (`lazy_data`, base exports) are positive-only:
+    /// they confirm-present but never prove absent (issue #505 tightens this).
+    pub fn namespace_member_status_sync(
+        &self,
+        package: &str,
+        member: &str,
+    ) -> NamespaceMemberStatus {
+        if is_load_all_sentinel(package) {
+            return NamespaceMemberStatus::Unknown;
+        }
+        // Base-package datasets/exports are merged into base_exports, not the
+        // per-package lazy_data — positive-only present check.
+        if self.is_base_package(package) && self.is_base_export(member) {
+            return NamespaceMemberStatus::Present;
+        }
+
+        // Resolve the best available exports set + completeness without R/mutation.
+        // Tier 1: cache snapshot (already-stamped completeness).
+        if let Some(info) = self.packages.load().get(package) {
+            if info.exports.contains(member) || info.lazy_data.contains(&member.to_string()) {
+                return NamespaceMemberStatus::Present;
+            }
+            match info.exports_completeness {
+                MemberCompleteness::Complete => return NamespaceMemberStatus::Absent,
+                MemberCompleteness::Partial => return NamespaceMemberStatus::Partial,
+                MemberCompleteness::Unknown => {} // fall through to other sources
+            }
+        }
+
+        // Tier 2: installed on disk — static NAMESPACE parse (no R).
+        if let Some(pkg_dir) = self.find_package_directory(package) {
+            let (exports, has_pattern) = crate::namespace_parser::parse_namespace_explicit_exports(
+                &pkg_dir.join("NAMESPACE"),
+            );
+            if exports.iter().any(|e| e == member) {
+                return NamespaceMemberStatus::Present;
+            }
+            return if has_pattern {
+                NamespaceMemberStatus::Partial
+            } else {
+                NamespaceMemberStatus::Absent
+            };
+        }
+
+        // Tier 3: providers (Complete export lists).
+        if let Some(info) = self.resolve_from_providers(package) {
+            if info.exports.contains(member) || info.lazy_data.contains(&member.to_string()) {
+                return NamespaceMemberStatus::Present;
+            }
+            return match info.exports_completeness {
+                MemberCompleteness::Complete => NamespaceMemberStatus::Absent,
+                MemberCompleteness::Partial => NamespaceMemberStatus::Partial,
+                MemberCompleteness::Unknown => NamespaceMemberStatus::Unknown,
+            };
+        }
+
+        NamespaceMemberStatus::Unknown
+    }
+
     /// Check if a symbol is exported by any of the given packages (synchronous, cached-only)
     ///
     /// This method checks if the symbol is exported by any of the loaded packages,
@@ -958,8 +1028,31 @@ impl PackageLibrary {
     /// Insert a package into the cache
     ///
     /// This is primarily used for testing and initialization.
-    pub async fn insert_package(&self, info: PackageInfo) {
+    pub async fn insert_package(&self, mut info: PackageInfo) {
         self.update_packages(|cache| {
+            // Monotonic member authority: never let a weaker entry shadow a
+            // `Complete` exports set. Upgrades (Unknown/Partial -> Complete) and
+            // equal-or-stronger replacements publish as-is; a weaker incoming
+            // entry keeps the existing `Complete` exports + completeness, and we
+            // fold in (never drop) the existing positive-only data so a
+            // re-insert can only add.
+            if info.exports_completeness != MemberCompleteness::Complete
+                && let Some(existing) = cache.get(&info.name)
+                && existing.exports_completeness == MemberCompleteness::Complete
+            {
+                info.exports = existing.exports.clone();
+                info.exports_completeness = existing.exports_completeness;
+                for d in &existing.lazy_data {
+                    if !info.lazy_data.contains(d) {
+                        info.lazy_data.push(d.clone());
+                    }
+                }
+                for (stem, names) in &existing.data_aliases {
+                    info.data_aliases
+                        .entry(stem.clone())
+                        .or_insert_with(|| names.clone());
+                }
+            }
             cache.insert(info.name.clone(), Arc::new(info));
         });
     }
@@ -4817,6 +4910,72 @@ mod tests {
         let lib = build_package_library_tier1_only(None, &[dir.path().to_path_buf()], None).await;
         let info = lib.library.get_package("mypkg").await.expect("loads");
         assert_eq!(info.exports_completeness, MemberCompleteness::Complete);
+    }
+
+    #[tokio::test]
+    async fn member_status_present_absent_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 1.0\n").unwrap();
+        std::fs::write(pkg.join("NAMESPACE"), "export(foo)\n").unwrap();
+        let lib = build_package_library_tier1_only(None, &[dir.path().to_path_buf()], None)
+            .await
+            .library;
+        lib.get_package("mypkg").await; // warm
+
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "foo"),
+            NamespaceMemberStatus::Present
+        );
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "nope"),
+            NamespaceMemberStatus::Absent
+        );
+        // Never-loaded package with no on-disk dir and no provider: Unknown,
+        // never Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("ghostpkg", "x"),
+            NamespaceMemberStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_exports_not_downgraded_by_partial() {
+        let lib = PackageLibrary::new_empty();
+        // Seed a Complete entry: exports {foo}, so `bar` is authoritatively Absent.
+        let mut complete = PackageInfo::with_details(
+            "pkg".to_string(),
+            HashSet::from(["foo".to_string()]),
+            vec![],
+            vec![],
+        );
+        complete.exports_completeness = MemberCompleteness::Complete;
+        lib.insert_package(complete).await;
+        assert_eq!(
+            lib.namespace_member_status_sync("pkg", "bar"),
+            NamespaceMemberStatus::Absent
+        );
+
+        // A weaker (Partial) re-insert with a different export set must not
+        // downgrade the cached Complete authority.
+        let mut partial = PackageInfo::with_details(
+            "pkg".to_string(),
+            HashSet::from(["baz".to_string()]),
+            vec![],
+            vec![],
+        );
+        partial.exports_completeness = MemberCompleteness::Partial;
+        lib.insert_package(partial).await;
+
+        let cached = lib.packages.load();
+        let info = cached.get("pkg").expect("cached");
+        assert_eq!(info.exports_completeness, MemberCompleteness::Complete);
+        assert!(info.exports.contains("foo"));
+        assert_eq!(
+            lib.namespace_member_status_sync("pkg", "bar"),
+            NamespaceMemberStatus::Absent
+        );
     }
 
     #[tokio::test]
