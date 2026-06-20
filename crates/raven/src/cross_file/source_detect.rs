@@ -83,6 +83,40 @@ pub struct LibraryCall {
     pub attaches: bool,
 }
 
+/// A source range in LSP coordinates: 0-based line, **UTF-16** column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRange {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// The member (RHS) token of a `pkg::member` / `pkg:::member` reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceMember {
+    pub name: String,
+    pub range: SourceRange,
+}
+
+/// A detected `pkg::member` / `pkg:::member` (or incomplete `pkg::`) reference.
+///
+/// INVARIANT: every member-diagnostic site MUST check `!internal` before using
+/// `member` — `internal: true` is `:::`, which never gets member validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceReference {
+    /// Package name, with any string/backtick delimiters stripped.
+    pub package: String,
+    /// Range of the package (LHS) token.
+    pub package_range: SourceRange,
+    /// Member (RHS) token; `None` for an incomplete `pkg::` with no RHS.
+    pub member: Option<NamespaceMember>,
+    /// `true` for `:::` (internal lookup), `false` for `::`.
+    pub internal: bool,
+    /// Range of the whole `pkg::member` expression.
+    pub range: SourceRange,
+}
+
 /// Locate all top-level `source()` and `sys.source()` calls in an R syntax tree and extract their static parameters.
 ///
 /// This function traverses the given tree-sitter `Tree` of R source code and collects each `source()`
@@ -1114,6 +1148,95 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
     })
 }
 
+/// Detect `pkg::member` / `pkg:::member` references (and incomplete `pkg::`
+/// forms that parse as a `namespace_operator` with no RHS) across the document.
+///
+/// Canonical source for live LSP namespace metadata. Ranges are LSP UTF-16
+/// coordinates. Reuses `namespace_completion::unquote_package` for delimiter
+/// stripping (delimiter-strip only, not full R literal unescaping).
+pub fn detect_namespace_references(tree: &Tree, content: &str) -> Vec<NamespaceReference> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    visit_node_for_namespace(tree.root_node(), content, &lines, &mut out);
+    out.sort_by_key(|r| (r.range.start_line, r.range.start_column));
+    out
+}
+
+fn visit_node_for_namespace(
+    node: Node,
+    content: &str,
+    lines: &[&str],
+    out: &mut Vec<NamespaceReference>,
+) {
+    if node.kind() == "namespace_operator"
+        && let Some(reference) = parse_namespace_operator(node, content, lines)
+    {
+        out.push(reference);
+    }
+    let mut walk = node.walk();
+    for child in node.children(&mut walk) {
+        visit_node_for_namespace(child, content, lines, out);
+    }
+}
+
+fn parse_namespace_operator(ns: Node, content: &str, lines: &[&str]) -> Option<NamespaceReference> {
+    let lhs = ns.child_by_field_name("lhs")?;
+    // R accepts only an identifier or string/backtick literal as the package
+    // qualifier. Anything else (`a$b::x`) is an invalid LHS — ignore it.
+    if !matches!(lhs.kind(), "identifier" | "string") {
+        return None;
+    }
+    let package = crate::namespace_completion::unquote_package(node_text(lhs, content));
+    if package.is_empty() {
+        return None;
+    }
+
+    // The operator (`::`/`:::`) is the unnamed child whose text is colons.
+    let mut walk = ns.walk();
+    let op = ns
+        .children(&mut walk)
+        .find(|c| matches!(node_text(*c, content), "::" | ":::"))?;
+    let internal = node_text(op, content) == ":::";
+
+    let member = ns.child_by_field_name("rhs").and_then(|rhs| {
+        if !matches!(rhs.kind(), "identifier" | "string") {
+            return None;
+        }
+        let name = crate::namespace_completion::unquote_package(node_text(rhs, content));
+        if name.is_empty() {
+            return None;
+        }
+        Some(NamespaceMember {
+            name: name.to_string(),
+            range: node_range_utf16(rhs, lines),
+        })
+    });
+
+    Some(NamespaceReference {
+        package: package.to_string(),
+        package_range: node_range_utf16(lhs, lines),
+        member,
+        internal,
+        range: node_range_utf16(ns, lines),
+    })
+}
+
+/// Convert a node's tree-sitter byte-column range into LSP UTF-16 columns.
+fn node_range_utf16(node: Node, lines: &[&str]) -> SourceRange {
+    let start = node.start_position();
+    let end = node.end_position();
+    let col = |row: usize, byte_col: usize| -> u32 {
+        let line = lines.get(row).copied().unwrap_or("");
+        crate::utf16::byte_offset_to_utf16_column(line, byte_col)
+    };
+    SourceRange {
+        start_line: start.row as u32,
+        start_column: col(start.row, start.column),
+        end_line: end.row as u32,
+        end_column: col(end.row, end.column),
+    }
+}
+
 /// Determine whether an arguments node sets `character.only` to `TRUE` or `T`.
 ///
 /// Scans the children of `args_node` for a named argument `character.only` and
@@ -1663,6 +1786,93 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    #[test]
+    fn ns_ref_basic_exported() {
+        let code = "dplyr::mutate(x)\n";
+        let tree = parse_r(code);
+        let refs = detect_namespace_references(&tree, code);
+        assert_eq!(refs.len(), 1, "got: {refs:?}");
+        let r = &refs[0];
+        assert_eq!(r.package, "dplyr");
+        assert!(!r.internal);
+        let m = r.member.as_ref().expect("member present");
+        assert_eq!(m.name, "mutate");
+        // package range covers "dplyr" at columns 0..5
+        assert_eq!(
+            (
+                r.package_range.start_line,
+                r.package_range.start_column,
+                r.package_range.end_column
+            ),
+            (0, 0, 5)
+        );
+    }
+
+    #[test]
+    fn ns_ref_internal_triple_colon() {
+        let refs =
+            detect_namespace_references(&parse_r("dplyr:::peek_mask()\n"), "dplyr:::peek_mask()\n");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].internal);
+        assert_eq!(refs[0].member.as_ref().unwrap().name, "peek_mask");
+    }
+
+    #[test]
+    fn ns_ref_quoted_lhs_and_rhs() {
+        for code in [
+            r#""dplyr"::mutate"#,
+            "`dplyr`::mutate",
+            r#"dplyr::"mutate""#,
+        ] {
+            let src = format!("{code}\n");
+            let refs = detect_namespace_references(&parse_r(&src), &src);
+            assert_eq!(refs.len(), 1, "code: {code} got: {refs:?}");
+            assert_eq!(refs[0].package, "dplyr", "code: {code}");
+            assert_eq!(
+                refs[0].member.as_ref().unwrap().name,
+                "mutate",
+                "code: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn ns_ref_nonsyntactic_member() {
+        let src = "pkg::`non syntactic`\n";
+        let refs = detect_namespace_references(&parse_r(src), src);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].member.as_ref().unwrap().name, "non syntactic");
+    }
+
+    #[test]
+    fn ns_ref_incomplete_records_none_member() {
+        // Incomplete `pkg::` parsed as a namespace_operator with no rhs is kept
+        // for warming with member: None.
+        let src = "library(dplyr)\ndplyr::\n";
+        let refs = detect_namespace_references(&parse_r(src), src);
+        let incomplete: Vec<_> = refs.iter().filter(|r| r.member.is_none()).collect();
+        assert_eq!(incomplete.len(), 1, "got: {refs:?}");
+        assert_eq!(incomplete[0].package, "dplyr");
+    }
+
+    #[test]
+    fn ns_ref_ignores_invalid_lhs_and_comments() {
+        // a$b::x has a non-identifier/non-string LHS -> ignored.
+        // A `::` inside a comment or string is not a namespace_operator node.
+        let src = "a$b::x\n# dplyr::mutate\ny <- \"tidyr::pivot\"\n";
+        let refs = detect_namespace_references(&parse_r(src), src);
+        assert!(refs.is_empty(), "got: {refs:?}");
+    }
+
+    #[test]
+    fn ns_ref_utf16_columns() {
+        // 🎉 is 2 UTF-16 units; pkg starts at column 2.
+        let src = "🎉; dplyr::mutate\n";
+        let refs = detect_namespace_references(&parse_r(src), src);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].package_range.start_column, 4); // 2 (emoji) + 2 ("; ")
     }
 
     // ------------------------------------------------------------------

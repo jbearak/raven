@@ -90,12 +90,15 @@ impl PackageRecord {
     /// Decode this record back into a `PackageInfo`. `with_details` re-derives
     /// `is_meta_package` / `attached_packages` from the name.
     pub fn into_info(self) -> PackageInfo {
-        PackageInfo::with_details(
+        let mut info = PackageInfo::with_details(
             self.name,
             self.exports.into_iter().collect::<HashSet<String>>(),
             self.depends,
             self.lazy_data,
-        )
+        );
+        // Provider records carry a full export list for the captured version.
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        info
     }
 }
 
@@ -136,6 +139,22 @@ mod tests {
         );
         assert_eq!(back.depends, vec!["R".to_string()]);
         assert_eq!(back.lazy_data, vec!["starwars".to_string()]);
+    }
+
+    #[test]
+    fn record_into_info_is_export_complete() {
+        let rec = PackageRecord {
+            name: "p".into(),
+            version: "1.0".into(),
+            exports: vec!["a".into(), "b".into()],
+            depends: vec![],
+            lazy_data: vec![],
+        };
+        let info = rec.into_info();
+        assert_eq!(
+            info.exports_completeness,
+            crate::package_library::MemberCompleteness::Complete
+        );
     }
 
     #[test]

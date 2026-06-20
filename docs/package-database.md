@@ -18,6 +18,20 @@ The tiers are a **floor, never a replacement**: whenever a package resolves from
 
 > **Export names, not install status.** The database suppresses undefined-variable noise; it never makes a package count as *installed*. The missing-package diagnostic stays Tier-1-only and is **off by default in `raven check`**. See [Names vs. install status](#names-vs-install-status) below.
 
+### Exports completeness
+
+Each cached `PackageInfo` records how *complete* its export set is — the signal the [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember) diagnostic uses to decide whether absence is conclusive:
+
+| Completeness | Source | Member absence |
+|---|---|---|
+| **Complete** | static `NAMESPACE` parse without `exportPattern()`/`exportClassPattern()`; R's `getNamespaceExports()`; a Tier 2/3 provider record; the embedded base table — **and**, when the package ships a `data/` directory, only when its datasets were enumerated via R | Conclusive — a `pkg::member` not in the set is reported |
+| **Partial** | the `INDEX` approximation (R absent for an `exportPattern()` package); **or** a `data/`-bearing package whose datasets could not be enumerated (no R) — a binary `data/Rdata.rdb` exposes no object names to the static parse, so dataset absence cannot be concluded | Never concluded — exports are known but the full dataset set is not |
+| **Unknown** | not yet warmed, or unresolvable without R | Never concluded |
+
+The member authority (`namespace_member_status_sync`) is **synchronous, never spawns R, and never touches disk**: it consults the warmed cache, then the providers, and concludes `Absent` only from a `Complete` set. A package referenced via `pkg::` is warmed into the cache in the background, so until that warm completes the authority returns `Unknown` (silent) — it deliberately does not parse the on-disk `NAMESPACE` synchronously, which would block the keystroke path and could not see datasets. Data objects (`lazy_data`, the per-file `data_aliases` object names, and base-package datasets via `base_exports`) are **positive-only** — they confirm a member is present but never prove one absent.
+
+The cache write path (`insert_package`) is **monotonically authoritative**: once a package is cached `Complete`, a later weaker (`Partial`/`Unknown`) load can never downgrade its exports or completeness — it only ever folds in additional positive-only data. This keeps a transient R-less reload from turning a previously-conclusive export set back into "don't know."
+
 ## Tier 2 — the committed `.raven/packages.json`
 
 A repo-specific snapshot, generated on a machine that has R and the project's packages installed, and **committed to the repo**. Because it is produced through Raven's authoritative path, it is effectively *frozen Tier 1*: it captures the full structure — exports (with `exportPattern` correctly expanded), `Depends`, datasets, and meta-package attaches.

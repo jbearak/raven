@@ -638,6 +638,17 @@ pub(crate) fn diagnostics_from_snapshot(
         },
     );
 
+    // Namespace member-not-found diagnostics
+    collect_namespace_member_diagnostics_from_snapshot(
+        snapshot,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
+
     // Redundant directive diagnostics
     collect_redundant_directive_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
@@ -5125,9 +5136,115 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 end: Position::new(lib_call.line, lib_call.column),
             },
             severity: Some(severity),
-            message: format!("Package '{}' is not installed", lib_call.package),
+            message: format!("No installed package named '{}'", lib_call.package),
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+
+    for ns_ref in &snapshot.directive_meta.namespace_references {
+        // Both `::` and `:::` qualify for the missing-package diagnostic.
+        if snapshot.package_library.package_exists(&ns_ref.package) {
+            continue;
+        }
+        let line = ns_ref.package_range.start_line;
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            line,
+            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    line,
+                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+                ));
+            }
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, ns_ref.package_range.start_column),
+                end: Position::new(
+                    ns_ref.package_range.end_line,
+                    ns_ref.package_range.end_column,
+                ),
+            },
+            severity: Some(severity),
+            message: format!("No installed package named '{}'", ns_ref.package),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+}
+
+/// Emit `namespace-member-not-found` for `pkg::member` references whose package
+/// has a *complete* export set that does not contain `member`. Exports-
+/// authoritative: a `Partial`/`Unknown` set (or a never-warmed package) stays
+/// silent, and `pkg:::member` (internal access) is never validated. The member
+/// authority (`namespace_member_status_sync`) is sync and never spawns R, so a
+/// not-yet-warmed package yields `Unknown` here and the diagnostic appears only
+/// after warming republishes (see the cross-document force-republish path).
+fn collect_namespace_member_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    if !snapshot.cross_file_config.packages_enabled {
+        return;
+    }
+    if !snapshot.package_library_ready {
+        return;
+    }
+    let Some(severity) = snapshot
+        .cross_file_config
+        .packages_namespace_member_severity
+    else {
+        return;
+    };
+
+    for ns_ref in &snapshot.directive_meta.namespace_references {
+        if ns_ref.internal {
+            continue; // never validate `:::`
+        }
+        let Some(member) = &ns_ref.member else {
+            continue;
+        };
+        let status = snapshot
+            .package_library
+            .namespace_member_status_sync(&ns_ref.package, &member.name);
+        if status != crate::package_library::NamespaceMemberStatus::Absent {
+            continue;
+        }
+        let line = member.range.start_line;
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            line,
+            Some(crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    line,
+                    crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string(),
+                ));
+            }
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, member.range.start_column),
+                end: Position::new(member.range.end_line, member.range.end_column),
+            },
+            severity: Some(severity),
+            message: format!(
+                "'{}' is not an exported object of package '{}'",
+                member.name, ns_ref.package
+            ),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string(),
             )),
             ..Default::default()
         });
@@ -18276,17 +18393,41 @@ fn is_namespace_package_side(node: Node) -> bool {
         .is_some_and(|lhs| lhs.id() == node.id())
 }
 
+/// True when `node` sits under a `:::` (internal) namespace operator, false for
+/// `::`. Walks up to the enclosing `namespace_operator` and inspects the colon
+/// token. Hover uses this to skip member-existence suppression for `:::`:
+/// internal symbols are real members (just unexported), so they are never
+/// member-validated — mirroring the `namespace-member-not-found` diagnostic's
+/// `!internal` gate.
+fn namespace_operator_is_internal(node: Node, text: &str) -> bool {
+    let mut current = node;
+    loop {
+        if current.kind() == "namespace_operator" {
+            let mut cursor = current.walk();
+            return current
+                .children(&mut cursor)
+                .any(|c| node_text(c, text) == ":::");
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+}
+
 /// Build the hover markdown for the package side of `pkg::name` — the package's
-/// `Title`/`Description` from its installed DESCRIPTION, or a "not installed"
-/// note when no library path contains the package.
+/// `Title`/`Description` from its installed DESCRIPTION.
+///
+/// Returns `None` when no library path contains the package: there is no
+/// metadata to show, and the `package-not-installed` diagnostic already reports
+/// the missing package on this same token, so a "not installed" hover note would
+/// just duplicate it inside the hover popup (resolve-or-suppress).
 ///
 /// Session-free: reads DESCRIPTION off disk (no R subprocess), mirroring
 /// `parse_description_depends`'s consumers. This replaces the old `pkg::pkg`
 /// help-lookup artifact that rendered an awkward `from {pkg}` for the LHS.
-fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
-    let Some(pkg_dir) = state.package_library.find_package_directory(pkg) else {
-        return format!("Package `{}` is not installed.", pkg);
-    };
+fn package_metadata_hover(state: &WorldState, pkg: &str) -> Option<String> {
+    let pkg_dir = state.package_library.find_package_directory(pkg)?;
 
     let meta = crate::namespace_parser::parse_description_metadata(&pkg_dir.join("DESCRIPTION"))
         .unwrap_or_default();
@@ -18304,7 +18445,7 @@ fn package_metadata_hover(state: &WorldState, pkg: &str) -> String {
         value.push_str("\n\n");
         value.push_str(&escape_markdown(&description));
     }
-    value
+    Some(value)
 }
 
 /// True when `node` is the NAME of a function parameter at a definition site —
@@ -19281,15 +19422,36 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     if let Some(qualifier_pkg) = find_namespace_context(&node, &text) {
         // Package side (`pkg` in `pkg::name`): show the package's DESCRIPTION
         // Title/Description instead of a `pkg::pkg` help artifact (#382 step 1).
-        // The member (RHS) side keeps the qualified help-topic behavior below.
+        // When the package is not installed there is no metadata to show, and
+        // the package-not-installed diagnostic already reports it on this token,
+        // so hover stays silent rather than duplicating the diagnostic. The
+        // member (RHS) side keeps the qualified help-topic behavior below.
         if node.kind() == "identifier" && is_namespace_package_side(node) {
-            return Some(markdown_hover(
-                package_metadata_hover(state, name),
-                node_range,
-            ));
+            return package_metadata_hover(state, name)
+                .map(|value| markdown_hover(value, node_range));
         }
 
         let pkg_owned = qualifier_pkg.to_string();
+
+        // Resolve-or-suppress for the member (RHS) side: if `pkg::member`
+        // references a member that a COMPLETE export set authoritatively does not
+        // contain, show NO hover rather than fabricating a `from {pkg}`
+        // attribution for a member that does not exist (the #379 `from {base}`
+        // defect class). This keeps hover in parity with the
+        // `namespace-member-not-found` diagnostic: it suppresses exactly when the
+        // diagnostic fires. Never for `:::` (internal symbols are real members,
+        // just unexported) and never for Partial/Unknown metadata (the package
+        // may not be warmed yet) — `namespace_member_status_sync` returns
+        // `Absent` only from a `Complete` set.
+        if !namespace_operator_is_internal(node, &text)
+            && state
+                .package_library
+                .namespace_member_status_sync(&pkg_owned, name)
+                == crate::package_library::NamespaceMemberStatus::Absent
+        {
+            return None;
+        }
+
         let mut value = build_help_panel_link(name, &pkg_owned);
         if let Some(help_text) =
             get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
@@ -50491,9 +50653,11 @@ result <- my_func(1, 2)"#;
     }
 
     #[test]
-    fn test_hover_namespace_package_side_not_installed() {
-        // The package side of an uninstalled `pkg::fn` shows a clear note rather
-        // than nothing or a misattribution.
+    fn test_hover_namespace_package_side_not_installed_is_suppressed() {
+        // The package side of an uninstalled `pkg::fn` has no metadata to show,
+        // and the package-not-installed diagnostic already reports it on this
+        // token — so hover stays silent rather than duplicating that message
+        // inside the hover popup (issue #503 review feedback).
         let mut state = WorldState::new();
         let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
         pkg_lib.set_lib_paths(vec![std::path::PathBuf::from(
@@ -50508,13 +50672,12 @@ result <- my_func(1, 2)"#;
             .insert(uri.clone(), Document::new(code, None));
 
         let position = Position::new(0, 2);
-        let hover =
-            hover_blocking(&state, &uri, position).expect("package-side hover even when missing");
-        if let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents {
-            assert_eq!(value, "Package `nosuchpkg` is not installed.");
-        } else {
-            panic!("expected markup content");
-        }
+        let hover = hover_blocking(&state, &uri, position);
+        assert!(
+            hover.is_none(),
+            "package-side hover must be suppressed when not installed (the \
+             package-not-installed diagnostic reports it); got: {hover:?}"
+        );
     }
 
     #[test]
@@ -51871,7 +52034,7 @@ result <- helper_with_spaces(42)"#;
                 .message
                 .contains("__nonexistent_package_xyz__")
         );
-        assert!(diagnostics[0].message.contains("not installed"));
+        assert!(diagnostics[0].message.contains("No installed package"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     }
 
@@ -51908,6 +52071,117 @@ result <- helper_with_spaces(42)"#;
             0,
             "Should not emit diagnostic for base package"
         );
+    }
+
+    #[test]
+    fn namespace_ref_reports_missing_package() {
+        // A `pkg::member` reference to a non-installed package reports
+        // `package-not-installed`, anchored to the package (LHS) token.
+        let code = "missingpkg::foo\n";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // Non-empty lib_paths makes package_exists() reliable (no suppression),
+        // and the bogus path contains no packages, so `missingpkg` is missing.
+        pkg_lib.set_lib_paths(vec![std::path::PathBuf::from("/nonexistent")]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diags = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].message.contains("missingpkg"));
+        // Anchored to the package token (columns 0..10), not the whole expr.
+        assert_eq!(diags[0].range.start.character, 0);
+        assert_eq!(diags[0].range.end.character, 10);
+    }
+
+    /// Build a snapshot for `code` against a package library with a single
+    /// package `mypkg` whose `exports` and `exports_completeness` are exactly as
+    /// given (Tier-1 cache hit, so no disk/R is consulted). Mirrors the
+    /// missing-package collector tests' snapshot assembly.
+    async fn build_member_test_snapshot(
+        code: &str,
+        exports: &[&str],
+        completeness: crate::package_library::MemberCompleteness,
+    ) -> DiagnosticsSnapshot {
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "mypkg".to_string(),
+            exports.iter().map(|s| s.to_string()).collect(),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = completeness;
+        pkg_lib.insert_package(info).await;
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+        DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R")
+    }
+
+    #[tokio::test]
+    async fn member_diag_absent_complete_reports() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::nope\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].message.contains("nope"));
+        assert_eq!(
+            diags[0].code,
+            Some(NumberOrString::String(
+                crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND.to_string()
+            ))
+        );
+        // Anchored to the member (RHS) token: `nope` at columns 7..11.
+        assert_eq!(diags[0].range.start.character, 7);
+        assert_eq!(diags[0].range.end.character, 11);
+    }
+
+    #[tokio::test]
+    async fn member_diag_present_export_silent() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::foo\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[tokio::test]
+    async fn member_diag_partial_silent() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg::nope\n", &["foo"], MemberCompleteness::Partial)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
+    }
+
+    #[tokio::test]
+    async fn member_diag_internal_never_reports() {
+        use crate::package_library::MemberCompleteness;
+        let snapshot =
+            build_member_test_snapshot("mypkg:::nope\n", &["foo"], MemberCompleteness::Complete)
+                .await;
+        let mut diags = Vec::new();
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert!(diags.is_empty(), "got: {diags:?}");
     }
 
     #[test]
@@ -52062,7 +52336,7 @@ result <- helper_with_spaces(42)"#;
             "Should emit missing-package diagnostic when lib_paths are populated even if r_subprocess is None"
         );
         assert!(diagnostics[0].message.contains("__raven_not_installed__"));
-        assert!(diagnostics[0].message.contains("not installed"));
+        assert!(diagnostics[0].message.contains("No installed package"));
     }
 
     // ============================================================================
@@ -56707,6 +56981,17 @@ source(\"helpers.R\")
         check_predicate("dplyr::filter(df)\n", "filter", 0, true);
         check_predicate("dplyr:::filter(df)\n", "dplyr", 0, true);
         check_predicate("dplyr:::filter(df)\n", "filter", 0, true);
+    }
+
+    #[test]
+    fn namespace_operator_sides_remain_structural_after_metadata() {
+        // Regression lock (issue #503): recording `pkg::member` as cross-file
+        // namespace metadata must not turn either side into a bare-variable
+        // reference. Guards undefined-variable / out-of-scope handling.
+        check_predicate("dplyr::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr::filter(df)\n", "filter", 0, true);
+        check_predicate("dplyr:::peek(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr:::peek(df)\n", "peek", 0, true);
     }
 
     #[test]
@@ -65209,6 +65494,55 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             result.is_some(),
             "hover on a backtick-quoted syntactic call must resolve to the bare definition"
+        );
+    }
+
+    /// Hover on a `pkg::member` whose package has a COMPLETE export set that does
+    /// not contain the member must show NO hover — it must not fabricate a
+    /// `from {pkg}` attribution for a member that does not exist (resolve-or-
+    /// suppress, parity with the `namespace-member-not-found` diagnostic).
+    #[tokio::test]
+    async fn hover_on_absent_namespace_member_is_suppressed() {
+        let mut state = create_state();
+        // pkgload is cached with a Complete export set that lacks `undefined`.
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "pkgload".to_string(),
+            std::collections::HashSet::from(["load_all".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        state.package_library.insert_package(info).await;
+
+        let uri = add_doc(&mut state, "file:///t.R", "pkgload::undefined()\n");
+        // Cursor on `undefined` (RHS), which starts at column 9 (`pkgload::`).
+        let result = super::hover(&state, &uri, Position::new(0, 12)).await;
+        assert!(
+            result.is_none(),
+            "hover on an absent namespace member must be suppressed, got: {result:?}"
+        );
+    }
+
+    /// A real `pkg::member` (present in the cached export set) still hovers — the
+    /// suppression above must not swallow valid members.
+    #[tokio::test]
+    async fn hover_on_present_namespace_member_resolves() {
+        let mut state = create_state();
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "pkgload".to_string(),
+            std::collections::HashSet::from(["load_all".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        state.package_library.insert_package(info).await;
+
+        let uri = add_doc(&mut state, "file:///t.R", "pkgload::load_all()\n");
+        // Cursor on `load_all` (RHS), starting at column 9.
+        let result = super::hover(&state, &uri, Position::new(0, 12)).await;
+        assert!(
+            result.is_some(),
+            "hover on a present namespace member must still resolve"
         );
     }
 

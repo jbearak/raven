@@ -220,8 +220,18 @@ jobs:
             sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
             sccache-debug-${{ runner.os }}-
 
-      - name: Install mold linker
-        run: sudo apt-get install -y --no-install-recommends mold
+      # `r-base-core` is required, not optional: ~65 cargo tests gate on an
+      # available R subprocess (`RSubprocess::new(None)`) and silently `return`
+      # (passing vacuously) when R is absent. Without R here those tests never
+      # actually execute on CI, so regressions in package-mode / sysdata / R
+      # fallback behavior land green and are only caught locally. `r-base-core`
+      # ships every base-priority package these tests use (e.g. `grid`); tests
+      # needing CRAN packages are deliberately not written (see the stringr note
+      # in cli/check.rs).
+      - name: Install mold linker and R
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold r-base-core
 
       - name: Run cargo tests (debug)
         run: cargo test -p raven --features test-support

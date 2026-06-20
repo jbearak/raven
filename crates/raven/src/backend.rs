@@ -78,6 +78,35 @@ fn edited_document_warm_packages(
     packages
 }
 
+/// Namespace-reference package names that pass the warm filter: a valid package
+/// name that is not the load-all sentinel.
+///
+/// Single source of truth for "which `pkg::` packages may be warmed", shared by
+/// every warm path (`namespace_warm_packages`, `collect_open_document_packages`)
+/// because `prefetch_packages()` trusts its callers. Namespace references warm
+/// metadata only — they never attach the package to bare-name scope.
+fn valid_namespace_ref_packages(
+    meta: &crate::cross_file::CrossFileMetadata,
+) -> impl Iterator<Item = &str> {
+    meta.namespace_references
+        .iter()
+        .map(|r| r.package.as_str())
+        .filter(|p| is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p))
+}
+
+/// Deduplicated package names worth warming from a document's namespace
+/// references, in first-seen order.
+fn namespace_warm_packages(meta: &crate::cross_file::CrossFileMetadata) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut packages = Vec::new();
+    for p in valid_namespace_ref_packages(meta) {
+        if seen.insert(p) {
+            packages.push(p.to_string());
+        }
+    }
+    packages
+}
+
 /// Parameters for the raven/activeDocumentsChanged notification
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -418,6 +447,12 @@ pub(crate) fn parse_cross_file_config(
             .and_then(|v| v.as_str())
         {
             config.packages_missing_package_severity = parse_severity(sev);
+        }
+        if let Some(sev) = packages
+            .get("namespaceMemberSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.packages_namespace_member_severity = parse_severity(sev);
         }
         if let Some(v) = packages.get("watchLibraryPaths").and_then(|v| v.as_bool()) {
             config.packages_watch_library_paths = v;
@@ -3620,7 +3655,9 @@ impl LanguageServer for Backend {
 
             // Collect package names from library calls for background prefetch
             let packages_to_prefetch: Vec<String> = if packages_enabled {
-                extract_loaded_packages_from_library_calls(&meta.library_calls)
+                let mut p = extract_loaded_packages_from_library_calls(&meta.library_calls);
+                p.extend(namespace_warm_packages(&meta));
+                p
             } else {
                 Vec::new()
             };
@@ -4511,10 +4548,12 @@ impl LanguageServer for Backend {
                 // Collect package names for prefetch (validate names to
                 // reject suspicious inputs before R subprocess calls)
                 let pkgs: Vec<String> = if packages_enabled {
-                    match state.documents.get(&uri_clone) {
+                    let mut p = match state.documents.get(&uri_clone) {
                         Some(doc) => edited_document_warm_packages(&meta.library_calls, doc),
                         None => extract_loaded_packages_from_library_calls(&meta.library_calls),
-                    }
+                    };
+                    p.extend(namespace_warm_packages(&meta));
+                    p
                 } else {
                     Vec::new()
                 };
@@ -4818,6 +4857,13 @@ impl LanguageServer for Backend {
             let revalidation_uri = uri.clone();
             let direct_packages = packages_to_prefetch;
             let traversal_truncation = self.traversal_truncation.clone();
+            // URIs already force-marked + scheduled by the synchronous
+            // dependency-graph path above. The sibling republish below must
+            // exclude them: double-marking the force-republish counter would
+            // leak a phantom marker (a later same-URI job cancels an earlier
+            // one before it consumes its mark).
+            let scheduled_uris: std::collections::HashSet<Url> =
+                work_items.iter().map(|(u, _, _)| u.clone()).collect();
             tokio::spawn(async move {
                 // Extend direct library_calls with inherited packages from
                 // parent source() chains. Snapshot under the lock, release it,
@@ -4888,8 +4934,14 @@ impl LanguageServer for Backend {
                 log::trace!("Background prefetching {} packages", packages_vec.len());
                 pkg_lib.prefetch_packages(&packages_vec).await;
 
+                // Warming a package can change `pkg::member` / missing-package
+                // diagnostics in OTHER open documents that reference it but do
+                // not `source()` this file (issue #503), so collect those
+                // siblings and force-republish them alongside the edited file.
+                let warmed: std::collections::HashSet<String> = packages_vec.into_iter().collect();
+
                 // After prefetch completes, trigger diagnostic revalidation
-                let (debounce_ms, trigger_version, trigger_revision) = {
+                let (debounce_ms, trigger_version, trigger_revision, sibling_jobs) = {
                     let state = state_arc.read().await;
                     if !state.documents.contains_key(&revalidation_uri) {
                         return; // Document was closed during prefetch
@@ -4900,8 +4952,43 @@ impl LanguageServer for Backend {
                     let doc = state.documents.get(&revalidation_uri);
                     let ver = doc.and_then(|d| d.version);
                     let rev = doc.map(|d| d.revision);
-                    (state.cross_file_config.revalidation_debounce_ms, ver, rev)
+
+                    // Cross-document sibling republish (issue #503), excluding the
+                    // edited file (revalidated below by its own version bump).
+                    let mut sibling_jobs: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+                    for sib in open_docs_referencing_packages(&state, &warmed) {
+                        // Skip the edited file (revalidated by its own version
+                        // bump) and any URI the synchronous path already marked +
+                        // scheduled — re-marking would leak a phantom force
+                        // counter.
+                        if sib == revalidation_uri || scheduled_uris.contains(&sib) {
+                            continue;
+                        }
+                        state.diagnostics_gate.mark_force_republish(&sib);
+                        let sdoc = state.documents.get(&sib);
+                        let sver = sdoc.and_then(|d| d.version);
+                        let srev = sdoc.map(|d| d.revision);
+                        sibling_jobs.push((sib, sver, srev));
+                    }
+                    (
+                        state.cross_file_config.revalidation_debounce_ms,
+                        ver,
+                        rev,
+                        sibling_jobs,
+                    )
                 };
+
+                for (sib, sver, srev) in sibling_jobs {
+                    tokio::spawn(run_debounced_diagnostics(
+                        state_arc.clone(),
+                        client.clone(),
+                        sib,
+                        debounce_ms,
+                        sver,
+                        srev,
+                        Some(traversal_truncation.clone()),
+                    ));
+                }
 
                 run_debounced_diagnostics(
                     state_arc,
@@ -8278,10 +8365,42 @@ fn collect_open_document_packages(
         for p in &doc.data_packages {
             doc_pkgs.insert(p.clone());
         }
+        // Namespace references warm metadata but never attach scope; pull them
+        // from the document's enriched metadata (the shared source of truth),
+        // through the same warm filter every other path uses.
+        if let Some(meta) = state.get_enriched_metadata(uri) {
+            for p in valid_namespace_ref_packages(&meta) {
+                doc_pkgs.insert(p.to_string());
+            }
+        }
         let line = doc.text().lines().count().saturating_sub(1) as u32;
         docs.push((uri.clone(), line));
     }
     (doc_pkgs, docs)
+}
+
+/// Open documents whose namespace references (`pkg::member`) name any package in
+/// `warmed`. After a background prefetch warms a package, these documents may
+/// gain/lose `namespace-member-not-found` / `package-not-installed` diagnostics
+/// even though they don't `source()` the edited file, so they must be marked
+/// for force-republish (issue #503). Reads each doc's enriched metadata — the
+/// shared source of truth for namespace references.
+fn open_docs_referencing_packages(
+    state: &WorldState,
+    warmed: &std::collections::HashSet<String>,
+) -> Vec<Url> {
+    let mut out = Vec::new();
+    for uri in state.documents.keys() {
+        if let Some(meta) = state.get_enriched_metadata(uri)
+            && meta
+                .namespace_references
+                .iter()
+                .any(|r| warmed.contains(&r.package))
+        {
+            out.push(uri.clone());
+        }
+    }
+    out
 }
 
 /// Collect effective packages for all open documents (direct `library()` calls
@@ -10207,6 +10326,34 @@ mod tests {
         }
 
         #[test]
+        fn parse_cross_file_config_reads_namespace_member_severity() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+            let settings = json!({
+                "packages": { "namespaceMemberSeverity": "error" }
+            });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.packages_namespace_member_severity,
+                Some(DiagnosticSeverity::ERROR)
+            );
+        }
+
+        #[test]
+        fn parse_cross_file_config_namespace_member_severity_defaults_to_warning() {
+            use tower_lsp::lsp_types::DiagnosticSeverity;
+            let settings = json!({ "packages": {} });
+            let config = crate::backend::parse_cross_file_config(&settings)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.packages_namespace_member_severity,
+                Some(DiagnosticSeverity::WARNING)
+            );
+        }
+
+        #[test]
         fn parse_cross_file_config_clamps_watch_debounce_ms() {
             let settings = json!({
                 "packages": { "watchDebounceMs": 50 }  // below floor
@@ -11307,6 +11454,67 @@ mod refresh_packages_tests {
             "did_change warm set must include data(package=) packages (issue #429); got {:?}",
             pkgs
         );
+    }
+
+    #[test]
+    fn namespace_warm_packages_validates_and_dedups() {
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        let mk = |pkg: &str| crate::cross_file::source_detect::NamespaceReference {
+            package: pkg.to_string(),
+            package_range: crate::cross_file::source_detect::SourceRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            member: None,
+            internal: false,
+            range: crate::cross_file::source_detect::SourceRange {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+        };
+        meta.namespace_references = vec![
+            mk("dplyr"),
+            mk("dplyr"),                                   // dup
+            mk(crate::package_library::LOAD_ALL_SENTINEL), // sentinel filtered
+            mk("not a package"),                           // invalid filtered
+        ];
+        let pkgs = namespace_warm_packages(&meta);
+        assert_eq!(pkgs, vec!["dplyr".to_string()]);
+    }
+
+    #[test]
+    fn open_docs_referencing_packages_finds_namespace_users() {
+        use crate::state::{Document, WorldState};
+        let mut state = WorldState::new();
+        let a = Url::parse("file:///ws/a.R").unwrap();
+        let b = Url::parse("file:///ws/b.R").unwrap();
+        let c = Url::parse("file:///ws/c.R").unwrap();
+        // a.R warms `dplyr` via library(); b.R references it via `dplyr::`;
+        // c.R references an unrelated package.
+        state
+            .documents
+            .insert(a.clone(), Document::new("library(dplyr)\n", Some(1)));
+        state
+            .documents
+            .insert(b.clone(), Document::new("dplyr::mutate(x)\n", Some(1)));
+        state
+            .documents
+            .insert(c.clone(), Document::new("tidyr::pivot(x)\n", Some(1)));
+
+        let warmed: std::collections::HashSet<String> =
+            std::iter::once("dplyr".to_string()).collect();
+        let found = open_docs_referencing_packages(&state, &warmed);
+        assert!(found.contains(&b), "b.R references dplyr::; got {found:?}");
+        assert!(
+            !found.contains(&c),
+            "c.R references only tidyr::; got {found:?}"
+        );
+        // a.R has no namespace reference (only a library() call).
+        assert!(!found.contains(&a), "a.R has no pkg:: ref; got {found:?}");
     }
 
     /// Deterministic (R-free) coverage of the issue #429 sysdata fallback gate

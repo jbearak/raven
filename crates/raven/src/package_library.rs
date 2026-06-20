@@ -140,6 +140,25 @@ fn is_readable_file(path: &Path) -> bool {
     path.is_file() && std::fs::File::open(path).is_ok()
 }
 
+/// How complete a package's exported-member set is, for absence diagnostics.
+/// `Absent` may be concluded only from a `Complete` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemberCompleteness {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+}
+
+/// Result of a synchronous `pkg::member` membership query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceMemberStatus {
+    Present,
+    Absent,
+    Partial,
+    Unknown,
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -178,6 +197,10 @@ pub struct PackageInfo {
     /// cross-file scope — never injected after bare `library()` for
     /// non-LazyData packages.
     pub data_aliases: HashMap<String, Vec<String>>,
+    /// Completeness of `exports` for member-absence diagnostics. Defaults to
+    /// `Unknown` (never absence-authoritative) via every constructor; production
+    /// load paths stamp the real value. See `namespace_member_status_sync`.
+    pub exports_completeness: MemberCompleteness,
 }
 
 impl PackageInfo {
@@ -193,6 +216,7 @@ impl PackageInfo {
             attached_packages,
             lazy_data: Vec::new(),
             data_aliases: HashMap::new(),
+            exports_completeness: MemberCompleteness::Unknown,
         }
     }
 
@@ -213,6 +237,7 @@ impl PackageInfo {
             attached_packages,
             lazy_data,
             data_aliases: HashMap::new(),
+            exports_completeness: MemberCompleteness::Unknown,
         }
     }
 }
@@ -308,7 +333,14 @@ fn dedup_preserving_order(names: Vec<String>) -> Vec<String> {
 /// from packages that require R subprocess due to `exportPattern()` usage.
 #[derive(Debug)]
 pub struct NamespaceParseResult {
-    /// Explicit exports from export() and S3method() directives
+    /// Explicit exports parsed from NAMESPACE: `export()`, `S3method()`,
+    /// `exportClasses()` and `exportMethods()` names (issue #474 — S4
+    /// classes/generics appear in `getNamespaceExports()` and are captured here
+    /// as plain names). `exportPattern()` / `exportClassPattern()` are NOT
+    /// included; they set [`Self::has_export_pattern`] instead. So when
+    /// `has_export_pattern` is false this set is the package's *complete* export
+    /// list, which is what lets `namespace_member_status_sync` conclude `Absent`
+    /// from a static parse.
     pub explicit_exports: Vec<String>,
     /// Whether the package uses exportPattern() and needs R subprocess for accuracy
     pub has_export_pattern: bool,
@@ -806,6 +838,87 @@ impl PackageLibrary {
         None
     }
 
+    /// Synchronous, cache/provider-only `pkg::member` authority. Never spawns R,
+    /// never touches disk, and never mutates the cache. `Absent` only from a
+    /// `Complete` exports set. Data objects (`lazy_data`, the per-file
+    /// `data_aliases` object names, and base exports) are positive-only: they
+    /// confirm-present but never prove absent (issue #505 tightens this).
+    ///
+    /// Resolution is **cache-or-provider only** by design: a package referenced
+    /// via `pkg::` is warmed into the cache in the background, and this authority
+    /// reports `Unknown` (silent) until that warm completes and republishes — so
+    /// it deliberately does NOT parse the on-disk NAMESPACE here. A synchronous
+    /// disk parse would (a) block the keystroke path with file I/O per reference
+    /// and (b) be unable to see datasets (which never appear in NAMESPACE
+    /// `export()`), risking a false `Absent` on a real `pkg::dataset` before the
+    /// warm populates the full metadata.
+    pub fn namespace_member_status_sync(
+        &self,
+        package: &str,
+        member: &str,
+    ) -> NamespaceMemberStatus {
+        if is_load_all_sentinel(package) {
+            return NamespaceMemberStatus::Unknown;
+        }
+        // Base-package datasets/exports are merged into base_exports, not the
+        // per-package lazy_data — positive-only present check.
+        if self.is_base_package(package) && self.is_base_export(member) {
+            return NamespaceMemberStatus::Present;
+        }
+
+        // A member is "present" if it is an exported symbol, a lazy-loaded data
+        // object, OR an object bound by one of the package's data files (the
+        // `data_aliases` VALUES — for a non-LazyData package the real dataset
+        // names live only here, while `lazy_data` keeps file stems). All three
+        // are positive-only signals.
+        let member_present = |info: &PackageInfo| -> bool {
+            info.exports.contains(member)
+                || info.lazy_data.iter().any(|d| d == member)
+                || info
+                    .data_aliases
+                    .values()
+                    .any(|names| names.iter().any(|n| n == member))
+        };
+
+        // Tier 1: cache snapshot (already-stamped completeness).
+        if let Some(info) = self.packages.load().get(package) {
+            if member_present(info) {
+                return NamespaceMemberStatus::Present;
+            }
+            match info.exports_completeness {
+                MemberCompleteness::Complete => return NamespaceMemberStatus::Absent,
+                MemberCompleteness::Partial => return NamespaceMemberStatus::Partial,
+                MemberCompleteness::Unknown => {} // fall through to providers
+            }
+        }
+
+        // Tier 2: providers (Complete export lists from Tier 2/3 metadata).
+        if let Some(info) = self.resolve_from_providers(package) {
+            if member_present(&info) {
+                return NamespaceMemberStatus::Present;
+            }
+            // A provider record is authoritative for ABSENCE only when the
+            // package is NOT installed locally (the CI / no-`.libPaths()` case).
+            // When a local install exists, IT is the source of truth and may be
+            // newer than the provider snapshot (e.g. a dev build exporting a
+            // symbol the captured release lacked). Background warming resolves
+            // the install into Tier 1; until then, defer rather than trust a
+            // possibly-stale provider and risk a false `Absent` on a real local
+            // export. A bare directory probe (no NAMESPACE parse) keeps this
+            // off the keystroke hot path's heavy work.
+            if self.find_package_directory(package).is_some() {
+                return NamespaceMemberStatus::Unknown;
+            }
+            return match info.exports_completeness {
+                MemberCompleteness::Complete => NamespaceMemberStatus::Absent,
+                MemberCompleteness::Partial => NamespaceMemberStatus::Partial,
+                MemberCompleteness::Unknown => NamespaceMemberStatus::Unknown,
+            };
+        }
+
+        NamespaceMemberStatus::Unknown
+    }
+
     /// Check if a symbol is exported by any of the given packages (synchronous, cached-only)
     ///
     /// This method checks if the symbol is exported by any of the loaded packages,
@@ -942,8 +1055,38 @@ impl PackageLibrary {
     /// Insert a package into the cache
     ///
     /// This is primarily used for testing and initialization.
-    pub async fn insert_package(&self, info: PackageInfo) {
+    pub async fn insert_package(&self, mut info: PackageInfo) {
         self.update_packages(|cache| {
+            // Monotonic member authority: never let a weaker entry shadow a
+            // `Complete` exports set. Upgrades (Unknown/Partial -> Complete) and
+            // equal-or-stronger replacements publish as-is; a weaker incoming
+            // entry keeps the existing `Complete` exports + completeness, and we
+            // fold in (never drop) the existing positive-only data so a
+            // re-insert can only add.
+            if info.exports_completeness != MemberCompleteness::Complete
+                && let Some(existing) = cache.get(&info.name)
+                && existing.exports_completeness == MemberCompleteness::Complete
+            {
+                info.exports = existing.exports.clone();
+                info.exports_completeness = existing.exports_completeness;
+                for d in &existing.lazy_data {
+                    if !info.lazy_data.contains(d) {
+                        info.lazy_data.push(d.clone());
+                    }
+                }
+                // Union per stem (not `or_insert_with`, which would keep only the
+                // incoming list for a shared stem and drop the existing object
+                // names — a silent narrowing that could make a real dataset
+                // member falsely Absent). "Can only add" must hold per stem too.
+                for (stem, names) in &existing.data_aliases {
+                    let merged = info.data_aliases.entry(stem.clone()).or_default();
+                    for n in names {
+                        if !merged.contains(n) {
+                            merged.push(n.clone());
+                        }
+                    }
+                }
+            }
             cache.insert(info.name.clone(), Arc::new(info));
         });
     }
@@ -1092,6 +1235,8 @@ impl PackageLibrary {
                     parse_result.depends,
                 )
                 .await;
+                // INDEX fallback lists only documented topics, not every export.
+                info.exports_completeness = MemberCompleteness::Partial;
                 // Preserve any pre-fetched dataset enumeration for this package.
                 apply_enumeration_from(datasets_map, pkg_name, &pkg_dir, &mut info);
                 self.insert_package(info).await;
@@ -1229,6 +1374,11 @@ impl PackageLibrary {
         // Each R spawn is 75-350ms, so we batch once up front.
         let mut datasets_map: HashMap<String, Vec<crate::r_subprocess::DataObject>> =
             HashMap::new();
+        // Whether the batched R dataset enumeration ran successfully this round.
+        // A `data/`-bearing static package is only absence-authoritative when its
+        // datasets were enumerated (a binary `data/Rdata.rdb` exposes no object
+        // names to the static parse); otherwise it stays `Partial`.
+        let mut datasets_batch_ok = false;
         if let Some(ref r_subprocess) = self.r_subprocess {
             // Collect names of packages with a data/ dir from both categories.
             let mut data_pkgs: Vec<String> = Vec::new();
@@ -1253,6 +1403,7 @@ impl PackageLibrary {
                             map.len()
                         );
                         datasets_map = map;
+                        datasets_batch_ok = true;
                     }
                     Err(e) => {
                         log::trace!(
@@ -1269,6 +1420,16 @@ impl PackageLibrary {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
             let mut info =
                 package_info_from_dir(name.clone(), &pkg_dir, exports, parse_result.depends).await;
+            // `static_packages` holds only non-`exportPattern` packages, so the
+            // statically-parsed EXPORT set is exhaustive. But if the package
+            // ships a `data/` dir whose datasets were not enumerated via R, its
+            // dataset names are unknown to the static parse, so it must not be
+            // absence-authoritative — stay `Partial` (datasets are positive-only).
+            info.exports_completeness = if pkg_dir.join("data").is_dir() && !datasets_batch_ok {
+                MemberCompleteness::Partial
+            } else {
+                MemberCompleteness::Complete
+            };
 
             // Apply dataset enumeration if available for this package.
             apply_enumeration_from(&mut datasets_map, &name, &pkg_dir, &mut info);
@@ -1314,6 +1475,9 @@ impl PackageLibrary {
                                         depends,
                                     )
                                     .await;
+                                    // Exports came from R's getNamespaceExports —
+                                    // an exhaustive enumeration.
+                                    i.exports_completeness = MemberCompleteness::Complete;
                                     // Apply dataset enumeration if available.
                                     apply_enumeration_from(
                                         &mut datasets_map,
@@ -1338,12 +1502,20 @@ impl PackageLibrary {
                                         None
                                     };
                                     from_provider.unwrap_or_else(|| {
-                                        PackageInfo::with_details(
+                                        let mut i = PackageInfo::with_details(
                                             pkg_name.clone(),
                                             exports_set,
                                             Vec::new(),
                                             Vec::new(),
-                                        )
+                                        );
+                                        // A non-empty R `getNamespaceExports()`
+                                        // result is authoritative → Complete; an
+                                        // empty one is a swallowed error and stays
+                                        // Unknown (never absence-authoritative).
+                                        if !i.exports.is_empty() {
+                                            i.exports_completeness = MemberCompleteness::Complete;
+                                        }
+                                        i
                                     })
                                 }
                             };
@@ -1766,6 +1938,14 @@ impl PackageLibrary {
             }
         }
 
+        // Packages whose NAMESPACE uses `exportPattern` — their disk-derived
+        // export set is the INDEX approximation (Partial) UNLESS R's
+        // `getNamespaceExports()` enumerates them authoritatively in Step 4.
+        let pattern_set: HashSet<String> = pattern_packages.iter().cloned().collect();
+        // Pattern packages for which R returned a non-empty authoritative export
+        // set this run. Used in Step 5 to stamp `Complete` vs `Partial`.
+        let mut r_resolved: HashSet<String> = HashSet::new();
+
         // Step 4: If R subprocess is available and we have pattern packages,
         // try to get accurate exports for them
         if !pattern_packages.is_empty()
@@ -1781,6 +1961,12 @@ impl PackageLibrary {
             {
                 Ok(exports_map) => {
                     for (pkg_name, exports) in exports_map {
+                        // A non-empty R enumeration is authoritative; an empty
+                        // one (e.g. a swallowed asNamespace error) is not, so it
+                        // leaves the package on the Partial INDEX fallback.
+                        if !exports.is_empty() {
+                            r_resolved.insert(pkg_name.clone());
+                        }
                         let is_attached_base = attached_base_packages.contains(&pkg_name);
                         let pkg_exports = per_package_exports.entry(pkg_name).or_default();
                         for export in exports {
@@ -1820,12 +2006,25 @@ impl PackageLibrary {
                         all_base_exports.insert(s.to_string());
                     }
                 }
-                let info = PackageInfo::with_details(
+                // A base-priority package that WAS found on disk owns its cache
+                // entry — Step 5 inserts it with the correct (possibly `Partial`,
+                // when an `exportPattern` package fell back to INDEX without R)
+                // completeness. The embedded floor must not pre-seed a `Complete`
+                // entry that the monotonic `insert_package` guard would then keep,
+                // which would make INDEX-only exports falsely absence-authoritative.
+                // Disk data wins; the embedded floor only covers absent packages.
+                if per_package_exports.contains_key(p.name) {
+                    continue;
+                }
+                let mut info = PackageInfo::with_details(
                     p.name.to_string(),
                     p.exports.iter().map(|s| s.to_string()).collect(),
                     p.depends.iter().map(|s| s.to_string()).collect(),
                     p.datasets.iter().map(|s| s.to_string()).collect(),
                 );
+                // The embedded base table ships the full export list for each
+                // base-priority package.
+                info.exports_completeness = MemberCompleteness::Complete;
                 self.insert_package(info).await;
             }
         }
@@ -1839,7 +2038,21 @@ impl PackageLibrary {
             // `lazy_data` is intentionally empty here: these are base packages,
             // whose datasets are merged into `base_exports` above (issue #276) —
             // so this deliberately does NOT route through `package_info_from_dir`.
-            let info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
+            // A base package whose NAMESPACE uses `exportPattern` is only
+            // `Complete` when R enumerated it this run; otherwise its export set
+            // is the INDEX approximation, so it stays `Partial` and can never
+            // drive a false `namespace-member-not-found`. Non-pattern base
+            // packages parse exhaustively from NAMESPACE → `Complete`. (Member
+            // presence is additionally guarded by the positive-only
+            // `base_exports` check in `namespace_member_status_sync`.)
+            let completeness = if pattern_set.contains(&pkg_name) && !r_resolved.contains(&pkg_name)
+            {
+                MemberCompleteness::Partial
+            } else {
+                MemberCompleteness::Complete
+            };
+            let mut info = PackageInfo::with_details(pkg_name, exports, depends, Vec::new());
+            info.exports_completeness = completeness;
             self.insert_package(info).await;
         }
 
@@ -1954,58 +2167,77 @@ impl PackageLibrary {
             }
         };
 
-        // Step 4: Determine export loading strategy based on pattern presence
-        let exports: HashSet<String> = if parse_result.has_export_pattern {
-            // Tier 2: Package uses exportPattern - try R subprocess for accuracy
-            log::trace!(
-                "Package '{}' uses exportPattern, trying R subprocess for accuracy",
-                name
-            );
-
-            if let Some(ref r_subprocess) = self.r_subprocess {
-                match r_subprocess.get_package_exports(name).await {
-                    Ok(r_exports) => {
-                        log::trace!(
-                            "Got {} exports for package '{}' from R subprocess",
-                            r_exports.len(),
-                            name
-                        );
-                        r_exports.into_iter().collect()
-                    }
-                    Err(e) => {
-                        // Tier 3: R failed, fall back to INDEX + explicit exports
-                        log::trace!(
-                            "R subprocess failed for package '{}': {}, using INDEX fallback",
-                            name,
-                            e
-                        );
-                        self.load_with_index_fallback(&pkg_dir, &parse_result).await
-                    }
-                }
-            } else {
-                // No R subprocess, use INDEX fallback
+        // Step 4: Determine export loading strategy based on pattern presence.
+        // `completeness` tracks whether the resolved export set is exhaustive:
+        // a static parse without `exportPattern` and a successful R enumeration
+        // are both `Complete`; an INDEX fallback (R failed/absent) is `Partial`
+        // because it lists only documented topics. See `exports_completeness`.
+        let (exports, completeness): (HashSet<String>, MemberCompleteness) =
+            if parse_result.has_export_pattern {
+                // Tier 2: Package uses exportPattern - try R subprocess for accuracy
                 log::trace!(
-                    "No R subprocess available for package '{}', using INDEX fallback",
+                    "Package '{}' uses exportPattern, trying R subprocess for accuracy",
                     name
                 );
-                self.load_with_index_fallback(&pkg_dir, &parse_result).await
-            }
-        } else {
-            // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
-            log::trace!(
-                "Package '{}' uses explicit exports only, loaded {} exports statically",
-                name,
-                parse_result.explicit_exports.len()
-            );
-            parse_result.explicit_exports.into_iter().collect()
-        };
+
+                if let Some(ref r_subprocess) = self.r_subprocess {
+                    match r_subprocess.get_package_exports(name).await {
+                        Ok(r_exports) => {
+                            log::trace!(
+                                "Got {} exports for package '{}' from R subprocess",
+                                r_exports.len(),
+                                name
+                            );
+                            (
+                                r_exports.into_iter().collect(),
+                                MemberCompleteness::Complete,
+                            )
+                        }
+                        Err(e) => {
+                            // Tier 3: R failed, fall back to INDEX + explicit exports
+                            log::trace!(
+                                "R subprocess failed for package '{}': {}, using INDEX fallback",
+                                name,
+                                e
+                            );
+                            (
+                                self.load_with_index_fallback(&pkg_dir, &parse_result).await,
+                                MemberCompleteness::Partial,
+                            )
+                        }
+                    }
+                } else {
+                    // No R subprocess, use INDEX fallback
+                    log::trace!(
+                        "No R subprocess available for package '{}', using INDEX fallback",
+                        name
+                    );
+                    (
+                        self.load_with_index_fallback(&pkg_dir, &parse_result).await,
+                        MemberCompleteness::Partial,
+                    )
+                }
+            } else {
+                // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
+                log::trace!(
+                    "Package '{}' uses explicit exports only, loaded {} exports statically",
+                    name,
+                    parse_result.explicit_exports.len()
+                );
+                (
+                    parse_result.explicit_exports.into_iter().collect(),
+                    MemberCompleteness::Complete,
+                )
+            };
 
         // Step 5: Create PackageInfo (incl. datasets from `data/`) and cache it.
         let mut info =
             package_info_from_dir(name.to_string(), &pkg_dir, exports, parse_result.depends).await;
+        info.exports_completeness = completeness;
 
         // Issue #429: enumerate lazy-data objects via R when the package ships data/.
         let data_dir = pkg_dir.join("data");
+        let mut datasets_enumerated = false;
         if data_dir.is_dir()
             && let Some(ref r_subprocess) = self.r_subprocess
         {
@@ -2013,6 +2245,7 @@ impl PackageLibrary {
             match r_subprocess.get_multiple_package_datasets(&pkgs).await {
                 Ok(mut map) => {
                     apply_enumeration_from(&mut map, name, &pkg_dir, &mut info);
+                    datasets_enumerated = true;
                 }
                 Err(e) => {
                     log::trace!(
@@ -2022,6 +2255,19 @@ impl PackageLibrary {
                     );
                 }
             }
+        }
+        // A package that ships a `data/` directory whose datasets were NOT
+        // enumerated via R cannot be absence-authoritative: a binary
+        // `data/Rdata.rdb` without a `datalist` exposes no object names to the
+        // static parse, so a real `pkg::dataset` would otherwise be wrongly
+        // `Absent` (datasets are positive-only). Downgrade an otherwise-`Complete`
+        // export set to `Partial` in that case. Datasets enumerated via R, or no
+        // `data/` dir at all, keep `Complete`.
+        if info.exports_completeness == MemberCompleteness::Complete
+            && data_dir.is_dir()
+            && !datasets_enumerated
+        {
+            info.exports_completeness = MemberCompleteness::Partial;
         }
 
         log::trace!(
@@ -4749,6 +4995,223 @@ mod tests {
         assert!(info.data_aliases.is_empty());
     }
 
+    #[test]
+    fn package_info_defaults_exports_completeness_unknown() {
+        let info = PackageInfo::new("p".to_string(), HashSet::new());
+        assert_eq!(info.exports_completeness, MemberCompleteness::Unknown);
+    }
+
+    #[tokio::test]
+    async fn static_namespace_exports_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 1.0\n").unwrap();
+        // No exportPattern() → static parse is exhaustive → Complete.
+        std::fs::write(pkg.join("NAMESPACE"), "export(foo)\nexport(bar)\n").unwrap();
+        let lib = build_package_library_tier1_only(None, &[dir.path().to_path_buf()], None).await;
+        let info = lib.library.get_package("mypkg").await.expect("loads");
+        assert_eq!(info.exports_completeness, MemberCompleteness::Complete);
+    }
+
+    #[tokio::test]
+    async fn member_status_present_absent_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 1.0\n").unwrap();
+        std::fs::write(pkg.join("NAMESPACE"), "export(foo)\n").unwrap();
+        let lib = build_package_library_tier1_only(None, &[dir.path().to_path_buf()], None)
+            .await
+            .library;
+        lib.get_package("mypkg").await; // warm
+
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "foo"),
+            NamespaceMemberStatus::Present
+        );
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "nope"),
+            NamespaceMemberStatus::Absent
+        );
+        // Never-loaded package with no on-disk dir and no provider: Unknown,
+        // never Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("ghostpkg", "x"),
+            NamespaceMemberStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_exports_not_downgraded_by_partial() {
+        let lib = PackageLibrary::new_empty();
+        // Seed a Complete entry: exports {foo}, so `bar` is authoritatively Absent.
+        let mut complete = PackageInfo::with_details(
+            "pkg".to_string(),
+            HashSet::from(["foo".to_string()]),
+            vec![],
+            vec![],
+        );
+        complete.exports_completeness = MemberCompleteness::Complete;
+        lib.insert_package(complete).await;
+        assert_eq!(
+            lib.namespace_member_status_sync("pkg", "bar"),
+            NamespaceMemberStatus::Absent
+        );
+
+        // A weaker (Partial) re-insert with a different export set must not
+        // downgrade the cached Complete authority.
+        let mut partial = PackageInfo::with_details(
+            "pkg".to_string(),
+            HashSet::from(["baz".to_string()]),
+            vec![],
+            vec![],
+        );
+        partial.exports_completeness = MemberCompleteness::Partial;
+        lib.insert_package(partial).await;
+
+        let cached = lib.packages.load();
+        let info = cached.get("pkg").expect("cached");
+        assert_eq!(info.exports_completeness, MemberCompleteness::Complete);
+        assert!(info.exports.contains("foo"));
+        assert_eq!(
+            lib.namespace_member_status_sync("pkg", "bar"),
+            NamespaceMemberStatus::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn member_status_defers_to_local_install_over_stale_provider() {
+        use crate::package_db::PackageMetadataProvider;
+        // A provider snapshot that is STALE: it knows `mypkg` but only an old
+        // export, missing `new_fn`.
+        struct StaleProvider;
+        impl PackageMetadataProvider for StaleProvider {
+            fn lookup(&self, name: &str) -> Option<PackageInfo> {
+                (name == "mypkg").then(|| {
+                    let mut info = PackageInfo::with_details(
+                        "mypkg".to_string(),
+                        HashSet::from(["old_fn".to_string()]),
+                        vec![],
+                        vec![],
+                    );
+                    info.exports_completeness = MemberCompleteness::Complete;
+                    info
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: mypkg\nVersion: 2.0\n").unwrap();
+        // The LOCAL install is newer: it exports `new_fn`.
+        std::fs::write(pkg.join("NAMESPACE"), "export(new_fn)\n").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![dir.path().to_path_buf()]);
+        lib.set_providers(vec![Box::new(StaleProvider)]);
+
+        // Cache miss + stale provider lacking `new_fn`, but mypkg is installed
+        // locally — must DEFER (Unknown), never a false Absent on a real local
+        // export. (The provider's `old_fn` is also not asserted Absent for the
+        // same reason.)
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "new_fn"),
+            NamespaceMemberStatus::Unknown
+        );
+
+        // A package the provider knows but that is NOT installed locally: the
+        // provider IS authoritative, so a genuine typo is Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("ghostpkg", "anything"),
+            NamespaceMemberStatus::Unknown // provider doesn't know ghostpkg either
+        );
+
+        // After warming from the local install, the authoritative export set
+        // resolves `new_fn` as Present.
+        lib.get_package("mypkg").await;
+        assert_eq!(
+            lib.namespace_member_status_sync("mypkg", "new_fn"),
+            NamespaceMemberStatus::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn data_package_without_r_enumeration_is_partial() {
+        // Regression: a non-exportPattern package that ships a `data/` directory
+        // whose datasets cannot be enumerated without R (a binary Rdata.rdb
+        // exposes no object names to the static parse) must NOT be Complete —
+        // otherwise a real `pkg::dataset` would be falsely Absent. new_empty()
+        // has no R subprocess, so enumeration deterministically cannot run.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("datapkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("DESCRIPTION"), "Package: datapkg\nVersion: 1.0\n").unwrap();
+        std::fs::write(pkg.join("NAMESPACE"), "export(some_fn)\n").unwrap();
+        std::fs::create_dir_all(pkg.join("data")).unwrap();
+        // Binary lazy-load DB: opaque to the static dataset parse.
+        std::fs::write(pkg.join("data").join("Rdata.rdb"), b"\x00binary").unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![dir.path().to_path_buf()]);
+        let info = lib.get_package("datapkg").await.expect("loads");
+        assert_eq!(
+            info.exports_completeness,
+            MemberCompleteness::Partial,
+            "data/-bearing package without R dataset enumeration must be Partial"
+        );
+        // A dataset member is therefore Partial (silent), never a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("datapkg", "some_dataset"),
+            NamespaceMemberStatus::Partial
+        );
+        // The exported function is still confirmed Present.
+        assert_eq!(
+            lib.namespace_member_status_sync("datapkg", "some_fn"),
+            NamespaceMemberStatus::Present
+        );
+    }
+
+    #[tokio::test]
+    async fn member_status_resolves_data_alias_objects() {
+        // Regression: a non-LazyData data package (e.g. survey) keeps file STEMS
+        // in lazy_data but the real dataset object NAMES in data_aliases values.
+        // The member authority must treat those as Present, not Absent, even when
+        // the package is Complete.
+        let lib = PackageLibrary::new_empty();
+        let mut info = PackageInfo::with_details(
+            "survey".to_string(),
+            HashSet::from(["svymean".to_string()]),
+            vec![],
+            // lazy_data carries only the file stem for a non-LazyData package.
+            vec!["api".to_string()],
+        );
+        info.data_aliases.insert(
+            "api".to_string(),
+            vec!["apiclus1".to_string(), "apistrat".to_string()],
+        );
+        info.exports_completeness = MemberCompleteness::Complete;
+        lib.insert_package(info).await;
+
+        // Exported function: Present.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "svymean"),
+            NamespaceMemberStatus::Present
+        );
+        // Real dataset object bound by a data file (data_aliases value): Present,
+        // NOT a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "apiclus1"),
+            NamespaceMemberStatus::Present
+        );
+        // A genuine typo against a Complete package: Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("survey", "apiclusX"),
+            NamespaceMemberStatus::Absent
+        );
+    }
+
     #[tokio::test]
     async fn test_apply_enumerated_data_lazydata_package() {
         // Rdata.rdb present → lazy_data replaced by enumerated names; aliases mapped.
@@ -6292,6 +6755,114 @@ mod tests {
         assert!(
             grid.exports.contains("gpar"),
             "library(grid) resolves gpar with no R and no names.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_pattern_package_without_r_stays_partial() {
+        // Regression (issue #503 review blocker): a base-priority package whose
+        // NAMESPACE uses exportPattern, initialized with NO R subprocess, must
+        // NOT be stamped Complete — its exports came only from the INDEX
+        // approximation, so member absence is not authoritative.
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib_root = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        // A real base package on disk so the embedded fallback path is skipped.
+        let base_dir = lib_root.join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("DESCRIPTION"),
+            "Package: base\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base_dir.join("INDEX"),
+            "print                   Print Values\n",
+        )
+        .unwrap();
+
+        // grid: base-priority, exportPattern → needs R/INDEX. INDEX lists only
+        // `grid.ls`, so the cached export set is the partial approximation.
+        let grid_dir = lib_root.join("grid");
+        std::fs::create_dir_all(&grid_dir).unwrap();
+        std::fs::write(
+            grid_dir.join("DESCRIPTION"),
+            "Package: grid\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(grid_dir.join("NAMESPACE"), "exportPattern(\"^grid\")\n").unwrap();
+        std::fs::write(
+            grid_dir.join("INDEX"),
+            "grid.ls                 List Grobs\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root]);
+        // No r_subprocess: pattern packages can only use the INDEX fallback.
+        lib.initialize().await.unwrap();
+
+        let grid = lib.get_package("grid").await.expect("grid cached");
+        assert_eq!(
+            grid.exports_completeness,
+            MemberCompleteness::Partial,
+            "exportPattern base package without R must be Partial, not Complete"
+        );
+        // Therefore an unknown member is Partial (silent), never a false Absent.
+        assert_eq!(
+            lib.namespace_member_status_sync("grid", "definitely_not_exported"),
+            NamespaceMemberStatus::Partial
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_fallback_does_not_override_disk_partial_base_package() {
+        // Regression (issue #503 re-review blocker): a lib path with a
+        // non-attached base-priority `exportPattern` package (grid) but NO
+        // attached base package leaves `all_base_exports` empty, so the embedded
+        // fallback fires. It must NOT pre-seed a Complete grid entry that the
+        // monotonic insert guard would keep over the disk-derived Partial.
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lib_root = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        // Only grid on disk — no attached base package contributes exports, so
+        // the embedded fallback path runs.
+        let grid_dir = lib_root.join("grid");
+        std::fs::create_dir_all(&grid_dir).unwrap();
+        std::fs::write(
+            grid_dir.join("DESCRIPTION"),
+            "Package: grid\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+        std::fs::write(grid_dir.join("NAMESPACE"), "exportPattern(\"^grid\")\n").unwrap();
+        std::fs::write(
+            grid_dir.join("INDEX"),
+            "grid.ls                 List Grobs\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_lib_paths(vec![lib_root]);
+        lib.initialize().await.unwrap();
+
+        let grid = lib.get_package("grid").await.expect("grid cached");
+        assert_eq!(
+            grid.exports_completeness,
+            MemberCompleteness::Partial,
+            "on-disk exportPattern grid (no R) must stay Partial even when the \
+             embedded fallback runs"
+        );
+        assert_eq!(
+            lib.namespace_member_status_sync("grid", "definitely_not_exported"),
+            NamespaceMemberStatus::Partial
         );
     }
 

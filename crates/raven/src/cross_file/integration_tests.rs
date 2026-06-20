@@ -399,6 +399,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_metadata_populates_namespace_references() {
+        let code = "dplyr::mutate(x)\n";
+        let tree = parse_r_tree(code);
+        let meta = crate::cross_file::extract_metadata_with_tree(code, Some(&tree));
+        assert_eq!(meta.namespace_references.len(), 1);
+        assert_eq!(meta.namespace_references[0].package, "dplyr");
+    }
+
+    #[test]
     fn test_workspace_creation() {
         let workspace = TestWorkspace::new().unwrap();
         assert!(workspace.root().exists());

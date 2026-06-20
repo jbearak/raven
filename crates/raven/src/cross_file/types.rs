@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Url;
 
-use super::source_detect::LibraryCall;
+use super::source_detect::{LibraryCall, NamespaceReference};
 
 /// What a `# raven: ignore` directive (the `@lsp-` forms named throughout this
 /// file are permanent aliases that parse identically) on a given line targets.
@@ -248,6 +248,9 @@ pub struct CrossFileMetadata {
     /// the child's forward resolution.
     #[serde(default)]
     pub standalone: bool,
+    /// Detected `pkg::member` namespace references (issue #503).
+    #[serde(default)]
+    pub namespace_references: Vec<NamespaceReference>,
 }
 
 impl CrossFileMetadata {

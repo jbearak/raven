@@ -1539,6 +1539,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("R")).unwrap();
         fs::copy(&fixture_rda, tmp.path().join("R/sysdata.rda")).unwrap();
+        // A real fetched package always ships a DESCRIPTION; `Auto` package mode
+        // activates only on a DESCRIPTION `Package:` field (see
+        // `effective_workspace`), so without this the directory is not a package
+        // workspace and the sysdata contribution never reaches scope.
+        fs::write(tmp.path().join("DESCRIPTION"), "Package: sysdatapkg\n").unwrap();
         fs::write(tmp.path().join("NAMESPACE"), "export(get_internal)\n").unwrap();
         fs::write(
             tmp.path().join("R/main.R"),

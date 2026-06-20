@@ -111,6 +111,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
     { vsCodeKey: 'packages.rPath', jsonPath: ['packages', 'rPath'], type: 'string' },
     { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'packages.namespaceMemberSeverity', jsonPath: ['packages', 'namespaceMemberSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'packages.watchLibraryPaths', jsonPath: ['packages', 'watchLibraryPaths'], type: 'boolean' },
     { vsCodeKey: 'packages.watchDebounceMs', jsonPath: ['packages', 'watchDebounceMs'], type: 'number' },
     { vsCodeKey: 'packages.packageMode', jsonPath: ['packages', 'packageMode'], type: 'enum', enumValues: ['auto', 'enabled', 'disabled'] as const },
@@ -495,6 +496,7 @@ suite('Settings Transmission Unit Tests', () => {
                 ['crossFile.missingFileSeverity', severity],
                 ['crossFile.circularDependencySeverity', severity],
                 ['packages.missingPackageSeverity', severity],
+                ['packages.namespaceMemberSeverity', severity],
                 ['diagnostics.undefinedVariableSeverity', severity],
             ]);
 
@@ -504,6 +506,7 @@ suite('Settings Transmission Unit Tests', () => {
             assert.strictEqual(options.crossFile?.missingFileSeverity, severity);
             assert.strictEqual(options.crossFile?.circularDependencySeverity, severity);
             assert.strictEqual(options.packages?.missingPackageSeverity, severity);
+            assert.strictEqual(options.packages?.namespaceMemberSeverity, severity);
             assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, severity);
         }
     });

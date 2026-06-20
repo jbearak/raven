@@ -1280,6 +1280,25 @@
           "default": "warning",
           "description": "Severity level for diagnostics when a package referenced in library() cannot be found. Controls how missing package references are reported in the editor."
         },
+        "raven.packages.namespaceMemberSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Report unknown namespace members as errors",
+            "Report unknown namespace members as warnings",
+            "Report unknown namespace members as information",
+            "Report unknown namespace members as hints",
+            "Disable namespace member diagnostics"
+          ],
+          "default": "warning",
+          "description": "Severity for diagnostics when `pkg::member` references a member that a complete package export set does not contain. Data objects are positive-only; member absence is reported only from complete metadata."
+        },
         "raven.packages.watchLibraryPaths": {
           "type": "boolean",
           "default": true,
