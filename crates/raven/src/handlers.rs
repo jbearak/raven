@@ -5132,6 +5132,42 @@ fn collect_missing_package_diagnostics_from_snapshot(
             ..Default::default()
         });
     }
+
+    for ns_ref in &snapshot.directive_meta.namespace_references {
+        // Both `::` and `:::` qualify for the missing-package diagnostic.
+        if snapshot.package_library.package_exists(&ns_ref.package) {
+            continue;
+        }
+        let line = ns_ref.package_range.start_line;
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            line,
+            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    line,
+                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+                ));
+            }
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, ns_ref.package_range.start_column),
+                end: Position::new(
+                    ns_ref.package_range.end_line,
+                    ns_ref.package_range.end_column,
+                ),
+            },
+            severity: Some(severity),
+            message: format!("Package '{}' is not installed", ns_ref.package),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
 }
 
 /// F2 Step 3: emit `unused-suppression` (HINT) diagnostics for suppression
@@ -51911,6 +51947,35 @@ result <- helper_with_spaces(42)"#;
     }
 
     #[test]
+    fn namespace_ref_reports_missing_package() {
+        // A `pkg::member` reference to a non-installed package reports
+        // `package-not-installed`, anchored to the package (LHS) token.
+        let code = "missingpkg::foo\n";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        // Non-empty lib_paths makes package_exists() reliable (no suppression),
+        // and the bogus path contains no packages, so `missingpkg` is missing.
+        pkg_lib.set_lib_paths(vec![std::path::PathBuf::from("/nonexistent")]);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diags = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diags, None);
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert!(diags[0].message.contains("missingpkg"));
+        // Anchored to the package token (columns 0..10), not the whole expr.
+        assert_eq!(diags[0].range.start.character, 0);
+        assert_eq!(diags[0].range.end.character, 10);
+    }
+
+    #[test]
     fn test_missing_package_diagnostic_ignored_line() {
         // Test that diagnostics are not emitted for ignored lines
         // Validates: Requirement 15.1 with @lsp-ignore support
@@ -56707,6 +56772,17 @@ source(\"helpers.R\")
         check_predicate("dplyr::filter(df)\n", "filter", 0, true);
         check_predicate("dplyr:::filter(df)\n", "dplyr", 0, true);
         check_predicate("dplyr:::filter(df)\n", "filter", 0, true);
+    }
+
+    #[test]
+    fn namespace_operator_sides_remain_structural_after_metadata() {
+        // Regression lock (issue #503): recording `pkg::member` as cross-file
+        // namespace metadata must not turn either side into a bare-variable
+        // reference. Guards undefined-variable / out-of-scope handling.
+        check_predicate("dplyr::filter(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr::filter(df)\n", "filter", 0, true);
+        check_predicate("dplyr:::peek(df)\n", "dplyr", 0, true);
+        check_predicate("dplyr:::peek(df)\n", "peek", 0, true);
     }
 
     #[test]
