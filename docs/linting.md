@@ -247,6 +247,19 @@ Numeric-argument linters accept both the named and the first-positional form: `l
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
 
+### Exclusions
+
+A `.lintr` `exclusions:` field that lists files and directories — e.g. `exclusions: list("R/legacy.R", "tests", "NAMESPACE")` — maps to a single `[[linting.overrides]]` entry with `enabled = false`, anchored at the project root. Each entry becomes one or more globs matched against the project-relative path:
+
+| `exclusions:` entry | Globs emitted | Matches |
+|---|---|---|
+| `"R/"` (trailing slash → directory) | `R/**` | every file under `R/` |
+| any other entry (`"R/foo.R"`, `"NAMESPACE"`, `"pkg.Rcheck"`, …) | `<entry>` **and** `<entry>/**` | the path itself if it's a file, or its contents if it's a directory |
+
+Raven resolves exclusions without touching the filesystem, so it can't tell whether a bare entry like `NAMESPACE` (a file) or `pkg.Rcheck` (a directory) is which — and a dot is no help (`foo.R` is a file, `pkg.Rcheck` is a directory). It therefore emits both an exact glob and a recursive glob for every entry that doesn't already end in `/`. The extra glob only ever disables linting on a path that doesn't exist, so it is harmless. Add a trailing slash to force directory-only matching.
+
+Not supported: the named line-range form `list("file.R" = 1:10)` (exclude specific lines of a file) has no Raven equivalent and is ignored with the batch warning. A `=` *inside* a quoted name (e.g. `"a=b.R"`) is treated as an ordinary filename, not this form.
+
 > **Note:** `mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints — they are always-on semantic warnings configured under `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Diagnostics § Semantic Warnings](diagnostics.md#semantic-warnings).
 
 If you'd like a starter project-scoped `raven.linting.*` block scaffolded into `.vscode/settings.json` — every linting key Raven maps to `raven.toml`, each prefaced with a `//` comment naming its `lintr` equivalent — run the **Raven: Create linting settings** command from the Command Palette ([Configuration § Scaffold Commands](configuration.md#scaffold-commands)). It merges into an existing `settings.json` without disturbing unrelated keys or comments, preserves client-only linting settings such as `raven.linting.readHomeLintr`, and prompts before overwriting any pre-existing project-scoped `raven.linting.*` values.

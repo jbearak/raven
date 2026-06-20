@@ -385,19 +385,40 @@ fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constru
     let inner = strip_named_call(body, "list").unwrap_or(body);
     let mut globs = Vec::new();
     for part in split_top_level_commas(inner) {
-        let p = part.trim().trim_matches(|c| c == '"' || c == '\'');
-        if p.is_empty() {
-            continue;
-        }
-        if p.contains('=') {
+        let part = part.trim();
+        // A top-level `=` *outside* the quotes marks lintr's named/line-range
+        // form (`"file" = 1:10`), which Raven has no equivalent for. A `=`
+        // *inside* the quotes is just a filename character (e.g. `"a=b.R"`),
+        // so test the raw token (via the shared `ScanState`) before stripping
+        // quotes — otherwise a legitimate odd filename is silently dropped.
+        if has_unquoted_eq(part) {
             *unrecognized_constructs += 1;
             continue;
         }
-        // Directories become recursive globs; files stay as-is.
-        if p.ends_with('/') || !p.contains('.') {
-            globs.push(json!(format!("{}/**", p.trim_end_matches('/'))));
+        let p = part.trim_matches(|c| c == '"' || c == '\'');
+        if p.is_empty() {
+            continue;
+        }
+        // Exclusion paths map to globset globs matched against the
+        // project-relative file path (see `config_file::overrides`). globset's
+        // `<p>/**` matches files *under* `<p>/` but never `<p>` itself. We
+        // can't stat the path to learn whether it's a file or a directory, and
+        // a dot is not a reliable signal (`foo.R` is a file but `pkg.Rcheck`
+        // and `.github` are directories), so:
+        //   - trailing `/` → explicit directory → recursive glob only.
+        //   - otherwise    → ambiguous file-or-dir: emit BOTH the exact glob
+        //                    (matches it as a file) and the recursive glob
+        //                    (matches it as a directory's contents). An extra
+        //                    `enabled: false` glob only ever disables linting
+        //                    on a path that doesn't exist, so emitting both is
+        //                    always safe — and it covers extensionless files
+        //                    (`NAMESPACE`), dotted files (`foo.R`), and dotted
+        //                    directories (`pkg.Rcheck`) uniformly.
+        if let Some(dir) = p.strip_suffix('/') {
+            globs.push(json!(format!("{}/**", dir.trim_end_matches('/'))));
         } else {
             globs.push(json!(p));
+            globs.push(json!(format!("{}/**", p)));
         }
     }
     if !globs.is_empty() {
@@ -406,6 +427,20 @@ fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constru
             "enabled": false,
         }));
     }
+}
+
+/// True if `s` contains an `=` outside any string literal or `#` comment — i.e.
+/// a named argument / line-range form (`"file" = 1:10`) rather than a `=` that
+/// is part of a quoted filename (`"a=b.R"`). Uses the shared [`ScanState`] so it
+/// agrees with [`split_top_level_commas`] on what counts as "inside a string".
+fn has_unquoted_eq(s: &str) -> bool {
+    let mut st = ScanState::default();
+    for c in s.chars() {
+        if st.step(c) && c == '=' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shared lexical state for scanning a `.lintr` field value as R-ish text:
@@ -710,8 +745,11 @@ mod tests {
             .as_array()
             .expect("overrides array");
         let files = overrides[0]["files"].as_array().expect("files array");
-        assert_eq!(files[0], json!("R/café.R"));
-        assert_eq!(files[1], json!("naïve/**"));
+        // The non-ASCII path must survive verbatim into a glob. (A path with
+        // no trailing slash also emits a harmless `<p>/**`; the trailing-slash
+        // directory emits only the recursive form.)
+        assert!(files.iter().any(|v| v == &json!("R/café.R")), "{files:?}");
+        assert!(files.iter().any(|v| v == &json!("naïve/**")), "{files:?}");
     }
 
     #[test]
@@ -1002,6 +1040,124 @@ mod tests {
         let files = entry["files"].as_array().unwrap();
         assert!(files.iter().any(|v| v == &json!("R/legacy.R")));
         assert!(files.iter().any(|v| v == &json!("tests/**")));
+    }
+
+    /// Collect the glob strings of the single `enabled: false` exclusion
+    /// override emitted by `apply_exclusions`.
+    fn exclusion_globs(out: &LoadedLintr) -> Vec<String> {
+        out.settings["linting"]["overrides"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn exclusions_extensionless_file_excludes_the_file() {
+        // `NAMESPACE` (and `DESCRIPTION`, `Makefile`, `LICENSE`, …) is a real
+        // file with no extension. The exclusion must emit an exact glob so
+        // linting is disabled on the file itself — globset's `NAMESPACE/**`
+        // matches only files *under* a `NAMESPACE/` directory, never the file.
+        let out = load_str("exclusions: list(\"NAMESPACE\")\n");
+        let files = exclusion_globs(&out);
+        assert!(
+            files.contains(&"NAMESPACE".to_string()),
+            "expected an exact glob matching the file: {files:?}"
+        );
+        // The entry is ambiguous (could name a directory), so the recursive
+        // form is emitted too.
+        assert!(
+            files.contains(&"NAMESPACE/**".to_string()),
+            "expected a recursive glob for the ambiguous dir case: {files:?}"
+        );
+    }
+
+    #[test]
+    fn exclusions_directory_forms_still_recursive() {
+        // A trailing slash (`R/`) is an explicit directory; a bare name
+        // (`tests`) is ambiguous but commonly a directory — both must still
+        // disable linting on their contents.
+        let out = load_str("exclusions: list(\"R/\", \"tests\")\n");
+        let files = exclusion_globs(&out);
+        assert!(files.contains(&"R/**".to_string()), "{files:?}");
+        assert!(files.contains(&"tests/**".to_string()), "{files:?}");
+        // A trailing-slash directory is unambiguous — no bogus exact glob.
+        assert!(
+            !files.contains(&"R/".to_string()),
+            "trailing-slash directory must not emit an exact glob: {files:?}"
+        );
+    }
+
+    #[test]
+    fn exclusions_file_with_extension_still_excludes_the_file() {
+        // A path with an extension is still excluded as a file. We can't stat
+        // it, so per the uniform "emit both unless trailing slash" rule the
+        // recursive glob is emitted too (harmless: nothing lives under a file).
+        let out = load_str("exclusions: list(\"R/foo.R\")\n");
+        let files = exclusion_globs(&out);
+        assert!(files.contains(&"R/foo.R".to_string()), "{files:?}");
+        assert!(files.contains(&"R/foo.R/**".to_string()), "{files:?}");
+    }
+
+    #[test]
+    fn exclusions_dotted_directory_name_is_recursive() {
+        // A directory whose name contains a dot (`pkg.Rcheck` — the R CMD
+        // check output dir — `.github`, …) must still exclude its contents.
+        // A naive "contains '.' => file" heuristic would emit only the exact
+        // glob and silently lint everything inside.
+        let out = load_str("exclusions: list(\"pkg.Rcheck\", \".github\")\n");
+        let files = exclusion_globs(&out);
+        assert!(
+            files.contains(&"pkg.Rcheck/**".to_string()),
+            "dotted directory must emit a recursive glob: {files:?}"
+        );
+        assert!(
+            files.contains(&".github/**".to_string()),
+            "hidden directory must emit a recursive glob: {files:?}"
+        );
+    }
+
+    #[test]
+    fn exclusions_filename_with_equals_is_a_file_not_named_form() {
+        // A quoted filename containing `=` (rare) is a positional file entry,
+        // not lintr's unsupported `"file" = lines` named form — the `=` lives
+        // inside the quotes. It must be excluded as a file, not dropped.
+        let out = load_str("exclusions: list(\"a=b.R\")\n");
+        let files = exclusion_globs(&out);
+        assert!(files.contains(&"a=b.R".to_string()), "{files:?}");
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "a quoted filename with `=` must not be treated as unsupported: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn exclusions_named_line_range_form_is_unsupported() {
+        // lintr's `list("file.R" = 1:10)` (exclude specific lines) has no
+        // Raven equivalent. The top-level `=` *outside* the quotes marks it
+        // unsupported — it must not produce a glob, and it warns.
+        let out = load_str("exclusions: list(\"R/foo.R\" = 1:10)\n");
+        let has_override = out
+            .settings
+            .get("linting")
+            .and_then(|l| l.get("overrides"))
+            .is_some();
+        assert!(
+            !has_override,
+            "named line-range form must not produce a glob: {:?}",
+            out.settings
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "named line-range form should produce the batch warning: {:?}",
+            out.warnings
+        );
     }
 
     #[test]
