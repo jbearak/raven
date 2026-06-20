@@ -170,12 +170,14 @@ fn apply_linter_call(
 ) {
     match name {
         "line_length_linter" => {
-            if let Some(n) = parse_positional_int(args) {
+            if let Some(n) = parse_named_int(args, "length").or_else(|| parse_positional_int(args))
+            {
                 linting.insert("lineLength".into(), json!(n));
             }
         }
         "object_length_linter" => {
-            if let Some(n) = parse_positional_int(args) {
+            if let Some(n) = parse_named_int(args, "length").or_else(|| parse_positional_int(args))
+            {
                 linting.insert("objectLength".into(), json!(n));
             }
         }
@@ -198,13 +200,20 @@ fn apply_linter_call(
                 linting.insert("objectNameStyleArgument".into(), json!(first));
             }
         }
+        "quotes_linter" if args.trim().is_empty() => {
+            linting.insert("stringDelimiter".into(), json!("\""));
+        }
+        "single_quotes_linter" if args.trim().is_empty() => {
+            linting.insert("stringDelimiter".into(), json!("'"));
+        }
+        "quotes_linter" | "single_quotes_linter" => {
+            *unrecognized_constructs += 1;
+        }
         "trailing_whitespace_linter"
         | "whitespace_linter"
         | "trailing_blank_lines_linter"
         | "infix_spaces_linter"
         | "commented_code_linter"
-        | "quotes_linter"
-        | "single_quotes_linter"
         | "commas_linter"
         | "T_and_F_symbol_linter"
         | "semicolon_linter"
@@ -335,49 +344,42 @@ fn parse_positional_int(args: &str) -> Option<u64> {
 }
 
 fn parse_named_int(args: &str, name: &str) -> Option<u64> {
+    parse_named_arg(args, name)?.parse::<u64>().ok()
+}
+
+fn parse_named_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
     for part in split_top_level_commas(args) {
         // `if let Some(...)` rather than `?` so a positional argument
         // earlier in the list (e.g. `indentation_linter(2, indent = 4)`)
-        // doesn't short-circuit the whole search — mirrors the
-        // `parse_named_string` / `parse_named_string_vec` shape.
+        // doesn't short-circuit the whole search.
         if let Some((lhs, rhs)) = part.split_once('=')
             && lhs.trim() == name
         {
-            return rhs.trim().parse::<u64>().ok();
+            return Some(rhs.trim());
         }
     }
     None
 }
 
 fn parse_named_string(args: &str, name: &str) -> Option<String> {
-    for part in split_top_level_commas(args) {
-        if let Some((lhs, rhs)) = part.split_once('=')
-            && lhs.trim() == name
-        {
-            let v = rhs.trim().trim_matches(|c| c == '"' || c == '\'');
-            return Some(v.to_string());
-        }
-    }
-    None
+    Some(
+        parse_named_arg(args, name)?
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string(),
+    )
 }
 
 fn parse_named_string_vec(args: &str, name: &str) -> Option<Vec<String>> {
-    for part in split_top_level_commas(args) {
-        if let Some((lhs, rhs)) = part.split_once('=')
-            && lhs.trim() == name
-        {
-            let rhs = rhs.trim();
-            let inner = rhs.strip_prefix("c(").and_then(|r| r.strip_suffix(')'))?;
-            return Some(
-                split_top_level_commas(inner)
-                    .into_iter()
-                    .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-            );
-        }
-    }
-    None
+    let inner = parse_named_arg(args, name)?
+        .strip_prefix("c(")
+        .and_then(|r| r.strip_suffix(')'))?;
+    Some(
+        split_top_level_commas(inner)
+            .into_iter()
+            .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -388,6 +390,63 @@ mod tests {
     fn line_length_param_maps() {
         let out = load_str("linters: linters_with_defaults(line_length_linter(120))\n");
         assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+    }
+
+    #[test]
+    fn line_length_named_length_param_maps() {
+        let out = load_str("linters: linters_with_defaults(line_length_linter(length = 120))\n");
+        assert_eq!(out.settings["linting"]["lineLength"], json!(120));
+    }
+
+    #[test]
+    fn object_length_named_length_param_maps() {
+        let out = load_str("linters: linters_with_defaults(object_length_linter(length = 45))\n");
+        assert_eq!(out.settings["linting"]["objectLength"], json!(45));
+    }
+
+    #[test]
+    fn single_quotes_linter_maps_string_delimiter() {
+        let out = load_str("linters: linters_with_defaults(single_quotes_linter())\n");
+        assert_eq!(out.settings["linting"]["stringDelimiter"], json!("'"));
+    }
+
+    #[test]
+    fn quotes_linter_maps_string_delimiter() {
+        let out = load_str("linters: linters_with_defaults(quotes_linter())\n");
+        assert_eq!(out.settings["linting"]["stringDelimiter"], json!("\""));
+    }
+
+    #[test]
+    fn parameterized_quotes_linters_are_unsupported_not_misread() {
+        let out = load_str("linters: linters_with_defaults(quotes_linter(delimiter = \"'\"))\n");
+        assert!(
+            out.settings
+                .get("linting")
+                .and_then(|linting| linting.get("stringDelimiter"))
+                .is_none(),
+            "unsupported quotes_linter args must not be mapped to double quotes"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "unsupported quotes_linter args should produce the batch warning"
+        );
+
+        let out = load_str("linters: linters_with_defaults(single_quotes_linter(TRUE))\n");
+        assert!(
+            out.settings
+                .get("linting")
+                .and_then(|linting| linting.get("stringDelimiter"))
+                .is_none(),
+            "unsupported single_quotes_linter args must not be mapped to single quotes"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("unrecognized construct")),
+            "unsupported single_quotes_linter args should produce the batch warning"
+        );
     }
 
     #[test]

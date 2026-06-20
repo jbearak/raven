@@ -108,6 +108,7 @@ export interface RavenInitializationOptions {
          * `lintr-auto-enable.ts` and #337.
          */
         autoEnableFromDotLintr?: boolean;
+        readHomeLintr?: boolean;
         lineLength?: number;
         objectLength?: number;
         indentationUnit?: number | "auto";
@@ -397,6 +398,7 @@ export function getInitializationOptions(
     // previous state would persist until restart.
     options.linting = {
         enabled: config.get<boolean | 'auto' | 'on' | 'off'>('linting.enabled', 'auto'),
+        readHomeLintr: config.get<boolean>('linting.readHomeLintr', false),
         lineLength: config.get<number>('linting.lineLength', 80),
         objectLength: config.get<number>('linting.objectLength', 30),
         indentationUnit: (() => {

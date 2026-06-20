@@ -7,8 +7,13 @@ pub mod merge;
 pub mod overrides;
 pub mod toml_loader;
 
-pub use discovery::{DiscoveredConfig, find_config};
-pub use discovery_load::{DiscoveredLoad, discover_and_load};
+pub use discovery::{
+    ConfigFileKind, DiscoveredConfig, DiscoveryOptions, find_config, find_config_with_options,
+};
+pub use discovery_load::{
+    DiscoveredLoad, LoadedConfig, discover_and_load, discover_and_load_with_options,
+    load_explicit_config, load_explicit_config_from_base, resolve_explicit_config_path,
+};
 pub use lintr_loader::load as load_lintr;
 pub use merge::merge as merge_settings;
 pub use overrides::{
@@ -99,9 +104,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let lintr_discovered = state
         .project_config_path
         .as_deref()
-        .and_then(|p| p.file_name())
-        .map(|n| n == std::ffi::OsStr::new(".lintr"))
-        .unwrap_or(false);
+        .is_some_and(ConfigFileKind::is_lintr_path);
     // Gate ONLY the `.lintr` auto-enable path on the client environment signal
     // (#337). An explicit client `on`/`off` and `raven.toml enabled = true`
     // flow through `merged` independently and are unaffected, because they

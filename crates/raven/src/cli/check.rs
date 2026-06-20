@@ -123,7 +123,8 @@ Honors raven.toml / .lintr.
 
 Options:
   --workspace DIR             Workspace root to index (default: current directory)
-  --config PATH               Path to raven.toml (default: search upward from --workspace)
+  --config PATH               Path to raven.toml or .lintr (default: search upward from
+                              --workspace, skipping literal ~/.lintr unless passed here)
   --no-config                 Use built-in defaults; ignore raven.toml/.lintr
   --format text|json|sarif    Output format (default: text)
   --max-severity LEVEL        Highest severity that does NOT fail the build
@@ -249,14 +250,17 @@ pub async fn run(args: CheckArgs) -> i32 {
             return EXIT_OPERATOR_ERROR;
         }
     };
+    run_with_cwd(args, &cwd).await
+}
 
+async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Workspace root: --workspace (resolved against CWD if relative), else CWD.
     // Canonicalize so `Url::from_file_path` gets an absolute path and the
     // relative paths in output are stable.
     let abs_workspace = match args.workspace {
         Some(ref p) if p.is_absolute() => p.clone(),
         Some(ref p) => cwd.join(p),
-        None => cwd.clone(),
+        None => cwd.to_path_buf(),
     };
     let root = std::fs::canonicalize(&abs_workspace).unwrap_or(abs_workspace);
 
@@ -271,6 +275,7 @@ pub async fn run(args: CheckArgs) -> i32 {
         &workspace_url,
         args.no_config,
         args.config_path.as_deref(),
+        cwd,
     ) {
         Ok(s) => s,
         Err(code) => return code,
@@ -388,9 +393,10 @@ fn build_indexed_state(
     workspace_url: &Url,
     no_config: bool,
     config_path: Option<&Path>,
+    explicit_config_base: &Path,
 ) -> Result<crate::state::WorldState, i32> {
     let (project_settings, project_config_path) =
-        resolve_project_config(no_config, config_path, root)?;
+        resolve_project_config(no_config, config_path, root, explicit_config_base)?;
 
     let mut state = crate::state::WorldState::new();
     state.workspace_folders = vec![workspace_url.clone()];
@@ -442,13 +448,32 @@ fn build_indexed_state(
 }
 
 /// Discover and load the project config at or above `search_start` (the search
-/// itself is done by `find_config`). Returns `(settings, config_path)` to wire
-/// into the `WorldState`. Prints warnings to stderr; returns
-/// `Err(EXIT_OPERATOR_ERROR)` when a config that exists cannot be loaded.
+/// itself is done by `find_config`). Explicit relative `--config` paths resolve
+/// from `explicit_config_base`, i.e. the command invocation CWD, not the selected
+/// workspace root. Returns `(settings, config_path)` to wire into the
+/// `WorldState`. Prints warnings to stderr; returns `Err(EXIT_OPERATOR_ERROR)`
+/// when a config that exists cannot be loaded.
 fn resolve_project_config(
     no_config: bool,
     config_path: Option<&Path>,
     search_start: &Path,
+    explicit_config_base: &Path,
+) -> Result<(Option<serde_json::Value>, Option<PathBuf>), i32> {
+    resolve_project_config_with_options(
+        no_config,
+        config_path,
+        search_start,
+        explicit_config_base,
+        &crate::config_file::DiscoveryOptions::default(),
+    )
+}
+
+fn resolve_project_config_with_options(
+    no_config: bool,
+    config_path: Option<&Path>,
+    search_start: &Path,
+    explicit_config_base: &Path,
+    discovery_options: &crate::config_file::DiscoveryOptions,
 ) -> Result<(Option<serde_json::Value>, Option<PathBuf>), i32> {
     if no_config {
         return Ok((None, None));
@@ -462,8 +487,11 @@ fn resolve_project_config(
         Ok((Some(settings), Some(path)))
     };
     if let Some(explicit) = config_path {
-        return match crate::config_file::load_toml(explicit) {
-            Some(l) => loaded(l.warnings, l.settings, explicit.to_path_buf()),
+        return match crate::config_file::load_explicit_config_from_base(
+            explicit_config_base,
+            explicit,
+        ) {
+            Some((explicit_abs, l)) => loaded(l.warnings, l.settings, explicit_abs),
             None => {
                 eprintln!(
                     "raven check: failed to load --config {}",
@@ -476,7 +504,7 @@ fn resolve_project_config(
     // Discovery (raven.toml beats .lintr) and loading are shared with the LSP
     // server via `config_file::discover_and_load`, so the CLI and editor can't
     // drift on discovery precedence or which loader reads `.lintr`.
-    match crate::config_file::discover_and_load(search_start) {
+    match crate::config_file::discover_and_load_with_options(search_start, discovery_options) {
         crate::config_file::DiscoveredLoad::Loaded {
             path,
             settings,
@@ -1131,6 +1159,12 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(run(args))
     }
 
+    fn run_with_cwd_blocking(args: CheckArgs, cwd: &Path) -> i32 {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_with_cwd(args, cwd))
+    }
+
     fn base_args(workspace: &Path) -> CheckArgs {
         CheckArgs {
             paths: Vec::new(),
@@ -1353,6 +1387,162 @@ mod tests {
             "HELP"
         );
         assert!(parse_args(["--bogus"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    #[test]
+    fn resolve_project_config_honors_explicit_lintr() {
+        let tmp = TempDir::new().unwrap();
+        let lintr = tmp.path().join(".lintr");
+        fs::write(
+            &lintr,
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (settings, path) =
+            resolve_project_config(false, Some(&lintr), tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(path.as_deref(), Some(lintr.as_path()));
+        assert_eq!(
+            settings.unwrap()["linting"]["lineLength"],
+            serde_json::json!(120)
+        );
+    }
+
+    #[test]
+    fn resolve_project_config_relative_explicit_lintr_loads_from_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (settings, path) = resolve_project_config(
+            false,
+            Some(Path::new("config/.lintr")),
+            tmp.path(),
+            tmp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(path.as_deref(), Some(config_dir.join(".lintr").as_path()));
+        assert_eq!(
+            settings.unwrap()["linting"]["lineLength"],
+            serde_json::json!(120)
+        );
+    }
+
+    #[test]
+    fn resolve_project_config_relative_explicit_lintr_loads_from_invocation_cwd() {
+        let invocation = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config_dir = invocation.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+
+        let (settings, path) = resolve_project_config_with_options(
+            false,
+            Some(Path::new("config/.lintr")),
+            workspace.path(),
+            invocation.path(),
+            &crate::config_file::DiscoveryOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(path.as_deref(), Some(config_dir.join(".lintr").as_path()));
+        assert_eq!(
+            settings.unwrap()["linting"]["lineLength"],
+            serde_json::json!(120)
+        );
+    }
+
+    #[test]
+    fn resolve_project_config_ignores_literal_home_lintr_by_default() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            home.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(120))\n",
+        )
+        .unwrap();
+        let discovery_options =
+            crate::config_file::DiscoveryOptions::default().with_home_dir(home.path());
+
+        let (settings, path) = resolve_project_config_with_options(
+            false,
+            None,
+            &workspace,
+            &workspace,
+            &discovery_options,
+        )
+        .unwrap();
+
+        assert!(
+            settings.is_none(),
+            "CLI auto-discovery should ignore literal home .lintr by default"
+        );
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn end_to_end_explicit_lintr_finds_line_length_violation() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(20))\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("over.R"),
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.no_config = false;
+        args.config_path = Some(tmp.path().join(".lintr"));
+        args.paths = vec![tmp.path().join("over.R")];
+        args.max_severity = SeverityLevel::Off;
+
+        assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn end_to_end_relative_explicit_lintr_uses_invocation_cwd_not_workspace() {
+        let invocation = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let config_dir = invocation.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join(".lintr"),
+            "linters: linters_with_defaults(line_length_linter(20))\n",
+        )
+        .unwrap();
+        let target = workspace.path().join("over.R");
+        fs::write(
+            &target,
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.no_config = false;
+        args.config_path = Some(PathBuf::from("config/.lintr"));
+        args.paths = vec![target];
+        args.max_severity = SeverityLevel::Off;
+
+        assert_eq!(
+            run_with_cwd_blocking(args, invocation.path()),
+            EXIT_LINT_FAILED
+        );
     }
 
     #[test]
@@ -1791,7 +1981,8 @@ mod tests {
     ) -> (crate::state::WorldState, Vec<PathBuf>) {
         let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
         let workspace_url = Url::from_file_path(&root).unwrap();
-        let mut state = build_indexed_state(&root, &workspace_url, args.no_config, None).unwrap();
+        let mut state =
+            build_indexed_state(&root, &workspace_url, args.no_config, None, &root).unwrap();
         if !args.report_uninstalled {
             state.cross_file_config.packages_missing_package_severity = None;
         }
@@ -1942,7 +2133,7 @@ mod tests {
     fn warm_set_for(root: &Path) -> std::collections::HashSet<String> {
         let canon = std::fs::canonicalize(root).unwrap();
         let workspace_url = Url::from_file_path(&canon).unwrap();
-        let state = build_indexed_state(&canon, &workspace_url, true, None).unwrap();
+        let state = build_indexed_state(&canon, &workspace_url, true, None, &canon).unwrap();
         let mut operator_error = false;
         let targets = collect_report_targets(&[], &canon, &mut operator_error);
         reported_packages_to_warm(&state, &targets)
@@ -2522,8 +2713,8 @@ mod tests {
         .unwrap();
 
         let workspace_url = Url::from_file_path(root).unwrap();
-        let mut state =
-            build_indexed_state(root, &workspace_url, true, None).expect("build_indexed_state");
+        let mut state = build_indexed_state(root, &workspace_url, true, None, root)
+            .expect("build_indexed_state");
 
         // Precondition: build_indexed_state's `apply_package_event(Initial)`
         // populated the overlay, so the internal resolves under the sentinel.

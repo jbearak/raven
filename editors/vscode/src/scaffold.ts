@@ -11,7 +11,7 @@ import {
  * (`.gitignore`) and Raven configuration (`.vscode/settings.json`).
  * Single-file writes prompt before overwriting; the linting-settings
  * scaffold merges into an existing settings file and only prompts when
- * it would overwrite existing `raven.linting.*` keys.
+ * it would overwrite existing project-scoped `raven.linting.*` keys.
  */
 
 export const GITIGNORE_TEMPLATE = `# History files
@@ -73,6 +73,14 @@ scratch.R
 interface LintingGroup {
     comment: string;
     entries: Array<{ key: string; value: unknown }>;
+}
+
+const LINTING_SETTING_PREFIX = 'raven.linting.';
+
+const CLIENT_ONLY_LINTING_SETTINGS = new Set(['raven.linting.readHomeLintr']);
+
+export function isProjectScopedLintingSettingKey(key: string): boolean {
+    return key.startsWith(LINTING_SETTING_PREFIX) && !CLIENT_ONLY_LINTING_SETTINGS.has(key);
 }
 
 const LINTING_GROUPS: LintingGroup[] = [
@@ -237,14 +245,15 @@ export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
  *     all the same way and refuse to merge.
  *   - `nonObjectRoot`: parsed fine but root isn't a JSON object (e.g. an
  *     array, scalar, or `null`). Can't safely merge into it.
- *   - `unsupportedValue`: a top-level `raven.linting.*` key has a non-scalar
- *     value (object or array). All declared `raven.linting.*` settings are
- *     scalars; a non-scalar value would span multiple lines and the per-key
- *     remover (which targets the single key/value range jsonc-parser identifies)
- *     can't migrate the surrounding context cleanly.
+ *   - `unsupportedValue`: a top-level project-scoped `raven.linting.*` key has
+ *     a non-scalar value (object or array). All declared project-scoped
+ *     `raven.linting.*` settings are scalars; a non-scalar value would span
+ *     multiple lines and the per-key remover (which targets the single
+ *     key/value range jsonc-parser identifies) can't migrate the surrounding
+ *     context cleanly.
  *   - `object`: parsed as an object. `userManagedKeys` lists the top-level
- *     `raven.linting.*` keys whose values are scalars — these are the keys the
- *     scaffold prompts about before overwriting.
+ *     project-scoped `raven.linting.*` keys whose values are scalars — these
+ *     are the keys the scaffold prompts about before overwriting.
  */
 type LintingClassification =
     | { kind: 'empty' }
@@ -313,7 +322,8 @@ function stripSentineledLintingBlock(text: string): string {
 
 /**
  * Iterate the top-level properties of a parsed `jsonc-parser` object node,
- * yielding `{ key, valueNode }` pairs for `raven.linting.*` keys only.
+ * yielding `{ key, valueNode }` pairs for project-scoped `raven.linting.*`
+ * keys only. Client-only linting settings are preserved by the scaffold.
  * Skips malformed property nodes defensively.
  */
 function* iterateLintingProperties(
@@ -325,7 +335,7 @@ function* iterateLintingProperties(
         const keyNode = prop.children[0];
         const valueNode = prop.children[1];
         if (typeof keyNode.value !== 'string') continue;
-        if (!keyNode.value.startsWith('raven.linting.')) continue;
+        if (!isProjectScopedLintingSettingKey(keyNode.value)) continue;
         yield { key: keyNode.value, valueNode };
     }
 }
@@ -333,7 +343,7 @@ function* iterateLintingProperties(
 /**
  * Classify `text` for the scaffold's merge step. Wraps `jsonc-parser`'s
  * `parseTree` and adds the project-specific checks (non-object root,
- * non-scalar `raven.linting.*` value).
+ * non-scalar project-scoped `raven.linting.*` value).
  */
 function classifyExisting(text: string): LintingClassification {
     if (text.trim().length === 0) return { kind: 'empty' };
@@ -353,8 +363,9 @@ function classifyExisting(text: string): LintingClassification {
 
 /**
  * Same as `classifyExisting`, but applied to the post-sentinel-strip text
- * so callers only see *user-managed* `raven.linting.*` keys (everything
- * inside our sentinel block was our own and is silently regenerable).
+ * so callers only see *user-managed* project-scoped `raven.linting.*` keys
+ * (everything inside our sentinel block was our own and is silently
+ * regenerable).
  */
 export function classifyUserManagedLintingKeys(text: string): LintingClassification {
     return classifyExisting(stripSentineledLintingBlock(text));
@@ -362,9 +373,9 @@ export function classifyUserManagedLintingKeys(text: string): LintingClassificat
 
 /**
  * The shape kept around for the test suite as a parse-success signal:
- * top-level `raven.linting.*` keys, or `null` if classification rejected
- * the input for any reason. An empty file is a parse-success with zero
- * keys (not a rejection).
+ * top-level project-scoped `raven.linting.*` keys, or `null` if classification
+ * rejected the input for any reason. An empty file is a parse-success with
+ * zero keys (not a rejection).
  */
 export function detectExistingLintingKeys(text: string): string[] | null {
     const result = classifyExisting(text);
@@ -387,10 +398,11 @@ export function detectUserManagedLintingKeys(text: string): string[] | null {
 }
 
 /**
- * Remove every top-level `raven.linting.*` key from `text`. Uses
- * `jsonc-parser`'s `parseTree` to identify each key's property node
- * (so nested keys under e.g. a `[r]` language override are left
- * untouched), then splices the property's own range out of the text.
+ * Remove every top-level project-scoped `raven.linting.*` key from `text`.
+ * Uses `jsonc-parser`'s `parseTree` to identify each key's property node (so
+ * nested keys under e.g. a `[r]` language override and client-only linting
+ * settings are left untouched), then splices the property's own range out of
+ * the text.
  *
  * Why not `modify` + `applyEdits`? `jsonc-parser`'s `modify`-for-removal
  * has two edge-case bugs we hit:
@@ -422,7 +434,7 @@ function removeTopLevelLintingKeys(text: string): string {
                 continue;
             }
             const key = prop.children[0].value;
-            if (typeof key === 'string' && key.startsWith('raven.linting.')) {
+            if (typeof key === 'string' && isProjectScopedLintingSettingKey(key)) {
                 propNode = prop;
                 break;
             }
@@ -532,9 +544,10 @@ function hasCommaBetween(text: string, after: number, before: number): boolean {
  *
  *   1. Strip any prior sentinel-managed block we wrote.
  *   2. Classify the rest via `jsonc-parser` (parse errors / non-object
- *      root / non-scalar `raven.linting.*` value all return `null`).
- *   3. Remove every remaining top-level `raven.linting.*` key via
- *      `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
+ *      root / non-scalar project-scoped `raven.linting.*` value all return
+ *      `null`).
+ *   3. Remove every remaining top-level project-scoped `raven.linting.*` key
+ *      via `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
  *      `jsonc-parser`'s `modify` + `applyEdits` looked tempting here
  *      but has two edge-case bugs we hit (see that function's doc
  *      comment for why we don't use it).
@@ -676,8 +689,8 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
 /**
  * Merge a Raven linting-settings block into `.vscode/settings.json`,
  * creating the file (and the `.vscode/` directory) if absent. If the
- * file already contains any `raven.linting.*` keys, prompt before
- * overwriting them; unrelated keys and comments are preserved.
+ * file already contains any project-scoped `raven.linting.*` keys, prompt
+ * before overwriting them; unrelated keys and comments are preserved.
  */
 async function runLintingSettingsScaffold(
     folder: vscode.WorkspaceFolder,
@@ -697,8 +710,8 @@ async function runLintingSettingsScaffold(
     if (existing !== undefined) {
         // Keys inside our sentinel-managed block were produced by an
         // earlier run of this same scaffold, so it's safe to regenerate
-        // them silently. Only user-authored `raven.linting.*` keys
-        // (anything outside the sentinel range) trigger the prompt.
+        // them silently. Only user-authored project-scoped `raven.linting.*`
+        // keys (anything outside the sentinel range) trigger the prompt.
         const classification = classifyUserManagedLintingKeys(existing);
         if (classification.kind === 'parseError') {
             void vscode.window.showErrorMessage(
@@ -714,7 +727,7 @@ async function runLintingSettingsScaffold(
         }
         if (classification.kind === 'unsupportedValue') {
             void vscode.window.showErrorMessage(
-                `Raven: ${displayName} sets ${classification.key} to a non-scalar value (object or array). All raven.linting.* settings are scalars (boolean, number, or string); please correct the value before re-running this command.`,
+                `Raven: ${displayName} sets ${classification.key} to a non-scalar value (object or array). All project-scoped raven.linting.* settings are scalars (boolean, number, or string); please correct the value before re-running this command.`,
             );
             return undefined;
         }
@@ -723,10 +736,10 @@ async function runLintingSettingsScaffold(
         if (userManagedKeys.length > 0) {
             const label =
                 userManagedKeys.length === 1
-                    ? '1 raven.linting.* setting'
-                    : `${userManagedKeys.length} raven.linting.* settings`;
+                    ? '1 project-scoped raven.linting.* setting'
+                    : `${userManagedKeys.length} project-scoped raven.linting.* settings`;
             const choice = await vscode.window.showWarningMessage(
-                `${label} already in ${displayName}. Overwrite the raven.linting.* block? Other keys and comments will be preserved.`,
+                `${label} already in ${displayName}. Overwrite the project-scoped raven.linting.* block? Other keys and comments will be preserved.`,
                 { modal: true },
                 'Overwrite',
             );

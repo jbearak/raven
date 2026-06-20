@@ -9,7 +9,7 @@
 
 Every `raven.*` setting Raven reads, in one alphabetical table. Most are exposed through the VS Code Settings UI; a handful of advanced server-side knobs are LSP-init-only (still readable from `raven.toml`). For narrative explanations of each surface, follow the **Docs** link on a row. For how `raven.toml` layering works, see [Configuration](configuration.md).
 
-The **`raven.toml` path** column shows where to set a key in a project's `raven.toml`. A `—` means the setting is VS Code-client-only and is not read from `raven.toml`.
+The **`raven.toml` path** column shows where to set a key in a project's `raven.toml`. A `—` means the setting is not read from `raven.toml`; most such settings are VS Code-client-only, and LSP-client-only exceptions say so in their descriptions.
 
 | Setting | Default | Type / Allowed values | `raven.toml` path | Docs | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -62,7 +62,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.linting.assignmentOperatorSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.assignmentOperatorSeverity` | [linting](linting.md) | Severity for the assignment-operator lint. |
 | `raven.linting.commasSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.commasSeverity` | [linting](linting.md) | Severity for the commas lint. |
 | `raven.linting.commentedCodeSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.commentedCodeSeverity` | [linting](linting.md) | Severity for the commented-code lint. |
-| `raven.linting.enabled` | `"auto"` | `"auto"` \| `"on"` \| `"off"` \| `true` \| `false` | `linting.enabled` | [linting](linting.md) | Controls native lint diagnostics. "auto" (default) enables linting when a .lintr or raven.toml opts in — but a discovered .lintr is ignored when REditorSupport's own lintr diagnostics are live (it is installed and enabled with r.lsp.enabled and r.lsp.diagnostics on) or when running in Positron, so the same .lintr isn't linted twice. true/"on" forces linting on. false/"off" disables linting unless a discovered raven.toml explicitly sets enabled = true (it always overrides .lintr auto-discovery). |
+| `raven.linting.enabled` | `"auto"` | `"auto"` \| `"on"` \| `"off"` \| `true` \| `false` | `linting.enabled` | [linting](linting.md) | "auto" enables linting when a .lintr or raven.toml opts in, except literal ~/.lintr is ignored unless the LSP-client setting raven.linting.readHomeLintr is true or the CLI receives --config ~/.lintr, and .lintr is ignored when REditorSupport or Positron already owns lintr diagnostics. |
 | `raven.linting.equalsNaSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.equalsNaSeverity` | [linting](linting.md) | Severity for the equals-NA lint. |
 | `raven.linting.functionLeftParenthesesSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.functionLeftParenthesesSeverity` | [linting](linting.md) | Severity for the function-left-parentheses lint. |
 | `raven.linting.indentationSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.indentationSeverity` | [linting](linting.md) | Severity for the indentation lint. |
@@ -78,6 +78,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.linting.objectNameStyleFunction` | `"snake_case"` | `"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"any"` | `linting.objectNameStyleFunction` | [linting](linting.md) | Required naming scheme for functions (assignments whose value is a function definition). |
 | `raven.linting.objectNameStyleVariable` | `"snake_case"` | `"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"any"` | `linting.objectNameStyleVariable` | [linting](linting.md) | Required naming scheme for variables (assignments whose value is not a function definition). |
 | `raven.linting.quotesSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.quotesSeverity` | [linting](linting.md) | Severity for the quotes lint. |
+| `raven.linting.readHomeLintr` | `false` | boolean | — | [linting](linting.md) | VS Code/LSP-client-only. Read literal ~/.lintr during project-config discovery; the CLI uses literal ~/.lintr only when passed explicitly with --config ~/.lintr. |
 | `raven.linting.semicolonSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.semicolonSeverity` | [linting](linting.md) | Severity for the semicolon lint. |
 | `raven.linting.spacesInsideSeverity` | `"hint"` | `"error"` \| `"warning"` \| `"information"` \| `"hint"` \| `"off"` | `linting.spacesInsideSeverity` | [linting](linting.md) | Severity for the spaces-inside lint. |
 | `raven.linting.stringDelimiter` | `"\""` | `"\""` \| `"'"` | `linting.stringDelimiter` | [linting](linting.md) | Preferred string-literal delimiter. |

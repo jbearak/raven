@@ -10,7 +10,7 @@ The recommended way to configure Raven is a `raven.toml` file at the project roo
 
 ### Discovery
 
-Raven walks upward from each workspace folder looking for `raven.toml`. If none is found, `.lintr` is read for linting settings only (subset; see [Linting](linting.md#migrating-from-lintr)).
+Raven walks upward from the active project root looking for `raven.toml`: the first workspace folder in editors, `--workspace` for `raven check`, and the invocation working directory for `raven lint`. If none is found, `.lintr` is read for linting settings only (subset; see [Linting](linting.md#migrating-from-lintr)), except the literal home-directory `~/.lintr` is ignored by default so user-level `lintr` preferences do not silently affect every project. In VS Code, set `raven.linting.readHomeLintr = true` to include it; in the CLI, pass it explicitly with `--config ~/.lintr`. In multi-root workspaces, open a project folder directly when you need a different folder-specific project config.
 
 ### Precedence
 
@@ -18,7 +18,7 @@ Per-key. For each setting, project values win over the LSP client's `initializat
 
 ### Schema
 
-The TOML mirrors the LSP `initializationOptions` shape 1:1. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of VS Code-only settings whose behavior is most useful to document alongside them (R-console activation, plot/help viewer columns, the word-separator opt-in, and the server-binary override). Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
+Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
 
 ```toml
 [linting]
@@ -47,7 +47,7 @@ undefinedVariableSeverity = "warning"
 
 ### Live reload
 
-Edits to `raven.toml` (or `.lintr`) are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. Open documents re-publish diagnostics automatically — no Raven restart required.
+In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
 
 Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
 
@@ -129,9 +129,9 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Command | File | Contents |
 |---|---|---|
-| `Raven: Create raven.toml` | `raven.toml` | A starter project config at the workspace root, with the sections Raven reads (`linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`) |
+| `Raven: Create raven.toml` | `raven.toml` | A starter linting-focused project config at the workspace root, with the `[linting]` keys Raven maps from VS Code settings. Add other sections from this reference as needed (`crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`) |
 | `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
-| `Raven: Create linting settings` | `.vscode/settings.json` | Every `raven.linting.*` key Raven understands, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments; prompts before overwriting an existing `raven.linting.*` block |
+| `Raven: Create linting settings` | `.vscode/settings.json` | Every project-scoped `raven.linting.*` key Raven maps to `raven.toml`, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments, preserves client-only linting settings such as `raven.linting.readHomeLintr`, and prompts before overwriting an existing project-scoped `raven.linting.*` block |
 
 ## R Console Activation
 
@@ -192,11 +192,12 @@ See [Smart Indentation](indentation.md) for details.
 
 ## Linting Settings
 
-Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` or `raven.toml` opts in — except a `.lintr` is ignored when REditorSupport's own `lintr` diagnostics are live or you're in Positron ([details](linting.md#auto-and-reditorsupport--positron)) — set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
+Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` or `raven.toml` opts in — except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled (or the CLI receives `--config ~/.lintr`), and any `.lintr` is ignored when REditorSupport's own `lintr` diagnostics are live or you're in Positron ([details](linting.md#auto-and-reditorsupport--positron)) — set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `hint` so they don't crowd the Problems pane. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
 
 | Setting | Default | Description |
 |---|---|---|
 | `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
+| `raven.linting.readHomeLintr` | `false` | VS Code/LSP-client-only. Include the literal home-directory `~/.lintr` in discovery. Workspace and non-home parent `.lintr` files are still discovered when this is `false`; the CLI uses literal `~/.lintr` only when passed explicitly with `--config ~/.lintr`. |
 | `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
