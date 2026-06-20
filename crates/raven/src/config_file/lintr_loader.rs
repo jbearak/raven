@@ -428,7 +428,7 @@ struct ScanState {
 }
 
 impl ScanState {
-    /// Advance over one byte-as-char `c`. Returns `true` when `c` is a
+    /// Advance over one character `c`. Returns `true` when `c` is a
     /// *structural* character — not inside a string or comment — so callers can
     /// act on `,` / brackets only when this is `true`. Escape state is tracked
     /// internally (no `prev` parameter needed), so a string ending in an
@@ -478,8 +478,8 @@ impl ScanState {
 /// indentation rules.
 fn net_bracket_depth(s: &str) -> i32 {
     let mut st = ScanState::default();
-    for &b in s.as_bytes() {
-        st.step(b as char);
+    for c in s.chars() {
+        st.step(c);
     }
     st.depth
 }
@@ -492,8 +492,7 @@ fn net_bracket_depth(s: &str) -> i32 {
 fn strip_comments(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut st = ScanState::default();
-    for &b in s.as_bytes() {
-        let c = b as char;
+    for c in s.chars() {
         let was_comment = st.in_comment;
         let was_str = st.in_str.is_some();
         st.step(c);
@@ -517,8 +516,7 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut st = ScanState::default();
     let mut start = 0usize;
-    for (i, &b) in input.as_bytes().iter().enumerate() {
-        let c = b as char;
+    for (i, c) in input.char_indices() {
         let structural = st.step(c);
         if structural && c == ',' && st.depth == 0 {
             out.push(&input[start..i]);
@@ -677,6 +675,43 @@ mod tests {
         // Real top-level comma still splits; nested + quoted commas do not.
         let parts = split_top_level_commas("f(1, 2), \"x,y\", g()");
         assert_eq!(parts, vec!["f(1, 2)", " \"x,y\"", " g()"]);
+    }
+
+    #[test]
+    fn strip_comments_preserves_multibyte_utf8() {
+        // strip_comments must not mangle non-ASCII bytes. Regression: a byte-wise
+        // rebuild (`b as char` over `as_bytes()`) split each UTF-8 byte into its
+        // own scalar, corrupting "café" (0x63 0x61 0x66 0xC3 0xA9) into "cafÃ©".
+        // A comment-free value must round-trip verbatim:
+        assert_eq!(strip_comments("\"R/café.R\""), "\"R/café.R\"");
+        // The non-ASCII character survives when a trailing comment is removed:
+        assert_eq!(strip_comments("\"café\" # nöte"), "\"café\" ");
+        // A `#` inside a non-ASCII string is preserved, not treated as a comment:
+        assert_eq!(strip_comments("\"caf# é\""), "\"caf# é\"");
+    }
+
+    #[test]
+    fn non_ascii_is_inert_to_the_scanners() {
+        // net_bracket_depth and split_top_level_commas key only off ASCII
+        // structure, so a multi-byte char must neither miscount brackets nor
+        // land a comma split mid-character.
+        assert_eq!(net_bracket_depth("f(\"café\")"), 0);
+        assert_eq!(net_bracket_depth("f(café"), 1);
+        let parts = split_top_level_commas("\"café\", \"naïve\"");
+        assert_eq!(parts, vec!["\"café\"", " \"naïve\""]);
+    }
+
+    #[test]
+    fn exclusions_with_non_ascii_path_are_not_mangled() {
+        // End-to-end: a non-ASCII exclusion path must survive into the override
+        // glob unchanged, so it can actually match the real file on disk.
+        let out = load_str("exclusions: list(\"R/café.R\", \"naïve/\")\n");
+        let overrides = out.settings["linting"]["overrides"]
+            .as_array()
+            .expect("overrides array");
+        let files = overrides[0]["files"].as_array().expect("files array");
+        assert_eq!(files[0], json!("R/café.R"));
+        assert_eq!(files[1], json!("naïve/**"));
     }
 
     #[test]
