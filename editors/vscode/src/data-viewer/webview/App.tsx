@@ -395,7 +395,10 @@ export function App({
     const rowCountText = describeVisibleRows(effectiveNrow, visibleRange, loading);
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
-     *  changing the toolbar width — without that the wrap state can be stale. */
+     *  changing the toolbar width — without that the wrap state can be stale.
+     *  `labelsHaveEffect`/`formatHasEffect` are in the deps for the same reason:
+     *  they add/remove the Labels and Format/digits controls (changing the action
+     *  group's width) on dataset change without changing the toolbar width. */
     const toolbarChipsWrapped = useToolbarWrap(
         {
             toolbar: toolbarRef,
@@ -403,7 +406,7 @@ export function App({
             chips: toolbarChipsRef,
             actions: toolbarActionsRef,
         },
-        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length],
+        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length, labelsHaveEffect, formatHasEffect],
     );
     /** Summary text appended to the status bar when a sort is active.
      *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
@@ -1461,33 +1464,45 @@ export function App({
                     />
                 </div>
                 <div className="toolbar-actions" ref={toolbarActionsRef}>
-                    <button
-                        type="button"
-                        className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
-                        disabled={!labelsHaveEffect}
-                        onClick={() => setToolbar(t => ({ ...t, labelsOn: !t.labelsOn }))}
-                    >
-                        Labels
-                    </button>
-                    <button
-                        type="button"
-                        className={toolbar.formatOn ? 'toggle active' : 'toggle'}
-                        disabled={!formatHasEffect}
-                        onClick={() => setToolbar(t => ({ ...t, formatOn: !t.formatOn }))}
-                    >
-                        Format
-                    </button>
-                    <select
-                        className="digits"
-                        value={toolbar.digits}
-                        disabled={!toolbar.formatOn || !formatHasEffect}
-                        onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
-                        aria-label="Digits"
-                    >
-                        {[0, 1, 2, 3, 4, 5, 6].map(d => (
-                            <option key={d} value={d}>{d}</option>
-                        ))}
-                    </select>
+                    {/* Labels/Format act on specific column kinds (factors &
+                       labelled / Float). When no column in the dataset is
+                       affected, the control can never do anything, so hide it
+                       rather than show a permanently-greyed button. */}
+                    {labelsHaveEffect && (
+                        <button
+                            type="button"
+                            className={toolbar.labelsOn ? 'toggle active' : 'toggle'}
+                            onClick={() => setToolbar(t => ({ ...t, labelsOn: !t.labelsOn }))}
+                        >
+                            Labels
+                        </button>
+                    )}
+                    {formatHasEffect && (
+                        <>
+                            <button
+                                type="button"
+                                className={toolbar.formatOn ? 'toggle active' : 'toggle'}
+                                onClick={() => setToolbar(t => ({ ...t, formatOn: !t.formatOn }))}
+                            >
+                                Format
+                            </button>
+                            {/* Digits is a dependent control: shown whenever
+                               Format applies, but disabled (not hidden) while
+                               Format is toggled off — a transient, user-driven
+                               state, unlike the dataset-level no-effect case. */}
+                            <select
+                                className="digits"
+                                value={toolbar.digits}
+                                disabled={!toolbar.formatOn}
+                                onChange={event => setToolbar(t => ({ ...t, digits: Number(event.target.value) }))}
+                                aria-label="Digits"
+                            >
+                                {[0, 1, 2, 3, 4, 5, 6].map(d => (
+                                    <option key={d} value={d}>{d}</option>
+                                ))}
+                            </select>
+                        </>
+                    )}
                     <div className="columns-popover-anchor">
                         <button
                             type="button"
