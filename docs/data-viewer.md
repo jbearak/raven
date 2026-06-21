@@ -83,12 +83,11 @@ holds a small hysteresis band so the toolbar doesn't flap between one
 and two rows as the panel is resized across the boundary.
 
 Each toggle is filled when active; clicking flips it. The Labels and
-Format buttons are disabled (dimmed) when no column in the current data
-set would be affected by them — e.g. an all-integer matrix disables
-both, while a frame with only factors disables Format but keeps Labels
-active. The
-small badge on `Columns` shows the count of currently hidden columns
-(absent when none are hidden).
+Format buttons (and the digits dropdown) are hidden when no column in the
+current data set would be affected by them — e.g. an all-integer matrix
+hides all three, while a frame with only factors hides Format and digits
+but keeps Labels. The small badge on `Columns` shows the count of
+currently hidden columns (absent when none are hidden).
 
 ### Labels
 
