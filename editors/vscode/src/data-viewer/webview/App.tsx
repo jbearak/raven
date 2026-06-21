@@ -7,9 +7,12 @@ import React, {
 } from 'react';
 import {
     CompactSelection,
-    DataEditor,
+    DataEditorCore as DataEditor,
     GridCellKind,
+    markerCellRenderer,
+    textCellRenderer,
     type DataEditorRef,
+    type DataEditorCoreProps,
     type DrawCellCallback,
     type DrawHeaderCallback,
     type GridMouseEventArgs,
@@ -102,6 +105,16 @@ type HeaderTooltipState = {
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
 const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
+// Glide's renderer type is invariant, but dispatch is by each renderer's `kind`.
+const DATA_VIEWER_RENDERERS = [
+    markerCellRenderer,
+    textCellRenderer,
+] as unknown as NonNullable<DataEditorCoreProps['renderers']>;
+const DATA_VIEWER_IMAGE_LOADER: DataEditorCoreProps['imageWindowLoader'] = {
+    setWindow: () => undefined,
+    loadOrGetImage: () => undefined,
+    setCallback: () => undefined,
+};
 
 function createEmptySelection(): GridSelection {
     return {
@@ -1439,6 +1452,8 @@ export function App({
             <div className="grid-shell" ref={gridShellRef}>
                 <DataEditor
                     ref={gridRef}
+                    renderers={DATA_VIEWER_RENDERERS}
+                    imageWindowLoader={DATA_VIEWER_IMAGE_LOADER}
                     theme={vscodeTheme}
                     width="100%"
                     height="100%"
