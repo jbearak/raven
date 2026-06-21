@@ -65,6 +65,7 @@ import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
 import { FilterStrip } from './filter-strip';
 import { FilterPopover } from './filter-popover';
+import { colKind } from './filter-column-kind';
 import { useToolbarWrap } from './use-toolbar-wrap';
 
 type VscodeApi = {
@@ -313,6 +314,10 @@ export function App({
     const inflightRef = useRef(new Map<number, string>());
     const pendingKeysRef = useRef(new Set<string>());
     const nextRequestIdRef = useRef(0);
+    /** Column indices whose histogram has been requested from the host but
+     *  not yet received, so the lazy-fetch effect fires at most one
+     *  getHistogram per column. Cleared on replace (new dataset). */
+    const histogramRequestedRef = useRef(new Set<number>());
     const viewportGenerationRef = useRef(0);
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
@@ -349,6 +354,12 @@ export function App({
     const [filterPending, setFilterPending] = useState(false);
     const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
     const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
+    /** True until the first init/replace lands. Until then nrow is 0 and the
+     *  row-count readout would say "Showing 0-0 of 0", which reads as an
+     *  empty/broken table; show "Loading…" instead. Starts false when we
+     *  restored a non-empty schema from getState (we already have something
+     *  to show). */
+    const [loading, setLoading] = useState<boolean>(!(restored?.columns && restored.columns.length > 0));
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
@@ -381,7 +392,7 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
-    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange);
+    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange, loading);
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale. */
@@ -417,7 +428,9 @@ export function App({
         return `filtered to ${nrowFiltered.toLocaleString()}${pct}`;
     }, [nrowFiltered, nrow]);
     const statusText = [
-        describeShape(nrow, columns, objectClass),
+        // While loading, the toolbar lead already shows "Loading…"; don't
+        // also show a misleading "0 rows x 0 columns" in the status bar.
+        loading ? '' : describeShape(nrow, columns, objectClass),
         describeHiddenColumnCount(layout.hiddenColumns.length),
         sortPending ? 'Sorting…' : sortStatusText,
         filterPending ? 'Filtering…' : filterStatusText,
@@ -578,9 +591,20 @@ export function App({
         setSort(m.sort);
         setSortPending(false);
         setFilter(m.filter);
-        setHistograms(m.histograms ?? {});
+        // Histograms are fetched lazily per column (getHistogram) the first
+        // time a numeric filter popover opens — not shipped in init/replace.
+        // Drop any cached bins + in-flight request markers whenever the
+        // dataset changes (always on replace; on init unless this is the same
+        // dataset being restored from getState, e.g. after a tab hide/show),
+        // since bins are keyed by column index and would be wrong for a
+        // different schema. A same-dataset init keeps the restored cache.
+        if (m.type === 'replace' || !sameDataset) {
+            setHistograms({});
+            histogramRequestedRef.current.clear();
+        }
         setFilterPending(false);
         if (m.filter.entries.length === 0) setNrowFiltered(undefined);
+        setLoading(false);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
@@ -634,6 +658,12 @@ export function App({
             gridRef.current?.updateCells(damageList);
         }
     }, [panelGeneration, visibleCols, visibleRange.end, visibleRange.start]);
+
+    const applyHistogram = useCallback((m: Extract<ExtensionToWebview, { type: 'histogram' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        histogramRequestedRef.current.delete(m.columnIndex);
+        setHistograms(prev => ({ ...prev, [m.columnIndex]: m.bins }));
+    }, [panelGeneration]);
 
     const applySortApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'sortApplied' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
@@ -975,6 +1005,9 @@ export function App({
                 case 'labels':
                     applyLabels(m);
                     return;
+                case 'histogram':
+                    applyHistogram(m);
+                    return;
                 case 'copyDone':
                     applyCopyDone(m);
                     return;
@@ -1008,6 +1041,7 @@ export function App({
         applyCopyDone,
         applyFilterApplied,
         applyFilterStatus,
+        applyHistogram,
         applyInitOrReplace,
         applyLabels,
         applyRows,
@@ -1028,6 +1062,35 @@ export function App({
             toolbar,
         });
     }, [panelGeneration, schemaHash, toolbar, vscode]);
+
+    // Lazily fetch a numeric column's histogram the first time its filter
+    // popover opens. Histograms are not shipped at init (a full-frame scan
+    // would block the grid from painting — see histograms.ts), so the brush
+    // appears once the host replies. Non-numeric columns have no brush, so
+    // we don't request them.
+    useEffect(() => {
+        if (filterEditor === null) return;
+        const ci = filterEditor.entry?.columnIndex ?? filterEditor.columnIndex;
+        if (ci === undefined) return;
+        const col = columns[ci];
+        if (!col) return;
+        // Only columns that get a histogram brush in the popover. Gate on the
+        // same classifier the popover uses (colKind) so "shows a brush" and
+        // "fetches the bins" can never diverge — both numeric and labelled-
+        // numeric columns offer the between/histogram predicate.
+        const kind = colKind(col);
+        if (kind !== 'numeric' && kind !== 'labelledNumeric') return;
+        if (histograms[ci] !== undefined) return;          // already cached
+        if (histogramRequestedRef.current.has(ci)) return;  // request in flight
+        histogramRequestedRef.current.add(ci);
+        const requestId = ++nextRequestIdRef.current;
+        vscode.postMessage({
+            type: 'getHistogram',
+            panelGeneration,
+            requestId,
+            columnIndex: ci,
+        });
+    }, [filterEditor, columns, histograms, panelGeneration, vscode]);
 
     useEffect(() => {
         // Guard on the same bootstrap flag as saveToolbar: until the first

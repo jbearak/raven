@@ -108,10 +108,10 @@ export const EMPTY_FILTER: FilterState = {
     labelsOnWhenFiltered: true,
 };
 
-/** Bin in a numeric column's precomputed histogram. Bins are
- *  uniform-width over `[min, max]` of the present values; NA / NaN
- *  rows are excluded from `count`. A column with no present values
- *  serializes to an empty array. */
+/** Bin in a numeric column's histogram (computed on demand; see the
+ *  `histogram` message). Bins are uniform-width over `[min, max]` of the
+ *  present values; NA / NaN rows are excluded from `count`. A column with
+ *  no present values serializes to an empty array. */
 export type HistogramBin = {
     lo: number;
     hi: number;
@@ -142,10 +142,6 @@ export type ExtensionToWebview =
          *  none. Webview reflects this in the chip strip without firing
          *  the apply-pulse animation. */
         filter: FilterState;
-        /** Precomputed histograms keyed by column index, or empty object
-         *  if not yet available. Used to populate filter popover sparklines
-         *  without a round-trip. */
-        histograms: Record<number, HistogramBin[]>;
     }
     | {
         type: 'rows';
@@ -184,10 +180,20 @@ export type ExtensionToWebview =
          *  none. Webview reflects this in the chip strip without firing
          *  the apply-pulse animation. */
         filter: FilterState;
-        /** Precomputed histograms keyed by column index, or empty object
-         *  if not yet available. Used to populate filter popover sparklines
-         *  without a round-trip. */
-        histograms: Record<number, HistogramBin[]>;
+    }
+    | {
+        /** On-demand numeric histogram for a single column, sent in
+         *  response to a `getHistogram` request. Histograms are computed
+         *  lazily (and cached host-side) the first time a numeric column's
+         *  filter popover opens — they are NOT precomputed at init, because
+         *  scanning every numeric column up front blocks the grid from
+         *  painting on large frames (a multi-second to multi-minute stall).
+         *  `bins` is `[]` for a column with no present finite values. */
+        type: 'histogram';
+        panelGeneration: number;
+        requestId: number;
+        columnIndex: number;
+        bins: HistogramBin[];
     }
     | {
         /** Sent after the extension host has finished building the
@@ -306,6 +312,16 @@ export type WebviewToExtension =
         requestId: number;
         columnIndex: number;
         indices: number[];
+    }
+    | {
+        /** Request the numeric histogram for one column. Sent the first
+         *  time a numeric column's filter popover opens and the webview
+         *  has no cached bins for it. The host replies with a `histogram`
+         *  message. */
+        type: 'getHistogram';
+        panelGeneration: number;
+        requestId: number;
+        columnIndex: number;
     }
     | {
         type: 'saveLayout';

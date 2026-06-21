@@ -78,7 +78,10 @@ export function buildVisibleGridColumns(
     return visibleCols.map(index => allColumns[index]).filter(Boolean);
 }
 
-export function describeVisibleRows(nrow: number, range: VisibleRange): string {
+export function describeVisibleRows(nrow: number, range: VisibleRange, loading = false): string {
+    // Before the init/replace message lands, nrow is 0 and a bare
+    // "Showing 0-0 of 0" reads as an empty/broken table; say it's loading.
+    if (loading) return 'Loading…';
     if (nrow <= 0) return 'Showing 0-0 of 0';
     if (range.end <= range.start) return `Showing 0-0 of ${nrow.toLocaleString()}`;
     const start = Math.min(nrow, range.start + 1);

@@ -279,7 +279,12 @@ and applying updates the existing filter (it does not add a second one — see
 
 For numeric `between` / `not between`, the editor shows a histogram of the
 column's distribution with draggable range thumbs alongside the numeric
-input fields.
+input fields. The histogram is computed the first time you open that
+column's filter (not up front when the table loads), so on a very large
+frame it may appear a moment after the popover opens; it is cached
+thereafter. This keeps the histogram scan off the initial load path, so
+opening a table paints the grid without waiting for every numeric column to
+be scanned.
 
 For factor columns, the editor shows a searchable checklist of levels when
 the column's value dictionary has been shipped; large or unshipped
