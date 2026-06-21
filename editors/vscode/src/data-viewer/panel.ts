@@ -229,7 +229,6 @@ export class DataViewerPanel {
             settings: this.settings,
             dictionaries: this.dictionaries,
             schemaHash: layoutHash,
-            objectClass: reader.schema.objectClass,
             sort: restored,
             filter: restoredFilter,
         };
@@ -293,7 +292,6 @@ export class DataViewerPanel {
             toolbar: activeToolbar,
             dictionaries: this.dictionaries,
             schemaHash: layoutHash,
-            objectClass: reader.schema.objectClass,
             sort: restored,
             filter: restoredFilter,
         };
@@ -713,9 +711,9 @@ export class DataViewerPanel {
         } catch (err) {
             // Drop the failure entirely if a newer setSort or a panel
             // replace landed while computePermutation was in flight —
-            // publishing a stale idle/error pair would either confuse the
-            // status bar (clearing a "Sorting…" that belongs to a newer
-            // request) or surface an error that's no longer relevant.
+            // publishing a stale idle/error pair would either clear a
+            // "Sorting…" pill that belongs to a newer request or surface
+            // an error that's no longer relevant.
             if (gen !== this.generation
                 || mySortGen !== this.sortGeneration
                 || this.disposed) {

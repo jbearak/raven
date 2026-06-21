@@ -1,6 +1,6 @@
 /**
- * Pure summarizer for FilterPredicates. Used by chip strip labels, aria
- * labels, and the status bar. Output is intentionally short — the chip
+ * Pure summarizer for FilterPredicates. Used by chip strip labels and aria
+ * labels. Output is intentionally short — the chip
  * has limited width — and uses Unicode glyphs so a chip reads like math
  * (≠, ≤, ∈, ∉) without needing CSS.
  *

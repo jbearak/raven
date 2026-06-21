@@ -133,7 +133,6 @@ export type ExtensionToWebview =
          *  that was current when the user toggled, even if a later
          *  replace swapped the dataset before the debounce fired. */
         schemaHash: string;
-        objectClass?: string;
         /** Sort state restored from persistence, or EMPTY_SORT if none.
          *  Webview reflects this in its header glyphs and toolbar strip
          *  without firing the apply-pulse animation. */
@@ -174,7 +173,6 @@ export type ExtensionToWebview =
         toolbar: ToolbarState;
         dictionaries: Record<number, string[]>;
         schemaHash: string;
-        objectClass?: string;
         sort: SortState;
         /** Filter state restored from persistence, or EMPTY_FILTER if
          *  none. Webview reflects this in the chip strip without firing
@@ -198,9 +196,9 @@ export type ExtensionToWebview =
     | {
         /** Sent after the extension host has finished building the
          *  permutation for a setSort request. The webview updates its
-         *  header glyphs, toolbar strip, status bar, and gutter
-         *  renderer. The pulse animation fires only when
-         *  `fromPersistence` is false. */
+         *  header glyphs, toolbar sort chips, and gutter renderer, and
+         *  clears the "Sorting…" pill. The pulse animation fires only
+         *  when `fromPersistence` is false. */
         type: 'sortApplied';
         panelGeneration: number;
         requestId: number;
@@ -208,16 +206,17 @@ export type ExtensionToWebview =
         fromPersistence: boolean;
     }
     | {
-        /** Lifecycle ping for the in-panel status bar. `state: 'pending'`
-         *  shows a "Sorting…" indicator; `'idle'` clears it. */
+        /** Lifecycle ping driving the toolbar "Sorting…" progress pill.
+         *  `state: 'pending'` shows it; `'idle'` clears it. */
         type: 'sortStatus';
         panelGeneration: number;
         state: 'pending' | 'idle';
     }
     | {
-        /** Filter index has been (re)built. Webview updates chip strip,
-         *  status bar, and gutter renderer. The pulse animation fires
-         *  only when `fromPersistence` is false. */
+        /** Filter index has been (re)built. Webview updates the filter
+         *  chip strip and gutter renderer, and clears the "Filtering…"
+         *  pill. The pulse animation fires only when `fromPersistence`
+         *  is false. */
         type: 'filterApplied';
         panelGeneration: number;
         requestId: number;
