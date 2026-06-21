@@ -9,6 +9,7 @@ const sveltePreprocess = require('svelte-preprocess').default ?? require('svelte
 
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
+const reactProductionDefine = { 'process.env.NODE_ENV': '"production"' };
 
 // `jsonc-parser` ships both a UMD `main` (`./lib/umd/main.js`) and an ESM
 // `module` (`./lib/esm/main.js`). esbuild's Node platform defaults to
@@ -80,7 +81,9 @@ async function buildReactWebview(name, entry) {
         platform: 'browser',
         target: 'chrome108',
         format: 'iife',
+        define: reactProductionDefine,
         loader: { '.css': 'css' },
+        minify: true,
         sourcemap: true,
         outfile: path.join(webviewDist, 'index.js'),
         logLevel: 'info',
