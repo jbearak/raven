@@ -18,6 +18,7 @@ import {
     EMPTY_SORT,
     ExtensionToWebview,
     FilterState,
+    HistogramBin,
     Layout,
     Settings,
     SortState,
@@ -25,7 +26,7 @@ import {
 } from './messages';
 import { computePermutation } from './sort';
 import { computeFilteredIndices } from './filter';
-import { computeNumericHistograms } from './histograms';
+import { computeHistogramForColumn } from './histograms';
 import { LayoutStore, schemaHash } from './layout-state';
 import { ToolbarState, ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
@@ -68,6 +69,11 @@ export class DataViewerPanel {
     /** Monotonic counter — bumped on every setFilters call so stale
      *  async results can be detected and dropped. */
     private filterGeneration = 0;
+    /** Per-column numeric histogram cache, keyed by column index, for the
+     *  current reader. Populated lazily by the `getHistogram` handler (a
+     *  histogram costs two full column scans, so we never recompute one).
+     *  Cleared on `replace()` because the new reader is a different dataset. */
+    private histogramCache = new Map<number, HistogramBin[]>();
     private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     /** Latest visible-row range observed via lifecycle events. Used by
      *  the integration test API. `undefined` until the first lifecycle
@@ -167,6 +173,8 @@ export class DataViewerPanel {
         this.filter = EMPTY_FILTER;
         this.filteredIndices = undefined;
         this.filterGeneration += 1;
+        // Histograms are reader-scoped; the new reader is a different dataset.
+        this.histogramCache.clear();
         const prevReader = this.reader;
         const prevPath = this.filePath;
         this.reader = reader;
@@ -211,8 +219,6 @@ export class DataViewerPanel {
         if (generation !== this.generation || reader !== this.reader) return false;
         const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
         if (generation !== this.generation || reader !== this.reader) return false;
-        const histograms = await computeNumericHistograms(reader);
-        if (generation !== this.generation || reader !== this.reader) return false;
         const msg: ExtensionToWebview = {
             type: 'init',
             panelGeneration: generation,
@@ -226,7 +232,6 @@ export class DataViewerPanel {
             objectClass: reader.schema.objectClass,
             sort: restored,
             filter: restoredFilter,
-            histograms,
         };
         this.trace('post-init', {
             generation,
@@ -279,8 +284,6 @@ export class DataViewerPanel {
         if (generation !== this.generation || reader !== this.reader) return;
         const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
         if (generation !== this.generation || reader !== this.reader) return;
-        const histograms = await computeNumericHistograms(reader);
-        if (generation !== this.generation || reader !== this.reader) return;
         const msg: ExtensionToWebview = {
             type: 'replace',
             panelGeneration: generation,
@@ -293,7 +296,6 @@ export class DataViewerPanel {
             objectClass: reader.schema.objectClass,
             sort: restored,
             filter: restoredFilter,
-            histograms,
         };
         this.trace('post-replace', {
             generation,
@@ -600,6 +602,41 @@ export class DataViewerPanel {
                     requestId: m.requestId,
                     columnIndex: m.columnIndex,
                     labels,
+                };
+                await this.webviewPanel.webview.postMessage(reply);
+                return;
+            }
+            case 'getHistogram': {
+                const reader = this.reader;
+                const ci = m.columnIndex;
+                // panel.ts is the trust boundary for webview messages: a bad
+                // index would throw deep in the column scan. Reply with empty
+                // bins for an out-of-range column rather than computing.
+                if (!Number.isInteger(ci) || ci < 0 || ci >= reader.schema.columns.length) {
+                    await this.webviewPanel.webview.postMessage({
+                        type: 'histogram',
+                        panelGeneration: gen,
+                        requestId: m.requestId,
+                        columnIndex: ci,
+                        bins: [],
+                    } satisfies ExtensionToWebview);
+                    return;
+                }
+                let bins = this.histogramCache.get(ci);
+                if (!bins) {
+                    bins = await computeHistogramForColumn(reader, ci);
+                    // A replace mid-scan swaps the reader; drop this result so a
+                    // histogram for the old dataset never lands under the new
+                    // generation or pollutes the new reader's cache.
+                    if (gen !== this.generation || reader !== this.reader) return;
+                    this.histogramCache.set(ci, bins);
+                }
+                const reply: ExtensionToWebview = {
+                    type: 'histogram',
+                    panelGeneration: gen,
+                    requestId: m.requestId,
+                    columnIndex: ci,
+                    bins,
                 };
                 await this.webviewPanel.webview.postMessage(reply);
                 return;

@@ -8,7 +8,7 @@ import { describe, test, expect } from 'bun:test';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
-import { computeNumericHistograms } from '../../editors/vscode/src/data-viewer/histograms';
+import { computeNumericHistograms, computeHistogramForColumn } from '../../editors/vscode/src/data-viewer/histograms';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = (n: string) =>
@@ -60,6 +60,27 @@ describe('computeNumericHistograms', () => {
                 expect(b.count).toBeGreaterThanOrEqual(0);
             }
         }
+        await r.close();
+    });
+});
+
+describe('computeHistogramForColumn (lazy single-column entry point)', () => {
+    test('matches the per-column result computeNumericHistograms produces', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const all = await computeNumericHistograms(r);
+        const x = await computeHistogramForColumn(r, 0);   // x — Int32
+        const y = await computeHistogramForColumn(r, 1);   // y — Float64
+        expect(x).toEqual(all[0]);
+        expect(y).toEqual(all[1]);
+        expect(x.length).toBe(50);
+        expect(x.reduce((s, b) => s + b.count, 0)).toBe(5);
+        await r.close();
+    });
+
+    test('non-numeric column yields an empty histogram (no present finite values)', async () => {
+        const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
+        const s = await computeHistogramForColumn(r, 2);   // s — Utf8
+        expect(s).toEqual([]);
         await r.close();
     });
 });

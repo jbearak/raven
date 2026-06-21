@@ -313,6 +313,10 @@ export function App({
     const inflightRef = useRef(new Map<number, string>());
     const pendingKeysRef = useRef(new Set<string>());
     const nextRequestIdRef = useRef(0);
+    /** Column indices whose histogram has been requested from the host but
+     *  not yet received, so the lazy-fetch effect fires at most one
+     *  getHistogram per column. Cleared on replace (new dataset). */
+    const histogramRequestedRef = useRef(new Set<number>());
     const viewportGenerationRef = useRef(0);
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
@@ -578,7 +582,17 @@ export function App({
         setSort(m.sort);
         setSortPending(false);
         setFilter(m.filter);
-        setHistograms(m.histograms ?? {});
+        // Histograms are fetched lazily per column (getHistogram) the first
+        // time a numeric filter popover opens — not shipped in init/replace.
+        // Drop any cached bins + in-flight request markers whenever the
+        // dataset changes (always on replace; on init unless this is the same
+        // dataset being restored from getState, e.g. after a tab hide/show),
+        // since bins are keyed by column index and would be wrong for a
+        // different schema. A same-dataset init keeps the restored cache.
+        if (m.type === 'replace' || !sameDataset) {
+            setHistograms({});
+            histogramRequestedRef.current.clear();
+        }
         setFilterPending(false);
         if (m.filter.entries.length === 0) setNrowFiltered(undefined);
         toolbarBootstrappedRef.current = true;
@@ -634,6 +648,12 @@ export function App({
             gridRef.current?.updateCells(damageList);
         }
     }, [panelGeneration, visibleCols, visibleRange.end, visibleRange.start]);
+
+    const applyHistogram = useCallback((m: Extract<ExtensionToWebview, { type: 'histogram' }>) => {
+        if (m.panelGeneration !== panelGeneration) return;
+        histogramRequestedRef.current.delete(m.columnIndex);
+        setHistograms(prev => ({ ...prev, [m.columnIndex]: m.bins }));
+    }, [panelGeneration]);
 
     const applySortApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'sortApplied' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
@@ -975,6 +995,9 @@ export function App({
                 case 'labels':
                     applyLabels(m);
                     return;
+                case 'histogram':
+                    applyHistogram(m);
+                    return;
                 case 'copyDone':
                     applyCopyDone(m);
                     return;
@@ -1008,6 +1031,7 @@ export function App({
         applyCopyDone,
         applyFilterApplied,
         applyFilterStatus,
+        applyHistogram,
         applyInitOrReplace,
         applyLabels,
         applyRows,
@@ -1028,6 +1052,32 @@ export function App({
             toolbar,
         });
     }, [panelGeneration, schemaHash, toolbar, vscode]);
+
+    // Lazily fetch a numeric column's histogram the first time its filter
+    // popover opens. Histograms are not shipped at init (a full-frame scan
+    // would block the grid from painting — see histograms.ts), so the brush
+    // appears once the host replies. Non-numeric columns have no brush, so
+    // we don't request them.
+    useEffect(() => {
+        if (filterEditor === null) return;
+        const ci = filterEditor.entry?.columnIndex ?? filterEditor.columnIndex;
+        if (ci === undefined) return;
+        const col = columns[ci];
+        if (!col) return;
+        const t = col.arrowType;
+        const isNumeric = t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float');
+        if (!isNumeric) return;
+        if (histograms[ci] !== undefined) return;          // already cached
+        if (histogramRequestedRef.current.has(ci)) return;  // request in flight
+        histogramRequestedRef.current.add(ci);
+        const requestId = ++nextRequestIdRef.current;
+        vscode.postMessage({
+            type: 'getHistogram',
+            panelGeneration,
+            requestId,
+            columnIndex: ci,
+        });
+    }, [filterEditor, columns, histograms, panelGeneration, vscode]);
 
     useEffect(() => {
         // Guard on the same bootstrap flag as saveToolbar: until the first

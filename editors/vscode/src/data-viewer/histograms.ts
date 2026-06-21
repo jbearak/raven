@@ -1,6 +1,6 @@
 /**
- * Precomputed numeric-column histograms for the filter popover. One
- * uniform-width 50-bin histogram per Int/Uint/Float column.
+ * Numeric-column histograms for the filter popover. One uniform-width
+ * 50-bin histogram per Int/Uint/Float column.
  *
  * NA / NaN are excluded from `count` because they are filtered through
  * `includeMissing`, not via the histogram brush. ±Inf is excluded
@@ -11,9 +11,16 @@
  * present value equals min collapse to a single zero-width bin holding
  * the full count.
  *
- * Computed once per panel-init off the open ArrowSliceReader. RSS is
- * bounded by the bin array (50 × 24 bytes per numeric column), not by
- * row count.
+ * IMPORTANT — these are NOT precomputed at panel init. A single column's
+ * histogram requires two full scans of that column (a min/max pass and a
+ * binning pass), so doing every numeric column up front blocks the grid
+ * from painting until the entire frame has been read — on a 10M-row × 50-col
+ * frame that was ~49s of empty grid. Instead `computeHistogramForColumn`
+ * is called on demand the first time a numeric column's filter popover
+ * opens (see `DataViewerPanel`'s getHistogram handler, which also caches
+ * the result per reader). `computeNumericHistograms` (all columns at once)
+ * remains for tests and any future eager use. RSS is bounded by the bin
+ * array (50 × 24 bytes per numeric column), not by row count.
  */
 
 import type { ArrowSliceReader } from './arrow-reader';
@@ -31,12 +38,18 @@ export async function computeNumericHistograms(
         if (!(t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'))) {
             continue;
         }
-        out[ci] = await histogramForColumn(reader, ci);
+        out[ci] = await computeHistogramForColumn(reader, ci);
     }
     return out;
 }
 
-async function histogramForColumn(
+/**
+ * Compute the 50-bin histogram for one column. Returns `[]` for a column
+ * with no present finite values (including non-numeric columns, whose
+ * values are never finite numbers) so callers can treat "no histogram"
+ * and "empty histogram" identically.
+ */
+export async function computeHistogramForColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
 ): Promise<HistogramBin[]> {

@@ -174,7 +174,7 @@ async function setupPanel(
 }
 
 describe('DataViewerPanel: filter round-trips', () => {
-    test('init carries EMPTY_FILTER and histograms with numeric columns', async () => {
+    test('init carries EMPTY_FILTER and does NOT eagerly compute histograms', async () => {
         const { fakeWebview } = await setupPanel();
 
         fakeWebview.deliverFromWebview({ type: 'webviewReady' });
@@ -183,12 +183,73 @@ describe('DataViewerPanel: filter round-trips', () => {
         expect(init).toBeDefined();
         // Filter should be the empty sentinel.
         expect(init.filter).toEqual({ entries: [], labelsOnWhenFiltered: true });
-        // tiny.arrow has col 0 = x (Int32) — at least that key must be present.
-        expect(init.histograms).toBeDefined();
-        expect(Object.keys(init.histograms).length).toBeGreaterThan(0);
-        expect(init.histograms[0]).toBeDefined();
-        expect(Array.isArray(init.histograms[0])).toBe(true);
-        expect(init.histograms[0].length).toBeGreaterThan(0);
+        // Histograms are no longer precomputed at init — they would force a
+        // full-frame scan before the grid can paint (the ~1-minute empty-grid
+        // regression on large frames). They are fetched lazily per column via
+        // getHistogram when a filter popover opens. See histograms.ts.
+        expect(init.histograms).toBeUndefined();
+    });
+
+    test('REGRESSION: init paints without any batch-level scan (histograms stay lazy)', async () => {
+        // The original regression: histograms were precomputed for every
+        // numeric column inside sendInit, blocking the grid from painting
+        // until the entire frame had been scanned (~49s on a 10M×50 frame).
+        // The old test suite asserted histograms were PRESENT in init, which
+        // locked the slow behavior in. This asserts the opposite invariant:
+        // sending init must not decode a single record batch. Histogram work
+        // (the only per-row scan in this surface) happens lazily on
+        // getHistogram. Re-introducing any full-frame scan on the paint path
+        // makes getBatchCalls non-zero and fails here.
+        const { fakeWebview, reader } = await setupPanel();
+        // reader.open() (in setupPanel) already counted its batches; start
+        // counting only the batch decodes the panel triggers from here on.
+        let getBatchCalls = 0;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = (i: number) => { getBatchCalls++; return origGetBatch(i); };
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        expect(init).toBeDefined();
+        expect(getBatchCalls).toBe(0);
+
+        // Opening a numeric filter is what legitimately triggers the
+        // single-column scan — proving the scan still exists, just deferred.
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 30,
+            columnIndex: 0,
+        });
+        await flush();
+        expect(getBatchCalls).toBeGreaterThan(0);
+    });
+
+    test('getHistogram round-trip: lazily computes one numeric column on demand', async () => {
+        const { fakeWebview } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        // tiny.arrow col 0 = x (Int32). Request its histogram on demand.
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: gen,
+            requestId: 20,
+            columnIndex: 0,
+        });
+        await flush();
+
+        const hist = fakeWebview.posted.find(
+            m => m.type === 'histogram' && m.requestId === 20,
+        ) as any;
+        expect(hist).toBeDefined();
+        expect(hist.columnIndex).toBe(0);
+        expect(Array.isArray(hist.bins)).toBe(true);
+        expect(hist.bins.length).toBe(50);
+        expect(hist.bins.reduce((s: number, b: any) => s + b.count, 0)).toBe(5);
     });
 
     test('setFilters round-trip: filterStatus pending → filterApplied, then getRows returns matching rows', async () => {
