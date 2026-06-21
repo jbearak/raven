@@ -305,8 +305,6 @@ local({
                  paste(class(x), collapse = "/"), "\`", call. = FALSE)
         }
 
-        obj_class <- paste(class(x), collapse = "/")
-
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
             if (.raven_meaningful_rownames(x)) {
@@ -327,8 +325,7 @@ local({
                                    "-", sample.int(.Machine$integer.max, 1L), ".arrow"))
 
         tryCatch(
-            .raven_write_arrow(df, path,
-                               schema_md = list("raven.object_class" = obj_class)),
+            .raven_write_arrow(df, path),
             error = function(e) {
                 stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
             })

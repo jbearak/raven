@@ -58,10 +58,6 @@ export type ColumnSchema = {
 
 export type ReaderSchema = {
     columns: ColumnSchema[];
-    /** `paste(class(x), collapse = "/")` of the original R object passed to
-     *  `View(x)` — slash-joined class chain. Absent when the Arrow file
-     *  came from a non-R producer (e.g. test fixtures). */
-    objectClass?: string;
 };
 
 export type GetRowsRequest = {
@@ -157,7 +153,6 @@ export class ArrowSliceReader {
             const ravenFieldsRaw = schemaMd?.get('raven.fields');
             const ravenFields: Record<string, Record<string, string>> =
                 ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
-            const objectClass = schemaMd?.get('raven.object_class') || undefined;
 
             // Pass 2: build the schema, sampling first-batch dictionaries for
             // dict-encoded columns.
@@ -203,7 +198,7 @@ export class ArrowSliceReader {
             return new ArrowSliceReader(
                 reader,
                 fh,
-                { columns: cols, objectClass },
+                { columns: cols },
                 nrow,
                 batchStarts,
             );
