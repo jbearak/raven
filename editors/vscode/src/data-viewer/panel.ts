@@ -26,7 +26,7 @@ import {
 } from './messages';
 import { computePermutation } from './sort';
 import { computeFilteredIndices } from './filter';
-import { computeHistogramForColumn } from './histograms';
+import { computeHistogramForColumn, isNumericArrowType } from './histograms';
 import { LayoutStore, schemaHash } from './layout-state';
 import { ToolbarState, ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
@@ -609,27 +609,44 @@ export class DataViewerPanel {
             case 'getHistogram': {
                 const reader = this.reader;
                 const ci = m.columnIndex;
-                // panel.ts is the trust boundary for webview messages: a bad
-                // index would throw deep in the column scan. Reply with empty
-                // bins for an out-of-range column rather than computing.
-                if (!Number.isInteger(ci) || ci < 0 || ci >= reader.schema.columns.length) {
-                    await this.webviewPanel.webview.postMessage({
-                        type: 'histogram',
-                        panelGeneration: gen,
-                        requestId: m.requestId,
-                        columnIndex: ci,
-                        bins: [],
-                    } satisfies ExtensionToWebview);
-                    return;
-                }
                 let bins = this.histogramCache.get(ci);
                 if (!bins) {
-                    bins = await computeHistogramForColumn(reader, ci);
-                    // A replace mid-scan swaps the reader; drop this result so a
-                    // histogram for the old dataset never lands under the new
-                    // generation or pollutes the new reader's cache.
-                    if (gen !== this.generation || reader !== this.reader) return;
-                    this.histogramCache.set(ci, bins);
+                    // panel.ts is the trust boundary for webview messages.
+                    // Only scan a valid, numeric column; an out-of-range or
+                    // non-numeric index (a malformed/future caller — the UI
+                    // gates on colKind) degrades to an empty histogram without
+                    // launching a wasted full-column scan. A decode error must
+                    // likewise still produce a reply — otherwise the webview's
+                    // in-flight marker for this column never clears and the
+                    // brush stays blank forever with no retry (unlike getRows,
+                    // a missing histogram reply is unrecoverable). All degrade
+                    // to "no brush". The whole-grid getRows path would also be
+                    // failing if a batch genuinely can't decode, and a decode
+                    // failure on a fixed Arrow file is deterministic, so the
+                    // empty result is cached below rather than re-scanning on
+                    // every popover reopen.
+                    const cols = reader.schema.columns;
+                    const scannable = Number.isInteger(ci) && ci >= 0 && ci < cols.length
+                        && isNumericArrowType(cols[ci].arrowType);
+                    if (!scannable) {
+                        bins = [];
+                    } else {
+                        try {
+                            bins = await computeHistogramForColumn(reader, ci);
+                        } catch {
+                            bins = [];
+                        }
+                    }
+                    // After the await: drop if the panel was disposed or the
+                    // dataset was swapped (mirrors the getRows handler) — no
+                    // reply is owed, the new generation's webview already
+                    // cleared its in-flight marker. A concurrent request for
+                    // the same column may have cached a result meanwhile;
+                    // first writer wins so a late error-[] never clobbers it.
+                    if (this.disposed || gen !== this.generation || reader !== this.reader) return;
+                    const existing = this.histogramCache.get(ci);
+                    if (existing) bins = existing;
+                    else this.histogramCache.set(ci, bins);
                 }
                 const reply: ExtensionToWebview = {
                     type: 'histogram',

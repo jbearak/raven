@@ -28,16 +28,23 @@ import type { HistogramBin } from './messages';
 
 const BIN_COUNT = 50;
 
+/** True for the Arrow types that produce a numeric histogram (the same
+ *  types `colKind` classifies as `numeric` / `labelledNumeric`). The host
+ *  uses this as a trust-boundary guard before launching an on-demand scan
+ *  for a webview-supplied column index. */
+export function isNumericArrowType(arrowType: string): boolean {
+    return arrowType.startsWith('Int')
+        || arrowType.startsWith('Uint')
+        || arrowType.startsWith('Float');
+}
+
 export async function computeNumericHistograms(
     reader: ArrowSliceReader,
 ): Promise<Record<number, HistogramBin[]>> {
     const out: Record<number, HistogramBin[]> = {};
     const schema = reader.schema.columns;
     for (let ci = 0; ci < schema.length; ci++) {
-        const t = schema[ci].arrowType;
-        if (!(t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'))) {
-            continue;
-        }
+        if (!isNumericArrowType(schema[ci].arrowType)) continue;
         out[ci] = await computeHistogramForColumn(reader, ci);
     }
     return out;

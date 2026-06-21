@@ -108,10 +108,10 @@ export const EMPTY_FILTER: FilterState = {
     labelsOnWhenFiltered: true,
 };
 
-/** Bin in a numeric column's precomputed histogram. Bins are
- *  uniform-width over `[min, max]` of the present values; NA / NaN
- *  rows are excluded from `count`. A column with no present values
- *  serializes to an empty array. */
+/** Bin in a numeric column's histogram (computed on demand; see the
+ *  `histogram` message). Bins are uniform-width over `[min, max]` of the
+ *  present values; NA / NaN rows are excluded from `count`. A column with
+ *  no present values serializes to an empty array. */
 export type HistogramBin = {
     lo: number;
     hi: number;

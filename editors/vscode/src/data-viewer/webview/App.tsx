@@ -65,6 +65,7 @@ import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
 import { FilterStrip } from './filter-strip';
 import { FilterPopover } from './filter-popover';
+import { colKind } from './filter-column-kind';
 import { useToolbarWrap } from './use-toolbar-wrap';
 
 type VscodeApi = {
@@ -1064,9 +1065,12 @@ export function App({
         if (ci === undefined) return;
         const col = columns[ci];
         if (!col) return;
-        const t = col.arrowType;
-        const isNumeric = t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float');
-        if (!isNumeric) return;
+        // Only columns that get a histogram brush in the popover. Gate on the
+        // same classifier the popover uses (colKind) so "shows a brush" and
+        // "fetches the bins" can never diverge — both numeric and labelled-
+        // numeric columns offer the between/histogram predicate.
+        const kind = colKind(col);
+        if (kind !== 'numeric' && kind !== 'labelledNumeric') return;
         if (histograms[ci] !== undefined) return;          // already cached
         if (histogramRequestedRef.current.has(ci)) return;  // request in flight
         histogramRequestedRef.current.add(ci);

@@ -252,6 +252,82 @@ describe('DataViewerPanel: filter round-trips', () => {
         expect(hist.bins.reduce((s: number, b: any) => s + b.count, 0)).toBe(5);
     });
 
+    test('getHistogram always replies (empty bins) when the column scan throws', async () => {
+        // A reply MUST be posted even on a decode failure, or the webview's
+        // in-flight marker for the column never clears and the brush stays
+        // blank forever with no retry. Degrade to no brush, never silence.
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        (reader as any).getBatch = () => { throw new Error('decode boom'); };
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 40,
+            columnIndex: 0,
+        });
+        await flush();
+
+        const hist = fakeWebview.posted.find(
+            m => m.type === 'histogram' && m.requestId === 40,
+        ) as any;
+        expect(hist).toBeDefined();
+        expect(hist.bins).toEqual([]);
+    });
+
+    test('getHistogram replies with empty bins for an out-of-range column index', async () => {
+        const { fakeWebview } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 41,
+            columnIndex: 9999,
+        });
+        await flush();
+
+        const hist = fakeWebview.posted.find(
+            m => m.type === 'histogram' && m.requestId === 41,
+        ) as any;
+        expect(hist).toBeDefined();
+        expect(hist.bins).toEqual([]);
+    });
+
+    test('getHistogram for a non-numeric column replies [] without scanning', async () => {
+        // Trust boundary: the UI only requests numeric/labelledNumeric columns
+        // (colKind gate), but a malformed/future caller must not trigger a
+        // wasted full-column scan that can only return [].
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        let getBatchCalls = 0;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = (i: number) => { getBatchCalls++; return origGetBatch(i); };
+
+        // tiny.arrow col 2 = s (Utf8) — not numeric, no histogram brush.
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 42,
+            columnIndex: 2,
+        });
+        await flush();
+
+        const hist = fakeWebview.posted.find(
+            m => m.type === 'histogram' && m.requestId === 42,
+        ) as any;
+        expect(hist).toBeDefined();
+        expect(hist.bins).toEqual([]);
+        expect(getBatchCalls).toBe(0);
+    });
+
     test('setFilters round-trip: filterStatus pending → filterApplied, then getRows returns matching rows', async () => {
         const { fakeWebview } = await setupPanel();
 
