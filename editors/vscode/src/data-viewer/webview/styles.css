@@ -115,11 +115,6 @@ body,
     box-shadow: 0 0 0 1px var(--vscode-focusBorder, #007fd4);
 }
 
-.toggle:disabled {
-    cursor: default;
-    opacity: 0.45;
-}
-
 .digits {
     flex: 0 0 auto;
     height: 26px;
