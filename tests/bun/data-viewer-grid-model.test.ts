@@ -3,13 +3,12 @@ import {
     buildGridColumns,
     buildVisibleGridColumns,
     clampColumnWidth,
-    describeHiddenColumnCount,
-    describeShape,
     describeVisibleRows,
     fitLeadingText,
     MAX_COLUMN_WIDTH_PX,
     MIN_COLUMN_WIDTH_PX,
     paddedRange,
+    pendingOperationLabels,
     rowMarkerWidth,
     visibleColumnIndices,
 } from '../../editors/vscode/src/data-viewer/webview/grid-model';
@@ -74,9 +73,15 @@ describe('React data-viewer grid model', () => {
     test('description helpers are stable', () => {
         expect(describeVisibleRows(1000, { start: 0, end: 25 }))
             .toBe('Showing 1-25 of 1,000');
-        expect(describeShape(1000, cols, 'data.frame')).toBe('1,000 rows x 3 columns | data.frame');
-        expect(describeHiddenColumnCount(0)).toBeNull();
-        expect(describeHiddenColumnCount(2)).toBe('2 columns hidden');
+    });
+
+    test('pendingOperationLabels lists active host operations', () => {
+        // The toolbar progress pills replace the old bottom status bar's
+        // "Sorting…"/"Filtering…" text. Both can be active at once.
+        expect(pendingOperationLabels(false, false)).toEqual([]);
+        expect(pendingOperationLabels(true, false)).toEqual(['Sorting…']);
+        expect(pendingOperationLabels(false, true)).toEqual(['Filtering…']);
+        expect(pendingOperationLabels(true, true)).toEqual(['Sorting…', 'Filtering…']);
     });
 
     test('describeVisibleRows shows Loading until the dataset arrives', () => {

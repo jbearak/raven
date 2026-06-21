@@ -52,9 +52,6 @@ side-by-side.
   Error: Can't `View()` an object of class `numeric`
   ```
 
-  The class is shown as `paste(class(x), collapse = "/")`, so an object with
-  multiple classes (e.g. a `tbl_df`) reports them joined with `/`.
-
 ## Triggering
 
 Call `View()` in a Raven-managed R terminal:
@@ -244,12 +241,12 @@ row values (column names and types can match while values differ).
 Set `raven.dataViewer.persistSort` to `false` to make every panel
 open unsorted.
 
-### Status bar
+### Sort indicator
 
-When a sort is active, the status bar appends `sorted by mpg ▲,
-cyl ▼` (truncated to four keys with a `+N more` suffix when needed).
-While the host is building a large permutation, the status bar shows
-`Sorting…`.
+The active sort keys appear as chips in the toolbar — one per key, in
+priority order. While the host is building a large permutation, a
+`Sorting…` pill appears beside the chips; it is the only progress cue,
+as the data viewer has no bottom status bar.
 
 ## Filtering
 
@@ -340,12 +337,12 @@ Filters across different columns are combined with AND — a row must satisfy
 all active filters to appear. At most one filter is allowed per column;
 adding a second filter for the same column replaces the first.
 
-### Status bar
+### Filter indicator
 
-When a filter is active, the status bar shows `filtered to N (X%)` — the
-count of rows passing all filters and the percentage of the full row count.
-The percentage is omitted in the 0–1 % and 99–100 % bands. While the host
-is rebuilding the filter index the status bar shows `Filtering…`.
+Active filters appear as chips in the toolbar. The row-count readout in
+the top-left reflects the filtered total — `Showing X-Y of N`, where `N`
+is the count of rows passing all filters. While the host is rebuilding the
+filter index a `Filtering…` pill appears beside the chips.
 
 ### Persistence
 

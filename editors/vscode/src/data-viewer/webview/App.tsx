@@ -43,13 +43,12 @@ import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
 import {
     buildGridColumns,
     buildVisibleGridColumns,
-    describeHiddenColumnCount,
-    describeShape,
     describeVisibleRows,
     fitLeadingText,
     HEADER_HEIGHT_PX,
     OVERSCAN_ROWS,
     paddedRange,
+    pendingOperationLabels,
     rowMarkerWidth,
     ROW_HEIGHT_PX,
     type VisibleRange,
@@ -82,7 +81,6 @@ type PersistedState = {
     settings: Settings;
     toolbar: ToolbarState;
     schemaHash: string;
-    objectClass?: string;
     visibleRange: VisibleRange;
     sort: SortState;
     filter: FilterState;
@@ -338,7 +336,6 @@ export function App({
     const [settings, setSettings] = useState<Settings>(restored?.settings ?? DEFAULT_SETTINGS);
     const [toolbar, setToolbar] = useState<ToolbarState>(restored?.toolbar ?? EMPTY_TOOLBAR);
     const [schemaHash, setSchemaHash] = useState(restored?.schemaHash ?? '');
-    const [objectClass, setObjectClass] = useState<string | undefined>(restored?.objectClass);
     const [visibleRange, setVisibleRange] = useState<VisibleRange>(restored?.visibleRange ?? { start: 0, end: 0 });
     const [cacheRevision, setCacheRevision] = useState(0);
     const [gridSelection, setGridSelection] = useState<GridSelection>(createEmptySelection);
@@ -406,38 +403,16 @@ export function App({
             chips: toolbarChipsRef,
             actions: toolbarActionsRef,
         },
-        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length, labelsHaveEffect, formatHasEffect],
+        // sortPending/filterPending are deps because the progress pills they
+        // drive widen the chip group, which can change whether it must wrap.
+        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length, sortPending, filterPending, labelsHaveEffect, formatHasEffect],
     );
-    /** Summary text appended to the status bar when a sort is active.
-     *  Truncates to 4 keys with an ellipsis so the bar never wraps; the
-     *  toolbar chip strip is the full picture. */
-    const sortStatusText = useMemo(() => {
-        if (sort.keys.length === 0) return '';
-        const MAX = 4;
-        const visible = sort.keys.slice(0, MAX).map(k => {
-            const col = columns[k.columnIndex];
-            const name = col?.name ?? `col ${k.columnIndex}`;
-            return `${name} ${k.direction === 'asc' ? '▲' : '▼'}`;
-        }).join(', ');
-        return sort.keys.length > MAX
-            ? `sorted by ${visible}, +${sort.keys.length - MAX} more`
-            : `sorted by ${visible}`;
-    }, [columns, sort]);
-    const filterStatusText = useMemo(() => {
-        if (nrowFiltered === undefined) return '';
-        const pctNum = nrow > 0 ? (100 * nrowFiltered) / nrow : 0;
-        // Omit the percentage in the noisy 0–1% and 99–100% bands.
-        const pct = pctNum <= 1 || pctNum >= 99 ? '' : ` (${pctNum.toFixed(1)}%)`;
-        return `filtered to ${nrowFiltered.toLocaleString()}${pct}`;
-    }, [nrowFiltered, nrow]);
-    const statusText = [
-        // While loading, the toolbar lead already shows "Loading…"; don't
-        // also show a misleading "0 rows x 0 columns" in the status bar.
-        loading ? '' : describeShape(nrow, columns, objectClass),
-        describeHiddenColumnCount(layout.hiddenColumns.length),
-        sortPending ? 'Sorting…' : sortStatusText,
-        filterPending ? 'Filtering…' : filterStatusText,
-    ].filter(Boolean).join(' | ');
+    /** Transient progress pills for the toolbar chip group. The data viewer
+     *  has no bottom status bar: the sort/filter chip strips carry the full
+     *  sort/filter picture, and the row-count lead carries the totals (and
+     *  "Loading…"). These pills are the only "working…" cue while the host
+     *  rebuilds a permutation/filter index on a large frame. */
+    const pendingLabels = pendingOperationLabels(sortPending, filterPending);
 
     const persistWebviewState = useCallback(() => {
         vscode.setState?.({
@@ -449,7 +424,6 @@ export function App({
             settings,
             toolbar,
             schemaHash,
-            objectClass,
             visibleRange,
             sort,
             filter,
@@ -466,7 +440,6 @@ export function App({
         settings,
         toolbar,
         schemaHash,
-        objectClass,
         visibleRange,
         sort,
         filter,
@@ -588,7 +561,6 @@ export function App({
         setLayout(m.layout);
         setDictionaries(m.dictionaries);
         setSchemaHash(m.schemaHash);
-        setObjectClass(m.objectClass);
         if (m.type === 'init') setSettings(m.settings);
         setToolbar(m.toolbar);
         setSort(m.sort);
@@ -1462,6 +1434,16 @@ export function App({
                         onRemove={onRemoveFilter}
                         onClearAll={onClearAllFilters}
                     />
+                    {pendingLabels.map(label => (
+                        <span
+                            key={label}
+                            className="toolbar-progress"
+                            role="status"
+                            aria-live="polite"
+                        >
+                            {label}
+                        </span>
+                    ))}
                 </div>
                 <div className="toolbar-actions" ref={toolbarActionsRef}>
                     {/* Labels/Format act on specific column kinds (factors &
@@ -1796,7 +1778,6 @@ export function App({
                 )}
             </div>
             {copyStatus && <div className={`toast toast-${copyStatus}`}>{copyStatusMsg}</div>}
-            <div className="status-bar">{statusText}</div>
         </div>
     );
 }

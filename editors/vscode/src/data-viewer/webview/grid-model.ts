@@ -89,14 +89,16 @@ export function describeVisibleRows(nrow: number, range: VisibleRange, loading =
     return `Showing ${start.toLocaleString()}-${end.toLocaleString()} of ${nrow.toLocaleString()}`;
 }
 
-export function describeShape(nrow: number, columns: readonly ColumnSchema[], objectClass?: string): string {
-    const shape = `${nrow.toLocaleString()} rows x ${columns.length.toLocaleString()} columns`;
-    return objectClass ? `${shape} | ${objectClass}` : shape;
-}
-
-export function describeHiddenColumnCount(hiddenCount: number): string | null {
-    if (hiddenCount <= 0) return null;
-    return hiddenCount === 1 ? '1 column hidden' : `${hiddenCount} columns hidden`;
+/** Labels for the host operations currently in progress, shown as transient
+ *  pills in the toolbar chip group. The data viewer has no bottom status bar;
+ *  this is the only progress cue for a multi-second sort/filter on a large
+ *  frame. Both can be active at once (a re-sort triggered while a filter index
+ *  rebuilds), so this returns a list rather than a single string. */
+export function pendingOperationLabels(sortPending: boolean, filterPending: boolean): string[] {
+    const out: string[] = [];
+    if (sortPending) out.push('Sorting…');
+    if (filterPending) out.push('Filtering…');
+    return out;
 }
 
 export function paddedRange(
