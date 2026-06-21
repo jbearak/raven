@@ -11,6 +11,9 @@ vsc-extension-quickstart.md
 **/.eslintrc.json
 **/*.map
 **/*.ts
+dist/knit/**
+icon.svg
+test-fixtures/**
 scripts/**
 .vscode-test.mjs
 package-lock.json
