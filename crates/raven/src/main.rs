@@ -14,7 +14,7 @@ use std::env;
 
 fn print_usage() {
     println!(
-        "raven {}, a static R Language Server.",
+        "raven {}, a static analyzer and language server for R.",
         env!("CARGO_PKG_VERSION")
     );
     print!(
