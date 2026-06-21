@@ -79,6 +79,17 @@ describe('React data-viewer grid model', () => {
         expect(describeHiddenColumnCount(2)).toBe('2 columns hidden');
     });
 
+    test('describeVisibleRows shows Loading until the dataset arrives', () => {
+        // Before init lands, nrow is 0 and the bare "Showing 0-0 of 0" reads
+        // as an empty/broken table; show that it is loading instead.
+        expect(describeVisibleRows(0, { start: 0, end: 0 }, true)).toBe('Loading…');
+        // loading wins even if a stale count is around (e.g. getState restore).
+        expect(describeVisibleRows(1000, { start: 0, end: 25 }, true)).toBe('Loading…');
+        // default (not loading) is unchanged.
+        expect(describeVisibleRows(0, { start: 0, end: 0 })).toBe('Showing 0-0 of 0');
+        expect(describeVisibleRows(0, { start: 0, end: 0 }, false)).toBe('Showing 0-0 of 0');
+    });
+
     test('toolbar effect detection still matches Raven column metadata', () => {
         expect(hasFormatEffect(cols)).toBe(true);
         expect(hasLabelsEffect(cols)).toBe(true);

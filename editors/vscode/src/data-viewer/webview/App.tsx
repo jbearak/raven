@@ -354,6 +354,12 @@ export function App({
     const [filterPending, setFilterPending] = useState(false);
     const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
     const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
+    /** True until the first init/replace lands. Until then nrow is 0 and the
+     *  row-count readout would say "Showing 0-0 of 0", which reads as an
+     *  empty/broken table; show "Loading…" instead. Starts false when we
+     *  restored a non-empty schema from getState (we already have something
+     *  to show). */
+    const [loading, setLoading] = useState<boolean>(!(restored?.columns && restored.columns.length > 0));
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
@@ -386,7 +392,7 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
-    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange);
+    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange, loading);
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale. */
@@ -422,7 +428,9 @@ export function App({
         return `filtered to ${nrowFiltered.toLocaleString()}${pct}`;
     }, [nrowFiltered, nrow]);
     const statusText = [
-        describeShape(nrow, columns, objectClass),
+        // While loading, the toolbar lead already shows "Loading…"; don't
+        // also show a misleading "0 rows x 0 columns" in the status bar.
+        loading ? '' : describeShape(nrow, columns, objectClass),
         describeHiddenColumnCount(layout.hiddenColumns.length),
         sortPending ? 'Sorting…' : sortStatusText,
         filterPending ? 'Filtering…' : filterStatusText,
@@ -596,6 +604,7 @@ export function App({
         }
         setFilterPending(false);
         if (m.filter.entries.length === 0) setNrowFiltered(undefined);
+        setLoading(false);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
