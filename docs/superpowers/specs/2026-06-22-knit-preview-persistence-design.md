@@ -54,18 +54,25 @@ Register a `WebviewPanelSerializer` for `raven.knitOutput`, and on restore
 **adopt** the orphaned old-session preview dir into the *current* session's
 preview path for that source. Adoption keeps the path model consistent: a
 later "Knit again" is a normal in-place update (same `rootDir`), not a
-`rootDir` change that would dispose-and-recreate the panel and confuse the
-existing refcount/disposal logic. Per-session isolation (which protects
-concurrent windows) is preserved.
+`rootDir` change that dispose-and-recreates the panel — and it folds the
+orphaned old-`sessionId` dir back into the session tree so it isn't left for
+the 7-day sweep. Per-session isolation (which protects concurrent windows) is
+preserved.
+
+(Note: the dispose-and-recreate branch in `showOrUpdate` is not itself a
+data-loss risk today — the knit pipeline pins the preview dir before writing
+and cancels any stale deletion after a successful write, so a re-knit that
+changes `rootDir` does not delete fresh output. Adoption's value is therefore
+path-consistency and orphan-avoidance, not race-avoidance.)
 
 Rejected alternatives:
 
 - **Leave artifacts in place, restore pointing at the old path.** Simpler, but
-  the restored panel reads from an orphaned old-`sessionId` dir; the first
-  "Knit again" writes to the new session dir → `rootDir` changes →
-  dispose-and-recreate, and the disposal handler (which computes the *current*
-  session's preview dir) can race to delete the freshly-written dir. Adoption
-  avoids this entire class of bug.
+  the restored panel reads from an orphaned old-`sessionId` dir that the 7-day
+  sweep eventually reclaims out from under a long-lived restored panel, and the
+  first "Knit again" changes `rootDir` (old session → new session), forcing an
+  unnecessary dispose-and-recreate. Adoption keeps everything in one session
+  tree.
 - **Relocate previews to `context.storageUri`.** Durable across reboot, but
   reboot is out of scope and this is the heaviest option (relocating `figure/`
   images, larger persistent storage footprint).
@@ -85,20 +92,31 @@ vscode.window.registerWebviewPanelSerializer('raven.knitOutput', {
 });
 ```
 
+- **Activation event.** Add `"onWebviewPanel:raven.knitOutput"` to
+  `editors/vscode/package.json` `activationEvents`. Without it, VS Code does
+  not activate the extension to restore a serialized panel on a cold restart,
+  and the serializer is never registered — the feature silently no-ops on
+  restart (it would still work on in-window reload, masking the bug).
 - The webview shell script (`knit-output.ts` / `buildShellHtml`) calls
   `acquireVsCodeApi().setState({ sourceFsPath, outputPath })` once on load so
   VS Code persists enough to reconstruct. (The shell already acquires the VS
   Code API for its `postMessage` calls; this adds a single `setState`.)
+  `sourceFsPath` is **not currently threaded** into `buildShellHtml` — thread
+  it `updateContent → buildShellHtml → inline <script>` alongside the existing
+  `outputPath` arg.
 - `state` shape: `{ sourceFsPath: string; outputPath: string }`. Validate
-  defensively on deserialize — if either field is missing or not a string,
-  render the "no longer available" placeholder (see §3).
+  defensively on deserialize — if either field is missing/not a string, **or**
+  `outputPath` does not resolve inside the `<tmp>/raven-knit/` tree (see §2
+  containment check), render the "no longer available" placeholder (see §3).
 - New static `KnitOutputPanel.restore(context, panel, state, output)`:
-  - Sets `panel.webview.options` to match `create()`'s options
-    (`enableScripts`, `enableFindWidget`, `retainContextWhenHidden`,
-    `localResourceRoots: [Uri.file(rootDir)]` where `rootDir =
-    dirname(adoptedOutputPath)`). `localResourceRoots` **can** be set in
-    `deserializeWebviewPanel` because the panel is handed to us before first
-    paint.
+  - Sets `panel.webview.options = { enableScripts: true, localResourceRoots:
+    [Uri.file(rootDir)] }` where `rootDir = dirname(adoptedOutputPath)`. Only
+    the `WebviewOptions` are settable post-construction; `enableFindWidget` and
+    `retainContextWhenHidden` are `WebviewPanelOptions` fixed at creation and
+    restored by VS Code from the serialized panel — do **not** try to assign
+    them to `webview.options` (no-op / type error). If VS Code does not restore
+    `retainContextWhenHidden`, the only consequence is the hidden-tab DOM is
+    rebuilt from disk on reveal, which is harmless here.
   - Performs artifact adoption (§2) to compute the live `outputPath`.
   - Registers the instance in `KnitOutputPanel.instances` keyed by
     `sourceUri.fsPath`, wires the same theme/config/font listeners and
@@ -121,27 +139,38 @@ the `knit/index.ts` deactivation disposable):
   Closed panels already self-clean via the existing
   `onDidDispose → requestPreviewDirDeletion` path, so the only `preview/` dirs
   left at shutdown are those backing panels still open — exactly the set we
-  must keep for restore.
+  must keep for restore. **This applies to both branches of
+  `cleanupCurrentSession`**: the workspace branch (`workspaceHash !== null`,
+  removes `sessionRoot`) and the single-file branch (`workspaceHash === null`,
+  walks every `workspaceHash/<sessionId>` dir). Both must switch from
+  "remove session root" to "remove only `export/` + empty scaffolding" when the
+  flag is on.
 - When `persistPreview` is `false`: today's behavior — remove the whole session
-  root immediately.
+  root immediately (both branches unchanged).
 
-**Adoption on restore** (new pure-ish helper, e.g.
-`adoptPreviewArtifacts(sourceFsPath, persistedOutputPath)` in
-`raven-knit-paths.ts` or a small new module):
+**Adoption on restore** (new helper in a small new module, e.g.
+`preview-persistence.ts`, keeping `raven-knit-paths.ts` free of `fs`-heavy
+logic — `adoptPreviewArtifacts(sourceFsPath, persistedOutputPath)`):
 
-1. Compute the current-session paths via `previewArtifactPaths(sourceFsPath)`
+1. **Containment check.** Reject unless `persistedOutputPath` resolves (via
+   `realpath`, reusing `isUnderContainmentRoot`) inside
+   `<tmp>/raven-knit/`. A corrupted or crafted persisted state must never drive
+   a `rename`/`rm` on an arbitrary directory. On rejection → "missing"
+   sentinel.
+2. Compute current-session paths via `previewArtifactPaths(sourceFsPath)`
    → `{ previewDir: newDir, htmlPath: newHtml }`.
-2. If `newHtml` already exists, use it as-is (a knit already ran this session;
-   nothing to adopt).
-3. Else if `persistedOutputPath` exists on disk: ensure `newDir`'s parent
-   exists, then `fs.rename(oldPreviewDir, newDir)` (where `oldPreviewDir =
-   dirname(persistedOutputPath)`). On `EXDEV` or any rename failure, fall back
-   to a recursive copy then best-effort remove of the source. `touch` `newDir`
-   (update mtime) so the >7-day stale sweep clock resets for the adopted dir.
-   Return the adopted html path (basename preserved — the basename derives from
-   the `.Rmd` name, which is stable across sessions).
-4. Else (no live artifact anywhere): return a sentinel indicating "missing", so
-   the caller renders the placeholder.
+3. **Guard against an in-progress / completed current-session knit.** If
+   `newDir` already exists (a knit ran or is running this session — VS Code may
+   deserialize a hidden panel lazily, after a re-knit has started), do **not**
+   adopt: return `newHtml` if it exists, else "missing". Never `rename`/copy
+   into an existing destination, and never adopt while the source op is busy.
+4. Else if `persistedOutputPath` exists: ensure `newDir`'s parent exists, then
+   `fs.rename(oldPreviewDir, newDir)` (`oldPreviewDir =
+   dirname(persistedOutputPath)`). On `EXDEV`/rename failure, fall back to
+   recursive copy + best-effort remove of the source. `touch` `newDir` so the
+   >7-day sweep clock resets. Return the adopted html path (basename derives
+   from the stable `.Rmd` name).
+5. Else: return "missing" → caller renders the placeholder.
 
 The basename of the html under `newDir` is recomputed from `sourceFsPath` via
 the same `previewArtifactPaths` logic, so adoption does not depend on parsing
@@ -167,25 +196,26 @@ the restore case.)
 
 ### 4. New setting `raven.knit.persistPreview`
 
-- Boolean, default `true`, resource-scoped (matches the other `raven.knit.*`
-  settings so it can be overridden per-folder).
-- Read live via `vscode.workspace.getConfiguration('raven.knit').get(
-  'persistPreview', true)` at the two decision points: serializer deserialize
-  and deactivation cleanup. Reading live (not cached at activation) means
-  toggling it off mid-session takes effect at the next deactivation, and the
-  deserialize guard handles the "turned off between sessions" case by disposing
-  the restored panel.
+- Boolean, default `true`. **`window` scope, not resource scope.** It is a
+  behavior flag, not a per-document value like the font settings, and the
+  deactivation-cleanup decision point has no source URI to resolve a
+  resource-scoped value against — a `window`-scoped setting reads cleanly with
+  a bare `getConfiguration('raven.knit').get('persistPreview', true)`.
+- Read live (not cached at activation) at the two decision points: serializer
+  deserialize and deactivation cleanup. Toggling it off mid-session takes
+  effect at the next deactivation; the deserialize guard handles the "turned
+  off between sessions" case by disposing the restored panel.
 - Wiring: add to `editors/vscode/package.json` `configuration` schema →
   regenerate the alphabetical settings index with
   `bun editors/vscode/scripts/generate-settings-reference.mjs` (the drift test
   `tests/bun/settings-reference.test.ts` gates this) → document in
   `docs/knit.md` settings table and `docs/settings-reference.md`.
-- **LSP wiring check:** this is a TS-side knit-pipeline setting read directly
-  via `getConfiguration`, not consumed by the Rust backend. During
-  implementation, confirm no knit setting flows through
-  `editors/vscode/src/initializationOptions.ts` / `SETTINGS_MAPPING`; if none
-  do, the three-place LSP-setting wiring from CLAUDE.md does not apply and only
-  the package.json + settings-reference + docs touchpoints are needed.
+- **LSP wiring: not needed (confirmed).** No `raven.knit.*` setting flows
+  through `editors/vscode/src/initializationOptions.ts` / `SETTINGS_MAPPING`
+  (verified — none of the knit settings appear there; they are read directly
+  via `getConfiguration` on the TS side). So the three-place LSP-setting wiring
+  from CLAUDE.md does not apply: only the package.json + settings-reference +
+  docs touchpoints are needed.
 
 ### 5. New command `Raven: Clean Up Knit Preview Cache` (`raven.knit.cleanupCache`)
 
@@ -203,10 +233,20 @@ the restore case.)
 - On completion, show an information notification reporting how many dirs /
   roughly how much space was freed (best-effort byte count, or just a count if
   sizing is too slow).
-- Concurrency caveat documented: with two windows on the same workspace, the
-  age threshold — not session ownership — is what protects the *other* window's
-  files, because session ownership cannot be determined cross-process. The
-  threshold makes this safe in practice.
+- **Concurrency caveat (honestly documented).** Session ownership cannot be
+  determined cross-process, so the age threshold — not ownership — is what
+  spares another window's files. The residual gap: a preview open in another
+  window, idle for longer than the threshold, can have its temp dir removed.
+  The severity is limited because that window's panel uses
+  `retainContextWhenHidden`, so the *running* panel keeps its rendered DOM in
+  memory and is unaffected; only a *future* restore of that panel would fall
+  back to the "knit again" placeholder. We accept this for a manual,
+  user-invoked command and document it in `docs/knit.md`.
+- **Optional hardening (deferred, flagged for the user).** If cross-window
+  restore-survival turns out to matter, a per-preview lease file (touched by
+  open panels on render/restore and on a modest interval) would let cleanup
+  distinguish "live elsewhere" from "orphaned" without relying on age. This
+  adds a per-panel timer; not built in v1 unless requested.
 
 ### 6. Untouched
 
@@ -252,13 +292,25 @@ settings index; `cargo fmt`/`clippy` unaffected (no Rust changes expected).
   behavior), the settings table (new `raven.knit.persistPreview` row), and a
   short entry for the new cleanup command.
 - `docs/settings-reference.md`: regenerated.
-- `editors/vscode/package.json`: command + setting contributions.
+- `editors/vscode/package.json`: `activationEvents` (`onWebviewPanel:raven.knitOutput`),
+  command contribution (`raven.knit.cleanupCache`), and the
+  `raven.knit.persistPreview` setting.
 
 ## Open implementation questions (resolve during build, not blocking)
 
-- Exact module home for the adoption + cleanup-selector helpers (extend
-  `raven-knit-paths.ts` vs a new `preview-persistence.ts`). Lean toward a new
-  small module to keep `raven-knit-paths.ts` free of `fs`-heavy logic.
 - Whether `setState` belongs in the existing shell script or a tiny added
   inline script block — pick whichever keeps the CSP nonce handling simplest.
 - The cleanup command's space-reporting fidelity (count vs bytes).
+
+## Review
+
+This spec was adversarially reviewed by Codex (2026-06-22). Incorporated:
+the missing `onWebviewPanel:` activation event (§1), the
+`WebviewOptions`/`WebviewPanelOptions` split (§1), `window`-scope for the
+setting (§4), the adoption guard against an in-progress current-session knit
+and the path-containment check (§2), the single-file-mode cleanup branch (§2),
+and `sourceFsPath` threading (§1). The cleanup cross-window concern (§5) was
+calibrated — the running panel is unaffected (`retainContextWhenHidden`), so
+the age-threshold approach is kept with the limitation documented and a
+lease-file hardening flagged as deferred. The overstated adoption-vs-race
+rationale was softened (the knit pipeline already guards that race).
