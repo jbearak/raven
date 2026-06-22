@@ -93,6 +93,18 @@ describe('buildShellHtml', () => {
         expect(html).toContain('outputPath: "/work/report.html"');
     });
 
+    test('escapes < in the setState path so a </script> in a path cannot break out', () => {
+        const html = buildShellHtml({
+            ...args('/work/weird</script><x>.html'),
+            sourceFsPath: '/work/weird</script><x>.Rmd',
+        });
+        // The raw closing-tag sequence must NOT appear inside the inline script.
+        const scriptStart = html.indexOf('<script nonce');
+        const script = html.slice(scriptStart);
+        expect(script).toContain('\\u003c/script>');
+        expect(script).not.toContain('</script><x>');
+    });
+
     test('skips setState when sourceFsPath is absent', () => {
         // Non-persistence callers (unit tests) omit sourceFsPath; the
         // guard means no useless restore record is stored.

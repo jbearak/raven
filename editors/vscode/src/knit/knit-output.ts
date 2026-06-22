@@ -305,6 +305,19 @@ function escapeHtml(s: string): string {
 }
 
 /**
+ * Serialize a (possibly user-controlled) string to a JS literal safe to
+ * embed inside an inline `<script>`. `JSON.stringify` does not escape
+ * `<`, so a value containing `</script>` (legal in a filesystem path)
+ * would otherwise terminate the script element early — both a breakage
+ * and an HTML-injection vector. Replacing each `<` with its `<` JS
+ * unicode escape keeps the literal valid JS while neutralizing
+ * `</script>` and `<!--`.
+ */
+function jsonForScript(value: string): string {
+    return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+/**
  * Build the outer-shell HTML for the Knit Preview webview.
  *
  * The shell is Raven-controlled and owns the CSP in `<head>`; the
@@ -710,8 +723,8 @@ export function buildShellHtml(args: {
       // built the shell — skip setState so we don't store a useless
       // record.
       var ravenRestoreState = {
-        sourceFsPath: ${JSON.stringify(sourceFsPath)},
-        outputPath: ${JSON.stringify(outputPath)},
+        sourceFsPath: ${jsonForScript(sourceFsPath)},
+        outputPath: ${jsonForScript(outputPath)},
       };
       if (ravenRestoreState.sourceFsPath) {
         try { vscode.setState(ravenRestoreState); } catch (e) { /* setState unavailable */ }

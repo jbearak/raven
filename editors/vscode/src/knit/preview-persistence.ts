@@ -133,15 +133,12 @@ export function adoptPreviewArtifacts(
     }
 
     // (4) Adopt the old-session dir if its artifact is still on disk.
+    // (When the persisted dir already IS the current path — e.g. the
+    // session id was unchanged on an in-process reload — its HTML would
+    // exist and step 2 has already returned 'reused'; so here the source
+    // and destination are always distinct.)
     if (io.existsSync(persistedOutputPath)) {
         const oldPreviewDir = path.dirname(persistedOutputPath);
-        // No-op guard: if the persisted dir already IS the current path
-        // (e.g. session id unchanged), there is nothing to move.
-        if (path.resolve(oldPreviewDir) === path.resolve(current.previewDir)) {
-            return io.existsSync(htmlPath)
-                ? { htmlPath, available: true, reason: 'reused' }
-                : { htmlPath, available: false, reason: 'missing-source' };
-        }
         // Move the old dir into the current-session path. This must never
         // throw out of restore: any filesystem failure (EXDEV with a
         // failed copy, EACCES, ENOSPC, …) degrades to the placeholder,
@@ -260,7 +257,9 @@ export async function listSessionDirs(root: string): Promise<SessionDirInfo[]> {
     } catch {
         return [];
     }
-    const out: SessionDirInfo[] = [];
+    // Collect the session dirs first, then compute their recencies
+    // concurrently — the per-session stat walks are independent.
+    const found: Array<{ path: string; sessionId: string }> = [];
     for (const wd of workspaceDirs) {
         if (!wd.isDirectory()) continue;
         const wdPath = path.join(root, wd.name);
@@ -272,13 +271,14 @@ export async function listSessionDirs(root: string): Promise<SessionDirInfo[]> {
         }
         for (const sd of sessDirs) {
             if (!sd.isDirectory()) continue;
-            const sPath = path.join(wdPath, sd.name);
-            out.push({
-                path: sPath,
-                sessionId: sd.name,
-                recencyMs: await sessionRecencyMs(sPath),
-            });
+            found.push({ path: path.join(wdPath, sd.name), sessionId: sd.name });
         }
     }
-    return out;
+    return Promise.all(
+        found.map(async (f) => ({
+            path: f.path,
+            sessionId: f.sessionId,
+            recencyMs: await sessionRecencyMs(f.path),
+        })),
+    );
 }
