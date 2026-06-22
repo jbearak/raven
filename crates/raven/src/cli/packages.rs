@@ -1480,29 +1480,69 @@ pub async fn run_build_embedded_base(args: BuildEmbeddedBaseArgs) -> Result<(), 
 /// Dispatch the `packages` subcommand group on its second token.
 pub async fn run(mut argv: impl Iterator<Item = String>) -> Result<(), String> {
     match argv.next().as_deref() {
+        Some("--help" | "help") => {
+            print_help();
+            Ok(())
+        }
         Some("update") => {
-            let args = parse_update_args(argv)?;
-            run_update(args).await
+            match parse_update_args(argv) {
+                Ok(args) => run_update(args).await,
+                Err(msg) if msg == "HELP" => {
+                    print_update_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some("freeze") => {
-            let args = parse_freeze_args(argv)?;
-            run_freeze(args).await
+            match parse_freeze_args(argv) {
+                Ok(args) => run_freeze(args).await,
+                Err(msg) if msg == "HELP" => {
+                    print_freeze_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some("fetch") => {
-            let args = parse_fetch_args(argv)?;
-            run_fetch(args).await
+            match parse_fetch_args(argv) {
+                Ok(args) => run_fetch(args).await,
+                Err(msg) if msg == "HELP" => {
+                    print_fetch_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some("build-shipped-db") => {
-            let args = parse_build_shipped_db_args(argv)?;
-            run_build_shipped_db(args).await
+            match parse_build_shipped_db_args(argv) {
+                Ok(args) => run_build_shipped_db(args).await,
+                Err(msg) if msg == "HELP" => {
+                    print_build_shipped_db_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some("build-embedded-base") => {
-            let args = parse_build_embedded_base_args(argv)?;
-            run_build_embedded_base(args).await
+            match parse_build_embedded_base_args(argv) {
+                Ok(args) => run_build_embedded_base(args).await,
+                Err(msg) if msg == "HELP" => {
+                    print_build_embedded_base_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some("validate-shipped-db") => {
-            let args = parse_validate_shipped_db_args(argv)?;
-            run_validate_shipped_db(args)
+            match parse_validate_shipped_db_args(argv) {
+                Ok(args) => run_validate_shipped_db(args),
+                Err(msg) if msg == "HELP" => {
+                    print_validate_shipped_db_help();
+                    Ok(())
+                }
+                Err(msg) => Err(msg),
+            }
         }
         Some(other) => Err(format!("unknown packages subcommand: {other}")),
         None => {
@@ -1523,7 +1563,105 @@ pub fn print_help() {
 [--runiverse-bioc DIR|dbdump.bson [--runiverse-bioc-min N]] [--seed names.db | --fresh] --output names.db \
 [--snapshot-date S] [--source S]\n  \
          raven packages build-embedded-base --reference-lib DIR [--output PATH]\n  \
-         raven packages validate-shipped-db names.db\n"
+         raven packages validate-shipped-db names.db\n\n\
+         Run `raven packages <subcommand> --help` for command-specific help.\n\
+         Docs: {}\n",
+        env!("CARGO_PKG_REPOSITORY")
+    );
+}
+
+pub fn print_fetch_help() {
+    println!(
+        "raven packages fetch — fetch package exports from r-universe\n\n\
+         Usage: raven packages fetch [OPTIONS]\n\n\
+         Produces .raven/packages.json from CRAN/Bioconductor r-universe metadata.\n\
+         Existing records are preserved and new records are added for packages the\n\
+         workspace uses but the file does not already cover.\n\n\
+         Options:\n  \
+         --missing-only              Skip packages already installed locally when R is available\n  \
+         --fail-on-missing           Exit non-zero if any used package cannot be resolved\n  \
+         --output PATH               Output path (default: .raven/packages.json)\n  \
+         --workspace DIR             Workspace root to scan (default: current directory)\n  \
+         --base-urls URL[,URL]       Ordered r-universe hosts\n  \
+         --help                      Print this help message\n\n\
+         Alias: raven fetch [OPTIONS]\n\
+         Docs: {}\n",
+        env!("CARGO_PKG_REPOSITORY")
+    );
+}
+
+pub fn print_freeze_help() {
+    println!(
+        "raven packages freeze — capture installed package exports\n\n\
+         Usage: raven packages freeze [OPTIONS]\n\n\
+         Writes .raven/packages.json from packages installed in the local R library.\n\
+         Commit this file when CI should use version-pinned package export metadata\n\
+         without downloading a broad database.\n\n\
+         Options:\n  \
+         --used                      Capture packages used by the workspace (default)\n  \
+         --installed, --all          Capture every installed package\n  \
+         --output PATH               Output path (default: .raven/packages.json)\n  \
+         --workspace DIR             Workspace root to scan (default: current directory)\n  \
+         --help                      Print this help message\n\n\
+         Alias: raven freeze [OPTIONS]\n\
+         Docs: {}\n",
+        env!("CARGO_PKG_REPOSITORY")
+    );
+}
+
+pub fn print_update_help() {
+    println!(
+        "raven packages update — download Raven's package symbol database\n\n\
+         Usage: raven packages update [YYYY-MM-DD | --base-url URL] [OPTIONS]\n\n\
+         Downloads names.db, Raven's broad CRAN/Bioconductor package symbol database.\n\
+         Use this in CI or local installs when R packages are not installed but Raven\n\
+         should still recognize exported package symbols.\n\n\
+         Options:\n  \
+         --base-url URL              Release asset base URL to download from\n  \
+         --dest-dir DIR              Destination directory for names.db\n  \
+         --help                      Print this help message\n\n\
+         Docs: {}\n",
+        env!("CARGO_PKG_REPOSITORY")
+    );
+}
+
+pub fn print_build_shipped_db_help() {
+    println!(
+        "raven packages build-shipped-db — maintainer package database builder\n\n\
+         Usage: raven packages build-shipped-db [OPTIONS] --output names.db\n\n\
+         Options:\n  \
+         --runiverse-cran PATH       CRAN r-universe dbdump BSON or package JSON directory\n  \
+         --runiverse-cran-min N      Minimum distinct CRAN packages required\n  \
+         --runiverse-bioc PATH       Bioconductor r-universe dbdump BSON or package JSON directory\n  \
+         --runiverse-bioc-min N      Minimum distinct Bioconductor packages required\n  \
+         --seed names.db             Prior database seed\n  \
+         --fresh, --no-seed          Build without a prior database seed\n  \
+         --output names.db           Output database path (required)\n  \
+         --snapshot-date S           Snapshot date recorded in provenance\n  \
+         --source S                  Source label recorded in provenance\n  \
+         --help                      Print this help message\n"
+    );
+}
+
+pub fn print_build_embedded_base_help() {
+    println!(
+        "raven packages build-embedded-base — maintainer embedded base table builder\n\n\
+         Usage: raven packages build-embedded-base --reference-lib DIR [OPTIONS]\n\n\
+         Options:\n  \
+         --reference-lib DIR         Reference R library containing base-priority packages (required)\n  \
+         --output PATH               Generated Rust source path\n  \
+         --help                      Print this help message\n"
+    );
+}
+
+pub fn print_validate_shipped_db_help() {
+    println!(
+        "raven packages validate-shipped-db — validate a names.db database\n\n\
+         Usage: raven packages validate-shipped-db names.db\n\n\
+         Opens and fully decodes a shipped database, checking container metadata,\n\
+         format compatibility, checksums, index bounds, and record count.\n\n\
+         Options:\n  \
+         --help                      Print this help message\n"
     );
 }
 
