@@ -55,6 +55,7 @@ pub fn parse_args(args: &mut impl Iterator<Item = String>) -> Result<AnalysisSta
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" => return Err("HELP".to_string()),
             "--csv" => csv = true,
             "--only" => {
                 let phase = args
@@ -87,6 +88,24 @@ pub fn parse_args(args: &mut impl Iterator<Item = String>) -> Result<AnalysisSta
     }
 
     Ok(AnalysisStatsArgs { path, csv, only })
+}
+
+pub fn print_help() {
+    println!(
+        "raven analysis-stats {} — profile workspace analysis phases
+
+Usage: raven analysis-stats <path> [OPTIONS]
+
+Loads a workspace and reports timing metrics for each analysis phase:
+scan, parse, metadata, scope, and packages.
+
+Options:
+  --csv                      Output results in CSV format
+  --only PHASE               Run only one phase (scan, parse, metadata, scope, packages)
+  --help                     Print this help message
+",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Run the analysis-stats command and return phase results.

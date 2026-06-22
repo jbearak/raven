@@ -43,11 +43,11 @@ mod tests {
     async fn packages_run_help_via_alias_argv_matches_nested() {
         // The alias `raven fetch --help` passes ["fetch", "--help"] to packages::run.
         // The nested `raven packages fetch --help` also passes ["fetch", "--help"] after skip(1).
-        // Both must return Err("HELP").
+        // Both must be handled directly by packages::run.
         let result = packages::run(["fetch", "--help"].into_iter().map(String::from)).await;
-        assert_eq!(result, Err("HELP".to_string()));
+        assert_eq!(result, Ok(()));
 
         let result = packages::run(["freeze", "--help"].into_iter().map(String::from)).await;
-        assert_eq!(result, Err("HELP".to_string()));
+        assert_eq!(result, Ok(()));
     }
 }

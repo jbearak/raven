@@ -54,6 +54,8 @@ freeze, fetch                Top-level aliases for raven packages freeze/fetch
 
 "#
     );
+    println!("Run `raven <command> --help` for command-specific help.");
+    println!("Docs: {}", env!("CARGO_PKG_REPOSITORY"));
 }
 
 #[tokio::main]
@@ -67,6 +69,10 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = argv.collect();
 
     match args.first().map(String::as_str) {
+        Some("help") => {
+            print_usage();
+            return Ok(());
+        }
         Some("analysis-stats") => {
             env_logger::init();
             let mut rest = args.into_iter().skip(1);
@@ -78,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         cli::analysis_stats::print_results(&results);
                     }
+                    return Ok(());
+                }
+                Err(e) if e == "HELP" => {
+                    cli::analysis_stats::print_help();
                     return Ok(());
                 }
                 Err(e) => {

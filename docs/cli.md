@@ -5,6 +5,8 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes).
 - `raven lint` — run the native **style** linter only.
 
+Run `raven`, `raven --help`, or `raven help` for top-level usage. Commands with options accept `--help`, including package-database commands such as `raven packages fetch --help` and the top-level aliases `raven fetch --help` / `raven freeze --help`.
+
 If your codebase imports any R packages — and it almost certainly does — Raven needs to know the symbols those packages export. Run `raven check` on the same machine where you run your R scripts and it reads them straight from your R installation.
 
 You may instead want to run Raven where R isn't installed — or where it is, but not all your packages are. The common case is an automated check on your pull requests: base images with R exist, but installing packages can take minutes or hours, expensive next to the moment `raven check` takes. So Raven can run without R: run `raven packages update && raven check`, where `raven packages update` downloads a database of known R packages. Or commit `raven packages freeze`, which writes your packages' exports — read from your local R install — into a `.raven/` file in your repository, so CI needs no download.
