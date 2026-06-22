@@ -108,9 +108,12 @@ suite('KnitOutputPanel.restore (serializer rebuild)', () => {
 
             const inst = KnitOutputPanel.getInstancesForTesting().get(src.fsPath);
             assert.ok(inst, 'instance still registered so Knit again works');
+            // Assert the placeholder-UNIQUE copy, not the toolbar's
+            // always-present "Knit again" button, so this discriminates the
+            // placeholder branch from a (wrongly) rendered content branch.
             assert.ok(
-                panel.webview.html.includes('Knit again'),
-                'placeholder points the user at the Knit again button',
+                panel.webview.html.includes('This preview is no longer available'),
+                'the knit-again placeholder body is shown',
             );
         } finally {
             output.dispose();
