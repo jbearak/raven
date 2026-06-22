@@ -108,7 +108,8 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-    await cleanupCurrentSession();
+    // Full teardown of the session root (persistPreview=false → remove all).
+    await cleanupCurrentSession(false);
     __resetSessionStateForTests();
 });
 
