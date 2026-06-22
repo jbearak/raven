@@ -387,7 +387,6 @@ export class KnitOutputPanel {
                 localResourceRoots: [vscode.Uri.file(rootDir)],
             },
         );
-        applyViewerTabIcon(panel, 'book');
         return KnitOutputPanel.wireAndRegister(context, panel, args, rootDir);
     }
 
@@ -429,6 +428,22 @@ export class KnitOutputPanel {
         }
 
         const sourceUri = vscode.Uri.file(sourceFsPath);
+
+        // A live panel for this source may already exist when the
+        // serializer fires (a knit completed during activation, or
+        // "Developer: Reload Webviews"). Keep the existing one as
+        // authoritative and drop the duplicate VS Code just handed us —
+        // registering the new one would orphan the old panel and its
+        // dispose handler. (`create` never hits this because `showOrUpdate`
+        // resolves any existing instance before calling it.)
+        const existing = KnitOutputPanel.instances.get(sourceUri.fsPath);
+        if (existing && !existing.disposed) {
+            const col = existing.panel.viewColumn ?? existing.lastKnownColumn;
+            existing.panel.reveal(col, true);
+            panel.dispose();
+            return;
+        }
+
         let current: { previewDir: string; htmlPath: string };
         try {
             const paths = previewArtifactPaths(sourceFsPath);
@@ -448,7 +463,6 @@ export class KnitOutputPanel {
             enableScripts: true,
             localResourceRoots: [vscode.Uri.file(rootDir)],
         };
-        applyViewerTabIcon(panel, 'book');
         if (!adopt.available) {
             output.appendLine(
                 `[restore] ${sourceFsPath}: no rendered artifact to restore ` +
@@ -482,6 +496,9 @@ export class KnitOutputPanel {
         rootDir: string,
     ): KnitOutputPanel {
         const key = args.sourceUri.fsPath;
+        // Tab icon is set here (the shared path) so `create` and `restore`
+        // can't drift on it.
+        applyViewerTabIcon(panel, 'book');
         const instance = new KnitOutputPanel(context, panel, rootDir, args);
         KnitOutputPanel.instances.set(key, instance);
 

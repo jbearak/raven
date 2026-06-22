@@ -5,6 +5,7 @@ import * as path from 'path';
 import {
     adoptPreviewArtifacts,
     selectStaleSessionDirs,
+    listSessionDirs,
     ravenKnitRoot,
     type AdoptIo,
     type SessionDirInfo,
@@ -211,6 +212,35 @@ describe('selectStaleSessionDirs', () => {
         expect(out.sort()).toEqual(
             ['/tmp/raven-knit/wh/stale1', '/tmp/raven-knit/wh/stale2'].sort(),
         );
+    });
+});
+
+describe('listSessionDirs', () => {
+    it('returns one entry per <workspaceHash>/<sessionId> dir with recency', async () => {
+        const root = fs.mkdtempSync(path.join(KNIT_ROOT, 'list-'));
+        fixtures.push(root);
+        // <root>/wh1/sessA/preview/h, <root>/wh1/sessB, <root>/wh2/sessC
+        const a = path.join(root, 'wh1', 'sessA', 'preview', 'h');
+        const b = path.join(root, 'wh1', 'sessB');
+        const c = path.join(root, 'wh2', 'sessC');
+        fs.mkdirSync(a, { recursive: true });
+        fs.writeFileSync(path.join(a, 'doc.html'), 'x');
+        fs.mkdirSync(b, { recursive: true });
+        fs.mkdirSync(c, { recursive: true });
+        // A stray file at the workspace level must be ignored.
+        fs.writeFileSync(path.join(root, 'wh1', 'stray.txt'), 'x');
+
+        const out = await listSessionDirs(root);
+        const ids = out.map((s) => s.sessionId).sort();
+        expect(ids).toEqual(['sessA', 'sessB', 'sessC']);
+        for (const s of out) {
+            expect(s.recencyMs).toBeGreaterThan(0);
+        }
+    });
+
+    it('returns [] when the root does not exist', async () => {
+        const out = await listSessionDirs(path.join(KNIT_ROOT, 'does-not-exist-xyz'));
+        expect(out).toEqual([]);
     });
 });
 

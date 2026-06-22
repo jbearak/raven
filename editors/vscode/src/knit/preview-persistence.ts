@@ -20,14 +20,12 @@
  */
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { isUnderContainmentRoot } from './raven-knit-paths';
+import { isUnderContainmentRoot, ravenKnitRoot } from './raven-knit-paths';
 
-/** Root under which every per-session knit artifact lives. */
-export function ravenKnitRoot(): string {
-    return path.join(os.tmpdir(), 'raven-knit');
-}
+// Re-exported so persistence callers can reach the knit-temp root without
+// also importing the path module. `raven-knit-paths` is the single owner.
+export { ravenKnitRoot };
 
 /**
  * The pair of paths a restore targets for a given source: the
@@ -144,23 +142,32 @@ export function adoptPreviewArtifacts(
                 ? { htmlPath, available: true, reason: 'reused' }
                 : { htmlPath, available: false, reason: 'missing-source' };
         }
-        io.mkdirSync(path.dirname(current.previewDir));
+        // Move the old dir into the current-session path. This must never
+        // throw out of restore: any filesystem failure (EXDEV with a
+        // failed copy, EACCES, ENOSPC, …) degrades to the placeholder,
+        // detected by the existsSync check below.
         try {
-            io.renameSync(oldPreviewDir, current.previewDir);
-        } catch {
-            // Cross-device (EXDEV) or other rename failure: copy then
-            // best-effort remove the source.
-            io.cpSync(oldPreviewDir, current.previewDir);
+            io.mkdirSync(path.dirname(current.previewDir));
             try {
-                io.rmSync(oldPreviewDir);
+                io.renameSync(oldPreviewDir, current.previewDir);
             } catch {
-                /* best-effort — source left behind, swept later */
+                // Cross-device (EXDEV) or other rename failure: copy then
+                // best-effort remove the source.
+                io.cpSync(oldPreviewDir, current.previewDir);
+                try {
+                    io.rmSync(oldPreviewDir);
+                } catch {
+                    /* best-effort — source left behind, swept later */
+                }
             }
+        } catch {
+            /* fall through — existsSync(htmlPath) below decides the outcome */
         }
-        io.touch(current.previewDir);
-        return io.existsSync(htmlPath)
-            ? { htmlPath, available: true, reason: 'adopted' }
-            : { htmlPath, available: false, reason: 'missing-source' };
+        if (io.existsSync(htmlPath)) {
+            io.touch(current.previewDir);
+            return { htmlPath, available: true, reason: 'adopted' };
+        }
+        return { htmlPath, available: false, reason: 'missing-source' };
     }
 
     return { htmlPath, available: false, reason: 'missing-source' };
@@ -201,4 +208,77 @@ export function selectStaleSessionDirs(args: {
         .filter((s) => s.sessionId !== args.currentSessionId)
         .filter((s) => args.nowMs - s.recencyMs > args.ageThresholdMs)
         .map((s) => s.path);
+}
+
+/**
+ * Recency (max mtime, ms) of a session dir and its immediate `preview/`
+ * children — so a session actively rendering in another window reads as
+ * recent even though the top-level dir mtime can lag behind writes that
+ * land inside `preview/<sourceHash>/`. Returns 0 when the dir is gone.
+ */
+export async function sessionRecencyMs(sessionPath: string): Promise<number> {
+    let max = 0;
+    try {
+        max = (await fs.promises.stat(sessionPath)).mtimeMs;
+    } catch {
+        /* ignore */
+    }
+    const previewDir = path.join(sessionPath, 'preview');
+    let entries: fs.Dirent[];
+    try {
+        entries = await fs.promises.readdir(previewDir, { withFileTypes: true });
+    } catch {
+        return max;
+    }
+    const childMtimes = await Promise.all(
+        entries.map(async (e) => {
+            try {
+                return (await fs.promises.stat(path.join(previewDir, e.name))).mtimeMs;
+            } catch {
+                return 0;
+            }
+        }),
+    );
+    for (const m of childMtimes) {
+        if (m > max) max = m;
+    }
+    return max;
+}
+
+/**
+ * Walk `<root>/<workspaceHash>/<sessionId>/` and return one
+ * `SessionDirInfo` per discovered session directory (with its recency).
+ * Shared by both reclaimers — the activation-time `sweepStaleSessions`
+ * and the manual `Raven: Clean Up Knit Preview Cache` — so they observe
+ * the same tree shape and recency definition and cannot drift. Returns
+ * `[]` when the root does not exist.
+ */
+export async function listSessionDirs(root: string): Promise<SessionDirInfo[]> {
+    let workspaceDirs: fs.Dirent[];
+    try {
+        workspaceDirs = await fs.promises.readdir(root, { withFileTypes: true });
+    } catch {
+        return [];
+    }
+    const out: SessionDirInfo[] = [];
+    for (const wd of workspaceDirs) {
+        if (!wd.isDirectory()) continue;
+        const wdPath = path.join(root, wd.name);
+        let sessDirs: fs.Dirent[];
+        try {
+            sessDirs = await fs.promises.readdir(wdPath, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const sd of sessDirs) {
+            if (!sd.isDirectory()) continue;
+            const sPath = path.join(wdPath, sd.name);
+            out.push({
+                path: sPath,
+                sessionId: sd.name,
+                recencyMs: await sessionRecencyMs(sPath),
+            });
+        }
+    }
+    return out;
 }

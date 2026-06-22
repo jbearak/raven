@@ -1,8 +1,6 @@
 import * as child_process from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands, runKnitWithExistingController } from './knit-commands';
@@ -20,9 +18,9 @@ import { registerExportCommands } from './export-commands';
 import { KnitOutputPanel } from './knit-output-panel';
 import { previewArtifactPaths } from './raven-knit-paths';
 import {
+    listSessionDirs,
     ravenKnitRoot,
     selectStaleSessionDirs,
-    type SessionDirInfo,
 } from './preview-persistence';
 import { isPandocVersionOutput } from './pandoc-probe';
 
@@ -84,7 +82,7 @@ export function registerKnit(
         });
         // Non-blocking sweep of orphaned sibling sessions. Best effort —
         // errors are swallowed inside `sweepStaleSessions`.
-        void sweepStaleSessions(path.join(os.tmpdir(), 'raven-knit'));
+        void sweepStaleSessions(ravenKnitRoot());
     }
 
     // One shared output channel for both knit and export. Two
@@ -259,40 +257,8 @@ function readPersistPreview(): boolean {
  * unit-tested; this function owns only the impure walk + removal.
  */
 async function cleanupPreviewCache(output: vscode.OutputChannel): Promise<void> {
-    const root = ravenKnitRoot();
     const currentSessionId = maybeCurrentSession()?.sessionId ?? '';
-
-    let workspaceDirs: import('fs').Dirent[];
-    try {
-        workspaceDirs = await fs.promises.readdir(root, { withFileTypes: true });
-    } catch {
-        void vscode.window.showInformationMessage(
-            'Raven: Knit — no preview cache to clean up.',
-        );
-        return;
-    }
-
-    const sessions: SessionDirInfo[] = [];
-    for (const wd of workspaceDirs) {
-        if (!wd.isDirectory()) continue;
-        const wdPath = path.join(root, wd.name);
-        let sessDirs: import('fs').Dirent[];
-        try {
-            sessDirs = await fs.promises.readdir(wdPath, { withFileTypes: true });
-        } catch {
-            continue;
-        }
-        for (const sd of sessDirs) {
-            if (!sd.isDirectory()) continue;
-            const sPath = path.join(wdPath, sd.name);
-            sessions.push({
-                path: sPath,
-                sessionId: sd.name,
-                recencyMs: await sessionRecencyMs(sPath),
-            });
-        }
-    }
-
+    const sessions = await listSessionDirs(ravenKnitRoot());
     const toRemove = selectStaleSessionDirs({
         sessions,
         currentSessionId,
@@ -318,37 +284,6 @@ async function cleanupPreviewCache(output: vscode.OutputChannel): Promise<void> 
             : `Raven: Knit — cleaned up ${removed} stale preview ` +
               `${removed === 1 ? 'directory' : 'directories'}.`,
     );
-}
-
-/**
- * Recency (max mtime, ms) of a session dir and its immediate `preview/`
- * children — so a session actively rendering in another window reads as
- * recent even though the top-level dir mtime can lag behind writes that
- * land inside `preview/<sourceHash>/`.
- */
-async function sessionRecencyMs(sessionPath: string): Promise<number> {
-    let max = 0;
-    try {
-        max = (await fs.promises.stat(sessionPath)).mtimeMs;
-    } catch {
-        /* ignore */
-    }
-    const previewDir = path.join(sessionPath, 'preview');
-    let entries: import('fs').Dirent[];
-    try {
-        entries = await fs.promises.readdir(previewDir, { withFileTypes: true });
-    } catch {
-        return max;
-    }
-    for (const e of entries) {
-        try {
-            const st = await fs.promises.stat(path.join(previewDir, e.name));
-            if (st.mtimeMs > max) max = st.mtimeMs;
-        } catch {
-            /* ignore */
-        }
-    }
-    return max;
 }
 
 /**
