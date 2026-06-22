@@ -52,8 +52,11 @@ suite('KnitOutputPanel.restore (serializer rebuild)', () => {
             createdPreviewDirs.push(current.previewDir);
             assert.ok(!fs.existsSync(current.htmlPath), 'precondition: no current artifact');
 
-            // Old-session dir with the same basename the current path expects.
-            const oldDir = fs.mkdtempSync(path.join(ravenKnitRoot(), 'restore-old-'));
+            // Old-session dir: its dir name must equal the current preview
+            // dir's name (the source hash) for the adopt guard to accept it.
+            const oldParent = fs.mkdtempSync(path.join(ravenKnitRoot(), 'restore-old-'));
+            const oldDir = path.join(oldParent, path.basename(current.previewDir));
+            fs.mkdirSync(oldDir, { recursive: true });
             const oldHtml = path.join(oldDir, path.basename(current.htmlPath));
             fs.writeFileSync(oldHtml, '<html><body>RESTORED-MARKER-7Q</body></html>', 'utf-8');
 

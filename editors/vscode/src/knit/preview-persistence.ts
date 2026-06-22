@@ -139,6 +139,16 @@ export function adoptPreviewArtifacts(
     // and destination are always distinct.)
     if (io.existsSync(persistedOutputPath)) {
         const oldPreviewDir = path.dirname(persistedOutputPath);
+        // Safety: only adopt a preview dir that belongs to THIS source.
+        // Its directory name is the source hash, which is identical to the
+        // current-session preview dir's name (same `.Rmd` → same hash,
+        // regardless of session/workspace). Containment alone would let a
+        // crafted or corrupt persisted path point at a whole session /
+        // workspace / other-source directory, which the move below would
+        // then relocate wholesale.
+        if (path.basename(oldPreviewDir) !== path.basename(current.previewDir)) {
+            return { htmlPath, available: false, reason: 'rejected-path' };
+        }
         // Move the old dir into the current-session path. This must never
         // throw out of restore: any filesystem failure (EXDEV with a
         // failed copy, EACCES, ENOSPC, …) degrades to the placeholder,
@@ -203,6 +213,12 @@ export function selectStaleSessionDirs(args: {
 }): string[] {
     return args.sessions
         .filter((s) => s.sessionId !== args.currentSessionId)
+        // Unknown recency (<= 0 — e.g. a stat that failed under fd
+        // pressure) means "don't know how old this is"; never delete it.
+        // Without this guard `nowMs - 0 > ageThresholdMs` is always true,
+        // so a transient stat failure on a live session would select it
+        // for removal.
+        .filter((s) => s.recencyMs > 0)
         .filter((s) => args.nowMs - s.recencyMs > args.ageThresholdMs)
         .map((s) => s.path);
 }
@@ -274,11 +290,21 @@ export async function listSessionDirs(root: string): Promise<SessionDirInfo[]> {
             found.push({ path: path.join(wdPath, sd.name), sessionId: sd.name });
         }
     }
-    return Promise.all(
-        found.map(async (f) => ({
-            path: f.path,
-            sessionId: f.sessionId,
-            recencyMs: await sessionRecencyMs(f.path),
-        })),
-    );
+    // Compute recencies in bounded batches: each session's stat walk
+    // opens several fds, so an unbounded fan-out over a large accumulated
+    // cache could exhaust the process fd limit (EMFILE).
+    const RECENCY_CONCURRENCY = 16;
+    const out: SessionDirInfo[] = [];
+    for (let i = 0; i < found.length; i += RECENCY_CONCURRENCY) {
+        const batch = found.slice(i, i + RECENCY_CONCURRENCY);
+        const resolved = await Promise.all(
+            batch.map(async (f) => ({
+                path: f.path,
+                sessionId: f.sessionId,
+                recencyMs: await sessionRecencyMs(f.path),
+            })),
+        );
+        out.push(...resolved);
+    }
+    return out;
 }

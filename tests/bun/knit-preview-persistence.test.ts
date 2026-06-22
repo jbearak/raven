@@ -56,26 +56,65 @@ describe('adoptPreviewArtifacts', () => {
         expect(fs.existsSync(old.htmlPath)).toBe(true);
     });
 
+    // The adopt move requires the old and current preview dirs to share a
+    // base name (the source hash). Build a realistic
+    // `<root>/preview/<hash>` pair for both sides.
+    function matchedPair(label: string): {
+        hash: string;
+        cur: { previewDir: string; htmlPath: string };
+        oldDir: string;
+        oldHtml: string;
+    } {
+        const hash = `h-${label}-${process.pid}-${Math.floor(performance.now())}`;
+        const curRoot = fs.mkdtempSync(path.join(KNIT_ROOT, `cur-${label}-`));
+        const oldRoot = fs.mkdtempSync(path.join(KNIT_ROOT, `old-${label}-`));
+        fixtures.push(curRoot, oldRoot);
+        const curDir = path.join(curRoot, 'preview', hash);
+        const oldDir = path.join(oldRoot, 'preview', hash);
+        fs.mkdirSync(oldDir, { recursive: true });
+        return {
+            hash,
+            cur: { previewDir: curDir, htmlPath: path.join(curDir, 'doc.html') },
+            oldDir,
+            oldHtml: path.join(oldDir, 'doc.html'),
+        };
+    }
+
     it('adopts the old dir when the current session has no output yet', () => {
-        // Current preview dir does NOT exist yet.
-        const curDir = path.join(KNIT_ROOT, `test-adopt-new-${process.pid}-${Math.floor(performance.now())}`);
-        const cur = { previewDir: curDir, htmlPath: path.join(curDir, 'doc.html') };
-        fixtures.push(curDir);
+        const { cur, oldDir, oldHtml } = matchedPair('adopt');
+        fs.writeFileSync(oldHtml, '<html>old</html>');
+        fs.mkdirSync(path.join(oldDir, 'figure'), { recursive: true });
+        fs.writeFileSync(path.join(oldDir, 'figure', 'p.png'), 'x');
 
-        const old = freshPreviewDir('adopt-old');
-        fs.writeFileSync(old.htmlPath, '<html>old</html>');
-        fs.mkdirSync(path.join(old.previewDir, 'figure'), { recursive: true });
-        fs.writeFileSync(path.join(old.previewDir, 'figure', 'p.png'), 'x');
-
-        const out = adoptPreviewArtifacts(cur, old.htmlPath);
+        const out = adoptPreviewArtifacts(cur, oldHtml);
         expect(out.reason).toBe('adopted');
         expect(out.available).toBe(true);
         expect(out.htmlPath).toBe(cur.htmlPath);
         // Artifacts now live at the current path, including figures.
         expect(fs.readFileSync(cur.htmlPath, 'utf-8')).toBe('<html>old</html>');
-        expect(fs.existsSync(path.join(curDir, 'figure', 'p.png'))).toBe(true);
+        expect(fs.existsSync(path.join(cur.previewDir, 'figure', 'p.png'))).toBe(true);
         // Old dir moved away.
-        expect(fs.existsSync(old.previewDir)).toBe(false);
+        expect(fs.existsSync(oldDir)).toBe(false);
+    });
+
+    it('rejects adopting a preview dir whose hash does not match this source', () => {
+        // Old artifact exists and is under the knit tree, but its preview
+        // dir name differs from the current source hash (a crafted/corrupt
+        // record, or another source's dir). Must NOT be moved.
+        const { cur } = matchedPair('mismatch-cur');
+        const otherRoot = fs.mkdtempSync(path.join(KNIT_ROOT, 'other-'));
+        fixtures.push(otherRoot);
+        const otherDir = path.join(otherRoot, 'preview', 'DIFFERENT-HASH');
+        fs.mkdirSync(otherDir, { recursive: true });
+        const otherHtml = path.join(otherDir, 'doc.html');
+        fs.writeFileSync(otherHtml, '<html>other</html>');
+
+        const out = adoptPreviewArtifacts(cur, otherHtml);
+        expect(out.reason).toBe('rejected-path');
+        expect(out.available).toBe(false);
+        // The other source's dir is untouched.
+        expect(fs.existsSync(otherHtml)).toBe(true);
+        expect(fs.existsSync(cur.previewDir)).toBe(false);
     });
 
     it('reports missing-source when the persisted artifact is gone', () => {
@@ -122,11 +161,8 @@ describe('adoptPreviewArtifacts', () => {
     });
 
     it('falls back to copy+remove when rename fails (EXDEV)', () => {
-        const curDir = path.join(KNIT_ROOT, `test-exdev-${process.pid}-${Math.floor(performance.now())}`);
-        const cur = { previewDir: curDir, htmlPath: path.join(curDir, 'doc.html') };
-        fixtures.push(curDir);
-        const old = freshPreviewDir('exdev-old');
-        fs.writeFileSync(old.htmlPath, '<html>old</html>');
+        const { cur, oldDir, oldHtml } = matchedPair('exdev');
+        fs.writeFileSync(oldHtml, '<html>old</html>');
 
         let renameCalled = false;
         let cpCalled = false;
@@ -144,13 +180,13 @@ describe('adoptPreviewArtifacts', () => {
             touch: () => { /* noop */ },
         };
 
-        const out = adoptPreviewArtifacts(cur, old.htmlPath, io);
+        const out = adoptPreviewArtifacts(cur, oldHtml, io);
         expect(renameCalled).toBe(true);
         expect(cpCalled).toBe(true);
         expect(out.reason).toBe('adopted');
         expect(out.available).toBe(true);
         expect(fs.readFileSync(cur.htmlPath, 'utf-8')).toBe('<html>old</html>');
-        expect(fs.existsSync(old.previewDir)).toBe(false);
+        expect(fs.existsSync(oldDir)).toBe(false);
     });
 });
 
@@ -176,6 +212,21 @@ describe('selectStaleSessionDirs', () => {
 
     it('protects sessions touched within the age threshold', () => {
         const sessions = [mk('other', 60 * 1000)]; // 1 min ago < 5 min
+        const out = selectStaleSessionDirs({
+            sessions,
+            currentSessionId: 'cur',
+            nowMs: now,
+            ageThresholdMs: threshold,
+        });
+        expect(out).toEqual([]);
+    });
+
+    it('spares sessions whose recency is unknown (<= 0)', () => {
+        // A stat that failed (e.g. EMFILE) yields recencyMs 0; that must
+        // never be read as "ancient" and deleted.
+        const sessions: SessionDirInfo[] = [
+            { path: '/tmp/raven-knit/wh/unknown', sessionId: 'unknown', recencyMs: 0 },
+        ];
         const out = selectStaleSessionDirs({
             sessions,
             currentSessionId: 'cur',
