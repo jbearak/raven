@@ -56,6 +56,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.knit.export.timeoutMs` | `120000` | integer (≥5000) | — | [knit](knit.md) | Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. |
 | `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit Preview output. |
 | `raven.knit.monospaceFontFamily` | `""` | string | — | [knit](knit.md) | Monospace font for both highlighted code chunks and bare output blocks in the Raven: Knit Preview output. |
+| `raven.knit.persistPreview` | `true` | boolean | — | [knit](knit.md) | Keep the Knit Preview panel across window reloads and VS Code restarts. |
 | `raven.knit.timeoutMs` | `600000` | integer (≥1000) | — | [knit](knit.md) | Hard timeout (milliseconds) for the Raven: Knit Preview subprocess. |
 | `raven.knit.workingDirectory` | `"document"` | `"document"` \| `"project"` \| `"current"` | — | [knit](knit.md) | Working directory used for knitr chunk evaluation (knitr::opts_knit$set(root.dir = ...)). |
 | `raven.linting.assignmentOperator` | `"<-"` | `"<-"` \| `"="` | `linting.assignmentOperator` | [linting](linting.md) | Preferred assignment operator. |

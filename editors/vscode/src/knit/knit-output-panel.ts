@@ -15,6 +15,8 @@ import {
     type ResolvedFonts,
 } from './render-html';
 import { inlineLocalImagesAsDataUrls } from './inline-images';
+import { previewArtifactPaths } from './raven-knit-paths';
+import { adoptPreviewArtifacts } from './preview-persistence';
 import { getKnitGrammarRegistry } from './post-knit-renderer';
 import {
     resolveActiveThemePalette,
@@ -374,7 +376,6 @@ export class KnitOutputPanel {
         rootDir: string,
         column: vscode.ViewColumn,
     ): KnitOutputPanel {
-        const key = args.sourceUri.fsPath;
         const panel = vscode.window.createWebviewPanel(
             'raven.knitOutput',
             'Knit Preview',
@@ -386,6 +387,117 @@ export class KnitOutputPanel {
                 localResourceRoots: [vscode.Uri.file(rootDir)],
             },
         );
+        return KnitOutputPanel.wireAndRegister(context, panel, args, rootDir);
+    }
+
+    /**
+     * Rebuild a panel that VS Code is restoring after a window
+     * reload/restart, from the `{ sourceFsPath, outputPath }` record the
+     * shell's `setState` persisted. Called by the
+     * `WebviewPanelSerializer` registered in `knit/index.ts` (which has
+     * already confirmed `raven.knit.persistPreview` is enabled — when it
+     * isn't, the serializer disposes the panel instead of calling here).
+     *
+     * The orphaned old-session artifact is adopted into the current
+     * session's preview path (`adoptPreviewArtifacts`) so a later "Knit
+     * again" is a normal in-place update. When nothing is left to adopt
+     * the panel still rebuilds, showing the "knit again" placeholder
+     * (`updateContent`'s read-failure branch) — the toolbar's Knit-again
+     * button only needs the source URI.
+     *
+     * VS Code does NOT persist `webview.options`, so `enableScripts` and
+     * `localResourceRoots` must be re-applied here. `enableFindWidget` /
+     * `retainContextWhenHidden` are `WebviewPanelOptions` (fixed at
+     * creation) and are restored by VS Code from the serialized panel —
+     * they cannot be set post-construction and are intentionally not
+     * touched here.
+     */
+    static async restore(
+        context: vscode.ExtensionContext,
+        panel: vscode.WebviewPanel,
+        state: unknown,
+        output: vscode.OutputChannel,
+    ): Promise<void> {
+        const s = (state ?? {}) as { sourceFsPath?: unknown; outputPath?: unknown };
+        const sourceFsPath = typeof s.sourceFsPath === 'string' ? s.sourceFsPath : '';
+        const persistedOutputPath = typeof s.outputPath === 'string' ? s.outputPath : '';
+        if (sourceFsPath.length === 0) {
+            // No source recorded — nothing actionable to restore.
+            panel.dispose();
+            return;
+        }
+
+        const sourceUri = vscode.Uri.file(sourceFsPath);
+
+        // A live panel for this source may already exist when the
+        // serializer fires (a knit completed during activation, or
+        // "Developer: Reload Webviews"). Keep the existing one as
+        // authoritative and drop the duplicate VS Code just handed us —
+        // registering the new one would orphan the old panel and its
+        // dispose handler. (`create` never hits this because `showOrUpdate`
+        // resolves any existing instance before calling it.)
+        const existing = KnitOutputPanel.instances.get(sourceUri.fsPath);
+        if (existing && !existing.disposed) {
+            const col = existing.panel.viewColumn ?? existing.lastKnownColumn;
+            existing.panel.reveal(col, true);
+            panel.dispose();
+            return;
+        }
+
+        let current: { previewDir: string; htmlPath: string };
+        try {
+            const paths = previewArtifactPaths(sourceFsPath);
+            current = { previewDir: paths.previewDir, htmlPath: paths.htmlPath };
+        } catch {
+            // Session state not initialized (shouldn't happen — registerKnit
+            // runs before the serializer can fire). Bail gracefully.
+            panel.dispose();
+            return;
+        }
+
+        const adopt = adoptPreviewArtifacts(current, persistedOutputPath);
+        const htmlPath = adopt.htmlPath;
+        const rootDir = path.dirname(htmlPath);
+        // Re-apply the WebviewOptions VS Code dropped on serialization.
+        panel.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [vscode.Uri.file(rootDir)],
+        };
+        if (!adopt.available) {
+            output.appendLine(
+                `[restore] ${sourceFsPath}: no rendered artifact to restore ` +
+                `(${adopt.reason}); showing the knit-again placeholder.`,
+            );
+        }
+        KnitOutputPanel.wireAndRegister(
+            context,
+            panel,
+            { sourceUri, outputPath: htmlPath, output },
+            rootDir,
+        );
+    }
+
+    /**
+     * Shared post-creation wiring for both `create` (fresh panel) and
+     * `restore` (serializer-rebuilt panel): construct the instance,
+     * register it in the per-source map, anchor the preview column,
+     * attach the view-state / dispose / theme / config listeners, and
+     * render the initial content. Keeping this in one place means the two
+     * entry points cannot drift in their lifecycle handling.
+     */
+    private static wireAndRegister(
+        context: vscode.ExtensionContext,
+        panel: vscode.WebviewPanel,
+        args: {
+            sourceUri: vscode.Uri;
+            outputPath: string;
+            output: vscode.OutputChannel;
+        },
+        rootDir: string,
+    ): KnitOutputPanel {
+        const key = args.sourceUri.fsPath;
+        // Tab icon is set here (the shared path) so `create` and `restore`
+        // can't drift on it.
         applyViewerTabIcon(panel, 'book');
         const instance = new KnitOutputPanel(context, panel, rootDir, args);
         KnitOutputPanel.instances.set(key, instance);
@@ -599,8 +711,14 @@ export class KnitOutputPanel {
             this.output.appendLine(
                 `[panel] read failed: ${err instanceof Error ? err.message : String(err)}`,
             );
-            htmlContent = '<!doctype html><html><body><p>Raven: Knit Preview — '
-                + 'could not read the rendered output. Use Open in Browser instead.'
+            // Reached both when a live render's `.html` is unreadable and
+            // when a restored panel has no artifact left to show. The
+            // toolbar (including Knit again) is rendered by the
+            // surrounding shell regardless, so point the user at it.
+            htmlContent = '<!doctype html><html><body style="font-family: var(--vscode-font-family); '
+                + 'padding: 1rem; color: var(--vscode-foreground);"><p>'
+                + 'This preview is no longer available. Press <strong>Knit again</strong> '
+                + '(the refresh button above) to regenerate it.'
                 + '</p></body></html>';
         }
         // Subresources in the rendered HTML (CSS, images, fonts)
@@ -638,6 +756,8 @@ export class KnitOutputPanel {
             cspSource: this.panel.webview.cspSource,
             outputPath: args.outputPath,
             nonce,
+            // Persisted into webview state for the serializer restore path.
+            sourceFsPath: this.sourceUri.fsPath,
             initialThemeApplied: KnitOutputPanel.readThemePreference(this.context),
             // Resolved palette is delivered out-of-band via
             // postMessage from `pushVscodeThemePalette` — the

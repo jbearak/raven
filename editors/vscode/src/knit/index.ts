@@ -1,8 +1,6 @@
 import * as child_process from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import * as vscode from 'vscode';
 import type { LanguageClient } from 'vscode-languageclient/node';
 import { registerKnitCommands, runKnitWithExistingController } from './knit-commands';
@@ -19,6 +17,11 @@ import { OperationRegistry } from './operation-controller';
 import { registerExportCommands } from './export-commands';
 import { KnitOutputPanel } from './knit-output-panel';
 import { previewArtifactPaths } from './raven-knit-paths';
+import {
+    listSessionDirs,
+    ravenKnitRoot,
+    selectStaleSessionDirs,
+} from './preview-persistence';
 import { isPandocVersionOutput } from './pandoc-probe';
 
 export { disposeKnitGrammarRegistryForDeactivation };
@@ -75,11 +78,11 @@ export function registerKnit(
             ?? null;
         initSessionState({ sessionId: crypto.randomUUID(), workspaceUri });
         context.subscriptions.push({
-            dispose: () => { void cleanupCurrentSession(); },
+            dispose: () => { void cleanupCurrentSession(readPersistPreview()); },
         });
         // Non-blocking sweep of orphaned sibling sessions. Best effort —
         // errors are swallowed inside `sweepStaleSessions`.
-        void sweepStaleSessions(path.join(os.tmpdir(), 'raven-knit'));
+        void sweepStaleSessions(ravenKnitRoot());
     }
 
     // One shared output channel for both knit and export. Two
@@ -136,6 +139,41 @@ export function registerKnit(
         },
     );
 
+    // Restore Knit Preview panels after a window reload/restart. VS Code
+    // calls `deserializeWebviewPanel` once per panel that was open when
+    // the window closed, handing back the `{ sourceFsPath, outputPath }`
+    // the shell persisted via `setState`. Gated live on
+    // `raven.knit.persistPreview`: when disabled we dispose the panel
+    // rather than restoring (covers "feature turned off between
+    // sessions"). Registered once per process — `registerKnit` is
+    // normally called once per activation, but the session-init guard
+    // above shows it can re-run in dev reloads, and a second serializer
+    // for the same view type would throw.
+    if (!knitSerializerRegistered) {
+        knitSerializerRegistered = true;
+        context.subscriptions.push(
+            vscode.window.registerWebviewPanelSerializer('raven.knitOutput', {
+                deserializeWebviewPanel: async (panel, state) => {
+                    if (!readPersistPreview()) {
+                        panel.dispose();
+                        return;
+                    }
+                    await KnitOutputPanel.restore(context, panel, state, knitOutput);
+                },
+            }),
+        );
+    }
+
+    // Manual cache reclaim. Removes orphaned per-session preview dirs
+    // left by prior windows/restarts. Safe with concurrent windows: it
+    // never touches the current session, nor any session touched within
+    // a short age threshold (a concurrent window may be live there).
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.knit.cleanupCache', () =>
+            cleanupPreviewCache(knitOutput),
+        ),
+    );
+
     // Export commands (Pandoc-driven HTML/PDF/Word). The resolver is
     // shared across export invocations so the once-per-session probe is
     // amortized; settings changes invalidate the cache.
@@ -187,6 +225,65 @@ export function registerKnit(
             KnitOutputPanel.notifyExportBusy(rmdAbsPath, busy);
         },
     });
+}
+
+/**
+ * Set once the WebviewPanelSerializer has been registered this process.
+ * `registerKnit` normally runs once per activation, but the session-init
+ * guard shows it can re-run in dev reloads; re-registering a serializer
+ * for the same view type throws.
+ */
+let knitSerializerRegistered = false;
+
+/** Age below which a non-current session dir is spared by cleanup. */
+const CLEANUP_AGE_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Read `raven.knit.persistPreview` live. Window-scoped (not resource-
+ * scoped) so it reads cleanly without a source URI — the deactivation
+ * cleanup path has no document to resolve a resource scope against.
+ */
+function readPersistPreview(): boolean {
+    return vscode.workspace
+        .getConfiguration('raven.knit')
+        .get<boolean>('persistPreview', true);
+}
+
+/**
+ * `Raven: Clean Up Knit Preview Cache` handler. Walks
+ * `<tmp>/raven-knit/<workspaceHash>/<sessionId>/`, computes each
+ * session's recency, and removes the stale orphans
+ * (`selectStaleSessionDirs`). The selection predicate is pure and
+ * unit-tested; this function owns only the impure walk + removal.
+ */
+async function cleanupPreviewCache(output: vscode.OutputChannel): Promise<void> {
+    const currentSessionId = maybeCurrentSession()?.sessionId ?? '';
+    const sessions = await listSessionDirs(ravenKnitRoot());
+    const toRemove = selectStaleSessionDirs({
+        sessions,
+        currentSessionId,
+        nowMs: Date.now(),
+        ageThresholdMs: CLEANUP_AGE_THRESHOLD_MS,
+    });
+
+    let removed = 0;
+    for (const p of toRemove) {
+        try {
+            await fs.promises.rm(p, { recursive: true, force: true });
+            removed++;
+        } catch (err) {
+            output.appendLine(
+                `[cleanup] failed to remove ${p}: ${(err as Error).message}`,
+            );
+        }
+    }
+
+    void vscode.window.showInformationMessage(
+        removed === 0
+            ? 'Raven: Knit — no stale preview directories to clean up.'
+            : `Raven: Knit — cleaned up ${removed} stale preview ` +
+              `${removed === 1 ? 'directory' : 'directories'}.`,
+    );
 }
 
 /**

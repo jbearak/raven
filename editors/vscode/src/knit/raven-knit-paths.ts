@@ -82,9 +82,19 @@ export function isUnderContainmentRoot(absPath: string, root: string): boolean {
     return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+/**
+ * Root under which every per-session knit artifact lives:
+ * `<os.tmpdir()>/raven-knit`. The single source of truth for this path —
+ * `sessionRoot`, the activation sweep, the deactivation cleanup, and the
+ * persistence helpers all derive from it.
+ */
+export function ravenKnitRoot(): string {
+    return path.join(os.tmpdir(), 'raven-knit');
+}
+
 /** Root of all per-session artifacts: `<tmp>/raven-knit/<workspaceHash>/<sessionId>/`. */
 export function sessionRoot(workspaceHash: string, sessionId: string): string {
-    return path.join(os.tmpdir(), 'raven-knit', workspaceHash, sessionId);
+    return path.join(ravenKnitRoot(), workspaceHash, sessionId);
 }
 
 /** `<sessionRoot>/preview/<sourceHash>/`. Stable per `.Rmd` for the session. */

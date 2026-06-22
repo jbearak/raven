@@ -16,7 +16,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { computeSourceHash, computeWorkspaceHash, sessionRoot } from './raven-knit-paths';
+import { computeSourceHash, computeWorkspaceHash, ravenKnitRoot, sessionRoot } from './raven-knit-paths';
+import { listSessionDirs, selectStaleSessionDirs } from './preview-persistence';
 
 export interface SessionInfo {
     sessionId: string;
@@ -76,63 +77,77 @@ export function __resetSessionStateForTests(): void {
     state = null;
 }
 
-export async function cleanupCurrentSession(): Promise<void> {
+/**
+ * Remove this session's temp artifacts at deactivation.
+ *
+ * When `persistPreview` is false (the feature is disabled) this removes
+ * the entire session root immediately — the historical behavior.
+ *
+ * When `persistPreview` is true, the open Knit Preview panels are about
+ * to be serialized by VS Code and restored on the next launch, so their
+ * `preview/<sourceHash>/` artifacts MUST survive. We therefore remove
+ * only the throwaway `export/` subtree and leave `preview/` in place.
+ * (Closed panels already self-clean their own `preview/<sourceHash>` dir
+ * via `KnitOutputPanel.onDidDispose → requestPreviewDirDeletion`, so the
+ * only preview dirs left at shutdown back panels that are still open —
+ * exactly the set restore needs.) Orphaned leftovers are reclaimed by
+ * `sweepStaleSessions` (>7 days) and the `Raven: Clean Up Knit Preview
+ * Cache` command.
+ */
+export async function cleanupCurrentSession(persistPreview: boolean): Promise<void> {
     if (!state) return;
     if (state.workspaceHash === null) {
         // Single-file mode — per-`.Rmd` parent-dir hashes were used.
         // We can't enumerate them at cleanup without keeping a registry,
         // so we sweep the whole sessionId by walking every workspaceHash
         // directory that contains our sessionId subdir. Best effort.
-        const knitRoot = path.join(require('os').tmpdir(), 'raven-knit');
+        const knitRoot = ravenKnitRoot();
         let workspaceDirs: string[];
         try { workspaceDirs = await fs.promises.readdir(knitRoot); } catch { return; }
         for (const wd of workspaceDirs) {
             const sessionPath = path.join(knitRoot, wd, state.sessionId);
-            try { await fs.promises.rm(sessionPath, { recursive: true, force: true }); } catch { /* ignore */ }
+            const target = persistPreview ? path.join(sessionPath, 'export') : sessionPath;
+            try { await fs.promises.rm(target, { recursive: true, force: true }); } catch { /* ignore */ }
         }
         return;
     }
     const root = sessionRoot(state.workspaceHash, state.sessionId);
+    const target = persistPreview ? path.join(root, 'export') : root;
     try {
-        await fs.promises.rm(root, { recursive: true, force: true });
+        await fs.promises.rm(target, { recursive: true, force: true });
     } catch {
         /* ignore — best effort */
     }
 }
 
 /**
- * Remove stale `<workspaceHash>/<sessionId>/` directories whose mtime is
- * older than `maxAgeMs`. Runs in the background at activation.
+ * Remove stale `<workspaceHash>/<sessionId>/` directories whose recency
+ * is older than `maxAgeMs`. Runs in the background at activation.
+ *
+ * Shares the `listSessionDirs` walk and the `selectStaleSessionDirs`
+ * predicate with the manual `Raven: Clean Up Knit Preview Cache` command
+ * so the two reclaimers observe the same tree shape and recency
+ * definition. The only differences are the threshold (7 days here vs a
+ * few minutes for the manual command) and that the sweep does not exclude
+ * a "current" session — at a 7-day threshold the freshly-created current
+ * session is never stale, so passing an empty current id is sufficient.
  */
 export async function sweepStaleSessions(
-    ravenKnitRoot: string,
+    knitRoot: string,
     maxAgeMs = 7 * 24 * 60 * 60 * 1000,
 ): Promise<void> {
-    let workspaceDirs: string[];
-    try {
-        workspaceDirs = await fs.promises.readdir(ravenKnitRoot);
-    } catch {
-        return;
-    }
-    const now = Date.now();
-    for (const wd of workspaceDirs) {
-        const wdPath = path.join(ravenKnitRoot, wd);
-        let sessions: string[];
+    const sessions = await listSessionDirs(knitRoot);
+    const stale = selectStaleSessionDirs({
+        sessions,
+        currentSessionId: '',
+        nowMs: Date.now(),
+        ageThresholdMs: maxAgeMs,
+    });
+    for (const p of stale) {
         try {
-            sessions = await fs.promises.readdir(wdPath);
+            await fs.promises.rm(p, { recursive: true, force: true });
         } catch {
-            continue;
-        }
-        for (const session of sessions) {
-            const sPath = path.join(wdPath, session);
-            try {
-                const stat = await fs.promises.stat(sPath);
-                if (now - stat.mtimeMs > maxAgeMs) {
-                    await fs.promises.rm(sPath, { recursive: true, force: true });
-                }
-            } catch {
-                /* ignore */
-            }
+            /* ignore */
         }
     }
 }
