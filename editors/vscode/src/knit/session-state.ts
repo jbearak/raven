@@ -76,7 +76,24 @@ export function __resetSessionStateForTests(): void {
     state = null;
 }
 
-export async function cleanupCurrentSession(): Promise<void> {
+/**
+ * Remove this session's temp artifacts at deactivation.
+ *
+ * When `persistPreview` is false (the feature is disabled) this removes
+ * the entire session root immediately — the historical behavior.
+ *
+ * When `persistPreview` is true, the open Knit Preview panels are about
+ * to be serialized by VS Code and restored on the next launch, so their
+ * `preview/<sourceHash>/` artifacts MUST survive. We therefore remove
+ * only the throwaway `export/` subtree and leave `preview/` in place.
+ * (Closed panels already self-clean their own `preview/<sourceHash>` dir
+ * via `KnitOutputPanel.onDidDispose → requestPreviewDirDeletion`, so the
+ * only preview dirs left at shutdown back panels that are still open —
+ * exactly the set restore needs.) Orphaned leftovers are reclaimed by
+ * `sweepStaleSessions` (>7 days) and the `Raven: Clean Up Knit Preview
+ * Cache` command.
+ */
+export async function cleanupCurrentSession(persistPreview: boolean = false): Promise<void> {
     if (!state) return;
     if (state.workspaceHash === null) {
         // Single-file mode — per-`.Rmd` parent-dir hashes were used.
@@ -88,13 +105,15 @@ export async function cleanupCurrentSession(): Promise<void> {
         try { workspaceDirs = await fs.promises.readdir(knitRoot); } catch { return; }
         for (const wd of workspaceDirs) {
             const sessionPath = path.join(knitRoot, wd, state.sessionId);
-            try { await fs.promises.rm(sessionPath, { recursive: true, force: true }); } catch { /* ignore */ }
+            const target = persistPreview ? path.join(sessionPath, 'export') : sessionPath;
+            try { await fs.promises.rm(target, { recursive: true, force: true }); } catch { /* ignore */ }
         }
         return;
     }
     const root = sessionRoot(state.workspaceHash, state.sessionId);
+    const target = persistPreview ? path.join(root, 'export') : root;
     try {
-        await fs.promises.rm(root, { recursive: true, force: true });
+        await fs.promises.rm(target, { recursive: true, force: true });
     } catch {
         /* ignore — best effort */
     }

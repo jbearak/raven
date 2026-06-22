@@ -19,6 +19,11 @@ import { OperationRegistry } from './operation-controller';
 import { registerExportCommands } from './export-commands';
 import { KnitOutputPanel } from './knit-output-panel';
 import { previewArtifactPaths } from './raven-knit-paths';
+import {
+    ravenKnitRoot,
+    selectStaleSessionDirs,
+    type SessionDirInfo,
+} from './preview-persistence';
 import { isPandocVersionOutput } from './pandoc-probe';
 
 export { disposeKnitGrammarRegistryForDeactivation };
@@ -75,7 +80,7 @@ export function registerKnit(
             ?? null;
         initSessionState({ sessionId: crypto.randomUUID(), workspaceUri });
         context.subscriptions.push({
-            dispose: () => { void cleanupCurrentSession(); },
+            dispose: () => { void cleanupCurrentSession(readPersistPreview()); },
         });
         // Non-blocking sweep of orphaned sibling sessions. Best effort —
         // errors are swallowed inside `sweepStaleSessions`.
@@ -136,6 +141,41 @@ export function registerKnit(
         },
     );
 
+    // Restore Knit Preview panels after a window reload/restart. VS Code
+    // calls `deserializeWebviewPanel` once per panel that was open when
+    // the window closed, handing back the `{ sourceFsPath, outputPath }`
+    // the shell persisted via `setState`. Gated live on
+    // `raven.knit.persistPreview`: when disabled we dispose the panel
+    // rather than restoring (covers "feature turned off between
+    // sessions"). Registered once per process — `registerKnit` is
+    // normally called once per activation, but the session-init guard
+    // above shows it can re-run in dev reloads, and a second serializer
+    // for the same view type would throw.
+    if (!knitSerializerRegistered) {
+        knitSerializerRegistered = true;
+        context.subscriptions.push(
+            vscode.window.registerWebviewPanelSerializer('raven.knitOutput', {
+                deserializeWebviewPanel: async (panel, state) => {
+                    if (!readPersistPreview()) {
+                        panel.dispose();
+                        return;
+                    }
+                    await KnitOutputPanel.restore(context, panel, state, knitOutput);
+                },
+            }),
+        );
+    }
+
+    // Manual cache reclaim. Removes orphaned per-session preview dirs
+    // left by prior windows/restarts. Safe with concurrent windows: it
+    // never touches the current session, nor any session touched within
+    // a short age threshold (a concurrent window may be live there).
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.knit.cleanupCache', () =>
+            cleanupPreviewCache(knitOutput),
+        ),
+    );
+
     // Export commands (Pandoc-driven HTML/PDF/Word). The resolver is
     // shared across export invocations so the once-per-session probe is
     // amortized; settings changes invalidate the cache.
@@ -187,6 +227,128 @@ export function registerKnit(
             KnitOutputPanel.notifyExportBusy(rmdAbsPath, busy);
         },
     });
+}
+
+/**
+ * Set once the WebviewPanelSerializer has been registered this process.
+ * `registerKnit` normally runs once per activation, but the session-init
+ * guard shows it can re-run in dev reloads; re-registering a serializer
+ * for the same view type throws.
+ */
+let knitSerializerRegistered = false;
+
+/** Age below which a non-current session dir is spared by cleanup. */
+const CLEANUP_AGE_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Read `raven.knit.persistPreview` live. Window-scoped (not resource-
+ * scoped) so it reads cleanly without a source URI — the deactivation
+ * cleanup path has no document to resolve a resource scope against.
+ */
+function readPersistPreview(): boolean {
+    return vscode.workspace
+        .getConfiguration('raven.knit')
+        .get<boolean>('persistPreview', true);
+}
+
+/**
+ * `Raven: Clean Up Knit Preview Cache` handler. Walks
+ * `<tmp>/raven-knit/<workspaceHash>/<sessionId>/`, computes each
+ * session's recency, and removes the stale orphans
+ * (`selectStaleSessionDirs`). The selection predicate is pure and
+ * unit-tested; this function owns only the impure walk + removal.
+ */
+async function cleanupPreviewCache(output: vscode.OutputChannel): Promise<void> {
+    const root = ravenKnitRoot();
+    const currentSessionId = maybeCurrentSession()?.sessionId ?? '';
+
+    let workspaceDirs: import('fs').Dirent[];
+    try {
+        workspaceDirs = await fs.promises.readdir(root, { withFileTypes: true });
+    } catch {
+        void vscode.window.showInformationMessage(
+            'Raven: Knit — no preview cache to clean up.',
+        );
+        return;
+    }
+
+    const sessions: SessionDirInfo[] = [];
+    for (const wd of workspaceDirs) {
+        if (!wd.isDirectory()) continue;
+        const wdPath = path.join(root, wd.name);
+        let sessDirs: import('fs').Dirent[];
+        try {
+            sessDirs = await fs.promises.readdir(wdPath, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const sd of sessDirs) {
+            if (!sd.isDirectory()) continue;
+            const sPath = path.join(wdPath, sd.name);
+            sessions.push({
+                path: sPath,
+                sessionId: sd.name,
+                recencyMs: await sessionRecencyMs(sPath),
+            });
+        }
+    }
+
+    const toRemove = selectStaleSessionDirs({
+        sessions,
+        currentSessionId,
+        nowMs: Date.now(),
+        ageThresholdMs: CLEANUP_AGE_THRESHOLD_MS,
+    });
+
+    let removed = 0;
+    for (const p of toRemove) {
+        try {
+            await fs.promises.rm(p, { recursive: true, force: true });
+            removed++;
+        } catch (err) {
+            output.appendLine(
+                `[cleanup] failed to remove ${p}: ${(err as Error).message}`,
+            );
+        }
+    }
+
+    void vscode.window.showInformationMessage(
+        removed === 0
+            ? 'Raven: Knit — no stale preview directories to clean up.'
+            : `Raven: Knit — cleaned up ${removed} stale preview ` +
+              `${removed === 1 ? 'directory' : 'directories'}.`,
+    );
+}
+
+/**
+ * Recency (max mtime, ms) of a session dir and its immediate `preview/`
+ * children — so a session actively rendering in another window reads as
+ * recent even though the top-level dir mtime can lag behind writes that
+ * land inside `preview/<sourceHash>/`.
+ */
+async function sessionRecencyMs(sessionPath: string): Promise<number> {
+    let max = 0;
+    try {
+        max = (await fs.promises.stat(sessionPath)).mtimeMs;
+    } catch {
+        /* ignore */
+    }
+    const previewDir = path.join(sessionPath, 'preview');
+    let entries: import('fs').Dirent[];
+    try {
+        entries = await fs.promises.readdir(previewDir, { withFileTypes: true });
+    } catch {
+        return max;
+    }
+    for (const e of entries) {
+        try {
+            const st = await fs.promises.stat(path.join(previewDir, e.name));
+            if (st.mtimeMs > max) max = st.mtimeMs;
+        } catch {
+            /* ignore */
+        }
+    }
+    return max;
 }
 
 /**

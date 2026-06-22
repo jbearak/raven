@@ -343,6 +343,16 @@ export function buildShellHtml(args: {
     outputPath: string;
     nonce: string;
     /**
+     * Absolute path of the source `.Rmd`. Persisted into the webview's
+     * `setState` (alongside `outputPath`) so the `WebviewPanelSerializer`
+     * can rebuild the panel after a window reload/restart: `outputPath`
+     * locates the (old-session) rendered artifact to adopt, and
+     * `sourceFsPath` is what "Knit again" and the current-session path
+     * computation need. Omitted/empty in unit tests that don't exercise
+     * persistence — `setState` is then skipped.
+     */
+    sourceFsPath?: string;
+    /**
      * Persisted theme-toggle state. Caller reads it from
      * `context.globalState` so the choice survives panel disposal /
      * recreation between knits.
@@ -390,6 +400,7 @@ export function buildShellHtml(args: {
         cspSource,
         outputPath,
         nonce,
+        sourceFsPath = '',
         initialThemeApplied,
         vscodeThemePaletteCss,
         vscodeFontFamiliesCss,
@@ -691,6 +702,20 @@ export function buildShellHtml(args: {
   <script nonce="${nonce}">
     (function () {
       const vscode = acquireVsCodeApi();
+      // Persist enough for the WebviewPanelSerializer to rebuild this
+      // panel after a window reload/restart: the source .Rmd path and
+      // the rendered HTML path. VS Code returns this object to
+      // \`deserializeWebviewPanel\` on the next launch. Empty
+      // sourceFsPath means a non-persistence caller (e.g. a unit test)
+      // built the shell — skip setState so we don't store a useless
+      // record.
+      var ravenRestoreState = {
+        sourceFsPath: ${JSON.stringify(sourceFsPath)},
+        outputPath: ${JSON.stringify(outputPath)},
+      };
+      if (ravenRestoreState.sourceFsPath) {
+        try { vscode.setState(ravenRestoreState); } catch (e) { /* setState unavailable */ }
+      }
       const iframe = document.getElementById('raven-knit-frame');
       const themeBtn = document.getElementById('raven-knit-theme');
       let loadFired = false;

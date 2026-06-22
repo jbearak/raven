@@ -82,6 +82,26 @@ describe('buildShellHtml', () => {
         expect(html).toContain('id="raven-knit-theme"');
     });
 
+    test('persists restore state via setState when sourceFsPath is given', () => {
+        const html = buildShellHtml({
+            ...args('/work/report.html'),
+            sourceFsPath: '/work/report.Rmd',
+        });
+        // The serializer-restore record must carry both fields.
+        expect(html).toContain('vscode.setState(ravenRestoreState)');
+        expect(html).toContain('sourceFsPath: "/work/report.Rmd"');
+        expect(html).toContain('outputPath: "/work/report.html"');
+    });
+
+    test('skips setState when sourceFsPath is absent', () => {
+        // Non-persistence callers (unit tests) omit sourceFsPath; the
+        // guard means no useless restore record is stored.
+        const html = buildShellHtml(args('/work/report.html'));
+        expect(html).toContain('sourceFsPath: ""');
+        // The guard `if (ravenRestoreState.sourceFsPath)` gates the call.
+        expect(html).toContain('if (ravenRestoreState.sourceFsPath)');
+    });
+
     test('open-in-browser renders visible in a local workspace', () => {
         // `isRemoteWorkspace` defaults to false; both the toolbar
         // button (icon-only after the icon-toolbar redesign) and the
@@ -620,14 +640,18 @@ describe('buildShellHtml', () => {
         expect(html).toContain("execCommand('copy')");
     });
 
-    test('theme toggle posts themeChanged message instead of using setState', () => {
-        // Persistence lives in the extension's globalState so the
-        // choice survives panel disposal/recreation across knits.
-        // The webview only posts a message; the extension writes.
+    test('theme toggle posts themeChanged message (persistence is host-side globalState)', () => {
+        // The theme-toggle choice lives in the extension's globalState so
+        // it survives panel disposal/recreation across knits; the webview
+        // only posts a message and the extension writes. (Note: the shell
+        // DOES use vscode.setState — but only to persist the
+        // serializer-restore record {sourceFsPath, outputPath}, never the
+        // theme choice. Those are separate concerns.)
         const html = buildShellHtml(args('/work/report.html'));
         expect(html).toContain("type: 'themeChanged'");
         expect(html).toMatch(/postMessage\(\s*\{\s*type:\s*['"]themeChanged['"]/);
-        expect(html).not.toContain('vscode.setState');
+        // The only setState call is the restore-record one.
+        expect(html).toContain('vscode.setState(ravenRestoreState)');
     });
 
     test('filename does not appear in the toolbar (panel title already shows it)', () => {

@@ -16,6 +16,17 @@ intentionally narrow:
   in one keystroke. Re-rendering only on demand keeps the preview
   deterministic (you decide when it changes) and avoids spurious
   re-renders while you're mid-edit.
+- The preview **persists across window reload/restart**. If a preview
+  panel is open when you reload the window or quit and reopen VS Code,
+  Raven restores it automatically showing the **last rendered output** —
+  no re-knit, no R subprocess. The restored panel is a static snapshot
+  of the previous render; press **Knit again** to refresh it. This is
+  controlled by `raven.knit.persistPreview` (default on); disable it to
+  go back to the previous behavior, where the panel disappears on reload
+  and its temp files are removed immediately. Surviving a machine reboot
+  is out of scope — the OS may clear the temp directory. If a restored
+  preview's temp files are gone (swept, or cleaned up), the panel shows a
+  "press Knit again" placeholder.
 - The preview is saved to a per-session temp directory under
   `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
   so the `.Rmd`'s own directory stays clean. Export commands write the
@@ -258,9 +269,26 @@ when an `.Rmd` file is open.
     `<sessionId>` is a UUID generated at extension activation so two
     VS Code windows on the same workspace are isolated, and
     `<sourceHash>` is a SHA-256 of the `.Rmd`'s absolute path. The
-    whole directory is removed when the panel is disposed; the entire
-    session subtree is removed when VS Code exits. Stale sibling
-    sessions (>7 days) are swept on activation.
+    whole `preview/<sourceHash>` directory is removed when its panel is
+    disposed (closed). What happens at window exit depends on
+    `raven.knit.persistPreview`:
+
+    - **On (default)** — the `preview/` artifacts of panels that are
+      still open are **kept** so they can be restored on the next launch
+      (only the throwaway `export/` subtree is removed). On restore,
+      Raven adopts that old-session `preview/<sourceHash>` directory into
+      the new session's tree, so a later **Knit again** is a normal
+      in-place update. Orphaned leftovers (a window closed and never
+      reopened) are reclaimed by the >7-day sweep and by **Raven: Clean
+      Up Knit Preview Cache**.
+    - **Off** — the entire session subtree is removed when VS Code exits,
+      as before.
+
+    Stale sibling sessions (>7 days) are swept on activation regardless.
+    **Raven: Clean Up Knit Preview Cache** reclaims orphaned session
+    directories on demand; it never touches the current session, nor any
+    session written within the last few minutes (so a preview open in a
+    concurrent window on the same workspace is spared).
 
 ## Exporting
 
@@ -333,6 +361,7 @@ template fidelity, run `rmarkdown::render(...)` in the R console.
 | `raven.rConsole.activation` | `auto` | Gates the knit command (and the R console / plot / data viewers / chunk run commands). |
 | `raven.knit.workingDirectory` | `document` | `document` / `project` / `current`. |
 | `raven.knit.timeoutMs` | `600000` | Hard timeout (ms) for the knit R subprocess. |
+| `raven.knit.persistPreview` | `true` | Keep the Knit Preview panel across window reload/restart (restores the last rendered output without re-knitting). Disable to drop previews and their temp files on window close. |
 | `raven.knit.export.timeoutMs` | `120000` | Hard timeout (ms) for the Pandoc subprocess during export. |
 | `raven.knit.fontFamily` | `""` | Body/prose font for the preview. Empty inherits `markdown.preview.fontFamily`. |
 | `raven.knit.monospaceFontFamily` | `""` | Monospace font for code chunks and output. Empty inherits `editor.fontFamily`. |
