@@ -177,7 +177,7 @@ raven lint [OPTIONS] [PATHS...]
 - uses: jbearak/setup-raven@v1
   with:
     version: latest
-- run: raven lint R/ tests/
+- run: raven lint .
 ```
 
 ### Scope

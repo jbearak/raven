@@ -1,7 +1,9 @@
 # Design: `setup-raven` GitHub Action
 
 **Date:** 2026-06-23
-**Status:** Draft plan for PR implementation and extraction.
+**Status:** Implemented. Action extracted to `jbearak/setup-raven` and tagged
+`v1`; this repo's dogfood workflow now consumes `jbearak/setup-raven@v1` as a
+drift smoke test (section 7 step 4 complete).
 
 ---
 

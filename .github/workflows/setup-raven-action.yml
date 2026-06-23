@@ -1,10 +1,17 @@
 name: Setup Raven Action
 
+# Integration smoke test for the external jbearak/setup-raven action: verifies
+# it can still install Raven's own latest release on every supported runner,
+# catching asset-naming/mapping drift between this repo's releases and the
+# action. The action's own source and tests live in jbearak/setup-raven.
+
 on:
   pull_request:
     paths:
-      - ".github/actions/setup-raven/**"
       - ".github/workflows/setup-raven-action.yml"
+  schedule:
+    # Weekly, so release-asset drift is caught even without a PR touching this file.
+    - cron: "0 12 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -20,9 +27,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - uses: ./.github/actions/setup-raven
+      - uses: jbearak/setup-raven@v1
         with:
           version: latest
 
