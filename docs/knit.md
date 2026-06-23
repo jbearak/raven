@@ -47,6 +47,11 @@ using whichever R / Python / SQL / Bash grammar your installed VS
 Code extensions contribute, with Raven's `function` semantic-token
 overlay layered on top of R blocks.
 
+While you edit the source `.Rmd` (or `.qmd`), VS Code's **Outline**
+view and breadcrumbs reflect the document's Markdown heading structure —
+the same structure the preview renders — so you can navigate the document
+as you preview it. See [docs/document-outline.md](document-outline.md).
+
 See [docs/coexistence.md](coexistence.md) for the surfaces Raven
 defers to other extensions (most notably `quarto.quarto`). The R and
 R Markdown grammars are vendored from REditorSupport upstream and ship

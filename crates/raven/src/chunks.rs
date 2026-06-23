@@ -501,6 +501,167 @@ pub fn position_in_r_chunk_body(text: &str, line: u32) -> bool {
     false
 }
 
+/// A prose Markdown heading detected in an R Markdown / Quarto document.
+///
+/// Surfaced in the document outline (see `SymbolExtractor::extract_markdown_headings`)
+/// so the rendered document's heading structure — the same structure the Knit
+/// Preview shows — appears in VS Code's Outline view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownHeading {
+    /// 0-based line index of the heading.
+    pub line: u32,
+    /// ATX heading level: 1 (`#`) through 6 (`######`).
+    pub level: u32,
+    /// Heading text, with the leading `#` run, any closing `#` sequence, and
+    /// surrounding whitespace removed. Never empty (empty-title headings are
+    /// dropped).
+    pub title: String,
+}
+
+/// Detect prose (ATX) Markdown headings in raw R Markdown / Quarto text.
+///
+/// Only headings in *prose* are returned: lines inside leading YAML front
+/// matter and inside fenced code blocks (both ` ```{r} ` chunks and generic
+/// ` ``` ` / `~~~` blocks) are skipped, so a `#` comment inside code never
+/// becomes a phantom heading. This intentionally complements [`mask_to_r`],
+/// which keeps R chunk bodies and blanks prose; here we keep prose headings and
+/// skip code.
+///
+/// Heading recognition follows CommonMark ATX rules: 1–6 leading `#` (after up
+/// to 3 spaces of indentation) must be followed by a space/tab or end of line
+/// (so `#hashtag` is not a heading), an optional trailing `#` closing sequence
+/// is stripped only when preceded by whitespace, and empty-title headings are
+/// dropped. Setext (underline) headings are not recognized.
+///
+/// Fence tracking mirrors [`detect_rmd_chunks`]'s close rules — a closing fence
+/// must use the same character as its opener, be at least as long, and carry no
+/// info string — so the two stay aligned on tilde/backtick and unclosed-to-EOF
+/// behavior. An unclosed fence runs to end of document.
+pub fn detect_markdown_headings(text: &str) -> Vec<MarkdownHeading> {
+    // BOM-tolerant, column-0 scan: matching anchors at column 0 (after ≤3
+    // spaces). Reported positions are line numbers only, so the stripped
+    // first line is safe here. #346.
+    let lines = crate::utf16::lines_for_column0_scan(text);
+    let n = lines.len();
+
+    // Skip a leading YAML frontmatter block, mirroring the contract in
+    // `frontmatter_declares_params`: the first non-empty line must be exactly
+    // `---`, and the block ends at the next `---`/`...`. An unterminated block
+    // is not treated as frontmatter (scan from the top), matching that sniff.
+    let mut scan_start = 0usize;
+    let mut first_non_empty = 0usize;
+    while first_non_empty < n && lines[first_non_empty].trim().is_empty() {
+        first_non_empty += 1;
+    }
+    if first_non_empty < n && lines[first_non_empty].trim() == "---" {
+        for (j, line) in lines.iter().enumerate().skip(first_non_empty + 1) {
+            let t = line.trim();
+            if t == "---" || t == "..." {
+                scan_start = j + 1;
+                break;
+            }
+        }
+    }
+
+    let mut headings = Vec::new();
+    let mut fence: Option<(char, usize)> = None; // (fence char, opening length)
+
+    for (idx, &line) in lines.iter().enumerate().skip(scan_start) {
+        if let Some((ch, len, has_info)) = fence_marker(line) {
+            match fence {
+                // A closing fence: same character, at least as long, no info string.
+                Some((open_ch, open_len)) if ch == open_ch && len >= open_len && !has_info => {
+                    fence = None;
+                }
+                Some(_) => {} // a fence-looking line inside a different fence stays content
+                None => fence = Some((ch, len)),
+            }
+            continue; // fence lines are never headings
+        }
+        if fence.is_some() {
+            continue;
+        }
+        if let Some((level, title)) = parse_atx_heading(line) {
+            headings.push(MarkdownHeading {
+                line: idx as u32,
+                level,
+                title,
+            });
+        }
+    }
+
+    headings
+}
+
+/// Classify a line as a Markdown code-fence marker: a run of ≥3 backticks or
+/// tildes at column 0. Returns the fence character, the run length, and whether
+/// a non-whitespace info string follows (a closing fence must have none).
+///
+/// Fences are recognized only at column 0, matching [`detect_rmd_chunks`]
+/// (`fence_header_re`/`fence_close_re` both anchor at column 0). Keeping the two
+/// detectors aligned means heading detection and chunk-range detection never
+/// disagree about where a fenced block opens or closes — e.g. an indented ```
+/// closes neither, so both let the fence run on rather than one treating the
+/// following text as prose and the other as code.
+fn fence_marker(line: &str) -> Option<(char, usize, bool)> {
+    let first = line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = line.chars().take_while(|&c| c == first).count();
+    if run < 3 {
+        return None;
+    }
+    // `first` is a single-byte ASCII char, so `run` bytes index the rest safely.
+    let has_info = !line[run..].trim().is_empty();
+    Some((first, run, has_info))
+}
+
+/// Parse a line as an ATX Markdown heading, returning `(level, title)` when it
+/// is one with a non-empty title. Follows CommonMark: ≤3 spaces of indentation,
+/// 1–6 `#`, a required space/tab (or end of line) after the `#` run, and an
+/// optional trailing `#` closing sequence stripped only when whitespace-separated.
+fn parse_atx_heading(line: &str) -> Option<(u32, String)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None; // 4+ spaces is an indented code block, not a heading
+    }
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let after = &trimmed[hashes..]; // '#' is single-byte ASCII
+    // The `#` run must be followed by whitespace or end of line.
+    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let content = after.trim_matches([' ', '\t']);
+    let title = strip_closing_hashes(content).trim_matches([' ', '\t']);
+    if title.is_empty() {
+        return None;
+    }
+    Some((hashes as u32, title.to_string()))
+}
+
+/// Strip a trailing ATX closing sequence (`#`s) from heading content. The
+/// closing sequence is removed only when it is whitespace-separated from the
+/// content or constitutes the entire content; otherwise the `#`s are content
+/// (e.g. `bar#`).
+fn strip_closing_hashes(content: &str) -> &str {
+    let without = content.trim_end_matches('#');
+    if without.len() == content.len() {
+        return content; // no trailing '#'
+    }
+    if without.is_empty() {
+        return ""; // content was only '#'s
+    }
+    if without.ends_with([' ', '\t']) {
+        return without.trim_end_matches([' ', '\t']);
+    }
+    content // trailing '#' not whitespace-separated → part of the content
+}
+
 /// Regex for the in-chunk `# raven: ignore-chunk` directive (F2 Step 4),
 /// optionally with a `[code]` selector. Anchored to the start of a (possibly
 /// indented) line; a trailing comment-only directive.
@@ -1537,5 +1698,163 @@ mod tests {
         append_chunk_suppressions(&mut meta, src);
         assert_eq!(meta.ignored_ranges.len(), 1);
         assert_eq!(meta.ignored_ranges[0].what, LineSuppression::All);
+    }
+
+    // ---- detect_markdown_headings -----------------------------------------
+
+    fn headings(text: &str) -> Vec<(u32, u32, String)> {
+        detect_markdown_headings(text)
+            .into_iter()
+            .map(|h| (h.line, h.level, h.title))
+            .collect()
+    }
+
+    #[test]
+    fn markdown_headings_basic_levels() {
+        let src = "# One\n\n## Two\n\n### Three\n";
+        assert_eq!(
+            headings(src),
+            vec![
+                (0, 1, "One".to_string()),
+                (2, 2, "Two".to_string()),
+                (4, 3, "Three".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_levels_one_through_six() {
+        let src = "# a\n## b\n### c\n#### d\n##### e\n###### f\n####### g\n";
+        // 7 hashes is not a heading.
+        assert_eq!(
+            headings(src),
+            vec![
+                (0, 1, "a".to_string()),
+                (1, 2, "b".to_string()),
+                (2, 3, "c".to_string()),
+                (3, 4, "d".to_string()),
+                (4, 5, "e".to_string()),
+                (5, 6, "f".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_skip_yaml_frontmatter() {
+        // The `# comment` and `## title` lines inside frontmatter are not headings.
+        let src = "---\ntitle: Doc\n# yaml comment\n---\n\n# Real Heading\n";
+        assert_eq!(headings(src), vec![(5, 1, "Real Heading".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_skip_unterminated_frontmatter_is_not_frontmatter() {
+        // An unterminated leading `---` block is not valid frontmatter; the
+        // heading after it is still detected (the `---`/`title:` lines are not
+        // ATX headings, so they simply don't match).
+        let src = "---\ntitle: Doc\n\n# Heading\n";
+        assert_eq!(headings(src), vec![(3, 1, "Heading".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_skip_generic_fenced_code() {
+        let src = "# Before\n\n```\n# not a heading\n```\n\n# After\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 1, "Before".to_string()), (6, 1, "After".to_string()),]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_skip_r_chunk_bodies() {
+        let src = "# Before\n\n```{r}\n# an R comment\nx <- 1\n```\n\n## After\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 1, "Before".to_string()), (7, 2, "After".to_string()),]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_skip_tilde_fenced_code() {
+        let src = "# Before\n\n~~~\n# not a heading\n~~~\n\n# After\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 1, "Before".to_string()), (6, 1, "After".to_string()),]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_unclosed_fence_runs_to_eof() {
+        // The fence is never closed, so the `# heading` after it is code.
+        let src = "# Before\n\n```\n# swallowed\n\n# also swallowed\n";
+        assert_eq!(headings(src), vec![(0, 1, "Before".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_shorter_close_does_not_close_fence() {
+        // Open fence of 4 backticks; a 3-backtick line does not close it, so
+        // the `#` line stays inside the fence.
+        let src = "````\n# inside\n```\n# still inside\n````\n# outside\n";
+        assert_eq!(headings(src), vec![(5, 1, "outside".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_indented_close_does_not_close_fence() {
+        // Fences are recognized only at column 0, matching the Rmd chunk
+        // detector (`detect_rmd_chunks`). An indented ``` does not close the
+        // fence, so the heading between it and the real close stays code.
+        let src = "```\n# inside\n   ```\n# still inside\n```\n# outside\n";
+        assert_eq!(headings(src), vec![(5, 1, "outside".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_reject_hashtag_without_space() {
+        let src = "#hashtag\n# real\n";
+        assert_eq!(headings(src), vec![(1, 1, "real".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_reject_indented_code_block() {
+        // 4 spaces of indentation makes it an indented code block, not a heading.
+        let src = "    # indented code\n  ## up to three spaces ok\n";
+        assert_eq!(
+            headings(src),
+            vec![(1, 2, "up to three spaces ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_strip_closing_hash_sequence() {
+        // `## foo ##` -> "foo" (closing sequence preceded by space).
+        // `# bar#`    -> "bar#" (no space before '#', so it is content).
+        let src = "## foo ##\n# bar#\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 2, "foo".to_string()), (1, 1, "bar#".to_string()),]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_drop_empty_titles() {
+        // `#`, `###`, and `# ###` are all empty headings and are dropped.
+        let src = "#\n###\n# ###\n# kept\n";
+        assert_eq!(headings(src), vec![(3, 1, "kept".to_string())]);
+    }
+
+    #[test]
+    fn markdown_headings_crlf() {
+        let src = "# One\r\n\r\n## Two\r\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 1, "One".to_string()), (2, 2, "Two".to_string()),]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_bom_first_line() {
+        let src = "\u{FEFF}# Title\n## Sub\n";
+        assert_eq!(
+            headings(src),
+            vec![(0, 1, "Title".to_string()), (1, 2, "Sub".to_string()),]
+        );
     }
 }
