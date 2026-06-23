@@ -34902,6 +34902,24 @@ result <- data %>% filter(x > 0)
                 .any(|s| s.kind == SymbolKind::STRING && s.name == "Heading Two"),
             "H2 nests under H1"
         );
+
+        // The divider is demoted, not removed: it still appears somewhere in the
+        // tree as an entry (per docs/document-outline.md).
+        let mut stack: Vec<&DocumentSymbol> = symbols.iter().collect();
+        let mut found_divider = false;
+        while let Some(sym) = stack.pop() {
+            if sym.name == "Inner Divider" {
+                found_divider = true;
+                break;
+            }
+            if let Some(children) = sym.children.as_ref() {
+                stack.extend(children.iter());
+            }
+        }
+        assert!(
+            found_divider,
+            "the divider is demoted but still present in the tree"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ The document outline appears in VS Code's **Outline** view (usually in the Explo
 
 - **Hierarchical symbol tree** - See nested functions, variables within sections, and class methods
 - **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
-- **R Markdown / Quarto headings** - Prose Markdown headings (`# Title`, `## Section`) form the document outline, mirroring the structure you see in the Knit Preview
+- **R Markdown / Quarto headings** - Prose Markdown headings (`# Title`, `## Section`) form the document outline
 - **R Markdown / Quarto chunks** - Each ```` ```{r ...} ```` block (and `# %%` cell in plain `.R` files) appears as its own outline entry, distinct from section headers
 - **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
 - **Quick navigation** - Click any symbol to jump to its definition
@@ -132,7 +132,7 @@ R symbols defined *inside* an R chunk body — functions, variable assignments, 
 
 ## R Markdown / Quarto Headings
 
-For `.Rmd` and `.qmd` files, prose Markdown headings form the document outline — the same heading structure the Knit Preview renders. Opening the Outline view (or breadcrumbs) while editing the source therefore mirrors the rendered document.
+For `.Rmd` and `.qmd` files, prose Markdown headings (`#`, `##`, …) form the document outline, so the Outline view and breadcrumbs reflect the document's section structure as you edit the source.
 
 ```rmd
 ---
