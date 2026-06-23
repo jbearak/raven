@@ -1,0 +1,29 @@
+name: Setup Raven Action
+
+on:
+  pull_request:
+    paths:
+      - ".github/actions/setup-raven/**"
+      - ".github/workflows/setup-raven-action.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - uses: ./.github/actions/setup-raven
+        with:
+          version: latest
+
+      - run: raven --version

@@ -73,6 +73,8 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 **Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
+**GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
+
 **Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
 
 ## Documentation
