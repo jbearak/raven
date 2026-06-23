@@ -1477,6 +1477,14 @@ pub enum DocumentSymbolKind {
     /// symbol kinds to icons) can include or exclude chunks separately from
     /// section headers.
     Chunk,
+    /// Prose Markdown heading in an `.Rmd`/`.qmd` document (SymbolKind::STRING).
+    ///
+    /// Maps to `STRING` to match VS Code's native Markdown outline, and is kept
+    /// distinct from `Module` (R `# Section ----` dividers) so the outline
+    /// filter can treat document headings and code sections separately. Like
+    /// `Module`, it carries a `section_level` and forms the section spine of the
+    /// outline (see `HierarchyBuilder::is_section_symbol`).
+    Heading,
 }
 
 impl DocumentSymbolKind {
@@ -1512,6 +1520,7 @@ impl DocumentSymbolKind {
             Self::Interface => SymbolKind::INTERFACE,
             Self::Module => SymbolKind::MODULE,
             Self::Chunk => SymbolKind::OBJECT,
+            Self::Heading => SymbolKind::STRING,
         }
     }
 }
@@ -2601,6 +2610,55 @@ impl<'a> SymbolExtractor<'a> {
         symbols
     }
 
+    /// Extract prose Markdown headings (`.Rmd`/`.qmd` only) as outline sections.
+    ///
+    /// Each heading becomes a [`DocumentSymbolKind::Heading`] `RawSymbol` with a
+    /// `section_level` (1–6), so the [`HierarchyBuilder`] treats it as part of
+    /// the section spine: chunks and chunk-body R symbols nest beneath the
+    /// heading whose section contains them, mirroring the rendered document and
+    /// the Knit Preview. Detection (see [`crate::chunks::detect_markdown_headings`])
+    /// scans the RAW text — the masked analysis text blanks prose — and skips
+    /// front matter and fenced code, so a `#` comment inside a chunk never
+    /// produces a phantom heading.
+    ///
+    /// `range`/`selection_range` span the heading line; the range is later
+    /// extended to the section's extent by `HierarchyBuilder::compute_section_ranges`.
+    pub fn extract_markdown_headings(&self) -> Vec<RawSymbol> {
+        let headings = crate::chunks::detect_markdown_headings(self.text);
+        if headings.is_empty() {
+            return Vec::new();
+        }
+        // Measure end columns from the raw (un-stripped) lines so a first-line
+        // BOM doesn't shorten the reported range; line indices match the
+        // detector's column-0 scan (both come from `str::lines`).
+        let lines: Vec<&str> = self.text.lines().collect();
+        headings
+            .into_iter()
+            .map(|h| {
+                let line_text = lines.get(h.line as usize).copied().unwrap_or("");
+                let range = Range {
+                    start: Position {
+                        line: h.line,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: h.line,
+                        character: utf16_len(line_text),
+                    },
+                };
+                RawSymbol {
+                    name: h.title,
+                    kind: DocumentSymbolKind::Heading,
+                    range,
+                    selection_range: range,
+                    detail: None,
+                    section_level: Some(h.level),
+                    children: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
     /// Extract decorative banner and inline headings for JAGS and Stan files.
     fn extract_decorative_sections(&self, style: ModelCommentStyle) -> Vec<RawSymbol> {
         let mut sections = Vec::new();
@@ -2825,6 +2883,18 @@ impl HierarchyBuilder {
         ) || (matches!(symbol.kind, DocumentSymbolKind::Module) && symbol.section_level == Some(0))
     }
 
+    /// Whether a symbol forms part of the outline's section spine — an R
+    /// comment section (`Module`) or a Markdown heading (`Heading`) carrying a
+    /// `section_level`. "Section" throughout the `HierarchyBuilder` means
+    /// `section_level.is_some()` for these kinds; level-0 Stan/JAGS blocks are
+    /// `Module` and so are sections too.
+    fn is_section_symbol(symbol: &RawSymbol) -> bool {
+        matches!(
+            symbol.kind,
+            DocumentSymbolKind::Module | DocumentSymbolKind::Heading
+        ) && symbol.section_level.is_some()
+    }
+
     /// Creates a new HierarchyBuilder with the given symbols and line count.
     ///
     /// # Arguments
@@ -2844,9 +2914,11 @@ impl HierarchyBuilder {
 
     /// Compute section ranges (from section comment to next section or EOF).
     ///
-    /// This method updates the `range` field of section symbols (those with `kind == Module`
-    /// and `section_level` set) to span from the section comment line to the line before
-    /// the next section, or to the end of the document if this is the last section.
+    /// This method updates the `range` field of section symbols (those for which
+    /// [`Self::is_section_symbol`] holds — a `Module` or `Heading` with a
+    /// `section_level`) to span from the section comment/heading line to the line
+    /// before the next section, or to the end of the document if this is the last
+    /// section.
     ///
     /// The `selection_range` is NOT modified - it remains the comment line only, as set
     /// during extraction.
@@ -2867,14 +2939,12 @@ impl HierarchyBuilder {
     /// - THE section symbol's `selectionRange` SHALL be the section comment line only
     ///   - Requirement 4.3 (already satisfied by extract_sections)
     pub fn compute_section_ranges(&mut self) {
-        // Collect indices of section symbols (kind == Module with section_level set)
+        // Collect indices of section symbols (Module or Heading with a level)
         let mut section_indices: Vec<usize> = self
             .symbols
             .iter()
             .enumerate()
-            .filter(|(_, sym)| {
-                matches!(sym.kind, DocumentSymbolKind::Module) && sym.section_level.is_some()
-            })
+            .filter(|(_, sym)| Self::is_section_symbol(sym))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -3222,7 +3292,7 @@ impl HierarchyBuilder {
                         continue;
                     }
                     let container = &symbols[container_idx];
-                    if Self::symbol_is_inside_container(sym, container) {
+                    if Self::can_contain(container, sym) {
                         nested_indices.push(i);
                         break;
                     }
@@ -3251,9 +3321,7 @@ impl HierarchyBuilder {
             for sym in to_nest {
                 let mut inserted = false;
                 for container in remaining.iter_mut() {
-                    if Self::is_container_symbol(container)
-                        && Self::symbol_is_inside_container(&sym, container)
-                    {
+                    if Self::can_contain(container, &sym) {
                         Self::insert_into_innermost_container(&mut container.children, sym.clone());
                         inserted = true;
                         break;
@@ -3271,10 +3339,38 @@ impl HierarchyBuilder {
     }
 
     fn is_container_symbol(symbol: &RawSymbol) -> bool {
+        // Chunks (and `.R` `# %%` cells) contain the R symbols defined in their
+        // body, the same way functions and loops contain theirs. Treating them
+        // as containers here nests chunk-body symbols under their chunk at every
+        // level of the tree — including when the chunk itself is nested under a
+        // Markdown heading — rather than relying on a root-level positional
+        // accident in `nest_in_sections`.
         matches!(
             symbol.kind,
-            DocumentSymbolKind::Function | DocumentSymbolKind::Loop
+            DocumentSymbolKind::Function | DocumentSymbolKind::Loop | DocumentSymbolKind::Chunk
         )
+    }
+
+    /// Whether `container` may adopt `sym` as a child during function/loop/chunk
+    /// nesting: `container` is a container, `sym` falls inside its range, and the
+    /// pairing is allowed.
+    ///
+    /// A chunk/cell never adopts a section-spine entry (a Markdown `Heading` or
+    /// an R `# Section ----` `Module`). A `.R` `# %%` cell's range extends up to
+    /// and including a following section divider (see `detect_r_cells`), so
+    /// without this guard the divider — which must stay a top-level section —
+    /// would be swallowed as a child of the cell once chunks became containers.
+    ///
+    /// The guard is deliberately scoped to chunks. Functions and loops have
+    /// always been able to adopt a section that falls inside their body, and
+    /// Stan/JAGS rely on it: a decorative `// --- ... ---` section nests under
+    /// its enclosing `for` loop (see `test_stan_section_inside_loop_is_clamped_to_loop_end`).
+    /// Broadening the exclusion to all containers would regress that.
+    fn can_contain(container: &RawSymbol, sym: &RawSymbol) -> bool {
+        Self::is_container_symbol(container)
+            && Self::symbol_is_inside_container(sym, container)
+            && !(matches!(container.kind, DocumentSymbolKind::Chunk)
+                && Self::is_section_symbol(sym))
     }
 
     /// Check if a symbol is inside a container's range.
@@ -3296,8 +3392,7 @@ impl HierarchyBuilder {
     /// allowing for arbitrary nesting depth.
     fn insert_into_innermost_container(children: &mut Vec<RawSymbol>, symbol: RawSymbol) {
         for child in children.iter_mut() {
-            if Self::is_container_symbol(child) && Self::symbol_is_inside_container(&symbol, child)
-            {
+            if Self::can_contain(child, &symbol) {
                 Self::insert_into_innermost_container(&mut child.children, symbol);
                 return;
             }
@@ -4057,6 +4152,21 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             // Rmd docs this surfaces real R symbols defined inside chunk bodies.
             let ast_extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols = ast_extractor.extract_all();
+            // In an Rmd/Quarto outline, Markdown headings (added below) are the
+            // section spine. The `Module` sections `extract_all` finds here come
+            // only from R `# X ----` dividers inside chunk bodies (prose is
+            // masked), and their numeric levels are unrelated to Markdown heading
+            // levels — letting them share the section stack would mis-close
+            // headings. Demote them to plain positioned entries so they still
+            // appear, nested by position, without competing as section
+            // boundaries. (Plain `.R` files keep their dividers as sections.)
+            if doc.is_rmd_document() {
+                for sym in &mut raw_symbols {
+                    if matches!(sym.kind, DocumentSymbolKind::Module) {
+                        sym.section_level = None;
+                    }
+                }
+            }
             // Chunk detection (R Markdown / Quarto fences and `.R` `# %%` cells)
             // must scan the RAW text: an Rmd doc's masked analysis text has its
             // fence and prose lines blanked. For plain R the raw text equals
@@ -4070,6 +4180,12 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
             let raw_text = rmd_raw_text.as_deref().unwrap_or(&analysis_text);
             let chunk_extractor = SymbolExtractor::new(raw_text, tree.root_node());
             raw_symbols.extend(chunk_extractor.extract_chunks(doc.chunk_kind));
+            // Prose Markdown headings form the outline's section spine for
+            // Rmd/Quarto only — detected from the raw text (prose is masked away
+            // in the analysis text).
+            if doc.is_rmd_document() {
+                raw_symbols.extend(chunk_extractor.extract_markdown_headings());
+            }
             raw_symbols
         }
     };
@@ -34600,6 +34716,192 @@ result <- data %>% filter(x > 0)
     fn test_chunk_lsp_kind_is_object() {
         // Distinct from sections (MODULE) so clients can filter independently.
         assert_eq!(DocumentSymbolKind::Chunk.to_lsp_kind(), SymbolKind::OBJECT);
+    }
+
+    #[test]
+    fn test_heading_lsp_kind_is_string() {
+        // Markdown headings map to STRING — VS Code's native Markdown-outline
+        // kind — so they read as headings and filter apart from chunks (OBJECT)
+        // and R sections (MODULE).
+        assert_eq!(
+            DocumentSymbolKind::Heading.to_lsp_kind(),
+            SymbolKind::STRING
+        );
+    }
+
+    #[test]
+    fn test_extract_markdown_headings_basic() {
+        let code = "# Title\n\nProse.\n\n## Section\n";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let headings = extractor.extract_markdown_headings();
+        assert_eq!(headings.len(), 2);
+        assert_eq!(headings[0].name, "Title");
+        assert!(matches!(headings[0].kind, DocumentSymbolKind::Heading));
+        assert_eq!(headings[0].section_level, Some(1));
+        assert_eq!(headings[0].range.start.line, 0);
+        assert_eq!(headings[0].range.start.character, 0);
+        // Selection range spans the heading line.
+        assert_eq!(
+            headings[0].selection_range.end.character,
+            utf16_len("# Title")
+        );
+        assert_eq!(headings[1].name, "Section");
+        assert_eq!(headings[1].section_level, Some(2));
+        assert_eq!(headings[1].range.start.line, 4);
+    }
+
+    #[test]
+    fn test_extract_markdown_headings_bom_first_line_columns() {
+        // Open documents keep a leading BOM verbatim (position-aligned with the
+        // client). The detector strips it only to anchor the column-0 match, but
+        // the LSP range columns must be measured against the RAW document line,
+        // so the end column is the real end-of-line (BOM + "# Title" = 8 UTF-16
+        // units), not the BOM-stripped width (7) — which would land one unit
+        // short of the heading's end.
+        let code = "\u{FEFF}# Title\n";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let headings = extractor.extract_markdown_headings();
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].name, "Title");
+        assert_eq!(headings[0].range.start.line, 0);
+        assert_eq!(
+            headings[0].selection_range.end.character,
+            utf16_len("\u{FEFF}# Title"),
+            "range end is measured on the raw (BOM-inclusive) line"
+        );
+    }
+
+    #[test]
+    fn test_document_symbol_nests_chunk_and_symbol_under_markdown_heading() {
+        // The outline mirrors the rendered document: Markdown headings form the
+        // top-level spine; a chunk nests under its heading, and an R symbol
+        // defined in the chunk nests under the chunk.
+        use crate::state::{Document, WorldState};
+
+        // 0 "# Analysis"
+        // 4 "```{r demo}"
+        // 5 "my_fun <- function(a) a + 1"
+        // 6 "```"
+        // 8 "## Details"
+        let code = "# Analysis\n\nIntro prose.\n\n```{r demo}\nmy_fun <- function(a) a + 1\n```\n\n## Details\n\nMore.\n";
+        let uri = Url::parse("file:///report.Rmd").unwrap();
+        let mut state = WorldState::new();
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        // One top-level H1; the H2 nests beneath it.
+        assert_eq!(symbols.len(), 1, "single top-level heading");
+        let h1 = &symbols[0];
+        assert_eq!(h1.kind, SymbolKind::STRING);
+        assert_eq!(h1.name, "Analysis");
+
+        let kids = h1.children.as_ref().expect("H1 has children");
+        let chunk = kids
+            .iter()
+            .find(|s| s.kind == SymbolKind::OBJECT && s.name == "demo")
+            .expect("chunk nested under H1");
+        let my_fun = chunk
+            .children
+            .as_ref()
+            .and_then(|k| k.iter().find(|s| s.name == "my_fun"))
+            .expect("my_fun nested under the chunk");
+        assert_eq!(my_fun.kind, SymbolKind::FUNCTION);
+        assert_eq!(my_fun.range.start.line, 5);
+
+        let h2 = kids
+            .iter()
+            .find(|s| s.kind == SymbolKind::STRING && s.name == "Details")
+            .expect("H2 nested under H1");
+        assert_eq!(h2.range.start.line, 8);
+    }
+
+    #[test]
+    fn test_document_symbol_r_cell_divider_stays_top_level_section() {
+        // Regression guard: chunks/cells are containers, but they must never
+        // adopt section-spine entries. In a `.R` file a `# Section ----` divider
+        // falls inside the preceding `# %%` cell's range, yet it must remain a
+        // top-level MODULE section, not become a child of the cell.
+        use crate::state::{Document, WorldState};
+
+        let code = "# %% Setup\nlibrary(x)\n# Analysis ----\ny <- 1\n";
+        let uri = Url::parse("file:///cells.R").unwrap();
+        let mut state = WorldState::new();
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::MODULE && s.name == "Analysis"),
+            "the divider must stay a top-level section, got: {:?}",
+            symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_document_symbol_rmd_demotes_chunk_r_divider() {
+        // An R section divider (`# X ----`) inside a chunk body must NOT act as
+        // a document-level section competing with Markdown headings, or it would
+        // mis-close the heading hierarchy (its numeric level is unrelated to the
+        // Markdown heading levels). The heading hierarchy must stay intact.
+        use crate::state::{Document, WorldState};
+
+        // 0 "# Heading One"
+        // 2 "```{r}"
+        // 3 "# Inner Divider ----"
+        // 4 "x <- 1"
+        // 5 "```"
+        // 7 "## Heading Two"
+        let code = "# Heading One\n\n```{r}\n# Inner Divider ----\nx <- 1\n```\n\n## Heading Two\n";
+        let uri = Url::parse("file:///divider.Rmd").unwrap();
+        let mut state = WorldState::new();
+        state.symbol_config.hierarchical_document_symbol_support = true;
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let response = super::document_symbol(&state, &uri).expect("response");
+        let symbols = match response {
+            DocumentSymbolResponse::Nested(s) => s,
+            DocumentSymbolResponse::Flat(_) => panic!("expected nested"),
+        };
+
+        // Exactly one top-level heading; the R divider is not a top-level section.
+        assert_eq!(symbols.len(), 1, "only the H1 is top-level");
+        assert_eq!(symbols[0].name, "Heading One");
+        assert!(
+            symbols.iter().all(|s| s.kind != SymbolKind::MODULE),
+            "no R-divider MODULE section competes at the top level"
+        );
+
+        // "Heading Two" (H2) nests under H1.
+        let kids = symbols[0].children.as_ref().expect("H1 has children");
+        assert!(
+            kids.iter()
+                .any(|s| s.kind == SymbolKind::STRING && s.name == "Heading Two"),
+            "H2 nests under H1"
+        );
     }
 
     #[test]

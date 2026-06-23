@@ -8,6 +8,7 @@ The document outline appears in VS Code's **Outline** view (usually in the Explo
 
 - **Hierarchical symbol tree** - See nested functions, variables within sections, and class methods
 - **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
+- **R Markdown / Quarto headings** - Prose Markdown headings (`# Title`, `## Section`) form the document outline, mirroring the structure you see in the Knit Preview
 - **R Markdown / Quarto chunks** - Each ```` ```{r ...} ```` block (and `# %%` cell in plain `.R` files) appears as its own outline entry, distinct from section headers
 - **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
 - **Quick navigation** - Click any symbol to jump to its definition
@@ -128,6 +129,48 @@ Chunk #3        {python}
 Chunks use a distinct symbol kind (`OBJECT`) so the outline filter can include or exclude them separately from section headers.
 
 R symbols defined *inside* an R chunk body — functions, variable assignments, S4/R6 classes — also appear in the outline, nested under their chunk, at their real document line. Prose, YAML front matter, and non-R chunk bodies are ignored, so a `library(...)` call in prose or a Python chunk never produces a phantom outline entry. (For non-R chunks only the chunk entry itself is shown.)
+
+## R Markdown / Quarto Headings
+
+For `.Rmd` and `.qmd` files, prose Markdown headings form the document outline — the same heading structure the Knit Preview renders. Opening the Outline view (or breadcrumbs) while editing the source therefore mirrors the rendered document.
+
+```rmd
+---
+title: "My Report"
+---
+
+# Introduction
+
+Some prose.
+
+```{r setup}
+library(dplyr)
+```
+
+## Methods
+
+```{r model}
+fit <- lm(y ~ x, data = df)
+```
+```
+
+Outline view shows:
+
+```text
+▼ Introduction
+  ▼ setup
+  ▼ Methods
+    ▼ model
+        fit
+```
+
+Details:
+
+- **Levels nest by depth.** `#` is level 1, `##` is level 2, and so on through `######`; deeper headings nest under shallower ones, just like R code sections.
+- **Chunks and chunk-body symbols nest under their heading.** A chunk appears under the heading whose section contains it, and the R symbols defined in that chunk nest under the chunk.
+- **Only prose headings count.** Headings inside YAML front matter, fenced code blocks, and R chunk bodies are ignored, so a `#` comment in code never becomes a phantom heading. A `# Section ----` divider inside a chunk body still appears as an entry, but it does not compete with Markdown headings for the document's section structure.
+- **Distinct icon.** Headings use the heading (string) symbol kind, so the outline filter can show or hide them separately from code chunks (object) and R sections (module).
+- **ATX headings only.** Setext (underline-style) headings — text underlined with `===` or `---` — are not recognized; use `#`-prefixed (ATX) headings.
 
 ### `# %%` cells in `.R` files
 
