@@ -358,10 +358,10 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     //      `window/showMessage`; `raven check` had no equivalent.
     //
     // All are emitted together so they share a stream and stay grouped:
-    // `route_footer_notes` keeps them on the diagnostics' own stream (stdout for
+    // `footer_stream` keeps them on the diagnostics' own stream (stdout for
     // `text`, where a merged terminal/CI consumer would otherwise interleave
     // them with the findings; stderr for json/sarif, which reserve stdout for
-    // the machine document). See `route_footer_notes`.
+    // the machine document). See `footer_stream`.
     let mut footer = db_load_notes;
     if !missing_export_metadata_packages.is_empty() {
         footer.push(format_missing_export_metadata_warning(
@@ -373,17 +373,17 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         footer.push(note);
     }
     if !footer.is_empty() {
-        let (to_stdout, to_stderr) = route_footer_notes(args.format, &footer);
-        if !to_stdout.is_empty() {
-            use std::io::Write as _;
-            // Lock + flush so the footer lands after the diagnostics already
-            // written by `render` and is fully drained before the process exits.
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{}", to_stdout.join("\n"));
-            let _ = out.flush();
-        }
-        if !to_stderr.is_empty() {
-            eprintln!("{}", to_stderr.join("\n"));
+        let body = footer.join("\n");
+        match footer_stream(args.format) {
+            FooterStream::Stdout => {
+                use std::io::Write as _;
+                // Lock + flush so the footer lands after the diagnostics already
+                // written by `render` and is fully drained before process exit.
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{body}");
+                let _ = out.flush();
+            }
+            FooterStream::Stderr => eprintln!("{body}"),
         }
     }
 
@@ -558,10 +558,16 @@ fn resolve_project_config_with_options(
 /// to stderr so CI shows what was missing; `Disabled` (the user turned package
 /// awareness off in `raven.toml`) is silent, matching the editor.
 ///
-/// Returns the build's [`ShippedDbLoad`] verdict so the caller can tailor the
-/// missing-export-metadata warning (absent / loaded / present-but-failed)
-/// without re-stat-ing disk — the build already knows whether the shipped
-/// `names.db` actually loaded, which a bare `Path::exists()` cannot tell.
+/// Returns `(shipped_db_load, load_notes)`:
+/// - the build's [`ShippedDbLoad`] verdict, so the caller can tailor the
+///   missing-export-metadata warning (absent / loaded / present-but-failed)
+///   without re-stat-ing disk — the build already knows whether the shipped
+///   `names.db` actually loaded, which a bare `Path::exists()` cannot tell;
+/// - the present-but-unusable package-DB load notes (each already prefixed
+///   `raven check: `). The caller folds these into the shared footer rather
+///   than this function printing them, so they ride the diagnostics' own stream
+///   (stdout for `text`) instead of being reorderable against the findings on
+///   stderr. See `footer_stream`.
 async fn maybe_init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
@@ -884,25 +890,32 @@ fn format_missing_export_metadata_warning(
     }
 }
 
-/// Decide which stream each post-render context note goes to, given the output
-/// format. Pure (no I/O) so the routing rule is unit-testable without spawning
-/// the binary or an R subprocess; the caller does the actual writing.
+/// Which stream the post-render context-note footer goes to.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FooterStream {
+    Stdout,
+    Stderr,
+}
+
+/// Decide which stream the post-render context-note footer goes to, given the
+/// output format. Pure (no I/O) so the routing rule is unit-testable without
+/// spawning the binary or an R subprocess; the caller owns the footer `Vec` and
+/// does the actual writing (no copy here).
 ///
-/// The notes (missing-export-metadata warning, traversal-budget note) annotate
-/// the diagnostics, so for the human-readable `text` format they MUST share the
-/// diagnostics' stream — stdout. stdout and stderr are independent OS pipes that
-/// a merged consumer (a terminal, `2>&1`, or GitHub Actions — which timestamps
-/// each line at *read* time across two reader threads) reorders freely, so
-/// splitting a logically-grouped report across both streams interleaves the
-/// notes with the findings they describe. Same stream ⇒ a single reader
-/// preserves order. For the machine formats (`json`/`sarif`) stdout carries the
-/// parsed document, so notes stay on stderr where they can't corrupt it.
-///
-/// Returns `(to_stdout, to_stderr)`; exactly one is non-empty for a given format.
-fn route_footer_notes(format: OutputFormat, notes: &[String]) -> (Vec<String>, Vec<String>) {
+/// The footer notes (package-DB load note, missing-export-metadata warning,
+/// traversal-budget note) annotate the diagnostics, so for the human-readable
+/// `text` format they MUST share the diagnostics' stream — stdout. stdout and
+/// stderr are independent OS pipes that a merged consumer (a terminal, `2>&1`,
+/// or GitHub Actions — which timestamps each line at *read* time across two
+/// reader threads) reorders freely, so splitting a logically-grouped report
+/// across both streams interleaves the notes with the findings they describe.
+/// Same stream ⇒ a single reader preserves order. For the machine formats
+/// (`json`/`sarif`) stdout carries the parsed document, so the footer goes to
+/// stderr where it can't corrupt it.
+fn footer_stream(format: OutputFormat) -> FooterStream {
     match format {
-        OutputFormat::Text => (notes.to_vec(), Vec::new()),
-        OutputFormat::Json | OutputFormat::Sarif => (Vec::new(), notes.to_vec()),
+        OutputFormat::Text => FooterStream::Stdout,
+        OutputFormat::Json | OutputFormat::Sarif => FooterStream::Stderr,
     }
 }
 
@@ -1252,26 +1265,23 @@ mod tests {
     }
 
     #[test]
-    fn footer_notes_go_to_stdout_for_text_format() {
+    fn footer_goes_to_stdout_for_text_format() {
         // Text output is human-readable and shares the terminal/CI stream with
-        // the diagnostics, so context notes must ride the SAME stream (stdout)
-        // — otherwise a merged consumer (GitHub Actions, `2>&1`) interleaves
-        // them with the findings they annotate. See issue: check footer stream.
-        let notes = vec!["note A".to_string(), "note B".to_string()];
-        let (to_stdout, to_stderr) = super::route_footer_notes(OutputFormat::Text, &notes);
-        assert_eq!(to_stdout, notes);
-        assert!(to_stderr.is_empty());
+        // the diagnostics, so the context-note footer must ride the SAME stream
+        // (stdout) — otherwise a merged consumer (GitHub Actions, `2>&1`)
+        // interleaves it with the findings it annotates.
+        assert_eq!(
+            super::footer_stream(OutputFormat::Text),
+            super::FooterStream::Stdout
+        );
     }
 
     #[test]
-    fn footer_notes_go_to_stderr_for_machine_formats() {
-        // json/sarif reserve stdout for the machine document, so notes stay on
-        // stderr where they cannot corrupt the parsed output.
-        let notes = vec!["note A".to_string()];
+    fn footer_goes_to_stderr_for_machine_formats() {
+        // json/sarif reserve stdout for the machine document, so the footer
+        // stays on stderr where it cannot corrupt the parsed output.
         for fmt in [OutputFormat::Json, OutputFormat::Sarif] {
-            let (to_stdout, to_stderr) = super::route_footer_notes(fmt, &notes);
-            assert!(to_stdout.is_empty());
-            assert_eq!(to_stderr, notes);
+            assert_eq!(super::footer_stream(fmt), super::FooterStream::Stderr);
         }
     }
 
