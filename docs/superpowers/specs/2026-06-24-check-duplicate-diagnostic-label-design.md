@@ -70,6 +70,48 @@ Notes on the rewrites:
   `handlers.rs:7937` ("Syntax error") is reworded. The specific child messages
   (unclosed-paren/brace/bracket, "Missing …") are already descriptive.
 
+## Codex adversarial review (2026-06-24) — additional dependencies found
+
+A codex review surfaced message-text dependencies beyond the single matcher
+originally noted. All must be migrated for the reword to be correct:
+
+1. **Package-corpus fixtures (large).** `crates/raven/tests/package_corpus.rs`
+   keys diagnostics by exact `message` (`DiagnosticKey`, ~line 548) and compares
+   observed diagnostics against TOML ledgers. The ledgers contain the old
+   prose: **~1366 `Undefined variable: …` lines in
+   `known_false_positives.toml`, 67 in `accepted_real_diagnostics.toml`, and 9
+   `Assigning to string literal …` lines** in the accepted ledger (no
+   syntax-error / unused-suppression entries). These must be transformed with
+   the *identical* rule as the emitter so keys still match. Transform is regular
+   (the message is the only varying field), so it is scriptable + verifiable by
+   grep. The heavy corpus run is `#[ignore]` (needs downloaded packages, not in
+   routine CI per project policy), but the ledgers are a maintained asset and
+   must stay correct.
+2. **More syntax-error test filters.** Beyond `handlers.rs:9433–9529`, also
+   `handlers.rs:9562, 9690, 9706, 9729, 10423` compare `d.message == "Syntax
+   error"`. These are test filters → update the literal.
+3. **Undefined-variable test *helpers* that parse the prefix.**
+   `handlers.rs:58460` uses `strip_prefix("Undefined variable: ")` to extract
+   the name, and `handlers.rs:58784` filters with the same prefix. These must
+   be migrated to the new wording (extract via the new shape, or anchor on
+   `code`) or they silently stop collecting diagnostics.
+4. **VS Code tests.** `editors/vscode/src/test/lsp.test.ts:201,218` classify via
+   `message.toLowerCase().includes('undefined')` — the new wording drops the
+   word "undefined", so switch to `includes('is not defined')`. Test-only; no
+   runtime extension code parses these strings.
+5. **Docs.** `docs/diagnostics.md:80` (`Syntax error`) and `:92`
+   (`Undefined variable: total_count (defined later on line 7)`) quote old
+   examples. `diagnostics.md:88` already describes undefined-variable misses
+   across local / cross-file / package scope, confirming "{name} is not
+   defined" is accurate (no "in this scope" qualifier).
+
+Confirmed clean by the review: `assign-to-string-literal` directionality (the
+`->`/`->>` target is the rhs — `handlers.rs:12879,12884` — so "assignment
+target" is direction-agnostic and correct); no cross-file NSE / interface-hash
+coupling on message text (`collect_cross_file_nse` and `compute_interface_hash`
+key on metadata + `code`, not prose); no runtime LSP/editor consumer parses
+these four messages.
+
 ## Required correctness fix: re-anchor logic on `code`, not message text
 
 Rewording silently breaks any code that detects these diagnostics by string-
@@ -96,22 +138,33 @@ handle; the message is free prose.**
 
 2. **Test filters** — `handlers.rs` syntax-error filters of the form
    `d.message == "Syntax error" || d.message.starts_with("Missing")`
-   (lines ~9433–9529) re-anchor onto the `syntax-error` code (and its
-   `SYNTAX_ERROR_CHILDREN` via `diagnostic_code::parent`), not the literal.
+   (lines ~9433–9529, plus 9562/9690/9706/9729/10423). These are tests, not
+   production code, so updating the `"Syntax error"` literal in place is correct
+   and lower-risk than re-anchoring on `code`; the `|| starts_with("Missing")`
+   branch stays. (Re-anchoring is reserved for the production matcher in #1.)
 
 ## Blast radius
 
-Mechanical but real, dominated by `undefined-variable`:
+Mechanical but real, dominated by `undefined-variable`. Two surfaces:
 
-- `Undefined variable` — ~350 references across `crates/raven/src`, almost all
-  test assertions (`message == "Undefined variable: x"` / `.contains(...)`).
-- `Syntax error` — ~a dozen test filters / equality checks.
-- `Unused suppression` — 2 references.
-- `Assigning to string literal` — 1 reference.
+**Source (`crates/raven/src`), ~350 references** — almost all test assertions
+(`message == "Undefined variable: x"` / `.contains(...)`), plus the emitter, the
+production matcher, and the two parsing helpers above. Patterns vary
+(`format!`, `==`, `.contains`, `strip_prefix`), so this is handled with scoped
+regex substitutions verified by recompile + full test run, not a blind sed.
 
-Every one must be updated to the new wording (or, where appropriate, switched to
-assert on `code`). This is the cost of fixing the prose at the source while
-keeping the rule id, versus a renderer-only hack.
+**Fixtures (`crates/raven/tests/fixtures/package_corpus`), ~1433 lines** —
+regular `message = "…"` data, transformed by script with the identical rule and
+verified by grep (zero old-form remaining).
+
+Bare-phrase occurrences without the `: name` colon (e.g. comment prose
+`// false "Undefined variable" diagnostics`, and synthetic placeholder
+diagnostics in `backend.rs` whose `message` is literally `"Undefined variable"`)
+are **not** message instances and are left untouched — the transform keys on the
+`Undefined variable: ` prefix (colon + space).
+
+This is the cost of fixing the prose at the source while keeping the rule id,
+versus a renderer-only hack.
 
 ## Out of scope
 
