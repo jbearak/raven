@@ -322,3 +322,22 @@ jobs:
           done
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
+
+  # Smoke-test that the release just published above installs through the public
+  # setup-raven action on every supported OS. Runs after github-release, so it is
+  # informational and does not gate marketplace publishing. `@v1` is intentionally
+  # a floating tag here (unlike the SHA-pinned actions elsewhere): the point is to
+  # verify the exact ref users consume still installs this release.
+  verify-install:
+    name: Verify install via setup-raven on ${{ matrix.os }}
+    needs: github-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: jbearak/setup-raven@v1
+        with:
+          version: ${{ github.ref_name }}
+      - run: raven --version
