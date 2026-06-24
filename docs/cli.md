@@ -13,7 +13,7 @@ You may instead want to run Raven where R isn't installed — or where it is, bu
 
 - `raven packages freeze` — generate a committed `.raven/packages.json` package symbol database. This is the reproducible, project-specific path for CI: it captures the exports your installed project dependencies expose and should be committed when you need version-pinned package metadata. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 - `raven packages fetch` — produce the same `.raven/packages.json` from CRAN/Bioconductor r-universe instead of a local R install. Needs no R, no installed packages, and no dependency on the `names-db` Release. See [`raven packages fetch`](#raven-packages-fetch) and [Package database](package-database.md).
-- `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. In GitHub Actions, run it as a step after `jbearak/setup-raven@v1`; for source-build installs (`cargo install --git` or local), run it explicitly since those install only the executable. See [`raven packages update`](#raven-packages-update).
+- `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. No install bundles this database, so run it whenever you want broad coverage without a local R install — in GitHub Actions as a step after `jbearak/setup-raven@v1`, or explicitly during a source-build or CI-image setup. See [`raven packages update`](#raven-packages-update).
 
 ## Why Raven analyzes R without running it
 
