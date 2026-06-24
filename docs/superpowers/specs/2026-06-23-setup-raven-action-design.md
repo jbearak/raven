@@ -2,8 +2,9 @@
 
 **Date:** 2026-06-23
 **Status:** Implemented. Action extracted to `jbearak/setup-raven` and tagged
-`v1`; this repo's dogfood workflow now consumes `jbearak/setup-raven@v1` as a
-drift smoke test (section 7 step 4 complete).
+`v1`; the internal copy and staging dogfood workflow are removed, and
+`release-build.yml` verifies each published release installs through
+`jbearak/setup-raven@v1` (section 7 complete).
 
 ---
 
@@ -203,17 +204,10 @@ append bin directory to GITHUB_PATH
 run raven --version
 ```
 
-Dogfood the internal action with a focused workflow:
-
-```text
-.github/workflows/setup-raven-action.yml
-```
-
-The workflow should run on changes to the internal action and on manual
-dispatch. It should test `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`,
-and `windows-latest`, and run `raven --version` after setup. It does not run any
-`raven` subcommand beyond the smoke test; `check` and package commands are
-covered by Raven's normal integration gates.
+Dogfood the internal action with a focused workflow during staging so it is
+validated on `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`, and
+`windows-latest` before extraction. (After extraction this staging workflow is
+removed — see section 7.)
 
 ---
 
@@ -245,19 +239,23 @@ The sequence:
 3. Create `jbearak/setup-raven`: copy `action.yml`, `setup-raven.sh`, and the
    README into it, add a minimal CI workflow that exercises the action against
    live Raven release assets, and tag `v1`.
-4. Repoint the dogfood workflow from `./.github/actions/setup-raven` to
-   `jbearak/setup-raven@v1` and **delete the internal
-   `.github/actions/setup-raven/` implementation**. Once the public repo exists,
-   the action lives there and nowhere else; the repointed workflow keeps no
-   duplicated implementation and becomes an integration smoke test that verifies
-   the public action can still install Raven's own latest releases, catching
-   asset-naming/mapping drift between the two repos.
+4. **Delete the internal `.github/actions/setup-raven/` implementation and the
+   staging dogfood workflow.** Once the public repo exists, the action lives
+   there and nowhere else, and `jbearak/setup-raven`'s own CI tests it on every
+   supported OS. In place of a standalone dogfood/cron workflow, add a
+   `verify-install` job to `release-build.yml` that installs each newly published
+   release through `jbearak/setup-raven@v1` and runs `raven --version` on
+   Linux/macOS/Windows — tying the only useful consumer-side check to the moment
+   a release is published, rather than an arbitrary schedule. (An earlier draft
+   kept a weekly-cron "drift" workflow to catch release-asset renames; that risk
+   is moot because the same maintainer owns both the release pipeline and the
+   action and will not rename assets, so the cron was dropped.)
 
 There is exactly one source of truth for the action — `jbearak/setup-raven`. The
-Raven repo never keeps a second copy of `action.yml`/`setup-raven.sh`; it keeps
-only a workflow that *consumes* the published action. The docs reference
-`jbearak/setup-raven@v1`, so steps 1–3 land together (or the public repo and its
-`v1` tag are created first) to avoid a window where the documented action 404s.
+Raven repo never keeps a second copy of `action.yml`/`setup-raven.sh`. The docs
+reference `jbearak/setup-raven@v1`, so steps 1–3 land together (or the public
+repo and its `v1` tag are created first) to avoid a window where the documented
+action 404s.
 
 ---
 
@@ -301,8 +299,8 @@ not a primary workflow for a Raven/Stata-style static analyzer.
 
 Local/offline checks:
 
-- `bash -n .github/actions/setup-raven/setup-raven.sh`
-- Parse `action.yml` and the dogfood workflow as YAML.
+- `bash -n setup-raven.sh`
+- Parse `action.yml` and the CI workflow as YAML.
 - Verify invalid inputs fail before network access:
   - bad `version`
   - unsupported OS (e.g. a non-Linux/macOS/Windows `RUNNER_OS`)
@@ -314,16 +312,19 @@ Local/offline checks:
 
 GitHub-hosted checks:
 
-- Dogfood workflow installs `version: latest`, then runs `raven --version` on
-  `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`, and `windows-latest`.
-- The public `setup-raven` repo should repeat the live-install matrix before
-  tagging `v1`.
+- During staging, the dogfood workflow installs `version: latest` and runs
+  `raven --version` on `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`, and
+  `windows-latest`.
+- After extraction, `jbearak/setup-raven`'s own CI runs the live-install matrix
+  (the same four runners plus a pinned-tag job) on every change, and
+  `release-build.yml`'s `verify-install` job installs each newly published
+  release through `jbearak/setup-raven@v1` on Linux/macOS/Windows.
 
 Acceptance criteria:
 
 - A workflow can install Raven from Release binaries on `ubuntu-latest`.
-- Linux arm64, macOS, and Windows installs work, or failures are caught by
-  dogfood before public release.
+- Linux arm64, macOS, and Windows installs work, verified in CI before public
+  release.
 - Normal users do not need Rust or Cargo.
 - Downloads are checksum verified.
 - `raven` is available on `PATH` in later steps.
