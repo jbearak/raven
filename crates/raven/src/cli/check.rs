@@ -993,25 +993,23 @@ const DIAGNOSTICS_DOCS_URL: &str = "https://github.com/jbearak/raven/blob/main/d
 /// and the editor carry neither this footer nor an inline hint (the editor
 /// shows just the bare "`x` is not defined"), so this is `text`-only.
 fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
-    use std::collections::BTreeSet;
     let mut count = 0usize;
-    let mut suggestions: BTreeSet<String> = BTreeSet::new();
+    let mut hints = Vec::new();
     for (_, d) in diags {
         if let Some(hint) = crate::diagnostic_code::undefined_variable_nse_hint(&d.data) {
             count += 1;
-            suggestions.insert(hint.directive_suggestion());
+            hints.push(hint);
         }
     }
     if count == 0 {
         return None;
     }
-    // Named-formal suggestions (`# raven: nse fn(x)`) first; the positional
-    // two-directive form (`# raven: func …` / `# raven: nse …`, on two lines)
-    // last, since it is wordier and the explanation below applies only to it.
-    let is_positional = |s: &str| s.starts_with("# raven: func");
-    let mut suggestions: Vec<String> = suggestions.into_iter().collect();
-    suggestions.sort_by(|a, b| (is_positional(a), a).cmp(&(is_positional(b), b)));
-    let has_positional = suggestions.iter().any(|s| is_positional(s));
+    // Aggregate per callee (named-formal directives first, positional pair last,
+    // both sorted for determinism). Per-callee aggregation is load-bearing:
+    // `# raven: nse` is last-declaration-wins, so one directive per formal would
+    // leave only the last in effect — see `nse_footer_directives`.
+    let suggestions = crate::diagnostic_code::nse_footer_directives(&hints);
+    let has_positional = suggestions.iter().any(|s| s.starts_with("# raven: func"));
 
     // Number-agnostic lead clause without an awkward "warning(s)". "whose
     // source raven can't see" (not "cannot analyze") makes clear the cause is a

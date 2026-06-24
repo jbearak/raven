@@ -60166,15 +60166,20 @@ my_func <- function(a = default_value) {
         );
         // The NSE discoverability hint now lives in `Diagnostic.data`, not the
         // message (production no longer inlines it — it surfaces only in the
-        // `raven check` text footer). Append its rendered
-        // directive here so the hint-presence/suppression tests below keep
+        // `raven check` text footer). Append the footer directive(s) this single
+        // hint would produce so the hint-presence/suppression tests below keep
         // asserting against the very suggestion the footer would show, without
         // each having to reach into `data` itself.
         diagnostics
             .into_iter()
             .map(
                 |d| match crate::diagnostic_code::undefined_variable_nse_hint(&d.data) {
-                    Some(h) => format!("{} {}", d.message, h.directive_suggestion()),
+                    Some(h) => format!(
+                        "{} {}",
+                        d.message,
+                        crate::diagnostic_code::nse_footer_directives(std::slice::from_ref(&h))
+                            .join("\n")
+                    ),
                     None => d.message,
                 },
             )

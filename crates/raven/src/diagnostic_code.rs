@@ -199,28 +199,58 @@ pub struct NseHint {
     pub formal: Option<String>,
 }
 
-impl NseHint {
-    /// The copy-pasteable directive(s) shown in the deduplicated `raven check`
-    /// footer (see `format_nse_hint_footer`). For a named argument it names the
-    /// captured formal (`# raven: nse foo(x)`); for a positional one the formal
-    /// order is unknown, so it falls back to the `# raven: func` + `# raven:
-    /// nse` placeholder pair the user fills in. This is the only rendered form
-    /// of the hint — it is deliberately not appended to the diagnostic message.
-    ///
-    /// The positional pair is rendered on **two separate lines**: each
-    /// `# raven:` directive must be the only directive on its comment line (the
-    /// `nse` regex in `cross_file::directive` is start- AND end-anchored), so a
-    /// one-line `func … and nse …` form would parse the `func` half but silently
-    /// drop the NSE contract once the user applied it.
-    pub fn directive_suggestion(&self) -> String {
-        let Self { dir, formal, .. } = self;
-        match formal {
-            Some(f) => format!("# raven: nse {dir}({f})"),
-            None => {
-                format!("# raven: func {dir}(<formals>)\n# raven: nse {dir}(<nse-formals>)")
+/// The copy-pasteable directive lines for the deduplicated `raven check` footer
+/// (see `format_nse_hint_footer`), built from all of a run's NSE hints. This is
+/// the only rendered form of the hints — they are deliberately not appended to
+/// the diagnostic message.
+///
+/// Aggregation is per **callee** and is load-bearing for correctness, because
+/// `# raven: nse` is *last-declaration-wins* (see `own_directive_nse_policy` in
+/// `handlers.rs`): emitting one directive per formal would leave only the last
+/// one in effect, so a user who pasted them would still see the earlier
+/// findings. Therefore:
+///   - All named formals captured by one callee collapse into a single
+///     `# raven: nse callee(x, y, …)` directive (formals sorted for
+///     determinism).
+///   - A positional argument (formal order unknown) yields the two-line
+///     `# raven: func callee(<formals>)` + `# raven: nse callee(<nse-formals>)`
+///     placeholder pair the user fills in. The pair is on **two separate lines**
+///     because each `# raven:` directive must be the only one on its comment
+///     line (the `nse` regex in `cross_file::directive` is start- AND
+///     end-anchored), so a one-line `func … and nse …` form would parse the
+///     `func` half but silently drop the NSE contract. When a callee has *any*
+///     positional finding, only this placeholder form is emitted (the user fills
+///     `<nse-formals>` with every captured formal, named ones included), so the
+///     two forms never collide for the same callee.
+///
+/// Named-formal directives sort first; the wordier positional pair sorts last.
+pub fn nse_footer_directives(hints: &[NseHint]) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // callee directive spelling -> (named formals, has a positional finding)
+    let mut by_callee: BTreeMap<&str, (BTreeSet<&str>, bool)> = BTreeMap::new();
+    for h in hints {
+        let entry = by_callee.entry(h.dir.as_str()).or_default();
+        match &h.formal {
+            Some(f) => {
+                entry.0.insert(f.as_str());
             }
+            None => entry.1 = true,
         }
     }
+    let mut out: Vec<String> = Vec::new();
+    for (dir, (formals, has_positional)) in &by_callee {
+        if *has_positional {
+            out.push(format!(
+                "# raven: func {dir}(<formals>)\n# raven: nse {dir}(<nse-formals>)"
+            ));
+        } else if !formals.is_empty() {
+            let list = formals.iter().copied().collect::<Vec<_>>().join(", ");
+            out.push(format!("# raven: nse {dir}({list})"));
+        }
+    }
+    let is_positional = |s: &str| s.starts_with("# raven: func");
+    out.sort_by(|a, b| (is_positional(a), a.as_str()).cmp(&(is_positional(b), b.as_str())));
+    out
 }
 
 /// Build the `Diagnostic.data` payload for an undefined-variable diagnostic from
@@ -365,28 +395,57 @@ mod tests {
         }
     }
 
+    fn named_hint_for(dir: &str, formal: &str) -> NseHint {
+        NseHint {
+            callee: dir.to_string(),
+            dir: dir.to_string(),
+            formal: Some(formal.to_string()),
+        }
+    }
+
     #[test]
-    fn nse_hint_directive_suggestion_is_the_copy_pasteable_tail() {
-        assert_eq!(named_hint().directive_suggestion(), "# raven: nse aes(x)");
+    fn nse_footer_directives_render_the_copy_pasteable_tail() {
+        assert_eq!(
+            nse_footer_directives(&[named_hint()]),
+            vec!["# raven: nse aes(x)".to_string()]
+        );
         // The positional fallback renders the two directives on SEPARATE lines:
         // the `nse` directive regex is end-anchored, so a one-line `func … and
         // nse …` form would silently fail to declare the NSE contract (see
-        // `positional_directive_suggestion_parses_as_two_directives`).
+        // `positional_directive_parses_as_two_directives`).
         assert_eq!(
-            positional_hint().directive_suggestion(),
-            "# raven: func facet_wrap(<formals>)\n# raven: nse facet_wrap(<nse-formals>)"
+            nse_footer_directives(&[positional_hint()]),
+            vec![
+                "# raven: func facet_wrap(<formals>)\n# raven: nse facet_wrap(<nse-formals>)"
+                    .to_string()
+            ]
         );
     }
 
     #[test]
-    fn positional_directive_suggestion_parses_as_two_directives() {
+    fn nse_footer_collapses_multiple_named_formals_for_one_callee() {
+        // Regression: `# raven: nse` is last-declaration-wins, so one directive
+        // per formal would leave only the last in effect — the user pasting both
+        // would still see the other finding. All named formals for one callee
+        // must collapse into a single directive (formals sorted).
+        let dirs = nse_footer_directives(&[
+            named_hint_for("somepkg::f", "x"),
+            named_hint_for("somepkg::f", "y"),
+        ]);
+        assert_eq!(dirs, vec!["# raven: nse somepkg::f(x, y)".to_string()]);
+        // And the collapsed directive actually captures BOTH formals when parsed.
+        let meta = crate::cross_file::directive::parse_directives(&dirs[0]);
+        assert_eq!(meta.nse_declarations.len(), 1, "{dirs:?}");
+    }
+
+    #[test]
+    fn positional_directive_parses_as_two_directives() {
         // Regression: a user who copies the positional suggestion and fills in
         // the placeholders must get BOTH a `func` and an `nse` declaration. The
         // `nse` directive regex is start- AND end-anchored, so the previous
         // one-line `# raven: func … and # raven: nse …` form parsed only the
         // `func` half and silently dropped the NSE contract.
-        let applied = positional_hint()
-            .directive_suggestion()
+        let applied = nse_footer_directives(&[positional_hint()])[0]
             .replace("<formals>", "data, x")
             .replace("<nse-formals>", "x");
         let meta = crate::cross_file::directive::parse_directives(&applied);
