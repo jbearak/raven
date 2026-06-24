@@ -308,7 +308,7 @@ Cross-file resolution walks the `source()` dependency graph under two safety bud
 The defaults are sized so realistic workspaces never reach them (the neighborhood is naturally bounded by the workspace's file count). If a workspace is large and dense enough to exhaust a budget, Raven stops following some `source()` edges, and the symbols those files define can surface as **false-positive `undefined-variable` warnings**. When that happens:
 
 - In the editor, Raven shows a throttled warning naming the setting to raise.
-- `raven check` prints a one-line note to stderr (so budget-induced drops are distinguishable from genuine undefined variables in CI).
+- `raven check` prints a one-line note (grouped with the diagnostics on stdout for the default `text` output, or on stderr for `json`/`sarif` — see [Output streams](cli.md#output-streams)), so budget-induced drops are distinguishable from genuine undefined variables in CI.
 
 Raise the relevant setting in `raven.toml` to analyze more of the graph. See [Configuration](configuration.md).
 
