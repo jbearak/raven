@@ -182,6 +182,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_has_code_matches_only_the_string_code() {
+        use tower_lsp::lsp_types::NumberOrString;
+        let matching = Some(NumberOrString::String(UNDEFINED_VARIABLE.to_string()));
+        assert!(diagnostic_has_code(&matching, UNDEFINED_VARIABLE));
+        assert!(!diagnostic_has_code(&matching, SYNTAX_ERROR));
+        // A different code, a numeric code, and an absent code never match.
+        let other = Some(NumberOrString::String(SYNTAX_ERROR.to_string()));
+        assert!(!diagnostic_has_code(&other, UNDEFINED_VARIABLE));
+        assert!(!diagnostic_has_code(
+            &Some(NumberOrString::Number(7)),
+            UNDEFINED_VARIABLE
+        ));
+        assert!(!diagnostic_has_code(&None, UNDEFINED_VARIABLE));
+    }
+
+    #[test]
     fn normalize_accepts_both_spellings() {
         assert_eq!(normalize("line_length"), "line-length");
         assert_eq!(normalize("line-length"), "line-length");

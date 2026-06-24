@@ -139,7 +139,8 @@ fn expect_start_end_block_unused_is_reported() {
     // No undefined variable in the block → the expect-start suppressed nothing.
     let out = check_one("# raven: expect-start[undefined-variable]\nx <- 1\n# raven: ignore-end\n");
     assert!(
-        out.contains("unused-suppression") || out.contains("Unused `expect` suppression"),
+        out.contains("unused-suppression")
+            || out.contains("This `expect` directive matched no diagnostic"),
         "an unused `expect-start` block must be reported as unused. Output:\n{out}"
     );
 }
@@ -152,7 +153,8 @@ fn expect_that_suppresses_nothing_is_reported_unused() {
         "defined_value <- 1\nresult <- defined_value # raven: expect[undefined-variable]\n",
     );
     assert!(
-        out.contains("unused-suppression") || out.contains("Unused `expect` suppression"),
+        out.contains("unused-suppression")
+            || out.contains("This `expect` directive matched no diagnostic"),
         "an `expect` that suppressed nothing must be reported as unused. Output:\n{out}"
     );
 }
