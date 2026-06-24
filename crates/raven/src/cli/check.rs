@@ -372,11 +372,10 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     if let Some(note) = format_traversal_budget_note(&state) {
         footer.push(note);
     }
-    // The deduplicated NSE-discoverability footer is `text`-only: the machine
-    // formats (json/sarif) and the editor keep the self-contained inline hint on
-    // each finding, so a footer there would merely duplicate it. The text
-    // renderer (`shared::print_text`) strips the per-finding inline hint, and
-    // this re-surfaces it once. See `format_nse_hint_footer`.
+    // The deduplicated NSE-discoverability footer is `text`-only. The hint is
+    // never inline on a finding (json/sarif/editor all show the bare
+    // "`x` is not defined"); it rides `Diagnostic.data` and surfaces only here,
+    // once, aggregated and deduplicated. See `format_nse_hint_footer`.
     if args.format == OutputFormat::Text
         && let Some(note) = format_nse_hint_footer(&all_diags)
     {
@@ -1007,8 +1006,8 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
         return None;
     }
     // Named-formal suggestions (`# raven: nse fn(x)`) first; the positional
-    // two-directive form (`# raven: func … and # raven: nse …`) last, since it
-    // is wordier and the explanation below applies only to it.
+    // two-directive form (`# raven: func …` / `# raven: nse …`, on two lines)
+    // last, since it is wordier and the explanation below applies only to it.
     let is_positional = |s: &str| s.starts_with("# raven: func");
     let mut suggestions: Vec<String> = suggestions.into_iter().collect();
     suggestions.sort_by(|a, b| (is_positional(a), a).cmp(&(is_positional(b), b)));
@@ -1043,18 +1042,24 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
          instead of suppressing:\n"
     );
     for s in &suggestions {
-        out.push_str("\n  ");
-        out.push_str(s);
+        // A positional suggestion is two directives on separate lines (each
+        // `# raven:` directive must own its line); indent every line so the
+        // whole pair stays aligned under the footer.
+        for line in s.lines() {
+            out.push_str("\n  ");
+            out.push_str(line);
+        }
     }
     if has_positional {
         // Explain why some suggestions carry two directives: a positionally
         // passed argument has no name to key on, so raven needs the function's
         // formal list (`# raven: func`) before it can say which formal is NSE.
         out.push_str(
-            "\n\nThe `# raven: func … and # raven: nse …` pair is for an argument passed \
+            "\n\nThe two-line `# raven: func …` / `# raven: nse …` pair is for an argument passed \
              positionally: raven needs the function's parameter list to know which formal the \
              argument is, so fill `<formals>` with the function's signature and `<nse-formals>` \
-             with the captured ones. When the argument is passed by name, naming that formal \
+             with the captured ones. Keep them on separate lines — each `# raven:` directive must \
+             be the only one on its line. When the argument is passed by name, naming that formal \
              (`# raven: nse fn(x)`) is enough.",
         );
     }
@@ -1452,10 +1457,9 @@ mod tests {
             "aes suggestion appears once despite two findings: {footer}"
         );
         assert!(
-            footer.contains(
-                "# raven: func facet_wrap(<formals>) and # raven: nse facet_wrap(<nse-formals>)"
-            ),
-            "positional suggestion present: {footer}"
+            footer.contains("# raven: func facet_wrap(<formals>)")
+                && footer.contains("# raven: nse facet_wrap(<nse-formals>)"),
+            "positional suggestion present (two directives, separate lines): {footer}"
         );
         // Named form first, positional (two-directive) form last.
         assert!(

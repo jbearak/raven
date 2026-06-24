@@ -348,11 +348,13 @@ functions outside that built-in coverage. If that is the case here, declare the
 function's NSE contract instead of suppressing:
 
   # raven: nse somepkg::my_filter(x)
-  # raven: func somepkg::other(<formals>) and # raven: nse somepkg::other(<nse-formals>)
+  # raven: func somepkg::other(<formals>)
+  # raven: nse somepkg::other(<nse-formals>)
 
-The `# raven: func … and # raven: nse …` pair is for an argument passed positionally:
+The two-line `# raven: func …` / `# raven: nse …` pair is for an argument passed positionally:
 raven needs the function's parameter list to know which formal the argument is, so fill
-`<formals>` with the function's signature and `<nse-formals>` with the captured ones. When
+`<formals>` with the function's signature and `<nse-formals>` with the captured ones. Keep them
+on separate lines — each `# raven:` directive must be the only one on its line. When
 the argument is passed by name, naming that formal (`# raven: nse fn(x)`) is enough.
 
 See <directives.md> for these directives and <diagnostics.md> for handling false positives.

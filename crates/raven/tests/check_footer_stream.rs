@@ -218,11 +218,11 @@ fn text_format_keeps_findings_clean_and_emits_reframed_deduped_footer() {
         1,
         "duplicate suggestions must dedup; stdout was:\n{stdout}"
     );
-    // The positional finding gets the two-directive placeholder form.
+    // The positional finding gets the two-directive placeholder form, rendered
+    // on separate lines (each `# raven:` directive must own its line to parse).
     assert!(
-        stdout.contains(
-            "# raven: func somepkg::other(<formals>) and # raven: nse somepkg::other(<nse-formals>)"
-        ),
+        stdout.contains("# raven: func somepkg::other(<formals>)")
+            && stdout.contains("# raven: nse somepkg::other(<nse-formals>)"),
         "positional suggestion present; stdout was:\n{stdout}"
     );
     // ...and the footer explains why that case needs two directives.

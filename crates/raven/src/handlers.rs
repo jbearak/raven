@@ -60167,7 +60167,7 @@ my_func <- function(a = default_value) {
         );
         // The NSE discoverability hint now lives in `Diagnostic.data`, not the
         // message (production no longer inlines it — it surfaces only in the
-        // `raven check` footer and the editor quick-fix). Append its rendered
+        // `raven check` text footer). Append its rendered
         // directive here so the hint-presence/suppression tests below keep
         // asserting against the very suggestion the footer would show, without
         // each having to reach into `data` itself.

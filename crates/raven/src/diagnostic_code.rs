@@ -180,11 +180,11 @@ pub const UNDEFINED_VARIABLE_POSITION_VARIANT: &str = "undefined-variable/positi
 /// The structured NSE-discoverability hint carried by an undefined-variable
 /// diagnostic whose flagged identifier sits inside a call argument that *might*
 /// be captured by non-standard evaluation (see `nse_hint_for_usage` in
-/// `handlers.rs`). The emitter both appends [`NseHint::message_suffix`] to the
-/// diagnostic message (so the editor and `--format json/sarif` carry a
-/// self-contained fix inline) AND stores the structured fields here so the
-/// human-readable `raven check` text report can strip the per-finding suffix
-/// and surface one deduplicated footer instead.
+/// `handlers.rs`). The emitter stores the structured fields here and **never**
+/// appends them to the diagnostic message: the editor and `--format json/sarif`
+/// carry no NSE prose (their message stays the bare "`x` is not defined"), and
+/// the hint surfaces only once, as the deduplicated footer the human-readable
+/// `raven check` text report builds via [`NseHint::directive_suggestion`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NseHint {
     /// Source spelling of the callee, retaining backticks for a non-syntactic
@@ -206,12 +206,18 @@ impl NseHint {
     /// order is unknown, so it falls back to the `# raven: func` + `# raven:
     /// nse` placeholder pair the user fills in. This is the only rendered form
     /// of the hint — it is deliberately not appended to the diagnostic message.
+    ///
+    /// The positional pair is rendered on **two separate lines**: each
+    /// `# raven:` directive must be the only directive on its comment line (the
+    /// `nse` regex in `cross_file::directive` is start- AND end-anchored), so a
+    /// one-line `func … and nse …` form would parse the `func` half but silently
+    /// drop the NSE contract once the user applied it.
     pub fn directive_suggestion(&self) -> String {
         let Self { dir, formal, .. } = self;
         match formal {
             Some(f) => format!("# raven: nse {dir}({f})"),
             None => {
-                format!("# raven: func {dir}(<formals>) and # raven: nse {dir}(<nse-formals>)")
+                format!("# raven: func {dir}(<formals>)\n# raven: nse {dir}(<nse-formals>)")
             }
         }
     }
@@ -276,8 +282,8 @@ pub fn undefined_variable_nse_hint(data: &Option<serde_json::Value>) -> Option<N
 
 /// The `Diagnostic.data` payload with the internal NSE hint removed, for
 /// serialization into machine output. The hint exists only so the `raven check`
-/// text footer can aggregate it (and the editor quick-fix can recompute the
-/// same fix); it is not part of the diagnostic's machine contract. Machine
+/// text footer can aggregate it; it is not part of the diagnostic's machine
+/// contract. Machine
 /// consumers still get the position-variant marker (historically present in
 /// `data`), but no NSE trace. Returns `None` when nothing remains, matching the
 /// "omit empty `data`" convention `Diagnostic` serializes with.
@@ -362,9 +368,37 @@ mod tests {
     #[test]
     fn nse_hint_directive_suggestion_is_the_copy_pasteable_tail() {
         assert_eq!(named_hint().directive_suggestion(), "# raven: nse aes(x)");
+        // The positional fallback renders the two directives on SEPARATE lines:
+        // the `nse` directive regex is end-anchored, so a one-line `func … and
+        // nse …` form would silently fail to declare the NSE contract (see
+        // `positional_directive_suggestion_parses_as_two_directives`).
         assert_eq!(
             positional_hint().directive_suggestion(),
-            "# raven: func facet_wrap(<formals>) and # raven: nse facet_wrap(<nse-formals>)"
+            "# raven: func facet_wrap(<formals>)\n# raven: nse facet_wrap(<nse-formals>)"
+        );
+    }
+
+    #[test]
+    fn positional_directive_suggestion_parses_as_two_directives() {
+        // Regression: a user who copies the positional suggestion and fills in
+        // the placeholders must get BOTH a `func` and an `nse` declaration. The
+        // `nse` directive regex is start- AND end-anchored, so the previous
+        // one-line `# raven: func … and # raven: nse …` form parsed only the
+        // `func` half and silently dropped the NSE contract.
+        let applied = positional_hint()
+            .directive_suggestion()
+            .replace("<formals>", "data, x")
+            .replace("<nse-formals>", "x");
+        let meta = crate::cross_file::directive::parse_directives(&applied);
+        assert_eq!(
+            meta.declared_functions.len(),
+            1,
+            "func directive must parse: {applied:?}"
+        );
+        assert_eq!(
+            meta.nse_declarations.len(),
+            1,
+            "nse directive must parse (one-line form silently dropped it): {applied:?}"
         );
     }
 
