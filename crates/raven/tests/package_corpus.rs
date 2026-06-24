@@ -738,7 +738,7 @@ fn parses_raven_json_diagnostics() {
             "end": { "line": 2, "character": 11 }
           },
           "severity": 2,
-          "message": "Undefined variable: missing",
+          "message": "missing is not defined",
           "code": "undefined-variable"
         }
       }
@@ -758,7 +758,7 @@ fn parses_raven_json_diagnostics() {
                 end_character: 11,
             },
             severity: Some(2),
-            message: "Undefined variable: missing".into(),
+            message: "missing is not defined".into(),
             code: Some("undefined-variable".into()),
         }]
     );
@@ -771,7 +771,7 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
         [[diagnostic]]
         package = "pkg"
         path = "R/accepted.R"
-        message = "Undefined variable: accepted"
+        message = "accepted is not defined"
         evidence = "Confirmed by replacing the symbol with a local definition in a temp checkout."
         [diagnostic.range]
         start_line = 0
@@ -782,7 +782,7 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
         [[diagnostic]]
         package = "pkg"
         path = "R/stale.R"
-        message = "Undefined variable: stale"
+        message = "stale is not defined"
         evidence = "Confirmed by replacing the symbol with a local definition in a temp checkout."
         [diagnostic.range]
         start_line = 1
@@ -802,7 +802,7 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
             end_character: 8,
         },
         severity: Some(2),
-        message: "Undefined variable: accepted".into(),
+        message: "accepted is not defined".into(),
         code: None,
     };
     let unclassified = ObservedDiagnostic {
@@ -815,7 +815,7 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
             end_character: 3,
         },
         severity: Some(2),
-        message: "Undefined variable: new".into(),
+        message: "new is not defined".into(),
         code: None,
     };
 
@@ -834,7 +834,7 @@ fn classification_flags_unclassified_and_stale_diagnostics() {
     assert_eq!(classification.stale_acceptances.len(), 1);
     assert_eq!(
         classification.stale_acceptances[0].message,
-        "Undefined variable: stale"
+        "stale is not defined"
     );
 }
 
@@ -849,7 +849,7 @@ fn stale_entries_reported_for_run_package_with_no_diagnostics() {
         [[diagnostic]]
         package = "cleared"
         path = "R/old.R"
-        message = "Undefined variable: gone"
+        message = "gone is not defined"
         evidence = "was real once"
         [diagnostic.range]
         start_line = 0
@@ -864,7 +864,7 @@ fn stale_entries_reported_for_run_package_with_no_diagnostics() {
         [[false_positive]]
         package = "cleared"
         path = "R/methods.R"
-        message = "Assigning to string literal \"f\"; ..."
+        message = "The assignment target \"f\" is a string literal; ..."
         reason = "idiomatic"
         [false_positive.range]
         start_line = 3

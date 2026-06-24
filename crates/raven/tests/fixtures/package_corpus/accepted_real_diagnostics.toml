@@ -72,7 +72,7 @@ end_character = 25
 [[diagnostic]]
 package = "base"
 path = "R/library.R"
-message = "Assigning to string literal \"__library_can_mask__\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"__library_can_mask__\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__library_can_mask__` <- canMaskEnv ``."
@@ -85,7 +85,7 @@ end_character = 42
 [[diagnostic]]
 package = "base"
 path = "R/all.equal.R"
-message = "Assigning to string literal \"__all.eq.E__\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"__all.eq.E__\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Same dynGet-sentinel idiom as the accepted `__library_can_mask__` / `__NameSpacesLoading__` / `__LoadingNamespaceInfo__` entries: `\"__all.eq.E__\" <- environment()` inside a function body, read back via `dynGet(\"__all.eq.E__\", NULL)`. The value is not a function, so the idiomatic function-definition exemption deliberately does not apply; the backtick-quoted spelling would silence it."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__all.eq.E__` <- environment() ``."
@@ -111,7 +111,7 @@ end_character = 51
 [[diagnostic]]
 package = "base"
 path = "R/namespace.R"
-message = "Assigning to string literal \"__NameSpacesLoading__\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"__NameSpacesLoading__\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__NameSpacesLoading__` <- c(package, loading) ``."
@@ -124,7 +124,7 @@ end_character = 27
 [[diagnostic]]
 package = "base"
 path = "R/namespace.R"
-message = "Assigning to string literal \"__LoadingNamespaceInfo__\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"__LoadingNamespaceInfo__\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real in preserved R SVN trunk base checkout at /var/folders/78/22_t8jqx7vjbff5vngkd38kw0000gn/T/.tmpGMJMxE: rewriting the string-literal assignment as the equivalent backtick-quoted name assignment removed this diagnostic; rerunning `target/debug/raven check --workspace <edited-base> --format json --max-severity error --no-config` returned `[]`."
 source = "R SVN trunk src/library/base"
 minimal_edit = "Rewrite the string-literal assignment as a backtick-quoted name assignment: `` `__LoadingNamespaceInfo__` <- list(...) ``."
@@ -137,7 +137,7 @@ end_character = 34
 [[diagnostic]]
 package = "compiler"
 path = "tests/assign.R"
-message = "Assigning to string literal \"x\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"x\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/compiler"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `x` <- ... ``."
@@ -163,7 +163,7 @@ end_character = 39
 [[diagnostic]]
 package = "compiler"
 path = "tests/envir.R"
-message = "Assigning to string literal \"v\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"v\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/compiler"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
@@ -176,7 +176,7 @@ end_character = 44
 [[diagnostic]]
 package = "methods"
 path = "R/BasicClasses.R"
-message = "Assigning to string literal \"<undef>\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"<undef>\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "R SVN trunk src/library/methods"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `<undef>` <- ... ``."
@@ -306,7 +306,7 @@ end_character = 53
 [[diagnostic]]
 package = "codetools"
 path = "tests/tests.R"
-message = "Assigning to string literal \"v\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"v\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git codetools"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `v` <- ... ``."
@@ -371,7 +371,7 @@ end_character = 23
 [[diagnostic]]
 package = "nlme"
 path = "tests/deparse.R"
-message = "Assigning to string literal \"mydata2\"; R will bind the value to the variable named by the string. Was this intentional?"
+message = "The assignment target \"mydata2\" is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
 evidence = "Confirmed real: rewriting as backtick-quoted name assignment removes the diagnostic."
 source = "CRAN/git nlme"
 minimal_edit = "Rewrite as backtick-quoted assignment: `` `mydata2` <- ... ``."
@@ -423,7 +423,7 @@ end_character = 47
 [[diagnostic]]
 package = "stats"
 path = "tests/drop1-polr.R"
-message = "Undefined variable: lreg1"
+message = "lreg1 is not defined"
 evidence = "Confirmed real: `lreg` is defined at line 19 but `lreg1` is referenced at line 20; this is a genuine typo in the R test code."
 source = "R SVN trunk src/library/stats"
 minimal_edit = "Correct `lreg1` to `lreg`."
@@ -449,7 +449,7 @@ end_character = 38
 [[diagnostic]]
 package = "methods"
 path = "R/SClasses.R"
-message = "Undefined variable: fields"
+message = "fields is not defined"
 evidence = "inferProperties() has parameter `props` but error message references `fields` (should be `class(props)`)"
 
 [diagnostic.range]
@@ -460,7 +460,7 @@ end_character = 55
 [[diagnostic]]
 package = "stats"
 path = "demo/smooth.R"
-message = "Undefined variable: x1"
+message = "x1 is not defined"
 evidence = "x1 referenced at line 36 in for-loop argument, never defined anywhere in demo/smooth.R"
 
 [diagnostic.range]
@@ -471,7 +471,7 @@ end_character = 16
 [[diagnostic]]
 package = "survival"
 path = "R/residuals.survfitcox.R"
-message = "Undefined variable: mf"
+message = "mf is not defined"
 evidence = "model.extract(mf, ...) called but `mf` is never computed in residuals.survfitcox()"
 
 [diagnostic.range]
@@ -482,7 +482,7 @@ end_character = 39
 [[diagnostic]]
 package = "survival"
 path = "R/summary.survfit.R"
-message = "Undefined variable: newdata"
+message = "newdata is not defined"
 evidence = "names(newdata) used but function has no `newdata` param; should be `names(fit$newdata)`"
 
 [diagnostic.range]
@@ -493,7 +493,7 @@ end_character = 29
 [[diagnostic]]
 package = "survival"
 path = "R/summary.survfit.R"
-message = "Undefined variable: newdata"
+message = "newdata is not defined"
 evidence = "second `newdata` reference on same line; should be `fit$newdata`"
 
 [diagnostic.range]
@@ -504,7 +504,7 @@ end_character = 54
 [[diagnostic]]
 package = "survival"
 path = "R/survcallback.R"
-message = "Undefined variable: pcol"
+message = "pcol is not defined"
 evidence = "Same pcol/pcols typo as survpenal.fit.R; entire file is dead code wrapped in if(FALSE)"
 
 [diagnostic.range]
@@ -515,7 +515,7 @@ end_character = 26
 [[diagnostic]]
 package = "survival"
 path = "R/survcallback.R"
-message = "Undefined variable: nstrat2"
+message = "nstrat2 is not defined"
 evidence = "nstrat2 defined in survpenal.fit.R but not in this extracted stub; dead code wrapped in if(FALSE)"
 
 [diagnostic.range]
@@ -526,7 +526,7 @@ end_character = 27
 [[diagnostic]]
 package = "survival"
 path = "R/survdiff.R"
-message = "Undefined variable: Call"
+message = "Call is not defined"
 evidence = "Line 2 defines `call` (lowercase) but line 13 references `Call` (uppercase); R is case-sensitive"
 
 [diagnostic.range]
@@ -537,7 +537,7 @@ end_character = 33
 [[diagnostic]]
 package = "survival"
 path = "R/survnew.R"
-message = "Undefined variable: individual"
+message = "individual is not defined"
 evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
 
 [diagnostic.range]
@@ -548,7 +548,7 @@ end_character = 23
 [[diagnostic]]
 package = "survival"
 path = "R/survnew.R"
-message = "Undefined variable: individual"
+message = "individual is not defined"
 evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
 
 [diagnostic.range]
@@ -559,7 +559,7 @@ end_character = 26
 [[diagnostic]]
 package = "survival"
 path = "R/survnew.R"
-message = "Undefined variable: individual"
+message = "individual is not defined"
 evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
 
 [diagnostic.range]
@@ -570,7 +570,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "R/survnew.R"
-message = "Undefined variable: individual"
+message = "individual is not defined"
 evidence = "survfitnew() copied from survfit.coxphms() but omits `individual` parameter"
 
 [diagnostic.range]
@@ -581,7 +581,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "R/survpenal.fit.R"
-message = "Undefined variable: pcol"
+message = "pcol is not defined"
 evidence = "Line 165 reads `pcols[[i]]` (function param) but line 166 writes to `pcol[[i]]` - typo for `pcols`"
 
 [diagnostic.range]
@@ -592,7 +592,7 @@ end_character = 26
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx1"
+message = "indx1 is not defined"
 evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -603,7 +603,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx2"
+message = "indx2 is not defined"
 evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -614,7 +614,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx3"
+message = "indx3 is not defined"
 evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -625,7 +625,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx1"
+message = "indx1 is not defined"
 evidence = "Typo for `sindx1`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -636,7 +636,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx2"
+message = "indx2 is not defined"
 evidence = "Typo for `sindx2`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -647,7 +647,7 @@ end_character = 18
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: indx3"
+message = "indx3 is not defined"
 evidence = "Typo for `sindx3`; dead code inside if(FALSE) block"
 
 [diagnostic.range]
@@ -658,7 +658,7 @@ end_character = 18
 [[diagnostic]]
 package = "Matrix"
 path = "R/subassign.R"
-message = "Undefined variable: i"
+message = "i is not defined"
 evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
 
 [diagnostic.range]
@@ -669,7 +669,7 @@ end_character = 18
 [[diagnostic]]
 package = "Matrix"
 path = "R/subassign.R"
-message = "Undefined variable: i"
+message = "i is not defined"
 evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
 
 [diagnostic.range]
@@ -680,7 +680,7 @@ end_character = 68
 [[diagnostic]]
 package = "Matrix"
 path = "R/subassign.R"
-message = "Undefined variable: i"
+message = "i is not defined"
 evidence = "Function .subassign.invalid(value) references `i` but its only parameter is `value`; `i` is not in any enclosing lexical scope. Dead code inside if(FALSE) TODO block — parameter name mismatch."
 
 [diagnostic.range]
@@ -691,7 +691,7 @@ end_character = 69
 [[diagnostic]]
 package = "mgcv"
 path = "R/sparse.r"
-message = "Undefined variable: ind"
+message = "ind is not defined"
 evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
 
 [diagnostic.range]
@@ -702,7 +702,7 @@ end_character = 9
 [[diagnostic]]
 package = "mgcv"
 path = "R/sparse.r"
-message = "Undefined variable: ind"
+message = "ind is not defined"
 evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
 
 [diagnostic.range]
@@ -713,7 +713,7 @@ end_character = 7
 [[diagnostic]]
 package = "mgcv"
 path = "R/sparse.r"
-message = "Undefined variable: ind"
+message = "ind is not defined"
 evidence = "Function spasm.construct.default(object, data) uses `ind[[i]]` and `ind[[1]]` without ever initializing `ind <- list()`. Sibling function spasm.construct.cus has the init — that's what leaked before the fix. Uninitialised variable will crash at runtime."
 
 [diagnostic.range]
@@ -724,7 +724,7 @@ end_character = 19
 [[diagnostic]]
 package = "lubridate"
 path = "R/coercion.r"
-message = "Undefined variable: x"
+message = "x is not defined"
 evidence = "Function signature is function(new, orig) but body uses class(x). Parameter name mismatch — should be class(new)."
 
 [diagnostic.range]
@@ -735,7 +735,7 @@ end_character = 74
 [[diagnostic]]
 package = "grDevices"
 path = "R/postscript.R"
-message = "Undefined variable: cmd"
+message = "cmd is not defined"
 evidence = "stop(gettextf(..., cmd)) at line 992 (0-indexed 991) uses `cmd` which isn't assigned until line 995. Used-before-defined that will crash if system2() returns non-zero."
 
 [diagnostic.range]
@@ -746,7 +746,7 @@ end_character = 67
 [[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
+message = "cumprob is not defined"
 evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
 
 [diagnostic.range]
@@ -757,7 +757,7 @@ end_character = 28
 [[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
+message = "cumprob is not defined"
 evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
 
 [diagnostic.range]
@@ -768,7 +768,7 @@ end_character = 53
 [[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
+message = "cumprob is not defined"
 evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
 
 [diagnostic.range]
@@ -779,7 +779,7 @@ end_character = 66
 [[diagnostic]]
 package = "survival"
 path = "R/points.survfit.R"
-message = "Undefined variable: cumprob"
+message = "cumprob is not defined"
 evidence = "Function signature omits cumprob parameter present in plot.survfit and lines.survfit; missing() on non-formal errors at runtime."
 
 [diagnostic.range]
@@ -790,7 +790,7 @@ end_character = 34
 [[diagnostic]]
 package = "httr"
 path = "demo/oauth2-yelp.R"
-message = "Undefined variable: token"
+message = "token is not defined"
 evidence = "File defines yelp_token (line 24) but uses undefined token (line 41); should be config(token = yelp_token)."
 
 [diagnostic.range]
@@ -801,7 +801,7 @@ end_character = 36
 [[diagnostic]]
 package = "survival"
 path = "tests/multi2.R"
-message = "Undefined variable: d1"
+message = "d1 is not defined"
 evidence = "d1 never defined anywhere in file; dead code inside if(FALSE) block; same pattern as accepted indx1/2/3 entries."
 
 [diagnostic.range]
@@ -812,7 +812,7 @@ end_character = 10
 [[diagnostic]]
 package = "utils"
 path = "R/mach-o.R"
-message = "Undefined variable: f"
+message = "f is not defined"
 evidence = "isSeekable(f) called at line 48 but f <- filename assigned at line 49; used-before-defined."
 
 [diagnostic.range]
@@ -823,7 +823,7 @@ end_character = 25
 [[diagnostic]]
 package = "survival"
 path = "R/parsecovar.R"
-message = "Undefined variable: k"
+message = "k is not defined"
 evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
 
 [diagnostic.range]
@@ -834,7 +834,7 @@ end_character = 49
 [[diagnostic]]
 package = "survival"
 path = "R/parsecovar.R"
-message = "Undefined variable: k"
+message = "k is not defined"
 evidence = "any(k = expr) passes named arg to any(), does not bind k in calling scope. k undefined at stop() call."
 
 [diagnostic.range]
@@ -845,7 +845,7 @@ end_character = 47
 [[diagnostic]]
 package = "broom"
 path = "R/margins.R"
-message = "Undefined variable: ."
+message = ". is not defined"
 evidence = "In tidy.margins (R/margins.R lines 82-106), `ret <- { tryCatch(pivot_longer(ret, ...), error = function(e) { mutate(., ...) |> pivot_longer(...) }) }` \u2014 the block is NOT piped into (no %>% anywhere in margins.R; the success branch already uses `ret` explicitly), so `.` inside the error handler is unbound; if pivot_longer ever errors, the handler fails with \"object '.' not found\". Leftover from a magrittr-block-to-native-pipe refactor. Belongs in the accepted-real fixture."
 
 [diagnostic.range]
@@ -856,7 +856,7 @@ end_character = 15
 [[diagnostic]]
 package = "cli"
 path = "tests/testthat/progresstest/R/test.R"
-message = "Undefined variable: test2"
+message = "test2 is not defined"
 evidence = "test2() at tests/testthat/progresstest/R/test.R:38 has no definition anywhere: the C routine test2 (src/test.c:94) is exposed only as the prefixed object c_test2 (NAMESPACE: useDynLib(progresstest, .registration=TRUE, .fixes=\"c_\")), and no R-level test2 exists in the fixture or its Imports (only cli); calling test3() errors 'could not find function \"test2\"'"
 
 [diagnostic.range]
@@ -867,7 +867,7 @@ end_character = 7
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -878,7 +878,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -889,7 +889,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -900,7 +900,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -911,7 +911,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -922,7 +922,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -944,7 +944,7 @@ end_character = 47
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -955,7 +955,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -977,7 +977,7 @@ end_character = 46
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -988,7 +988,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -1010,7 +1010,7 @@ end_character = 60
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -1021,7 +1021,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -1032,7 +1032,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -1043,7 +1043,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -1054,7 +1054,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -1065,7 +1065,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -1076,7 +1076,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DF"
+message = "DF is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DF is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DF' not found\"."
 
 [diagnostic.range]
@@ -1087,7 +1087,7 @@ end_character = 2
 [[diagnostic]]
 package = "dtplyr"
 path = "vignettes/benchmark.R"
-message = "Undefined variable: DT"
+message = "DT is not defined"
 evidence = "vignettes/benchmark.R defines only lowercase df (line 1) and dt (line 2); DT is never assigned anywhere; the only Rmd (vignettes/translation.Rmd) contains no read_chunk() and nothing references benchmark.R; file is ^vignettes/benchmark\\.R$ in .Rbuildignore. Evaluating this line fails with \"object 'DT' not found\"."
 
 [diagnostic.range]
@@ -1098,7 +1098,7 @@ end_character = 2
 [[diagnostic]]
 package = "ggplot2"
 path = "icons/icons.R"
-message = "Undefined variable: g (defined later on line 521)"
+message = "g is used before it is defined (defined on line 521)"
 evidence = "g is used at line 516 inside write_icon(\"scale_colour_viridis_d\", {...}) (lines 512-518) but the only assignments to g are at lines 521 and 531, inside LATER write_icon blocks; write_icon forces its `code` promise immediately via grid.draw, so a fresh top-to-bottom run errors with \"object 'g' not found\" at this block \u2014 it is also missing the `g <- scale_fill_viridis_d(); g$train(1:5)` setup its siblings have"
 
 [diagnostic.range]
@@ -1109,7 +1109,7 @@ end_character = 22
 [[diagnostic]]
 package = "googledrive"
 path = "data-raw/old/discovery-doc-prep.R"
-message = "Undefined variable: ."
+message = ". is not defined"
 evidence = "Pipe chain at lines 13-18 uses the native |> operator, which has no `.` placeholder; `.` in find_package_root_file(\"data-raw\", .) at line 18 is an ordinary unbound symbol and the branch errors with 'object \".\" not found' at runtime"
 
 [diagnostic.range]
@@ -1120,7 +1120,7 @@ end_character = 40
 [[diagnostic]]
 package = "googledrive"
 path = "internal/old/04_map_demo.Rmd"
-message = "Undefined variable: drive_file"
+message = "drive_file is not defined"
 evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
 
 [diagnostic.range]
@@ -1131,7 +1131,7 @@ end_character = 23
 [[diagnostic]]
 package = "googledrive"
 path = "internal/old/04_map_demo.Rmd"
-message = "Undefined variable: drive_delete"
+message = "drive_delete is not defined"
 evidence = "drive_delete is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
 
 [diagnostic.range]
@@ -1142,7 +1142,7 @@ end_character = 25
 [[diagnostic]]
 package = "googledrive"
 path = "internal/old/06_dots_demo.Rmd"
-message = "Undefined variable: drive_file"
+message = "drive_file is not defined"
 evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
 
 [diagnostic.range]
@@ -1153,7 +1153,7 @@ end_character = 12
 [[diagnostic]]
 package = "googledrive"
 path = "internal/old/06_dots_demo.Rmd"
-message = "Undefined variable: drive_file"
+message = "drive_file is not defined"
 evidence = "drive_file is a May-2017 development-era googledrive function that no longer exists anywhere in R/ or NAMESPACE (the API was renamed, e.g. drive_delete -> drive_rm); the chunk attaches the current package via library(googledrive) so the call would fail with 'could not find function' at runtime"
 
 [diagnostic.range]
@@ -1164,7 +1164,7 @@ end_character = 12
 [[diagnostic]]
 package = "pillar"
 path = "revdep/drake-deps.R"
-message = "Undefined variable: plan_deps"
+message = "plan_deps is not defined"
 evidence = "revdep/drake-deps.R sources only revdep/drake-base.R, where plan_deps exists solely as a local inside get_plan_deps() (drake-base.R lines 30 and 43) and is never assigned at top level; drake::make() evaluates its plan argument normally, so the script fails at runtime with \"object 'plan_deps' not found\" (revdep/drake.R line 102 assigns plan_deps only inside another function and is not sourced here)"
 
 [diagnostic.range]
@@ -1175,7 +1175,7 @@ end_character = 21
 [[diagnostic]]
 package = "rvest"
 path = "data-raw/keydef.R"
-message = "Undefined variable: keydef"
+message = "keydef is not defined"
 evidence = "`keydef` is created only inside the V8 JavaScript context (ct$eval of the string \"keydef = {...}\" at lines 9-10); the R-level binding is `keydefs <- ct$get(\"keydef\")` at line 11. `tibble::enframe(keydef)` at line 15 would error at runtime with object 'keydef' not found \u2014 should be `keydefs`. Belongs in the accepted-real fixture."
 
 [diagnostic.range]
@@ -1186,7 +1186,7 @@ end_character = 22
 [[diagnostic]]
 package = "rvest"
 path = "demo/tripadvisor.R"
-message = "Undefined variable: ."
+message = ". is not defined"
 evidence = "The demo uses the native |> pipe exclusively (zero %>% in the file). Line 23 `html_attr(\"alt\") |> gsub(\" of 5 stars\", \"\", .)` desugars to gsub(lhs, \" of 5 stars\", \"\", .): the native pipe has no dot placeholder, so `.` is unbound and the call errors with object '.' not found (and the argument order is wrong besides). Belongs in the accepted-real fixture."
 
 [diagnostic.range]
@@ -1197,7 +1197,7 @@ end_character = 27
 [[diagnostic]]
 package = "tidyr"
 path = "tests/testthat/test-gather.R"
-message = "Undefined variable: d"
+message = "d is not defined"
 evidence = "Confirmed real in the tidyverse/tidyr git checkout: the test defines `df` then calls `gather(d, key, val, -x)` (a `df`->`d` typo in an `expect_error` block). Editing the call to `gather(df, key, val, -x)` and rerunning `target/debug/raven check --workspace <checkout> --format json --max-severity error --no-config` removed the diagnostic. Surfaced by issue #431: the package's own `gather` now resolves to its NSE policy, which checks the `data` argument."
 source = "tidyverse/tidyr git HEAD"
 minimal_edit = "Fix the typo: `gather(d, key, val, -x)` -> `gather(df, key, val, -x)`."

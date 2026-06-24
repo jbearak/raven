@@ -1597,7 +1597,7 @@ mod tests {
         // This is the bug: the previous implementation only walked backward
         // dependents, so a parent edit never triggered a child republish.
         // User-visible symptom: edits removing `y <- 1` from parent.R never
-        // produced "Undefined variable: y" in child.R until the user
+        // produced "y is not defined" in child.R until the user
         // manually edited child.R.
         let mut graph = DependencyGraph::new();
         let parent = affected_url("parent.R");

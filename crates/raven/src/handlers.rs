@@ -5405,12 +5405,9 @@ fn collect_unused_suppression_diagnostics(
         }
         let message = match directive.flavor {
             SuppressionFlavor::Expect => {
-                "Unused `expect` suppression: no matching diagnostic was suppressed here."
-                    .to_string()
+                "This `expect` directive matched no diagnostic.".to_string()
             }
-            SuppressionFlavor::Ignore => {
-                "Unused suppression: no matching diagnostic was suppressed here.".to_string()
-            }
+            SuppressionFlavor::Ignore => "This directive suppressed no diagnostic.".to_string(),
         };
         diagnostics.push(Diagnostic {
             range: Range {
@@ -6783,11 +6780,11 @@ fn collect_undefined_variables_from_snapshot(
 
         let mut message = match forward_ref_defined_line {
             Some(line) => format!(
-                "Undefined variable: {} (defined later on line {})",
+                "{} is used before it is defined (defined on line {})",
                 name,
                 line + 1
             ),
-            None => format!("Undefined variable: {}", name),
+            None => format!("{} is not defined", name),
         };
         if let Some((callee, formal)) = nse_hint_for_usage(usage_node, text, &nse_analysis) {
             // The call is described by the source callee (`callee`, which keeps
@@ -7930,11 +7927,11 @@ fn collect_syntax_errors_inner(
                 });
             }
             ErrorClassification::Multi(diags) if diags.is_empty() => {
-                // Fallback: generic "Syntax error" at the minimized range.
+                // Fallback: generic parse-failure message at the minimized range.
                 diagnostics.push(Diagnostic {
                     range: minimize_error_range(node, text),
                     severity: Some(DiagnosticSeverity::ERROR),
-                    message: "Syntax error".to_string(),
+                    message: "R code could not be parsed here".to_string(),
                     code: Some(NumberOrString::String(
                         crate::diagnostic_code::SYNTAX_ERROR.to_string(),
                     )),
@@ -8330,7 +8327,7 @@ fn extract_from_leaf(raw: &str, base_byte: usize, row: u32, out: &mut Vec<DelimE
 ///    arises from writing `=>` (no such operator in R).
 /// 5. Delimiter scan — stack-based processing of the event stream; emits
 ///    zero or more per-fault diagnostics. An empty result causes the caller
-///    to fall back to a single generic `"Syntax error"`.
+///    to fall back to a single generic `"R code could not be parsed here"`.
 ///
 /// Returns `ErrorClassification::Whole` when a single classifier matched, or
 /// `ErrorClassification::Multi` with the scan's results otherwise.
@@ -8363,7 +8360,7 @@ fn classify_error(node: Node, text: &str, state: &mut CollectState) -> ErrorClas
     }
 
     // Delimiter scan: produces zero or more per-fault diagnostics. An
-    // empty Vec falls back to a single "Syntax error" in the caller.
+    // empty Vec falls back to a single "R code could not be parsed here" in the caller.
     let scan = classify_via_delimiter_scan(node, text, state);
     ErrorClassification::Multi(scan)
 }
@@ -8723,7 +8720,7 @@ fn detect_mismatched_via_structural_parent(
 /// ERROR child whose only token is `>`, and the right-hand expression as
 /// the next sibling. Adjacency matters — `x = > 1` (with a space) and
 /// `x =\n> 1` produce the same node shape but are *not* a literal `=>`
-/// token, so they should fall back to the generic "Syntax error".
+/// token, so they should fall back to the generic "R code could not be parsed here".
 fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
     let node_text = text.get(node.start_byte()..node.end_byte())?;
     if node_text != ">" {
@@ -8751,7 +8748,7 @@ fn detect_fat_arrow(node: Node, text: &str) -> Option<String> {
 mod unused_suppression_tests {
     use super::collect_unused_suppression_diagnostics;
     use crate::cross_file::types::{LineSuppression, SuppressionDirective, SuppressionFlavor};
-    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
     fn directive(
         line: u32,
@@ -8771,7 +8768,7 @@ mod unused_suppression_tests {
         diags
             .iter()
             .filter(|d| {
-                matches!(&d.code, Some(NumberOrString::String(c)) if c == crate::diagnostic_code::UNUSED_SUPPRESSION)
+                matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNUSED_SUPPRESSION)
             })
             .map(|d| d.range.start.line)
             .collect()
@@ -9430,7 +9427,9 @@ mod syntax_error_range_tests {
         let diags = collect(code);
         let syntax_or_missing: Vec<_> = diags
             .iter()
-            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .filter(|d| {
+                d.message == "R code could not be parsed here" || d.message.starts_with("Missing")
+            })
             .collect();
         // tree-sitter may or may not parse this cleanly. If it does produce
         // diagnostics, document it as a grammar limitation.
@@ -9455,7 +9454,9 @@ mod syntax_error_range_tests {
         let diags = collect(code);
         let syntax_or_missing: Vec<_> = diags
             .iter()
-            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .filter(|d| {
+                d.message == "R code could not be parsed here" || d.message.starts_with("Missing")
+            })
             .collect();
         assert!(
             syntax_or_missing.is_empty(),
@@ -9475,7 +9476,9 @@ mod syntax_error_range_tests {
         let diags = collect(code);
         let syntax_or_missing: Vec<_> = diags
             .iter()
-            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .filter(|d| {
+                d.message == "R code could not be parsed here" || d.message.starts_with("Missing")
+            })
             .collect();
         if !syntax_or_missing.is_empty() {
             eprintln!(
@@ -9495,7 +9498,9 @@ mod syntax_error_range_tests {
         let diags = collect(code);
         let syntax_or_missing: Vec<_> = diags
             .iter()
-            .filter(|d| d.message == "Syntax error" || d.message.starts_with("Missing"))
+            .filter(|d| {
+                d.message == "R code could not be parsed here" || d.message.starts_with("Missing")
+            })
             .collect();
         // tree-sitter should accept this. If not, document as grammar limitation.
         if !syntax_or_missing.is_empty() {
@@ -9526,7 +9531,8 @@ mod syntax_error_range_tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+                .any(|d| d.message == "R code could not be parsed here"
+                    || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -9556,10 +9562,10 @@ mod syntax_error_range_tests {
         // `x <- 1 +\n+ 2` — double operator across lines.
         let code = "x <- 1 +\n+ 2";
         let diags = collect(code);
-        // Count only "Syntax error" diagnostics (not "Missing")
+        // Count only "R code could not be parsed here" diagnostics (not "Missing")
         let syntax_errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.message == "Syntax error")
+            .filter(|d| d.message == "R code could not be parsed here")
             .collect();
         // Should produce at most one syntax error (no cascading duplicates)
         assert!(
@@ -9638,7 +9644,7 @@ mod syntax_error_range_tests {
         // `libs <- c("lib1", "lib2", "lib3)` — an unclosed string literal
         // inside a function call. Tree-sitter wraps the call body in an
         // ERROR node containing a lone `"` token; the message should explain
-        // *why* it's an error rather than just "Syntax error".
+        // *why* it's an error rather than just "R code could not be parsed here".
         let code = "libs <- c(\"lib1\", \"lib2\", \"lib3)";
         let diags = collect(code);
         assert!(
@@ -9687,7 +9693,7 @@ mod syntax_error_range_tests {
         );
         assert!(
             diags.iter().any(|d| {
-                d.message == "Syntax error"
+                d.message == "R code could not be parsed here"
                     || d.message.starts_with("Missing")
                     || d.message.starts_with("Unclosed")
             }),
@@ -9703,7 +9709,7 @@ mod syntax_error_range_tests {
         let diags = collect(code);
         // If tree-sitter produces errors, they should not blame `f`
         for d in &diags {
-            if d.message == "Syntax error" {
+            if d.message == "R code could not be parsed here" {
                 assert!(
                     d.range.start.character > 0,
                     "syntax error should not start at column 0 (the `f` call), got col {}",
@@ -9726,7 +9732,8 @@ mod syntax_error_range_tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message == "Syntax error" || d.message.starts_with("Missing")),
+                .any(|d| d.message == "R code could not be parsed here"
+                    || d.message.starts_with("Missing")),
             "should produce a syntax/missing diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -10248,7 +10255,7 @@ mod syntax_error_range_tests {
 
             // For each MISSING node position, there should be a diagnostic placed
             // at that exact location. The diagnostic may come from:
-            // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "Syntax error")
+            // 1. minimize_error_range Phase 1 (MISSING inside ERROR → "R code could not be parsed here")
             // 2. collect_syntax_errors direct MISSING handling (→ "Missing <kind>")
             //
             // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
@@ -10416,14 +10423,14 @@ mod syntax_error_range_tests {
             let mut diagnostics = Vec::new();
             collect_syntax_errors(root, &code, &mut diagnostics);
 
-            // Count only "Syntax error" diagnostics (not "Missing ..." diagnostics,
+            // Count only "R code could not be parsed here" diagnostics (not "Missing ..." diagnostics,
             // which come from MISSING nodes outside ERROR nodes and are separate).
             let syntax_error_count = diagnostics
                 .iter()
-                .filter(|d| d.message == "Syntax error")
+                .filter(|d| d.message == "R code could not be parsed here")
                 .count();
 
-            // The number of "Syntax error" diagnostics must not exceed the number
+            // The number of "R code could not be parsed here" diagnostics must not exceed the number
             // of top-level ERROR nodes. This ensures nested ERROR children do not
             // produce duplicate diagnostics.
             prop_assert!(
@@ -10577,7 +10584,7 @@ mod syntax_error_range_tests {
             //
             // MISSING-based diagnostics can appear as:
             // 1. "Missing <kind>" — from collect_syntax_errors direct MISSING handling
-            // 2. "Syntax error" — from minimize_error_range Phase 1 (MISSING inside ERROR)
+            // 2. "R code could not be parsed here" — from minimize_error_range Phase 1 (MISSING inside ERROR)
             //
             // Exception (Task 7): bracket-kind MISSING nodes (`)`, `}`, `]`, `]]`)
             // are re-anchored to the opener position and emit "Unclosed `X`...".
@@ -11286,7 +11293,7 @@ mod syntax_error_range_tests {
     // / `Unclosed …` events. The fix in `extract_from_leaf` guards the
     // byte-scan with an "every byte is `}`/`)`/`]` or ASCII whitespace"
     // precondition, so these leaves now fall back to the generic
-    // "Syntax error".
+    // "R code could not be parsed here".
     #[test]
     fn special_operator_with_bracket_chars_no_spurious_bracket_diag() {
         for code in &["x <- %]%", "x <- %}%", "x <- %(%", "x <- %[[%"] {
@@ -12151,7 +12158,7 @@ mod semantic_warning_pipeline_tests {
         // Sanity: the baseline undefined symbol MUST still be flagged —
         // otherwise the collector isn't running and the test is vacuous.
         assert!(
-            messages.contains(&"Undefined variable: totally_undefined_baseline"),
+            messages.contains(&"totally_undefined_baseline is not defined"),
             "baseline undefined symbol must still flag; pipeline may not be firing. messages: {messages:?}"
         );
         // Control: a backtick-quoted call to an UNDECLARED function IS collected
@@ -12159,7 +12166,7 @@ mod semantic_warning_pipeline_tests {
         // callee position is inspected at all, so the `my_func` non-flagging
         // below is a genuine resolution, not a vacuous "callees aren't checked".
         assert!(
-            messages.contains(&"Undefined variable: `undeclared_helper`"),
+            messages.contains(&"`undeclared_helper` is not defined"),
             "an undeclared backtick-quoted callee must still flag. messages: {messages:?}"
         );
         assert!(
@@ -12186,7 +12193,7 @@ mod semantic_warning_pipeline_tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+                .any(|d| d.message == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must still flag; pipeline may not be firing. messages: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -12214,7 +12221,7 @@ mod semantic_warning_pipeline_tests {
     fn undefined_params_messages(diags: &[super::Diagnostic]) -> Vec<String> {
         diags
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: params"))
+            .filter(|d| d.message.contains("params is not defined"))
             .map(|d| d.message.clone())
             .collect()
     }
@@ -12992,7 +12999,7 @@ impl TargetClassification {
                 format!("Cannot assign to {} `{target_text}`.", self.label)
             }
             (DiagnosticSeverity::WARNING, "string literal") => format!(
-                "Assigning to string literal {target_text}; R will bind the value to the variable named by the string. Was this intentional?"
+                "The assignment target {target_text} is a string literal; R will bind the value to the variable named by that string. Was this intentional?"
             ),
             (DiagnosticSeverity::WARNING, "dots") => format!(
                 "Assigning to `{target_text}` creates a binding that can't be reached through the usual `...` accessors."
@@ -26619,7 +26626,7 @@ clean_data <- function(x) {
     }
 
     /// Diagnostic pipeline: a NAMESPACE `importFrom(tidyr, pivot_longer)`
-    /// must suppress "Undefined variable: pivot_longer" for an `R/*.R`
+    /// must suppress "pivot_longer is not defined" for an `R/*.R`
     /// file under the package.
     ///
     /// The suppression flows through `parent_symbol_names` — the collector
@@ -26702,7 +26709,7 @@ clean_data <- function(x) {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+                .any(|d| d.message == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
             diagnostics
                 .iter()
@@ -26712,9 +26719,9 @@ clean_data <- function(x) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: pivot_longer"),
+                .any(|d| d.message == "pivot_longer is not defined"),
             "importFrom(tidyr, pivot_longer) in the package NAMESPACE must suppress \
-             `Undefined variable: pivot_longer` for R/ files. messages: {:?}",
+             `pivot_longer is not defined` for R/ files. messages: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -26723,7 +26730,7 @@ clean_data <- function(x) {
     }
 
     /// Workstream B: a NAMESPACE `importFrom(pkg, fn)` MUST suppress
-    /// "Undefined variable: fn" for `R/*.R` files even when `pkg` is NOT
+    /// "fn is not defined" for `R/*.R` files even when `pkg` is NOT
     /// installed — the explicit symbol name is statically known from the
     /// NAMESPACE directive and needs no package library lookup.
     ///
@@ -26814,7 +26821,7 @@ clean_data <- function(x) {
 
         let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
         assert!(
-            messages.contains(&"Undefined variable: genuine_undefined"),
+            messages.contains(&"genuine_undefined is not defined"),
             "baseline undefined MUST still fire; got: {messages:?}",
         );
         assert!(
@@ -27084,7 +27091,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. \
              messages: {messages:?}"
         );
@@ -27157,17 +27164,15 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_var")),
+                .any(|m| m.contains("undefined_var is not defined")),
             "argument of a resolved no-policy export must be checked; messages: {messages:?}"
         );
         // The resolved export itself must not be flagged. Use
-        // `contains("Undefined variable: my_fn")` rather than `contains("my_fn")`
+        // `contains("my_fn is not defined")` rather than `contains("my_fn")`
         // because the NSE hint for `undefined_var`'s diagnostic legitimately
         // mentions `my_fn` as the callee (correct behavior per #455).
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: my_fn")),
+            !messages.iter().any(|m| m.contains("my_fn is not defined")),
             "resolved package export `my_fn` must not be flagged; messages: {messages:?}"
         );
         // Contrast: an unresolved callee falls back to WholeCall, suppressing
@@ -27182,7 +27187,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: unknown_unresolved_fn"),
+                .any(|m| m == "unknown_unresolved_fn is not defined"),
             "unresolved callee must be flagged; messages: {messages:?}"
         );
     }
@@ -27255,20 +27260,16 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         // The columns quoted by `.()` must NOT be flagged.
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: iso")),
+            !messages.iter().any(|m| m.contains("iso is not defined")),
             "`.(iso, ...)` must suppress the quoted column `iso`; messages: {messages:?}"
         );
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: yearY")),
+            !messages.iter().any(|m| m.contains("yearY is not defined")),
             "`.(.., yearY)` must suppress the quoted column `yearY`; messages: {messages:?}"
         );
         // Scoping boundary: `ddply`'s base policy still checks its data-frame
@@ -27277,7 +27278,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_df_arg")),
+                .any(|m| m.contains("undefined_df_arg is not defined")),
             "`ddply`'s data argument must stay checked (standard-eval); messages: {messages:?}"
         );
     }
@@ -27347,25 +27348,21 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: team")),
+            !messages.iter().any(|m| m.contains("team is not defined")),
             "`summarise` data-masks the forwarded `...`, so `team` must not be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: year")),
+            !messages.iter().any(|m| m.contains("year is not defined")),
             "`.(year)` must suppress the quoted column `year`; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_df_arg")),
+                .any(|m| m.contains("undefined_df_arg is not defined")),
             "`ddply`'s `.data` argument must stay checked; messages: {messages:?}"
         );
     }
@@ -27383,13 +27380,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_typo")),
+                .any(|m| m.contains("undefined_typo is not defined")),
             "an ordinary `.fun` leaves the forwarded `...` checked, so the typo must be flagged; messages: {messages:?}"
         );
     }
@@ -27406,13 +27403,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: raw_col")),
+                .any(|m| m.contains("raw_col is not defined")),
             "`transform` data-masks the forwarded `...`, so `raw_col` must not be flagged; messages: {messages:?}"
         );
     }
@@ -27429,19 +27426,19 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: value_col")),
+                .any(|m| m.contains("value_col is not defined")),
             "`summarise` as `llply`'s 2nd-position `.fun` must data-mask the `...`; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_input")),
+                .any(|m| m.contains("undefined_input is not defined")),
             "`llply`'s `.data` must stay checked; messages: {messages:?}"
         );
     }
@@ -27460,13 +27457,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_typo")),
+                .any(|m| m.contains("undefined_typo is not defined")),
             "a locally-shadowed `.fun` does not data-mask, so the typo must be flagged; messages: {messages:?}"
         );
     }
@@ -27484,13 +27481,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: value_col")),
+                .any(|m| m.contains("value_col is not defined")),
             "a piped `.fun` (summarise) must still data-mask the forwarded `...`; messages: {messages:?}"
         );
     }
@@ -27507,13 +27504,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: team")),
+            !messages.iter().any(|m| m.contains("team is not defined")),
             "`plyr::summarise` as `.fun` must data-mask the forwarded `...`; messages: {messages:?}"
         );
     }
@@ -27537,19 +27532,19 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: bad_typo")),
+                .any(|m| m.contains("bad_typo is not defined")),
             "a named control formal (`.drop`) stays checked even when `.fun` data-masks; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: value_col")),
+                .any(|m| m.contains("value_col is not defined")),
             "the genuinely data-masked `...` column must still be suppressed (proves the upgrade fired); messages: {messages:?}"
         );
     }
@@ -27567,13 +27562,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: value_col")),
+                .any(|m| m.contains("value_col is not defined")),
             "a named `.fun = summarise` must still be located and data-mask the `...`; messages: {messages:?}"
         );
     }
@@ -27595,13 +27590,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_typo")),
+                .any(|m| m.contains("undefined_typo is not defined")),
             "`mdply` splats `.fun`, so its `...` are NOT data-masked and the typo must be flagged; messages: {messages:?}"
         );
     }
@@ -27622,13 +27617,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: team")),
+            !messages.iter().any(|m| m.contains("team is not defined")),
             "an aliased `*ply` (`my_ddply <- plyr::ddply`) must apply the data-mask upgrade; messages: {messages:?}"
         );
     }
@@ -27679,7 +27672,7 @@ clean_data <- function(x) {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: totally_undefined_baseline"),
+                .any(|d| d.message == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. messages: {:?}",
             diagnostics
                 .iter()
@@ -27689,7 +27682,7 @@ clean_data <- function(x) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: return"),
+                .any(|d| d.message == "return is not defined"),
             "`return(...)` must not be flagged as undefined (return is a builtin). messages: {:?}",
             diagnostics
                 .iter()
@@ -27723,7 +27716,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -27754,7 +27747,7 @@ clean_data <- function(x) {
         let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: later"),
+            messages.iter().any(|m| m == "later is not defined"),
             "direct same-function use before binding must remain diagnostic; messages: {messages:?}"
         );
     }
@@ -27785,22 +27778,22 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined must fire; messages: {messages:?}"
         );
-        // Use `contains("Undefined variable: is_true")` rather than
+        // Use `contains("is_true is not defined")` rather than
         // `contains("is_true")` because `# raven: nse` hint messages for
         // other diagnostics may legitimately mention `is_true` as the callee.
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: is_true")),
+                .any(|m| m.contains("is_true is not defined")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: deferred_run")),
+                .any(|m| m.contains("deferred_run is not defined")),
             "conditional def inside if block must not be flagged; messages: {messages:?}"
         );
     }
@@ -27828,7 +27821,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined must fire; messages: {messages:?}"
         );
         assert!(
@@ -27887,7 +27880,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -27919,7 +27912,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -27955,7 +27948,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -27963,7 +27956,7 @@ clean_data <- function(x) {
             "quoted-string LHS defining a function is idiomatic and must not be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: foo"),
+            !messages.iter().any(|m| m == "foo is not defined"),
             "string-literal assignment target `foo<-` must define the replacement binding; messages: {messages:?}"
         );
     }
@@ -27992,7 +27985,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -28024,11 +28017,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: envir"),
+            !messages.iter().any(|m| m == "envir is not defined"),
             "`.Internal(remove(...))` must not remove the formal `envir`; messages: {messages:?}"
         );
     }
@@ -28056,7 +28049,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -28089,7 +28082,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -28122,13 +28115,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            messages
-                .iter()
-                .any(|m| m == "Undefined variable: .Random.seed"),
+            messages.iter().any(|m| m == ".Random.seed is not defined"),
             "`.Random.seed` before set.seed() must be reported; messages: {messages:?}"
         );
     }
@@ -28157,13 +28148,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            messages
-                .iter()
-                .any(|m| m == "Undefined variable: .Random.seed"),
+            messages.iter().any(|m| m == ".Random.seed is not defined"),
             "a commented-out `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
         );
     }
@@ -28191,13 +28180,11 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
-            messages
-                .iter()
-                .any(|m| m == "Undefined variable: .Random.seed"),
+            messages.iter().any(|m| m == ".Random.seed is not defined"),
             "a stringified `set.seed(` must not suppress `.Random.seed`; messages: {messages:?}"
         );
     }
@@ -28225,7 +28212,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
@@ -28259,14 +28246,14 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         for name in ["a", "b", "d", "x"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m.starts_with(&format!("Undefined variable: {name}"))),
+                    .any(|m| m.starts_with(&format!("{name} is not defined"))),
                 "`%<-%` must define `{name}`; messages: {messages:?}"
             );
         }
@@ -28296,13 +28283,13 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}"
         );
         assert!(
             !messages
                 .iter()
-                .any(|m| m.starts_with("Undefined variable: error_call")),
+                .any(|m| m.starts_with("error_call is not defined")),
             "`%<~%` must define its bare-symbol LHS; messages: {messages:?}"
         );
     }
@@ -28330,7 +28317,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.starts_with("Undefined variable: a")),
+                .any(|m| m.starts_with("a is used before it is defined")),
             "use before the `%<-%` statement must still flag; messages: {messages:?}"
         );
     }
@@ -28356,9 +28343,7 @@ clean_data <- function(x) {
         let diagnostics = diagnostics(&state, &uri, &DiagCancelToken::never());
         let messages: Vec<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| m.starts_with("Undefined variable: p")),
+            messages.iter().any(|m| m.starts_with("p is not defined")),
             "`%foo%` must not bind `p`; messages: {messages:?}"
         );
     }
@@ -28406,7 +28391,7 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. \
              messages: {messages:?}",
         );
@@ -28414,7 +28399,7 @@ clean_data <- function(x) {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "S3 method special variable `{special}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -28463,14 +28448,14 @@ clean_data <- function(x) {
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged. messages: {messages:?}",
         );
         for special in [".Generic", ".Method", ".Class"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "S4 method special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -28529,14 +28514,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged. messages: {messages:?}",
         );
         for special in [".Generic", ".Method", ".Class", ".Group"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "group-generic special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -28608,14 +28593,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged. messages: {messages:?}",
         );
         for pronoun in ["self", "private", "super"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                    .any(|m| m == &format!("{pronoun} is not defined")),
                 "R6 pronoun `{pronoun}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -28675,14 +28660,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         for pronoun in ["self", "private"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                    .any(|m| m == &format!("{pronoun} is not defined")),
                 "R6 pronoun `{pronoun}` in nested fn must not be flagged. messages: {messages:?}",
             );
         }
@@ -28739,12 +28724,12 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         // With R6Class shadowed, `self` should be flagged as undefined
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: self"),
+            messages.iter().any(|m| m == "self is not defined"),
             "R6 pronoun `self` must be flagged when R6Class is shadowed. messages: {messages:?}",
         );
     }
@@ -28798,12 +28783,12 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: completely_nonexistent_var"),
+                .any(|m| m == "completely_nonexistent_var is not defined"),
             "genuine undefined inside R6 method must still be flagged. messages: {messages:?}",
         );
         // But `self` should NOT be flagged
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: self"),
+            !messages.iter().any(|m| m == "self is not defined"),
             "R6 pronoun `self` must not be flagged. messages: {messages:?}",
         );
     }
@@ -28859,14 +28844,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         for pronoun in ["self", "private"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                    .any(|m| m == &format!("{pronoun} is not defined")),
                 "R6 pronoun `{pronoun}` must not be flagged with bare R6Class. messages: {messages:?}",
             );
         }
@@ -28924,14 +28909,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         for pronoun in ["self", "private"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {pronoun}")),
+                    .any(|m| m == &format!("{pronoun} is not defined")),
                 "R6 pronoun `{pronoun}` in positional member list must not be flagged. messages: {messages:?}",
             );
         }
@@ -28985,11 +28970,11 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: self"),
+            !messages.iter().any(|m| m == "self is not defined"),
             "R6 pronoun `self` in bare positional member list must not be flagged. messages: {messages:?}",
         );
     }
@@ -29044,11 +29029,11 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: self"),
+            !messages.iter().any(|m| m == "self is not defined"),
             "R6 pronoun `self` in method default argument must not be flagged. messages: {messages:?}",
         );
     }
@@ -29101,11 +29086,11 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline must fire. messages: {messages:?}",
         );
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: self"),
+            messages.iter().any(|m| m == "self is not defined"),
             "`self` in an unnamed list() passed to a non-R6Class call must still flag. messages: {messages:?}",
         );
     }
@@ -29159,7 +29144,7 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. \
              messages: {messages:?}",
         );
@@ -29167,7 +29152,7 @@ y <- totally_undefined_baseline()
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "Reference Class method special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -29221,7 +29206,7 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. \
              messages: {messages:?}",
         );
@@ -29229,7 +29214,7 @@ y <- totally_undefined_baseline()
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "Reference Class table special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -29283,7 +29268,7 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; pipeline may not be firing. \
              messages: {messages:?}",
         );
@@ -29291,7 +29276,7 @@ y <- totally_undefined_baseline()
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "registered Reference Class method helper special `{special}` must not be flagged. \
                  messages: {messages:?}",
             );
@@ -29341,7 +29326,7 @@ y <- totally_undefined_baseline()
             assert!(
                 messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {special}")),
+                    .any(|m| m == &format!("{special} is not defined")),
                 "ordinary function special `{special}` should still be flagged. messages: {messages:?}",
             );
         }
@@ -29394,11 +29379,11 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}",
         );
         assert!(
-            !messages.iter().any(|m| m == "Undefined variable: bar"),
+            !messages.iter().any(|m| m == "bar is not defined"),
             "Reference Class field `bar` must not be flagged inside its method. messages: {messages:?}",
         );
     }
@@ -29419,14 +29404,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}",
         );
         for name in ["addToBar", "b2", "setB2", "getB2"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {name}")),
+                    .any(|m| m == &format!("{name} is not defined")),
                 "Reference Class inherited/member name `{name}` must not be flagged. messages: {messages:?}",
             );
         }
@@ -29442,14 +29427,14 @@ y <- totally_undefined_baseline()
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Undefined variable: totally_undefined_baseline"),
+                .any(|m| m == "totally_undefined_baseline is not defined"),
             "baseline undefined symbol must be flagged; messages: {messages:?}",
         );
         for name in ["bar", "flag"] {
             assert!(
                 !messages
                     .iter()
-                    .any(|m| m == &format!("Undefined variable: {name}")),
+                    .any(|m| m == &format!("{name} is not defined")),
                 "Reference Class field `{name}` must not be flagged in `$methods(...)`. messages: {messages:?}",
             );
         }
@@ -29520,7 +29505,7 @@ y <- totally_undefined_baseline()
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: helper_fn"),
+                .any(|d| d.message == "helper_fn is not defined"),
             "r_internal_symbols must suppress undefined-variable for R/ files. \
              messages: {:?}",
             diagnostics
@@ -29607,7 +29592,7 @@ y <- totally_undefined_baseline()
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: fixture"),
+                .any(|d| d.message == "fixture is not defined"),
             "test_helper_symbols must suppress undefined-variable for peer test files. \
              messages: {:?}",
             diagnostics
@@ -29631,9 +29616,7 @@ y <- totally_undefined_baseline()
         )
         .await;
         assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message == "Undefined variable: x"),
+            !diagnostics.iter().any(|d| d.message == "x is not defined"),
             "the package's own `filter` must data-mask `x` in its own tests. \
              messages: {:?}",
             diagnostics
@@ -29656,9 +29639,7 @@ y <- totally_undefined_baseline()
         )
         .await;
         assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message == "Undefined variable: x"),
+            !diagnostics.iter().any(|d| d.message == "x is not defined"),
             "masked `x` must stay suppressed. messages: {:?}",
             diagnostics
                 .iter()
@@ -29668,7 +29649,7 @@ y <- totally_undefined_baseline()
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: bogus_symbol"),
+                .any(|d| d.message == "bogus_symbol is not defined"),
             "a genuine undefined outside any mask position must still flag. \
              messages: {:?}",
             diagnostics
@@ -29690,9 +29671,7 @@ y <- totally_undefined_baseline()
         )
         .await;
         assert!(
-            !diagnostics
-                .iter()
-                .any(|d| d.message == "Undefined variable: x"),
+            !diagnostics.iter().any(|d| d.message == "x is not defined"),
             "the package's own `filter` must data-mask `x` in its own R/ files. \
              messages: {:?}",
             diagnostics
@@ -29716,9 +29695,7 @@ y <- totally_undefined_baseline()
         )
         .await;
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message == "Undefined variable: x"),
+            diagnostics.iter().any(|d| d.message == "x is not defined"),
             "a file outside the package tree must not inherit the self-package \
              policy. messages: {:?}",
             diagnostics
@@ -29861,7 +29838,7 @@ y <- totally_undefined_baseline()
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: fixture"),
+                .any(|d| d.message == "fixture is not defined"),
             "R/ files must not see test_helper_symbols — expected an \
              undefined-variable diagnostic. messages: {:?}",
             diagnostics
@@ -29962,7 +29939,7 @@ y <- totally_undefined_baseline()
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message.starts_with("Undefined variable:")),
+                .any(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE)),
             "setup-file top-level defs must suppress undefined-variable for \
              sibling test files. messages: {:?}",
             diagnostics
@@ -30018,7 +29995,7 @@ y <- totally_undefined_baseline()
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: CLEAN"),
+                .any(|d| d.message == "CLEAN is not defined"),
             "R/ files must not see setup-file defs — expected an \
              undefined-variable diagnostic. messages: {:?}",
             diagnostics
@@ -30822,7 +30799,7 @@ y <- totally_undefined_baseline()
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: test_that"),
+                .any(|d| d.message == "test_that is not defined"),
             "R/ files must flag testthat exports as undefined. messages: {:?}",
             diagnostics
                 .iter()
@@ -35462,7 +35439,7 @@ result <- data %>% filter(x > 0)
         let code = "```{r}\nx <- 1\n```\n\nProse paragraph.\n\n```{r}\ny <- 2\n```\n\nMore prose.\n\n```{r}\nprint(x)\n```\n";
         let diags = rmd_diagnostics(code, "file:///cross.Rmd", |_| {});
         assert!(
-            !diags.iter().any(|d| d.message == "Undefined variable: x"),
+            !diags.iter().any(|d| d.message == "x is not defined"),
             "x defined in an earlier chunk must resolve in a later chunk, got {:?}",
             diags
                 .iter()
@@ -35480,7 +35457,7 @@ result <- data %>% filter(x > 0)
         let diags = rmd_diagnostics(code, "file:///undef.Rmd", |_| {});
         let undef = diags
             .iter()
-            .find(|d| d.message == "Undefined variable: totally_undefined_symbol")
+            .find(|d| d.message == "totally_undefined_symbol is not defined")
             .unwrap_or_else(|| {
                 panic!(
                     "undefined symbol must be flagged, got {:?}",
@@ -35531,7 +35508,7 @@ result <- data %>% filter(x > 0)
         assert!(
             !diags
                 .iter()
-                .any(|d| d.message.contains("Undefined variable: abort")),
+                .any(|d| d.message.contains("abort is not defined")),
             "man/rmd/ file must see package exports, got {:?}",
             diags
                 .iter()
@@ -35549,9 +35526,7 @@ result <- data %>% filter(x > 0)
         let diags = rmd_diagnostics(code, "file:///cross_undef.Rmd", |_| {});
         // x must NOT be flagged (cross-chunk resolution)
         assert!(
-            !diags
-                .iter()
-                .any(|d| d.message.contains("Undefined variable: x")),
+            !diags.iter().any(|d| d.message.contains("x is not defined")),
             "x from chunk 1 must resolve in chunk 2, got {:?}",
             diags
                 .iter()
@@ -35562,7 +35537,7 @@ result <- data %>% filter(x > 0)
         assert!(
             diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: never_defined_anywhere"),
+                .any(|d| d.message == "never_defined_anywhere is not defined"),
             "genuinely undefined symbol must still flag in later chunk, got {:?}",
             diags
                 .iter()
@@ -42422,7 +42397,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
+                .filter(|d| d.message == format!("{} is not defined", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -42476,7 +42451,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
+                .filter(|d| d.message == format!("{} is not defined", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -42528,7 +42503,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this reserved word
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message == format!("Undefined variable: {}", reserved_word))
+                .filter(|d| d.message == format!("{} is not defined", reserved_word))
                 .collect();
 
             prop_assert!(
@@ -42579,7 +42554,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", var_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", var_name)))
                 .collect();
 
             prop_assert!(
@@ -43505,7 +43480,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this variable
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", var_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", var_name)))
                 .collect();
 
             prop_assert!(
@@ -43564,7 +43539,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this function
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", func_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", func_name)))
                 .collect();
 
             prop_assert!(
@@ -43626,7 +43601,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", symbol_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", symbol_name)))
                 .collect();
 
             prop_assert!(
@@ -43705,7 +43680,7 @@ mod proptests {
             // Exact match should NOT produce diagnostic
             let exact_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", base_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", base_name)))
                 .collect();
 
             prop_assert!(
@@ -43717,7 +43692,7 @@ mod proptests {
             // Case-mismatched usage SHOULD produce diagnostic
             let mismatched_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", mixed_case_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", mixed_case_name)))
                 .collect();
 
             prop_assert!(
@@ -43789,7 +43764,7 @@ mod proptests {
             let var1_before_diags: Vec<_> = diagnostics
                 .iter()
                 .filter(|d| {
-                    d.message.contains(&format!("Undefined variable: {}", var1))
+                    d.message.starts_with(&format!("{} ", var1))
                         && d.range.start.line == 0
                 })
                 .collect();
@@ -43804,7 +43779,7 @@ mod proptests {
             let var1_after_diags: Vec<_> = diagnostics
                 .iter()
                 .filter(|d| {
-                    d.message.contains(&format!("Undefined variable: {}", var1))
+                    d.message.starts_with(&format!("{} ", var1))
                         && d.range.start.line == 3
                 })
                 .collect();
@@ -43819,7 +43794,7 @@ mod proptests {
             let var2_after_diags: Vec<_> = diagnostics
                 .iter()
                 .filter(|d| {
-                    d.message.contains(&format!("Undefined variable: {}", var2))
+                    d.message.starts_with(&format!("{} ", var2))
                         && d.range.start.line == 4
                 })
                 .collect();
@@ -43833,7 +43808,9 @@ mod proptests {
             // Total diagnostics should be exactly 1 (for var1 on line 0)
             let total_undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains("Undefined variable:"))
+                .filter(|d| {
+                    matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
+                })
                 .collect();
 
             prop_assert_eq!(
@@ -43906,7 +43883,7 @@ mod proptests {
             // Filter for "Undefined variable" diagnostics for this symbol
             let undefined_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains(&format!("Undefined variable: {}", symbol_name)))
+                .filter(|d| d.message.contains(&format!("{} is not defined", symbol_name)))
                 .collect();
 
             prop_assert!(
@@ -53535,12 +53512,12 @@ result <- helper_with_spaces(42)"#;
         // helper is not visible from the caller's environment).
         let undefined_helper: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: helper"))
+            .filter(|d| d.message.contains("helper is not defined"))
             .collect();
         assert!(
             !undefined_helper.is_empty(),
-            "Expected 'Undefined variable: helper' diagnostic — local=TRUE \
-             doesn't inherit. Got: {:?}",
+            "Expected 'helper' diagnostic — local=TRUE \
+             doesn't inherit. Got: {:?} is not defined",
             diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
         );
     }
@@ -53800,7 +53777,7 @@ result <- helper_with_spaces(42)"#;
         // the diagnostic is suppressed.
         //
         // Expected snapshot behavior: NO "used before sourced" for xyz; the RHS
-        // remains a genuine "Undefined variable: xyz" because no outer `xyz`
+        // remains a genuine "xyz is not defined" because no outer `xyz`
         // exists at that point in the timeline.
         let data_code = "xyz <- xyz\nsource(\"indices.R\")\n";
         let indices_code = "xyz <- 99\n";
@@ -53858,13 +53835,13 @@ result <- helper_with_spaces(42)"#;
         // one undefined-variable diagnostic on line 0.
         let undefined_xyz: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .filter(|d| d.message.contains("xyz is not defined"))
             .filter(|d| d.range.start.line == 0)
             .collect();
         assert_eq!(
             undefined_xyz.len(),
             1,
-            "Expected exactly one 'Undefined variable: xyz' on line 0; got {:?}",
+            "Expected exactly one 'xyz' on line 0; got {:?} is not defined",
             diags
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
@@ -54991,7 +54968,7 @@ y <- x"#;
 
     /// File A: `x <- 1`. File B: `source('a.R')\ny <- x`. Editing A to remove
     /// the definition must cause B's next diagnostic pass to surface
-    /// "Undefined variable: x" — confirms diagnostic logic, not LSP plumbing.
+    /// "x is not defined" — confirms diagnostic logic, not LSP plumbing.
     #[test]
     fn test_undefined_variable_appears_in_dependent_after_parent_edit() {
         use tempfile::TempDir;
@@ -55037,7 +55014,7 @@ y <- x"#;
         let pre_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
         let pre_undefined_x: Vec<_> = pre_diags
             .iter()
-            .filter(|d| d.message == "Undefined variable: x")
+            .filter(|d| d.message == "x is not defined")
             .collect();
         assert!(
             pre_undefined_x.is_empty(),
@@ -55055,11 +55032,11 @@ y <- x"#;
             .cross_file_graph
             .update_file(&a_url, &meta_a_after, Some(&workspace_url), |_| None);
 
-        // Post-condition: B SHOULD now report "Undefined variable: x".
+        // Post-condition: B SHOULD now report "x is not defined".
         let post_diags = diagnostics(&state, &b_url, &DiagCancelToken::never());
         let post_undefined_x: Vec<_> = post_diags
             .iter()
-            .filter(|d| d.message == "Undefined variable: x")
+            .filter(|d| d.message == "x is not defined")
             .collect();
         assert_eq!(
             post_undefined_x.len(),
@@ -55154,7 +55131,7 @@ y <- x"#;
         // propagates through scope resolution) — keep this assertion as a
         // canary so a future regression on the symmetric path is also caught.
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: z"),
+            messages.iter().any(|m| m == "z is not defined"),
             "z should be flagged as undefined in parent.R after \
              source(child.R), since grandchild.R's rm(z) ran. Got: {:?}",
             messages
@@ -55164,7 +55141,7 @@ y <- x"#;
         // control returned to parent.R, so x is not in scope at parent's
         // line 2 reference.
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: x"),
+            messages.iter().any(|m| m == "x is not defined"),
             "x should be flagged as undefined in parent.R after \
              source(child.R), since child.R's rm(x) ran. Got: {:?}",
             messages
@@ -55186,16 +55163,12 @@ y <- x"#;
         .unwrap_or_default();
         let snapshot_messages: Vec<_> = snapshot_diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            snapshot_messages
-                .iter()
-                .any(|m| m == "Undefined variable: z"),
+            snapshot_messages.iter().any(|m| m == "z is not defined"),
             "snapshot path: z should be flagged as undefined; got: {:?}",
             snapshot_messages
         );
         assert!(
-            snapshot_messages
-                .iter()
-                .any(|m| m == "Undefined variable: x"),
+            snapshot_messages.iter().any(|m| m == "x is not defined"),
             "snapshot path: x should be flagged as undefined; got: {:?}",
             snapshot_messages
         );
@@ -55265,7 +55238,7 @@ y <- x"#;
         let diags = diagnostics(&state, &child2_url, &DiagCancelToken::never());
         let messages: Vec<_> = diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: x"),
+            messages.iter().any(|m| m == "x is not defined"),
             "x should be undefined in child2.R: child1.R defined and removed \
              it before child2.R was sourced. Got: {:?}",
             messages
@@ -55282,7 +55255,7 @@ y <- x"#;
         .unwrap_or_default();
         let snap_messages: Vec<_> = snap_diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            snap_messages.iter().any(|m| m == "Undefined variable: x"),
+            snap_messages.iter().any(|m| m == "x is not defined"),
             "snapshot path: x should be undefined in child2.R; got: {:?}",
             snap_messages
         );
@@ -55326,7 +55299,7 @@ y <- x"#;
         let diags = diagnostics(&state, &file_url, &DiagCancelToken::never());
         let messages: Vec<_> = diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            messages.iter().any(|m| m == "Undefined variable: x"),
+            messages.iter().any(|m| m == "x is not defined"),
             "x referenced inside f() must be flagged: top-level rm(x) \
              removed it before the function is called, and hoist must not \
              resurrect it. Got: {:?}",
@@ -55344,7 +55317,7 @@ y <- x"#;
         .unwrap_or_default();
         let snap_messages: Vec<_> = snap_diags.iter().map(|d| d.message.clone()).collect();
         assert!(
-            snap_messages.iter().any(|m| m == "Undefined variable: x"),
+            snap_messages.iter().any(|m| m == "x is not defined"),
             "snapshot path: x referenced inside f() must be flagged when \
              rm(x) precedes the function definition; got: {:?}",
             snap_messages
@@ -55445,14 +55418,16 @@ x <- 1
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
-        assert!(diagnostics[0].message.contains("Undefined variable: x"));
+        assert!(diagnostics[0]
+            .message
+            .contains("x is used before it is defined"));
         assert_eq!(diagnostics[0].range.start.line, 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         // Message must point at the line where the symbol is actually defined.
         // x is defined on file line 3 (the trailing newline after `x` puts the
         // definition on row 2, 1-indexed = 3).
         assert_eq!(
-            diagnostics[0].message, "Undefined variable: x (defined later on line 3)",
+            diagnostics[0].message, "x is used before it is defined (defined on line 3)",
             "Forward reference should mention the definition line",
         );
     }
@@ -55490,7 +55465,7 @@ greet <- function() \"hi\"
 
         let greet_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: greet"))
+            .filter(|d| d.message.contains("greet is used before it is defined"))
             .collect();
         assert_eq!(
             greet_diags.len(),
@@ -55499,7 +55474,7 @@ greet <- function() \"hi\"
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
         assert_eq!(
-            greet_diags[0].message, "Undefined variable: greet (defined later on line 3)",
+            greet_diags[0].message, "greet is used before it is defined (defined on line 3)",
             "Forward reference to a function must mention the definition line",
         );
     }
@@ -55537,7 +55512,7 @@ g <- \\(x) x + 1
 
         let g_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: g"))
+            .filter(|d| d.message.contains("g is used before it is defined"))
             .collect();
         assert_eq!(
             g_diags.len(),
@@ -55546,7 +55521,7 @@ g <- \\(x) x + 1
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
         assert_eq!(
-            g_diags[0].message, "Undefined variable: g (defined later on line 3)",
+            g_diags[0].message, "g is used before it is defined (defined on line 3)",
             "Forward reference to a `\\()` lambda must mention the \
              definition line, same as `function() ...`",
         );
@@ -55590,7 +55565,7 @@ f <- function() {
 
         let x_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: x"))
+            .filter(|d| d.message.contains("x is not defined"))
             .collect();
         assert_eq!(
             x_diags.len(),
@@ -55599,7 +55574,7 @@ f <- function() {
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
         assert_eq!(
-            x_diags[0].message, "Undefined variable: x",
+            x_diags[0].message, "x is not defined",
             "Function-local later assignment must NOT be cited as a forward \
              reference — it is not visible at top level",
         );
@@ -55640,18 +55615,18 @@ x <- 2
 
         let x_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: x"))
+            .filter(|d| d.message.contains("x is used before it is defined"))
             .collect();
         assert_eq!(x_diags.len(), 1, "Should have one forward-ref diagnostic");
         assert_eq!(
-            x_diags[0].message, "Undefined variable: x (defined later on line 3)",
+            x_diags[0].message, "x is used before it is defined (defined on line 3)",
             "Must cite the earliest later definition (line 3, 1-indexed), \
              not the last reassignment (line 4)",
         );
     }
 
     /// A genuinely undefined symbol (never defined anywhere in the file) must
-    /// keep the plain `Undefined variable: <name>` message — the
+    /// keep the plain `<name> is not defined` message — the
     /// forward-reference annotation must only appear when the symbol is
     /// defined later in the same file.
     #[test]
@@ -55680,7 +55655,7 @@ totally_unknown
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
         assert_eq!(
-            diagnostics[0].message, "Undefined variable: totally_unknown",
+            diagnostics[0].message, "totally_unknown is not defined",
             "Truly undefined symbols must use the plain message",
         );
     }
@@ -55714,7 +55689,9 @@ x <- 1
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
-        assert!(diagnostics[0].message.contains("Undefined variable: x"));
+        assert!(diagnostics[0]
+            .message
+            .contains("x is used before it is defined"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
@@ -55786,7 +55763,7 @@ x <- 1
         // food is used on lines 0 and 1, defined on line 2 → 2 forward references
         let food_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: food"))
+            .filter(|d| d.message.contains("food is used before it is defined"))
             .collect();
         assert_eq!(
             food_diags.len(),
@@ -55806,7 +55783,7 @@ x <- 1
                 .expect("Should produce diagnostics");
         let snapshot_food: Vec<_> = snapshot_diags
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: food"))
+            .filter(|d| d.message.contains("food is used before it is defined"))
             .collect();
         assert_eq!(
             snapshot_food.len(),
@@ -55987,7 +55964,7 @@ myvar
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: apple"),
+                .any(|d| d.message == "apple is not defined"),
             "exists() guard should suppress later use of apple; got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -56052,7 +56029,7 @@ myvar
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: apple" && d.range.start.line == 0),
+                .any(|d| d.message == "apple is not defined" && d.range.start.line == 0),
             "use before exists() must still be flagged; got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -56086,7 +56063,7 @@ myvar
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: apple"),
+                .any(|d| d.message == "apple is not defined"),
             "exists() in a function body declares apple file-level; got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -56119,7 +56096,7 @@ myvar
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: apple"),
+                .any(|d| d.message == "apple is not defined"),
             "exists(some_var) must not declare apple; got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -56193,7 +56170,7 @@ myfunc()
             1,
             "Usage before declaration should emit diagnostic"
         );
-        assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
+        assert!(diagnostics[0].message.contains("myvar is not defined"));
         assert_eq!(diagnostics[0].range.start.line, 0);
     }
 
@@ -56232,7 +56209,7 @@ MyVar
             1,
             "Only case-mismatched usage should emit diagnostic"
         );
-        assert!(diagnostics[0].message.contains("Undefined variable: MyVar"));
+        assert!(diagnostics[0].message.contains("MyVar is not defined"));
         assert_eq!(diagnostics[0].range.start.line, 2);
     }
 
@@ -56346,8 +56323,8 @@ myvar
             2,
             "Both usages should emit diagnostics since trailing-comment directive is not recognized"
         );
-        assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
-        assert!(diagnostics[1].message.contains("Undefined variable: myvar"));
+        assert!(diagnostics[0].message.contains("myvar is not defined"));
+        assert!(diagnostics[1].message.contains("myvar is not defined"));
     }
 
     // ========================================================================
@@ -56720,16 +56697,16 @@ x
         );
 
         // The RHS `xyz` is genuinely undefined; we expect exactly one
-        // "Undefined variable: xyz" diagnostic on line 0 (0-indexed).
+        // "xyz is not defined" diagnostic on line 0 (0-indexed).
         let undefined: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .filter(|d| d.message.contains("xyz is not defined"))
             .collect();
         assert_eq!(
             undefined.len(),
             1,
-            "Expected exactly one 'Undefined variable: xyz' diagnostic for the RHS \
-             of `xyz = xyz`, got: {:?}",
+            "Expected exactly one 'xyz' diagnostic for the RHS \
+             of  is not defined`xyz = xyz`, got: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -57401,13 +57378,13 @@ source(\"helpers.R\")
             // Pre-scan we expect deferral, so no undefined diagnostic.
             let undefined: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.contains("Undefined variable: xyz"))
+                .filter(|d| d.message.contains("xyz is not defined"))
                 .collect();
             if workspace_scan_complete {
                 assert_eq!(
                     undefined.len(),
                     1,
-                    "Expected 'Undefined variable: xyz' post-scan, got: {:?}",
+                    "Expected 'xyz' post-scan, got: {:?} is not defined",
                     diagnostics
                         .iter()
                         .map(|d| d.message.clone())
@@ -57483,12 +57460,12 @@ source(\"helpers.R\")
 
         let undefined: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable: xyz"))
+            .filter(|d| d.message.contains("xyz is not defined"))
             .collect();
         assert_eq!(
             undefined.len(),
             1,
-            "Expected 'Undefined variable: xyz' for the RHS of `xyz = xyz` in a \
+            "Expected 'xyz' for the RHS of  is not defined`xyz = xyz` in a \
              worldwide-shaped workspace. Diagnostics: {:?}",
             diagnostics
                 .iter()
@@ -57598,7 +57575,7 @@ source(\"helpers.R\")
     ///    confirming the DFS actually traversed the file_6→…→file_9 suffix.
     /// 3. `dplyr` (library() in file_0.R) appears in inherited/loaded packages,
     ///    confirming library() propagates across all 5 source() edges.
-    /// 4. The "Undefined variable: xyz" diagnostic fires in the full pipeline.
+    /// 4. The "xyz is not defined" diagnostic fires in the full pipeline.
     #[test]
     fn self_ref_variable_not_in_scope_across_deep_source_chain() {
         use crate::state::{Document, WorldState};
@@ -57671,12 +57648,12 @@ source(\"helpers.R\")
             rhs_scope.inherited_packages, rhs_scope.loaded_packages
         );
 
-        // 4. Diagnostic: the pipeline must also report "Undefined variable: xyz".
+        // 4. Diagnostic: the pipeline must also report "xyz is not defined".
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("Undefined variable: xyz")),
-            "Expected 'Undefined variable: xyz' diagnostic; got: {:?}",
+                .any(|d| d.message.contains("xyz is not defined")),
+            "Expected 'xyz' diagnostic; got: {:?} is not defined",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -57709,7 +57686,7 @@ source(\"helpers.R\")
     ///
     /// Pre-fix this test would observe `xyz` in scope at (1, 7) with
     /// `source_uri = data.R` and the snapshot path would silently suppress
-    /// the "Undefined variable: xyz" diagnostic.
+    /// the "xyz is not defined" diagnostic.
     #[test]
     fn test_self_file_symbol_does_not_leak_through_cross_file_recursion() {
         use crate::cross_file::scope::scope_at_position_with_graph;
@@ -57799,15 +57776,15 @@ source(\"helpers.R\")
         );
 
         // Snapshot diagnostic check: the production path must emit
-        // "Undefined variable: xyz" instead of silently suppressing it.
+        // "xyz is not defined" instead of silently suppressing it.
         let snapshot = DiagnosticsSnapshot::build(&state, &data_uri).expect("snapshot");
         let diags = diagnostics_from_snapshot(&snapshot, &data_uri, &DiagCancelToken::never())
             .expect("diags");
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("Undefined variable: xyz")),
-            "Expected 'Undefined variable: xyz' on the RHS, got: {:?}",
+                .any(|d| d.message.contains("xyz is not defined")),
+            "Expected 'xyz' on the RHS, got: {:?} is not defined",
             diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
         );
     }
@@ -58429,7 +58406,7 @@ mod function_parameter_tests {
         uri
     }
 
-    /// Collect the names reported as "Undefined variable: <name>" for `code`.
+    /// Collect the names reported as "<name> is not defined" for `code`.
     /// Extracts just the bare identifier, stripping the optional
     /// " (defined later …)" forward-reference note and the optional
     /// ". If `f()` captures …" NSE hint, so the result is stable while
@@ -58456,15 +58433,30 @@ mod function_parameter_tests {
 
         diagnostics
             .iter()
+            .filter(|d| {
+                matches!(
+                    &d.code,
+                    Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                        if c == crate::diagnostic_code::UNDEFINED_VARIABLE
+                )
+            })
             .filter_map(|d| {
-                d.message.strip_prefix("Undefined variable: ").map(|rest| {
-                    // Strip the optional " (defined later …)" forward-ref note
-                    // and the optional ". If `f()` captures …" NSE hint, leaving
-                    // the bare name. A `.split('.')` would truncate dotted R
-                    // identifiers (`my.var` -> `my`).
-                    let rest = rest.split(" (defined later").next().unwrap_or(rest);
-                    rest.split(". If `").next().unwrap_or(rest).to_string()
-                })
+                // Undefined-variable messages now lead with the name:
+                //   "{name} is not defined[. If `f()` captures …]"
+                //   "{name} is used before it is defined (defined on line N)[…]"
+                // The name is everything before the first marker phrase. Using
+                // the marker (not `.split('.')`) preserves dotted R identifiers
+                // (`my.var`). The `len <` guard confirms the marker was present.
+                let msg = d.message.as_str();
+                msg.split(" is not defined")
+                    .next()
+                    .filter(|n| n.len() < msg.len())
+                    .or_else(|| {
+                        msg.split(" is used before it is defined")
+                            .next()
+                            .filter(|n| n.len() < msg.len())
+                    })
+                    .map(str::to_string)
             })
             .collect()
     }
@@ -58781,7 +58773,7 @@ add <- function(a, b) {
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         // Print diagnostics for debugging
@@ -58797,13 +58789,13 @@ add <- function(a, b) {
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: a"),
+                .any(|d| d.message == "a is not defined"),
             "Parameter 'a' should not be flagged as undefined"
         );
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: b"),
+                .any(|d| d.message == "b is not defined"),
             "Parameter 'b' should not be flagged as undefined"
         );
     }
@@ -58840,7 +58832,7 @@ outer_func <- function(x) {
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         // Print diagnostics for debugging
@@ -58856,13 +58848,13 @@ outer_func <- function(x) {
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: x"),
+                .any(|d| d.message == "x is not defined"),
             "Parameter 'x' should not be flagged as undefined"
         );
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: y"),
+                .any(|d| d.message == "y is not defined"),
             "Parameter 'y' should not be flagged as undefined"
         );
     }
@@ -58898,7 +58890,7 @@ my_func <- function(a = undefined_var) {
         // Filter to only undefined variable warnings
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         // Print diagnostics for debugging
@@ -58913,7 +58905,7 @@ my_func <- function(a = undefined_var) {
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: a"),
+                .any(|d| d.message == "a is not defined"),
             "Parameter name 'a' should not be flagged as undefined"
         );
 
@@ -58921,7 +58913,7 @@ my_func <- function(a = undefined_var) {
         assert!(
             undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: undefined_var"),
+                .any(|d| d.message == "undefined_var is not defined"),
             "Undefined variable 'undefined_var' in default expression should be flagged"
         );
     }
@@ -58958,7 +58950,7 @@ other_func <- function(y = still_missing) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
@@ -58973,7 +58965,7 @@ other_func <- function(y = still_missing) {
         assert!(
             undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: still_missing"),
+                .any(|d| d.message == "still_missing is not defined"),
             "A genuinely missing default expression symbol must still be flagged. \
              Diagnostics: {:?}",
             undefined_var_diags
@@ -59014,13 +59006,13 @@ other_func <- function(y = still_missing) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: local_default"),
+                .any(|d| d.message == "local_default is not defined"),
             "Default expression should resolve a binding created in the function \
              body before the default is forced. Diagnostics: {:?}",
             undefined_var_diags
@@ -59028,7 +59020,7 @@ other_func <- function(y = still_missing) {
         assert!(
             undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: still_missing"),
+                .any(|d| d.message == "still_missing is not defined"),
             "A genuinely missing default expression symbol must still be flagged. \
              Diagnostics: {:?}",
             undefined_var_diags
@@ -59064,13 +59056,13 @@ my_func()
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: y"),
+                .any(|d| d.message == "y is not defined"),
             "Default expression `x = y` should resolve `y` as a formal parameter. \
              Diagnostics: {:?}",
             undefined_var_diags
@@ -59106,13 +59098,13 @@ my_func(1)
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: y"),
+                .any(|d| d.message == "y is not defined"),
             "Default expression `x = y` should resolve required formal parameter `y`. \
              Diagnostics: {:?}",
             undefined_var_diags
@@ -59148,13 +59140,13 @@ my_func()
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: y"),
+                .any(|d| d.message == "y is not defined"),
             "Default expression `x = y` should resolve later formal parameter `y`. \
              Diagnostics: {:?}",
             undefined_var_diags
@@ -59192,7 +59184,7 @@ my_func <- function(a = default_value) {
         // Filter to only undefined variable warnings
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         // Print diagnostics for debugging
@@ -59207,13 +59199,13 @@ my_func <- function(a = default_value) {
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: a"),
+                .any(|d| d.message == "a is not defined"),
             "Parameter name 'a' should not be flagged as undefined"
         );
         assert!(
             !undefined_var_diags
                 .iter()
-                .any(|d| d.message == "Undefined variable: default_value"),
+                .any(|d| d.message == "default_value is not defined"),
             "Defined variable 'default_value' should not be flagged as undefined"
         );
     }
@@ -59223,7 +59215,7 @@ my_func <- function(a = default_value) {
         // When tree-sitter wraps an incomplete expression inside an ERROR node,
         // identifiers become flat children of the ERROR (not inside a
         // binary_operator). The LHS assignment check would fail, causing false
-        // "Undefined variable: x" diagnostics. We skip ERROR node subtrees
+        // "x is not defined" diagnostics. We skip ERROR node subtrees
         // entirely since the parse tree structure is unreliable there.
         let mut state = create_test_state();
         let code = "if (1 == 1) {\n  x <-\n}";
@@ -59247,7 +59239,7 @@ my_func <- function(a = default_value) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable"))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
@@ -59291,7 +59283,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: summary_table"),
+                .any(|d| d.message == "summary_table is not defined"),
             "Symbol exported by sourced file should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
@@ -59345,7 +59337,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: summary_table"),
+                .any(|d| d.message == "summary_table is not defined"),
             "Symbol exported by sourced file (workspace-root fallback resolution) should not be flagged as undefined: {:?}",
             diagnostics
                 .iter()
@@ -59381,7 +59373,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: createWorkbook"),
+                .any(|d| d.message == "createWorkbook is not defined"),
             "Package call target should be suppressed until package metadata is ready: {:?}",
             diagnostics
                 .iter()
@@ -59437,7 +59429,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: __pending_fn__"),
+                .any(|d| d.message == "__pending_fn__ is not defined"),
             "Package call target should be suppressed while package cache is pending: {:?}",
             diagnostics
                 .iter()
@@ -59449,7 +59441,7 @@ my_func <- function(a = default_value) {
     #[tokio::test]
     async fn test_namespace_import_does_not_suppress_when_source_package_uninstalled() {
         // Regression test: a NAMESPACE `importFrom(lme4, lmer)` must NOT suppress
-        // the "Undefined variable: lmer" diagnostic when lme4 is not actually installed.
+        // the "lmer is not defined" diagnostic when lme4 is not actually installed.
         //
         // Previously this was tested via the workspace_imports suppression set (deleted
         // in Phase 5b.1). Now the scope engine handles symbol visibility, and this test
@@ -59492,7 +59484,7 @@ my_func <- function(a = default_value) {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: lmer"),
+                .any(|d| d.message == "lmer is not defined"),
             "NAMESPACE-imported symbols must still be flagged when the source package is not installed: {:?}",
             diagnostics
                 .iter()
@@ -59553,7 +59545,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: lmer"),
+                .any(|d| d.message == "lmer is not defined"),
             "lmer must be deferred while workspace scan is incomplete: {:?}",
             diagnostics
                 .iter()
@@ -59579,7 +59571,7 @@ my_func <- function(a = default_value) {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: lmer"),
+                .any(|d| d.message == "lmer is not defined"),
             "lmer must be flagged after the workspace scan completes (lme4 cached \
              with empty exports, no parent file defines lmer): {:?}",
             diagnostics
@@ -59623,7 +59615,7 @@ my_func <- function(a = default_value) {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: __raven_fake_fn__"),
+                .any(|d| d.message == "__raven_fake_fn__ is not defined"),
             "Functions from not-installed packages must be flagged as undefined: {:?}",
             diagnostics
                 .iter()
@@ -59679,7 +59671,7 @@ my_func <- function(a = default_value) {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message == "Undefined variable: __installed_fn__"),
+                .any(|d| d.message == "__installed_fn__ is not defined"),
             "Functions from installed-but-uncached packages must be suppressed while pending: {:?}",
             diagnostics
                 .iter()
@@ -59729,7 +59721,7 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.starts_with("Undefined variable"))
+                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
                 .collect();
 
             assert!(
@@ -59778,13 +59770,13 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.starts_with("Undefined variable"))
+                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
                 .collect();
 
             assert!(
                 !undefined_var_diags
                     .iter()
-                    .any(|d| d.message == "Undefined variable: x"),
+                    .any(|d| d.message == "x is not defined"),
                 "Complete {} ({:?}): target 'x' should not be flagged as undefined. Got: {:?}",
                 label,
                 code,
@@ -59811,7 +59803,7 @@ my_func <- function(a = default_value) {
             code: &'static str,
             label: &'static str,
             expected_undefined_count: usize,
-            // Lines of the file (0-indexed) where we expect "Undefined variable: merp"
+            // Lines of the file (0-indexed) where we expect "merp is not defined"
             expected_lines: &'static [u32],
         }
 
@@ -59858,13 +59850,13 @@ my_func <- function(a = default_value) {
 
             let merp_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message == "Undefined variable: merp")
+                .filter(|d| d.message == "merp is not defined")
                 .collect();
 
             assert_eq!(
                 merp_diags.len(),
                 case.expected_undefined_count,
-                "{} ({:?}): expected {} 'Undefined variable: merp' diagnostic(s), got {:?}",
+                "{} ({:?}): expected {} 'merp' diagnostic(s), got {:?} is not defined",
                 case.label,
                 case.code,
                 case.expected_undefined_count,
@@ -59895,7 +59887,7 @@ my_func <- function(a = default_value) {
         // be processed *after* any Removal events that live inside the RHS,
         // not in LHS-anchor order.
         //
-        // We assert via the absence of an "Undefined variable: x" diagnostic
+        // We assert via the absence of an "x is not defined" diagnostic
         // on the line that uses `x` after the assignment.
         let mut state = create_test_state();
         let code = "x <- { rm(x); 1 }\nprint(x)\n";
@@ -59919,7 +59911,7 @@ my_func <- function(a = default_value) {
 
         let x_diags_on_print: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message == "Undefined variable: x" && d.range.start.line == 1)
+            .filter(|d| d.message == "x is not defined" && d.range.start.line == 1)
             .collect();
 
         assert!(
@@ -59974,9 +59966,7 @@ my_func <- function(a = default_value) {
 
             let undefined_self_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| {
-                    d.message == "Undefined variable: f" || d.message == "Undefined variable: g"
-                })
+                .filter(|d| d.message == "f is not defined" || d.message == "g is not defined")
                 .collect();
 
             assert!(
@@ -60017,7 +60007,7 @@ my_func <- function(a = default_value) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with("Undefined variable"))
+            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
             .collect();
 
         assert!(
@@ -60079,7 +60069,7 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| d.message.starts_with("Undefined variable"))
+                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
                 .collect();
 
             assert!(
@@ -60165,7 +60155,7 @@ my_func <- function(a = default_value) {
         assert!(
             load_namespace_messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: masked_col")),
+                .any(|m| m.contains("masked_col is not defined")),
             "loadNamespace(plyranges) must not attach dplyr's data-mask policy; \
              got {load_namespace_messages:?}"
         );
@@ -60521,7 +60511,7 @@ my_func <- function(a = default_value) {
     // workspace root `file:///w/`, wire the dependency graph (open_document does
     // NOT — only `update_file` creates edges), then run the full `diagnostics`
     // entry point on `query` and return the diagnostic messages. The undefined
-    // message is `"Undefined variable: <name>"`.
+    // message is `"<name> is not defined"`.
     fn cross_file_diag_messages(files: &[(&str, &str)], query: &str) -> Vec<String> {
         let ws = Url::parse("file:///w/").unwrap();
         let mut state = WorldState::new();
@@ -61205,11 +61195,11 @@ my_func <- function(a = default_value) {
         );
         let msgs: Vec<String> = diagnostics.into_iter().map(|d| d.message).collect();
         assert!(
-            !msgs.iter().any(|m| m.contains("Undefined variable: x")),
+            !msgs.iter().any(|m| m.contains("x is not defined")),
             "first positional binds captured formal `formula`; got {msgs:?}"
         );
         assert!(
-            !msgs.iter().any(|m| m.contains("Undefined variable: y")),
+            !msgs.iter().any(|m| m.contains("y is not defined")),
             "second positional binds captured formal `data`; got {msgs:?}"
         );
     }
@@ -61400,7 +61390,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_var")),
+                .any(|m| m.contains("undefined_var is not defined")),
             "standard-eval call argument should be flagged end-to-end; got {messages:?}"
         );
     }
@@ -61423,7 +61413,7 @@ my_func <- function(a = default_value) {
         assert_eq!(
             messages
                 .iter()
-                .filter(|m| m.as_str() == "Undefined variable: inner")
+                .filter(|m| m.as_str() == "inner is not defined")
                 .count(),
             1,
             "inner is leak-free: defined in the deferred body, undefined at \
@@ -61446,7 +61436,7 @@ my_func <- function(a = default_value) {
         );
         assert_eq!(
             messages,
-            vec!["Undefined variable: typo_var".to_string()],
+            vec!["typo_var is not defined".to_string()],
             "only typo_var should be flagged; got {messages:?}"
         );
     }
@@ -61464,7 +61454,7 @@ my_func <- function(a = default_value) {
         );
         assert_eq!(
             messages,
-            vec!["Undefined variable: typo_var".to_string()],
+            vec!["typo_var is not defined".to_string()],
             "only typo_var should be flagged; got {messages:?}"
         );
     }
@@ -61483,7 +61473,7 @@ my_func <- function(a = default_value) {
         );
         assert_eq!(
             messages,
-            vec!["Undefined variable: inner".to_string()],
+            vec!["inner is not defined".to_string()],
             "whitespace-qualified deferred body must still isolate inner; got {messages:?}"
         );
     }
@@ -61523,7 +61513,7 @@ my_func <- function(a = default_value) {
         );
         assert_eq!(
             messages,
-            vec!["Undefined variable: handler_local".to_string()],
+            vec!["handler_local is not defined".to_string()],
             "handler_local must not leak out of the observeEvent body; got {messages:?}"
         );
     }
@@ -61632,7 +61622,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_var")),
+                .any(|m| m.contains("undefined_var is not defined")),
             "single-bracket index on a non-data.table should be flagged end-to-end; \
              got {messages:?}"
         );
@@ -61644,9 +61634,7 @@ my_func <- function(a = default_value) {
     fn nse_double_bracket_index_undefined_flagged_end_to_end() {
         let messages = collect_undefined_messages("lst <- list(a = 1)\nlst[[typo]]");
         assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("Undefined variable: typo")),
+            messages.iter().any(|m| m.contains("typo is not defined")),
             "double-bracket index should be flagged end-to-end; got {messages:?}"
         );
     }
@@ -61691,7 +61679,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: checked_vec")),
+                .any(|m| m.contains("checked_vec is not defined")),
             "base::rm(list = ...) value should be checked; got {messages:?}"
         );
     }
@@ -61711,7 +61699,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: checked_env")),
+                .any(|m| m.contains("checked_env is not defined")),
             "base::substitute env value should be checked; got {messages:?}"
         );
     }
@@ -61732,7 +61720,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: checked_path")),
+                .any(|m| m.contains("checked_path is not defined")),
             "utils::data(lib.loc = ...) value should be checked; got {messages:?}"
         );
     }
@@ -61751,7 +61739,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: checked_from")),
+                .any(|m| m.contains("checked_from is not defined")),
             "graphics::curve(from = ...) value should be checked; got {messages:?}"
         );
     }
@@ -61769,7 +61757,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: checked_pkg")),
+                .any(|m| m.contains("checked_pkg is not defined")),
             "utils::example(package = ...) value should be checked; got {messages:?}"
         );
     }
@@ -61795,7 +61783,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_df_xyz")),
+                .any(|m| m.contains("undefined_df_xyz is not defined")),
             "lm `data` is evaluated and should be checked; got {messages:?}"
         );
     }
@@ -61856,7 +61844,7 @@ my_func <- function(a = default_value) {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_extra_arg")),
+                .any(|m| m.contains("undefined_extra_arg is not defined")),
             "rename_with trailing dots are evaluated and should be checked; got {messages:?}"
         );
     }
@@ -61871,14 +61859,14 @@ my_func <- function(a = default_value) {
         assert!(
             vignette
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_topic")),
+                .any(|m| m.contains("undefined_topic is not defined")),
             "vignette is standard-eval; its argument should be flagged; got {vignette:?}"
         );
         let citation = collect_undefined_messages("utils::citation(undefined_pkg)");
         assert!(
             citation
                 .iter()
-                .any(|m| m.contains("Undefined variable: undefined_pkg")),
+                .any(|m| m.contains("undefined_pkg is not defined")),
             "citation is standard-eval; its argument should be flagged; got {citation:?}"
         );
     }
@@ -61894,7 +61882,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("somepkg::my_filter(real_df, x)\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: x"))
+            .find(|m| m.contains("x is not defined"))
             .expect("x reported");
         assert!(
             d.contains("# raven: nse"),
@@ -61913,7 +61901,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("pkgx::my_fn(`weird name` = undef)\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef"))
+            .find(|m| m.contains("undef is not defined"))
             .expect("undef reported");
         assert!(
             !d.contains("nse pkgx::my_fn(`weird name`)"),
@@ -61938,7 +61926,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .find(|m| m.contains("undef_arg is not defined"))
             .expect("undef_arg reported");
         assert!(
             !d.contains("# raven: nse") && !d.contains("# raven: func"),
@@ -61956,7 +61944,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("pkg::`my fn`(undef_arg)\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .find(|m| m.contains("undef_arg is not defined"))
             .expect("undef_arg reported");
         assert!(
             d.contains("\"pkg::my fn\""),
@@ -62039,7 +62027,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("paste(undefined_x)\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undefined_x"))
+            .find(|m| m.contains("undefined_x is not defined"))
             .expect("reported");
         assert!(!d.contains("# raven: nse"), "no hint for builtins: {d}");
     }
@@ -62052,7 +62040,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("x + 1\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: x"))
+            .find(|m| m.contains("x is not defined"))
             .expect("top-level x flagged");
         assert!(
             !d.contains("# raven: nse"),
@@ -62068,7 +62056,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("g <- function(a) a\ng(undefined_fn(1))\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undefined_fn"))
+            .find(|m| m.contains("undefined_fn is not defined"))
             .expect("undefined_fn flagged");
         assert!(
             !d.contains("# raven: nse"),
@@ -62086,7 +62074,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: p1"))
+            .find(|m| m.contains("p1 is not defined"))
             .expect("p1 flagged");
         assert!(
             !d.contains("# raven: nse"),
@@ -62102,7 +62090,7 @@ my_func <- function(a = default_value) {
         let diags = collect_undefined_messages("# raven: nse foo(x)\notherpkg::foo(undef_arg)\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .find(|m| m.contains("undef_arg is not defined"))
             .expect("undef_arg flagged");
         assert!(
             d.contains("# raven: nse"),
@@ -62121,7 +62109,7 @@ my_func <- function(a = default_value) {
             collect_undefined_messages("otherpkg::foo(undef_arg)\n# raven: nse otherpkg::foo\n");
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .find(|m| m.contains("undef_arg is not defined"))
             .expect("undef_arg flagged");
         assert!(
             d.contains("# raven: nse"),
@@ -62140,7 +62128,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: ub_chain"))
+            .find(|m| m.contains("ub_chain is not defined"))
             .expect("ub_chain flagged");
         assert!(
             !d.contains("# raven: nse") && !d.contains("# raven: func"),
@@ -62159,7 +62147,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_data"))
+            .find(|m| m.contains("undef_data is not defined"))
             .expect("undef_data flagged");
         assert!(
             !d.contains("# raven: nse") && !d.contains("# raven: func"),
@@ -62178,7 +62166,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: undef_arg"))
+            .find(|m| m.contains("undef_arg is not defined"))
             .expect("undef_arg flagged");
         assert!(
             d.contains("# raven: nse"),
@@ -62267,7 +62255,7 @@ my_func <- function(a = default_value) {
         );
         let d = diags
             .iter()
-            .find(|m| m.contains("Undefined variable: real_undef"))
+            .find(|m| m.contains("real_undef is not defined"))
             .expect("real_undef flagged");
         assert!(
             d.contains("# raven: nse"),

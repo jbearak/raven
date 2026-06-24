@@ -65,7 +65,7 @@ Two flavors:
 
 ### Parse Errors
 
-Raven surfaces parse errors from the tree-sitter R grammar whenever the document cannot be parsed as valid R. There's no per-rule severity knob, but the master switch `raven.diagnostics.enabled` suppresses them along with every other diagnostic. Where possible Raven provides a specific, actionable message rather than a generic "Syntax error":
+Raven surfaces parse errors from the tree-sitter R grammar whenever the document cannot be parsed as valid R. There's no per-rule severity knob, but the master switch `raven.diagnostics.enabled` suppresses them along with every other diagnostic. Where possible Raven provides a specific, actionable message rather than a generic "R code could not be parsed here":
 
 | Message | Trigger |
 |---|---|
@@ -77,7 +77,7 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 | `` Missing opening `{` `` / `` Missing opening `(` `` / `` Missing opening `[` `` / `` Missing opening `[[` `` | A closing delimiter appears with no matching opener (`}` at top level, `)` after a complete expression). A run of stray closers (`}}}`) reports a single diagnostic for the whole run. |
 | `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
 | ``'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line`` | `else` appears anywhere R would reject a bare `else` — e.g. `else { 1 }` at the top of a file, `else { … }` inside a `{ … }` block, `(else)`, `else |> f()`, or `else` used as a function argument / assignment RHS |
-| `Syntax error` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
+| `R code could not be parsed here` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
 
 The `Mismatched brackets` message also covers wrong-closer typos where the user typed an unexpected closer immediately after an unclosed opener (e.g. `f(}` produces a single `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic rather than two separate ones).
 
@@ -89,7 +89,7 @@ The `Mismatched brackets` message also covers wrong-closer typos where the user 
 
 Raven checks whether each symbol reference has a visible definition — either in the current file (above the cursor), in a sourced parent/child file (respecting position), or in a loaded package. If not found, it reports an undefined variable diagnostic at the configured severity (default `warning`; see `raven.diagnostics.undefinedVariableSeverity` in [Configuration](configuration.md)).
 
-If the symbol is defined later in the same file at top level, the message also reports that line — e.g. `Undefined variable: total_count (defined later on line 7)`. R does not hoist top-level bindings, so the use is still flagged, but the annotation makes it easy to distinguish a forward reference from a missing import or typo.
+If the symbol is defined later in the same file at top level, the message also reports that line — e.g. `total_count is used before it is defined (defined on line 7)`. R does not hoist top-level bindings, so the use is still flagged, but the annotation makes it easy to distinguish a forward reference from a missing import or typo.
 
 **What suppresses it:**
 - A definition above the usage in the same file

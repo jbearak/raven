@@ -748,9 +748,15 @@ fn reported_packages_to_warm(
 fn has_package_metadata_sensitive_undefined_diagnostic(
     all_diags: &[(PathBuf, Diagnostic)],
 ) -> bool {
+    // Anchor on the stable rule code, not the (free-prose) message. The
+    // forward-reference variant (symbol defined later in the same file) is not
+    // package-metadata-sensitive, so it is excluded via its message marker.
     all_diags.iter().any(|(_, d)| {
-        d.message.starts_with("Undefined variable:")
-            && !d.message.contains("(defined later on line ")
+        matches!(
+            &d.code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(c))
+                if c == crate::diagnostic_code::UNDEFINED_VARIABLE
+        ) && !d.message.contains("is used before it is defined")
     })
 }
 
@@ -1287,7 +1293,10 @@ mod tests {
         let diags = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
-                message: "Undefined variable: missing_fun".into(),
+                message: "missing_fun is not defined".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
                 ..Default::default()
             },
         )];
@@ -1302,7 +1311,10 @@ mod tests {
         let defined_later = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
-                message: "Undefined variable: x (defined later on line 3)".into(),
+                message: "x is used before it is defined (defined on line 3)".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
                 ..Default::default()
             },
         )];
@@ -1314,7 +1326,10 @@ mod tests {
         let package_sensitive = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
-                message: "Undefined variable: mutate".into(),
+                message: "mutate is not defined".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
                 ..Default::default()
             },
         )];
@@ -1672,7 +1687,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: helper_fn"),
+                .any(|(_, d)| d.message == "helper_fn is not defined"),
             "NAMESPACE-only root (no DESCRIPTION) must NOT activate package mode: \
              the cross-file helper must read as undefined in script mode. \
              Diagnostics: {:?}",
@@ -1701,7 +1716,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: grid.ls"),
+                .any(|(_, d)| d.message == "grid.ls is not defined"),
             "`library(grid)` must make `grid.ls` available to `raven check`. Diagnostics: {:?}",
             diags
                 .iter()
@@ -1746,7 +1761,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: sysdata_var1"),
+                .any(|(_, d)| d.message == "sysdata_var1 is not defined"),
             "a package's own R/ code must see its R/sysdata.rda objects via the \
              R fallback even with no data-raw/ script. Diagnostics: {:?}",
             diags
@@ -1787,7 +1802,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: helper"),
+                .any(|(_, d)| d.message == "helper is not defined"),
             "source(\"child.r\") must resolve on-disk child.R on a case-insensitive FS \
              (issue #476). Diagnostics: {:?}",
             diags
@@ -1819,7 +1834,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: helper"),
+                .any(|(_, d)| d.message == "helper is not defined"),
             "on a case-sensitive FS, source(\"child.r\") (only child.R exists) must NOT \
              resolve — case-correction only ever maps to a real on-disk entry. \
              Diagnostics: {:?}",
@@ -1877,15 +1892,13 @@ mod tests {
         // Sanity: `shared` resolves (no false positive) while the genuine undefined
         // is reported — so the determinism assertion is over a meaningful set.
         assert!(
-            !first
-                .iter()
-                .any(|d| d.contains("Undefined variable: shared")),
+            !first.iter().any(|d| d.contains("shared is not defined")),
             "shared() should resolve via the hub. Got: {first:?}"
         );
         assert!(
             first
                 .iter()
-                .any(|d| d.contains("Undefined variable: not_defined_here")),
+                .any(|d| d.contains("not_defined_here is not defined")),
             "the genuine undefined should be reported. Got: {first:?}"
         );
     }
@@ -1925,7 +1938,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: helper"),
+                .any(|(_, d)| d.message == "helper is not defined"),
             "a hub's genuinely forward-sourced symbol must resolve even when it also \
              appears in the hub's parent prefix (issue #476). Diagnostics: {:?}",
             diags
@@ -1958,7 +1971,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message == "Undefined variable: helper"),
+                .any(|(_, d)| d.message == "helper is not defined"),
             "a top-level source(local = TRUE) child must inherit the parent's prior \
              regular symbols (issue #476). Diagnostics: {:?}",
             diags
@@ -2245,7 +2258,7 @@ mod tests {
         assert!(
             without_source
                 .iter()
-                .any(|(_, d)| d.message.contains("Undefined variable: helper_fn")),
+                .any(|(_, d)| d.message.contains("helper_fn is not defined")),
             "without source(), helper_fn must be flagged undefined; got {:?}",
             without_source
                 .iter()
@@ -2276,7 +2289,7 @@ mod tests {
         assert!(
             !diags
                 .iter()
-                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+                .any(|(_, d)| d.message.contains("params is not defined")),
             "params must not be flagged when frontmatter declares it; got {:?}",
             diags
                 .iter()
@@ -2298,7 +2311,7 @@ mod tests {
         assert!(
             diags2
                 .iter()
-                .any(|(_, d)| d.message.contains("Undefined variable: params")),
+                .any(|(_, d)| d.message.contains("params is not defined")),
             "without a params: frontmatter, params must be flagged; got {:?}",
             diags2
                 .iter()
@@ -2750,7 +2763,7 @@ mod tests {
     fn has_undefined(diags: &[(PathBuf, Diagnostic)], name: &str) -> bool {
         diags
             .iter()
-            .any(|(_, d)| d.message == format!("Undefined variable: {name}"))
+            .any(|(_, d)| d.message == format!("{name} is not defined"))
     }
 
     fn args_for(root: &Path, target: &Path) -> CheckArgs {
