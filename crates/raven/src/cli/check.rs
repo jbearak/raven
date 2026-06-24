@@ -983,7 +983,7 @@ const DIAGNOSTICS_DOCS_URL: &str = "https://github.com/jbearak/raven/blob/main/d
 /// call argument raven cannot analyze carries a structured `NseHint`
 /// (`crate::diagnostic_code`); the hint is NOT in the diagnostic message (see
 /// the emitter in `handlers.rs`). This is the *only* place the hint surfaces in
-/// output, and it is framed carefully: these warnings are *probably real*, so
+/// output, and it is framed carefully: these findings are *probably real*, so
 /// the footer leads with the universal false-positive escape hatches (ignore /
 /// expect, as any linter has) and presents the R-specific NSE cause as one
 /// possibility — never as raven asserting the call *is* NSE. It still lists the
@@ -1017,15 +1017,19 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
     // source raven can't see" (not "cannot analyze") makes clear the cause is a
     // missing definition — a package export raven has no body for — not an
     // analysis error on code it does have.
+    // Severity-neutral noun ("finding", not "warning"): `raven check` honors
+    // `diagnostics.undefinedVariableSeverity`, so these may render as errors,
+    // info, or hints above — the footer must not contradict the configured
+    // severity.
     let (noun, verb, obj) = if count == 1 {
         (
-            "warning",
+            "finding",
             "sits",
             "a call to a package function whose source raven can't see",
         )
     } else {
         (
-            "warnings",
+            "findings",
             "sit",
             "calls to package functions whose source raven can't see",
         )
@@ -1037,7 +1041,7 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
          function that captures an argument via non-standard evaluation (NSE) — as \
          `dplyr::filter(df, col > 0)` treats `col` as a column, not a variable — makes a valid \
          name look undefined. Raven already recognizes NSE in many common packages (the \
-         tidyverse and more) but not all, so these warnings come from functions outside that \
+         tidyverse and more) but not all, so these findings come from functions outside that \
          built-in coverage. If that is the case here, declare the function's NSE contract \
          instead of suppressing:\n"
     );
@@ -1429,7 +1433,7 @@ mod tests {
 
         assert!(
             footer.contains(
-                "3 undefined-variable warnings above sit inside calls to package functions whose source raven can't see"
+                "3 undefined-variable findings above sit inside calls to package functions whose source raven can't see"
             ),
             "count + plural lead clause: {footer}"
         );
@@ -1487,7 +1491,7 @@ mod tests {
             super::format_nse_hint_footer(&[nse_diag("aes", Some("x"))]).expect("footer present");
         assert!(
             footer.contains(
-                "1 undefined-variable warning above sits inside a call to a package function whose source raven can't see"
+                "1 undefined-variable finding above sits inside a call to a package function whose source raven can't see"
             ),
             "singular lead clause: {footer}"
         );

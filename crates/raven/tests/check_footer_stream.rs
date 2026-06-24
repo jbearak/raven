@@ -200,7 +200,7 @@ fn text_format_keeps_findings_clean_and_emits_reframed_deduped_footer() {
     // One reframed footer summarizes all three hinted findings...
     assert!(
         stdout.contains(&format!(
-            "3 undefined-variable warnings above {NSE_FOOTER_LEAD}"
+            "3 undefined-variable findings above {NSE_FOOTER_LEAD}"
         )),
         "footer counts all hinted findings; stdout was:\n{stdout}"
     );

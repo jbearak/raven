@@ -332,18 +332,18 @@ Each note below is printed only when its condition holds; a clean run on a fully
 
 #### NSE-discoverability footer
 
-When some undefined-variable warnings sit inside call arguments that Raven cannot see into (a package function that *might* capture the argument via [non-standard evaluation](non-standard-evaluation.md)), the **`text`** report prints one footer after the findings — and **only** there. The footer is framed carefully so it never reads as Raven asserting the call *is* NSE: it leads with the universal false-positive escape hatches every linter has (`# raven: ignore`, `# nolint`, `# raven: expect`) and presents NSE as the *one R-specific* additional cause. It then lists the distinct, copy-pasteable per-function directives (one per function, however many warnings it caused) and links [the directives reference](directives.md) and [handling false positives](diagnostics.md). The snippet is enough to apply without understanding the syntax; the links explain it — mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline.
+When some undefined-variable findings sit inside call arguments that Raven cannot see into (a package function that *might* capture the argument via [non-standard evaluation](non-standard-evaluation.md)), the **`text`** report prints one footer after the findings — and **only** there. The footer is framed carefully so it never reads as Raven asserting the call *is* NSE: it leads with the universal false-positive escape hatches every linter has (`# raven: ignore`, `# nolint`, `# raven: expect`) and presents NSE as the *one R-specific* additional cause. It then lists the distinct, copy-pasteable per-function directives (one per function, however many findings it caused) and links [the directives reference](directives.md) and [handling false positives](diagnostics.md). The snippet is enough to apply without understanding the syntax; the links explain it — mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline.
 
 It reads (with concrete callees filled in):
 
 ```
-raven check: 3 undefined-variable warnings above sit inside calls to package functions
+raven check: 3 undefined-variable findings above sit inside calls to package functions
 whose source raven can't see. If one is a false positive, you can suppress it as with any
 linter (`# raven: ignore`, `# nolint`, or `# raven: expect`).
 R has one extra cause: a function that captures an argument via non-standard
 evaluation (NSE) — as `dplyr::filter(df, col > 0)` treats `col` as a column, not a
 variable — makes a valid name look undefined. Raven already recognizes NSE in many
-common packages (the tidyverse and more) but not all, so these warnings come from
+common packages (the tidyverse and more) but not all, so these findings come from
 functions outside that built-in coverage. If that is the case here, declare the
 function's NSE contract instead of suppressing:
 
