@@ -752,10 +752,9 @@ fn has_package_metadata_sensitive_undefined_diagnostic(
     // forward-reference variant (symbol defined later in the same file) is not
     // package-metadata-sensitive, so it is excluded via its message marker.
     all_diags.iter().any(|(_, d)| {
-        matches!(
+        crate::diagnostic_code::diagnostic_has_code(
             &d.code,
-            Some(tower_lsp::lsp_types::NumberOrString::String(c))
-                if c == crate::diagnostic_code::UNDEFINED_VARIABLE
+            crate::diagnostic_code::UNDEFINED_VARIABLE,
         ) && !d.message.contains("is used before it is defined")
     })
 }

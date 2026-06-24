@@ -29939,7 +29939,10 @@ y <- totally_undefined_baseline()
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE)),
+                .any(|d| crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE
+                )),
             "setup-file top-level defs must suppress undefined-variable for \
              sibling test files. messages: {:?}",
             diagnostics
@@ -43809,7 +43812,7 @@ mod proptests {
             let total_undefined_diags: Vec<_> = diagnostics
                 .iter()
                 .filter(|d| {
-                    matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE)
+                    crate::diagnostic_code::diagnostic_has_code(&d.code, crate::diagnostic_code::UNDEFINED_VARIABLE)
                 })
                 .collect();
 
@@ -55418,9 +55421,11 @@ x <- 1
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
-        assert!(diagnostics[0]
-            .message
-            .contains("x is used before it is defined"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("x is used before it is defined")
+        );
         assert_eq!(diagnostics[0].range.start.line, 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         // Message must point at the line where the symbol is actually defined.
@@ -55689,9 +55694,11 @@ x <- 1
         );
 
         assert_eq!(diagnostics.len(), 1, "Should have 1 diagnostic");
-        assert!(diagnostics[0]
-            .message
-            .contains("x is used before it is defined"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("x is used before it is defined")
+        );
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
@@ -58434,10 +58441,9 @@ mod function_parameter_tests {
         diagnostics
             .iter()
             .filter(|d| {
-                matches!(
+                crate::diagnostic_code::diagnostic_has_code(
                     &d.code,
-                    Some(tower_lsp::lsp_types::NumberOrString::String(c))
-                        if c == crate::diagnostic_code::UNDEFINED_VARIABLE
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
                 )
             })
             .filter_map(|d| {
@@ -58773,7 +58779,12 @@ add <- function(a, b) {
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         // Print diagnostics for debugging
@@ -58832,7 +58843,12 @@ outer_func <- function(x) {
         // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         // Print diagnostics for debugging
@@ -58890,7 +58906,12 @@ my_func <- function(a = undefined_var) {
         // Filter to only undefined variable warnings
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         // Print diagnostics for debugging
@@ -58950,7 +58971,12 @@ other_func <- function(y = still_missing) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59006,7 +59032,12 @@ other_func <- function(y = still_missing) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59056,7 +59087,12 @@ my_func()
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59098,7 +59134,12 @@ my_func(1)
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59140,7 +59181,12 @@ my_func()
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59184,7 +59230,12 @@ my_func <- function(a = default_value) {
         // Filter to only undefined variable warnings
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         // Print diagnostics for debugging
@@ -59239,7 +59290,12 @@ my_func <- function(a = default_value) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -59721,7 +59777,12 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+                .filter(|d| {
+                    crate::diagnostic_code::diagnostic_has_code(
+                        &d.code,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE,
+                    )
+                })
                 .collect();
 
             assert!(
@@ -59770,7 +59831,12 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+                .filter(|d| {
+                    crate::diagnostic_code::diagnostic_has_code(
+                        &d.code,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE,
+                    )
+                })
                 .collect();
 
             assert!(
@@ -60007,7 +60073,12 @@ my_func <- function(a = default_value) {
 
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE,
+                )
+            })
             .collect();
 
         assert!(
@@ -60069,7 +60140,12 @@ my_func <- function(a = default_value) {
 
             let undefined_var_diags: Vec<_> = diagnostics
                 .iter()
-                .filter(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == crate::diagnostic_code::UNDEFINED_VARIABLE))
+                .filter(|d| {
+                    crate::diagnostic_code::diagnostic_has_code(
+                        &d.code,
+                        crate::diagnostic_code::UNDEFINED_VARIABLE,
+                    )
+                })
                 .collect();
 
             assert!(

@@ -163,6 +163,20 @@ pub fn suppresses(suppression_code: &str, diagnostic_code: &str) -> bool {
     false
 }
 
+/// True when a diagnostic's `code` is the canonical string code `want`.
+///
+/// Centralizes the `Some(NumberOrString::String(_))` match so callers that ask
+/// "is this an X diagnostic?" read as intent rather than boilerplate, and stay
+/// correct in one place if the `code` representation ever changes. Prefer this
+/// over message-text matching: the code is the stable handle, the message is
+/// free prose (see the `undefined-variable` reword).
+pub fn diagnostic_has_code(
+    code: &Option<tower_lsp::lsp_types::NumberOrString>,
+    want: &str,
+) -> bool {
+    matches!(code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == want)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
