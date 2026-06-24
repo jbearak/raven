@@ -164,10 +164,14 @@ V1 support target:
 | `ubuntu-24.04-arm` (Linux arm64) | Supported and dogfooded |
 | `macos-latest` arm64 | Supported and dogfooded |
 | macOS x64 | Supported by mapping/release asset |
-| Windows | Not a v1 target |
+| Windows | Not a v1 target (action only; Raven runs on Windows) |
 
-Raven publishes Windows release binaries, but Windows GitHub Actions support is
-not necessary for v1. The action should fail clearly on unsupported OS values
+"Not a v1 target" scopes the **action**, not Raven. Raven runs on Windows and
+publishes Windows release binaries, so a user could install it on a Windows
+runner by hand. There is rarely a reason to: Raven's analysis is
+platform-independent, so a Linux runner yields identical results and costs less
+(GitHub bills Windows runners at a higher minute rate). So Windows-runner support
+buys nothing for v1, and the action should fail clearly on unsupported OS values
 rather than carrying extra implementation branches that are not dogfooded.
 
 ---
