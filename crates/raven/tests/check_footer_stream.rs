@@ -67,10 +67,23 @@ fn run_check(workspace: &std::path::Path, extra: &[&str]) -> Output {
         .expect("run raven check")
 }
 
+/// `raven check` must finish with a findings-based exit code — `0` (nothing over
+/// threshold) or `1` (some) — never the operator-error code `2`. Asserting this
+/// guards the footer tests against an exit-code regression that still happened
+/// to emit the note on the expected stream (Codex review).
+fn assert_findings_exit(out: &Output) {
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "raven check exited with an unexpected (operator-error) status: {:?}",
+        out.status.code()
+    );
+}
+
 #[test]
 fn text_format_emits_traversal_note_on_stdout_not_stderr() {
     let ws = truncating_workspace();
     let out = run_check(ws.path(), &[]);
+    assert_findings_exit(&out);
     let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
 
@@ -99,6 +112,7 @@ fn text_format_emits_traversal_note_on_stdout_not_stderr() {
 fn json_format_keeps_traversal_note_on_stderr() {
     let ws = truncating_workspace();
     let out = run_check(ws.path(), &["--format", "json"]);
+    assert_findings_exit(&out);
     let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
 
@@ -122,7 +136,7 @@ const LOAD_NOTE: &str = ".raven/packages.json is unreadable";
 /// A workspace whose committed Tier-2 package DB (`.raven/packages.json`) is
 /// corrupt, so `maybe_init_r` emits a package-DB load note. No R subprocess and
 /// no `names.db` required — this drives the load-note footer path that
-/// `route_footer_notes` must keep on the diagnostics' stream. `a.R` is
+/// `footer_stream` must keep on the diagnostics' stream. `a.R` is
 /// diagnostic-free so the load note is the ONLY footer entry, proving it
 /// surfaces on its own (a regression that reverted `maybe_init_r` to print it
 /// inline on stderr would fail this).
@@ -143,6 +157,7 @@ fn corrupt_package_db_workspace() -> TempDir {
 fn text_format_emits_load_note_on_stdout_not_stderr() {
     let ws = corrupt_package_db_workspace();
     let out = run_check(ws.path(), &[]);
+    assert_findings_exit(&out);
     let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
 
@@ -160,6 +175,7 @@ fn text_format_emits_load_note_on_stdout_not_stderr() {
 fn json_format_keeps_load_note_on_stderr() {
     let ws = corrupt_package_db_workspace();
     let out = run_check(ws.path(), &["--format", "json"]);
+    assert_findings_exit(&out);
     let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
     let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
 
