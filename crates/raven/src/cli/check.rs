@@ -748,26 +748,21 @@ fn reported_packages_to_warm(
 fn has_package_metadata_sensitive_undefined_diagnostic(
     all_diags: &[(PathBuf, Diagnostic)],
 ) -> bool {
-    // Anchor on the stable rule code, not the (free-prose) message — but the
-    // `undefined-variable` code covers three message variants and only the
-    // plain one ("<name> is not defined") is resolvable by package export
-    // metadata. The two position/ordering variants (the symbol exists, it is
-    // just not visible at the use site) must be excluded:
-    //   - forward reference, same file:   "… (defined on line N)"
-    //   - symbol sourced later, x-file:    "… (sourced on line N)"
-    // We key on the emitter-appended parentheticals, not the leading prose
-    // ("is used before it is defined / it's available"): the message prepends
-    // the raw (possibly backtick-quoted) symbol name, so a pathological name
-    // could otherwise spoof the prose. The old prefix-matcher saw only the
-    // plain "Undefined variable: <name>" form, so excluding both keeps
-    // behavior from drifting. See the undefined-variable emitters in
-    // handlers.rs.
+    // Anchor on the stable rule code, not the (free-prose) message. The
+    // `undefined-variable` code covers three variants and only the plain one
+    // ("<name> is not defined") is resolvable by package export metadata. The
+    // two position/ordering variants (forward reference, or a symbol sourced
+    // later — the symbol exists, it is just not visible at the use site) are
+    // tagged by the emitters via `Diagnostic.data`, so we exclude them on that
+    // structured marker rather than parsing the message: the message prepends
+    // the raw (possibly backtick-quoted) symbol name, so any substring test
+    // could be spoofed by a pathological name. See the undefined-variable
+    // emitters in handlers.rs and `UNDEFINED_VARIABLE_POSITION_VARIANT`.
     all_diags.iter().any(|(_, d)| {
         crate::diagnostic_code::diagnostic_has_code(
             &d.code,
             crate::diagnostic_code::UNDEFINED_VARIABLE,
-        ) && !d.message.contains("(defined on line ")
-            && !d.message.contains("(sourced on line ")
+        ) && !crate::diagnostic_code::is_undefined_variable_position_variant(&d.data)
     })
 }
 
@@ -1326,6 +1321,8 @@ mod tests {
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                 )),
+                // Emitters tag the position variants here; the gate keys on it.
+                data: Some(crate::diagnostic_code::undefined_variable_position_variant_data()),
                 ..Default::default()
             },
         )];
@@ -1336,7 +1333,8 @@ mod tests {
 
         // The other position/ordering variant: a symbol defined in a sourced
         // file but used before the source() call. It carries the same
-        // undefined-variable code but is not package-metadata-sensitive either.
+        // undefined-variable code and position-variant tag, and is not
+        // package-metadata-sensitive either.
         let sourced_later = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
@@ -1344,6 +1342,7 @@ mod tests {
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                 )),
+                data: Some(crate::diagnostic_code::undefined_variable_position_variant_data()),
                 ..Default::default()
             },
         )];
@@ -1369,24 +1368,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_metadata_gate_handles_backtick_name_containing_forward_ref_phrase() {
-        // A pathological but valid R non-syntactic name whose text contains the
-        // forward-reference phrase: `is used before it is defined`. Its PLAIN
-        // (not-forward-ref) undefined-variable message is
-        // "`is used before it is defined` is not defined", which embeds the
-        // phrase. The gate must NOT misread it as a forward reference — it is a
-        // genuine, package-metadata-sensitive undefined-variable diagnostic.
-        // (Regression for the forward-ref exclusion keying on the parenthetical
-        // marker "(defined on line " rather than the leading prose.)
+    fn missing_metadata_gate_handles_backtick_name_containing_position_variant_text() {
+        // A pathological but valid R non-syntactic name whose text embeds the
+        // position-variant prose AND its parentheticals, e.g.
+        // `is used before it is defined (defined on line 3)`. Its PLAIN
+        // (genuinely-undefined) message would then read
+        // "`is used before it is defined (defined on line 3)` is not defined".
+        // A message-substring gate would misclassify it as a position variant
+        // and skip the package-metadata check. Because the gate now keys on the
+        // structured `data` tag (absent here — this is a genuine miss), the
+        // symbol name cannot spoof it: this is correctly package-sensitive.
         let mut state = crate::state::WorldState::new();
         state.cross_file_config.packages_enabled = true;
         let plain_backtick = vec![(
             PathBuf::from("main.R"),
             Diagnostic {
-                message: "`is used before it is defined` is not defined".into(),
+                message: "`is used before it is defined (defined on line 3)` is not defined".into(),
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                 )),
+                // No position-variant tag → a genuine miss, package-sensitive.
+                data: None,
                 ..Default::default()
             },
         )];

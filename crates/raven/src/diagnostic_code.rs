@@ -163,6 +163,34 @@ pub fn suppresses(suppression_code: &str, diagnostic_code: &str) -> bool {
     false
 }
 
+/// `Diagnostic.data` marker tagging an `undefined-variable` diagnostic as a
+/// **position/ordering variant**: the symbol exists but is not visible at the
+/// use site — a forward reference (defined later in the same file) or a symbol
+/// brought in by a `source()` that runs later. These are NOT resolvable by
+/// package export metadata.
+///
+/// The emitters set this so consumers can distinguish the variant from a
+/// genuinely-missing symbol **without parsing the free-prose message** — the
+/// message prepends the raw (possibly backtick-quoted) symbol name, so any
+/// substring test over it can be spoofed by a pathological name. The plain
+/// "genuinely undefined" variant leaves `data` unset. Read by the CLI's
+/// missing-export-metadata gate (`raven check`).
+pub const UNDEFINED_VARIABLE_POSITION_VARIANT: &str = "undefined-variable/position-variant";
+
+/// The [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker as a `Diagnostic.data`
+/// value, for emitters to attach.
+pub fn undefined_variable_position_variant_data() -> serde_json::Value {
+    serde_json::Value::String(UNDEFINED_VARIABLE_POSITION_VARIANT.to_string())
+}
+
+/// True if `data` carries the [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker.
+pub fn is_undefined_variable_position_variant(data: &Option<serde_json::Value>) -> bool {
+    matches!(
+        data,
+        Some(serde_json::Value::String(s)) if s == UNDEFINED_VARIABLE_POSITION_VARIANT
+    )
+}
+
 /// True when a diagnostic's `code` is the canonical string code `want`.
 ///
 /// Centralizes the `Some(NumberOrString::String(_))` match so callers that ask
@@ -195,6 +223,20 @@ mod tests {
             UNDEFINED_VARIABLE
         ));
         assert!(!diagnostic_has_code(&None, UNDEFINED_VARIABLE));
+    }
+
+    #[test]
+    fn position_variant_marker_round_trips_and_is_specific() {
+        let tagged = Some(undefined_variable_position_variant_data());
+        assert!(is_undefined_variable_position_variant(&tagged));
+        // Absent data, a different string, and a non-string value never match.
+        assert!(!is_undefined_variable_position_variant(&None));
+        assert!(!is_undefined_variable_position_variant(&Some(
+            serde_json::Value::String("something-else".to_string())
+        )));
+        assert!(!is_undefined_variable_position_variant(&Some(
+            serde_json::json!({ "kind": UNDEFINED_VARIABLE_POSITION_VARIANT })
+        )));
     }
 
     #[test]

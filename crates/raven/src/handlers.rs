@@ -5837,6 +5837,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                     code: Some(NumberOrString::String(
                         crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                     )),
+                    // Symbol exists but is sourced later — a position variant,
+                    // not a genuinely-missing symbol. Tag it so the CLI
+                    // metadata gate need not parse the message.
+                    data: Some(crate::diagnostic_code::undefined_variable_position_variant_data()),
                     ..Default::default()
                 });
             }
@@ -6812,6 +6816,13 @@ fn collect_undefined_variables_from_snapshot(
             code: Some(NumberOrString::String(
                 crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
             )),
+            // A forward reference (symbol defined later in the same file) is a
+            // position variant, not a genuinely-missing symbol; tag it so the
+            // CLI metadata gate need not parse the message. Plain undefined
+            // usages leave `data` unset.
+            data: forward_ref_defined_line
+                .is_some()
+                .then(crate::diagnostic_code::undefined_variable_position_variant_data),
             ..Default::default()
         });
     }
@@ -55435,6 +55446,12 @@ x <- 1
             diagnostics[0].message, "x is used before it is defined (defined on line 3)",
             "Forward reference should mention the definition line",
         );
+        // A forward reference is a position variant — tagged via `data` so the
+        // CLI metadata gate can exclude it without parsing the message.
+        assert!(
+            crate::diagnostic_code::is_undefined_variable_position_variant(&diagnostics[0].data),
+            "forward-ref diagnostic must carry the position-variant data tag",
+        );
     }
 
     /// Forward reference to a function should also report the definition line.
@@ -55582,6 +55599,12 @@ f <- function() {
             x_diags[0].message, "x is not defined",
             "Function-local later assignment must NOT be cited as a forward \
              reference — it is not visible at top level",
+        );
+        // A genuine miss (not a position variant) must leave `data` untagged so
+        // the CLI metadata gate treats it as package-metadata-sensitive.
+        assert!(
+            !crate::diagnostic_code::is_undefined_variable_position_variant(&x_diags[0].data),
+            "plain undefined diagnostic must not carry the position-variant tag",
         );
     }
 
@@ -57563,6 +57586,12 @@ source(\"helpers.R\")
             used_before[0].message.contains("(sourced on line 2)"),
             "Expected attribution to a.R on line 2, got: {}",
             used_before[0].message
+        );
+        // Sourced-before-available is a position variant — tagged via `data`
+        // so the CLI metadata gate excludes it without parsing the message.
+        assert!(
+            crate::diagnostic_code::is_undefined_variable_position_variant(&used_before[0].data),
+            "sourced-before-available diagnostic must carry the position-variant data tag",
         );
         assert!(
             !used_before[0].message.contains("(sourced on line 3)"),
