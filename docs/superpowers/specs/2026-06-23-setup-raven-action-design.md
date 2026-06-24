@@ -154,30 +154,16 @@ project-pinned.
 
 ---
 
-## 5. Support matrix
+## 5. Supported platforms
 
-V1 support target:
-
-| Runner | Status |
-|---|---|
-| `ubuntu-latest` x64 | Required, dogfooded |
-| `ubuntu-24.04-arm` (Linux arm64) | Supported and dogfooded |
-| `macos-latest` arm64 | Supported and dogfooded |
-| macOS x64 | Supported by mapping/release asset |
-| `windows-latest` x64 | Supported and dogfooded |
-| Windows arm64 | Supported by mapping/release asset |
-
-All three OSes Raven publishes binaries for are supported. Windows works through
-the same Bash installer (GitHub's Windows runners run `shell: bash` via Git Bash)
-with three small accommodations: the OS maps to the `windows` asset, the binary
-is `raven.exe`, extraction falls back from `unzip` to `7z` (Windows runners ship
-`7z`, not `unzip`), and `RUNNER_TEMP` backslashes are normalized so `sha256sum`
-does not escape its checksum output. The action fails clearly on any genuinely
-unsupported OS.
-
-Raven's analysis is platform-independent — the same R source yields the same
-results on any OS — and Linux runners bill at the lowest rate, so Linux is
-usually the most economical CI choice even though all three platforms work.
+The action supports macOS, Windows, and Linux runners. It runs as one Bash
+installer across all three — GitHub's Windows runners provide `bash` via Git
+Bash — with a few Windows accommodations:
+the OS maps to the `windows` asset, the binary is `raven.exe`, extraction falls
+back from `unzip` to `7z` (Windows runners ship `7z`, not `unzip`), and
+`RUNNER_TEMP` backslashes are normalized so `sha256sum` does not escape its
+checksum output. The action fails clearly on any platform without a matching
+release asset.
 
 ---
 
@@ -303,8 +289,7 @@ Docs should explain:
   reproducible project-specific package metadata path.
 - `raven packages fetch` is an ephemeral project-scoped CI producer from
   r-universe.
-- V1 supports Linux, macOS, and Windows runners; Linux is usually the most
-  economical CI choice since the analysis is platform-independent.
+- V1 supports Linux, macOS, and Windows runners.
 
 Do not lead with SARIF or GitHub code scanning. `--format sarif` can remain in
 the CLI output-format reference because Raven supports it, but code scanning is
