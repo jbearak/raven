@@ -292,8 +292,9 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
     // (R absent, init error, no library paths) degrades gracefully and prints
     // its own one-line note to stderr. The returned verdict feeds the
-    // missing-export-metadata warning below.
-    let shipped_db_load = maybe_init_r(&mut state, &root).await;
+    // missing-export-metadata warning below; the returned load notes
+    // (present-but-unusable package DB) ride the shared footer.
+    let (shipped_db_load, db_load_notes) = maybe_init_r(&mut state, &root).await;
 
     // Resolve system.file() sources now that both package state AND library
     // paths are available (maybe_init_r populates lib_paths from R discovery
@@ -341,26 +342,49 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     let use_color = resolve_color_from_env(args.color);
     render(args.format, &all_diags, &root, args.quiet, use_color);
 
+    // Post-render context notes that annotate the diagnostics above:
+    //   0. package-DB load notes (a present-but-unusable `names.db` /
+    //      `.raven/packages.json`), surfaced from `maybe_init_r`. They lead the
+    //      footer so the missing-export warning's "failed to load" wording reads
+    //      naturally after the specific load error.
+    //   1. the missing-export-metadata warning (some attached packages' symbols
+    //      couldn't be loaded, so undefined-variable findings may be inaccurate);
+    //   2. the cross-file traversal-budget note (issue #473) — when a budget is
+    //      hit the resolver silently stops following `source()` edges, so some
+    //      "Undefined variable" warnings above may be false positives. The owned
+    //      `state.cross_file_graph` accumulates these counters across every
+    //      target's diagnostic pass, so reading them after the loop reflects the
+    //      whole run. The editor surfaces the same via a throttled
+    //      `window/showMessage`; `raven check` had no equivalent.
+    //
+    // All are emitted together so they share a stream and stay grouped:
+    // `footer_stream` keeps them on the diagnostics' own stream (stdout for
+    // `text`, where a merged terminal/CI consumer would otherwise interleave
+    // them with the findings; stderr for json/sarif, which reserve stdout for
+    // the machine document). See `footer_stream`.
+    let mut footer = db_load_notes;
     if !missing_export_metadata_packages.is_empty() {
-        eprintln!(
-            "{}",
-            format_missing_export_metadata_warning(
-                &missing_export_metadata_packages,
-                shipped_db_load
-            )
-        );
+        footer.push(format_missing_export_metadata_warning(
+            &missing_export_metadata_packages,
+            shipped_db_load,
+        ));
     }
-
-    // Surface cross-file traversal-budget exhaustion (issue #473). The owned
-    // `state.cross_file_graph` accumulates these counters across every target's
-    // diagnostic pass (neighborhood collection records on the full graph), so
-    // reading them after the loop reflects the whole run. When a budget is hit
-    // the resolver silently stops following `source()` edges, so some
-    // "Undefined variable" warnings above may be false positives — say so, on
-    // stderr, so CI output is not misleading. The editor surfaces the same via
-    // a throttled `window/showMessage`; `raven check` had no equivalent.
     if let Some(note) = format_traversal_budget_note(&state) {
-        eprintln!("{note}");
+        footer.push(note);
+    }
+    if !footer.is_empty() {
+        let body = footer.join("\n");
+        match footer_stream(args.format) {
+            FooterStream::Stdout => {
+                use std::io::Write as _;
+                // Lock + flush so the footer lands after the diagnostics already
+                // written by `render` and is fully drained before process exit.
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{body}");
+                let _ = out.flush();
+            }
+            FooterStream::Stderr => eprintln!("{body}"),
+        }
     }
 
     // Operator error takes priority over a threshold breach: a half-read run
@@ -534,14 +558,20 @@ fn resolve_project_config_with_options(
 /// to stderr so CI shows what was missing; `Disabled` (the user turned package
 /// awareness off in `raven.toml`) is silent, matching the editor.
 ///
-/// Returns the build's [`ShippedDbLoad`] verdict so the caller can tailor the
-/// missing-export-metadata warning (absent / loaded / present-but-failed)
-/// without re-stat-ing disk — the build already knows whether the shipped
-/// `names.db` actually loaded, which a bare `Path::exists()` cannot tell.
+/// Returns `(shipped_db_load, load_notes)`:
+/// - the build's [`ShippedDbLoad`] verdict, so the caller can tailor the
+///   missing-export-metadata warning (absent / loaded / present-but-failed)
+///   without re-stat-ing disk — the build already knows whether the shipped
+///   `names.db` actually loaded, which a bare `Path::exists()` cannot tell;
+/// - the present-but-unusable package-DB load notes (each already prefixed
+///   `raven check: `). The caller folds these into the shared footer rather
+///   than this function printing them, so they ride the diagnostics' own stream
+///   (stdout for `text`) instead of being reorderable against the findings on
+///   stderr. See `footer_stream`.
 async fn maybe_init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
-) -> crate::package_library::ShippedDbLoad {
+) -> (crate::package_library::ShippedDbLoad, Vec<String>) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
     let r_path = state.cross_file_config.packages_r_path.clone();
@@ -559,13 +589,18 @@ async fn maybe_init_r(
     )
     .await;
 
-    // Surface present-but-unusable package-DB notes (e.g. a `.raven/packages.json`
-    // from a newer Raven, or a corrupt/incompatible `names.db`). These are
-    // build-time events carried on the outcome; print them before the status
-    // match below partially moves `outcome.library`.
-    for note in &outcome.load_notes {
-        eprintln!("raven check: {note}");
-    }
+    // Present-but-unusable package-DB notes (e.g. a `.raven/packages.json` from a
+    // newer Raven, or a corrupt/incompatible `names.db`) are build-time events
+    // carried on the outcome. Return them to the caller rather than printing here
+    // so they ride the shared footer on the diagnostics' own stream (stdout for
+    // `text`); printing to stderr inline would let a merged CI consumer reorder
+    // them relative to the findings. Extract before the status match below
+    // partially moves `outcome`.
+    let load_notes: Vec<String> = outcome
+        .load_notes
+        .iter()
+        .map(|note| format!("raven check: {note}"))
+        .collect();
 
     // Always install the returned library: on a non-`Ready` status it may still
     // carry Tier 2/3 providers or bundled base exports, which are the whole
@@ -598,7 +633,7 @@ async fn maybe_init_r(
             "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
         ),
     }
-    shipped_db_load
+    (shipped_db_load, load_notes)
 }
 
 /// `raven check`'s counterpart of the LSP startup's sysdata R fallback (the
@@ -849,9 +884,38 @@ fn format_missing_export_metadata_warning(
         ),
         Failed => format!(
             "{head}\n\
-             Raven's package symbol database is present but failed to load (corrupt or unsupported format), so it was not searched — see the load note above.\n\
+             Raven's package symbol database is present but failed to load (corrupt or unsupported format), so it was not searched.\n\
              Run `raven packages update` to re-download a working database."
         ),
+    }
+}
+
+/// Which stream the post-render context-note footer goes to.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FooterStream {
+    Stdout,
+    Stderr,
+}
+
+/// Decide which stream the post-render context-note footer goes to, given the
+/// output format. Pure (no I/O) so the routing rule is unit-testable without
+/// spawning the binary or an R subprocess; the caller owns the footer `Vec` and
+/// does the actual writing (no copy here).
+///
+/// The footer notes (package-DB load note, missing-export-metadata warning,
+/// traversal-budget note) annotate the diagnostics, so for the human-readable
+/// `text` format they MUST share the diagnostics' stream — stdout. stdout and
+/// stderr are independent OS pipes that a merged consumer (a terminal, `2>&1`,
+/// or GitHub Actions — which timestamps each line at *read* time across two
+/// reader threads) reorders freely, so splitting a logically-grouped report
+/// across both streams interleaves the notes with the findings they describe.
+/// Same stream ⇒ a single reader preserves order. For the machine formats
+/// (`json`/`sarif`) stdout carries the parsed document, so the footer goes to
+/// stderr where it can't corrupt it.
+fn footer_stream(format: OutputFormat) -> FooterStream {
+    match format {
+        OutputFormat::Text => FooterStream::Stdout,
+        OutputFormat::Json | OutputFormat::Sarif => FooterStream::Stderr,
     }
 }
 
@@ -1201,6 +1265,27 @@ mod tests {
     }
 
     #[test]
+    fn footer_goes_to_stdout_for_text_format() {
+        // Text output is human-readable and shares the terminal/CI stream with
+        // the diagnostics, so the context-note footer must ride the SAME stream
+        // (stdout) — otherwise a merged consumer (GitHub Actions, `2>&1`)
+        // interleaves it with the findings it annotates.
+        assert_eq!(
+            super::footer_stream(OutputFormat::Text),
+            super::FooterStream::Stdout
+        );
+    }
+
+    #[test]
+    fn footer_goes_to_stderr_for_machine_formats() {
+        // json/sarif reserve stdout for the machine document, so the footer
+        // stays on stderr where it cannot corrupt the parsed output.
+        for fmt in [OutputFormat::Json, OutputFormat::Sarif] {
+            assert_eq!(super::footer_stream(fmt), super::FooterStream::Stderr);
+        }
+    }
+
+    #[test]
     fn traversal_budget_note_none_when_no_truncation() {
         let state = crate::state::WorldState::new();
         assert!(super::format_traversal_budget_note(&state).is_none());
@@ -1289,6 +1374,16 @@ mod tests {
         assert!(
             !msg.contains("raven packages freeze"),
             "freeze is wrong advice when the DB merely failed to load: {msg}"
+        );
+        // Self-contained: must not cross-reference the separately-emitted load
+        // note by position. The load note and this footer can land on different
+        // streams a CI consumer reorders, so "see the load note above" can't be
+        // relied on; the load-note detail rides the same footer instead.
+        // (The shared head's "Undefined variable warnings above" is fine — those
+        // diagnostics share this footer's stream for `text`.)
+        assert!(
+            !msg.contains("load note above") && !msg.contains("see the load note"),
+            "warning must not reference the load note by position: {msg}"
         );
     }
 

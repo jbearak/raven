@@ -86,7 +86,7 @@ See [`raven packages fetch`](cli.md#raven-packages-fetch) and [Four ways to run 
 
 ### Version skew is explained, not silently dropped
 
-If a committed `.raven/packages.json` was written by a **newer** Raven than the one reading it (an incompatible schema), Raven does not silently ignore it. It **explains and continues**: `raven check` prints a specific note to stderr, the language server raises a notification, and resolution degrades to Tier 3 when a usable database is available. The message tells you to upgrade Raven here or regenerate the file with `raven packages freeze`. An unreadable or corrupt file is reported the same way. A missing file is normal and silent.
+If a committed `.raven/packages.json` was written by a **newer** Raven than the one reading it (an incompatible schema), Raven does not silently ignore it. It **explains and continues**: `raven check` prints a specific note (grouped with the diagnostics on stdout for the default `text` output, or on stderr for `json`/`sarif` — see [Output streams](cli.md#output-streams)), the language server raises a notification, and resolution degrades to Tier 3 when a usable database is available. The message tells you to upgrade Raven here or regenerate the file with `raven packages freeze`. An unreadable or corrupt file is reported the same way. A missing file is normal and silent.
 
 ## Tier 3 — `names.db` database
 

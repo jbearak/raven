@@ -377,7 +377,9 @@ the seam.
   returns `Absent` (normal, silent) vs `UnsupportedSchema { found, supported }` /
   `UnsupportedFormat` vs `Corrupt`. A present-but-unusable file (e.g. a
   `.raven/packages.json` written by a newer Raven) is **explained and the surface
-  continues**: `raven check` prints a specific stderr note, the language server
+  continues**: `raven check` prints a specific note (on stdout with the
+  diagnostics for `text` output, on stderr for `json`/`sarif` — it rides the
+  shared footer; see `footer_stream` in `cli/check.rs`), the language server
   raises `window/showMessage`, then resolution degrades to the next tier. A
   missing or unreadable database never hard-fails the LSP or the build.
 - **Tier 3 locator order:** environment overrides still win, then the user-data
