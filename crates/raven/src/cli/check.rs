@@ -292,8 +292,9 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
     // (R absent, init error, no library paths) degrades gracefully and prints
     // its own one-line note to stderr. The returned verdict feeds the
-    // missing-export-metadata warning below.
-    let shipped_db_load = maybe_init_r(&mut state, &root).await;
+    // missing-export-metadata warning below; the returned load notes
+    // (present-but-unusable package DB) ride the shared footer.
+    let (shipped_db_load, db_load_notes) = maybe_init_r(&mut state, &root).await;
 
     // Resolve system.file() sources now that both package state AND library
     // paths are available (maybe_init_r populates lib_paths from R discovery
@@ -342,6 +343,10 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     render(args.format, &all_diags, &root, args.quiet, use_color);
 
     // Post-render context notes that annotate the diagnostics above:
+    //   0. package-DB load notes (a present-but-unusable `names.db` /
+    //      `.raven/packages.json`), surfaced from `maybe_init_r`. They lead the
+    //      footer so the missing-export warning's "failed to load" wording reads
+    //      naturally after the specific load error.
     //   1. the missing-export-metadata warning (some attached packages' symbols
     //      couldn't be loaded, so undefined-variable findings may be inaccurate);
     //   2. the cross-file traversal-budget note (issue #473) — when a budget is
@@ -352,12 +357,12 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     //      whole run. The editor surfaces the same via a throttled
     //      `window/showMessage`; `raven check` had no equivalent.
     //
-    // Both are emitted together so they share a stream and stay grouped:
+    // All are emitted together so they share a stream and stay grouped:
     // `route_footer_notes` keeps them on the diagnostics' own stream (stdout for
     // `text`, where a merged terminal/CI consumer would otherwise interleave
     // them with the findings; stderr for json/sarif, which reserve stdout for
     // the machine document). See `route_footer_notes`.
-    let mut footer = Vec::new();
+    let mut footer = db_load_notes;
     if !missing_export_metadata_packages.is_empty() {
         footer.push(format_missing_export_metadata_warning(
             &missing_export_metadata_packages,
@@ -560,7 +565,7 @@ fn resolve_project_config_with_options(
 async fn maybe_init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
-) -> crate::package_library::ShippedDbLoad {
+) -> (crate::package_library::ShippedDbLoad, Vec<String>) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
     let r_path = state.cross_file_config.packages_r_path.clone();
@@ -578,13 +583,18 @@ async fn maybe_init_r(
     )
     .await;
 
-    // Surface present-but-unusable package-DB notes (e.g. a `.raven/packages.json`
-    // from a newer Raven, or a corrupt/incompatible `names.db`). These are
-    // build-time events carried on the outcome; print them before the status
-    // match below partially moves `outcome.library`.
-    for note in &outcome.load_notes {
-        eprintln!("raven check: {note}");
-    }
+    // Present-but-unusable package-DB notes (e.g. a `.raven/packages.json` from a
+    // newer Raven, or a corrupt/incompatible `names.db`) are build-time events
+    // carried on the outcome. Return them to the caller rather than printing here
+    // so they ride the shared footer on the diagnostics' own stream (stdout for
+    // `text`); printing to stderr inline would let a merged CI consumer reorder
+    // them relative to the findings. Extract before the status match below
+    // partially moves `outcome`.
+    let load_notes: Vec<String> = outcome
+        .load_notes
+        .iter()
+        .map(|note| format!("raven check: {note}"))
+        .collect();
 
     // Always install the returned library: on a non-`Ready` status it may still
     // carry Tier 2/3 providers or bundled base exports, which are the whole
@@ -617,7 +627,7 @@ async fn maybe_init_r(
             "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
         ),
     }
-    shipped_db_load
+    (shipped_db_load, load_notes)
 }
 
 /// `raven check`'s counterpart of the LSP startup's sysdata R fallback (the
@@ -868,7 +878,7 @@ fn format_missing_export_metadata_warning(
         ),
         Failed => format!(
             "{head}\n\
-             Raven's package symbol database is present but failed to load (corrupt or unsupported format), so it was not searched — see the load note above.\n\
+             Raven's package symbol database is present but failed to load (corrupt or unsupported format), so it was not searched.\n\
              Run `raven packages update` to re-download a working database."
         ),
     }
@@ -1354,6 +1364,16 @@ mod tests {
         assert!(
             !msg.contains("raven packages freeze"),
             "freeze is wrong advice when the DB merely failed to load: {msg}"
+        );
+        // Self-contained: must not cross-reference the separately-emitted load
+        // note by position. The load note and this footer can land on different
+        // streams a CI consumer reorders, so "see the load note above" can't be
+        // relied on; the load-note detail rides the same footer instead.
+        // (The shared head's "Undefined variable warnings above" is fine — those
+        // diagnostics share this footer's stream for `text`.)
+        assert!(
+            !msg.contains("load note above") && !msg.contains("see the load note"),
+            "warning must not reference the load note by position: {msg}"
         );
     }
 
