@@ -91,7 +91,7 @@ fn system_file_self_package_resolves_helper_into_scope() {
          to inst/helper.R. Output:\n{output}"
     );
     assert!(
-        !output.contains("Undefined variable: my_helper")
+        !output.contains("my_helper is not defined")
             && !output.contains("Undefined function: my_helper"),
         "my_helper should be in scope via source(system.file(...)). Output:\n{output}"
     );
@@ -147,7 +147,7 @@ fn system_file_cross_package_installed_resolves_helper_into_scope() {
          via additionalLibraryPaths. Output:\n{output}"
     );
     assert!(
-        !output.contains("Undefined variable: cross_pkg_fn")
+        !output.contains("cross_pkg_fn is not defined")
             && !output.contains("Undefined function: cross_pkg_fn"),
         "cross_pkg_fn should be in scope via cross-package system.file(). Output:\n{output}"
     );
@@ -238,7 +238,7 @@ fn system_file_transitive_nested_resolution() {
         "Transitive system.file() should resolve both hops. Output:\n{output}"
     );
     assert!(
-        !output.contains("Undefined variable: entry_fn")
+        !output.contains("entry_fn is not defined")
             && !output.contains("Undefined function: entry_fn"),
         "entry_fn should be in scope via transitive system.file(). Output:\n{output}"
     );
@@ -288,7 +288,7 @@ fn system_file_collect_diagnostics_blocking_resolves_installed_package() {
     // resolve path as collect_diagnostics_blocking after our fix).
     let output = run_check(workspace.path());
     assert!(
-        !output.contains("Undefined variable: inst_helper")
+        !output.contains("inst_helper is not defined")
             && !output.contains("Undefined function: inst_helper"),
         "inst_helper should be resolved via system.file() in raven check. Output:\n{output}"
     );

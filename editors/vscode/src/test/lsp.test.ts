@@ -14,7 +14,7 @@ suite('Ark LSP Extension', () => {
         const diagnostics = await waitForDiagnostics(doc.uri, 15000);
         assert.ok(diagnostics.length > 0, 'Expected diagnostics for undefined variable');
         const messages = diagnostics.map(d => d.message.toLowerCase());
-        assert.ok(messages.some(m => m.includes('undefined') || m.includes('nonexistent')), 
+        assert.ok(messages.some(m => m.includes('is not defined') || m.includes('nonexistent')),
             'Expected diagnostic about undefined variable');
     });
 
@@ -197,8 +197,8 @@ suite('Ark LSP Extension', () => {
         const diagnostics = await waitForDiagnostics(doc.uri, 15000);
         
         // Filter to only undefined variable warnings
-        const undefinedVarDiags = diagnostics.filter(d => 
-            d.message.toLowerCase().includes('undefined')
+        const undefinedVarDiags = diagnostics.filter(d =>
+            d.message.toLowerCase().includes('is not defined')
         );
         
         // Check that function parameters are NOT flagged as undefined
@@ -214,8 +214,8 @@ suite('Ark LSP Extension', () => {
         const diagnostics = await waitForDiagnostics(doc.uri, 15000);
         
         // Filter to only undefined variable warnings
-        const undefinedVarDiags = diagnostics.filter(d => 
-            d.message.toLowerCase().includes('undefined')
+        const undefinedVarDiags = diagnostics.filter(d =>
+            d.message.toLowerCase().includes('is not defined')
         );
         
         // Check that built-in functions are NOT flagged as undefined
@@ -280,7 +280,7 @@ suite('Ark LSP Extension', () => {
     test('forward reference at top level is flagged when file has parent', async function (this: Mocha.Context) {
         // Reproduces: main.r -> data.r -> impute.r
         // In impute.r, `food` is used on lines 2-3 before being defined on line 4.
-        // The forward reference should produce "Undefined variable: food" diagnostics.
+        // The forward reference should produce "food is used before it is defined" diagnostics.
         // sentinel_undefined_fwdref_usage is always undefined (sentinel to confirm checking ran).
         const doc = await openDocument('forward_ref/impute.r');
 

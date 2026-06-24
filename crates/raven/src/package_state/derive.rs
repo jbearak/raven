@@ -1054,7 +1054,7 @@ foo <- function() 1
     /// like helper defs. Real-world FP this guards against: googledrive's
     /// `tests/testthat/setup-testing.R` line 1 is `CLEAN <- SETUP <- FALSE`,
     /// referenced by 17 `test-*.R` files — without setup recognition Raven
-    /// emitted 34 "Undefined variable: CLEAN/SETUP" diagnostics.
+    /// emitted 34 "CLEAN/SETUP is not defined" diagnostics.
     #[test]
     fn scope_contribution_collects_setup_top_level_defs() {
         let setup_path: PathBuf = "/work/pkg/tests/testthat/setup-testing.R".into();

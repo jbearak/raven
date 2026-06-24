@@ -60,7 +60,7 @@ fn check_one_rmd(source: &str) -> String {
 fn matching_code_suppresses_undefined_variable() {
     let out = check_one("result <- totally_undefined_thing # raven: ignore[undefined-variable]\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "ignore[undefined-variable] should suppress the undefined-variable diagnostic. Output:\n{out}"
     );
 }
@@ -69,7 +69,7 @@ fn matching_code_suppresses_undefined_variable() {
 fn non_matching_code_does_not_suppress_undefined_variable() {
     let out = check_one("result <- totally_undefined_thing # raven: ignore[line-length]\n");
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "ignore[line-length] must NOT suppress an undefined-variable diagnostic. Output:\n{out}"
     );
 }
@@ -78,7 +78,7 @@ fn non_matching_code_does_not_suppress_undefined_variable() {
 fn bare_ignore_blankets_undefined_variable() {
     let out = check_one("result <- totally_undefined_thing # raven: ignore\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "a bare `# raven: ignore` should blanket the line. Output:\n{out}"
     );
 }
@@ -87,7 +87,7 @@ fn bare_ignore_blankets_undefined_variable() {
 fn lsp_ignore_with_matching_code_suppresses() {
     let out = check_one("result <- totally_undefined_thing # @lsp-ignore[undefined-variable]\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "@lsp-ignore[undefined-variable] should suppress the diagnostic. Output:\n{out}"
     );
 }
@@ -97,7 +97,7 @@ fn ignore_next_with_code_targets_following_line() {
     let out =
         check_one("# raven: ignore-next[undefined-variable]\nresult <- totally_undefined_thing\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "ignore-next[undefined-variable] should suppress the next line. Output:\n{out}"
     );
 }
@@ -110,7 +110,7 @@ fn expect_that_suppresses_a_diagnostic_is_not_reported_unused() {
     // unused-suppression hint should appear.
     let out = check_one("result <- totally_undefined_thing # raven: expect[undefined-variable]\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "expect should suppress the undefined-variable diagnostic. Output:\n{out}"
     );
     assert!(
@@ -125,7 +125,7 @@ fn expect_start_end_block_used_is_not_reported() {
         "# raven: expect-start[undefined-variable]\nresult <- totally_undefined_thing\n# raven: ignore-end\n",
     );
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "expect-start block should suppress the undefined-variable diagnostic. Output:\n{out}"
     );
     assert!(
@@ -139,7 +139,8 @@ fn expect_start_end_block_unused_is_reported() {
     // No undefined variable in the block → the expect-start suppressed nothing.
     let out = check_one("# raven: expect-start[undefined-variable]\nx <- 1\n# raven: ignore-end\n");
     assert!(
-        out.contains("unused-suppression") || out.contains("Unused `expect` suppression"),
+        out.contains("unused-suppression")
+            || out.contains("This `expect` directive matched no diagnostic"),
         "an unused `expect-start` block must be reported as unused. Output:\n{out}"
     );
 }
@@ -152,7 +153,8 @@ fn expect_that_suppresses_nothing_is_reported_unused() {
         "defined_value <- 1\nresult <- defined_value # raven: expect[undefined-variable]\n",
     );
     assert!(
-        out.contains("unused-suppression") || out.contains("Unused `expect` suppression"),
+        out.contains("unused-suppression")
+            || out.contains("This `expect` directive matched no diagnostic"),
         "an `expect` that suppressed nothing must be reported as unused. Output:\n{out}"
     );
 }
@@ -178,7 +180,7 @@ fn chunk_option_raven_ignore_suppresses_chunk_body() {
         "---\ntitle: T\n---\n\n```{r, raven.ignore=TRUE}\nresult <- totally_undefined_thing\n```\n",
     );
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "raven.ignore=TRUE chunk option should suppress the whole chunk body. Output:\n{out}"
     );
 }
@@ -188,7 +190,7 @@ fn chunk_without_option_still_reports() {
     let out =
         check_one_rmd("---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined_thing\n```\n");
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "a chunk without raven.ignore must still report diagnostics. Output:\n{out}"
     );
 }
@@ -199,7 +201,7 @@ fn in_chunk_ignore_chunk_directive_suppresses_body_e2e() {
         "---\ntitle: T\n---\n\n```{r}\n# raven: ignore-chunk\nresult <- totally_undefined_thing\n```\n",
     );
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "# raven: ignore-chunk should suppress the chunk body. Output:\n{out}"
     );
 }
@@ -211,7 +213,7 @@ fn chunk_option_per_code_only_targets_named_code() {
         "---\ntitle: T\n---\n\n```{r, raven.ignore=\"package-not-installed\"}\nresult <- totally_undefined_thing\n```\n",
     );
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "per-code chunk option must not suppress an unrelated code. Output:\n{out}"
     );
 }
@@ -253,7 +255,7 @@ fn lsp_ignore_inside_line_opening_multiline_string_does_not_suppress() {
     let out =
         check_one("result <- totally_undefined_thing + \"abc # @lsp-ignore\nstill string\"\n");
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "a marker inside a line-opening multi-line string must NOT suppress. Output:\n{out}"
     );
 }
@@ -263,7 +265,7 @@ fn raven_ignore_inside_line_opening_multiline_string_does_not_suppress() {
     let out =
         check_one("result <- totally_undefined_thing + \"abc # raven: ignore\nstill string\"\n");
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "a `# raven: ignore` inside a line-opening multi-line string must NOT suppress. Output:\n{out}"
     );
 }
@@ -274,7 +276,7 @@ fn genuine_trailing_comment_marker_after_real_code_still_suppresses() {
     // still suppress as before.
     let out = check_one("result <- totally_undefined_thing # @lsp-ignore\n");
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "a genuine trailing `# @lsp-ignore` after real code must still suppress. Output:\n{out}"
     );
 }
@@ -285,7 +287,7 @@ fn marker_inside_closed_single_line_string_does_not_suppress() {
     // there is no out-of-string comment marker, so nothing is suppressed.
     let out = check_one("result <- totally_undefined_thing + \"abc # @lsp-ignore\"\n");
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "a marker inside a closed single-line string must NOT suppress. Output:\n{out}"
     );
 }
@@ -361,7 +363,7 @@ fn chunk_option_empty_quoted_list_does_not_suppress_e2e() {
         "---\ntitle: T\n---\n\n```{r, raven.ignore=\"\"}\nresult <- totally_undefined_thing\n```\n",
     );
     assert!(
-        out.contains("Undefined variable: totally_undefined_thing"),
+        out.contains("totally_undefined_thing is not defined"),
         "raven.ignore=\"\" must NOT suppress undefined-variable (empty code list). Output:\n{out}"
     );
 }
@@ -373,7 +375,7 @@ fn chunk_option_named_code_suppresses_e2e() {
         "---\ntitle: T\n---\n\n```{r, raven.ignore=\"undefined-variable\"}\nresult <- totally_undefined_thing\n```\n",
     );
     assert!(
-        !out.contains("Undefined variable: totally_undefined_thing"),
+        !out.contains("totally_undefined_thing is not defined"),
         "raven.ignore=\"undefined-variable\" should suppress. Output:\n{out}"
     );
 }
@@ -422,7 +424,7 @@ fn save_non_sysdata_basename_does_not_whitelist_symbol() {
 
     let out = run_check(dir.path());
     assert!(
-        out.contains("Undefined variable: z2_internal"),
+        out.contains("z2_internal is not defined"),
         "notsysdata.rda must NOT whitelist z2_internal. Output:\n{out}"
     );
 }
@@ -450,7 +452,7 @@ fn save_sysdata_rda_basename_whitelists_symbol() {
 
     let out = run_check(dir.path());
     assert!(
-        !out.contains("Undefined variable: z2_internal"),
+        !out.contains("z2_internal is not defined"),
         "R/sysdata.rda MUST whitelist z2_internal. Output:\n{out}"
     );
 }
@@ -472,7 +474,7 @@ fn rmd_chunk_lsp_ignore_inside_multiline_string_does_not_suppress() {
         "---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined + \"abc # @lsp-ignore\nstill string\"\n```\n",
     );
     assert!(
-        out.contains("Undefined variable: totally_undefined"),
+        out.contains("totally_undefined is not defined"),
         "# @lsp-ignore inside a chunk multi-line string must NOT suppress. Output:\n{out}"
     );
 }
@@ -484,7 +486,7 @@ fn rmd_chunk_genuine_trailing_lsp_ignore_suppresses() {
         "---\ntitle: T\n---\n\n```{r}\nresult <- totally_undefined # @lsp-ignore\n```\n",
     );
     assert!(
-        !out.contains("Undefined variable: totally_undefined"),
+        !out.contains("totally_undefined is not defined"),
         "genuine trailing # @lsp-ignore in a chunk must suppress. Output:\n{out}"
     );
 }

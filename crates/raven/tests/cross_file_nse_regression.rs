@@ -68,7 +68,7 @@ fn cross_file_filter_nse_suppressed_via_parent_library() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: x"),
+        !output.contains("x is not defined"),
         "filter(x > 5) in child.R should NOT flag x as undefined \
          when parent loads dplyr. Output:\n{output}"
     );
@@ -91,7 +91,7 @@ fn cross_file_filter_nse_via_tidyverse_meta_package() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: x"),
+        !output.contains("x is not defined"),
         "tidyverse meta-package should expand to include dplyr for NSE. Output:\n{output}"
     );
 }
@@ -111,7 +111,7 @@ fn forward_source_library_propagates_nse() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: x"),
+        !output.contains("x is not defined"),
         "source(\"loader.R\") with library(dplyr) must propagate NSE. Output:\n{output}"
     );
 }
@@ -128,7 +128,7 @@ fn magrittr_dot_curly_brace_pipe_not_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: ."),
+        !output.contains(". is not defined"),
         "dot pronoun in %>% curly-brace pipe must not be flagged. Output:\n{output}"
     );
 }
@@ -145,7 +145,7 @@ fn magrittr_dot_explicit_arg_not_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: ."),
+        !output.contains(". is not defined"),
         "dot pronoun as explicit pipe argument must not be flagged. Output:\n{output}"
     );
 }
@@ -158,7 +158,7 @@ fn dot_without_pipe_still_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        output.contains("Undefined variable: ."),
+        output.contains(". is not defined"),
         "dot without pipe context must still be flagged. Output:\n{output}"
     );
 }
@@ -180,7 +180,7 @@ fn cross_file_genuine_undefined_still_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        output.contains("Undefined variable: totally_undefined_thing"),
+        output.contains("totally_undefined_thing is not defined"),
         "genuine undefined must still be flagged. Output:\n{output}"
     );
 }
@@ -197,7 +197,7 @@ fn native_pipe_placeholder_not_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: _"),
+        !output.contains("_ is not defined"),
         "_ placeholder in native pipe must not be flagged. Output:\n{output}"
     );
 }
@@ -210,7 +210,7 @@ fn underscore_without_pipe_still_flagged() {
 
     let output = run_check(dir.path());
     assert!(
-        output.contains("Undefined variable: _"),
+        output.contains("_ is not defined"),
         "bare _ without pipe context must still be flagged. Output:\n{output}"
     );
 }
@@ -232,7 +232,7 @@ fn backtick_quoted_base_operators_as_values_not_flagged() {
     let output = run_check(dir.path());
     for name in ["`|`", "`&`", "`-`"] {
         assert!(
-            !output.contains(&format!("Undefined variable: {name}")),
+            !output.contains(&format!("{name} is not defined")),
             "{name} is a base operator and should not be flagged. Output:\n{output}"
         );
     }
@@ -275,15 +275,15 @@ fn testit_test_files_see_package_namespace() {
 
     let output = run_check(pkg);
     assert!(
-        !output.contains("Undefined variable: my_fun"),
+        !output.contains("my_fun is not defined"),
         "testit test file should see exported my_fun. Output:\n{output}"
     );
     assert!(
-        !output.contains("Undefined variable: internal_helper"),
+        !output.contains("internal_helper is not defined"),
         "testit test file should see package-internal internal_helper. Output:\n{output}"
     );
     assert!(
-        !output.contains("Undefined variable: head"),
+        !output.contains("head is not defined"),
         "testit test file should see imported head. Output:\n{output}"
     );
 }
@@ -329,7 +329,7 @@ fn diamond_sibling_library_does_not_suppress_undefined_in_other_branch() {
 
     let output = run_check(dir.path());
     assert!(
-        output.contains("Undefined variable: undefined_col"),
+        output.contains("undefined_col is not defined"),
         "A sibling file's library(dplyr) (reached via the shared helper.R) \
          must NOT suppress the genuine undefined-variable diagnostic for \
          undefined_col in main_a.R. Output:\n{output}"
@@ -359,7 +359,7 @@ fn transitive_ancestor_chain_library_propagates_nse() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: x"),
+        !output.contains("x is not defined"),
         "library(dplyr) on the grandparent must propagate transitively down \
          the ancestor chain to leaf.R's filter(). Output:\n{output}"
     );
@@ -410,7 +410,7 @@ fn rmd_diamond_sibling_library_does_not_suppress_undefined_in_chunk() {
 
     let output = run_check(dir.path());
     assert!(
-        output.contains("Undefined variable: undefined_col"),
+        output.contains("undefined_col is not defined"),
         "The sibling other.R's library(dplyr) (reached via the shared helper.R) \
          must NOT suppress the genuine undefined-variable diagnostic for \
          undefined_col in the Rmd chunk. Output:\n{output}"
@@ -434,7 +434,7 @@ fn rmd_own_library_in_chunk_suppresses_filter_nse() {
 
     let output = run_check(dir.path());
     assert!(
-        !output.contains("Undefined variable: x"),
+        !output.contains("x is not defined"),
         "library(dplyr) in the Rmd chunk itself must suppress filter() NSE for x. \
          Output:\n{output}"
     );

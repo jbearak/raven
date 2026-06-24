@@ -16271,7 +16271,7 @@ lineLength = 200
         assert!(
             !diags
                 .iter()
-                .any(|d| d.message.contains("Undefined variable: helper_fn")),
+                .any(|d| d.message.contains("helper_fn is not defined")),
             "helper_fn from the sourced helper must resolve; diagnostics: {:?}",
             diags
                 .iter()
@@ -16541,7 +16541,7 @@ lineLength = 200
         assert!(
             !diags
                 .iter()
-                .any(|d| d.message.contains("Undefined variable: helper_fn")),
+                .any(|d| d.message.contains("helper_fn is not defined")),
             "helper_fn from the parent Rmd chunk must resolve in helpers.R; diagnostics: {:?}",
             diags
                 .iter()
