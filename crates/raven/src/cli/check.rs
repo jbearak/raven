@@ -748,21 +748,26 @@ fn reported_packages_to_warm(
 fn has_package_metadata_sensitive_undefined_diagnostic(
     all_diags: &[(PathBuf, Diagnostic)],
 ) -> bool {
-    // Anchor on the stable rule code, not the (free-prose) message. The
-    // forward-reference variant (symbol defined later in the same file) is not
-    // package-metadata-sensitive, so it is excluded by the parenthetical the
-    // emitter appends — "(defined on line N)". We deliberately key on this
-    // parenthetical rather than the leading "is used before it is defined"
-    // prose: the message prepends the raw (possibly backtick-quoted) symbol
-    // name, so a pathological name like `is used before it is defined` would
-    // otherwise be misread as a forward reference. The parenthetical mirrors
-    // the old matcher's "(defined later on line " marker exactly, so behavior
-    // does not drift. See the undefined-variable emitter in handlers.rs.
+    // Anchor on the stable rule code, not the (free-prose) message — but the
+    // `undefined-variable` code covers three message variants and only the
+    // plain one ("<name> is not defined") is resolvable by package export
+    // metadata. The two position/ordering variants (the symbol exists, it is
+    // just not visible at the use site) must be excluded:
+    //   - forward reference, same file:   "… (defined on line N)"
+    //   - symbol sourced later, x-file:    "… (sourced on line N)"
+    // We key on the emitter-appended parentheticals, not the leading prose
+    // ("is used before it is defined / it's available"): the message prepends
+    // the raw (possibly backtick-quoted) symbol name, so a pathological name
+    // could otherwise spoof the prose. The old prefix-matcher saw only the
+    // plain "Undefined variable: <name>" form, so excluding both keeps
+    // behavior from drifting. See the undefined-variable emitters in
+    // handlers.rs.
     all_diags.iter().any(|(_, d)| {
         crate::diagnostic_code::diagnostic_has_code(
             &d.code,
             crate::diagnostic_code::UNDEFINED_VARIABLE,
         ) && !d.message.contains("(defined on line ")
+            && !d.message.contains("(sourced on line ")
     })
 }
 
@@ -1327,6 +1332,24 @@ mod tests {
         assert!(!super::should_check_missing_export_metadata(
             &state,
             &defined_later
+        ));
+
+        // The other position/ordering variant: a symbol defined in a sourced
+        // file but used before the source() call. It carries the same
+        // undefined-variable code but is not package-metadata-sensitive either.
+        let sourced_later = vec![(
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "'j' is used before it's available (sourced on line 5)".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
+                ..Default::default()
+            },
+        )];
+        assert!(!super::should_check_missing_export_metadata(
+            &state,
+            &sourced_later
         ));
 
         let package_sensitive = vec![(
