@@ -750,12 +750,19 @@ fn has_package_metadata_sensitive_undefined_diagnostic(
 ) -> bool {
     // Anchor on the stable rule code, not the (free-prose) message. The
     // forward-reference variant (symbol defined later in the same file) is not
-    // package-metadata-sensitive, so it is excluded via its message marker.
+    // package-metadata-sensitive, so it is excluded by the parenthetical the
+    // emitter appends — "(defined on line N)". We deliberately key on this
+    // parenthetical rather than the leading "is used before it is defined"
+    // prose: the message prepends the raw (possibly backtick-quoted) symbol
+    // name, so a pathological name like `is used before it is defined` would
+    // otherwise be misread as a forward reference. The parenthetical mirrors
+    // the old matcher's "(defined later on line " marker exactly, so behavior
+    // does not drift. See the undefined-variable emitter in handlers.rs.
     all_diags.iter().any(|(_, d)| {
         crate::diagnostic_code::diagnostic_has_code(
             &d.code,
             crate::diagnostic_code::UNDEFINED_VARIABLE,
-        ) && !d.message.contains("is used before it is defined")
+        ) && !d.message.contains("(defined on line ")
     })
 }
 
@@ -1335,6 +1342,34 @@ mod tests {
         assert!(super::should_check_missing_export_metadata(
             &state,
             &package_sensitive
+        ));
+    }
+
+    #[test]
+    fn missing_metadata_gate_handles_backtick_name_containing_forward_ref_phrase() {
+        // A pathological but valid R non-syntactic name whose text contains the
+        // forward-reference phrase: `is used before it is defined`. Its PLAIN
+        // (not-forward-ref) undefined-variable message is
+        // "`is used before it is defined` is not defined", which embeds the
+        // phrase. The gate must NOT misread it as a forward reference — it is a
+        // genuine, package-metadata-sensitive undefined-variable diagnostic.
+        // (Regression for the forward-ref exclusion keying on the parenthetical
+        // marker "(defined on line " rather than the leading prose.)
+        let mut state = crate::state::WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        let plain_backtick = vec![(
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "`is used before it is defined` is not defined".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
+                ..Default::default()
+            },
+        )];
+        assert!(super::should_check_missing_export_metadata(
+            &state,
+            &plain_backtick
         ));
     }
 
