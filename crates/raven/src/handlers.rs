@@ -53844,7 +53844,7 @@ result <- helper_with_spaces(42)"#;
         assert_eq!(
             undefined_xyz.len(),
             1,
-            "Expected exactly one 'xyz' on line 0; got {:?} is not defined",
+            "Expected exactly one 'xyz is not defined' on line 0; got {:?}",
             diags
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
@@ -56712,8 +56712,8 @@ x
         assert_eq!(
             undefined.len(),
             1,
-            "Expected exactly one 'xyz' diagnostic for the RHS \
-             of  is not defined`xyz = xyz`, got: {:?}",
+            "Expected exactly one 'xyz is not defined' diagnostic for the RHS \
+             of `xyz = xyz`, got: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
@@ -57391,7 +57391,7 @@ source(\"helpers.R\")
                 assert_eq!(
                     undefined.len(),
                     1,
-                    "Expected 'xyz' post-scan, got: {:?} is not defined",
+                    "Expected 'xyz is not defined' post-scan, got: {:?}",
                     diagnostics
                         .iter()
                         .map(|d| d.message.clone())
@@ -57472,7 +57472,7 @@ source(\"helpers.R\")
         assert_eq!(
             undefined.len(),
             1,
-            "Expected 'xyz' for the RHS of  is not defined`xyz = xyz` in a \
+            "Expected 'xyz is not defined' for the RHS of `xyz = xyz` in a \
              worldwide-shaped workspace. Diagnostics: {:?}",
             diagnostics
                 .iter()
@@ -57660,7 +57660,7 @@ source(\"helpers.R\")
             diags
                 .iter()
                 .any(|d| d.message.contains("xyz is not defined")),
-            "Expected 'xyz' diagnostic; got: {:?} is not defined",
+            "Expected 'xyz is not defined' diagnostic; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -57791,7 +57791,7 @@ source(\"helpers.R\")
             diags
                 .iter()
                 .any(|d| d.message.contains("xyz is not defined")),
-            "Expected 'xyz' on the RHS, got: {:?} is not defined",
+            "Expected 'xyz is not defined' on the RHS, got: {:?}",
             diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
         );
     }
@@ -59922,7 +59922,7 @@ my_func <- function(a = default_value) {
             assert_eq!(
                 merp_diags.len(),
                 case.expected_undefined_count,
-                "{} ({:?}): expected {} 'merp' diagnostic(s), got {:?} is not defined",
+                "{} ({:?}): expected {} 'merp is not defined' diagnostic(s), got {:?}",
                 case.label,
                 case.code,
                 case.expected_undefined_count,
