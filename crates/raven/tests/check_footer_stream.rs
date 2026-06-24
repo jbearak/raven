@@ -63,6 +63,12 @@ fn run_check(workspace: &std::path::Path, extra: &[&str]) -> Output {
     args.push("a.R");
     Command::new(raven_binary())
         .args(&args)
+        // Pin the logger to `error` so an inherited `RUST_LOG=warn`+ in the test
+        // environment can't make `env_logger` mirror the package-DB load note
+        // (logged at `warn` in `build_package_library`) onto stderr — which
+        // would defeat these tests' "note is absent from stderr for text"
+        // assertions. We are testing footer-stream routing, not logger config.
+        .env("RUST_LOG", "error")
         .output()
         .expect("run raven check")
 }
