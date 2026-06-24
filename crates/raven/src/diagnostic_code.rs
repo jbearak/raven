@@ -177,18 +177,122 @@ pub fn suppresses(suppression_code: &str, diagnostic_code: &str) -> bool {
 /// missing-export-metadata gate (`raven check`).
 pub const UNDEFINED_VARIABLE_POSITION_VARIANT: &str = "undefined-variable/position-variant";
 
-/// The [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker as a `Diagnostic.data`
-/// value, for emitters to attach.
-pub fn undefined_variable_position_variant_data() -> serde_json::Value {
-    serde_json::Value::String(UNDEFINED_VARIABLE_POSITION_VARIANT.to_string())
+/// The structured NSE-discoverability hint carried by an undefined-variable
+/// diagnostic whose flagged identifier sits inside a call argument that *might*
+/// be captured by non-standard evaluation (see `nse_hint_for_usage` in
+/// `handlers.rs`). The emitter both appends [`NseHint::message_suffix`] to the
+/// diagnostic message (so the editor and `--format json/sarif` carry a
+/// self-contained fix inline) AND stores the structured fields here so the
+/// human-readable `raven check` text report can strip the per-finding suffix
+/// and surface one deduplicated footer instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NseHint {
+    /// Source spelling of the callee, retaining backticks for a non-syntactic
+    /// name (e.g. `` `my fn` ``). Used only in the message prose.
+    pub callee: String,
+    /// Directive spelling of the callee (a non-syntactic name is quoted, a
+    /// qualifier kept) — what the user copies into the directive.
+    pub dir: String,
+    /// The matched formal name when the flagged argument is named (`foo(x =
+    /// ...)` → `Some("x")`); `None` for a positional argument, where the formal
+    /// order is unknown and the user must fill in placeholders.
+    pub formal: Option<String>,
 }
 
-/// True if `data` carries the [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker.
+impl NseHint {
+    /// The copy-pasteable directive(s) shown in the deduplicated `raven check`
+    /// footer (see `format_nse_hint_footer`). For a named argument it names the
+    /// captured formal (`# raven: nse foo(x)`); for a positional one the formal
+    /// order is unknown, so it falls back to the `# raven: func` + `# raven:
+    /// nse` placeholder pair the user fills in. This is the only rendered form
+    /// of the hint — it is deliberately not appended to the diagnostic message.
+    pub fn directive_suggestion(&self) -> String {
+        let Self { dir, formal, .. } = self;
+        match formal {
+            Some(f) => format!("# raven: nse {dir}({f})"),
+            None => {
+                format!("# raven: func {dir}(<formals>) and # raven: nse {dir}(<nse-formals>)")
+            }
+        }
+    }
+}
+
+/// Build the `Diagnostic.data` payload for an undefined-variable diagnostic from
+/// its two independent, composable markers: whether it is a position variant
+/// (forward reference or sourced-later — not resolvable by package export
+/// metadata) and an optional NSE-discoverability hint. Returns `None` (leaving
+/// `data` unset) for a plain genuinely-undefined usage with neither marker, so
+/// the common case stays allocation-free.
+pub fn undefined_variable_data(
+    position_variant: bool,
+    nse_hint: Option<&NseHint>,
+) -> Option<serde_json::Value> {
+    if !position_variant && nse_hint.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if position_variant {
+        obj.insert("positionVariant".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(h) = nse_hint {
+        let mut hint = serde_json::Map::new();
+        hint.insert(
+            "callee".to_string(),
+            serde_json::Value::String(h.callee.clone()),
+        );
+        hint.insert("dir".to_string(), serde_json::Value::String(h.dir.clone()));
+        if let Some(f) = &h.formal {
+            hint.insert("formal".to_string(), serde_json::Value::String(f.clone()));
+        }
+        obj.insert("nseHint".to_string(), serde_json::Value::Object(hint));
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
+/// True if `data` marks the diagnostic as a position variant (forward reference
+/// or sourced-later). Read by the CLI's missing-export-metadata gate.
 pub fn is_undefined_variable_position_variant(data: &Option<serde_json::Value>) -> bool {
     matches!(
         data,
-        Some(serde_json::Value::String(s)) if s == UNDEFINED_VARIABLE_POSITION_VARIANT
+        Some(serde_json::Value::Object(obj))
+            if obj.get("positionVariant") == Some(&serde_json::Value::Bool(true))
     )
+}
+
+/// Recover the structured NSE hint from `data`, or `None` if the diagnostic
+/// carries no hint. Inverse of [`undefined_variable_data`]'s `nse_hint` field.
+pub fn undefined_variable_nse_hint(data: &Option<serde_json::Value>) -> Option<NseHint> {
+    let obj = data.as_ref()?.as_object()?;
+    let hint = obj.get("nseHint")?.as_object()?;
+    Some(NseHint {
+        callee: hint.get("callee")?.as_str()?.to_string(),
+        dir: hint.get("dir")?.as_str()?.to_string(),
+        formal: hint
+            .get("formal")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// The `Diagnostic.data` payload with the internal NSE hint removed, for
+/// serialization into machine output. The hint exists only so the `raven check`
+/// text footer can aggregate it (and the editor quick-fix can recompute the
+/// same fix); it is not part of the diagnostic's machine contract. Machine
+/// consumers still get the position-variant marker (historically present in
+/// `data`), but no NSE trace. Returns `None` when nothing remains, matching the
+/// "omit empty `data`" convention `Diagnostic` serializes with.
+pub fn data_without_nse_hint(data: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let Some(serde_json::Value::Object(obj)) = data else {
+        // Non-object (or absent) data carries no hint to strip.
+        return data.clone();
+    };
+    let mut obj = obj.clone();
+    obj.remove("nseHint");
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// True when a diagnostic's `code` is the canonical string code `want`.
@@ -227,9 +331,9 @@ mod tests {
 
     #[test]
     fn position_variant_marker_round_trips_and_is_specific() {
-        let tagged = Some(undefined_variable_position_variant_data());
+        let tagged = undefined_variable_data(true, None);
         assert!(is_undefined_variable_position_variant(&tagged));
-        // Absent data, a different string, and a non-string value never match.
+        // Absent data, a bare string, and an object without the flag never match.
         assert!(!is_undefined_variable_position_variant(&None));
         assert!(!is_undefined_variable_position_variant(&Some(
             serde_json::Value::String("something-else".to_string())
@@ -237,6 +341,82 @@ mod tests {
         assert!(!is_undefined_variable_position_variant(&Some(
             serde_json::json!({ "kind": UNDEFINED_VARIABLE_POSITION_VARIANT })
         )));
+    }
+
+    fn named_hint() -> NseHint {
+        NseHint {
+            callee: "aes".to_string(),
+            dir: "aes".to_string(),
+            formal: Some("x".to_string()),
+        }
+    }
+
+    fn positional_hint() -> NseHint {
+        NseHint {
+            callee: "facet_wrap".to_string(),
+            dir: "facet_wrap".to_string(),
+            formal: None,
+        }
+    }
+
+    #[test]
+    fn nse_hint_directive_suggestion_is_the_copy_pasteable_tail() {
+        assert_eq!(named_hint().directive_suggestion(), "# raven: nse aes(x)");
+        assert_eq!(
+            positional_hint().directive_suggestion(),
+            "# raven: func facet_wrap(<formals>) and # raven: nse facet_wrap(<nse-formals>)"
+        );
+    }
+
+    #[test]
+    fn undefined_variable_data_composes_both_markers() {
+        // Neither marker → no data at all (plain undefined keeps `data` unset).
+        assert_eq!(undefined_variable_data(false, None), None);
+
+        // NSE hint alone: round-trips, and is NOT a position variant.
+        let hint = named_hint();
+        let nse_only = undefined_variable_data(false, Some(&hint));
+        assert!(!is_undefined_variable_position_variant(&nse_only));
+        assert_eq!(undefined_variable_nse_hint(&nse_only), Some(hint.clone()));
+
+        // Both markers compose on one diagnostic (a forward reference that also
+        // sits inside an NSE-capturing call argument).
+        let both = undefined_variable_data(true, Some(&hint));
+        assert!(is_undefined_variable_position_variant(&both));
+        assert_eq!(undefined_variable_nse_hint(&both), Some(hint));
+
+        // Position variant alone carries no NSE hint.
+        let pos_only = undefined_variable_data(true, None);
+        assert_eq!(undefined_variable_nse_hint(&pos_only), None);
+    }
+
+    #[test]
+    fn data_without_nse_hint_strips_only_the_hint() {
+        let hint = named_hint();
+
+        // Hint alone → nothing left, collapses to None (omitted on serialize).
+        let nse_only = undefined_variable_data(false, Some(&hint));
+        assert_eq!(data_without_nse_hint(&nse_only), None);
+
+        // Both markers → the position-variant marker survives, hint is gone.
+        let both = undefined_variable_data(true, Some(&hint));
+        let stripped = data_without_nse_hint(&both);
+        assert!(is_undefined_variable_position_variant(&stripped));
+        assert_eq!(undefined_variable_nse_hint(&stripped), None);
+
+        // No hint to begin with → unchanged (still a position variant).
+        let pos_only = undefined_variable_data(true, None);
+        assert_eq!(data_without_nse_hint(&pos_only), pos_only);
+
+        // Absent data → absent.
+        assert_eq!(data_without_nse_hint(&None), None);
+    }
+
+    #[test]
+    fn nse_hint_round_trips_a_positional_formal_omission() {
+        let hint = positional_hint();
+        let data = undefined_variable_data(false, Some(&hint));
+        assert_eq!(undefined_variable_nse_hint(&data), Some(hint));
     }
 
     #[test]

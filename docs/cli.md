@@ -306,12 +306,61 @@ Both `check` and `lint` share the same renderers:
 
 ### Output streams
 
-Diagnostics go to **stdout** for both commands. For `raven check`, context notes that *follow* and annotate the diagnostics — a package-database load note (a present-but-unusable `names.db` / `.raven/packages.json`), the "couldn't load exported symbols … warnings above may be inaccurate" warning, and the cross-file traversal-budget note — are routed together to keep the report readable (`raven lint` has no such notes):
+Diagnostics go to **stdout** for both commands. Beyond the diagnostics themselves, `raven check` may print a handful of **context notes** — short prose that explains *why* a result might be incomplete or how to act on it (`raven lint` prints none of these). They fall into two groups by *when* they appear:
 
-- For `text`, the notes are written to **stdout** too, as a footer after the diagnostics. They share the diagnostics' stream deliberately: stdout and stderr are independent streams that a merged consumer (a terminal, `2>&1`, or a CI log viewer such as GitHub Actions, which timestamps each line as it reads it) can reorder, which would interleave the multi-line note with the findings it describes. One stream keeps them grouped and in order — so a note never refers to another by position across streams.
-- For `json` / `sarif`, stdout carries only the machine document, so those notes go to **stderr** instead (where they can't corrupt the parsed output).
+- **Startup notes** — printed once, *before* any diagnostics, to **stderr**. They report a degraded environment that affects the whole run.
+- **Footer notes** — printed once, *after* all diagnostics, as a footer. They annotate the findings above them. For `text` they go to **stdout** (the diagnostics' own stream); for `json` / `sarif` they go to **stderr** so they can't corrupt the machine document on stdout.
 
-The one-line note printed when R is absent (or its library fails to initialize) is emitted earlier (before any diagnostics) and always goes to stderr.
+Footer notes share the diagnostics' stream for `text` deliberately: stdout and stderr are independent streams that a merged consumer (a terminal, `2>&1`, or a CI log viewer such as GitHub Actions, which timestamps each line as it reads it) can reorder, which would interleave a multi-line note with the findings it describes. One stream keeps them grouped and in order — so a note never refers to another by position across streams.
+
+#### What `raven check` can print, and when
+
+Each note below is printed only when its condition holds; a clean run on a fully-resolved workspace prints just the diagnostics and the summary line.
+
+**Startup notes (stderr, before diagnostics)** — one fires when R-backed package resolution is degraded, so undefined-variable findings for package symbols may be unreliable. The text names the cause and the consequence:
+
+- R not found on `PATH` — `R not found on PATH; package and base-symbol diagnostics will be limited`. (Base R-platform symbols are still covered by the embedded database; broad CRAN/Bioconductor coverage needs `raven packages update`.)
+- R found but its package library failed to initialize — `R found but its package library failed to initialize (…); …`.
+- R found but no library paths were discovered — `R found but no library paths were discovered; …`.
+
+**Footer notes (stdout for `text`, stderr for `json`/`sarif`, after diagnostics)**, in the order printed:
+
+1. **Package-database load note** — fires when a package symbol database is *present but unusable* (e.g. a malformed or unreadable committed `.raven/packages.json`, or a corrupt `names.db`). It names the specific load failure. *Why:* the database silently wasn't searched, so some symbols may be unresolved — distinguishing this from a genuine typo.
+2. **Missing-export-metadata warning** — fires when attached packages' exported symbols couldn't be loaded (`couldn't load exported symbols for <packages>. Some "Undefined variable" warnings above may be inaccurate …`), followed by a fix tailored to *why* the metadata was missing (install the package, run `raven packages freeze`, or run `raven packages update` in CI). *Why:* without a package's exports, calls into it can produce false undefined-variable findings.
+3. **Cross-file traversal-budget note** — fires when a bounded cross-file traversal was truncated, either by the visited-node budget (`maxTransitiveDependentsVisited`) or the chain-depth limit (`maxChainDepth`). It names the budget hit and how to raise it in `raven.toml`. *Why:* a truncated traversal stops following `source()` edges, so symbols defined across a dropped edge may appear as false-positive undefined-variable warnings — the note lets CI tell a budget-induced drop apart from a real undefined variable.
+4. **NSE-discoverability footer** — see below.
+
+#### NSE-discoverability footer
+
+When some undefined-variable warnings sit inside call arguments that Raven cannot see into (a package function that *might* capture the argument via [non-standard evaluation](non-standard-evaluation.md)), the **`text`** report prints one footer after the findings — and **only** there. The footer is framed carefully so it never reads as Raven asserting the call *is* NSE: it leads with the universal false-positive escape hatches every linter has (`# raven: ignore`, `# nolint`, `# raven: expect`) and presents NSE as the *one R-specific* additional cause. It then lists the distinct, copy-pasteable per-function directives (one per function, however many warnings it caused) and links [the directives reference](directives.md) and [handling false positives](diagnostics.md). The snippet is enough to apply without understanding the syntax; the links explain it — mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline.
+
+It reads (with concrete callees filled in):
+
+```
+raven check: 3 undefined-variable warnings above sit inside calls to package functions
+whose source raven can't see. If one is a false positive, you can suppress it as with any
+linter (`# raven: ignore`, `# nolint`, or `# raven: expect`).
+R has one extra cause: a function that captures an argument via non-standard
+evaluation (NSE) — as `dplyr::filter(df, col > 0)` treats `col` as a column, not a
+variable — makes a valid name look undefined. Raven already recognizes NSE in many
+common packages (the tidyverse and more) but not all, so these warnings come from
+functions outside that built-in coverage. If that is the case here, declare the
+function's NSE contract instead of suppressing:
+
+  # raven: nse somepkg::my_filter(x)
+  # raven: func somepkg::other(<formals>) and # raven: nse somepkg::other(<nse-formals>)
+
+The `# raven: func … and # raven: nse …` pair is for an argument passed positionally:
+raven needs the function's parameter list to know which formal the argument is, so fill
+`<formals>` with the function's signature and `<nse-formals>` with the captured ones. When
+the argument is passed by name, naming that formal (`# raven: nse fn(x)`) is enough.
+
+See <directives.md> for these directives and <diagnostics.md> for handling false positives.
+```
+
+(Named-formal suggestions are listed first; the wordier positional form, with the explanation above, last.)
+
+The suggestion is **not** repeated on each finding, and it does **not** appear in the diagnostic message at all: the editor and the `json` / `sarif` formats carry no NSE prose (their messages stay the bare "`x` is not defined"). In the editor there is no per-finding hint or code action — the editor diagnostic stays the bare "`x` is not defined", and the NSE suggestion is `raven check` text-footer only.
 
 ## Color output
 
