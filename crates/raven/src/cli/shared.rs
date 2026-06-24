@@ -360,10 +360,10 @@ fn print_json(diags: &[(PathBuf, Diagnostic)], root: &Path) {
         .iter()
         .map(|(p, d)| {
             let rel = p.strip_prefix(root).unwrap_or(p);
-            // Strip the internal NSE hint from `data` (text-footer / quick-fix
-            // only — see `data_without_nse_hint`) so it never reaches machine
-            // output. Clone so the in-memory diagnostics the footer later reads
-            // keep their hint.
+            // Strip the internal NSE hint from `data` (text-footer only — see
+            // `data_without_nse_hint`) so it never reaches machine output. Clone
+            // so the in-memory diagnostics the footer later reads keep their
+            // hint.
             let mut d = d.clone();
             d.data = crate::diagnostic_code::data_without_nse_hint(&d.data);
             json!({ "path": rel.display().to_string(), "diagnostic": d })

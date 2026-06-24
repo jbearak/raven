@@ -15150,15 +15150,14 @@ fn unary_literal_may_bind_function(value: Node, text: &str) -> bool {
 /// call line and its qualifier matches the call's exactly: a bare directive
 /// matches a bare call, and a `pkg::name` directive matches a `pkg::name` call.
 ///
-/// Shared by the discoverability hint and the quick-fix so they agree on when
-/// to step aside for a user who has already declared NSE. It deliberately does
-/// NOT model [`NseAnalysis::own_directive_nse_policy`]'s `BareInPlayQualified`
-/// pass (a `pkg::name` directive governing a *bare* call when `pkg` is in play):
-/// covering that would require the in-play package set here and in the
-/// code-action layer. The omission only ever errs toward *showing* the hint /
-/// offering the quick-fix for such a call — never toward hiding a diagnostic —
-/// which is the safe direction (the suggestion to extend coverage is harmless
-/// guidance, whereas a wrongly-hidden hint loses discoverability).
+/// Decides when the discoverability hint steps aside for a user who has already
+/// declared NSE. It deliberately does NOT model
+/// [`NseAnalysis::own_directive_nse_policy`]'s `BareInPlayQualified` pass (a
+/// `pkg::name` directive governing a *bare* call when `pkg` is in play):
+/// covering that would require the in-play package set here. The omission only
+/// ever errs toward *showing* the hint for such a call — never toward hiding a
+/// diagnostic — which is the safe direction (the suggestion to extend coverage
+/// is harmless guidance, whereas a wrongly-hidden hint loses discoverability).
 pub(crate) fn nse_directive_governs<'a>(
     entries: impl IntoIterator<Item = (Option<&'a str>, u32, bool)>,
     call_pkg: Option<&str>,
@@ -15342,7 +15341,7 @@ fn nse_eligible_call_arg<'t>(
     // knows its NSE surface (or that it has none), so the speculative "if this
     // captures the argument with NSE, declare it with # raven: nse" hint is
     // unwarranted, and acting on it would mislabel an ordinary undefined variable
-    // as a masked symbol. Reserve the hint/quick-fix for package functions raven
+    // as a masked symbol. Reserve the hint for package functions raven
     // cannot see into. Two deliberate restrictions:
     //   * UNQUALIFIED callees only — a `pkg::name(...)` call invokes the package
     //     export, never a same-named local binding, so it keeps the hint.
@@ -60457,7 +60456,7 @@ my_func <- function(a = default_value) {
 
     // Issue #460 (Codex review): a redundantly backticked BUILTIN/base callee
     // (`` `mean`(missing) ``) must be recognized as standard-eval by the
-    // hint/quick-fix eligibility filter (which canonicalizes the bare name), so no
+    // hint eligibility filter (which canonicalizes the bare name), so no
     // misleading `# raven: nse` suggestion is offered for a normal base call.
     #[test]
     fn no_hint_for_backticked_builtin_callee() {
@@ -61913,8 +61912,7 @@ my_func <- function(a = default_value) {
         // function raven statically analyzed; a bare call to it gets no hint.
         // (Quoting of a non-syntactic callee in the suggestion stays covered for
         // the still-eligible qualified case by
-        // `nse_hint_suggestion_quotes_whole_qualified_nonsyntactic_callee` and
-        // for the quick-fix by `nse_quick_fix_quotes_nonsyntactic_callee`.)
+        // `nse_hint_suggestion_quotes_whole_qualified_nonsyntactic_callee`.)
         let diags = collect_undefined_messages(
             "`my data fn` <- function(df, cond) df\n`my data fn`(real_df, undef_arg)\n",
         );
