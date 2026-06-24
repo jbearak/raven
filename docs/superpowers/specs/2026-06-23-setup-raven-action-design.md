@@ -164,15 +164,20 @@ V1 support target:
 | `ubuntu-24.04-arm` (Linux arm64) | Supported and dogfooded |
 | `macos-latest` arm64 | Supported and dogfooded |
 | macOS x64 | Supported by mapping/release asset |
-| Windows | Not a v1 target (action only; Raven runs on Windows) |
+| `windows-latest` x64 | Supported and dogfooded |
+| Windows arm64 | Supported by mapping/release asset |
 
-"Not a v1 target" scopes the **action**, not Raven. Raven runs on Windows and
-publishes Windows release binaries, so a user could install it on a Windows
-runner by hand. There is rarely a reason to: Raven's analysis is
-platform-independent, so a Linux runner yields identical results and costs less
-(GitHub bills Windows runners at a higher minute rate). So Windows-runner support
-buys nothing for v1, and the action should fail clearly on unsupported OS values
-rather than carrying extra implementation branches that are not dogfooded.
+All three OSes Raven publishes binaries for are supported. Windows works through
+the same Bash installer (GitHub's Windows runners run `shell: bash` via Git Bash)
+with three small accommodations: the OS maps to the `windows` asset, the binary
+is `raven.exe`, extraction falls back from `unzip` to `7z` (Windows runners ship
+`7z`, not `unzip`), and `RUNNER_TEMP` backslashes are normalized so `sha256sum`
+does not escape its checksum output. The action fails clearly on any genuinely
+unsupported OS.
+
+Raven's analysis is platform-independent — the same R source yields the same
+results on any OS — and Linux runners bill at the lowest rate, so Linux is
+usually the most economical CI choice even though all three platforms work.
 
 ---
 
@@ -187,12 +192,13 @@ Start with an internal composite action:
   README.md
 ```
 
-Use a Bash installer because the v1 support matrix is Linux/macOS. The script
+Use a Bash installer. It runs on all three OSes — GitHub's Windows runners
+execute `shell: bash` via Git Bash — so one script covers the matrix. The script
 should rely only on standard GitHub-hosted runner tools:
 
 - `bash`
 - `curl`
-- `unzip`
+- `unzip` (Linux/macOS) or `7z` (Windows) — the script falls back between them
 - `sha256sum` or `shasum`
 
 The composite action passes inputs through environment variables and executes
@@ -218,8 +224,8 @@ Dogfood the internal action with a focused workflow:
 ```
 
 The workflow should run on changes to the internal action and on manual
-dispatch. It should test `ubuntu-latest`, `ubuntu-24.04-arm`, and
-`macos-latest`, and run `raven --version` after setup. It does not run any
+dispatch. It should test `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`,
+and `windows-latest`, and run `raven --version` after setup. It does not run any
 `raven` subcommand beyond the smoke test; `check` and package commands are
 covered by Raven's normal integration gates.
 
@@ -297,8 +303,8 @@ Docs should explain:
   reproducible project-specific package metadata path.
 - `raven packages fetch` is an ephemeral project-scoped CI producer from
   r-universe.
-- V1 supports Linux/macOS runners; Windows GitHub Actions runners are not a v1
-  target.
+- V1 supports Linux, macOS, and Windows runners; Linux is usually the most
+  economical CI choice since the analysis is platform-independent.
 
 Do not lead with SARIF or GitHub code scanning. `--format sarif` can remain in
 the CLI output-format reference because Raven supports it, but code scanning is
@@ -314,7 +320,8 @@ Local/offline checks:
 - Parse `action.yml` and the dogfood workflow as YAML.
 - Verify invalid inputs fail before network access:
   - bad `version`
-  - unsupported OS such as Windows
+  - unsupported OS (e.g. a non-Linux/macOS/Windows `RUNNER_OS`)
+  - unsupported architecture
 - Simulate a release download with a fake `curl`, fake Raven zip, and matching
   `.sha256` so the install path (download, checksum verify, extract, `PATH`,
   smoke test) is exercised without network.
@@ -323,15 +330,15 @@ Local/offline checks:
 GitHub-hosted checks:
 
 - Dogfood workflow installs `version: latest`, then runs `raven --version` on
-  `ubuntu-latest`, `ubuntu-24.04-arm`, and `macos-latest`.
+  `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`, and `windows-latest`.
 - The public `setup-raven` repo should repeat the live-install matrix before
   tagging `v1`.
 
 Acceptance criteria:
 
 - A workflow can install Raven from Release binaries on `ubuntu-latest`.
-- Linux arm64 and macOS installs work, or failures are caught by dogfood before
-  public release.
+- Linux arm64, macOS, and Windows installs work, or failures are caught by
+  dogfood before public release.
 - Normal users do not need Rust or Cargo.
 - Downloads are checksum verified.
 - `raven` is available on `PATH` in later steps.
