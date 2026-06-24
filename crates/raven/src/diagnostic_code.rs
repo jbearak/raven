@@ -184,7 +184,7 @@ pub const UNDEFINED_VARIABLE_POSITION_VARIANT: &str = "undefined-variable/positi
 /// appends them to the diagnostic message: the editor and `--format json/sarif`
 /// carry no NSE prose (their message stays the bare "`x` is not defined"), and
 /// the hint surfaces only once, as the deduplicated footer the human-readable
-/// `raven check` text report builds via [`NseHint::directive_suggestion`].
+/// `raven check` text report builds via [`nse_footer_directives`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NseHint {
     /// Source spelling of the callee, retaining backticks for a non-syntactic
@@ -436,6 +436,31 @@ mod tests {
         // And the collapsed directive actually captures BOTH formals when parsed.
         let meta = crate::cross_file::directive::parse_directives(&dirs[0]);
         assert_eq!(meta.nse_declarations.len(), 1, "{dirs:?}");
+    }
+
+    #[test]
+    fn nse_footer_mixed_named_and_positional_for_one_callee_emits_only_the_pair() {
+        // A callee with both a named finding (`f(x = ...)`) and a positional one
+        // (`f(undef)`): the formal order is unknown for the positional arg, so we
+        // emit ONLY the placeholder pair (the user fills `<nse-formals>` with
+        // every captured formal). Emitting `# raven: nse f(x)` alongside it would
+        // collide under last-declaration-wins, re-introducing the original bug.
+        let dirs = nse_footer_directives(&[
+            named_hint_for("somepkg::f", "x"),
+            NseHint {
+                callee: "somepkg::f".to_string(),
+                dir: "somepkg::f".to_string(),
+                formal: None,
+            },
+        ]);
+        assert_eq!(
+            dirs,
+            vec![
+                "# raven: func somepkg::f(<formals>)\n# raven: nse somepkg::f(<nse-formals>)"
+                    .to_string()
+            ],
+            "mixed case emits only the positional placeholder pair"
+        );
     }
 
     #[test]
