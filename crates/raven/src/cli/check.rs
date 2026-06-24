@@ -341,26 +341,45 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     let use_color = resolve_color_from_env(args.color);
     render(args.format, &all_diags, &root, args.quiet, use_color);
 
+    // Post-render context notes that annotate the diagnostics above:
+    //   1. the missing-export-metadata warning (some attached packages' symbols
+    //      couldn't be loaded, so undefined-variable findings may be inaccurate);
+    //   2. the cross-file traversal-budget note (issue #473) — when a budget is
+    //      hit the resolver silently stops following `source()` edges, so some
+    //      "Undefined variable" warnings above may be false positives. The owned
+    //      `state.cross_file_graph` accumulates these counters across every
+    //      target's diagnostic pass, so reading them after the loop reflects the
+    //      whole run. The editor surfaces the same via a throttled
+    //      `window/showMessage`; `raven check` had no equivalent.
+    //
+    // Both are emitted together so they share a stream and stay grouped:
+    // `route_footer_notes` keeps them on the diagnostics' own stream (stdout for
+    // `text`, where a merged terminal/CI consumer would otherwise interleave
+    // them with the findings; stderr for json/sarif, which reserve stdout for
+    // the machine document). See `route_footer_notes`.
+    let mut footer = Vec::new();
     if !missing_export_metadata_packages.is_empty() {
-        eprintln!(
-            "{}",
-            format_missing_export_metadata_warning(
-                &missing_export_metadata_packages,
-                shipped_db_load
-            )
-        );
+        footer.push(format_missing_export_metadata_warning(
+            &missing_export_metadata_packages,
+            shipped_db_load,
+        ));
     }
-
-    // Surface cross-file traversal-budget exhaustion (issue #473). The owned
-    // `state.cross_file_graph` accumulates these counters across every target's
-    // diagnostic pass (neighborhood collection records on the full graph), so
-    // reading them after the loop reflects the whole run. When a budget is hit
-    // the resolver silently stops following `source()` edges, so some
-    // "Undefined variable" warnings above may be false positives — say so, on
-    // stderr, so CI output is not misleading. The editor surfaces the same via
-    // a throttled `window/showMessage`; `raven check` had no equivalent.
     if let Some(note) = format_traversal_budget_note(&state) {
-        eprintln!("{note}");
+        footer.push(note);
+    }
+    if !footer.is_empty() {
+        let (to_stdout, to_stderr) = route_footer_notes(args.format, &footer);
+        if !to_stdout.is_empty() {
+            use std::io::Write as _;
+            // Lock + flush so the footer lands after the diagnostics already
+            // written by `render` and is fully drained before the process exits.
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{}", to_stdout.join("\n"));
+            let _ = out.flush();
+        }
+        if !to_stderr.is_empty() {
+            eprintln!("{}", to_stderr.join("\n"));
+        }
     }
 
     // Operator error takes priority over a threshold breach: a half-read run
@@ -855,6 +874,28 @@ fn format_missing_export_metadata_warning(
     }
 }
 
+/// Decide which stream each post-render context note goes to, given the output
+/// format. Pure (no I/O) so the routing rule is unit-testable without spawning
+/// the binary or an R subprocess; the caller does the actual writing.
+///
+/// The notes (missing-export-metadata warning, traversal-budget note) annotate
+/// the diagnostics, so for the human-readable `text` format they MUST share the
+/// diagnostics' stream — stdout. stdout and stderr are independent OS pipes that
+/// a merged consumer (a terminal, `2>&1`, or GitHub Actions — which timestamps
+/// each line at *read* time across two reader threads) reorders freely, so
+/// splitting a logically-grouped report across both streams interleaves the
+/// notes with the findings they describe. Same stream ⇒ a single reader
+/// preserves order. For the machine formats (`json`/`sarif`) stdout carries the
+/// parsed document, so notes stay on stderr where they can't corrupt it.
+///
+/// Returns `(to_stdout, to_stderr)`; exactly one is non-empty for a given format.
+fn route_footer_notes(format: OutputFormat, notes: &[String]) -> (Vec<String>, Vec<String>) {
+    match format {
+        OutputFormat::Text => (notes.to_vec(), Vec::new()),
+        OutputFormat::Json | OutputFormat::Sarif => (Vec::new(), notes.to_vec()),
+    }
+}
+
 /// Build the cross-file traversal-budget note for `raven check`, or `None` if
 /// no traversal was truncated (issue #473).
 ///
@@ -1198,6 +1239,30 @@ mod tests {
 
         let default = parse_args(std::iter::empty()).unwrap();
         assert!(!default.report_uninstalled);
+    }
+
+    #[test]
+    fn footer_notes_go_to_stdout_for_text_format() {
+        // Text output is human-readable and shares the terminal/CI stream with
+        // the diagnostics, so context notes must ride the SAME stream (stdout)
+        // — otherwise a merged consumer (GitHub Actions, `2>&1`) interleaves
+        // them with the findings they annotate. See issue: check footer stream.
+        let notes = vec!["note A".to_string(), "note B".to_string()];
+        let (to_stdout, to_stderr) = super::route_footer_notes(OutputFormat::Text, &notes);
+        assert_eq!(to_stdout, notes);
+        assert!(to_stderr.is_empty());
+    }
+
+    #[test]
+    fn footer_notes_go_to_stderr_for_machine_formats() {
+        // json/sarif reserve stdout for the machine document, so notes stay on
+        // stderr where they cannot corrupt the parsed output.
+        let notes = vec!["note A".to_string()];
+        for fmt in [OutputFormat::Json, OutputFormat::Sarif] {
+            let (to_stdout, to_stderr) = super::route_footer_notes(fmt, &notes);
+            assert!(to_stdout.is_empty());
+            assert_eq!(to_stderr, notes);
+        }
     }
 
     #[test]

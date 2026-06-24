@@ -304,6 +304,15 @@ Both `check` and `lint` share the same renderers:
 - `json` — array of `{ path, diagnostic }` objects (`diagnostic` is a verbatim LSP `Diagnostic`).
 - `sarif` — SARIF 2.1.0 envelope. Tool name `raven`; `ruleId` from `Diagnostic.code`.
 
+### Output streams
+
+Diagnostics go to **stdout**. Context notes that *follow* and annotate them — the "couldn't load exported symbols … warnings above may be inaccurate" warning and the cross-file traversal-budget note — are routed to keep the report readable:
+
+- For `text`, the notes are written to **stdout** too, as a footer after the diagnostics. They share the diagnostics' stream deliberately: stdout and stderr are independent streams that a merged consumer (a terminal, `2>&1`, or a CI log viewer such as GitHub Actions, which timestamps each line as it reads it) can reorder, which would interleave the multi-line note with the findings it describes. One stream keeps them grouped and in order.
+- For `json` / `sarif`, stdout carries only the machine document, so those notes go to **stderr** instead (where they can't corrupt the parsed output).
+
+The one-line note printed when R is absent is emitted earlier (before any diagnostics) and always goes to stderr.
+
 ## Color output
 
 Both `check` and `lint` colorize the **severity word** (`error`, `warning`, `info`, `hint`) in `text` output — the rest of the line stays uncolored so it remains easy to grep. The `json` and `sarif` formats are machine-readable and are **never** colorized regardless of the flag or environment.
