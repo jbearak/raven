@@ -8,7 +8,7 @@ Raven activates **package mode** when the workspace root contains a `DESCRIPTION
 
 1. **Mutual visibility** — All `R/*.R` files see each other's top-level symbols, matching `devtools::load_all()` semantics. A function defined in `R/utils.R` is available in `R/analysis.R` without any `source()` call.
 
-2. **Import resolution** — Symbols imported via `NAMESPACE` or roxygen annotations (`@import`, `@importFrom`) suppress undefined-variable diagnostics.
+2. **Import resolution** — Symbols imported via `NAMESPACE` or roxygen annotations (`@import`, `@importFrom`) suppress undefined-variable diagnostics. Packages listed in `DESCRIPTION` `Depends:` are also treated as attached — their exports resolve unqualified, equivalent to a NAMESPACE `import(pkg)` of each — because R puts a `Depends:` package's exports on the search path when your package loads. `Imports:` keeps the stricter R semantics (loaded but not attached), so an `Imports:`-only package still requires `pkg::fn` or an explicit `@importFrom`/`importFrom(...)`.
 
 3. **Roxygen + NAMESPACE merge** — Raven unions imports and exports parsed from the generated `NAMESPACE` file with roxygen tags (`@import`, `@importFrom`, `@export`) parsed from `R/*.R` files. Imports visible to your code are the combined set from both sources, so you get correct import resolution whether you edit `NAMESPACE` directly, rely on `devtools::document()` to regenerate it from roxygen, or are mid-edit between the two.
 
@@ -421,6 +421,29 @@ and roxygen are deduped. This means roxygen-annotated imports are
 visible to diagnostics and completions even before you run
 `devtools::document()` to regenerate `NAMESPACE`, and NAMESPACE-only
 imports remain visible if some `R/*.R` files don't carry roxygen tags.
+
+`DESCRIPTION` `Depends:` packages are folded into this same set as
+whole-package imports: each `Depends:` entry is treated exactly like a
+NAMESPACE `import(pkg)`, because R attaches `Depends:` packages onto the
+search path when your package loads, making their exports available
+unqualified. Version constraints (`pkg (>= 1.0)`) and the special `R`
+entry are ignored. `Imports:` is deliberately *not* folded in — an
+`Imports:`-only package is loaded but not attached, so it still requires
+`pkg::fn` or an explicit `importFrom`/`@importFrom`, matching R.
+
+A meta-package in `Depends:` also expands to its members for
+non-standard-evaluation. `Depends: tidyverse` contributes dplyr, tidyr,
+ggplot2, … to the set of packages whose NSE argument policies are in
+play, so a data-masking verb like `filter(x > 5)` in your `R/` code does
+not flag the masked column `x`. This expansion is built in and does not
+depend on the member packages being installed, so it holds in CI without
+R. This applies to `Depends:` (and `library()`/`require()` attaches)
+because those *attach* the meta-package — putting its members on the
+search path. A NAMESPACE `import(tidyverse)` / `@import tidyverse` does
+**not** get this expansion: an `import()` is a selective namespace import,
+not an attach, so it does not bring the members' exports into scope (a
+bare member verb there is still resolved only if the member is genuinely
+re-exported and known to Raven's package database).
 
 ### data.table `[` detection in package mode
 

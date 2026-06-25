@@ -5975,6 +5975,23 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
     for pkg in snapshot.scope_contribution.full_imports.iter() {
         packages.insert(pkg.clone());
     }
+    // DESCRIPTION `Depends:` packages are *attached* (R puts their exports on
+    // the bare search path when the package loads), so a meta-package in
+    // `Depends:` (e.g. `tidyverse`) must expand to its members — `filter`'s
+    // NSE policy comes from the member (dplyr), not the meta-package itself.
+    // This hardcoded expansion is independent of the package library, so it
+    // holds when the library is cold (CI / no R) and the owner-preserving
+    // fallback (issue #407, `table_verb_policy` step 3.5) can't recover the
+    // member. NAMESPACE `import(pkg)` / roxygen `@import` are deliberately NOT
+    // fed here: an `import()` is a selective namespace import, not an attach
+    // (`import(tidyverse)` does not put dplyr's `filter` on the search path),
+    // so meta-expanding it would falsely suppress a masked column. Non-meta
+    // packages expand to nothing (`meta_package_members` → `&[]`), so this is a
+    // safe no-op for the common concrete-`Depends:` case.
+    for pkg in snapshot.scope_contribution.depends_attached_packages.iter() {
+        packages.insert(pkg.clone());
+        attached_packages_for_meta.insert(pkg.clone());
+    }
     // `imported_symbols` is keyed by imported SYMBOL with the source PACKAGE(s)
     // in the values (`importFrom(dplyr, filter)` -> {"filter": {"dplyr"}}), so
     // the package names live in the values, not the keys.
@@ -26819,6 +26836,299 @@ clean_data <- function(x) {
                 .iter()
                 .any(|m| m.contains("some_function_from_pkg")),
             "whole-package import with uninstalled package must NOT resolve arbitrary symbols; got: {messages:?}",
+        );
+    }
+
+    /// Issue #531 end-to-end: a package in `DESCRIPTION` `Depends:` is attached
+    /// at load time, so its exports resolve unqualified in the package's own
+    /// `R/` code — equivalent to a NAMESPACE `import(pkg)`, but with no
+    /// NAMESPACE present (the issue's exact repro). Drives the FULL path
+    /// (DESCRIPTION text → `derive_package_state` → `full_imports` →
+    /// `is_package_export` suppression).
+    #[tokio::test]
+    async fn test_depends_resolves_unqualified_symbols_in_package_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // ggplot2 exports must be known to the library so the whole-package
+        // (`full_imports`) resolution can confirm the symbols.
+        let mut ggplot2_exports = std::collections::HashSet::new();
+        ggplot2_exports.insert("ggplot".to_string());
+        ggplot2_exports.insert("aes".to_string());
+        ggplot2_exports.insert("theme_bw".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("ggplot2".to_string(), ggplot2_exports))
+            .await;
+
+        // The issue's repro: a package with `Depends: ggplot2` and NO NAMESPACE.
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: tp\nVersion: 0.0.1\nDepends: ggplot2\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "myplot <- function(d) ggplot(d, aes(x, y)) + theme_bw()\nz <- genuine_undefined()\n"
+                .into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/p.r"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // Derivation must have placed ggplot2 in full_imports (no NAMESPACE).
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("ggplot2"),
+            "Depends: ggplot2 must populate full_imports: {:?}",
+            state.package_state.scope_contribution().full_imports,
+        );
+
+        let code =
+            "myplot <- function(d) ggplot(d, aes(x, y)) + theme_bw()\nz <- genuine_undefined()\n";
+        let uri = Url::parse("file:///work/pkg/R/p.r").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        // Baseline: a genuinely-undefined symbol must still fire, else the
+        // pipeline isn't running and the test is vacuous.
+        assert!(
+            messages.contains(&"genuine_undefined is not defined"),
+            "baseline undefined symbol must be flagged; got: {messages:?}",
+        );
+        for sym in ["ggplot", "aes", "theme_bw"] {
+            assert!(
+                !messages.iter().any(|m| m.contains(sym)),
+                "Depends: ggplot2 must suppress `{sym} is not defined` in R/ files; got: {messages:?}",
+            );
+        }
+    }
+
+    /// Issue #531 follow-up: a *meta-package* in `Depends:` (e.g. `tidyverse`)
+    /// must expand to its member packages (dplyr, …) for NSE argument-policy
+    /// resolution, so a data-masking verb like `filter(x > 5)` in the package's
+    /// own `R/` code does NOT flag the masked column `x`.
+    ///
+    /// This pins the behavior with a COLD package library — no installed
+    /// packages, no `names.db` — which is the case (CI / no R) where the
+    /// owner-preserving resolution fallback (issue #407) cannot resolve the
+    /// member owner. Without the hardcoded meta-expansion of
+    /// `depends_attached_packages`, only `tidyverse` is in play, `tidyverse`
+    /// carries no NSE policy, and `x` is wrongly flagged. A NAMESPACE
+    /// `import(tidyverse)` deliberately does NOT get this expansion (it is a
+    /// namespace import, not an attach) — see the scoping guard
+    /// `test_namespace_import_meta_package_does_not_expand_for_nse`.
+    #[tokio::test]
+    async fn test_depends_meta_package_expands_for_nse_cold_library() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        // Deliberately seed NOTHING into the package library — dplyr/tidyverse
+        // exports are unknown, so owner resolution cannot recover the member;
+        // suppression must come from hardcoded meta-expansion of
+        // `depends_attached_packages`.
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: tp\nVersion: 0.0.1\nDepends: tidyverse\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "f <- function(df) df |> filter(x > 5)\nz <- genuine_undefined()\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/f.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        let code = "f <- function(df) df |> filter(x > 5)\nz <- genuine_undefined()\n";
+        let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        // Baseline: a genuinely-undefined symbol must still fire, else the
+        // pipeline isn't running and the test is vacuous.
+        assert!(
+            messages.contains(&"genuine_undefined is not defined"),
+            "baseline undefined symbol must be flagged; got: {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("x is not defined")),
+            "Depends: tidyverse must meta-expand to dplyr so filter(x > 5) does \
+             not flag the masked column x (cold library); got: {messages:?}",
+        );
+    }
+
+    /// Issue #531 scoping guard (codex review): a NAMESPACE `import(meta_pkg)`
+    /// must NOT trigger hardcoded meta-package expansion. `import(tidyverse)` is
+    /// a selective namespace import, not an attach — in R it does not put
+    /// dplyr's `filter` on the search path — so meta-expanding it would falsely
+    /// suppress a masked column. With a COLD package library (so the issue #407
+    /// owner-preserving fallback can't intervene), `filter(x > 5)` in an `R/`
+    /// file with only `import(tidyverse)` MUST still flag `x`. (`Depends:
+    /// tidyverse`, a true attach, is the case that DOES expand — see
+    /// `test_depends_meta_package_expands_for_nse_cold_library`.)
+    #[tokio::test]
+    async fn test_namespace_import_meta_package_does_not_expand_for_nse() {
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, NamespaceInput, PackageInputDelta, RFileInput,
+            RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        // Cold library on purpose (see the Depends counterpart test).
+
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: tp\nVersion: 0.0.1\n".into(),
+        });
+        state.package_inputs.namespace = Some(NamespaceInput {
+            text: "import(tidyverse)\n".into(),
+        });
+        let r_text: std::sync::Arc<str> = "f <- function(df) df |> filter(x > 5)\n".into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/f.R"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // `import(tidyverse)` populates `full_imports` but NOT
+        // `depends_attached_packages`, so meta-expansion does not apply.
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("tidyverse"),
+            "import(tidyverse) should populate full_imports",
+        );
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .depends_attached_packages
+                .is_empty(),
+            "NAMESPACE import must NOT populate depends_attached_packages",
+        );
+
+        let code = "f <- function(df) df |> filter(x > 5)\n";
+        let uri = Url::parse("file:///work/pkg/R/f.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("x is not defined")),
+            "import(tidyverse) must NOT meta-expand to dplyr, so the masked column \
+             x stays flagged with a cold library; got: {messages:?}",
         );
     }
 

@@ -858,6 +858,21 @@ pub struct PackageScopeContribution {
     pub imported_symbols: Arc<BTreeMap<String, BTreeSet<String>>>,
     pub full_imports: Arc<BTreeSet<String>>,
 
+    /// Packages from `DESCRIPTION` `Depends:` — a *subset* of `full_imports`
+    /// (issue #531). `Depends:` is a true attach (R puts the package's exports
+    /// on the bare search path when this package loads), so these are also fed
+    /// to the NSE meta-package expansion in `collect_in_play_packages`: a
+    /// meta-package here (e.g. `tidyverse`) expands to its members so a bare
+    /// data-masking verb resolves to the member's policy.
+    ///
+    /// Tracked separately from `full_imports` precisely so this hardcoded
+    /// meta-expansion does NOT also apply to NAMESPACE `import(pkg)` / roxygen
+    /// `@import` entries (which also live in `full_imports` but are selective
+    /// namespace imports, not attaches — `import(tidyverse)` does not put
+    /// dplyr's `filter` on the search path, so expanding it would falsely
+    /// suppress a masked column). The package's own name is excluded.
+    pub depends_attached_packages: Arc<BTreeSet<String>>,
+
     /// Packages that should be treated as if attached (via `library(...)`)
     /// when resolving scope for any file under `<root>/tests/testthat/`.
     ///
