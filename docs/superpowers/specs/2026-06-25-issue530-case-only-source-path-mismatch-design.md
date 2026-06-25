@@ -164,30 +164,51 @@ check — it emits only when `resolve_path*` returns `None`
 only when it is `Some`, `handlers.rs:4794`; snapshot early-returns when `None`,
 `handlers.rs:5138`).
 
-**The case-mismatch diagnostic therefore must NOT live inside the missing-file
-collectors (finding #4)** — `missingFileSeverity = "off"` must not silence it.
-Add a **dedicated collector** (a sync function plus, where the live path needs
-it, a parallel call site mirroring how missing-file collection is invoked), e.g.
-`collect_case_mismatch_diagnostics(meta, ctx, severity_config, &mut diagnostics)`:
+**Single owning phase (fixes finding #1 — no duplicates).** Both production
+entry points — the LSP debounced path (`backend.rs:2522`/`2539`) and `raven
+check` (`cli/check.rs:1102`/`1116`) — run `diagnostics_from_snapshot` first, then
+feed its output into `diagnostics_async_standalone`, which **strips** the
+snapshot's missing-file messages by string match (`handlers.rs:4783`) and
+re-emits them authoritatively via `collect_missing_file_diagnostics_standalone`
+(`handlers.rs:4796`). Missing-file is therefore *owned by the standalone phase*.
+The case-mismatch diagnostic must be emitted in **exactly that one phase**: add
+its collection inside `diagnostics_async_standalone`. The snapshot collector
+(`collect_missing_file_diagnostics_from_snapshot`) does **not** emit it, so there
+are no duplicates and the async strip step needs no new string to match.
 
-- Iterate `meta.sources` (forward only; skip `exempt_from_missing_file_diagnostics`).
-- For each, call `resolve_source_path_rich`. When `case_mismatch` is `Some`,
-  push a diagnostic.
-- It gets its **own gate** from `caseMismatchSeverity` (Component 4), independent
-  of `missing_file_severity`. When the resolved severity is `Off`, emit nothing.
-- Because the regime comes from resolution, this collector needs no separate
-  existence check (it sidesteps the snapshot collector's lack of one).
+**The case-mismatch diagnostic must NOT be gated by `missing_file_severity`
+(finding #4).** In `diagnostics_async_standalone`, the existing
+`collect_missing_file_diagnostics_standalone` call sits inside
+`if let Some(severity) = missing_file_severity`. The new case-mismatch
+collection goes **outside** that block, gated by its own resolved
+`caseMismatchSeverity`, so `missingFileSeverity = "off"` does not silence it.
+`diagnostics_async_standalone` gains a new parameter carrying the
+case-mismatch severity config; both callers (`backend.rs`, `cli/check.rs`) pass
+it from the snapshot's `cross_file_config`.
+
+Dedicated collector, e.g.
+`collect_case_mismatch_diagnostics_standalone(uri, meta, workspace_folders, cfg) -> Vec<Diagnostic>`:
+
+- Iterate `meta.sources` (**forward only**; skip
+  `exempt_from_missing_file_diagnostics`). Backward directives are not
+  considered.
+- For each, build the forward `PathContext` and call `resolve_source_path_rich`.
+  When `case_mismatch` is `Some`, push a diagnostic. Because the regime comes
+  from resolution, no separate existence check is needed.
+- Resolve `caseMismatchSeverity`: `Off` → emit nothing; `Fixed(s)` → severity
+  `s`; `Auto` → INFO for `CaseInsensitiveFs`, WARNING for `CaseSensitiveFs`.
 
 Diagnostic fields:
 - `code`: `source-path-case-mismatch`.
-- `range`: built with the **identical construction** the sibling missing-file
-  diagnostic uses for that source kind — for an AST/`source()` call,
-  `start = (line, column)` and `end = column + path.len()(utf16) + 10`; for a
-  forward directive, the directive line `0..LSP_EOL_CHARACTER`. (There is no
-  stored true literal-path range today; this matches existing behavior rather
-  than promising precise highlighting — finding #7.)
-- `severity`: resolved from `caseMismatchSeverity`; for `"auto"`, INFO for
-  `CaseInsensitiveFs`, WARNING for `CaseSensitiveFs`.
+- `range`: the **forward-source** construction the sibling missing-file
+  diagnostic in this same standalone phase uses (finding #2/#3): `start =
+  (source.line, source.column)`, `end = (source.line, source.column +
+  path.len() + 10)` using the standalone phase's byte-length `path.len()` (as at
+  `handlers.rs:5002`). Forward directives also live in `meta.sources` and use
+  this same `source.line/source.column` form — the `0..LSP_EOL_CHARACTER`
+  full-line form is for *backward* directives only and is not used here. (No
+  stored true literal-path range exists today; this matches existing behavior.)
+- `severity`: as resolved above.
 - `message`: names the typed path and the real on-disk file and the hazard:
   - `CaseInsensitiveFs`: `Case mismatch: 'scripts/templates.r' resolves to
     'templates.R' on this filesystem, but will not be found on a case-sensitive
@@ -199,10 +220,6 @@ Diagnostic fields:
 Mutual exclusivity with `unresolved-source-path` is structural: a path with
 `case_mismatch = Some` resolved to an existing file, so the missing-file branch
 does not fire for it.
-
-The collector is invoked from the same two production places that currently run
-missing-file collection (the standalone/live path and the snapshot path) so LSP
-and `raven check` behave identically.
 
 ### Component 4 — `raven.crossFile.caseMismatchSeverity` setting
 
@@ -226,9 +243,9 @@ so `"auto"` is distinct from a pinned level and from `off`.
 Wiring (the standard three-place + reference-regen dance for a new LSP setting):
 - Rust config layering: `config_file/mod.rs` (the raw layer + the
   `recompute_parsed_configs` writer) and the `cross_file_config`
-  (`cross_file/config.rs`) carried in `DiagnosticsSnapshot`, plus the parameter
-  threaded into the dedicated case-mismatch collector on the standalone/live
-  path.
+  (`cross_file/config.rs`) carried in `DiagnosticsSnapshot`. The resolved value
+  is threaded as a new parameter into `diagnostics_async_standalone` by both
+  callers (`backend.rs`, `cli/check.rs`) and on into the dedicated collector.
 - Backend init-options parsing: `backend.rs` string→value mapping (add the
   `"auto"` sentinel handling).
 - VS Code: `editors/vscode/package.json` schema, the shared
@@ -284,7 +301,9 @@ happens, so no cascade either).
   check) **no** `undefined-variable` cascade for the sourced file's symbols.
   Assert the dedicated collector is **independent of `missingFileSeverity`** —
   with `missingFileSeverity = "off"` and `caseMismatchSeverity` non-off, the
-  case-mismatch diagnostic still emits.
+  case-mismatch diagnostic still emits. Assert **single emission** (no
+  duplicate) through the full `diagnostics_from_snapshot` →
+  `diagnostics_async_standalone` pipeline.
 - **Config tests:** `"auto"` / pinned level / `"off"` each map to the expected
   emission and severity; VS Code `settings.test.ts` named-value cases;
   settings-reference drift test stays green.
@@ -323,6 +342,7 @@ happens, so no cascade either).
   `Option<PathBuf>` signatures via thin wrappers, so the refactor is internal to
   `path_resolve.rs`; verify no consumer relied on a behavior other than "return
   the resolved path or None".
-- **`raven check` snapshot vs live parity.** Ensure the dedicated case-mismatch
-  collector is wired into both the standalone/live and snapshot code paths so the
-  LSP and CLI agree (mirroring how missing-file collection is dual-wired).
+- **Single-phase emission parity.** The case-mismatch collector lives only in
+  `diagnostics_async_standalone`, which both the LSP and `raven check` run as the
+  final phase — so the two agree by construction and no duplicate can arise from
+  the snapshot phase. Do not also add it to `diagnostics_from_snapshot`.
