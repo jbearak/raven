@@ -647,7 +647,7 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 }
 /// Parse linting configuration from merged client + project settings.
 ///
-/// Reads the `linting` section and constructs a [`LintConfig`]. The
+/// Reads the `linting` section and constructs a [`crate::linting::config::LintConfig`]. The
 /// `enabled` field is tri-state (see [`crate::linting::LintEnabled`]):
 /// `Auto` (the default) resolves to `lintr_discovered`; `On` and `Off`
 /// always win. When `linting` is absent or non-object, returns
@@ -1014,7 +1014,7 @@ mod case_mismatch_severity_parse_tests {
 
 /// Parse an [`ObjectNameStyle`](crate::linting::ObjectNameStyle) string.
 ///
-/// Returns [`ObjectNameStyle::Any`] (the "disabled" sentinel for an individual
+/// Returns [`crate::linting::config::ObjectNameStyle::Any`] (the "disabled" sentinel for an individual
 /// kind) on unrecognised values so a misconfigured setting falls back to "no
 /// check" rather than a surprising default. `setting_name` is included in the
 /// warning so the user can find the offending setting in their config.
@@ -2189,7 +2189,7 @@ fn path_in_rprofile_sourced_set(
 }
 
 /// Returns `true` when any delta in `deltas` is `RProfileChanged`, or when any
-/// nested [`PackageInputDelta::Batch`] recursively contains one.
+/// nested [`crate::package_state::PackageInputDelta::Batch`] recursively contains one.
 fn batch_contains_rprofile_changed(deltas: &[crate::package_state::PackageInputDelta]) -> bool {
     deltas.iter().any(|d| match d {
         crate::package_state::PackageInputDelta::RProfileChanged => true,
@@ -3027,7 +3027,7 @@ impl LanguageServer for Backend {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// // Assuming `backend` is an initialized `Backend` and a Tokio runtime is available:
     /// // tokio::spawn(async move {
     /// //     backend.initialized(lsp_types::InitializedParams {}).await;
@@ -4649,7 +4649,7 @@ impl LanguageServer for Backend {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// // Typical invocation occurs inside the LSP runtime:
     /// // backend.did_change(params).await;
     /// ```
@@ -6991,7 +6991,7 @@ impl Backend {
     /// Send the `raven/projectConfigLoaded` notification reflecting the
     /// current project-config state.
     ///
-    /// Fires from [`initialize`], the `did_change_watched_files`
+    /// Fires from `initialize`, the `did_change_watched_files`
     /// `raven.toml` / `.lintr` reload branch, and `did_change_configuration`
     /// rediscovery after client settings alter config discovery. Clients see a
     /// fresh payload when the active project config changes, not just at

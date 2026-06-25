@@ -1,7 +1,7 @@
 //! Shared "discover the nearest project config, then load it" seam.
 //!
 //! The LSP startup path, the watched-files reload, `raven check`, and
-//! `raven lint` all need the same sequence: run [`find_config`] from the
+//! `raven lint` all need the same sequence: run [`crate::config_file::discovery::find_config`] from the
 //! caller's active project root, then load whichever file it discovered
 //! (`raven.toml` beats `.lintr`). Hand-reproducing that match in each site let
 //! them drift — notably on which loader reads `.lintr`. [`discover_and_load`]

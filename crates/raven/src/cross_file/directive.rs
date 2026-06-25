@@ -72,7 +72,7 @@ fn parse_suppression_codes(raw: Option<&str>) -> LineSuppression {
 ///
 /// The parity with `nolint::first_hash_body` is enforced by a property test in
 /// `cross_file::property_tests`, which reaches this scanner through the
-/// `#[cfg(test)]` re-export [`comment_region_outside_strings_for_parity_test`]
+/// `#[cfg(test)]` re-export `comment_region_outside_strings_for_parity_test`
 /// below.
 fn comment_region_outside_strings(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
@@ -239,7 +239,7 @@ fn is_formal_name(s: &str) -> bool {
 /// `pkg::name` qualifier must have both halves non-empty and neither half may
 /// itself contain a colon — so a malformed `pkg:::name` / `pkg::a::b` (which the
 /// quoted forms `"..."`/`'...'` would otherwise accept verbatim) is rejected
-/// before it can be stored as a symbol that [`declared_name_matches`]'s
+/// before it can be stored as a symbol that `declared_name_matches`'s
 /// `rsplit_once("::")` would mis-split and mis-pair. A name with NO `::` is
 /// always accepted: a lone `:` (e.g. a backtick-quoted R symbol `` `a:b` ``,
 /// declared via the quoted form) is not a namespace qualifier and `rsplit_once`

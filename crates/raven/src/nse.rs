@@ -12,11 +12,11 @@
 //! This module is the **pure** half of that machinery: it has no dependency on
 //! tree-sitter or scope resolution. It exposes
 //!
-//! - [`ArgPolicy`], the per-call decision (`Standard`, `WholeCall`, or
+//! - `ArgPolicy`, the per-call decision (`Standard`, `WholeCall`, or
 //!   `PerFormal`),
-//! - [`base_policy`] / [`package_policy`], the built-in `(source, name)` →
+//! - `base_policy` / `package_policy`, the built-in `(source, name)` →
 //!   policy table, and
-//! - [`suppressed_arguments`], which maps a policy plus the ordered argument
+//! - `suppressed_arguments`, which maps a policy plus the ordered argument
 //!   labels of a concrete call onto a per-argument suppression mask using R's
 //!   named-then-positional matching rules.
 //!

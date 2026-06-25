@@ -7,7 +7,7 @@
 //! actual leading-space count doesn't satisfy that expectation.
 //!
 //! Scopes and their expected indents:
-//! * `braced_expression` — inner lines indent one [`indent_unit`] beyond the
+//! * `braced_expression` — inner lines indent one `indent_unit` beyond the
 //!   line of the opening `{`. A `}` that starts its own line aligns with the
 //!   opening `{`'s line; a `}` trailing other code is left to the inner-line
 //!   rule.
@@ -15,13 +15,13 @@
 //!   `parenthesized_expression`, and `function_definition` parameter lists)
 //!   — when the opener is followed by code on the same line (e.g. `foo(a,`),
 //!   continuation lines may either align with the column after the opener
-//!   (`opener_col + 1`) or hang one [`indent_unit`] below the opener's line;
+//!   (`opener_col + 1`) or hang one `indent_unit` below the opener's line;
 //!   both are accepted to match the community-common aligned style. A
 //!   trailing `#` comment after the opener doesn't count as content (so
 //!   `foo( # note` is treated like `foo(`, hanging-only). When the opener
 //!   stands alone at end of line, only the hanging form is accepted.
 //! * `binary_operator` — when the operator's RHS lives on a later line than
-//!   the LHS, those continuation lines indent one [`indent_unit`] beyond the
+//!   the LHS, those continuation lines indent one `indent_unit` beyond the
 //!   line where the LHS starts. The on-type formatter additionally aligns
 //!   such lines with the binop's own start column (the column of its
 //!   leftmost token); when that column is to the right of the hanging indent,

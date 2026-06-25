@@ -1,4 +1,4 @@
-//! Content-addressed identity for an Arc<str>.
+//! Content-addressed identity for an `Arc<str>`.
 //!
 //! Used as the memoization key for per-file `RFileFacts` in `derive_package_state`.
 

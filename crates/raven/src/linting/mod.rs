@@ -76,7 +76,7 @@
 //!
 //! Same-line markers (`# nolint`, `# nolint start/end`, `# @lsp-ignore`) are
 //! additionally recognised when nested inside a commented-code line — e.g.
-//! `# x <- 1 # nolint` — via a parse-gated fallback. See [`nolint`] for the
+//! `# x <- 1 # nolint` — via a parse-gated fallback. See `nolint` for the
 //! full pipeline and limits.
 
 pub mod config;

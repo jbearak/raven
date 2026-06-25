@@ -417,7 +417,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
 /// the CLI owns `state` exclusively — while every piece of *logic* that could
 /// drift is single-sourced through shared seams: config discovery+load
 /// ([`crate::config_file::discover_and_load`]), the workspace scan
-/// ([`crate::state::scan_workspace`] + [`WorldState::apply_workspace_index`]),
+/// ([`crate::state::scan_workspace`] + [`crate::state::WorldState::apply_workspace_index`]),
 /// package-input seeding ([`crate::backend::initialize_package_inputs_from_state`]),
 /// and the R package library ([`crate::package_library::build_package_library`]).
 /// Keep new startup logic in those seams, not duplicated here.
@@ -568,7 +568,7 @@ fn resolve_project_config_with_options(
 /// awareness off in `raven.toml`) is silent, matching the editor.
 ///
 /// Returns `(shipped_db_load, load_notes)`:
-/// - the build's [`ShippedDbLoad`] verdict, so the caller can tailor the
+/// - the build's [`crate::package_library::ShippedDbLoad`] verdict, so the caller can tailor the
 ///   missing-export-metadata warning (absent / loaded / present-but-failed)
 ///   without re-stat-ing disk — the build already knows whether the shipped
 ///   `names.db` actually loaded, which a bare `Path::exists()` cannot tell;
@@ -842,7 +842,7 @@ async fn collect_missing_export_metadata_packages(
 /// then a database-specific fallback.
 ///
 /// The fallback depends on the Tier 3 shipped database's actual load state
-/// ([`ShippedDbLoad`]) — a three-way signal, not a present/absent boolean. The
+/// ([`crate::package_library::ShippedDbLoad`]) — a three-way signal, not a present/absent boolean. The
 /// distinction matters because `p.exists()` ("a database file is on disk") does
 /// NOT mean it loaded and was searched: a corrupt/unsupported file also exists.
 ///

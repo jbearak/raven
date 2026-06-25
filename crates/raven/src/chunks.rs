@@ -338,9 +338,9 @@ pub(crate) fn r_chunk_body_range(chunk: &Chunk, total_lines: u32) -> Option<(u32
 ///   information about trailing newlines). Any `\r` that precedes `\n` stays
 ///   attached to its segment.
 /// * [`detect_chunks`] with [`ChunkKind::Rmd`] locates R chunk bodies. A
-///   chunk is R when [`is_r_chunk_language`] returns `true` for its language
+///   chunk is R when `is_r_chunk_language` returns `true` for its language
 ///   tag. Body lines are `(chunk.header_line + 1)..=chunk.end_line`, clamped
-///   by [`r_chunk_body_range`] (shared with `semantic_tokens_for_rmd_document`):
+///   by `r_chunk_body_range` (shared with `semantic_tokens_for_rmd_document`):
 ///   - skip when `body_start > end_line` (empty chunk) or
 ///     `body_start >= total_lines` (header at EOF);
 ///   - clamp `end_line` to `total_lines - 1`.
@@ -533,7 +533,7 @@ pub struct MarkdownHeading {
 /// is stripped only when preceded by whitespace, and empty-title headings are
 /// dropped. Setext (underline) headings are not recognized.
 ///
-/// Fence tracking mirrors [`detect_rmd_chunks`]'s close rules — a closing fence
+/// Fence tracking mirrors `detect_rmd_chunks`'s close rules — a closing fence
 /// must use the same character as its opener, be at least as long, and carry no
 /// info string — so the two stay aligned on tilde/backtick and unclosed-to-EOF
 /// behavior. An unclosed fence runs to end of document.
@@ -674,7 +674,7 @@ fn ignore_chunk_re() -> &'static Regex {
 }
 
 /// Parse a comma-separated `[code]` body (or `None`/empty) into a
-/// [`LineSuppression`], normalizing each code to canonical kebab-case. Mirrors
+/// [`crate::cross_file::types::LineSuppression`], normalizing each code to canonical kebab-case. Mirrors
 /// the directive/lint-track parsers; empty → blanket.
 fn chunk_codes_or_all(body: Option<&str>) -> crate::cross_file::types::LineSuppression {
     use crate::cross_file::types::LineSuppression;
@@ -823,7 +823,7 @@ fn split_header_options(header_rest: &str) -> Vec<String> {
 /// 2. an in-chunk **directive** `# raven: ignore-chunk` (optionally `[code]`)
 ///    anywhere in the chunk body.
 ///
-/// Chunk suppressions are always the [`SuppressionFlavor::Ignore`] flavor
+/// Chunk suppressions are always the [`crate::cross_file::types::SuppressionFlavor::Ignore`] flavor
 /// (silent). Must be called on the RAW document text: the chunk header (which
 /// carries the option) is blanked in the masked analysis text. The directive
 /// hint anchor is the chunk header line. `# raven: ignore-start/end` blocks

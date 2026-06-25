@@ -1864,7 +1864,7 @@ impl<'a> SymbolExtractor<'a> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// // R6 class detection
     /// // MyClass <- R6Class("MyClass", ...) → CLASS
     ///
@@ -2131,7 +2131,7 @@ impl<'a> SymbolExtractor<'a> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// // Simple function: my_func <- function(x, y) { ... }
     /// // Returns: Some("(x, y)")
     ///
@@ -2915,7 +2915,7 @@ impl HierarchyBuilder {
     /// Compute section ranges (from section comment to next section or EOF).
     ///
     /// This method updates the `range` field of section symbols (those for which
-    /// [`Self::is_section_symbol`] holds — a `Module` or `Heading` with a
+    /// `Self::is_section_symbol` holds — a `Module` or `Heading` with a
     /// `section_level`) to span from the section comment/heading line to the line
     /// before the next section, or to the end of the document if this is the last
     /// section.
@@ -4282,7 +4282,7 @@ fn flatten_document_symbols_recursive(
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// // Given a parsed tree `tree` and source text `src`:
 /// // let root = tree.root_node();
 /// // let mut symbols = Vec::new();
@@ -4545,7 +4545,7 @@ fn collect_legacy_ast_symbols(
 ///
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
 /// restricts results to the file's **top-level** live exports (function-locals are excluded — see
-/// the [`ScopeArtifacts::exported_interface`] footgun), skips declared (virtual) symbols such as
+/// the [`crate::cross_file::scope::ScopeArtifacts::exported_interface`] footgun), skips declared (virtual) symbols such as
 /// `# raven: var`/`# raven: func` (aliases `@lsp-var`/`@lsp-func`), and maps internal symbol
 /// kinds to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation`
 /// with the provided `file_uri` and the symbol's definition position.
@@ -5167,8 +5167,8 @@ fn collect_case_mismatch_diagnostics_standalone(
 /// shares the `source-path-case-mismatch` code and the `caseMismatchSeverity`
 /// policy, but differs in three ways:
 /// - Iterates `meta.sourced_by` (backward directives) and resolves with
-///   [`PathContext::new`] (backward — ignores `# raven: cd`) via
-///   [`resolve_backward_path_rich`].
+///   [`crate::cross_file::path_resolve::PathContext::new`] (backward — ignores `# raven: cd`) via
+///   [`crate::cross_file::path_resolve::resolve_backward_path_rich`].
 /// - Anchors on the full directive line (`directive_line`), matching the backward
 ///   missing-file diagnostics, not the forward line/column+pad form.
 /// - Uses a backward-specific message: R never *executes* a backward directive
@@ -13378,7 +13378,7 @@ enum LspIgnoreKind {
 /// Classify the text after a `#` that opens a comment. Returns the ignore kind
 /// (`SameLine` for `# raven: ignore` / `@lsp-ignore`, `NextLine` for the
 /// `-next` forms) paired with what it suppresses (a blanket
-/// [`LineSuppression::All`] or a code-scoped set parsed from the `[code]`
+/// [`crate::cross_file::types::LineSuppression::All`] or a code-scoped set parsed from the `[code]`
 /// selector). Returns `None` otherwise. Matches word-boundary so
 /// `@lsp-ignored` does not match `@lsp-ignore`.
 fn classify_lsp_ignore_marker(
@@ -19501,7 +19501,7 @@ fn member_definition_info(
 
 /// Render the standard local/sourced-definition hover body: a code block with
 /// the definition statement followed by a file-location line — "this file,
-/// line N" for same-file definitions, or "[rel/path](uri), line N" otherwise.
+/// line N" for same-file definitions, or "\[rel/path\](uri), line N" otherwise.
 /// Shared by the cross-file-scope hover path and the qualified-member
 /// (#382 step 4) path so they cannot drift.
 fn local_definition_hover(

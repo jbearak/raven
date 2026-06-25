@@ -24,7 +24,7 @@
 //! Members reflect the value live at the cursor. A whole-value (re)write of an
 //! intermediate prefix (`alpha$beta <- ...`, constructor or opaque) is an
 //! *establishing site*; members declared before the latest visible one are
-//! dropped (see [`collect_prefix_writes`] and the cutoff in the core collector).
+//! dropped (see `collect_prefix_writes` and the cutoff in the core collector).
 //! A site only counts in the head's own scope — a rewrite inside an unrelated
 //! function body modifies a local copy and is excluded. To order sites and
 //! members that live in different files, each maps to a global,
@@ -302,7 +302,7 @@ pub struct StringSubscriptMember<'a> {
 /// any. The cursor may land on the `string` node itself or its inner
 /// `string_content`; both are accepted. Returns `None` unless the string is the
 /// sole positional literal subscript of a `subset2` (per
-/// [`subset2_sole_string_subscript`]).
+/// `subset2_sole_string_subscript`).
 ///
 /// This lets go-to-definition, hover, and find-references treat
 /// `` x$`name` `` and `x[["name"]]` symmetrically: the caller synthesizes the
@@ -333,7 +333,7 @@ pub fn string_subscript_member_at<'a>(
 }
 
 /// Bare member value for a `string` node that is a literal `[[` subscript (the
-/// find-references-direction view of [`subset2_sole_string_subscript`]: caller
+/// find-references-direction view of `subset2_sole_string_subscript`: caller
 /// holds the `string`, not the `subset2`). `None` for any other string.
 pub fn string_subscript_value<'a>(string_node: Node<'a>, text: &'a str) -> Option<&'a str> {
     string_subscript_context(string_node, text).map(|(_, value)| value)

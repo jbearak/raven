@@ -160,7 +160,7 @@ use crate::workspace_index::WorkspaceIndex;
 ///
 /// * **Analysis view** — [`tree`](Document::tree) together with
 ///   [`analysis_text()`](Document::analysis_text). For an Rmd document these are
-///   derived from [`chunks::mask_to_r`]: every non-R-chunk-body line is blanked
+///   derived from [`crate::chunks::mask_to_r`]: every non-R-chunk-body line is blanked
 ///   so the R tree-sitter parser sees only real R code. All AST work — parsing,
 ///   scope/symbol extraction, diagnostics, completion, hover — must pair
 ///   `tree` with `analysis_text()`, **never** with `text()`. Byte offsets in
@@ -339,7 +339,7 @@ impl Document {
     /// True when the document is an R Markdown / Quarto document.
     ///
     /// For Rmd documents the analysis view (`tree` + `analysis_text()`) is the
-    /// geometry-preserving [`chunks::mask_to_r`] mask, so R-language features
+    /// geometry-preserving [`crate::chunks::mask_to_r`] mask, so R-language features
     /// (diagnostics, completion, hover, signature help, go-to-definition,
     /// references, folding, selection, on-type formatting, semantic tokens) are
     /// first-class **inside R chunk bodies** and operate on document
@@ -349,7 +349,7 @@ impl Document {
     /// a prose guard — at a prose/YAML position the masked line is blank, which
     /// would otherwise let completion / signature help / on-type formatting
     /// behave like top-level R; guard such positions with
-    /// [`chunks::position_in_r_chunk_body`] on the *raw* text. (2) Whole-text
+    /// [`crate::chunks::position_in_r_chunk_body`] on the *raw* text. (2) Whole-text
     /// paths that can't consume the R AST (e.g. chunk-aware semantic tokens,
     /// the text-based document outline) branch on it.
     pub fn is_rmd_document(&self) -> bool {

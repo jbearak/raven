@@ -182,7 +182,7 @@ pub struct PackageInfo {
     /// folds both into the resolvable set so datasets resolve as symbols
     /// (issue #350).
     ///
-    /// For non-base packages this is populated by [`package_info_from_dir`],
+    /// For non-base packages this is populated by `package_info_from_dir`,
     /// the single chokepoint every on-disk load path routes through (both
     /// `get_package` and `prefetch_packages`, which inserts straight into the
     /// cache and so bypasses `get_package`). Base-package datasets take a
@@ -700,7 +700,7 @@ impl PackageLibrary {
         result
     }
 
-    /// Like [`get_exports_for_completions`], but attributes each symbol to its
+    /// Like [`Self::get_exports_for_completions`], but attributes each symbol to its
     /// true **owner** package rather than the loaded/aggregate package that made
     /// it visible. For `library(tidyverse)`, `mutate` is attributed to `dplyr`
     /// (the documentation owner) so completion detail (`{dplyr}`) and the
@@ -777,7 +777,7 @@ impl PackageLibrary {
     ///    `lazy_data` datasets, both of which `pkg::name` resolves). An *empty*
     ///    cached entry is NOT trusted: `get_package`/`prefetch_packages` cache an
     ///    empty-export placeholder when a package's namespace fails to load,
-    ///    which is exactly why [`package_exists`] ignores the cache. So an empty
+    ///    which is exactly why [`Self::package_exists`] ignores the cache. So an empty
     ///    entry falls through to disk rather than suppressing completions.
     /// 2. **Installed on disk** — when the package is in `lib_paths`, its
     ///    `NAMESPACE` is parsed directly for `export()` entries (no DESCRIPTION
@@ -1032,7 +1032,7 @@ impl PackageLibrary {
     /// package is not cached, has no `data/` enumeration, or the stem is
     /// unknown. Reads the current immutable `packages` snapshot via ArcSwap
     /// `load()` (no promotion, no locking), matching the hot-path discipline of
-    /// [`is_cached_sync`] / [`is_symbol_from_loaded_packages`].
+    /// [`Self::is_cached_sync`] / [`Self::is_symbol_from_loaded_packages`].
     pub fn data_objects_for_stem_sync(&self, package: &str, stem: &str) -> Vec<String> {
         // The load_all sentinel is not an installed package and has no datasets.
         if is_load_all_sentinel(package) {
@@ -1339,7 +1339,7 @@ impl PackageLibrary {
     /// static (no-`exportPattern`) packages, batch the `exportPattern` packages
     /// into a single R export call, and enumerate every data-bearing package's
     /// `data()` objects in one batched R call (issue #429). Does NOT recurse
-    /// into dependencies or populate `combined_entries` — [`prefetch_packages`]
+    /// into dependencies or populate `combined_entries` — [`Self::prefetch_packages`]
     /// drives the transitive closure and the combined warm-up.
     async fn prefetch_uncached_level(&self, uncached_packages: &[String]) {
         // Categorize packages: static (no exportPattern) vs pattern (needs R)
@@ -1569,8 +1569,8 @@ impl PackageLibrary {
         }
     }
 
-    /// Per-package fallback shared by [`find_package_for_symbol`] and
-    /// [`find_package_owner_for_symbol`]: returns the first loaded package whose
+    /// Per-package fallback shared by [`Self::find_package_for_symbol`] and
+    /// [`Self::find_package_owner_for_symbol`]: returns the first loaded package whose
     /// own (non-aggregate) cached exports contain `symbol`. Centralizing the loop
     /// keeps availability and owner attribution from diverging on direct-package
     /// lookup. Returns `None` if no loaded package exports the symbol.
@@ -1620,11 +1620,11 @@ impl PackageLibrary {
     /// Find the true owner package of a symbol made visible by `loaded_packages`
     /// (synchronous, cached-only).
     ///
-    /// Distinct from [`find_package_for_symbol`], which answers "which loaded
+    /// Distinct from [`Self::find_package_for_symbol`], which answers "which loaded
     /// package made this visible?" and returns the aggregate key (e.g.
     /// `tidyverse`). This answers "which package actually contributed the
     /// symbol?" — the documentation / NSE-policy owner (e.g. `dplyr`) — by
-    /// consulting the per-aggregate [`CombinedEntry`] snapshot. Falls back to
+    /// consulting the per-aggregate `CombinedEntry` snapshot. Falls back to
     /// direct per-package exports when no aggregate entry exists yet, preserving
     /// the previous behavior for unwarmed direct package caches. See issue #407.
     pub fn find_package_owner_for_symbol(
@@ -2626,7 +2626,7 @@ impl PackageLibraryOutcome {
 /// `cli::check::maybe_init_r`, `backend::ensure_package_library_initialized`,
 /// and the Task B post-scan startup init. Routing them all through one
 /// builder is what stops the editor and `raven check` from drifting, and this
-/// enum's [`classify`](PackageLibraryStatus::classify) is where the status
+/// enum's `classify` is where the status
 /// classification and degradation precedence live — not duplicated per site.
 ///
 /// Build status is distinct from the *consumer readiness gate*
