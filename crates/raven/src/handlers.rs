@@ -5044,6 +5044,36 @@ async fn collect_missing_file_diagnostics_standalone(
 /// `/inst/...` entry is NOT `exempt_from_missing_file_diagnostics`, so it must be
 /// excluded explicitly). Backward directives are not considered: the resolution
 /// leniency that surfaces a case mismatch is forward-only.
+/// The real on-disk spelling of a user-typed (relative) `source()` path: the
+/// trailing components of the resolved path matching the typed path's component
+/// count. This surfaces a directory-only case mismatch (`Scripts/` vs
+/// `scripts/`) in full instead of collapsing to just the filename — `file_name()`
+/// alone would render the useless "'Scripts/templates.R' resolves to
+/// 'templates.R'". Falls back to the bare file name if the component counts can't
+/// be lined up (e.g. a `.`/`..` component the normalizer collapsed). Always uses
+/// `/` separators to match the spelling the user writes in `source()`.
+fn corrected_relative_spelling(typed: &str, resolved: &std::path::Path) -> String {
+    use std::path::Component;
+    let typed_count = std::path::Path::new(typed.trim_start_matches('/'))
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    let real: Vec<std::borrow::Cow<'_, str>> = resolved
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    if typed_count == 0 || typed_count > real.len() {
+        return resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    real[real.len() - typed_count..].join("/")
+}
+
 fn collect_case_mismatch_diagnostics_standalone(
     uri: &Url,
     meta: &crate::cross_file::CrossFileMetadata,
@@ -5075,8 +5105,7 @@ fn collect_case_mismatch_diagnostics_standalone(
         let real_name = outcome
             .path
             .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|p| corrected_relative_spelling(&source.path, p))
             .unwrap_or_default();
         let message = match regime {
             CaseMismatchRegime::CaseInsensitiveFs => format!(
@@ -5175,6 +5204,39 @@ mod case_mismatch_collector_tests {
         assert_eq!(d.range.start.line, 0);
         assert!(d.message.contains("templates.r") && d.message.contains("templates.R"));
         // The diagnostic names the real on-disk file.
+    }
+
+    #[test]
+    fn message_shows_full_corrected_relative_spelling_for_directory_case_mismatch() {
+        // source("Scripts/templates.R") against on-disk scripts/templates.R: the
+        // filenames are identical, so a file_name()-only message ("resolves to
+        // 'templates.R'") would be useless. The message must show the corrected
+        // path at the same depth the user typed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "x <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        let meta = crate::cross_file::extract_metadata("source(\"Scripts/templates.R\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        // Only meaningful on a case-insensitive FS, where "Scripts" folds to
+        // "scripts"; on a case-sensitive FS this is a genuine missing directory.
+        if diags.is_empty() {
+            return;
+        }
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("scripts/templates.R"),
+            "message must surface the corrected DIRECTORY spelling, not just the \
+             filename: {:?}",
+            diags[0].message
+        );
     }
 
     #[test]
