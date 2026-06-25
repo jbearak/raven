@@ -205,6 +205,14 @@ For **AST-detected `source()` calls and forward directives** (`# raven: source`,
 
 Forward directives are semantically equivalent to `source()` calls (see `.kiro/specs/lsp-source-directive/`) and must resolve identically across dependency edges, scope, diagnostics, cmd-click, and path completion. This fallback must **not** apply to backward directives.
 
+### Case-leniency vs workspace-root fallback (decoupled, issue #535)
+
+These are two **independent** concepts; do not re-conflate them:
+- **Single-case-insensitive-match leniency** — fold a wrong-cased path to the unique on-disk match (exact wins; 2+ ambiguous stays unresolved; ASCII-only). This is **direction independent**: both forward `source()`/directives and backward directives (`# raven: sourced-by` etc.) get it, so a wrong-cased backward directive resolves on a case-sensitive filesystem instead of dropping the edge and cascading false `undefined-variable` warnings. Issue #530 introduced it forward-only; #535 made it bidirectional.
+- **Workspace-root fallback** (above) — try the path relative to the workspace root. This stays **forward-only**.
+
+In `resolve_path_rich`, the `try_workspace_fallback` bool now gates **only** the workspace-root fallback; the case-leniency branches are unconditional. Backward resolution (`resolve_path` / `resolve_backward_path_rich`) passes `try_workspace_fallback = false` — gaining the leniency but never the fallback. The backward case-mismatch diagnostic (`collect_backward_case_mismatch_diagnostics_standalone` in `handlers.rs`) reuses the `source-path-case-mismatch` code and `caseMismatchSeverity` policy but with a message that does not claim R errors (R never executes a backward directive).
+
 ### Parent-prefix scope and forward-source traversal
 
 Scope resolution has two distinct graph traversals:

@@ -9165,6 +9165,85 @@ mod file_path_definition_tests {
         assert_eq!(location.range.start.character, 0);
     }
 
+    use crate::test_utils::host_is_case_sensitive;
+
+    #[test]
+    fn test_file_path_definition_backward_directive_case_only_mismatch_navigates() {
+        // Issue #535: cmd-click on a wrong-cased `# raven: sourced-by Parent.r`
+        // (real file Parent.R) must navigate to the real on-disk file. This is the
+        // navigation surface that shares backward `resolve_path`, which is now
+        // case-lenient. Resolves on a case-insensitive FS via the step-1 correction
+        // AND on a case-sensitive FS via the new single-ci-match leniency, so the
+        // Location must point at Parent.R regardless of host.
+        let temp_dir = TempDir::new().unwrap();
+        let parent_path = temp_dir.path().join("Parent.R");
+        fs::write(&parent_path, "# parent file").unwrap();
+
+        let child_path = temp_dir.path().join("child.R");
+        let code = "# raven: sourced-by Parent.r";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&child_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+
+        // "# raven: sourced-by " is 20 chars; cursor inside "Parent.r".
+        let position = Position {
+            line: 0,
+            character: 24,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+
+        let location = result.expect("wrong-cased backward directive should still navigate");
+        assert_eq!(location.uri, Url::from_file_path(&parent_path).unwrap());
+    }
+
+    #[test]
+    fn test_file_path_definition_backward_directive_ambiguous_case_unresolved() {
+        // 2+ case-insensitive matches (only constructible on a case-sensitive FS) →
+        // ambiguous → no navigation (mirrors the forward ambiguity rule).
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("Parent.R"), "").unwrap();
+        fs::write(temp_dir.path().join("parent.R"), "").unwrap();
+
+        let child_path = temp_dir.path().join("child.R");
+        // Typed casing matches neither exactly; both match case-insensitively.
+        let code = "# raven: sourced-by PARENT.R";
+        let tree = parse_r(code);
+
+        let file_uri = Url::from_file_path(&child_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = make_metadata(None);
+        let position = Position {
+            line: 0,
+            character: 24,
+        };
+
+        let result = file_path_definition(
+            &tree,
+            code,
+            position,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+        assert!(
+            result.is_none(),
+            "ambiguous case-insensitive match must not navigate: {result:?}"
+        );
+    }
+
     #[test]
     fn test_file_path_definition_forward_directive_synonym_existing_file() {
         let temp_dir = TempDir::new().unwrap();

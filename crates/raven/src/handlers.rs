@@ -4814,6 +4814,17 @@ pub async fn diagnostics_async_standalone(
         workspace_folders,
         case_mismatch_severity,
     ));
+    // Backward-directive case mismatches (issue #535) — same phase, same severity
+    // policy, distinct message and (full-line) range. Resolution is now case-lenient
+    // for backward directives, so a wrong-cased `# raven: sourced-by` resolves into
+    // the graph (no undefined-variable cascade) and is reported here instead of as a
+    // "Parent file not found" miss.
+    diagnostics.extend(collect_backward_case_mismatch_diagnostics_standalone(
+        uri,
+        directive_meta,
+        workspace_folders,
+        case_mismatch_severity,
+    ));
 
     diagnostics
 }
@@ -5072,8 +5083,9 @@ fn corrected_relative_spelling(typed: &str, resolved: &std::path::Path) -> Strin
 ///
 /// `system.file()` sources are skipped (a non-goal — and a branch-1 self-package
 /// `/inst/...` entry is NOT `exempt_from_missing_file_diagnostics`, so it must be
-/// excluded explicitly). Backward directives are not considered: the resolution
-/// leniency that surfaces a case mismatch is forward-only.
+/// excluded explicitly). Backward directives are handled by the sibling
+/// [`collect_backward_case_mismatch_diagnostics_standalone`] (issue #535), which
+/// uses a backward-specific message and full-line range.
 fn collect_case_mismatch_diagnostics_standalone(
     uri: &Url,
     meta: &crate::cross_file::CrossFileMetadata,
@@ -5134,6 +5146,87 @@ fn collect_case_mismatch_diagnostics_standalone(
                         .saturating_add(source.path.len() as u32)
                         .saturating_add(10),
                 ),
+            },
+            severity: Some(severity),
+            message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+
+    diagnostics
+}
+
+/// Collect `source-path-case-mismatch` diagnostics (issue #535) for **backward**
+/// directives (`# raven: sourced-by` / `run-by` / `included-by`) whose path
+/// resolves only via a case-only difference from the real on-disk filename.
+///
+/// The backward sibling of [`collect_case_mismatch_diagnostics_standalone`]. It
+/// shares the `source-path-case-mismatch` code and the `caseMismatchSeverity`
+/// policy, but differs in three ways:
+/// - Iterates `meta.sourced_by` (backward directives) and resolves with
+///   [`PathContext::new`] (backward — ignores `# raven: cd`) via
+///   [`resolve_backward_path_rich`].
+/// - Anchors on the full directive line (`directive_line`), matching the backward
+///   missing-file diagnostics, not the forward line/column+pad form.
+/// - Uses a backward-specific message: R never *executes* a backward directive
+///   (it is a raven-only annotation), so the message must NOT claim R errors, and
+///   — because backward resolution is now case-lenient in both filesystem regimes
+///   (#535) — must NOT claim raven fails to resolve. It frames the mismatch as a
+///   casing/portability problem with the actionable fix "fix the directive's path
+///   casing".
+///
+/// Like the forward collector, this runs once in [`diagnostics_async_standalone`]
+/// (the single authoritative phase) so the diagnostic is emitted exactly once.
+fn collect_backward_case_mismatch_diagnostics_standalone(
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_folders: Option<&Url>,
+    severity_policy: crate::cross_file::CaseMismatchSeverity,
+) -> Vec<Diagnostic> {
+    use crate::cross_file::path_resolve::CaseMismatchRegime;
+
+    let mut diagnostics = Vec::new();
+    let Some(ctx) = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders)
+    else {
+        return diagnostics;
+    };
+
+    for directive in &meta.sourced_by {
+        let outcome =
+            crate::cross_file::path_resolve::resolve_backward_path_rich(&directive.path, &ctx);
+        let Some(regime) = outcome.case_mismatch else {
+            continue;
+        };
+        let Some(severity) = severity_policy.resolve(regime) else {
+            continue;
+        };
+        let real_name = outcome
+            .path
+            .as_ref()
+            .map(|p| corrected_relative_spelling(&directive.path, p))
+            .unwrap_or_default();
+        let message = match regime {
+            CaseMismatchRegime::CaseInsensitiveFs => format!(
+                "Case mismatch: backward directive '{}' resolves to '{}' on this \
+                 filesystem, but its casing does not match the file on disk. Fix the \
+                 directive's path casing so the relationship still resolves on a \
+                 case-sensitive filesystem (e.g. Linux CI).",
+                directive.path, real_name
+            ),
+            CaseMismatchRegime::CaseSensitiveFs => format!(
+                "Case mismatch: backward directive '{}' does not match the file on \
+                 disk; raven resolved the case-insensitive match '{}'. Fix the \
+                 directive's path casing to match the file on disk.",
+                directive.path, real_name
+            ),
+        };
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(directive.directive_line, 0),
+                end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
             },
             severity: Some(severity),
             message,
@@ -5339,6 +5432,160 @@ mod case_mismatch_collector_tests {
         assert!(
             diags.is_empty(),
             "missing file is unresolved-source-path, not case-mismatch: {diags:?}"
+        );
+    }
+
+    // ---- Issue #535: backward-directive case mismatch ----
+
+    #[test]
+    fn backward_emits_one_case_mismatch_with_backward_message() {
+        // child.R declares `# raven: sourced-by Parent.r`; the real parent is
+        // Parent.R. On a case-insensitive FS the step-1 case-correction folds it; on
+        // a case-sensitive FS the single-ci-match leniency does — either way the
+        // backward collector must fire exactly once with the backward-specific code.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "x <- 1\n").unwrap();
+        let child = dir.path().join("child.R");
+        let src = "# raven: sourced-by Parent.r\n";
+        std::fs::write(&child, src).unwrap();
+        let meta = crate::cross_file::extract_metadata(src);
+        assert_eq!(meta.sourced_by.len(), 1, "directive parsed: {meta:?}");
+        let uri = Url::from_file_path(&child).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+
+        let diags = collect_backward_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly one backward case-mismatch: {diags:?}"
+        );
+        let d = &diags[0];
+        assert!(crate::diagnostic_code::diagnostic_has_code(
+            &d.code,
+            crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH
+        ));
+        // Full-line range anchored on the directive line.
+        assert_eq!(d.range.start.line, 0);
+        assert_eq!(d.range.start.character, 0);
+        assert!(d.message.contains("Parent.r") && d.message.contains("Parent.R"));
+        assert!(
+            d.message.contains("backward directive"),
+            "message identifies it as a backward directive: {}",
+            d.message
+        );
+        // The backward message must NOT claim R errors — R never executes a
+        // backward directive.
+        assert!(
+            !d.message.contains("R errors") && !d.message.contains("R would error"),
+            "backward message must not claim R errors: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn backward_exact_case_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "x <- 1\n").unwrap();
+        let child = dir.path().join("child.R");
+        let src = "# raven: sourced-by Parent.R\n";
+        let meta = crate::cross_file::extract_metadata(src);
+        let uri = Url::from_file_path(&child).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_backward_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert!(diags.is_empty(), "exact case is not a mismatch: {diags:?}");
+    }
+
+    #[test]
+    fn backward_missing_file_emits_no_case_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child.R");
+        let src = "# raven: sourced-by ghost.R\n";
+        let meta = crate::cross_file::extract_metadata(src);
+        let uri = Url::from_file_path(&child).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_backward_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert!(
+            diags.is_empty(),
+            "a genuinely missing parent is unresolved-source-path, not case-mismatch: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn backward_off_policy_suppresses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "x <- 1\n").unwrap();
+        let child = dir.path().join("child.R");
+        let src = "# raven: sourced-by Parent.r\n";
+        let meta = crate::cross_file::extract_metadata(src);
+        let uri = Url::from_file_path(&child).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_backward_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Off,
+        );
+        assert!(diags.is_empty(), "Off policy emits nothing: {diags:?}");
+    }
+
+    #[test]
+    fn standalone_emits_backward_case_mismatch_without_parent_not_found() {
+        // Integration-level guard: through the real `diagnostics_async_standalone`,
+        // a wrong-cased backward directive must produce the backward case-mismatch
+        // (its own severity gate survives missingFileSeverity=off) and must NOT also
+        // produce a "Parent file not found" miss — the file now resolves.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "x <- 1\n").unwrap();
+        let child = dir.path().join("child.R");
+        let src = "# raven: sourced-by Parent.r\n";
+        let meta = crate::cross_file::extract_metadata(src);
+        let uri = Url::from_file_path(&child).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Pass a real missing-file severity so the missing-file collector also runs;
+        // it must NOT emit "Parent file not found" for the now-resolving directive.
+        let diags = rt.block_on(diagnostics_async_standalone(
+            &uri,
+            Vec::new(),
+            &meta,
+            Some(&ws),
+            Some(DiagnosticSeverity::WARNING),
+            CaseMismatchSeverity::Auto,
+        ));
+        let case_diags = diags
+            .iter()
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH,
+                )
+            })
+            .count();
+        assert_eq!(case_diags, 1, "one backward case-mismatch: {diags:?}");
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("Parent file not found")),
+            "no double-emission: the resolving directive must not also be a miss: {diags:?}"
         );
     }
 }

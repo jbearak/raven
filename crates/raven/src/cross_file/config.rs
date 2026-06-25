@@ -9,13 +9,18 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 
 use super::path_resolve::CaseMismatchRegime;
 
-/// Severity policy for the `source-path-case-mismatch` diagnostic (issue #530).
-/// Distinct from the plain `Option<DiagnosticSeverity>` other categories use
-/// because the default (`Auto`) is host-derived rather than a fixed level.
+/// Severity policy for the `source-path-case-mismatch` diagnostic (issue #530;
+/// extended to backward directives in #535). Distinct from the plain
+/// `Option<DiagnosticSeverity>` other categories use because the default
+/// (`Auto`) is host-derived rather than a fixed level. The same policy gates the
+/// forward (`source()`/forward-directive) and backward (`# raven: sourced-by`
+/// etc.) case-mismatch collectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CaseMismatchSeverity {
     /// Host-derived: information on a case-insensitive filesystem (portability
-    /// hazard), warning on a case-sensitive one (R would error). Default.
+    /// hazard), warning on a case-sensitive one (for a forward `source()` R would
+    /// error; for a backward directive it is a casing/portability mismatch).
+    /// Default.
     #[default]
     Auto,
     /// A user-pinned level applied in both regimes.

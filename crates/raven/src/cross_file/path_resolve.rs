@@ -231,8 +231,10 @@ pub enum CaseMismatchRegime {
     /// found on a case-sensitive filesystem (e.g. Linux CI). Information-level.
     CaseInsensitiveFs,
     /// The typed path did not exist; resolution found exactly one
-    /// case-insensitive match on a case-sensitive filesystem, where R itself
-    /// would error at `source()` time. Warning-level.
+    /// case-insensitive match on a case-sensitive filesystem. For a forward
+    /// `source()` R itself would error at `source()` time; for a backward
+    /// directive (issue #535) it is purely a casing/portability mismatch (R never
+    /// executes a backward directive). Warning-level either way.
     CaseSensitiveFs,
 }
 
@@ -240,13 +242,14 @@ pub enum CaseMismatchRegime {
 /// case-only-mismatch signal set when the path resolved via a case difference
 /// rather than an exact match. See issue #530.
 ///
-/// The `case_mismatch` signal is only **consumed** for forward resolution: the
-/// public `resolve_path` (backward) returns just `.path`, discarding it. Note
-/// that backward resolution can still *carry* a `CaseInsensitiveFs` signal — the
-/// exact-match (`exists()`) branch case-corrects regardless of direction — but
-/// the new single-case-insensitive-match leniency (the `CaseSensitiveFs` regime)
-/// is forward-only, so a backward directive never resolves a path it wouldn't
-/// have resolved before.
+/// The bare public `resolve_path` (backward) returns just `.path`, discarding the
+/// signal; `resolve_backward_path_rich` and `resolve_source_path_rich` carry it
+/// for the case-mismatch diagnostics. As of issue #535 BOTH regimes can arise in
+/// either direction: `CaseInsensitiveFs` from the direction-independent exact-match
+/// (`exists()`) case-correction, and `CaseSensitiveFs` from the
+/// single-case-insensitive-match leniency, which is now also direction independent
+/// (backward directives gain the leniency but never the forward-only workspace-root
+/// fallback).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolveOutcome {
     /// The resolved path, case-corrected to the real on-disk spelling. `Some`
@@ -274,8 +277,17 @@ impl ResolveOutcome {
     }
 }
 
-/// Resolve a path string to an absolute path.
-/// Handles file-relative, workspace-relative, and absolute paths with working directory context.
+/// Resolve a path string to an absolute path, **without** the workspace-root
+/// fallback (use for backward directives — `# raven: sourced-by`/`run-by`/
+/// `included-by` — which resolve relative to the file's own directory and ignore
+/// `# raven: cd`). Handles file-relative, workspace-relative, and absolute paths.
+///
+/// As of issue #535 this folds a single case-only typo to the real on-disk file
+/// (the single-case-insensitive-match leniency is direction independent), so a
+/// wrong-cased backward directive resolves on a case-sensitive filesystem too —
+/// but it still never gains the forward-only workspace-root fallback. The
+/// case-mismatch signal is discarded here; use [`resolve_backward_path_rich`] to
+/// keep it for the diagnostic.
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     resolve_path_rich(path, context, false).path
 }
@@ -301,10 +313,26 @@ pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -
 /// Forward-source resolution that also reports a case-only mismatch (issue
 /// #530). The `path` field is identical to
 /// [`resolve_path_with_workspace_fallback`]; `case_mismatch` is `Some` when the
-/// file resolved via a case difference. Use for the `source-path-case-mismatch`
-/// diagnostic. Forward only — backward directives never carry the signal.
+/// file resolved via a case difference. Use for the forward
+/// `source-path-case-mismatch` diagnostic. Forward wrapper only — for backward
+/// directives use [`resolve_backward_path_rich`] (which also carries the signal,
+/// issue #535).
 pub fn resolve_source_path_rich(path: &str, context: &PathContext) -> ResolveOutcome {
     resolve_path_rich(path, context, true)
+}
+
+/// Backward-directive resolution that also reports a case-only mismatch (issue
+/// #535). The `path` field is identical to [`resolve_path`]; `case_mismatch` is
+/// `Some` when the file resolved via a case difference. Use for the backward
+/// `source-path-case-mismatch` diagnostic.
+///
+/// Like [`resolve_path`], this passes `try_workspace_fallback = false`, so it
+/// gains the single-case-insensitive-match leniency (which is now direction
+/// independent, issue #535) but NOT the workspace-root fallback (forward-only;
+/// backward directives resolve relative to the file's own directory and ignore
+/// `# raven: cd`).
+pub fn resolve_backward_path_rich(path: &str, context: &PathContext) -> ResolveOutcome {
+    resolve_path_rich(path, context, false)
 }
 
 /// The trusted directory prefix to case-correct `canonical` beneath: the file's
@@ -344,13 +372,23 @@ fn case_mismatch_if_corrected(
 /// Ordering is exact-before-case-insensitive at every base (issue #530): a path
 /// that exists as typed (or via filesystem case-folding) always wins before the
 /// single-case-insensitive-match leniency is considered, and the workspace-root
-/// fallback retains its priority over the new leniency. The case-insensitive
-/// leniency (steps 3–4) is **forward-only** — gated on `try_workspace_fallback`,
-/// which is true only for `source()` calls and forward directives — so backward
-/// directives keep exact-only resolution and never resolve a path they wouldn't
-/// have before. (A backward resolution can still report a `CaseInsensitiveFs`
-/// signal from the step-1 case-correction, but the public `resolve_path` wrapper
-/// discards it.)
+/// fallback retains its priority over the leniency.
+///
+/// Two independent concepts are decoupled here (issue #535):
+/// - **`try_workspace_fallback`** gates ONLY the workspace-root fallback (step 2
+///   exact, step 4 single-ci-match, and the `workspace_fallback_root` computation).
+///   This is **forward-only**: true for `source()` calls and forward directives,
+///   false for backward directives, which resolve relative to the file's own
+///   directory and ignore `# raven: cd`.
+/// - The **single-case-insensitive-match leniency** (the `/`-path "missing as
+///   typed" arm and step 3) is **direction independent**: both forward and
+///   backward resolution fold a single case-only typo to the real on-disk file.
+///   Backward gained this in #535; it never gains the workspace-root fallback.
+///
+/// The step-1 exact-match case-correction (`canonicalize_case_below`) was always
+/// direction independent. The public `resolve_path` wrapper discards the
+/// `case_mismatch` signal; `resolve_backward_path_rich` carries it for the
+/// backward diagnostic.
 fn resolve_path_rich(
     path: &str,
     context: &PathContext,
@@ -387,11 +425,13 @@ fn resolve_path_rich(
                 );
                 ResolveOutcome::resolved(corrected, mismatch)
             }
-            // Missing as typed: forward-only single-case-insensitive-match leniency.
+            // Missing as typed: single-case-insensitive-match leniency. Direction
+            // independent (issue #535) — a `/`-path needs a workspace root to reach
+            // this code at all, so this is not the (forward-only) workspace-root
+            // fallback; it is the case-leniency that now applies to backward
+            // directives too.
             Some(canonical) => {
-                if try_workspace_fallback
-                    && let Some(corrected) = resolve_single_ci_match(workspace_root, &canonical)
-                {
+                if let Some(corrected) = resolve_single_ci_match(workspace_root, &canonical) {
                     ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs))
                 } else {
                     // Return the lexical path for missing-file diagnostics.
@@ -464,11 +504,14 @@ fn resolve_path_rich(
         }
     }
 
-    // Step 3: file-relative single-case-insensitive-match (forward only),
-    // scanned beneath the trusted prefix that contains the candidate (handles
-    // `../`-relative paths that stay inside the workspace).
-    if try_workspace_fallback
-        && let Some(prefix) = scan_prefix
+    // Step 3: file-relative single-case-insensitive-match, scanned beneath the
+    // trusted prefix that contains the candidate (handles `../`-relative paths
+    // that stay inside the workspace). Direction independent (issue #535): both
+    // forward source()/directives and backward directives get this leniency. It
+    // is NOT the workspace-root fallback — `scan_prefix` is the file's own `base`
+    // (or the workspace root only as the case-correction *prefix* for a `../`
+    // path), never an alternate resolution base.
+    if let Some(prefix) = scan_prefix
         && let Some(corrected) = resolve_single_ci_match(prefix, &canonical)
     {
         return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
@@ -958,17 +1001,7 @@ mod tests {
 
     // ---- Issue #530: case-only source() path mismatch ----
 
-    /// True when the host filesystem distinguishes entries by case (Linux/CI).
-    /// Used to gate assertions that can only be constructed on a case-sensitive
-    /// filesystem (two entries differing only by case cannot coexist on a
-    /// case-insensitive one).
-    fn host_is_case_sensitive() -> bool {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("caseprobe"), "").unwrap();
-        // If the upper-cased name does NOT resolve to the same file, the FS is
-        // case-sensitive.
-        !dir.path().join("CASEPROBE").exists()
-    }
+    use crate::test_utils::host_is_case_sensitive;
 
     #[test]
     fn real_entry_name_unique_returns_exact_match() {
@@ -1093,13 +1126,11 @@ mod tests {
     }
 
     #[test]
-    fn backward_resolution_stays_exact_only_on_case_sensitive_fs() {
-        // Backward directives (try_workspace_fallback = false) keep exact-only
-        // resolution: on a case-sensitive FS a wrong-case path stays unresolved
-        // (lexical), gaining no single-ci-match leniency and no CaseSensitiveFs
-        // signal. (On a case-insensitive FS the step-1 case-correction can report
-        // CaseInsensitiveFs, but the public `resolve_path` wrapper discards it —
-        // hence this is gated to a case-sensitive host.)
+    fn backward_resolution_resolves_single_ci_match_on_case_sensitive_fs() {
+        // Issue #535: backward directives (try_workspace_fallback = false) now gain
+        // the single-case-insensitive-match leniency on a case-sensitive FS — a
+        // wrong-cased `parent.r` resolves to the real on-disk `Parent.R` and carries
+        // the CaseSensitiveFs signal — WITHOUT gaining the workspace-root fallback.
         if !host_is_case_sensitive() {
             return;
         }
@@ -1110,9 +1141,123 @@ mod tests {
             Some(dir.path().to_str().unwrap()),
         );
         let outcome = resolve_path_rich("parent.r", &ctx, false);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
+        assert_eq!(
+            outcome.case_mismatch,
+            Some(CaseMismatchRegime::CaseSensitiveFs)
+        );
+    }
+
+    #[test]
+    fn backward_resolution_does_not_gain_workspace_root_fallback() {
+        // Issue #535 decouples case-leniency from the workspace-root fallback. The
+        // fallback must stay forward-only: a backward path that exists ONLY at the
+        // workspace root (not relative to the file's directory) must NOT resolve.
+        let dir = tempfile::tempdir().unwrap();
+        // Real file lives at <ws>/parent.R; the child is in <ws>/sub, so the path
+        // "parent.R" resolves (file-relative) to <ws>/sub/parent.R, which is absent.
+        std::fs::write(dir.path().join("parent.R"), "").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let ctx = make_context(
+            dir.path().join("sub").join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        // Backward (false): no workspace-root fallback → stays unresolved (lexical).
+        let backward = resolve_path_rich("parent.R", &ctx, false);
+        assert_eq!(backward.path, Some(dir.path().join("sub").join("parent.R")));
+        assert_eq!(backward.case_mismatch, None);
+        // Forward (true): workspace-root fallback resolves it at <ws>/parent.R.
+        let forward = resolve_path_rich("parent.R", &ctx, true);
+        assert_eq!(forward.path, Some(dir.path().join("parent.R")));
+    }
+
+    #[test]
+    fn backward_resolution_leaves_ambiguous_match_unresolved() {
+        // 2+ case-insensitive matches and no exact → stays lexical/unresolved for
+        // backward too (no silent pick), mirroring the forward rule.
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parent.R"), "").unwrap();
+        std::fs::write(dir.path().join("parent.r"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_path_rich("Parent.R", &ctx, false);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
         assert_eq!(outcome.case_mismatch, None);
-        // Lexical path returned unchanged (the real Parent.R is NOT substituted).
-        assert_eq!(outcome.path, Some(dir.path().join("parent.r")));
+    }
+
+    #[test]
+    fn resolve_backward_path_rich_flags_case_only_mismatch() {
+        // The public backward rich resolver carries the case-mismatch signal (the
+        // bare `resolve_path` still discards it). Host-derived regime, mirroring
+        // `resolve_source_path_rich_flags_case_only_mismatch`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_backward_path_rich("parent.r", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
+        let expected = if host_is_case_sensitive() {
+            CaseMismatchRegime::CaseSensitiveFs
+        } else {
+            CaseMismatchRegime::CaseInsensitiveFs
+        };
+        assert_eq!(outcome.case_mismatch, Some(expected));
+    }
+
+    #[test]
+    fn resolve_backward_path_rich_no_mismatch_on_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_backward_path_rich("Parent.R", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
+        assert_eq!(outcome.case_mismatch, None);
+    }
+
+    #[test]
+    fn resolve_backward_path_rich_missing_file_no_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_backward_path_rich("ghost.R", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("ghost.R")));
+        assert_eq!(outcome.case_mismatch, None);
+    }
+
+    #[test]
+    fn resolve_backward_path_rich_handles_parent_relative_case_mismatch() {
+        // `# raven: sourced-by ../main.r` from <ws>/R/child.R where the real file is
+        // <ws>/main.R: the candidate escapes `base` (<ws>/R) but stays in the
+        // workspace, so case-correction uses the workspace-root *prefix*
+        // (`case_scan_prefix`) — which is NOT the workspace-root *fallback*. Must
+        // resolve for backward too, in both FS regimes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.R"), "").unwrap();
+        std::fs::create_dir(dir.path().join("R")).unwrap();
+        let ctx = make_context(
+            dir.path().join("R").join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_backward_path_rich("../main.r", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("main.R")));
+        let expected = if host_is_case_sensitive() {
+            CaseMismatchRegime::CaseSensitiveFs
+        } else {
+            CaseMismatchRegime::CaseInsensitiveFs
+        };
+        assert_eq!(outcome.case_mismatch, Some(expected));
     }
 
     #[test]
