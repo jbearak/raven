@@ -4775,6 +4775,7 @@ pub async fn diagnostics_async_standalone(
     directive_meta: &crate::cross_file::CrossFileMetadata,
     workspace_folders: Option<&Url>,
     missing_file_severity: Option<DiagnosticSeverity>,
+    case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = sync_diagnostics;
 
@@ -4802,6 +4803,17 @@ pub async fn diagnostics_async_standalone(
         .await;
         diagnostics.extend(missing_file_diags);
     }
+
+    // Case-mismatch diagnostics (issue #530) are emitted here — the single
+    // authoritative phase — and gated by their OWN severity policy, OUTSIDE the
+    // `missing_file_severity` block, so `missingFileSeverity = "off"` does not
+    // silence them.
+    diagnostics.extend(collect_case_mismatch_diagnostics_standalone(
+        uri,
+        directive_meta,
+        workspace_folders,
+        case_mismatch_severity,
+    ));
 
     diagnostics
 }
@@ -5016,6 +5028,96 @@ async fn collect_missing_file_diagnostics_standalone(
     diagnostics
 }
 
+/// Collect `source-path-case-mismatch` diagnostics (issue #530) for forward
+/// `source()` calls and forward directives whose path resolves only via a
+/// case-only difference from the real on-disk filename.
+///
+/// This is a **dedicated** collector, separate from the missing-file collectors
+/// and gated by its own `caseMismatchSeverity` rather than `missingFileSeverity`,
+/// so turning off missing-file diagnostics does not silence it. It runs in the
+/// standalone phase ([`diagnostics_async_standalone`]) — the single phase that
+/// owns the authoritative cross-file path diagnostics for both the LSP and
+/// `raven check` — so the diagnostic is emitted exactly once (the snapshot
+/// collector does not emit it).
+///
+/// `system.file()` sources are skipped (a non-goal — and a branch-1 self-package
+/// `/inst/...` entry is NOT `exempt_from_missing_file_diagnostics`, so it must be
+/// excluded explicitly). Backward directives are not considered: the resolution
+/// leniency that surfaces a case mismatch is forward-only.
+fn collect_case_mismatch_diagnostics_standalone(
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_folders: Option<&Url>,
+    severity_policy: crate::cross_file::CaseMismatchSeverity,
+) -> Vec<Diagnostic> {
+    use crate::cross_file::path_resolve::CaseMismatchRegime;
+
+    let mut diagnostics = Vec::new();
+    let Some(ctx) =
+        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_folders)
+    else {
+        return diagnostics;
+    };
+
+    for source in &meta.sources {
+        // `system.file()` sources are out of scope (non-goal). Skip them all —
+        // including branch-1 self-package entries, which are not exempt.
+        if source.system_file.is_some() || source.exempt_from_missing_file_diagnostics() {
+            continue;
+        }
+        let outcome = crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, &ctx);
+        let Some(regime) = outcome.case_mismatch else {
+            continue;
+        };
+        let Some(severity) = severity_policy.resolve(regime) else {
+            continue;
+        };
+        let real_name = outcome
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let message = match regime {
+            CaseMismatchRegime::CaseInsensitiveFs => format!(
+                "Case mismatch: '{}' resolves to '{}' on this filesystem, but \
+                 will not be found on a case-sensitive filesystem (e.g. Linux CI).",
+                source.path, real_name
+            ),
+            CaseMismatchRegime::CaseSensitiveFs => format!(
+                "Case mismatch: '{}' not found; using the case-insensitive match \
+                 '{}'. R errors here on this case-sensitive filesystem — fix the \
+                 path casing.",
+                source.path, real_name
+            ),
+        };
+        // Use the same forward-source range construction as the standalone
+        // missing-file diagnostic (handlers.rs ~5002): start at the path's
+        // line/column, extend by the byte length plus a small pad. Forward
+        // directives also live in `meta.sources` and use this same form.
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(source.line, source.column),
+                end: Position::new(
+                    source.line,
+                    source
+                        .column
+                        .saturating_add(source.path.len() as u32)
+                        .saturating_add(10),
+                ),
+            },
+            severity: Some(severity),
+            message,
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+
+    diagnostics
+}
+
 /// Public test wrapper for `collect_missing_file_diagnostics_standalone`.
 ///
 /// This function is exposed for property-based testing of missing file diagnostics
@@ -5031,6 +5133,105 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
 ) -> Vec<Diagnostic> {
     collect_missing_file_diagnostics_standalone(uri, meta, workspace_folders, missing_file_severity)
         .await
+}
+
+#[cfg(test)]
+mod case_mismatch_collector_tests {
+    use super::*;
+    use crate::cross_file::CaseMismatchSeverity;
+
+    #[test]
+    fn emits_one_case_mismatch_independent_of_missing_file_severity() {
+        // main.R sources "scripts/templates.r"; the real file is templates.R.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "x <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        std::fs::write(&main, "source(\"scripts/templates.r\")\n").unwrap();
+
+        let meta = crate::cross_file::extract_metadata("source(\"scripts/templates.r\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+
+        // The collector takes ONLY its own severity policy — it does not receive
+        // missing_file_severity, so it cannot be silenced by it.
+        let diags = collect_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly one case-mismatch diagnostic: {diags:?}"
+        );
+        let d = &diags[0];
+        assert!(crate::diagnostic_code::diagnostic_has_code(
+            &d.code,
+            crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH
+        ));
+        // Anchored on the source() line (line 0).
+        assert_eq!(d.range.start.line, 0);
+        assert!(d.message.contains("templates.r") && d.message.contains("templates.R"));
+        // The diagnostic names the real on-disk file.
+    }
+
+    #[test]
+    fn off_policy_suppresses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "x <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        let meta = crate::cross_file::extract_metadata("source(\"scripts/templates.r\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Off,
+        );
+        assert!(diags.is_empty(), "Off policy emits nothing: {diags:?}");
+    }
+
+    #[test]
+    fn exact_case_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "x <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        let meta = crate::cross_file::extract_metadata("source(\"scripts/templates.R\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert!(diags.is_empty(), "exact case is not a mismatch: {diags:?}");
+    }
+
+    #[test]
+    fn missing_file_emits_no_case_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        let main = dir.path().join("main.R");
+        let meta = crate::cross_file::extract_metadata("source(\"scripts/ghost.R\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+        let diags = collect_case_mismatch_diagnostics_standalone(
+            &uri,
+            &meta,
+            Some(&ws),
+            CaseMismatchSeverity::Auto,
+        );
+        assert!(
+            diags.is_empty(),
+            "missing file is unresolved-source-path, not case-mismatch: {diags:?}"
+        );
+    }
 }
 
 /// Emit diagnostics for forward directives with invalid `line=0` parameter.

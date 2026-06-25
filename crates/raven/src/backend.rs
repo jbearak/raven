@@ -289,6 +289,12 @@ pub(crate) fn parse_cross_file_config(
             config.missing_file_severity = parse_severity(sev);
         }
         if let Some(sev) = cross_file
+            .get("caseMismatchSeverity")
+            .and_then(|v| v.as_str())
+        {
+            config.case_mismatch_severity = parse_case_mismatch_severity(sev);
+        }
+        if let Some(sev) = cross_file
             .get("circularDependencySeverity")
             .and_then(|v| v.as_str())
         {
@@ -503,6 +509,7 @@ pub(crate) fn parse_cross_file_config(
         config.undefined_variable_severity
     );
     log::info!("    missing_file: {:?}", config.missing_file_severity);
+    log::info!("    case_mismatch: {:?}", config.case_mismatch_severity);
     log::info!(
         "    circular_dependency: {:?}",
         config.circular_dependency_severity
@@ -949,6 +956,59 @@ pub(crate) fn parse_severity(s: &str) -> Option<DiagnosticSeverity> {
         "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
         "hint" => Some(DiagnosticSeverity::HINT),
         _ => Some(DiagnosticSeverity::WARNING),
+    }
+}
+
+/// Parse the `crossFile.caseMismatchSeverity` setting (issue #530). Unlike the
+/// plain severities, this carries an `"auto"` sentinel (the host-derived
+/// default) distinct from a pinned level and from `"off"`. An unrecognised
+/// value falls back to `Auto`.
+pub(crate) fn parse_case_mismatch_severity(s: &str) -> crate::cross_file::CaseMismatchSeverity {
+    use crate::cross_file::CaseMismatchSeverity;
+    match s.to_lowercase().as_str() {
+        "auto" => CaseMismatchSeverity::Auto,
+        "off" => CaseMismatchSeverity::Off,
+        "error" => CaseMismatchSeverity::Fixed(DiagnosticSeverity::ERROR),
+        "warning" => CaseMismatchSeverity::Fixed(DiagnosticSeverity::WARNING),
+        "information" | "info" => CaseMismatchSeverity::Fixed(DiagnosticSeverity::INFORMATION),
+        "hint" => CaseMismatchSeverity::Fixed(DiagnosticSeverity::HINT),
+        _ => CaseMismatchSeverity::Auto,
+    }
+}
+
+#[cfg(test)]
+mod case_mismatch_severity_parse_tests {
+    use super::parse_case_mismatch_severity;
+    use crate::cross_file::CaseMismatchSeverity;
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    #[test]
+    fn parses_auto_off_and_pinned_levels() {
+        assert_eq!(
+            parse_case_mismatch_severity("auto"),
+            CaseMismatchSeverity::Auto
+        );
+        assert_eq!(
+            parse_case_mismatch_severity("off"),
+            CaseMismatchSeverity::Off
+        );
+        assert_eq!(
+            parse_case_mismatch_severity("warning"),
+            CaseMismatchSeverity::Fixed(DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(
+            parse_case_mismatch_severity("ERROR"),
+            CaseMismatchSeverity::Fixed(DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            parse_case_mismatch_severity("info"),
+            CaseMismatchSeverity::Fixed(DiagnosticSeverity::INFORMATION)
+        );
+        // Unrecognised → Auto (host-derived default), not a surprising level.
+        assert_eq!(
+            parse_case_mismatch_severity("bogus"),
+            CaseMismatchSeverity::Auto
+        );
     }
 }
 
@@ -2542,6 +2602,7 @@ async fn run_debounced_diagnostics(
         &snapshot.directive_meta,
         workspace_folder.as_ref(),
         missing_file_severity,
+        snapshot.cross_file_config.case_mismatch_severity,
     )
     .await;
 
@@ -8270,6 +8331,7 @@ pub(crate) async fn publish_diagnostics_inner(
         directive_meta,
         workspace_folder,
         missing_file_severity,
+        case_mismatch_severity,
     ) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
@@ -8325,6 +8387,7 @@ pub(crate) async fn publish_diagnostics_inner(
 
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
+        let case_mismatch_severity = state.cross_file_config.case_mismatch_severity;
 
         (
             version,
@@ -8333,6 +8396,7 @@ pub(crate) async fn publish_diagnostics_inner(
             directive_meta,
             workspace_folder,
             missing_file_severity,
+            case_mismatch_severity,
         )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
@@ -8366,6 +8430,7 @@ pub(crate) async fn publish_diagnostics_inner(
             &directive_meta,
             workspace_folder.as_ref(),
             missing_file_severity,
+            case_mismatch_severity,
         )
         .await
     } else {
@@ -15747,6 +15812,7 @@ lineLength = 200
             &directive_meta,
             workspace_folder.as_ref(),
             missing_file_severity,
+            crate::cross_file::CaseMismatchSeverity::Auto,
         )
         .await;
 

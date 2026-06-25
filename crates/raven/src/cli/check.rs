@@ -1092,6 +1092,7 @@ fn compute_file_diagnostics_sync(
     Vec<Diagnostic>,
     crate::cross_file::CrossFileMetadata,
     Option<DiagnosticSeverity>,
+    crate::cross_file::CaseMismatchSeverity,
 )> {
     let snapshot = crate::handlers::DiagnosticsSnapshot::build_with_open_documents(
         state,
@@ -1101,7 +1102,13 @@ fn compute_file_diagnostics_sync(
     let cancel = crate::handlers::DiagCancelToken::never();
     let sync_diags = crate::handlers::diagnostics_from_snapshot(&snapshot, uri, &cancel)?;
     let missing_file_severity = snapshot.cross_file_config.missing_file_severity;
-    Some((sync_diags, snapshot.directive_meta, missing_file_severity))
+    let case_mismatch_severity = snapshot.cross_file_config.case_mismatch_severity;
+    Some((
+        sync_diags,
+        snapshot.directive_meta,
+        missing_file_severity,
+        case_mismatch_severity,
+    ))
 }
 
 /// The async half: replace the snapshot's cache-based missing-file checks with
@@ -1112,6 +1119,7 @@ async fn finalize_file_diagnostics(
     sync_diags: Vec<Diagnostic>,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     missing_file_severity: Option<DiagnosticSeverity>,
+    case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
 ) -> Vec<Diagnostic> {
     crate::handlers::diagnostics_async_standalone(
         uri,
@@ -1119,12 +1127,13 @@ async fn finalize_file_diagnostics(
         directive_meta,
         state.workspace_folders.first(),
         missing_file_severity,
+        case_mismatch_severity,
     )
     .await
 }
 
 async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -> Vec<Diagnostic> {
-    let Some((sync_diags, directive_meta, missing_file_severity)) =
+    let Some((sync_diags, directive_meta, missing_file_severity, case_mismatch_severity)) =
         compute_file_diagnostics_sync(state, uri, &state.documents)
     else {
         return Vec::new();
@@ -1135,6 +1144,7 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
         sync_diags,
         &directive_meta,
         missing_file_severity,
+        case_mismatch_severity,
     )
     .await
 }
@@ -1186,6 +1196,7 @@ async fn collect_target_diagnostics(
         sync_diags: Vec<Diagnostic>,
         directive_meta: crate::cross_file::CrossFileMetadata,
         missing_file_severity: Option<DiagnosticSeverity>,
+        case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
         loaded_packages: Vec<String>,
     }
 
@@ -1206,7 +1217,7 @@ async fn collect_target_diagnostics(
             let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
             let mut open_documents = std::collections::HashMap::new();
             open_documents.insert(uri.clone(), doc);
-            let (sync_diags, directive_meta, missing_file_severity) =
+            let (sync_diags, directive_meta, missing_file_severity, case_mismatch_severity) =
                 compute_file_diagnostics_sync(state, &uri, &open_documents)?;
             Some(SyncResult {
                 path: path.clone(),
@@ -1214,6 +1225,7 @@ async fn collect_target_diagnostics(
                 sync_diags,
                 directive_meta,
                 missing_file_severity,
+                case_mismatch_severity,
                 loaded_packages,
             })
         })
@@ -1230,6 +1242,7 @@ async fn collect_target_diagnostics(
             r.sync_diags,
             &r.directive_meta,
             r.missing_file_severity,
+            r.case_mismatch_severity,
         )
         .await;
         for d in diags {
@@ -2200,21 +2213,48 @@ mod tests {
                 .map(|(_, d)| d.message.clone())
                 .collect::<Vec<_>>()
         );
+        // Issue #530: the case-only mismatch now also surfaces a single
+        // information-level `source-path-case-mismatch` at the source() call —
+        // the portability signal that this breaks on a case-sensitive FS.
+        let case_diags: Vec<_> = diags
+            .iter()
+            .filter(|(_, d)| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH,
+                )
+            })
+            .collect();
+        assert_eq!(
+            case_diags.len(),
+            1,
+            "exactly one source-path-case-mismatch on a case-insensitive FS (issue #530): {:?}",
+            case_diags
+        );
+        assert_eq!(
+            case_diags[0].1.severity,
+            Some(DiagnosticSeverity::INFORMATION),
+            "case-insensitive FS regime is information severity under the default `auto` policy"
+        );
     }
 
-    /// Issue #476 (bug B, converse): case-correction must NOT invent a resolution.
-    /// On a case-SENSITIVE filesystem, `source("child.r")` when only `child.R`
-    /// exists is a genuine missing file, so `helper` stays undefined. (The
-    /// `canonical.exists()` guard means `canonicalize_case_below` never runs here.)
+    /// Issue #530: on a case-SENSITIVE filesystem, `source("child.r")` when only
+    /// `child.R` exists now RESOLVES the file into the graph (so `helper` is
+    /// defined — no cascade of false undefined-variable warnings) and emits a
+    /// single warning-level `source-path-case-mismatch` at the source() call.
+    /// This deliberately overturns the earlier #476 "stays undefined" behavior:
+    /// the cascade that dropped the file was exactly the bug #530 fixes. The
+    /// converse (a genuine typo with no case-insensitive match, or an ambiguous
+    /// 2+-match) still stays unresolved — covered by the resolver unit tests.
     /// Gated to case-sensitive filesystems; a no-op on macOS/Windows where the
-    /// previous test covers the fold.
+    /// case-insensitive test above covers the information-level variant.
     #[test]
-    fn case_mismatched_source_stays_undefined_on_case_sensitive_fs_476() {
+    fn case_mismatched_source_resolves_with_warning_on_case_sensitive_fs_530() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("child.R"), "helper <- function() 1\n").unwrap();
         let case_insensitive = std::fs::metadata(tmp.path().join("child.r")).is_ok();
         if case_insensitive {
-            return; // case-insensitive FS: child.r aliases child.R — covered elsewhere.
+            return; // case-insensitive FS: child.r aliases child.R — covered above.
         }
         fs::write(tmp.path().join("main.r"), "source(\"child.r\")\nhelper()\n").unwrap();
 
@@ -2222,16 +2262,35 @@ mod tests {
         args.paths = vec![tmp.path().join("main.r")];
         let diags = collect_diagnostics_blocking(&args);
         assert!(
-            diags
+            !diags
                 .iter()
                 .any(|(_, d)| d.message == "helper is not defined"),
-            "on a case-sensitive FS, source(\"child.r\") (only child.R exists) must NOT \
-             resolve — case-correction only ever maps to a real on-disk entry. \
-             Diagnostics: {:?}",
+            "issue #530: a single case-only match must resolve into the graph on a \
+             case-sensitive FS — no undefined-variable cascade. Diagnostics: {:?}",
             diags
                 .iter()
                 .map(|(_, d)| d.message.clone())
                 .collect::<Vec<_>>()
+        );
+        let case_diags: Vec<_> = diags
+            .iter()
+            .filter(|(_, d)| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH,
+                )
+            })
+            .collect();
+        assert_eq!(
+            case_diags.len(),
+            1,
+            "exactly one source-path-case-mismatch on a case-sensitive FS (issue #530): {:?}",
+            case_diags
+        );
+        assert_eq!(
+            case_diags[0].1.severity,
+            Some(DiagnosticSeverity::WARNING),
+            "case-sensitive FS regime is warning severity under the default `auto` policy"
         );
     }
 

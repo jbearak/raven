@@ -223,10 +223,54 @@ impl PathContext {
     }
 }
 
+/// Which filesystem regime produced a case-only path mismatch (issue #530).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseMismatchRegime {
+    /// The typed path resolved only because the host filesystem folds case
+    /// (macOS, typical Windows). R runs fine here, but the path will not be
+    /// found on a case-sensitive filesystem (e.g. Linux CI). Information-level.
+    CaseInsensitiveFs,
+    /// The typed path did not exist; resolution found exactly one
+    /// case-insensitive match on a case-sensitive filesystem, where R itself
+    /// would error at `source()` time. Warning-level.
+    CaseSensitiveFs,
+}
+
+/// Outcome of forward path resolution: the resolved (case-corrected) path, plus
+/// a case-only-mismatch signal set when the path resolved via a case difference
+/// rather than an exact match. The `case_mismatch` field is always `None` for
+/// backward resolution (`try_workspace_fallback = false`). See issue #530.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolveOutcome {
+    /// The resolved path, case-corrected to the real on-disk spelling. `Some`
+    /// for both a resolved file and an unresolved-but-normalizable path (the
+    /// latter so the caller can emit a missing-file diagnostic); `None` only on
+    /// normalization failure or a missing workspace root for a `/`-path.
+    pub path: Option<PathBuf>,
+    /// `Some` iff the path resolved to an existing file via a case-only
+    /// difference from the typed spelling.
+    pub case_mismatch: Option<CaseMismatchRegime>,
+}
+
+impl ResolveOutcome {
+    fn resolved(path: PathBuf, case_mismatch: Option<CaseMismatchRegime>) -> Self {
+        Self {
+            path: Some(path),
+            case_mismatch,
+        }
+    }
+    fn unresolved(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            case_mismatch: None,
+        }
+    }
+}
+
 /// Resolve a path string to an absolute path.
 /// Handles file-relative, workspace-relative, and absolute paths with working directory context.
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
-    resolve_path_impl(path, context, false)
+    resolve_path_rich(path, context, false).path
 }
 
 /// Resolve a path with workspace-root fallback for source() statements and forward directives.
@@ -244,40 +288,60 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
 /// Do NOT use for backward directives (`# raven: sourced-by`, `# raven: run-by`,
 /// `# raven: included-by`) which always resolve relative to the file's directory.
 pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -> Option<PathBuf> {
-    resolve_path_impl(path, context, true)
+    resolve_path_rich(path, context, true).path
 }
 
-/// Internal implementation of path resolution with optional workspace fallback
-fn resolve_path_impl(
+/// Forward-source resolution that also reports a case-only mismatch (issue
+/// #530). The `path` field is identical to
+/// [`resolve_path_with_workspace_fallback`]; `case_mismatch` is `Some` when the
+/// file resolved via a case difference. Use for the `source-path-case-mismatch`
+/// diagnostic. Forward only — backward directives never carry the signal.
+pub fn resolve_source_path_rich(path: &str, context: &PathContext) -> ResolveOutcome {
+    resolve_path_rich(path, context, true)
+}
+
+/// `Some(regime)` when `corrected` differs from `canonical` — i.e. the
+/// filesystem folded a wrong-case lookup so the on-disk spelling differs from
+/// the typed one (issue #530). Used for the exact-match (`exists()`) branches,
+/// where any spelling change means a case-insensitive filesystem.
+fn case_mismatch_if_corrected(
+    canonical: &Path,
+    corrected: &Path,
+    regime: CaseMismatchRegime,
+) -> Option<CaseMismatchRegime> {
+    (corrected != canonical).then_some(regime)
+}
+
+/// Internal core of path resolution. Returns the resolved/case-corrected path
+/// and a case-only-mismatch signal.
+///
+/// Ordering is exact-before-case-insensitive at every base (issue #530): a path
+/// that exists as typed (or via filesystem case-folding) always wins before the
+/// single-case-insensitive-match leniency is considered, and the workspace-root
+/// fallback retains its priority over the new leniency. The case-insensitive
+/// leniency (steps 3–4) is **forward-only** — gated on `try_workspace_fallback`,
+/// which is true only for `source()` calls and forward directives — so backward
+/// directives keep exact-only resolution and never gain a case mismatch.
+fn resolve_path_rich(
     path: &str,
     context: &PathContext,
     try_workspace_fallback: bool,
-) -> Option<PathBuf> {
+) -> ResolveOutcome {
     if path.is_empty() {
         log::trace!("Path resolution: empty path provided");
-        return None;
+        return ResolveOutcome::unresolved(None);
     }
 
-    let base_dir = context.effective_working_directory();
-    let working_dir = context.working_directory.as_ref();
+    let base = context.effective_working_directory();
 
-    log::trace!(
-        "Resolving path '{}' with base_dir='{}', working_dir={:?}, file_path='{}'",
-        path,
-        base_dir.display(),
-        working_dir.as_ref().map(|p| p.display().to_string()),
-        context.file_path.display()
-    );
-
-    // If path starts with /, it's explicitly workspace-root-relative
+    // If path starts with /, it's explicitly workspace-root-relative.
     if let Some(stripped) = path.strip_prefix('/') {
         let Some(workspace_root) = context.workspace_root.as_ref() else {
             log::warn!(
-                "Failed to resolve workspace-root-relative path '{}': no workspace root available, base_dir='{}'",
-                path,
-                base_dir.display()
+                "Failed to resolve workspace-root-relative path '{}': no workspace root available",
+                path
             );
-            return None;
+            return ResolveOutcome::unresolved(None);
         };
         let resolved = workspace_root.join(stripped);
         return match normalize_path(&resolved) {
@@ -286,89 +350,168 @@ fn resolve_path_impl(
             // filesystems (issue #476). This also covers a workspace-package
             // `system.file()` target, whose `/inst/...` path resolves here.
             Some(canonical) if canonical.exists() => {
-                Some(canonicalize_case_below(workspace_root, &canonical))
+                let corrected = canonicalize_case_below(workspace_root, &canonical);
+                let mismatch = case_mismatch_if_corrected(
+                    &canonical,
+                    &corrected,
+                    CaseMismatchRegime::CaseInsensitiveFs,
+                );
+                ResolveOutcome::resolved(corrected, mismatch)
             }
-            // Missing file: return the lexical path for missing-file diagnostics.
-            Some(canonical) => Some(canonical),
+            // Missing as typed: forward-only single-case-insensitive-match leniency.
+            Some(canonical) => {
+                if try_workspace_fallback
+                    && let Some(corrected) = resolve_single_ci_match(workspace_root, &canonical)
+                {
+                    ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs))
+                } else {
+                    // Return the lexical path for missing-file diagnostics.
+                    ResolveOutcome::unresolved(Some(canonical))
+                }
+            }
             None => {
                 log::warn!(
-                    "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
+                    "Failed to resolve path '{}': normalization failed, attempted_path='{}'",
                     path,
-                    resolved.display(),
-                    base_dir.display()
+                    resolved.display()
                 );
-                None
+                ResolveOutcome::unresolved(None)
             }
         };
     }
 
-    // Try file-relative or working-directory-relative path first.
-    // Reuse `base_dir` (already the effective working directory) as the trusted
-    // prefix for case-correction below.
-    let base = base_dir;
+    // Relative path. `base` (effective working directory) is the trusted prefix
+    // for case-correction below.
     let resolved = base.join(path);
-
-    if let Some(canonical) = normalize_path(&resolved) {
-        // Check if the file exists
-        if canonical.exists() {
-            // Correct component case to match the on-disk entry (issue #476) so
-            // the resulting URI equals the workspace index key on
-            // case-insensitive filesystems. `base` is the trusted prefix.
-            let canonical = canonicalize_case_below(&base, &canonical);
-            log::trace!(
-                "Resolved path '{}' to canonical path: '{}'",
-                path,
-                canonical.display()
-            );
-            return Some(canonical);
-        }
-
-        // File doesn't exist at the resolved path. Try the workspace-root
-        // fallback when it is enabled (forward source()/directives) AND no
-        // `# raven: cd` is in effect (explicit or inherited) AND a workspace root
-        // is available. `cd_in_effect` is the single definition of "a cd pins the
-        // working directory"; the callers that decide whether to PROPAGATE a
-        // working directory across a hop ([`PathContext::forward_child_inherited_wd`])
-        // use the same predicate, so a context that suppresses this fallback is
-        // exactly one that carried a cd forward.
-        if try_workspace_fallback
-            && !context.cd_in_effect()
-            && let Some(ref workspace_root) = context.workspace_root
-        {
-            let workspace_resolved = workspace_root.join(path);
-            if let Some(workspace_canonical) = normalize_path(&workspace_resolved)
-                && workspace_canonical.exists()
-            {
-                // Case-correct below the workspace-root prefix (issue #476).
-                let workspace_canonical =
-                    canonicalize_case_below(workspace_root, &workspace_canonical);
-                log::trace!(
-                    "Resolved path '{}' via workspace-root fallback: '{}' (file-relative '{}' did not exist)",
-                    path,
-                    workspace_canonical.display(),
-                    canonical.display()
-                );
-                return Some(workspace_canonical);
-            }
-        }
-
-        // Return the original resolved path even if file doesn't exist
-        // (caller may want to report diagnostics about missing file)
-        log::trace!(
-            "Resolved path '{}' to canonical path: '{}' (file may not exist)",
+    let Some(canonical) = normalize_path(&resolved) else {
+        log::warn!(
+            "Failed to resolve path '{}': normalization failed, attempted_path='{}'",
             path,
-            canonical.display()
+            resolved.display()
         );
-        return Some(canonical);
+        return ResolveOutcome::unresolved(None);
+    };
+
+    // Step 1: file-relative exact match (with #476 case-correction).
+    if canonical.exists() {
+        let corrected = canonicalize_case_below(&base, &canonical);
+        let mismatch = case_mismatch_if_corrected(
+            &canonical,
+            &corrected,
+            CaseMismatchRegime::CaseInsensitiveFs,
+        );
+        return ResolveOutcome::resolved(corrected, mismatch);
     }
 
-    log::warn!(
-        "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
-        path,
-        resolved.display(),
-        base.display()
-    );
-    None
+    // The workspace-root fallback applies only to forward source()/directives
+    // AND only when no `# raven: cd` is in effect (explicit or inherited) AND a
+    // workspace root is available. `cd_in_effect` is the single definition of "a
+    // cd pins the working directory"; the callers that decide whether to
+    // PROPAGATE a working directory across a hop
+    // ([`PathContext::forward_child_inherited_wd`]) use the same predicate.
+    let workspace_fallback_root = (try_workspace_fallback && !context.cd_in_effect())
+        .then_some(context.workspace_root.as_ref())
+        .flatten();
+
+    // Step 2: workspace-root fallback exact match.
+    if let Some(workspace_root) = workspace_fallback_root {
+        let workspace_resolved = workspace_root.join(path);
+        if let Some(workspace_canonical) = normalize_path(&workspace_resolved)
+            && workspace_canonical.exists()
+        {
+            let corrected = canonicalize_case_below(workspace_root, &workspace_canonical);
+            let mismatch = case_mismatch_if_corrected(
+                &workspace_canonical,
+                &corrected,
+                CaseMismatchRegime::CaseInsensitiveFs,
+            );
+            return ResolveOutcome::resolved(corrected, mismatch);
+        }
+    }
+
+    // Step 3: file-relative single-case-insensitive-match (forward only).
+    if try_workspace_fallback && let Some(corrected) = resolve_single_ci_match(&base, &canonical) {
+        return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
+    }
+
+    // Step 4: workspace-root fallback single-case-insensitive-match (forward only).
+    if let Some(workspace_root) = workspace_fallback_root {
+        let workspace_resolved = workspace_root.join(path);
+        if let Some(workspace_canonical) = normalize_path(&workspace_resolved)
+            && let Some(corrected) = resolve_single_ci_match(workspace_root, &workspace_canonical)
+        {
+            return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
+        }
+    }
+
+    // Unresolved: return the lexical path so callers can report a missing file.
+    ResolveOutcome::unresolved(Some(canonical))
+}
+
+/// Resolve a path that does not exist as typed to its real on-disk spelling,
+/// **only** when every component below `base` is either an exact entry or has
+/// **exactly one** case-insensitive match, and the resulting path exists. This
+/// is the case-sensitive-filesystem leniency for issue #530: it folds a
+/// single-case typo (`templates.r` → `templates.R`) but refuses an ambiguous
+/// match (both `templates.R` and `templates.r` present) so no arbitrary entry
+/// is silently chosen. Returns `None` when ambiguous, genuinely absent, or when
+/// nothing below `base` needed case-correction (a real typo).
+fn resolve_single_ci_match(base: &Path, full: &Path) -> Option<PathBuf> {
+    let corrected = canonicalize_case_below_unique(base, full)?;
+    // Only a *case* difference counts; an identical result that doesn't exist is
+    // a genuine missing file, not a case mismatch.
+    (corrected != full && corrected.exists()).then_some(corrected)
+}
+
+/// Like [`canonicalize_case_below`], but rejects ambiguity: each component below
+/// `base` must resolve to an exact entry or to exactly one case-insensitive
+/// match (via [`real_entry_name_unique`]). Returns `None` if any component has
+/// no match or 2+ case-insensitive matches. Issue #530.
+fn canonicalize_case_below_unique(base: &Path, full: &Path) -> Option<PathBuf> {
+    let suffix = full.strip_prefix(base).ok()?;
+    let mut result = base.to_path_buf();
+    for component in suffix.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                let real = real_entry_name_unique(&result, name)?;
+                result.push(real);
+            }
+            // Suffix is relative and normalized; non-Normal components are not
+            // expected, but pass them through defensively.
+            other => result.push(other.as_os_str()),
+        }
+    }
+    Some(result)
+}
+
+/// Return the real directory-entry name in `dir` matching `name`: an exact-case
+/// match if present, otherwise the unique case-insensitive match. Returns `None`
+/// if `dir` is unreadable, nothing matches, or **two or more** entries match
+/// case-insensitively (ambiguous — only possible on a case-sensitive
+/// filesystem). ASCII-only comparison, matching the rest of this module. Issue
+/// #530.
+fn real_entry_name_unique(dir: &Path, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut ci_match: Option<std::ffi::OsString> = None;
+    let mut ci_count = 0usize;
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        if entry_name == name {
+            // Exact match always wins, regardless of any case-insensitive ones.
+            return Some(entry_name);
+        }
+        if entry_name
+            .to_str()
+            .zip(name.to_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            ci_count += 1;
+            if ci_match.is_none() {
+                ci_match = Some(entry_name);
+            }
+        }
+    }
+    (ci_count == 1).then_some(ci_match).flatten()
 }
 
 /// Resolve a working directory path.
@@ -771,6 +914,176 @@ mod tests {
         let base = PathBuf::from("/some/base");
         let unrelated = PathBuf::from("/other/place/file.R");
         assert_eq!(canonicalize_case_below(&base, &unrelated), unrelated);
+    }
+
+    // ---- Issue #530: case-only source() path mismatch ----
+
+    /// True when the host filesystem distinguishes entries by case (Linux/CI).
+    /// Used to gate assertions that can only be constructed on a case-sensitive
+    /// filesystem (two entries differing only by case cannot coexist on a
+    /// case-insensitive one).
+    fn host_is_case_sensitive() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("caseprobe"), "").unwrap();
+        // If the upper-cased name does NOT resolve to the same file, the FS is
+        // case-sensitive.
+        !dir.path().join("CASEPROBE").exists()
+    }
+
+    #[test]
+    fn real_entry_name_unique_returns_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Templates.R"), "").unwrap();
+        let got = real_entry_name_unique(dir.path(), std::ffi::OsStr::new("Templates.R"));
+        assert_eq!(got.as_deref(), Some(std::ffi::OsStr::new("Templates.R")));
+    }
+
+    #[test]
+    fn real_entry_name_unique_folds_single_ci_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("templates.R"), "").unwrap();
+        let got = real_entry_name_unique(dir.path(), std::ffi::OsStr::new("templates.r"));
+        assert_eq!(got.as_deref(), Some(std::ffi::OsStr::new("templates.R")));
+    }
+
+    #[test]
+    fn real_entry_name_unique_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("other.R"), "").unwrap();
+        let got = real_entry_name_unique(dir.path(), std::ffi::OsStr::new("templates.r"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn real_entry_name_unique_none_when_ambiguous() {
+        // Two entries differing only by case can exist only on a case-sensitive
+        // FS; an inexact query that matches both must be rejected as ambiguous.
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("templates.R"), "").unwrap();
+        std::fs::write(dir.path().join("templates.r"), "").unwrap();
+        // An exact query still wins.
+        assert_eq!(
+            real_entry_name_unique(dir.path(), std::ffi::OsStr::new("templates.R")).as_deref(),
+            Some(std::ffi::OsStr::new("templates.R"))
+        );
+        // A third casing matches both case-insensitively → ambiguous → None.
+        assert_eq!(
+            real_entry_name_unique(dir.path(), std::ffi::OsStr::new("Templates.R")),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_source_path_rich_no_mismatch_on_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("main.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_source_path_rich("scripts/templates.R", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("scripts/templates.R")));
+        assert_eq!(outcome.case_mismatch, None);
+    }
+
+    #[test]
+    fn resolve_source_path_rich_flags_case_only_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("main.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_source_path_rich("scripts/templates.r", &ctx);
+        // Either FS resolves the file into the graph at its real on-disk spelling.
+        assert_eq!(outcome.path, Some(dir.path().join("scripts/templates.R")));
+        // The regime is host-derived: case-insensitive FS folded the lookup
+        // (INFO), case-sensitive FS resolved via the single-ci-match branch
+        // (WARNING).
+        let expected = if host_is_case_sensitive() {
+            CaseMismatchRegime::CaseSensitiveFs
+        } else {
+            CaseMismatchRegime::CaseInsensitiveFs
+        };
+        assert_eq!(outcome.case_mismatch, Some(expected));
+    }
+
+    #[test]
+    fn resolve_source_path_rich_missing_file_no_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        let ctx = make_context(
+            dir.path().join("main.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_source_path_rich("scripts/ghost.R", &ctx);
+        // A genuinely-missing file still returns a lexical path (for the
+        // unresolved-source-path diagnostic) but no case mismatch.
+        assert_eq!(outcome.path, Some(dir.path().join("scripts/ghost.R")));
+        assert_eq!(outcome.case_mismatch, None);
+    }
+
+    #[test]
+    fn backward_resolution_never_flags_or_resolves_case_mismatch() {
+        // Backward directives (try_workspace_fallback = false) keep exact-only
+        // resolution: on a case-sensitive FS a wrong-case path stays unresolved
+        // (lexical), gaining no leniency and no mismatch signal.
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_path_rich("parent.r", &ctx, false);
+        assert_eq!(outcome.case_mismatch, None);
+        // Lexical path returned unchanged (the real Parent.R is NOT substituted).
+        assert_eq!(outcome.path, Some(dir.path().join("parent.r")));
+    }
+
+    #[test]
+    fn forward_resolution_resolves_single_ci_match_on_case_sensitive_fs() {
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Parent.R"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_path_rich("parent.r", &ctx, true);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
+        assert_eq!(
+            outcome.case_mismatch,
+            Some(CaseMismatchRegime::CaseSensitiveFs)
+        );
+    }
+
+    #[test]
+    fn forward_resolution_leaves_ambiguous_match_unresolved() {
+        // 2+ case-insensitive matches and no exact → stays lexical/unresolved
+        // (no silent pick of an arbitrary one).
+        if !host_is_case_sensitive() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parent.R"), "").unwrap();
+        std::fs::write(dir.path().join("parent.r"), "").unwrap();
+        let ctx = make_context(
+            dir.path().join("child.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_path_rich("Parent.R", &ctx, true);
+        assert_eq!(outcome.path, Some(dir.path().join("Parent.R")));
+        assert_eq!(outcome.case_mismatch, None);
     }
 
     fn make_context(file: &str, workspace: Option<&str>) -> PathContext {
