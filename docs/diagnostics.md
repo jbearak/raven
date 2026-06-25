@@ -140,8 +140,9 @@ data.table's by-reference converters are also recognized: a statement-level `set
 
 Raven recognizes the special placeholders used by magrittr and dplyr so they are never flagged as undefined, while keeping them tightly scoped so genuine bugs still surface:
 
-- The magrittr dot `.` on the **right** of a `%>%` pipe (`df %>% nrow(.)`, `df %>% { .$x }`) is the piped value.
-- The **leading** `.` of a magrittr functional sequence (`f <- . %>% step1() %>% step2()`) is the anonymous function's formal.
+- The magrittr dot `.` on the **right** of a `%>%` or `%<>%` pipe (`df %>% nrow(.)`, `df %<>% { .$x }`) is the piped value.
+- The **leading** `.` of a magrittr functional sequence (`f <- . %>% step1() %>% step2()`) is the anonymous function's formal. (Only `%>%` builds functional sequences; `%<>%` cannot head one, since it assigns its result back to the left-hand side.)
+- The compound-assignment pipe `%<>%` (`x %<>% f()`, defined as `x <- x %>% f()`) feeds its left-hand side into the right-hand call's first argument exactly like `%>%`, so column arguments resolve identically — `df %<>% group_by(ring)` treats `ring` as a column, not an undefined variable.
 - `.` inside `dplyr::do(...)` (the current-group data frame) and inside the scoped-verb predicates `all_vars(...)` / `any_vars(...)` (the column under evaluation).
 - Every free identifier on the right of the exposition operator `lhs %$% rhs` (semantically `with(lhs, rhs)`), since `rhs` is evaluated in a data mask of `lhs` — e.g. `mtcars %$% cor(cyl, am)` resolves `cyl` and `am` as columns while still checking `mtcars`.
 - The native-pipe placeholder `_` on the right of a `|>` pipe (R 4.2+).
