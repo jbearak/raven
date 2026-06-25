@@ -309,7 +309,7 @@ Both `check` and `lint` share the same renderers:
 Diagnostics go to **stdout** for both commands. Beyond the diagnostics themselves, `raven check` may print a handful of **context notes** — short prose that explains *why* a result might be incomplete or how to act on it (`raven lint` prints none of these). They fall into two groups by *when* they appear:
 
 - **Startup notes** — printed once, *before* any diagnostics, to **stderr**. They report a degraded environment that affects the whole run.
-- **Footer notes** — printed once, *after* all diagnostics, as a footer. They annotate the findings above them. For `text` they go to **stdout** (the diagnostics' own stream); for `json` / `sarif` they go to **stderr** so they can't corrupt the machine document on stdout.
+- **Footer notes** — printed once, *after* all diagnostics, as a footer. They annotate the findings above them. For `text` they go to **stdout** (the diagnostics' own stream); for `json` / `sarif` they go to **stderr** so they can't corrupt the machine document on stdout. The footer is set off from the summary line by a blank line and introduced by a single `raven check:` header; the individual notes carry no per-line prefix and, when more than one fires, are separated by a blank line.
 
 Footer notes share the diagnostics' stream for `text` deliberately: stdout and stderr are independent streams that a merged consumer (a terminal, `2>&1`, or a CI log viewer such as GitHub Actions, which timestamps each line as it reads it) can reorder, which would interleave a multi-line note with the findings it describes. One stream keeps them grouped and in order — so a note never refers to another by position across streams.
 
@@ -317,11 +317,15 @@ Footer notes share the diagnostics' stream for `text` deliberately: stdout and s
 
 Each note below is printed only when its condition holds; a clean run on a fully-resolved workspace prints just the diagnostics and the summary line.
 
-**Startup notes (stderr, before diagnostics)** — one fires when R-backed package resolution is degraded, so undefined-variable findings for package symbols may be unreliable. The text names the cause and the consequence:
+**Startup notes (stderr, before diagnostics)** — one fires when R-backed package resolution is degraded **and** no offline package data is available to cover for it, so undefined-variable findings for package symbols may be unreliable. The text names the cause and the consequence.
 
-- R not found on `PATH` — `R not found on PATH; package and base-symbol diagnostics will be limited`. (Base R-platform symbols are still covered by the embedded database; broad CRAN/Bioconductor coverage needs `raven packages update`.)
-- R found but its package library failed to initialize — `R found but its package library failed to initialize (…); …`.
-- R found but no library paths were discovered — `R found but no library paths were discovered; …`.
+**The note is keyed on actual coverage, not merely on R's absence.** It is suppressed when offline package data loaded — an updated `names.db` (Tier 3) or a frozen `.raven/packages.json` (Tier 2) — because that data resolves package symbols without a live R library, so the warning would be a false alarm (and would tell a CI that *already ran* `raven packages update` to run it again). It fires only when coverage falls back to base R alone.
+
+All three variants share the same tail — ``package symbol resolution is limited to base R (covered by the embedded database). Run `raven packages update` for broad CRAN/Bioconductor coverage`` — because the limitation and its remedy are identical regardless of *why* the live R library was unavailable.
+
+- R not found on `PATH` — ``R not found on PATH; package symbol resolution is limited to base R (covered by the embedded database). Run `raven packages update` for broad CRAN/Bioconductor coverage``.
+- R found but its package library failed to initialize — ``R found but its package library failed to initialize (…); package symbol resolution is limited to base R (…). Run `raven packages update` …``.
+- R found but no library paths were discovered — ``R found but no library paths were discovered; package symbol resolution is limited to base R (…). Run `raven packages update` …``.
 
 **Footer notes (stdout for `text`, stderr for `json`/`sarif`, after diagnostics)**, in the order printed:
 
@@ -334,10 +338,10 @@ Each note below is printed only when its condition holds; a clean run on a fully
 
 When some undefined-variable findings sit inside call arguments that Raven cannot see into (a package function that *might* capture the argument via [non-standard evaluation](non-standard-evaluation.md)), the **`text`** report prints one footer after the findings — and **only** there. The footer is framed carefully so it never reads as Raven asserting the call *is* NSE: it leads with the universal false-positive escape hatches every linter has (`# raven: ignore`, `# nolint`, `# raven: expect`) and presents NSE as the *one R-specific* additional cause. It then lists the distinct, copy-pasteable per-function directives (one per function, however many findings it caused) and links [the directives reference](directives.md) and [handling false positives](diagnostics.md). The snippet is enough to apply without understanding the syntax; the links explain it — mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline.
 
-It reads (with concrete callees filled in):
+It reads (with concrete callees filled in), under the footer's shared `raven check:` header:
 
 ```
-raven check: 3 undefined-variable findings above sit inside calls to package functions
+3 undefined-variable findings above sit inside calls to package functions
 whose source raven can't see. If one is a false positive, you can suppress it as with any
 linter (`# raven: ignore`, `# nolint`, or `# raven: expect`).
 R has one extra cause: a function that captures an argument via non-standard

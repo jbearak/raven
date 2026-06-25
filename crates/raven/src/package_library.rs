@@ -2572,9 +2572,14 @@ impl PackageLibrary {
 /// failure text; this carries the structured verdict so callers don't parse strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShippedDbLoad {
-    /// No shipped `names.db` candidate exists on disk.
+    /// No usable shipped `names.db`: either no candidate exists on disk, or a
+    /// candidate opened successfully but is empty (zero packages). An empty DB
+    /// is treated as `Absent` rather than `Loaded` because it provides no
+    /// coverage — steering the missing-metadata advice toward `raven packages
+    /// update` (download a real DB), not `raven packages freeze`.
     Absent,
-    /// A shipped `names.db` was found and loaded successfully (provider wired).
+    /// A non-empty shipped `names.db` was found and loaded successfully (provider
+    /// wired). An empty DB does not reach this state — see `Absent`.
     Loaded,
     /// A shipped `names.db` file is present but failed to load — `Corrupt` or
     /// `UnsupportedFormat`. The detail is also recorded in `load_notes`.
@@ -2717,26 +2722,40 @@ pub async fn build_package_library(
         let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         // Tier 2 first (repo DB), then Tier 3 (shipped DB).
+        //
+        // A valid-but-empty DB (zero packages) resolves nothing, so it is NOT
+        // wired as a provider: `has_providers()` must mean "real package
+        // coverage exists" (the degraded-environment note in `cli::check` gates
+        // on it), and an empty provider would also cost futile lookups. An empty
+        // Tier-2 file is thus treated exactly like an absent one.
         if let Some(path) = repo_db_path {
             match crate::package_db::json_db::RepoDbProvider::from_file(&path) {
-                Ok(Some(p)) => providers.push(Box::new(p)),
-                Ok(None) => {}                       // Absent -> silent
+                Ok(Some(p)) if !p.is_empty() => providers.push(Box::new(p)),
+                Ok(_) => {}                          // Absent or empty -> silent
                 Err(e) => notes.push(e.to_string()), // explain-and-continue
             }
         }
         // Track the Tier 3 verdict alongside the provider: `Absent` until a
-        // candidate proves otherwise. A successful load wins and stops the scan;
-        // a failed candidate records `Failed` but keeps looking, so a later
-        // working candidate still upgrades the verdict to `Loaded`.
+        // candidate proves otherwise. A non-empty load wins, is wired, and stops
+        // the scan; a failed candidate records `Failed` but keeps looking, so a
+        // later working candidate still upgrades the verdict to `Loaded`.
+        //
+        // An empty DB (zero packages) is treated as no coverage: it is neither
+        // wired (see the Tier-2 note above) nor recorded as `Loaded`, and the
+        // scan continues to lower-precedence candidates. Leaving the verdict
+        // `Absent` is deliberate — the missing-export footer then points at
+        // `raven packages update` (download a real DB), the correct remedy,
+        // rather than the `Loaded` branch's "the package is likely private / not
+        // on CRAN", which would misdescribe an empty database.
         let mut shipped_db_load = ShippedDbLoad::Absent;
         for path in shipped_db_candidates {
             match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
-                Ok(Some(p)) => {
+                Ok(Some(p)) if !p.is_empty() => {
                     providers.push(Box::new(p));
                     shipped_db_load = ShippedDbLoad::Loaded;
                     break;
                 }
-                Ok(None) => {}
+                Ok(_) => {} // Absent (None) or empty -> not usable coverage; keep scanning
                 Err(e) => {
                     notes.push(format!("{}: {e}", path.display()));
                     shipped_db_load = ShippedDbLoad::Failed;

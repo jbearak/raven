@@ -284,6 +284,14 @@ impl ShippedDb {
     pub fn provenance(&self) -> &ShippedDbProvenance {
         &self.provenance
     }
+
+    /// True when the DB carries no package records. A successfully-opened but
+    /// empty DB resolves nothing, so callers gating on "real package coverage"
+    /// (e.g. the degraded-environment note in `cli::check`) must treat it as no
+    /// coverage rather than as a usable provider.
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
 }
 
 /// Tier 3 provider over an opened `ShippedDb`.
@@ -305,6 +313,11 @@ impl ShippedDbProvider {
             Err(ShippedDbError::Absent) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// True when the underlying DB carries no packages — see [`ShippedDb::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.db.is_empty()
     }
 }
 
