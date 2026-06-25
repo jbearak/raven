@@ -2236,6 +2236,10 @@ mod tests {
             Some(DiagnosticSeverity::INFORMATION),
             "case-insensitive FS regime is information severity under the default `auto` policy"
         );
+        assert_eq!(
+            case_diags[0].1.range.start.line, 0,
+            "diagnostic must be anchored at the source() call (line 0), not drift elsewhere"
+        );
     }
 
     /// Issue #530: on a case-SENSITIVE filesystem, `source("child.r")` when only
@@ -2291,6 +2295,10 @@ mod tests {
             case_diags[0].1.severity,
             Some(DiagnosticSeverity::WARNING),
             "case-sensitive FS regime is warning severity under the default `auto` policy"
+        );
+        assert_eq!(
+            case_diags[0].1.range.start.line, 0,
+            "diagnostic must be anchored at the source() call (line 0), not drift elsewhere"
         );
     }
 
