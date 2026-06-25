@@ -307,6 +307,25 @@ pub fn resolve_source_path_rich(path: &str, context: &PathContext) -> ResolveOut
     resolve_path_rich(path, context, true)
 }
 
+/// The trusted directory prefix to case-correct `canonical` beneath: the file's
+/// own `base` when the normalized candidate stays under it, otherwise the
+/// workspace root for a parent-relative path (`../foo`) that escapes `base` but
+/// still lands inside the workspace. Both are registered/trusted prefixes whose
+/// casing is taken verbatim (issue #476 keeps the registered workspace-folder
+/// spelling intact). Returns `None` only when the candidate escapes the
+/// workspace entirely, in which case no case-correction is attempted (the caller
+/// falls back to the base prefix, a no-op for an out-of-tree path). Issue #530.
+fn case_scan_prefix<'a>(
+    canonical: &Path,
+    base: &'a Path,
+    workspace_root: Option<&'a Path>,
+) -> Option<&'a Path> {
+    if canonical.starts_with(base) {
+        return Some(base);
+    }
+    workspace_root.filter(|root| canonical.starts_with(root))
+}
+
 /// `Some(regime)` when `corrected` differs from `canonical` — i.e. the
 /// filesystem folded a wrong-case lookup so the on-disk spelling differs from
 /// the typed one (issue #530). Used for the exact-match (`exists()`) branches,
@@ -402,9 +421,15 @@ fn resolve_path_rich(
         return ResolveOutcome::unresolved(None);
     };
 
+    // The trusted prefix to case-correct beneath: the file's `base` for an
+    // ordinary relative path, or the workspace root for a `../`-relative path
+    // that normalizes above `base` but still lands inside the workspace. Both
+    // are registered/trusted prefixes taken verbatim (issue #476).
+    let scan_prefix = case_scan_prefix(&canonical, &base, context.workspace_root.as_deref());
+
     // Step 1: file-relative exact match (with #476 case-correction).
     if canonical.exists() {
-        let corrected = canonicalize_case_below(&base, &canonical);
+        let corrected = canonicalize_case_below(scan_prefix.unwrap_or(&base), &canonical);
         let mismatch = case_mismatch_if_corrected(
             &canonical,
             &corrected,
@@ -439,8 +464,13 @@ fn resolve_path_rich(
         }
     }
 
-    // Step 3: file-relative single-case-insensitive-match (forward only).
-    if try_workspace_fallback && let Some(corrected) = resolve_single_ci_match(&base, &canonical) {
+    // Step 3: file-relative single-case-insensitive-match (forward only),
+    // scanned beneath the trusted prefix that contains the candidate (handles
+    // `../`-relative paths that stay inside the workspace).
+    if try_workspace_fallback
+        && let Some(prefix) = scan_prefix
+        && let Some(corrected) = resolve_single_ci_match(prefix, &canonical)
+    {
         return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
     }
 
@@ -1036,6 +1066,30 @@ mod tests {
         // unresolved-source-path diagnostic) but no case mismatch.
         assert_eq!(outcome.path, Some(dir.path().join("scripts/ghost.R")));
         assert_eq!(outcome.case_mismatch, None);
+    }
+
+    #[test]
+    fn resolve_source_path_rich_handles_parent_relative_case_mismatch() {
+        // `source("../child.r")` from <ws>/R/main.R where the real file is
+        // <ws>/child.R: the normalized candidate escapes `base` (<ws>/R) but
+        // stays inside the workspace, so case-correction must fall back to the
+        // workspace root as its trusted prefix. The cascade fix (and the
+        // diagnostic) must reach `../` paths too, in both FS regimes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.R"), "").unwrap();
+        std::fs::create_dir(dir.path().join("R")).unwrap();
+        let ctx = make_context(
+            dir.path().join("R").join("main.R").to_str().unwrap(),
+            Some(dir.path().to_str().unwrap()),
+        );
+        let outcome = resolve_source_path_rich("../child.r", &ctx);
+        assert_eq!(outcome.path, Some(dir.path().join("child.R")));
+        let expected = if host_is_case_sensitive() {
+            CaseMismatchRegime::CaseSensitiveFs
+        } else {
+            CaseMismatchRegime::CaseInsensitiveFs
+        };
+        assert_eq!(outcome.case_mismatch, Some(expected));
     }
 
     #[test]
