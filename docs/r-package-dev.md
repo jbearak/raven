@@ -429,11 +429,21 @@ search path when your package loads, making their exports available
 unqualified. Version constraints (`pkg (>= 1.0)`) and the special `R`
 entry are ignored. `Imports:` is deliberately *not* folded in — an
 `Imports:`-only package is loaded but not attached, so it still requires
-`pkg::fn` or an explicit `importFrom`/`@importFrom`, matching R. (One
-narrow case is not yet modeled: a *meta-package* in `Depends:` such as
-`Depends: tidyverse` resolves the meta-package's own exports but does not
-expand to member packages' NSE argument policies — the same limitation
-that `import(tidyverse)` has today. Concrete packages are unaffected.)
+`pkg::fn` or an explicit `importFrom`/`@importFrom`, matching R.
+
+A meta-package in `Depends:` also expands to its members for
+non-standard-evaluation. `Depends: tidyverse` contributes dplyr, tidyr,
+ggplot2, … to the set of packages whose NSE argument policies are in
+play, so a data-masking verb like `filter(x > 5)` in your `R/` code does
+not flag the masked column `x`. This expansion is built in and does not
+depend on the member packages being installed, so it holds in CI without
+R. This applies to `Depends:` (and `library()`/`require()` attaches)
+because those *attach* the meta-package — putting its members on the
+search path. A NAMESPACE `import(tidyverse)` / `@import tidyverse` does
+**not** get this expansion: an `import()` is a selective namespace import,
+not an attach, so it does not bring the members' exports into scope (a
+bare member verb there is still resolved only if the member is genuinely
+re-exported and known to Raven's package database).
 
 ### data.table `[` detection in package mode
 

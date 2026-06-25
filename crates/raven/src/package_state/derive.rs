@@ -170,9 +170,17 @@ fn build_scope_contribution(
     // never self-depends, but a malformed one mid-edit could, and self-name in
     // `full_imports` would query a possibly-stale installed package of the same
     // name.
+    //
+    // The same names are also collected into `depends_attached_packages` (a
+    // subset of `full_imports`) so the NSE meta-package expansion can treat
+    // `Depends:` as an attach WITHOUT meta-expanding NAMESPACE `import()` /
+    // `@import` (which share `full_imports` but are not attaches). See the field
+    // doc on `PackageScopeContribution::depends_attached_packages`.
+    let mut depends_attached_packages: BTreeSet<String> = BTreeSet::new();
     if let Some(desc) = description {
         for pkg in crate::namespace_parser::parse_description_field_pub(&desc.text, "Depends") {
             if pkg != ws.name {
+                depends_attached_packages.insert(pkg.clone());
                 full_imports.insert(pkg);
             }
         }
@@ -184,6 +192,7 @@ fn build_scope_contribution(
         r_internal_symbols: Arc::new(r_internal_symbols),
         imported_symbols: Arc::new(imported_symbols),
         full_imports: Arc::new(full_imports),
+        depends_attached_packages: Arc::new(depends_attached_packages),
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
         test_helper_attached_packages: Arc::new(test_helper_attached_packages),
@@ -556,6 +565,47 @@ mod tests {
             .filter(|p| p.as_str() == "rlang")
             .count();
         assert_eq!(count, 1, "rlang should appear exactly once");
+    }
+
+    /// `Depends:` packages populate `depends_attached_packages` (the
+    /// meta-expansion subset), while NAMESPACE `import(pkg)` does NOT — only
+    /// `Depends:` is a true attach. Both still land in `full_imports`.
+    #[test]
+    fn depends_populates_attached_subset_but_namespace_import_does_not() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: tp\nDepends: tidyverse\n");
+        inputs.namespace = Some(NamespaceInput {
+            text: "import(rlang)\n".into(),
+        });
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let attached = &s.scope_contribution.depends_attached_packages;
+        assert!(
+            attached.contains("tidyverse"),
+            "Depends entry must be attached"
+        );
+        assert!(
+            !attached.contains("rlang"),
+            "NAMESPACE import(rlang) must NOT be in depends_attached_packages"
+        );
+        // Both still resolve unqualified via full_imports.
+        let full = &s.scope_contribution.full_imports;
+        assert!(full.contains("tidyverse") && full.contains("rlang"));
+    }
+
+    /// The self-name filter applies to `depends_attached_packages` too.
+    #[test]
+    fn depends_attached_excludes_own_package_name() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: tp\nDepends: tp, ggplot2\n"),
+            &PackageInputDelta::Initial,
+        );
+        let attached = &s.scope_contribution.depends_attached_packages;
+        assert!(attached.contains("ggplot2"));
+        assert!(!attached.contains("tp"), "own name must be excluded");
     }
 
     /// A malformed self-dependency (`Depends:` listing the package's own name)

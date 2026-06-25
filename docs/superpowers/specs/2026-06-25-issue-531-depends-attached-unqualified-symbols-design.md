@@ -149,37 +149,59 @@ visible to any code evaluated with the package loaded — broader than a namespa
 not a regression, and is exactly what the issue requests ("equivalent to a
 NAMESPACE `import()` of each"). No new file-kind scoping mechanism is introduced.
 
-### Meta-package NSE expansion: intentional asymmetry (review finding 3)
+### Meta-package NSE expansion (review finding 3 — now implemented)
 
-`collect_in_play_packages` adds `full_imports` to the in-play `packages` set but
-**not** to `attached_packages_for_meta` (`handlers.rs:5975` vs `:5984`). Only
-`library()`/`require()` attaches and `test_attached_packages` feed
-`attached_packages_for_meta`, which expands meta-packages (e.g. `tidyverse`) to
-their members so a bare verb like `filter` resolves to dplyr's NSE policy.
+`collect_in_play_packages` originally added `full_imports` to the in-play
+`packages` set but **not** to `attached_packages_for_meta` (`handlers.rs`). Only
+`library()`/`require()` attaches and `test_attached_packages` fed
+`attached_packages_for_meta`, which expands a meta-package (e.g. `tidyverse`) to
+its members so a bare verb like `filter` resolves to dplyr's NSE policy.
 
-Routing `Depends:` through `full_imports` therefore does **not** trigger
-meta-package member expansion. We accept this deliberately:
+The first cut accepted the asymmetry as a documented limitation. On review it
+was upgraded to **fix now**, scoped to `Depends:` (a true attach), because:
 
-- It is **identical to the existing `import(pkg)` behavior** — `import(tidyverse)`
-  in NAMESPACE doesn't meta-expand today either — so `Depends:` stays consistent
-  with the mechanism the issue asked it to mirror.
-- The only affected case is a *meta-package* in `Depends:` (e.g.
-  `Depends: tidyverse`), which is rare and a discouraged anti-pattern. A concrete
-  package in `Depends:` (`ggplot2`, `data.table`, `dplyr`, `R6`, …) is itself a
-  member, so its own NSE policy resolves directly via the in-play `packages` set
-  — no meta-expansion needed. The motivating issue and all realistic cases are
-  concrete packages.
-- The worst-case symptom for a meta-package in `Depends:` is a *false positive*
-  (a mask argument flagged), never a false negative, and it is fixable by the
-  user with an explicit `library(member_pkg)` — the same escape hatch that exists
-  for `import(tidyverse)` today.
+- `Depends:` puts a whole package's exports on the bare search path when the
+  package loads — semantically an attach, exactly like `library()`. A
+  meta-package attached this way attaches its members, so their NSE policies
+  apply. It therefore belongs in the meta-expansion set.
+- The owner-preserving fallback (issue #407, `table_verb_policy` step 3.5)
+  already covers the meta-package case **when the package library is warm**
+  (installed deps or `names.db` let it resolve `filter`'s true owner, dplyr).
+  But when the library is **cold** (CI / no R / deps not installed), step 3.5
+  returns `None`, only the meta-package is in play, it carries no NSE policy, and
+  the masked column is wrongly flagged. Hardcoded meta-expansion closes exactly
+  that gap, independent of the library.
 
-Adding `Depends:`-specific meta-expansion would require tracking the `Depends:`
-subset separately from `full_imports` (since `import()` entries must *not* be
-meta-expanded, to preserve current behavior) and a new consumer in
-`collect_in_play_packages`. That cost is not justified by the rare anti-pattern
-case. If a real report surfaces, the follow-up is a separate
-`depends_attached_packages` field consumed there — explicitly out of scope here.
+**NAMESPACE `import()` / `@import` is deliberately excluded** (codex review).
+An `import(pkg)` is a *selective namespace import*, not an attach: in R,
+`import(tidyverse)` imports only tidyverse's own exports into the namespace and
+does **not** put dplyr's `filter` on the search path. Meta-expanding it would
+falsely suppress a masked column for code where the verb isn't actually
+available. The `attached_packages_for_meta` set is documented as "limited to
+true attach contexts," so feeding NAMESPACE imports into it would also violate
+that intent. (For the rare case where a meta-package genuinely re-exports a
+member verb, the warm-library owner-preserving fallback still covers it.)
+
+**Implementation.** `Depends:` packages are tracked in a dedicated
+`PackageScopeContribution::depends_attached_packages` set (a subset of
+`full_imports`, populated in `build_scope_contribution` alongside the
+`full_imports` union, same `pkg != ws.name` filter). `collect_in_play_packages`
+feeds **only that set** into `attached_packages_for_meta`; `full_imports` itself
+is left feeding only the in-play `packages` set as before. Non-meta `Depends:`
+packages expand to nothing (`meta_package_members` → `&[]`), so this is a safe
+no-op for the common concrete-`Depends:` case.
+
+**Tests.**
+- `test_depends_meta_package_expands_for_nse_cold_library` (`handlers.rs`) pins
+  the positive case with a deliberately **empty** package library (the cold case
+  the fallback can't cover): `Depends: tidyverse` + `filter(x > 5)` in `R/` must
+  not flag `x`, while a genuine undefined still fires. Fails without the
+  expansion, passes with it.
+- `test_namespace_import_meta_package_does_not_expand_for_nse` is the scoping
+  guard: `import(tidyverse)` with a cold library must **still** flag `x` (no
+  hardcoded expansion), and asserts `depends_attached_packages` stays empty.
+- Derive tests assert `Depends:` populates `depends_attached_packages` while
+  `import()` does not, and the self-name filter applies to both sets.
 
 ### Both-paths coverage (NAMESPACE present and absent)
 
