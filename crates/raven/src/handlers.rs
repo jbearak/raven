@@ -16080,9 +16080,10 @@ fn collect_usages_with_analysis<'a>(
         if is_inside_exposition_rhs(node, text) && !is_call_function_head(node) {
             return;
         }
-        // Magrittr dot pronoun: `.` on the RHS of `%>%` is the piped value,
-        // not a free variable. Walk up to find a binary_operator parent whose
-        // operator is `%>%` and whose RHS contains this node.
+        // Magrittr dot pronoun: `.` on the RHS of `%>%`/`%<>%` is the piped
+        // value, not a free variable. Walk up to find a binary_operator parent
+        // whose operator is a magrittr forward-flow pipe and whose RHS contains
+        // this node.
         if node_text(node, text) == "." && is_inside_magrittr_rhs(node, text) {
             return;
         }
@@ -16227,8 +16228,27 @@ fn call_is_internal_routine_argument(call_node: Node, text: &str) -> bool {
         == Some(".Internal")
 }
 
+/// True when `op_text` is a magrittr **forward-flow** pipe operator: one that
+/// supplies its LHS as the RHS call's implicit first argument, pre-consuming the
+/// RHS callee's first formal. The pipe itself does **not** data-mask the RHS —
+/// that is the RHS verb's own NSE policy; the pipe only shifts where the
+/// syntactic positional arguments bind (so a column that would otherwise land in
+/// the checked first formal instead binds a data-masked one). magrittr's
+/// compound-assignment pipe `%<>%` (`x %<>% f()` ≡ `x <- x %>% f()`) feeds the
+/// RHS identically to `%>%`; its only extra effect is writing the result back to
+/// the LHS, which does not change NSE column resolution (issue #537). The
+/// exposition operator `%$%` is deliberately excluded — it evaluates its whole
+/// RHS in a data mask of the LHS, a different mechanism handled by
+/// [`is_inside_exposition_rhs`]. The native pipe `|>` is a distinct AST node
+/// (`kind() == "|>"`), not a `special` token, so it is matched separately by the
+/// callers that accept it.
+fn special_is_magrittr_pipe(op_text: &str) -> bool {
+    matches!(op_text, "%>%" | "%<>%")
+}
+
 /// True when `call_node` is the right-hand side of a pipe operator
-/// (`%>%` magrittr or `|>` native), so its first formal is supplied implicitly.
+/// (`%>%`/`%<>%` magrittr or `|>` native), so its first formal is supplied
+/// implicitly.
 fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
     let Some(parent) = call_node.parent() else {
         return false;
@@ -16239,29 +16259,32 @@ fn call_is_pipe_fed(call_node: Node, text: &str) -> bool {
         return false;
     }
     // tree-sitter-r exposes the native pipe as a `|>` operator node and the
-    // magrittr pipe as a `special` token whose text is `%>%`.
+    // magrittr pipes (`%>%`, `%<>%`) as `special` tokens.
     let mut cursor = parent.walk();
     parent.children(&mut cursor).any(|child| {
-        child.kind() == "|>" || (child.kind() == "special" && node_text(child, text) == "%>%")
+        child.kind() == "|>"
+            || (child.kind() == "special" && special_is_magrittr_pipe(node_text(child, text)))
     })
 }
 
-/// True when `node` (an identifier `.`) is inside the RHS of a magrittr `%>%`
-/// pipe operator. In magrittr, `.` on the RHS is the pronoun for the piped
-/// value — it is always defined and should not be flagged as undefined.
+/// True when `node` (an identifier `.`) is inside the RHS of a magrittr forward-
+/// flow pipe (`%>%` or `%<>%`). In magrittr, `.` on the RHS is the pronoun for
+/// the piped value — it is always defined and should not be flagged as
+/// undefined. `%<>%` flows the same value into the RHS as `%>%` (issue #537), so
+/// its RHS `.` is equally a pronoun.
 fn is_inside_magrittr_rhs(node: Node, text: &str) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "binary_operator" {
-            // Check if the operator is %> % and `current` is on the RHS.
+            // Check if the operator is a magrittr pipe and `current` is on the RHS.
             let is_rhs = parent
                 .child_by_field_name("rhs")
                 .is_some_and(|rhs| rhs.byte_range().contains(&current.start_byte()));
             if is_rhs {
                 let mut cursor = parent.walk();
-                let has_magrittr = parent
-                    .children(&mut cursor)
-                    .any(|child| child.kind() == "special" && node_text(child, text) == "%>%");
+                let has_magrittr = parent.children(&mut cursor).any(|child| {
+                    child.kind() == "special" && special_is_magrittr_pipe(node_text(child, text))
+                });
                 if has_magrittr {
                     return true;
                 }
@@ -16333,6 +16356,10 @@ fn is_functional_sequence_head_dot(node: Node, text: &str) -> bool {
         return false;
     }
     let mut cursor = parent.walk();
+    // Intentionally `%>%`-only, NOT `special_is_magrittr_pipe`: `%<>%` cannot
+    // head a functional sequence — its LHS must be an assignable lvalue (it
+    // writes the result back), and magrittr builds functional sequences with
+    // `%>%` alone. A leading `.` before `%<>%` is not the sequence-formal form.
     parent
         .children(&mut cursor)
         .any(|child| child.kind() == "special" && node_text(child, text) == "%>%")
@@ -60682,6 +60709,115 @@ my_func <- function(a = default_value) {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Issue #537: the compound-assignment pipe `%<>%` flows its LHS into the
+    /// RHS call's first formal exactly like `%>%` (`x %<>% f()` ≡ `x <- x %>%
+    /// f()`), so a positional NSE column arg must be suppressed, not flagged.
+    /// Before the fix `call_is_pipe_fed` matched only `%>%`/`|>`, so `ring`
+    /// bound the checked `.data` formal and was reported undefined.
+    #[test]
+    fn nse_compound_assignment_pipe_suppresses_positional_column_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %<>% group_by(ring)\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("ring is not defined")),
+            "`%<>%` must pipe-feed `.data` so `ring` is a data-masked column; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #537: the full reported repro — `%<>%` then `%>%` in one chain.
+    /// Neither the `%<>%`-fed `group_by(ring)` nor the `%>%`-fed `mutate(z = x)`
+    /// column may be flagged.
+    #[test]
+    fn nse_compound_assignment_pipe_mixed_chain_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %<>% group_by(ring) %>% mutate(z = x)\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("ring is not defined")),
+            "`ring` is a column fed through `%<>%`; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("x is not defined")),
+            "`x` is a column in the downstream `%>%` verb; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #537: the magrittr `.` pronoun on the RHS of a `%<>%` pipe is the
+    /// piped value, exactly as for `%>%`. The `.` here sits in a *checked*
+    /// standard-eval position (`nrow`'s sole argument), so the test is not
+    /// vacuous — before the fix `is_inside_magrittr_rhs` ignored `%<>%` and the
+    /// `.` was reported undefined.
+    #[test]
+    fn nse_compound_assignment_pipe_dot_pronoun_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %<>% nrow(.)\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains(". is not defined")),
+            "the `.` pronoun on a `%<>%` RHS is the piped value; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #537: pipe-feeding `%<>%` must not *blanket*-suppress the RHS.
+    /// `pull(.data, var, name, ...)` captures `var`/`name` but its trailing
+    /// `...` is checked (`captured_dots = false`), so once the pipe pre-consumes
+    /// `.data`, the first two positionals bind the captured `var`/`name`
+    /// (suppressed) and the third lands in the checked overflow and must still
+    /// flag. Witnesses the binding-shift / false-positive-safe behavior.
+    #[test]
+    fn nse_compound_assignment_pipe_checked_overflow_still_flags_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %<>% pull(v, nm, typo)\nreally_undefined_xyz",
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("typo is not defined")),
+            "a checked overflow arg under `%<>%` must still flag; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("v is not defined")),
+            "`v` binds the captured `var` formal and must be suppressed; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("nm is not defined")),
+            "`nm` binds the captured `name` formal and must be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
+    }
+
+    /// Issue #537: a namespace-qualified verb under `%<>%` is pipe-fed the same
+    /// way — `call_is_pipe_fed` keys off the parent operator, not the callee
+    /// shape, and `dplyr::group_by` resolves to the same data-mask policy.
+    #[test]
+    fn nse_compound_assignment_pipe_qualified_verb_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(dplyr)\ndf <- data.frame(x = 1)\ndf %<>% dplyr::group_by(ring)\nreally_undefined_xyz",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("ring is not defined")),
+            "`dplyr::group_by` under `%<>%` must pipe-feed `.data`; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("really_undefined_xyz")),
+            "positive control should be flagged; got {messages:?}"
+        );
     }
 
     /// Issue #398 regression: idiomatic tidyverse must not flag data-masked

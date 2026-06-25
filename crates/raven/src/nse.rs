@@ -1311,9 +1311,10 @@ fn is_shiny_render_helper(name: &str) -> bool {
 /// matching, which real R supports, is intentionally not modeled.)
 ///
 /// `pipe_fed` is true when the call is the right-hand side of a pipe
-/// (`df %>% filter(col > 1)` / `df |> filter(col > 1)`): the pipe supplies the
-/// first formal (the data/object argument) implicitly, so it is pre-consumed
-/// and the syntactic positional arguments bind starting at the *second* formal.
+/// (`df %>% filter(col > 1)` / `df %<>% filter(col > 1)` / `df |> filter(col >
+/// 1)`): the pipe supplies the first formal (the data/object argument)
+/// implicitly, so it is pre-consumed and the syntactic positional arguments bind
+/// starting at the *second* formal.
 /// Without this, the data-masked `col > 1` would bind the non-captured `.data`
 /// formal and be checked — a false positive on the most common dplyr idiom.
 pub(crate) fn suppressed_arguments(
