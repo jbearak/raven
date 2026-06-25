@@ -320,6 +320,10 @@ When Raven resolves a relative path to another file, the base directory depends 
 - **Backward directives** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's own directory and **ignore `# raven: cd`**.
 - **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no working directory (an explicit `# raven: cd` or one inherited from a parent file) is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
 
+#### Case-only mismatches
+
+For a forward `source()`/directive path, an **exact-case match always wins**. If the path doesn't match exactly but differs from the real on-disk filename **only by case** (`source("scripts/templates.r")` for an on-disk `templates.R`), Raven resolves it to the real file anyway — provided there is exactly one case-insensitive match — so the file enters the source graph and its symbols stay visible. This holds uniformly across dependency edges, scope, diagnostics, cmd-click, and path completion. Raven also reports it once at the `source()` line as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch) (information on a case-insensitive filesystem, warning on a case-sensitive one). If two on-disk files match the path case-insensitively — only possible on a case-sensitive filesystem — the path is ambiguous and stays unresolved (`unresolved-source-path`). Matching is ASCII-only, and this leniency is forward-only: backward directives resolve by exact case.
+
 ### Global Symbol Hoisting
 
 R has late-binding semantics — a function can reference another function that hasn't been defined yet at the time of the function's *definition*, as long as it exists by the time the function is *called*:
