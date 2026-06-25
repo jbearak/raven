@@ -344,11 +344,11 @@ jobs:
 
   # ── Homebrew tap bump ───────────────────────────────────────────────
   # After the GitHub Release is published, open a PR against the Homebrew
-  # tap (jbearak/homebrew-raven) bumping the formula to this version with
-  # macOS checksums recomputed from the in-workflow release artifacts (no
+  # tap (jbearak/homebrew-raven) bumping the formula to this version with the
+  # Apple Silicon checksum recomputed from the in-workflow release artifact (no
   # dependence on release-CDN propagation). The tap's own CI (brew audit /
   # install / test) gates that PR before it can merge, so a broken formula
-  # never reaches the fleet. The formula edit lives in the tap repo
+  # never reaches users. The formula edit lives in the tap repo
   # (bin/update-formula.sh) — single source of truth shared with the tap's
   # bootstrap script.
   #
@@ -369,10 +369,10 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Download macOS LSP artifacts
+      - name: Download macOS arm64 LSP artifact
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          pattern: lsp-macos-*
+          pattern: lsp-macos-arm64
           path: lsp
           merge-multiple: true
 
@@ -386,7 +386,7 @@ jobs:
       - name: Bump formula
         run: |
           tap/bin/update-formula.sh "${{ steps.version.outputs.version }}" \
-            lsp/raven-macos-arm64.zip lsp/raven-macos-x64.zip
+            lsp/raven-macos-arm64.zip
 
       - name: Open bump PR
         working-directory: tap
