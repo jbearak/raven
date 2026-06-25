@@ -5225,17 +5225,64 @@ mod case_mismatch_collector_tests {
             Some(&ws),
             CaseMismatchSeverity::Auto,
         );
-        // Only meaningful on a case-insensitive FS, where "Scripts" folds to
-        // "scripts"; on a case-sensitive FS this is a genuine missing directory.
-        if diags.is_empty() {
-            return;
-        }
-        assert_eq!(diags.len(), 1);
+        // The directory component folds on BOTH host types: a case-insensitive
+        // FS resolves `Scripts/` directly; a case-sensitive FS resolves it via
+        // the single-case-insensitive-match leniency. So the diagnostic must be
+        // present and name the corrected directory regardless of host.
+        assert_eq!(
+            diags.len(),
+            1,
+            "directory-case mismatch must fire on any host"
+        );
         assert!(
             diags[0].message.contains("scripts/templates.R"),
             "message must surface the corrected DIRECTORY spelling, not just the \
              filename: {:?}",
             diags[0].message
+        );
+    }
+
+    #[test]
+    fn standalone_emits_case_mismatch_even_when_missing_file_severity_is_off() {
+        // Integration-level guard for the actual wiring: the case-mismatch
+        // collector runs in `diagnostics_async_standalone` OUTSIDE the
+        // `missing_file_severity` block, so `missingFileSeverity = "off"`
+        // (passed as None) must NOT silence it. A unit call to the collector
+        // can't catch a regression that moves it back inside that block; this
+        // drives the real function.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("templates.R"), "x <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        let meta = crate::cross_file::extract_metadata("source(\"scripts/templates.r\")\n");
+        let uri = Url::from_file_path(&main).unwrap();
+        let ws = Url::from_file_path(dir.path()).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let diags = rt.block_on(diagnostics_async_standalone(
+            &uri,
+            Vec::new(),
+            &meta,
+            Some(&ws),
+            None, // missingFileSeverity = "off"
+            CaseMismatchSeverity::Auto,
+        ));
+        let case_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::SOURCE_PATH_CASE_MISMATCH,
+                )
+            })
+            .collect();
+        assert_eq!(
+            case_diags.len(),
+            1,
+            "case-mismatch must survive missingFileSeverity=off (it has its own gate): {diags:?}"
         );
     }
 
