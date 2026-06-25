@@ -5028,22 +5028,6 @@ async fn collect_missing_file_diagnostics_standalone(
     diagnostics
 }
 
-/// Collect `source-path-case-mismatch` diagnostics (issue #530) for forward
-/// `source()` calls and forward directives whose path resolves only via a
-/// case-only difference from the real on-disk filename.
-///
-/// This is a **dedicated** collector, separate from the missing-file collectors
-/// and gated by its own `caseMismatchSeverity` rather than `missingFileSeverity`,
-/// so turning off missing-file diagnostics does not silence it. It runs in the
-/// standalone phase ([`diagnostics_async_standalone`]) — the single phase that
-/// owns the authoritative cross-file path diagnostics for both the LSP and
-/// `raven check` — so the diagnostic is emitted exactly once (the snapshot
-/// collector does not emit it).
-///
-/// `system.file()` sources are skipped (a non-goal — and a branch-1 self-package
-/// `/inst/...` entry is NOT `exempt_from_missing_file_diagnostics`, so it must be
-/// excluded explicitly). Backward directives are not considered: the resolution
-/// leniency that surfaces a case mismatch is forward-only.
 /// The real on-disk spelling of a user-typed (relative) `source()` path: the
 /// trailing components of the resolved path matching the typed path's component
 /// count. This surfaces a directory-only case mismatch (`Scripts/` vs
@@ -5074,6 +5058,22 @@ fn corrected_relative_spelling(typed: &str, resolved: &std::path::Path) -> Strin
     real[real.len() - typed_count..].join("/")
 }
 
+/// Collect `source-path-case-mismatch` diagnostics (issue #530) for forward
+/// `source()` calls and forward directives whose path resolves only via a
+/// case-only difference from the real on-disk filename.
+///
+/// This is a **dedicated** collector, separate from the missing-file collectors
+/// and gated by its own `caseMismatchSeverity` rather than `missingFileSeverity`,
+/// so turning off missing-file diagnostics does not silence it. It runs in the
+/// standalone phase ([`diagnostics_async_standalone`]) — the single phase that
+/// owns the authoritative cross-file path diagnostics for both the LSP and
+/// `raven check` — so the diagnostic is emitted exactly once (the snapshot
+/// collector does not emit it).
+///
+/// `system.file()` sources are skipped (a non-goal — and a branch-1 self-package
+/// `/inst/...` entry is NOT `exempt_from_missing_file_diagnostics`, so it must be
+/// excluded explicitly). Backward directives are not considered: the resolution
+/// leniency that surfaces a case mismatch is forward-only.
 fn collect_case_mismatch_diagnostics_standalone(
     uri: &Url,
     meta: &crate::cross_file::CrossFileMetadata,

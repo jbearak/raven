@@ -236,10 +236,17 @@ pub enum CaseMismatchRegime {
     CaseSensitiveFs,
 }
 
-/// Outcome of forward path resolution: the resolved (case-corrected) path, plus
-/// a case-only-mismatch signal set when the path resolved via a case difference
-/// rather than an exact match. The `case_mismatch` field is always `None` for
-/// backward resolution (`try_workspace_fallback = false`). See issue #530.
+/// Outcome of path resolution: the resolved (case-corrected) path, plus a
+/// case-only-mismatch signal set when the path resolved via a case difference
+/// rather than an exact match. See issue #530.
+///
+/// The `case_mismatch` signal is only **consumed** for forward resolution: the
+/// public `resolve_path` (backward) returns just `.path`, discarding it. Note
+/// that backward resolution can still *carry* a `CaseInsensitiveFs` signal — the
+/// exact-match (`exists()`) branch case-corrects regardless of direction — but
+/// the new single-case-insensitive-match leniency (the `CaseSensitiveFs` regime)
+/// is forward-only, so a backward directive never resolves a path it wouldn't
+/// have resolved before.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolveOutcome {
     /// The resolved path, case-corrected to the real on-disk spelling. `Some`
@@ -321,7 +328,10 @@ fn case_mismatch_if_corrected(
 /// fallback retains its priority over the new leniency. The case-insensitive
 /// leniency (steps 3–4) is **forward-only** — gated on `try_workspace_fallback`,
 /// which is true only for `source()` calls and forward directives — so backward
-/// directives keep exact-only resolution and never gain a case mismatch.
+/// directives keep exact-only resolution and never resolve a path they wouldn't
+/// have before. (A backward resolution can still report a `CaseInsensitiveFs`
+/// signal from the step-1 case-correction, but the public `resolve_path` wrapper
+/// discards it.)
 fn resolve_path_rich(
     path: &str,
     context: &PathContext,
@@ -1029,10 +1039,13 @@ mod tests {
     }
 
     #[test]
-    fn backward_resolution_never_flags_or_resolves_case_mismatch() {
+    fn backward_resolution_stays_exact_only_on_case_sensitive_fs() {
         // Backward directives (try_workspace_fallback = false) keep exact-only
         // resolution: on a case-sensitive FS a wrong-case path stays unresolved
-        // (lexical), gaining no leniency and no mismatch signal.
+        // (lexical), gaining no single-ci-match leniency and no CaseSensitiveFs
+        // signal. (On a case-insensitive FS the step-1 case-correction can report
+        // CaseInsensitiveFs, but the public `resolve_path` wrapper discards it —
+        // hence this is gated to a case-sensitive host.)
         if !host_is_case_sensitive() {
             return;
         }
