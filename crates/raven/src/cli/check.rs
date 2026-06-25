@@ -372,6 +372,15 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     if let Some(note) = format_traversal_budget_note(&state) {
         footer.push(note);
     }
+    // The deduplicated NSE-discoverability footer is `text`-only. The hint is
+    // never inline on a finding (json/sarif/editor all show the bare
+    // "`x` is not defined"); it rides `Diagnostic.data` and surfaces only here,
+    // once, aggregated and deduplicated. See `format_nse_hint_footer`.
+    if args.format == OutputFormat::Text
+        && let Some(note) = format_nse_hint_footer(&all_diags)
+    {
+        footer.push(note);
+    }
     if !footer.is_empty() {
         let body = footer.join("\n");
         match footer_stream(args.format) {
@@ -960,6 +969,109 @@ fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<Stri
     Some(lines.join("\n"))
 }
 
+/// Stable, public docs links for the NSE footer. raven has no hosted docs site
+/// — docs live in the repo and `README.md` points users to GitHub — so these
+/// are the canonical URLs, mirroring how ShellCheck/Clippy point at hosted docs
+/// rather than explaining the syntax inline.
+const DIRECTIVES_DOCS_URL: &str = "https://github.com/jbearak/raven/blob/main/docs/directives.md";
+const DIAGNOSTICS_DOCS_URL: &str = "https://github.com/jbearak/raven/blob/main/docs/diagnostics.md";
+
+/// Build the reframed NSE-discoverability footer for `raven check`'s
+/// human-readable `text` output, or `None` when no finding carries an NSE hint.
+///
+/// Each undefined-variable diagnostic whose flagged identifier sits inside a
+/// call argument raven cannot analyze carries a structured `NseHint`
+/// (`crate::diagnostic_code`); the hint is NOT in the diagnostic message (see
+/// the emitter in `handlers.rs`). This is the *only* place the hint surfaces in
+/// output, and it is framed carefully: these findings are *probably real*, so
+/// the footer leads with the universal false-positive escape hatches (ignore /
+/// expect, as any linter has) and presents the R-specific NSE cause as one
+/// possibility — never as raven asserting the call *is* NSE. It still lists the
+/// **deduplicated**, copy-pasteable per-function directives (sorted for
+/// determinism; one suggestion per function however many findings it caused)
+/// and links the docs for the semantics. The machine formats (`json`/`sarif`)
+/// and the editor carry neither this footer nor an inline hint (the editor
+/// shows just the bare "`x` is not defined"), so this is `text`-only.
+fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
+    let mut count = 0usize;
+    let mut hints = Vec::new();
+    for (_, d) in diags {
+        if let Some(hint) = crate::diagnostic_code::undefined_variable_nse_hint(&d.data) {
+            count += 1;
+            hints.push(hint);
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    // Aggregate per callee (named-formal directives first, positional pair last,
+    // both sorted for determinism). Per-callee aggregation is load-bearing:
+    // `# raven: nse` is last-declaration-wins, so one directive per formal would
+    // leave only the last in effect — see `nse_footer_directives`.
+    let suggestions = crate::diagnostic_code::nse_footer_directives(&hints);
+    let has_positional = suggestions.iter().any(|s| s.starts_with("# raven: func"));
+
+    // Number-agnostic lead clause without an awkward "warning(s)". "whose
+    // source raven can't see" (not "cannot analyze") makes clear the cause is a
+    // missing definition — a package export raven has no body for — not an
+    // analysis error on code it does have.
+    // Severity-neutral noun ("finding", not "warning"): `raven check` honors
+    // `diagnostics.undefinedVariableSeverity`, so these may render as errors,
+    // info, or hints above — the footer must not contradict the configured
+    // severity.
+    let (noun, verb, obj) = if count == 1 {
+        (
+            "finding",
+            "sits",
+            "a call to a package function whose source raven can't see",
+        )
+    } else {
+        (
+            "findings",
+            "sit",
+            "calls to package functions whose source raven can't see",
+        )
+    };
+    let mut out = format!(
+        "raven check: {count} undefined-variable {noun} above {verb} inside {obj}. If one is a \
+         false positive, you can suppress it as with any \
+         linter (`# raven: ignore`, `# nolint`, or `# raven: expect`). R has one extra cause: a \
+         function that captures an argument via non-standard evaluation (NSE) — as \
+         `dplyr::filter(df, col > 0)` treats `col` as a column, not a variable — makes a valid \
+         name look undefined. Raven already recognizes NSE in many common packages (the \
+         tidyverse and more) but not all, so these findings come from functions outside that \
+         built-in coverage. If that is the case here, declare the function's NSE contract \
+         instead of suppressing:\n"
+    );
+    for s in &suggestions {
+        // A positional suggestion is two directives on separate lines (each
+        // `# raven:` directive must own its line); indent every line so the
+        // whole pair stays aligned under the footer.
+        for line in s.lines() {
+            out.push_str("\n  ");
+            out.push_str(line);
+        }
+    }
+    if has_positional {
+        // Explain why some suggestions carry two directives: a positionally
+        // passed argument has no name to key on, so raven needs the function's
+        // formal list (`# raven: func`) before it can say which formal is NSE.
+        out.push_str(
+            "\n\nThe two-line `# raven: func …` / `# raven: nse …` pair is for an argument passed \
+             positionally: raven needs the function's parameter list to know which formal the \
+             argument is, so fill `<formals>` with the function's signature and `<nse-formals>` \
+             with the captured ones. Keep them on separate lines — each `# raven:` directive must \
+             be the only one on its line. When the argument is passed by name, naming that formal \
+             (`# raven: nse fn(x)`) is enough.",
+        );
+    }
+    out.push_str(&format!(
+        "\n\nSee {DIRECTIVES_DOCS_URL} for these directives and {DIAGNOSTICS_DOCS_URL} for \
+         handling false positives."
+    ));
+    Some(out)
+}
+
 /// Run the full diagnostic pipeline for one already-opened document. Returns an
 /// empty vec when the snapshot can't be built (parse failure or document not
 /// open). A malformed file is not an operator error here — its reportable
@@ -1264,6 +1376,130 @@ mod tests {
         assert!(!default.report_uninstalled);
     }
 
+    fn nse_diag(callee: &str, formal: Option<&str>) -> (PathBuf, Diagnostic) {
+        // The hint rides `data` only — the message is clean (production no longer
+        // appends an inline suffix), exactly as the footer builder reads it.
+        let hint = crate::diagnostic_code::NseHint {
+            callee: callee.to_string(),
+            dir: callee.to_string(),
+            formal: formal.map(str::to_string),
+        };
+        (
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: format!("{callee}_arg is not defined"),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
+                data: crate::diagnostic_code::undefined_variable_data(false, Some(&hint)),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn plain_undefined_diag() -> (PathBuf, Diagnostic) {
+        (
+            PathBuf::from("main.R"),
+            Diagnostic {
+                message: "z is not defined".into(),
+                code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                )),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn nse_footer_is_none_without_any_hint() {
+        assert!(super::format_nse_hint_footer(&[]).is_none());
+        assert!(super::format_nse_hint_footer(&[plain_undefined_diag()]).is_none());
+    }
+
+    #[test]
+    fn nse_footer_dedups_suggestions_but_counts_every_finding() {
+        // Three findings: two on `aes(x = ...)` (one suggestion) and one
+        // positional `facet_wrap(...)`. The count reflects all three findings;
+        // the suggestions deduplicate to two, sorted deterministically.
+        let diags = vec![
+            nse_diag("aes", Some("x")),
+            nse_diag("aes", Some("x")),
+            nse_diag("facet_wrap", None),
+            plain_undefined_diag(),
+        ];
+        let footer = super::format_nse_hint_footer(&diags).expect("footer present");
+
+        assert!(
+            footer.contains(
+                "3 undefined-variable findings above sit inside calls to package functions whose source raven can't see"
+            ),
+            "count + plural lead clause: {footer}"
+        );
+        // The coverage-gap note explains why only some package calls are flagged.
+        assert!(
+            footer.contains("recognizes NSE in many common packages")
+                && footer.contains("but not all"),
+            "footer acknowledges built-in NSE coverage and its gaps: {footer}"
+        );
+        // Reframed: universal escape hatches first, NSE as one possibility.
+        assert!(
+            footer.contains("# raven: ignore")
+                && footer.contains("# nolint")
+                && footer.contains("# raven: expect"),
+            "footer offers the universal suppression directives: {footer}"
+        );
+        assert!(
+            footer.contains("non-standard evaluation (NSE)"),
+            "footer names the R-specific NSE cause: {footer}"
+        );
+        // The deduplicated, copy-pasteable directives — exactly one `aes` line.
+        assert_eq!(
+            footer.matches("# raven: nse aes(x)").count(),
+            1,
+            "aes suggestion appears once despite two findings: {footer}"
+        );
+        assert!(
+            footer.contains("# raven: func facet_wrap(<formals>)")
+                && footer.contains("# raven: nse facet_wrap(<nse-formals>)"),
+            "positional suggestion present (two directives, separate lines): {footer}"
+        );
+        // Named form first, positional (two-directive) form last.
+        assert!(
+            footer.find("# raven: nse aes(x)").unwrap()
+                < footer.find("# raven: func facet_wrap").unwrap(),
+            "named suggestion sorts before positional: {footer}"
+        );
+        // The positional case is explained (why it needs two directives).
+        assert!(
+            footer.contains("needs the function's parameter list"),
+            "footer explains the positional two-directive form: {footer}"
+        );
+        // Both docs URLs are present (directives + handling false positives).
+        assert!(
+            footer.contains("https://github.com/jbearak/raven/blob/main/docs/directives.md")
+                && footer
+                    .contains("https://github.com/jbearak/raven/blob/main/docs/diagnostics.md"),
+            "docs URLs present: {footer}"
+        );
+    }
+
+    #[test]
+    fn nse_footer_uses_singular_lead_clause_for_one_finding() {
+        let footer =
+            super::format_nse_hint_footer(&[nse_diag("aes", Some("x"))]).expect("footer present");
+        assert!(
+            footer.contains(
+                "1 undefined-variable finding above sits inside a call to a package function whose source raven can't see"
+            ),
+            "singular lead clause: {footer}"
+        );
+        // No positional suggestion here, so the two-directive explanation is omitted.
+        assert!(
+            !footer.contains("needs the function's parameter list"),
+            "named-only footer omits the positional explanation: {footer}"
+        );
+    }
+
     #[test]
     fn footer_goes_to_stdout_for_text_format() {
         // Text output is human-readable and shares the terminal/CI stream with
@@ -1417,7 +1653,7 @@ mod tests {
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                 )),
                 // Emitters tag the position variants here; the gate keys on it.
-                data: Some(crate::diagnostic_code::undefined_variable_position_variant_data()),
+                data: crate::diagnostic_code::undefined_variable_data(true, None),
                 ..Default::default()
             },
         )];
@@ -1437,7 +1673,7 @@ mod tests {
                 code: Some(tower_lsp::lsp_types::NumberOrString::String(
                     crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
                 )),
-                data: Some(crate::diagnostic_code::undefined_variable_position_variant_data()),
+                data: crate::diagnostic_code::undefined_variable_data(true, None),
                 ..Default::default()
             },
         )];

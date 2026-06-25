@@ -159,6 +159,124 @@ fn corrupt_package_db_workspace() -> TempDir {
     dir
 }
 
+/// Distinctive lead fragment of the NSE footer. The hint appears ONLY here (the
+/// reframed `text` footer) — never inline on a finding, never in `json`/`sarif`.
+const NSE_FOOTER_LEAD: &str = "sit inside calls to package functions whose source raven can't see";
+
+/// A workspace whose `a.R` flags three undefined variables inside call
+/// arguments of qualified package callees (whose bodies raven cannot see), so
+/// each carries an NSE discoverability hint. Two share the same
+/// `somepkg::my_filter(x = ...)` named-arg suggestion (to exercise footer
+/// dedup); the third is positional (the two-directive placeholder form).
+fn nse_hint_workspace() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("a.R"),
+        "f <- function() {\n  somepkg::my_filter(x = aaa)\n  somepkg::my_filter(x = bbb)\n  \
+         somepkg::other(ccc)\n}\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn text_format_keeps_findings_clean_and_emits_reframed_deduped_footer() {
+    let ws = nse_hint_workspace();
+    let out = run_check(ws.path(), &[]);
+    assert_findings_exit(&out);
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
+
+    // No per-finding directive: the finding lines are just "<name> is not
+    // defined", with the directives reserved for the single footer below.
+    for line in stdout
+        .lines()
+        .filter(|l| l.contains("[undefined-variable]"))
+    {
+        assert!(
+            !line.contains("# raven:"),
+            "finding lines must carry no inline directive; offending line:\n{line}"
+        );
+    }
+    // One reframed footer summarizes all three hinted findings...
+    assert!(
+        stdout.contains(&format!(
+            "3 undefined-variable findings above {NSE_FOOTER_LEAD}"
+        )),
+        "footer counts all hinted findings; stdout was:\n{stdout}"
+    );
+    // ...leading with the universal escape hatches, NSE as one possibility.
+    assert!(
+        stdout.contains("# raven: ignore")
+            && stdout.contains("# nolint")
+            && stdout.contains("# raven: expect")
+            && stdout.contains("non-standard evaluation (NSE)"),
+        "footer frames suppression generally + names NSE; stdout was:\n{stdout}"
+    );
+    // The two named-arg findings collapse to a single copy-pasteable suggestion.
+    assert_eq!(
+        stdout.matches("# raven: nse somepkg::my_filter(x)").count(),
+        1,
+        "duplicate suggestions must dedup; stdout was:\n{stdout}"
+    );
+    // The positional finding gets the two-directive placeholder form, rendered
+    // on separate lines (each `# raven:` directive must own its line to parse).
+    assert!(
+        stdout.contains("# raven: func somepkg::other(<formals>)")
+            && stdout.contains("# raven: nse somepkg::other(<nse-formals>)"),
+        "positional suggestion present; stdout was:\n{stdout}"
+    );
+    // ...and the footer explains why that case needs two directives.
+    assert!(
+        stdout.contains("needs the function's parameter list"),
+        "footer explains the positional two-directive form; stdout was:\n{stdout}"
+    );
+    // Both docs URLs are present (directives + handling false positives).
+    assert!(
+        stdout.contains("https://github.com/jbearak/raven/blob/main/docs/directives.md")
+            && stdout.contains("https://github.com/jbearak/raven/blob/main/docs/diagnostics.md"),
+        "docs URLs present; stdout was:\n{stdout}"
+    );
+    // It is a footer: the findings precede it on the same stream.
+    let diag = stdout
+        .find("undefined-variable")
+        .expect("expected an undefined-variable diagnostic on stdout");
+    assert!(
+        diag < stdout.find(NSE_FOOTER_LEAD).unwrap(),
+        "the footer must follow the findings it annotates; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn json_format_carries_no_nse_hint_text_and_no_footer() {
+    let ws = nse_hint_workspace();
+    let out = run_check(ws.path(), &["--format", "json"]);
+    assert_findings_exit(&out);
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
+
+    // The machine document is clean JSON with no directive prose in any message
+    // (the hint suggestion is text-only; structured `data` carries no directive
+    // string), and no NSE footer leaks onto either stream.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "stdout must be valid JSON; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("# raven:") && !stdout.contains("non-standard evaluation"),
+        "json must carry no NSE directive prose; stdout was:\n{stdout}"
+    );
+    // The internal NSE hint is a text-footer / editor-quick-fix concern; it is
+    // stripped from `data` before serialization, so no trace reaches machine output.
+    assert!(
+        !stdout.contains("nseHint"),
+        "json must not leak the internal nseHint marker; stdout was:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(NSE_FOOTER_LEAD) && !stderr.contains(NSE_FOOTER_LEAD),
+        "the NSE footer is text-only; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn text_format_emits_load_note_on_stdout_not_stderr() {
     let ws = corrupt_package_db_workspace();

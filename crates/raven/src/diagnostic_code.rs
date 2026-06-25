@@ -177,18 +177,158 @@ pub fn suppresses(suppression_code: &str, diagnostic_code: &str) -> bool {
 /// missing-export-metadata gate (`raven check`).
 pub const UNDEFINED_VARIABLE_POSITION_VARIANT: &str = "undefined-variable/position-variant";
 
-/// The [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker as a `Diagnostic.data`
-/// value, for emitters to attach.
-pub fn undefined_variable_position_variant_data() -> serde_json::Value {
-    serde_json::Value::String(UNDEFINED_VARIABLE_POSITION_VARIANT.to_string())
+/// The structured NSE-discoverability hint carried by an undefined-variable
+/// diagnostic whose flagged identifier sits inside a call argument that *might*
+/// be captured by non-standard evaluation (see `nse_hint_for_usage` in
+/// `handlers.rs`). The emitter stores the structured fields here and **never**
+/// appends them to the diagnostic message: the editor and `--format json/sarif`
+/// carry no NSE prose (their message stays the bare "`x` is not defined"), and
+/// the hint surfaces only once, as the deduplicated footer the human-readable
+/// `raven check` text report builds via [`nse_footer_directives`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NseHint {
+    /// Source spelling of the callee, retaining backticks for a non-syntactic
+    /// name (e.g. `` `my fn` ``). Used only in the message prose.
+    pub callee: String,
+    /// Directive spelling of the callee (a non-syntactic name is quoted, a
+    /// qualifier kept) — what the user copies into the directive.
+    pub dir: String,
+    /// The matched formal name when the flagged argument is named (`foo(x =
+    /// ...)` → `Some("x")`); `None` for a positional argument, where the formal
+    /// order is unknown and the user must fill in placeholders.
+    pub formal: Option<String>,
 }
 
-/// True if `data` carries the [`UNDEFINED_VARIABLE_POSITION_VARIANT`] marker.
+/// The copy-pasteable directive lines for the deduplicated `raven check` footer
+/// (see `format_nse_hint_footer`), built from all of a run's NSE hints. This is
+/// the only rendered form of the hints — they are deliberately not appended to
+/// the diagnostic message.
+///
+/// Aggregation is per **callee** and is load-bearing for correctness, because
+/// `# raven: nse` is *last-declaration-wins* (see `own_directive_nse_policy` in
+/// `handlers.rs`): emitting one directive per formal would leave only the last
+/// one in effect, so a user who pasted them would still see the earlier
+/// findings. Therefore:
+///   - All named formals captured by one callee collapse into a single
+///     `# raven: nse callee(x, y, …)` directive (formals sorted for
+///     determinism).
+///   - A positional argument (formal order unknown) yields the two-line
+///     `# raven: func callee(<formals>)` + `# raven: nse callee(<nse-formals>)`
+///     placeholder pair the user fills in. The pair is on **two separate lines**
+///     because each `# raven:` directive must be the only one on its comment
+///     line (the `nse` regex in `cross_file::directive` is start- AND
+///     end-anchored), so a one-line `func … and nse …` form would parse the
+///     `func` half but silently drop the NSE contract. When a callee has *any*
+///     positional finding, only this placeholder form is emitted (the user fills
+///     `<nse-formals>` with every captured formal, named ones included), so the
+///     two forms never collide for the same callee.
+///
+/// Named-formal directives sort first; the wordier positional pair sorts last.
+pub fn nse_footer_directives(hints: &[NseHint]) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // callee directive spelling -> (named formals, has a positional finding)
+    let mut by_callee: BTreeMap<&str, (BTreeSet<&str>, bool)> = BTreeMap::new();
+    for h in hints {
+        let entry = by_callee.entry(h.dir.as_str()).or_default();
+        match &h.formal {
+            Some(f) => {
+                entry.0.insert(f.as_str());
+            }
+            None => entry.1 = true,
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (dir, (formals, has_positional)) in &by_callee {
+        if *has_positional {
+            out.push(format!(
+                "# raven: func {dir}(<formals>)\n# raven: nse {dir}(<nse-formals>)"
+            ));
+        } else if !formals.is_empty() {
+            let list = formals.iter().copied().collect::<Vec<_>>().join(", ");
+            out.push(format!("# raven: nse {dir}({list})"));
+        }
+    }
+    let is_positional = |s: &str| s.starts_with("# raven: func");
+    out.sort_by(|a, b| (is_positional(a), a.as_str()).cmp(&(is_positional(b), b.as_str())));
+    out
+}
+
+/// Build the `Diagnostic.data` payload for an undefined-variable diagnostic from
+/// its two independent, composable markers: whether it is a position variant
+/// (forward reference or sourced-later — not resolvable by package export
+/// metadata) and an optional NSE-discoverability hint. Returns `None` (leaving
+/// `data` unset) for a plain genuinely-undefined usage with neither marker, so
+/// the common case stays allocation-free.
+pub fn undefined_variable_data(
+    position_variant: bool,
+    nse_hint: Option<&NseHint>,
+) -> Option<serde_json::Value> {
+    if !position_variant && nse_hint.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if position_variant {
+        obj.insert("positionVariant".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(h) = nse_hint {
+        let mut hint = serde_json::Map::new();
+        hint.insert(
+            "callee".to_string(),
+            serde_json::Value::String(h.callee.clone()),
+        );
+        hint.insert("dir".to_string(), serde_json::Value::String(h.dir.clone()));
+        if let Some(f) = &h.formal {
+            hint.insert("formal".to_string(), serde_json::Value::String(f.clone()));
+        }
+        obj.insert("nseHint".to_string(), serde_json::Value::Object(hint));
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
+/// True if `data` marks the diagnostic as a position variant (forward reference
+/// or sourced-later). Read by the CLI's missing-export-metadata gate.
 pub fn is_undefined_variable_position_variant(data: &Option<serde_json::Value>) -> bool {
     matches!(
         data,
-        Some(serde_json::Value::String(s)) if s == UNDEFINED_VARIABLE_POSITION_VARIANT
+        Some(serde_json::Value::Object(obj))
+            if obj.get("positionVariant") == Some(&serde_json::Value::Bool(true))
     )
+}
+
+/// Recover the structured NSE hint from `data`, or `None` if the diagnostic
+/// carries no hint. Inverse of [`undefined_variable_data`]'s `nse_hint` field.
+pub fn undefined_variable_nse_hint(data: &Option<serde_json::Value>) -> Option<NseHint> {
+    let obj = data.as_ref()?.as_object()?;
+    let hint = obj.get("nseHint")?.as_object()?;
+    Some(NseHint {
+        callee: hint.get("callee")?.as_str()?.to_string(),
+        dir: hint.get("dir")?.as_str()?.to_string(),
+        formal: hint
+            .get("formal")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// The `Diagnostic.data` payload with the internal NSE hint removed, for
+/// serialization into machine output. The hint exists only so the `raven check`
+/// text footer can aggregate it; it is not part of the diagnostic's machine
+/// contract. Machine
+/// consumers still get the position-variant marker (historically present in
+/// `data`), but no NSE trace. Returns `None` when nothing remains, matching the
+/// "omit empty `data`" convention `Diagnostic` serializes with.
+pub fn data_without_nse_hint(data: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let Some(serde_json::Value::Object(obj)) = data else {
+        // Non-object (or absent) data carries no hint to strip.
+        return data.clone();
+    };
+    let mut obj = obj.clone();
+    obj.remove("nseHint");
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// True when a diagnostic's `code` is the canonical string code `want`.
@@ -227,9 +367,9 @@ mod tests {
 
     #[test]
     fn position_variant_marker_round_trips_and_is_specific() {
-        let tagged = Some(undefined_variable_position_variant_data());
+        let tagged = undefined_variable_data(true, None);
         assert!(is_undefined_variable_position_variant(&tagged));
-        // Absent data, a different string, and a non-string value never match.
+        // Absent data, a bare string, and an object without the flag never match.
         assert!(!is_undefined_variable_position_variant(&None));
         assert!(!is_undefined_variable_position_variant(&Some(
             serde_json::Value::String("something-else".to_string())
@@ -237,6 +377,164 @@ mod tests {
         assert!(!is_undefined_variable_position_variant(&Some(
             serde_json::json!({ "kind": UNDEFINED_VARIABLE_POSITION_VARIANT })
         )));
+    }
+
+    fn named_hint() -> NseHint {
+        NseHint {
+            callee: "aes".to_string(),
+            dir: "aes".to_string(),
+            formal: Some("x".to_string()),
+        }
+    }
+
+    fn positional_hint() -> NseHint {
+        NseHint {
+            callee: "facet_wrap".to_string(),
+            dir: "facet_wrap".to_string(),
+            formal: None,
+        }
+    }
+
+    fn named_hint_for(dir: &str, formal: &str) -> NseHint {
+        NseHint {
+            callee: dir.to_string(),
+            dir: dir.to_string(),
+            formal: Some(formal.to_string()),
+        }
+    }
+
+    #[test]
+    fn nse_footer_directives_render_the_copy_pasteable_tail() {
+        assert_eq!(
+            nse_footer_directives(&[named_hint()]),
+            vec!["# raven: nse aes(x)".to_string()]
+        );
+        // The positional fallback renders the two directives on SEPARATE lines:
+        // the `nse` directive regex is end-anchored, so a one-line `func … and
+        // nse …` form would silently fail to declare the NSE contract (see
+        // `positional_directive_parses_as_two_directives`).
+        assert_eq!(
+            nse_footer_directives(&[positional_hint()]),
+            vec![
+                "# raven: func facet_wrap(<formals>)\n# raven: nse facet_wrap(<nse-formals>)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn nse_footer_collapses_multiple_named_formals_for_one_callee() {
+        // Regression: `# raven: nse` is last-declaration-wins, so one directive
+        // per formal would leave only the last in effect — the user pasting both
+        // would still see the other finding. All named formals for one callee
+        // must collapse into a single directive (formals sorted).
+        let dirs = nse_footer_directives(&[
+            named_hint_for("somepkg::f", "x"),
+            named_hint_for("somepkg::f", "y"),
+        ]);
+        assert_eq!(dirs, vec!["# raven: nse somepkg::f(x, y)".to_string()]);
+        // And the collapsed directive actually captures BOTH formals when parsed.
+        let meta = crate::cross_file::directive::parse_directives(&dirs[0]);
+        assert_eq!(meta.nse_declarations.len(), 1, "{dirs:?}");
+    }
+
+    #[test]
+    fn nse_footer_mixed_named_and_positional_for_one_callee_emits_only_the_pair() {
+        // A callee with both a named finding (`f(x = ...)`) and a positional one
+        // (`f(undef)`): the formal order is unknown for the positional arg, so we
+        // emit ONLY the placeholder pair (the user fills `<nse-formals>` with
+        // every captured formal). Emitting `# raven: nse f(x)` alongside it would
+        // collide under last-declaration-wins, re-introducing the original bug.
+        let dirs = nse_footer_directives(&[
+            named_hint_for("somepkg::f", "x"),
+            NseHint {
+                callee: "somepkg::f".to_string(),
+                dir: "somepkg::f".to_string(),
+                formal: None,
+            },
+        ]);
+        assert_eq!(
+            dirs,
+            vec![
+                "# raven: func somepkg::f(<formals>)\n# raven: nse somepkg::f(<nse-formals>)"
+                    .to_string()
+            ],
+            "mixed case emits only the positional placeholder pair"
+        );
+    }
+
+    #[test]
+    fn positional_directive_parses_as_two_directives() {
+        // Regression: a user who copies the positional suggestion and fills in
+        // the placeholders must get BOTH a `func` and an `nse` declaration. The
+        // `nse` directive regex is start- AND end-anchored, so the previous
+        // one-line `# raven: func … and # raven: nse …` form parsed only the
+        // `func` half and silently dropped the NSE contract.
+        let applied = nse_footer_directives(&[positional_hint()])[0]
+            .replace("<formals>", "data, x")
+            .replace("<nse-formals>", "x");
+        let meta = crate::cross_file::directive::parse_directives(&applied);
+        assert_eq!(
+            meta.declared_functions.len(),
+            1,
+            "func directive must parse: {applied:?}"
+        );
+        assert_eq!(
+            meta.nse_declarations.len(),
+            1,
+            "nse directive must parse (one-line form silently dropped it): {applied:?}"
+        );
+    }
+
+    #[test]
+    fn undefined_variable_data_composes_both_markers() {
+        // Neither marker → no data at all (plain undefined keeps `data` unset).
+        assert_eq!(undefined_variable_data(false, None), None);
+
+        // NSE hint alone: round-trips, and is NOT a position variant.
+        let hint = named_hint();
+        let nse_only = undefined_variable_data(false, Some(&hint));
+        assert!(!is_undefined_variable_position_variant(&nse_only));
+        assert_eq!(undefined_variable_nse_hint(&nse_only), Some(hint.clone()));
+
+        // Both markers compose on one diagnostic (a forward reference that also
+        // sits inside an NSE-capturing call argument).
+        let both = undefined_variable_data(true, Some(&hint));
+        assert!(is_undefined_variable_position_variant(&both));
+        assert_eq!(undefined_variable_nse_hint(&both), Some(hint));
+
+        // Position variant alone carries no NSE hint.
+        let pos_only = undefined_variable_data(true, None);
+        assert_eq!(undefined_variable_nse_hint(&pos_only), None);
+    }
+
+    #[test]
+    fn data_without_nse_hint_strips_only_the_hint() {
+        let hint = named_hint();
+
+        // Hint alone → nothing left, collapses to None (omitted on serialize).
+        let nse_only = undefined_variable_data(false, Some(&hint));
+        assert_eq!(data_without_nse_hint(&nse_only), None);
+
+        // Both markers → the position-variant marker survives, hint is gone.
+        let both = undefined_variable_data(true, Some(&hint));
+        let stripped = data_without_nse_hint(&both);
+        assert!(is_undefined_variable_position_variant(&stripped));
+        assert_eq!(undefined_variable_nse_hint(&stripped), None);
+
+        // No hint to begin with → unchanged (still a position variant).
+        let pos_only = undefined_variable_data(true, None);
+        assert_eq!(data_without_nse_hint(&pos_only), pos_only);
+
+        // Absent data → absent.
+        assert_eq!(data_without_nse_hint(&None), None);
+    }
+
+    #[test]
+    fn nse_hint_round_trips_a_positional_formal_omission() {
+        let hint = positional_hint();
+        let data = undefined_variable_data(false, Some(&hint));
+        assert_eq!(undefined_variable_nse_hint(&data), Some(hint));
     }
 
     #[test]
