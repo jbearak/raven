@@ -45,109 +45,164 @@ mismatch once at the `source()` site, and never let it cascade.**
 - `system.file()` source diagnostics (package-internal; resolution
   case-correction from #476 already applies there, but no case-mismatch
   diagnostic is emitted for them).
-- Backward-directive (`# raven: sourced-by` / `run-by` / `included-by`)
-  diagnostics. Resolution leniency (component 1 below) applies uniformly because
-  it lives at the shared chokepoint, so a backward directive with a case typo
-  will *resolve* on a case-sensitive FS instead of erroring — a benign,
-  consistent side effect — but **no** case-mismatch diagnostic is emitted for
-  backward directives. This matches the issue's scope (`source()`/include).
+- **Backward-directive (`# raven: sourced-by` / `run-by` / `included-by`)
+  behavior is unchanged.** The new resolution leniency (Component 1) is
+  **forward-only** — gated on the same flag that enables the workspace-root
+  fallback (`try_workspace_fallback`, true only for `source()` calls and forward
+  directives). Backward directives continue to resolve via the exact-match path
+  only, so a case-typo'd `# raven: sourced-by` stays `unresolved-source-path` on
+  a case-sensitive FS exactly as today. This avoids silently altering the
+  dependency graph for backward edges with no diagnostic signal (a backward edge
+  is created the moment `resolve_path` returns a URI), and keeps the change
+  inside the issue's scope (`source()`/include). The five-consumer
+  uniform-resolution invariant is preserved *per direction*: all forward
+  consumers route through `resolve_path_with_workspace_fallback` and get the
+  leniency; all backward consumers route through `resolve_path` and do not.
+- **Non-ASCII case folding.** Case-insensitive matching reuses the existing
+  `eq_ignore_ascii_case` comparison (ASCII-only), matching #476's behavior. A
+  filename differing only by the case of a non-ASCII letter is **not** detected
+  as a case mismatch. Locale/Unicode-aware folding is out of scope.
 - Auto-fix / code action to correct the casing (possible follow-up).
 
 ## Design
 
-### Component 1 — resolution leniency at the chokepoint (`cross_file/path_resolve.rs`)
+### Component 1 — resolution leniency + mismatch signal at the chokepoint (`cross_file/path_resolve.rs`)
 
-`resolve_path_impl` currently runs `canonicalize_case_below` only inside the
-`if canonical.exists()` branch. Add a fallback branch for when the lexical path
-does **not** exist:
+The mismatch must be detected **inside resolution**, where the base that
+actually won (file-relative `base`, the workspace-root fallback base, or the
+`/`-prefixed `workspace_root`) is known. A separate after-the-fact helper cannot
+know which base produced the resolved path (finding #2), so resolution returns
+the signal directly.
 
-- Attempt case-insensitive resolution of the path components **below `base`**
-  (reusing the `canonicalize_case_below` mechanism), then re-check existence.
-- Only accept the corrected path when it exists **and every otherwise-missing
-  component resolved to exactly one case-insensitive directory entry**. If a
-  component has 2+ case-insensitive matches (only possible on a case-sensitive
-  FS), the result is ambiguous → return the lexical path unchanged (stays
-  `unresolved-source-path`, current behavior).
-
-This requires a **uniqueness-aware** variant of the existing `real_entry_name`
-(which today returns the *first* case-insensitive match without counting). The
-new helper distinguishes "exactly one ci match" from "multiple ci matches".
-
-Properties:
-- On a **case-insensitive FS** this new branch is a guaranteed no-op: if a
-  case-variant entry exists, `canonical.exists()` already returned true (the FS
-  folds the lookup), so the existing branch fired first. Two entries differing
-  only by case cannot coexist on such a filesystem. **No regression risk for the
-  already-working macOS path.**
-- On a **case-sensitive FS** this is what makes the file enter the dependency
-  graph, fixing the cascade **uniformly across all five resolution consumers**
-  (dependency-graph build, scope resolution, missing-file diagnostics,
-  go-to-definition path resolution, path completion) — the standing invariant
-  that resolution behavior must be identical across these five.
-
-Applies to both `resolve_path` and `resolve_path_with_workspace_fallback`, and
-to all three resolution shapes (file-relative, workspace-root `/`-prefixed, and
-workspace-root fallback), since all route through `resolve_path_impl` /
-`canonicalize_case_below`.
-
-### Component 2 — mismatch detection helper (`cross_file/path_resolve.rs`)
-
-A pure, public helper the diagnostic collectors call:
+Refactor `resolve_path_impl` to return a richer outcome, with thin wrappers
+preserving the five consumers' existing `Option<PathBuf>` signatures:
 
 ```rust
 pub enum CaseMismatchRegime { CaseInsensitiveFs, CaseSensitiveFs }
 
-/// Returns the case-mismatch regime for a forward source path, or None when the
-/// path resolves with an exact-case match (or doesn't resolve at all).
-pub fn source_path_case_mismatch(path: &str, ctx: &PathContext)
-    -> Option<(CaseMismatchRegime, PathBuf /* resolved real path */)>;
+pub struct ResolveOutcome {
+    pub path: Option<PathBuf>,            // case-corrected real path, as today
+    pub case_mismatch: Option<CaseMismatchRegime>, // Some iff resolved via case-only diff
+}
+
+// New rich entry point; forward-only fallback flag as today.
+fn resolve_path_rich(path: &str, ctx: &PathContext, try_workspace_fallback: bool) -> ResolveOutcome;
+
+// Existing public fns become wrappers returning `.path` — UNCHANGED signatures,
+// so dependency-graph build, scope, go-to-definition, and completion are
+// untouched:
+pub fn resolve_path(path, ctx) -> Option<PathBuf>            { resolve_path_rich(path, ctx, false).path }
+pub fn resolve_path_with_workspace_fallback(path, ctx) -> Option<PathBuf> { resolve_path_rich(path, ctx, true).path }
+
+// New public wrapper the case-mismatch collector calls:
+pub fn resolve_source_path_rich(path: &str, ctx: &PathContext) -> ResolveOutcome { resolve_path_rich(path, ctx, true) }
 ```
 
-Logic:
-1. Resolve via `resolve_path_with_workspace_fallback`. If `None`, return `None`.
-2. If the resolved real path does not exist, return `None` (that is a
-   missing-file case, handled by `unresolved-source-path`).
-3. Compare the resolved real spelling against the typed spelling, component by
-   component **below `base`**. If all are byte-equal → exact match → `None`. If
-   any differ but are case-insensitively equal → **mismatch**.
-4. Regime: derive **per-directory** from whether the typed absolute path
-   (`base.join(typed)`) exists as-typed. Exists → `CaseInsensitiveFs` (the FS
-   folded the lookup; R runs fine; INFO). Does not exist → `CaseSensitiveFs`
-   (R would error; WARNING). No global FS-sensitivity probe — this is accurate
-   even on mixed-sensitivity volumes (a case-sensitive APFS volume on macOS, a
-   case-insensitive mount on Linux).
+**Resolution ordering (pins finding #1).** For each base attempted, an
+exact-case match always wins before any case-insensitive match is considered.
+The full order for a forward (`try_workspace_fallback = true`) relative path:
 
-The regime decision is factored into a pure `fn regime(typed_exists: bool) ->
-CaseMismatchRegime` so the INFO/WARNING mapping is unit-testable without a real
-case-sensitive filesystem.
+1. file-relative **exact** (`base.join(path)` exists byte-for-byte on a
+   case-sensitive FS, or via FS folding on a case-insensitive FS) — today's
+   `canonical.exists()` branch, with `canonicalize_case_below` applied. On a
+   case-insensitive FS a case-variant resolves here and is flagged
+   `CaseInsensitiveFs`.
+2. workspace-root fallback **exact** (only when `!cd_in_effect()` and a
+   workspace root exists) — today's fallback branch.
+3. file-relative **case-insensitive single match** (new) — accept only if the
+   case-corrected path exists **and every otherwise-missing component below
+   `base` resolved to exactly one case-insensitive directory entry**; flag
+   `CaseSensitiveFs`.
+4. workspace-root fallback **case-insensitive single match** (new, same gate as
+   step 2 plus the single-match requirement) — flag `CaseSensitiveFs`.
+5. otherwise → `path: Some(lexical)`, `case_mismatch: None` (→
+   `unresolved-source-path`, today's behavior).
 
-### Component 3 — diagnostic emission (`handlers.rs`)
+Steps 3–4 are **forward-only** (guarded by `try_workspace_fallback`), so
+backward directives never gain leniency (finding #5). The `/`-prefixed branch
+resolves below `workspace_root`; it gets the same exact-then-single-ci-match
+treatment, also forward-only.
 
-Both collectors — `collect_missing_file_diagnostics_standalone` (async, live +
-standalone) and `collect_missing_file_diagnostics_from_snapshot` (snapshot
-path) — gain, for each **forward source that resolves to an existing file**, a
-call to `source_path_case_mismatch`. On a mismatch, push a diagnostic:
+The single-match gate needs a **uniqueness-aware** variant of `real_entry_name`
+(which today returns the *first* ci match without counting): it must
+distinguish "exactly one ci match" from "2+ ci matches", returning no match in
+the ambiguous case. ASCII-only comparison, as today (see Non-goals).
 
+**Regime derivation.** `CaseInsensitiveFs` when the path resolved at an
+exact-`exists()` step (1/2) but `canonicalize_case_below` changed a component's
+spelling (the FS folded the lookup — only possible on a case-insensitive FS).
+`CaseSensitiveFs` when it resolved only at a single-ci-match step (3/4) — the
+typed spelling did not exist, so this is a case-sensitive FS where R would
+error. This is determined per-directory from the actual resolution path, needs
+no global FS probe, and is correct on mixed-sensitivity volumes.
+
+Properties:
+- On a **case-insensitive FS** steps 3–4 are a guaranteed no-op: a case-variant
+  entry always satisfies step 1's `exists()` (the FS folds the lookup), and two
+  entries differing only by case cannot coexist. **No regression risk for the
+  already-working macOS path** — its only change is gaining the
+  `CaseInsensitiveFs` mismatch signal.
+- On a **case-sensitive FS** steps 3–4 are what make the file enter the
+  dependency graph, fixing the cascade **uniformly across all five forward
+  resolution consumers** (graph build, scope, missing-file diagnostics,
+  go-to-definition, completion), since all route through
+  `resolve_path_with_workspace_fallback` → `resolve_path_rich(.., true)`.
+
+### Component 2 — (folded into Component 1)
+
+The mismatch detection is part of resolution (Component 1); there is no separate
+post-hoc helper. The collector consumes `ResolveOutcome.case_mismatch`.
+
+### Component 3 — diagnostic emission: a separate, separately-gated collector (`handlers.rs`)
+
+**Factual correction (finding #3):** the two existing collectors are **not**
+symmetric. `collect_missing_file_diagnostics_standalone` (async) batches
+`exists()` checks and emits "File not found" for resolved-but-missing files.
+`collect_missing_file_diagnostics_from_snapshot` (sync) performs **no** existence
+check — it emits only when `resolve_path*` returns `None`
+(`handlers.rs:5154`). Both are gated by `missing_file_severity` (standalone runs
+only when it is `Some`, `handlers.rs:4794`; snapshot early-returns when `None`,
+`handlers.rs:5138`).
+
+**The case-mismatch diagnostic therefore must NOT live inside the missing-file
+collectors (finding #4)** — `missingFileSeverity = "off"` must not silence it.
+Add a **dedicated collector** (a sync function plus, where the live path needs
+it, a parallel call site mirroring how missing-file collection is invoked), e.g.
+`collect_case_mismatch_diagnostics(meta, ctx, severity_config, &mut diagnostics)`:
+
+- Iterate `meta.sources` (forward only; skip `exempt_from_missing_file_diagnostics`).
+- For each, call `resolve_source_path_rich`. When `case_mismatch` is `Some`,
+  push a diagnostic.
+- It gets its **own gate** from `caseMismatchSeverity` (Component 4), independent
+  of `missing_file_severity`. When the resolved severity is `Off`, emit nothing.
+- Because the regime comes from resolution, this collector needs no separate
+  existence check (it sidesteps the snapshot collector's lack of one).
+
+Diagnostic fields:
 - `code`: `source-path-case-mismatch`.
-- `range`: the `source()`/directive path span (same span the existing
-  unresolved-source-path / file-not-found diagnostics use).
-- `severity`: resolved from `caseMismatchSeverity` (see Component 4); for
-  `"auto"`, INFO for `CaseInsensitiveFs`, WARNING for `CaseSensitiveFs`.
-- `message`: names the typed path and the real on-disk file and the hazard, e.g.
-  - case-insensitive regime: `Case mismatch: 'scripts/templates.r' resolves to
+- `range`: built with the **identical construction** the sibling missing-file
+  diagnostic uses for that source kind — for an AST/`source()` call,
+  `start = (line, column)` and `end = column + path.len()(utf16) + 10`; for a
+  forward directive, the directive line `0..LSP_EOL_CHARACTER`. (There is no
+  stored true literal-path range today; this matches existing behavior rather
+  than promising precise highlighting — finding #7.)
+- `severity`: resolved from `caseMismatchSeverity`; for `"auto"`, INFO for
+  `CaseInsensitiveFs`, WARNING for `CaseSensitiveFs`.
+- `message`: names the typed path and the real on-disk file and the hazard:
+  - `CaseInsensitiveFs`: `Case mismatch: 'scripts/templates.r' resolves to
     'templates.R' on this filesystem, but will not be found on a case-sensitive
     filesystem (e.g. Linux CI).`
-  - case-sensitive regime: `Case mismatch: 'scripts/templates.r' not found;
-    using the case-insensitive match 'templates.R'. R errors here on this
+  - `CaseSensitiveFs`: `Case mismatch: 'scripts/templates.r' not found; using
+    the case-insensitive match 'templates.R'. R errors here on this
     case-sensitive filesystem — fix the path casing.`
 
-Mutual exclusivity is structural: a path either resolves to an existing file
-(→ possible case-mismatch diagnostic) or it does not (→ `unresolved-source-path`
-/ file-not-found). The two never fire for the same source.
+Mutual exclusivity with `unresolved-source-path` is structural: a path with
+`case_mismatch = Some` resolved to an existing file, so the missing-file branch
+does not fire for it.
 
-The standalone collector currently batches an existence check; the snapshot
-collector keys off `resolved.is_none()`. The case-mismatch call slots into the
-"resolved + exists" path of each so the resulting behavior matches.
+The collector is invoked from the same two production places that currently run
+missing-file collection (the standalone/live path and the snapshot path) so LSP
+and `raven check` behave identically.
 
 ### Component 4 — `raven.crossFile.caseMismatchSeverity` setting
 
@@ -170,8 +225,10 @@ so `"auto"` is distinct from a pinned level and from `off`.
 
 Wiring (the standard three-place + reference-regen dance for a new LSP setting):
 - Rust config layering: `config_file/mod.rs` (the raw layer + the
-  `recompute_parsed_configs` writer), the `cross_file_config` carried in
-  `DiagnosticsSnapshot`, and the standalone collector's parameters.
+  `recompute_parsed_configs` writer) and the `cross_file_config`
+  (`cross_file/config.rs`) carried in `DiagnosticsSnapshot`, plus the parameter
+  threaded into the dedicated case-mismatch collector on the standalone/live
+  path.
 - Backend init-options parsing: `backend.rs` string→value mapping (add the
   `"auto"` sentinel handling).
 - VS Code: `editors/vscode/package.json` schema, the shared
@@ -207,28 +264,37 @@ happens, so no cascade either).
 
 ## Testing
 
-- **`path_resolve.rs` unit tests** (tempdir, FS-agnostic):
-  - uniqueness-aware resolution: single ci match resolves to the real entry; 2+
-    ci matches → unresolved; exact-case query is returned verbatim (extends the
-    existing `canonicalize_case_below_*` tests).
-  - `source_path_case_mismatch`: detects a below-base directory-component
-    mismatch as well as a filename mismatch; returns `None` for exact matches and
-    for genuinely-missing files.
-  - pure `regime(typed_exists)` mapping → INFO/WARNING.
+- **`path_resolve.rs` unit tests** (tempdir):
+  - uniqueness-aware `real_entry_name` variant: single ci match → the real
+    entry; 2+ ci matches → no match (ambiguous); exact-case query returned
+    verbatim (extends the existing `canonicalize_case_below_*` tests).
+  - `resolve_path_rich` ordering: an exact match beats a case-insensitive match
+    at the same and at a later base (file-relative exact vs workspace-fallback
+    ci; workspace-fallback exact vs file-relative ci). On a case-sensitive host
+    a single-ci-match forward path resolves with
+    `case_mismatch = Some(CaseSensitiveFs)`; an ambiguous 2+-match path resolves
+    to `path: Some(lexical)`, `case_mismatch: None`. Backward
+    (`try_workspace_fallback = false`) never yields `case_mismatch`.
+  - regime correctness: when run on a case-insensitive host, a case-variant
+    forward path yields `Some(CaseInsensitiveFs)`; the `CaseSensitiveFs` arm is
+    asserted on a case-sensitive host (see below).
 - **`handlers.rs` collector tests:** a forward `source()` with a case-only
-  mismatch produces exactly one `source-path-case-mismatch` at the path span,
-  the correct severity, **no** `unresolved-source-path`, and **no**
-  `undefined-variable` cascade for the sourced file's symbols. Cover both
-  collectors.
-- **Config tests:** `"auto"` / pinned / `"off"` each map to the expected
-  emission; VS Code `settings.test.ts` named-value cases; settings-reference
-  drift test stays green.
-- **Case-sensitive-regime integration:** the WARNING regime requires
-  `typed.exists() == false` alongside a ci match, which cannot be constructed on
-  a case-insensitive host. Gate the full end-to-end WARNING assertion on a
-  genuinely case-sensitive host (runs in Linux CI); the regime *logic* is covered
-  host-independently via the pure `regime` function and via direct
-  `canonicalize_case_below`-style tests.
+  mismatch produces exactly one `source-path-case-mismatch` at the expected
+  range/severity, **no** `unresolved-source-path`, and (via an integration-level
+  check) **no** `undefined-variable` cascade for the sourced file's symbols.
+  Assert the dedicated collector is **independent of `missingFileSeverity`** —
+  with `missingFileSeverity = "off"` and `caseMismatchSeverity` non-off, the
+  case-mismatch diagnostic still emits.
+- **Config tests:** `"auto"` / pinned level / `"off"` each map to the expected
+  emission and severity; VS Code `settings.test.ts` named-value cases;
+  settings-reference drift test stays green.
+- **Host-FS dependence.** The `CaseSensitiveFs` regime requires the typed
+  spelling to not exist while a ci match does — impossible to construct on a
+  case-insensitive host. Tests that need it are gated with a runtime
+  case-sensitivity probe (create `aA`-style temp entries and check) and run for
+  real in Linux CI; on a case-insensitive dev host they assert the
+  `CaseInsensitiveFs` arm instead. The ordering/uniqueness tests are
+  host-agnostic.
 
 ## Docs to update
 
@@ -242,23 +308,21 @@ happens, so no cascade either).
 - `docs/cli.md`: note that `raven check` on case-sensitive CI surfaces the
   WARNING.
 
-## Risks / open questions for adversarial review
+## Risks / notes (post-review)
 
 - **Uniqueness vs. the existing first-match `real_entry_name`.** The existing
   `canonicalize_case_below` deliberately takes the first ci match (correct for
-  the post-`exists()` correction). The new branch must *not* resolve ambiguous
-  multi-match cases. Ensure the two code paths don't conflate.
-- **Per-directory regime accuracy.** Deriving the regime from `typed.exists()`
-  assumes the directory holding the file has consistent case behavior. This is
-  true per-directory in practice; document the assumption.
-- **Determinism across machines.** The same file yields INFO on a dev's Mac and
-  WARNING in Linux CI under `"auto"`. This is *intended* (the issue explicitly
-  wants the CI signal), but it means a snapshot/golden test of severity must not
-  assume a fixed level under `"auto"`.
-- **Interaction with `missingFileSeverity = "off"`.** The chosen design gives
-  case-mismatch its own knob, so turning off missing-file diagnostics does not
-  silence case-mismatch. Confirm this is desired (it is, per the dedicated-knob
-  decision).
-- **Backward-directive resolution leniency** is a deliberate, diagnostic-free
-  side effect. Confirm no test asserts that a case-typo'd backward directive
-  stays unresolved.
+  the post-`exists()` correction in steps 1–2). The new single-match gate
+  (steps 3–4) uses a *separate* uniqueness-aware lookup and must not resolve
+  ambiguous multi-match cases. The two paths stay distinct.
+- **Determinism across machines.** Under `"auto"` the same file yields INFO on a
+  dev's Mac and WARNING in Linux CI. This is *intended* (the issue wants the CI
+  signal). Golden/snapshot severity tests must not assume a fixed level under
+  `"auto"` — see Host-FS dependence in Testing.
+- **`ResolveOutcome` refactor blast radius.** The five consumers keep their
+  `Option<PathBuf>` signatures via thin wrappers, so the refactor is internal to
+  `path_resolve.rs`; verify no consumer relied on a behavior other than "return
+  the resolved path or None".
+- **`raven check` snapshot vs live parity.** Ensure the dedicated case-mismatch
+  collector is wired into both the standalone/live and snapshot code paths so the
+  LSP and CLI agree (mirroring how missing-file collection is dual-wired).
