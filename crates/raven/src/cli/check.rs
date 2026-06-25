@@ -384,14 +384,17 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         footer.push(note);
     }
     if !footer.is_empty() {
-        // One `raven check:` header attributes the whole block, so the individual
-        // notes carry no per-line prefix (every note here is from `raven check` —
-        // repeating it on each line is noise). A leading blank line separates the
-        // block from the summary line `render` just wrote, and notes are joined by
-        // a blank line so stacked notes read as distinct paragraphs rather than
-        // running together. The header rides the same stream as the notes
-        // (`footer_stream`) so it can't be reordered away from them.
-        let body = format!("\nraven check:\n{}", footer.join("\n\n"));
+        // The notes carry no header and no per-line prefix: this is `raven
+        // check`'s own contiguous output, so labeling it `raven check:` mid-stream
+        // is redundant self-reference (cf. ESLint, which prints its trailing
+        // summary unlabeled). A leading blank line separates the block from the
+        // summary line `render` just wrote, and notes are joined by a blank line
+        // so stacked notes read as distinct paragraphs rather than running
+        // together. (The standalone degraded-environment startup note on stderr
+        // keeps a `raven check: ` prefix — there it is a lone line that can
+        // interleave with other programs' output, where the prefix earns its
+        // place; see `degraded_env_note`.)
+        let body = format!("\n{}", footer.join("\n\n"));
         match footer_stream(args.format) {
             FooterStream::Stdout => {
                 use std::io::Write as _;
@@ -586,7 +589,7 @@ fn resolve_project_config_with_options(
 ///   without re-stat-ing disk — the build already knows whether the shipped
 ///   `names.db` actually loaded, which a bare `Path::exists()` cannot tell;
 /// - the present-but-unusable package-DB load notes (unprefixed; the caller's
-///   footer carries one `raven check:` header for the whole block). The caller folds these into the shared footer rather
+///   footer prints the notes blank-line-separated with no header). The caller folds these into the shared footer rather
 ///   than this function printing them, so they ride the diagnostics' own stream
 ///   (stdout for `text`) instead of being reorderable against the findings on
 ///   stderr. See `footer_stream`.
@@ -619,7 +622,7 @@ async fn maybe_init_r(
     // them relative to the findings. Extract before the status match below
     // partially moves `outcome`.
     // No `raven check: ` prefix: these ride the caller's shared footer, which
-    // carries one `raven check:` header for the whole block.
+    // prints its notes blank-line-separated with no header.
     let load_notes: Vec<String> = outcome.load_notes.clone();
 
     // Always install the returned library: on a non-`Ready` status it may still
@@ -1012,7 +1015,7 @@ fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<Stri
         ));
     }
     // Blank line between the two sub-notes so they read as distinct paragraphs
-    // under the footer's single `raven check:` header (no per-note prefix).
+    // in the footer (which carries no header and no per-note prefix).
     Some(lines.join("\n\n"))
 }
 

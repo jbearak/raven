@@ -309,7 +309,7 @@ Both `check` and `lint` share the same renderers:
 Diagnostics go to **stdout** for both commands. Beyond the diagnostics themselves, `raven check` may print a handful of **context notes** — short prose that explains *why* a result might be incomplete or how to act on it (`raven lint` prints none of these). They fall into two groups by *when* they appear:
 
 - **Startup notes** — printed once, *before* any diagnostics, to **stderr**. They report a degraded environment that affects the whole run.
-- **Footer notes** — printed once, *after* all diagnostics, as a footer. They annotate the findings above them. For `text` they go to **stdout** (the diagnostics' own stream); for `json` / `sarif` they go to **stderr** so they can't corrupt the machine document on stdout. The footer is set off from the summary line by a blank line and introduced by a single `raven check:` header; the individual notes carry no per-line prefix and, when more than one fires, are separated by a blank line.
+- **Footer notes** — printed once, *after* all diagnostics, as a footer. They annotate the findings above them. For `text` they go to **stdout** (the diagnostics' own stream); for `json` / `sarif` they go to **stderr** so they can't corrupt the machine document on stdout. The footer is set off from the summary line by a blank line and carries no header or per-line prefix (it is `raven check`'s own output, so labeling it as such mid-stream would be redundant); when more than one note fires, they are separated by a blank line.
 
 Footer notes share the diagnostics' stream for `text` deliberately: stdout and stderr are independent streams that a merged consumer (a terminal, `2>&1`, or a CI log viewer such as GitHub Actions, which timestamps each line as it reads it) can reorder, which would interleave a multi-line note with the findings it describes. One stream keeps them grouped and in order — so a note never refers to another by position across streams.
 
@@ -338,7 +338,7 @@ All three variants share the same tail — ``package symbol resolution is limite
 
 When some undefined-variable findings sit inside call arguments that Raven cannot see into (a package function that *might* capture the argument via [non-standard evaluation](non-standard-evaluation.md)), the **`text`** report prints one footer after the findings — and **only** there. The footer is framed carefully so it never reads as Raven asserting the call *is* NSE: it leads with the universal false-positive escape hatches every linter has (`# raven: ignore`, `# nolint`, `# raven: expect`) and presents NSE as the *one R-specific* additional cause. It then lists the distinct, copy-pasteable per-function directives (one per function, however many findings it caused) and links [the directives reference](directives.md) and [handling false positives](diagnostics.md). The snippet is enough to apply without understanding the syntax; the links explain it — mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline.
 
-It reads (with concrete callees filled in), under the footer's shared `raven check:` header:
+It reads (with concrete callees filled in), as a footer after the findings:
 
 ```
 3 undefined-variable findings above sit inside calls to package functions
