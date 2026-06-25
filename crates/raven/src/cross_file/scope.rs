@@ -4880,7 +4880,11 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 ///
 /// `u64` hash of the provided `interface`, `package_loads` (each package name
 /// with its `(line, column)` — position matters for cross-file scope, see the
-/// hashing site), `declared_symbols`, `top_level_removals`, `data_loads`, and
+/// hashing site), `declared_symbols` (each with its `formals`, since a
+/// `# raven: func` formal-order edit must revalidate dependents — see the
+/// hashing site), `nse_declarations` (each with `line` and scope, so a
+/// `# raven: nse` directive edit in any connected file revalidates dependents —
+/// see the hashing site), `top_level_removals`, `data_loads`, and
 /// `declarations` (the `(name, line)` pairs of all timeline `Declaration`
 /// events — see [`extract_top_level_declarations`]).
 /// Extract `(package, line, column, function_scope)` for every `PackageLoad`
