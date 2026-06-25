@@ -357,7 +357,8 @@ raven needs the function's parameter list to know which formal the argument is, 
 on separate lines — each `# raven:` directive must be the only one on its line. When
 the argument is passed by name, naming that formal (`# raven: nse fn(x)`) is enough.
 
-See <directives.md> for these directives and <diagnostics.md> for handling false positives.
+See https://github.com/jbearak/raven/blob/main/docs/directives.md for these directives and
+https://github.com/jbearak/raven/blob/main/docs/diagnostics.md for handling false positives.
 ```
 
 (Named-formal suggestions are listed first; the wordier positional form, with the explanation above, last.)
