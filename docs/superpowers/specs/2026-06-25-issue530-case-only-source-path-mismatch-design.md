@@ -183,15 +183,23 @@ are no duplicates and the async strip step needs no new string to match.
 collection goes **outside** that block, gated by its own resolved
 `caseMismatchSeverity`, so `missingFileSeverity = "off"` does not silence it.
 `diagnostics_async_standalone` gains a new parameter carrying the
-case-mismatch severity config; both callers (`backend.rs`, `cli/check.rs`) pass
-it from the snapshot's `cross_file_config`.
+case-mismatch severity config. **All** production callers must pass it from the
+snapshot's `cross_file_config`: the debounced LSP path (`backend.rs:2539`), the
+`publish_diagnostics_inner` LSP path (`backend.rs:8363`), and `raven check`
+(`cli/check.rs:1116`). Test call sites (e.g. `backend.rs:15744`) are updated
+too. A search for every `diagnostics_async_standalone(` call must come up
+fully-threaded — missing one would silently drop the diagnostic on that path.
 
 Dedicated collector, e.g.
 `collect_case_mismatch_diagnostics_standalone(uri, meta, workspace_folders, cfg) -> Vec<Diagnostic>`:
 
-- Iterate `meta.sources` (**forward only**; skip
-  `exempt_from_missing_file_diagnostics`). Backward directives are not
-  considered.
+- Iterate `meta.sources` (**forward only**). Skip any source where
+  `source.system_file.is_some()` — `system.file()` sources are a non-goal, and
+  branch-1 self-package entries (path `/inst/...`) are **not**
+  `exempt_from_missing_file_diagnostics` (`types.rs:370`), so they must be
+  excluded explicitly here or they would wrongly draw a case-mismatch
+  diagnostic. Also skip `exempt_from_missing_file_diagnostics` (inert/resolved
+  system.file entries). Backward directives are not considered.
 - For each, build the forward `PathContext` and call `resolve_source_path_rich`.
   When `case_mismatch` is `Some`, push a diagnostic. Because the regime comes
   from resolution, no separate existence check is needed.
