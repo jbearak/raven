@@ -59,3 +59,7 @@ To resync `r.tmLanguage.json` / `rmd.tmLanguage.json`:
    still match the new upstream `package.json`. If upstream renames a
    scope or adds an embedded language we want surfaced, update the
    manifest in lockstep.
+7. If you add or remove a vendored grammar (not merely resync the bytes of
+   an existing one), keep the user-facing docs that describe syntax
+   highlighting and remote-host behavior in lockstep —
+   `docs/syntax-highlighting.md` and `docs/knit.md`.

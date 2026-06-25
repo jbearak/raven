@@ -9,6 +9,9 @@
 // a thin shim over it: it parses argv and dispatches into `raven::cli` /
 // `raven::backend`, linking the already-compiled library rather than
 // recompiling every module a second time as a separate bin-crate module tree.
+// Re-declaring modules here (`mod foo;`) would resurrect that second tree — a
+// full duplicate compile AND a duplicated unit-test run. Declare new top-level
+// modules in `lib.rs`, never here.
 use raven::{backend, cli};
 use std::env;
 
