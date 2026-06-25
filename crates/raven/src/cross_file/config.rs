@@ -7,6 +7,38 @@
 use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
+use super::path_resolve::CaseMismatchRegime;
+
+/// Severity policy for the `source-path-case-mismatch` diagnostic (issue #530).
+/// Distinct from the plain `Option<DiagnosticSeverity>` other categories use
+/// because the default (`Auto`) is host-derived rather than a fixed level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaseMismatchSeverity {
+    /// Host-derived: information on a case-insensitive filesystem (portability
+    /// hazard), warning on a case-sensitive one (R would error). Default.
+    #[default]
+    Auto,
+    /// A user-pinned level applied in both regimes.
+    Fixed(DiagnosticSeverity),
+    /// Diagnostic suppressed entirely (resolution still happens, so no cascade).
+    Off,
+}
+
+impl CaseMismatchSeverity {
+    /// Resolve to the concrete severity for a given mismatch regime, or `None`
+    /// when the diagnostic should not be emitted.
+    pub fn resolve(self, regime: CaseMismatchRegime) -> Option<DiagnosticSeverity> {
+        match self {
+            CaseMismatchSeverity::Off => None,
+            CaseMismatchSeverity::Fixed(severity) => Some(severity),
+            CaseMismatchSeverity::Auto => Some(match regime {
+                CaseMismatchRegime::CaseInsensitiveFs => DiagnosticSeverity::INFORMATION,
+                CaseMismatchRegime::CaseSensitiveFs => DiagnosticSeverity::WARNING,
+            }),
+        }
+    }
+}
+
 /// How backward dependencies (parent files that source this file) are resolved
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackwardDependencyMode {
@@ -78,6 +110,10 @@ pub struct CrossFileConfig {
     pub undefined_variable_in_bracket_indices: bool,
     /// Severity for missing file diagnostics (None = disabled)
     pub missing_file_severity: Option<DiagnosticSeverity>,
+    /// Severity policy for the `source-path-case-mismatch` diagnostic (issue
+    /// #530). Independent of `missing_file_severity` so turning off missing-file
+    /// diagnostics does not silence this. Default `Auto` (host-derived).
+    pub case_mismatch_severity: CaseMismatchSeverity,
     /// Severity for circular dependency diagnostics (None = disabled)
     pub circular_dependency_severity: Option<DiagnosticSeverity>,
     /// Severity for out-of-scope symbol diagnostics (None = disabled)
@@ -209,6 +245,7 @@ impl Default for CrossFileConfig {
             undefined_variable_in_call_arguments: true,
             undefined_variable_in_bracket_indices: true,
             missing_file_severity: Some(DiagnosticSeverity::WARNING),
+            case_mismatch_severity: CaseMismatchSeverity::Auto,
             circular_dependency_severity: Some(DiagnosticSeverity::ERROR),
             out_of_scope_severity: Some(DiagnosticSeverity::WARNING),
             report_unused_suppressions: false,
@@ -356,6 +393,41 @@ mod tests {
         config2 = CrossFileConfig::default();
         config2.undefined_variable_severity = Some(DiagnosticSeverity::ERROR);
         assert!(!config1.scope_settings_changed(&config2));
+    }
+
+    #[test]
+    fn case_mismatch_severity_default_is_auto_and_resolves_host_derived() {
+        use super::super::path_resolve::CaseMismatchRegime;
+        // Default is Auto.
+        assert_eq!(
+            CrossFileConfig::default().case_mismatch_severity,
+            CaseMismatchSeverity::Auto
+        );
+        // Auto → information on a case-insensitive FS, warning on a case-sensitive FS.
+        assert_eq!(
+            CaseMismatchSeverity::Auto.resolve(CaseMismatchRegime::CaseInsensitiveFs),
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+        assert_eq!(
+            CaseMismatchSeverity::Auto.resolve(CaseMismatchRegime::CaseSensitiveFs),
+            Some(DiagnosticSeverity::WARNING)
+        );
+        // A pinned level overrides both regimes.
+        assert_eq!(
+            CaseMismatchSeverity::Fixed(DiagnosticSeverity::ERROR)
+                .resolve(CaseMismatchRegime::CaseInsensitiveFs),
+            Some(DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            CaseMismatchSeverity::Fixed(DiagnosticSeverity::ERROR)
+                .resolve(CaseMismatchRegime::CaseSensitiveFs),
+            Some(DiagnosticSeverity::ERROR)
+        );
+        // Off suppresses in every regime.
+        assert_eq!(
+            CaseMismatchSeverity::Off.resolve(CaseMismatchRegime::CaseSensitiveFs),
+            None
+        );
     }
 
     #[test]

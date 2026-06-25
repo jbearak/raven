@@ -34,6 +34,12 @@ pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 pub const SYNTAX_ERROR: &str = "syntax-error";
 /// A `source()` / `# raven: source` path that does not resolve to a file.
 pub const UNRESOLVED_SOURCE_PATH: &str = "unresolved-source-path";
+/// A `source()` / forward-directive path that resolves only via a case-only
+/// difference from the real on-disk filename (issue #530). Host-derived
+/// severity: information on a case-insensitive filesystem (a portability hazard
+/// — it will break on case-sensitive Linux), warning on a case-sensitive one
+/// (R itself would error). Governed by its severity setting, not suppressible.
+pub const SOURCE_PATH_CASE_MISMATCH: &str = "source-path-case-mismatch";
 /// Assignment whose target is a string literal (`"x" <- 1`) or other
 /// almost-certainly-unintended target.
 pub const ASSIGN_TO_STRING_LITERAL: &str = "assign-to-string-literal";
@@ -62,6 +68,7 @@ pub const ANALYZER_CODES: &[&str] = &[
     UNDEFINED_VARIABLE,
     SYNTAX_ERROR,
     UNRESOLVED_SOURCE_PATH,
+    SOURCE_PATH_CASE_MISMATCH,
     ASSIGN_TO_STRING_LITERAL,
     PACKAGE_NOT_INSTALLED,
     NAMESPACE_MEMBER_NOT_FOUND,
@@ -622,5 +629,14 @@ mod tests {
         assert!(!is_suppressible("unclosed-paren"));
         assert!(!is_suppressible("unresolved-source-path"));
         assert!(!is_suppressible("unused-suppression"));
+    }
+
+    #[test]
+    fn source_path_case_mismatch_is_registered_and_not_suppressible() {
+        // Issue #530: a registered analyzer code, governed only by its severity
+        // setting (like unresolved-source-path), never by `# raven: ignore`.
+        assert!(ANALYZER_CODES.contains(&SOURCE_PATH_CASE_MISMATCH));
+        assert!(!is_suppressible(SOURCE_PATH_CASE_MISMATCH));
+        assert_eq!(SOURCE_PATH_CASE_MISMATCH, "source-path-case-mismatch");
     }
 }

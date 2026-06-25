@@ -90,6 +90,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.revalidationDebounceMs', jsonPath: ['crossFile', 'revalidationDebounceMs'], type: 'number' },
     // Cross-file severity settings
     { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.caseMismatchSeverity', jsonPath: ['crossFile', 'caseMismatchSeverity'], type: 'enum', enumValues: ['auto', 'error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
@@ -510,6 +511,21 @@ suite('Settings Transmission Unit Tests', () => {
             assert.strictEqual(options.packages?.missingPackageSeverity, severity);
             assert.strictEqual(options.packages?.namespaceMemberSeverity, severity);
             assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, severity);
+        }
+    });
+
+    /**
+     * Unit test: caseMismatchSeverity accepts the standard severity levels AND
+     * the host-derived `auto` sentinel (issue #530).
+     */
+    test('caseMismatchSeverity transmits including the auto sentinel', () => {
+        const values = ['auto', 'error', 'warning', 'information', 'hint', 'off'] as const;
+        for (const value of values) {
+            const mockConfig = createMockConfig(
+                new Map<string, unknown>([['crossFile.caseMismatchSeverity', value]]),
+            );
+            const options = getInitializationOptions(mockConfig);
+            assert.strictEqual(options.crossFile?.caseMismatchSeverity, value);
         }
     });
 

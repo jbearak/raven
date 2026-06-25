@@ -56,6 +56,7 @@ export interface RavenInitializationOptions {
         maxRevalidationsPerTrigger?: number;
         revalidationDebounceMs?: number;
         missingFileSeverity?: SeverityLevel;
+        caseMismatchSeverity?: SeverityLevel | "auto";
         circularDependencySeverity?: SeverityLevel;
         outOfScopeSeverity?: SeverityLevel;
         maxChainDepthSeverity?: SeverityLevel;
@@ -186,6 +187,7 @@ export function getInitializationOptions(
     const maxRevalidationsPerTrigger = getExplicitSetting<number>(config, 'crossFile.maxRevalidationsPerTrigger');
     const revalidationDebounceMs = getExplicitSetting<number>(config, 'crossFile.revalidationDebounceMs');
     const missingFileSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.missingFileSeverity');
+    const caseMismatchSeverity = getExplicitSetting<SeverityLevel | "auto">(config, 'crossFile.caseMismatchSeverity');
     const circularDependencySeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.circularDependencySeverity');
     const outOfScopeSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.outOfScopeSeverity');
     const maxChainDepthSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.maxChainDepthSeverity');
@@ -237,6 +239,7 @@ export function getInitializationOptions(
         maxRevalidationsPerTrigger !== undefined ||
         revalidationDebounceMs !== undefined ||
         missingFileSeverity !== undefined ||
+        caseMismatchSeverity !== undefined ||
         circularDependencySeverity !== undefined ||
         outOfScopeSeverity !== undefined ||
         maxChainDepthSeverity !== undefined ||
@@ -274,6 +277,9 @@ export function getInitializationOptions(
         }
         if (missingFileSeverity !== undefined) {
             options.crossFile.missingFileSeverity = missingFileSeverity;
+        }
+        if (caseMismatchSeverity !== undefined) {
+            options.crossFile.caseMismatchSeverity = caseMismatchSeverity;
         }
         if (circularDependencySeverity !== undefined) {
             options.crossFile.circularDependencySeverity = circularDependencySeverity;

@@ -31,6 +31,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
 | `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
 | `unresolved-source-path` | A forward-directive path (`source()`, `# raven: source` / `# raven: run` / `# raven: include`) that does not resolve to a file | No |
+| `source-path-case-mismatch` | A `source()` / forward-directive path that resolves only by a case difference from the real filename (`templates.r` vs `templates.R`) | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
 | `package-not-installed` | `library()` / `require()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
 | `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported object (never for `pkg:::member`) | Yes |
@@ -212,12 +213,22 @@ Data objects (a package's `lazy_data`, and base-package datasets such as `datase
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
 | Missing file | warning | `source()` or directive references a file that doesn't exist |
+| Source path case mismatch | information / warning (host-derived) | `source()` or forward directive resolves only by a case difference from the real filename |
 | Circular dependency | error | Two files source each other (directly or transitively) |
 | Max chain depth exceeded | warning | Source chain exceeds configured maximum depth |
 | Out-of-scope symbol | warning | Symbol from a sourced file used before the `source()` call |
 | Redundant directive | hint | `# raven: source` directive for a file already brought in by an earlier `source()` call |
 
 These dependency-graph diagnostics are **not** suppressible with `# raven: ignore`; turn each off via its severity setting (see [Configuration](configuration.md)). The out-of-scope-symbol diagnostic is the exception — it honors `# raven: ignore` / `# raven: ignore-next` on the offending usage line.
+
+#### Source path case mismatch
+
+When a `source()` call or forward directive (`# raven: source` / `# raven: run` / `# raven: include`) names a path that differs from the real on-disk filename **only by case** — e.g. `source("scripts/templates.r")` when the file is `templates.R` — Raven still resolves the file into the source graph (so the symbols it defines stay visible and you don't get a flood of false `undefined-variable` warnings), and reports the problem **once, at the `source()` line**, as `source-path-case-mismatch`. Its severity is host-derived under the default `"auto"` policy:
+
+- **Case-insensitive filesystem** (macOS, typical Windows): **information**. The path works here, but it is a portability hazard — it will not be found on a case-sensitive filesystem such as Linux CI.
+- **Case-sensitive filesystem** (Linux/CI): **warning**. R itself would error at `source()` time; Raven resolves the single case-insensitive match anyway so the one actionable warning isn't buried under downstream noise.
+
+Because the severity reflects the host filesystem, the same code can surface as information on a developer's Mac and as a warning in Linux CI — which is intended: CI is exactly where the case-sensitive failure bites. Pin a fixed level or turn it off with [`raven.crossFile.caseMismatchSeverity`](configuration.md) (default `"auto"`). When two on-disk files match the path case-insensitively (only possible on a case-sensitive filesystem) the path is ambiguous, so Raven leaves it unresolved and reports `unresolved-source-path` instead. The match is ASCII-only.
 
 ### Assignment Targets
 
