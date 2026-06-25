@@ -8777,8 +8777,8 @@ where
 /// it never enters a production build). It mirrors what the diagnostics path in
 /// `handlers.rs` does per usage — `advance_to` followed by `is_visible(name)` —
 /// without requiring external benches to construct the `pub(crate)`
-/// [`ScopeStream`] directly. It is **NOT** a public API: do not call it from
-/// production code, and do not widen [`ScopeStream`]'s visibility for it.
+/// `ScopeStream` directly. It is **NOT** a public API: do not call it from
+/// production code, and do not widen `ScopeStream`'s visibility for it.
 ///
 /// `positions` must be in document order (the cursor advances monotonically;
 /// out-of-order targets are no-ops). Returns `0` if the stream can't be

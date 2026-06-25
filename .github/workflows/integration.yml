@@ -93,11 +93,16 @@ jobs:
       # from public docs, empty/invalid code blocks, malformed HTML) so doc
       # hygiene can't silently re-accumulate (issue #529). `--document-private-items`
       # checks internal docs too; `--no-deps` skips dependency docs. Runs here so
-      # it reuses the Clippy job's sccache/registry caches. The default (no-feature)
-      # invocation mirrors the issue's repro exactly; a `--features test-support`
-      # variant is tracked separately in issue #541.
+      # it reuses the Clippy job's sccache/registry caches. Both invocations are
+      # gated: the default (no-feature) build (issue #529) and the `--features
+      # test-support` build (issue #541), because each feature configuration
+      # compiles a different set of doc items (e.g. test-support-gated `pub fn`s)
+      # and so exposes different doc/link targets. The test-support build reuses
+      # the Clippy step's warm codegen on this same job.
       - name: Check rustdoc (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items
+      - name: Check rustdoc (deny warnings, test-support)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items --features test-support
 
 
   # Build only the release artifacts that genuinely need optimization: the LSP
