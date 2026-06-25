@@ -2058,6 +2058,8 @@ mod tests {
         Url::from_file_path(temp_dir.path().join(file)).unwrap()
     }
 
+    use crate::test_utils::host_is_case_sensitive;
+
     fn make_source(path: &str, line: u32) -> super::super::types::ForwardSource {
         super::super::types::ForwardSource {
             path: path.to_string(),
@@ -3189,6 +3191,93 @@ mod tests {
         let dependents = graph.get_dependents(&child);
         assert_eq!(dependents.len(), 1);
         assert_eq!(dependents[0].from, parent);
+    }
+
+    #[test]
+    fn test_backward_directive_case_only_mismatch_forms_edge_to_real_file() {
+        // Issue #535: a wrong-cased `# raven: sourced-by Parent.r` (real file
+        // Parent.R) must still form the backward edge — to the REAL on-disk spelling
+        // (Parent.R), so the edge target matches the workspace index key (#476) and
+        // the child inherits the parent's scope instead of cascading
+        // undefined-variable warnings. Resolves on a case-insensitive FS via the
+        // step-1 correction AND on a case-sensitive FS via the new single-ci-match
+        // leniency, so the edge target is Parent.R regardless of host.
+        use super::super::types::{BackwardDirective, CallSiteSpec};
+
+        let (temp_dir, workspace_url) = create_temp_workspace(&["Parent.R", "child.R"]);
+        let child = temp_url(&temp_dir, "child.R");
+        let real_parent = temp_url(&temp_dir, "Parent.R");
+
+        let mut graph = DependencyGraph::new();
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "Parent.r".to_string(), // wrong case
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&child, &meta, Some(&workspace_url), |_| None);
+
+        let dependents = graph.get_dependents(&child);
+        assert_eq!(
+            dependents.len(),
+            1,
+            "the case-only-mismatched backward directive must still form an edge: {dependents:?}"
+        );
+        assert_eq!(
+            dependents[0].from, real_parent,
+            "edge must target the REAL on-disk spelling (Parent.R), not the typed 'Parent.r'"
+        );
+    }
+
+    #[test]
+    fn test_backward_directive_ambiguous_case_does_not_pick_a_real_file() {
+        // 2+ case-insensitive matches (only constructible on a case-sensitive FS) →
+        // ambiguous → the directive must NOT silently resolve to either real file.
+        // Like a missing target, the graph still records an edge to the lexical
+        // (non-existent) typed path — `do_resolve_backward` checks existence later,
+        // not at edge-creation — but that target must be the typed `PARENT.R`,
+        // never `Parent.R` or `parent.R`, so no symbols flow from an
+        // arbitrarily-picked file.
+        if !host_is_case_sensitive() {
+            return;
+        }
+        use super::super::types::{BackwardDirective, CallSiteSpec};
+
+        let (temp_dir, workspace_url) = create_temp_workspace(&["Parent.R", "parent.R", "child.R"]);
+        let child = temp_url(&temp_dir, "child.R");
+
+        let mut graph = DependencyGraph::new();
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "PARENT.R".to_string(), // matches both case-insensitively
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        graph.update_file(&child, &meta, Some(&workspace_url), |_| None);
+
+        // Exactly one edge is recorded, and it targets the lexical (non-existent)
+        // typed `PARENT.R` — never `Parent.R` or `parent.R`. Asserting the concrete
+        // target (rather than only `!= real_file`) keeps this non-vacuous on a
+        // case-sensitive host even if edge-creation behavior changes.
+        let dependents = graph.get_dependents(&child);
+        assert_eq!(
+            dependents.len(),
+            1,
+            "ambiguous directive still records one edge (to the lexical, non-existent target)"
+        );
+        let lexical = temp_url(&temp_dir, "PARENT.R");
+        assert_eq!(
+            dependents[0].from, lexical,
+            "edge targets the typed (non-existent) PARENT.R, not an arbitrarily-picked real file"
+        );
+        assert_ne!(dependents[0].from, temp_url(&temp_dir, "Parent.R"));
+        assert_ne!(dependents[0].from, temp_url(&temp_dir, "parent.R"));
     }
 
     #[test]

@@ -98,7 +98,7 @@ Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
 |---|---|---|
 | `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Variable used but not defined in scope, sourced files, or loaded packages |
 | `raven.crossFile.missingFileSeverity` | `"warning"` | Missing file referenced by source() or directive |
-| `raven.crossFile.caseMismatchSeverity` | `"auto"` | A `source()`/forward-directive path that resolves only by a case difference from the real filename. Also accepts `"auto"` (in addition to the levels above): **information** on a case-insensitive filesystem, **warning** on a case-sensitive one. Independent of `missingFileSeverity`. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch). |
+| `raven.crossFile.caseMismatchSeverity` | `"auto"` | A `source()`/forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename. Also accepts `"auto"` (in addition to the levels above): **information** on a case-insensitive filesystem, **warning** on a case-sensitive one. Independent of `missingFileSeverity`. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch). |
 | `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
 | `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
 | `raven.crossFile.outOfScopeSeverity` | `"warning"` | Symbol used before it's in scope |

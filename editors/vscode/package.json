@@ -1079,15 +1079,15 @@
             "off"
           ],
           "enumDescriptions": [
-            "Host-derived: information on a case-insensitive filesystem (a portability hazard), warning on a case-sensitive one (R would error)",
-            "Report case-only source() path mismatches as errors",
-            "Report case-only source() path mismatches as warnings",
-            "Report case-only source() path mismatches as information",
-            "Report case-only source() path mismatches as hints",
-            "Disable case-only source() path mismatch diagnostics"
+            "Host-derived: information on a case-insensitive filesystem (a portability hazard), warning on a case-sensitive one (where a forward source() would error)",
+            "Report case-only path mismatches as errors",
+            "Report case-only path mismatches as warnings",
+            "Report case-only path mismatches as information",
+            "Report case-only path mismatches as hints",
+            "Disable case-only path mismatch diagnostics"
           ],
           "default": "auto",
-          "description": "Severity for the source-path-case-mismatch diagnostic when a source() call or forward directive resolves only by a case difference from the real filename. The file is still resolved into the source graph (no cascade of undefined-variable warnings); this controls the one diagnostic reported at the source() call. 'auto' picks information on a case-insensitive filesystem and warning on a case-sensitive one."
+          "description": "Severity for the source-path-case-mismatch diagnostic when a source() call, forward directive, or backward directive (# raven: sourced-by etc.) resolves only by a case difference from the real filename. The file is still resolved into the source graph (no cascade of undefined-variable warnings); this controls the one diagnostic reported at the path's line. 'auto' picks information on a case-insensitive filesystem and warning on a case-sensitive one."
         },
         "raven.crossFile.circularDependencySeverity": {
           "type": "string",

@@ -34,11 +34,16 @@ pub const UNDEFINED_VARIABLE: &str = "undefined-variable";
 pub const SYNTAX_ERROR: &str = "syntax-error";
 /// A `source()` / `# raven: source` path that does not resolve to a file.
 pub const UNRESOLVED_SOURCE_PATH: &str = "unresolved-source-path";
-/// A `source()` / forward-directive path that resolves only via a case-only
-/// difference from the real on-disk filename (issue #530). Host-derived
-/// severity: information on a case-insensitive filesystem (a portability hazard
-/// — it will break on case-sensitive Linux), warning on a case-sensitive one
-/// (R itself would error). Governed by its severity setting, not suppressible.
+/// A `source()` / forward-directive path (issue #530) **or** a backward-directive
+/// path (`# raven: sourced-by` / `run-by` / `included-by`, issue #535) that
+/// resolves only via a case-only difference from the real on-disk filename.
+/// Host-derived severity: information on a case-insensitive filesystem (a
+/// portability hazard — it will break on case-sensitive Linux), warning on a
+/// case-sensitive one. The forward and backward collectors share this code but
+/// emit different messages: the forward message notes R itself would error at
+/// `source()` time; the backward message does not (R never executes a backward
+/// directive — it is a Raven-only annotation) and instead asks to fix the
+/// directive's path casing. Governed by its severity setting, not suppressible.
 pub const SOURCE_PATH_CASE_MISMATCH: &str = "source-path-case-mismatch";
 /// Assignment whose target is a string literal (`"x" <- 1`) or other
 /// almost-certainly-unintended target.
