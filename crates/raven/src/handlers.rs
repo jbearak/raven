@@ -26822,6 +26822,111 @@ clean_data <- function(x) {
         );
     }
 
+    /// Issue #531 end-to-end: a package in `DESCRIPTION` `Depends:` is attached
+    /// at load time, so its exports resolve unqualified in the package's own
+    /// `R/` code — equivalent to a NAMESPACE `import(pkg)`, but with no
+    /// NAMESPACE present (the issue's exact repro). Drives the FULL path
+    /// (DESCRIPTION text → `derive_package_state` → `full_imports` →
+    /// `is_package_export` suppression).
+    #[tokio::test]
+    async fn test_depends_resolves_unqualified_symbols_in_package_file() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::{
+            ContentDigest, DescriptionInput, PackageInputDelta, RFileInput, RFileKind,
+        };
+        use crate::state::{Document, WorldState};
+
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+
+        // ggplot2 exports must be known to the library so the whole-package
+        // (`full_imports`) resolution can confirm the symbols.
+        let mut ggplot2_exports = std::collections::HashSet::new();
+        ggplot2_exports.insert("ggplot".to_string());
+        ggplot2_exports.insert("aes".to_string());
+        ggplot2_exports.insert("theme_bw".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("ggplot2".to_string(), ggplot2_exports))
+            .await;
+
+        // The issue's repro: a package with `Depends: ggplot2` and NO NAMESPACE.
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/work/pkg"));
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(DescriptionInput {
+            text: "Package: tp\nVersion: 0.0.1\nDepends: ggplot2\n".into(),
+        });
+        let r_text: std::sync::Arc<str> =
+            "myplot <- function(d) ggplot(d, aes(x, y)) + theme_bw()\nz <- genuine_undefined()\n"
+                .into();
+        state.package_inputs.r_files.insert(
+            std::path::PathBuf::from("/work/pkg/R/p.r"),
+            RFileInput {
+                kind: RFileKind::Source,
+                text: r_text.clone(),
+                content_digest: ContentDigest::of(&r_text),
+            },
+        );
+        state.apply_package_event(&PackageInputDelta::Initial);
+
+        // Derivation must have placed ggplot2 in full_imports (no NAMESPACE).
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .full_imports
+                .contains("ggplot2"),
+            "Depends: ggplot2 must populate full_imports: {:?}",
+            state.package_state.scope_contribution().full_imports,
+        );
+
+        let code =
+            "myplot <- function(d) ggplot(d, aes(x, y)) + theme_bw()\nz <- genuine_undefined()\n";
+        let uri = Url::parse("file:///work/pkg/R/p.r").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .unwrap();
+            parser.parse(code, None).unwrap()
+        };
+
+        let mut diagnostics = Vec::new();
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot built");
+        collect_undefined_variables_from_snapshot(
+            &snapshot,
+            &uri,
+            tree.root_node(),
+            code,
+            DiagnosticSeverity::WARNING,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        // Baseline: a genuinely-undefined symbol must still fire, else the
+        // pipeline isn't running and the test is vacuous.
+        assert!(
+            messages.contains(&"genuine_undefined is not defined"),
+            "baseline undefined symbol must be flagged; got: {messages:?}",
+        );
+        for sym in ["ggplot", "aes", "theme_bw"] {
+            assert!(
+                !messages.iter().any(|m| m.contains(sym)),
+                "Depends: ggplot2 must suppress `{sym} is not defined` in R/ files; got: {messages:?}",
+            );
+        }
+    }
+
     /// Workstream B negative test: a symbol NOT listed in any `importFrom`
     /// directive must still be flagged as undefined even when other symbols
     /// from the same package ARE imported. Ensures no leak of unnamed imports.

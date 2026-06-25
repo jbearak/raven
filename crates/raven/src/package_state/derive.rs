@@ -145,7 +145,7 @@ fn build_scope_contribution(
             }
         }
     }
-    let (imported_symbols, full_imports) = match namespace_model {
+    let (imported_symbols, mut full_imports) = match namespace_model {
         Some(m) => {
             let mut imp: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             for (pkg, sym) in &m.imports {
@@ -156,6 +156,27 @@ fn build_scope_contribution(
         }
         None => (BTreeMap::new(), BTreeSet::new()),
     };
+    // Issue #531: `DESCRIPTION` `Depends:` packages are *attached* when the
+    // package is loaded (R puts their exports on the search path), so their
+    // exports resolve unqualified inside the package's own code — exactly like
+    // a NAMESPACE `import(pkg)`. Union them into `full_imports` (runs after the
+    // match, so it applies whether or not a NAMESPACE exists; the `BTreeSet`
+    // dedupes a package that is both imported and depended-on).
+    //
+    // `Imports:` is deliberately excluded: it is loaded but not attached, so it
+    // stays `::`/`importFrom`-only (matches R). Version constraints and the
+    // special `R` entry are stripped by `parse_description_field_pub`. The
+    // package's own name is filtered (`pkg != ws.name`): a valid DESCRIPTION
+    // never self-depends, but a malformed one mid-edit could, and self-name in
+    // `full_imports` would query a possibly-stale installed package of the same
+    // name.
+    if let Some(desc) = description {
+        for pkg in crate::namespace_parser::parse_description_field_pub(&desc.text, "Depends") {
+            if pkg != ws.name {
+                full_imports.insert(pkg);
+            }
+        }
+    }
     let test_attached_packages = compute_test_attached_packages(description);
     PackageScopeContribution {
         workspace_root: Some(ws.root.clone()),
@@ -440,6 +461,119 @@ mod tests {
             &PackageInputDelta::Initial,
         );
         assert_eq!(s.workspace.as_ref().unwrap().name, "unknown");
+    }
+
+    /// Issue #531: a package in `DESCRIPTION` `Depends:` is attached at load
+    /// time, so its exports resolve unqualified in the package's own code —
+    /// equivalent to a NAMESPACE `import(pkg)`. It must land in `full_imports`
+    /// even with no NAMESPACE present (the issue's repro has no NAMESPACE).
+    #[test]
+    fn depends_packages_added_to_full_imports() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: tp\nDepends: ggplot2\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            s.scope_contribution.full_imports.contains("ggplot2"),
+            "Depends: ggplot2 should contribute to full_imports"
+        );
+    }
+
+    /// `Imports:` keeps the stricter R semantics (loaded, not attached → needs
+    /// `::`/`importFrom`), so it must NOT contribute to the unqualified set.
+    #[test]
+    fn imports_not_added_to_full_imports() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: tp\nImports: dplyr\n"),
+            &PackageInputDelta::Initial,
+        );
+        assert!(
+            !s.scope_contribution.full_imports.contains("dplyr"),
+            "Imports: dplyr must not contribute to full_imports"
+        );
+    }
+
+    /// `Depends:` unions with NAMESPACE `import(pkg)` — both populate the same
+    /// unqualified-export set.
+    #[test]
+    fn depends_unions_with_namespace_full_imports() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: tp\nDepends: ggplot2\n");
+        inputs.namespace = Some(NamespaceInput {
+            text: "import(rlang)\n".into(),
+        });
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let full = &s.scope_contribution.full_imports;
+        assert!(full.contains("ggplot2"), "Depends entry missing");
+        assert!(full.contains("rlang"), "NAMESPACE import entry missing");
+    }
+
+    /// Version constraints are stripped and the special `R` entry is dropped.
+    #[test]
+    fn depends_strips_version_and_drops_r() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(
+                PackageMode::Auto,
+                "Package: tp\nDepends: R (>= 3.5), ggplot2 (>= 3.0)\n",
+            ),
+            &PackageInputDelta::Initial,
+        );
+        let full = &s.scope_contribution.full_imports;
+        assert!(full.contains("ggplot2"), "ggplot2 should be present");
+        assert!(
+            !full.contains("R"),
+            "R version requirement is not a package"
+        );
+        assert!(
+            !full.iter().any(|p| p.contains('(')),
+            "version constraints must be stripped"
+        );
+    }
+
+    /// A package both depended-on and NAMESPACE-imported collapses to one entry
+    /// (the `BTreeSet` dedupes).
+    #[test]
+    fn depends_dedupes_with_namespace() {
+        let mut inputs = with_description(PackageMode::Auto, "Package: tp\nDepends: rlang\n");
+        inputs.namespace = Some(NamespaceInput {
+            text: "import(rlang)\n".into(),
+        });
+        let s = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let count = s
+            .scope_contribution
+            .full_imports
+            .iter()
+            .filter(|p| p.as_str() == "rlang")
+            .count();
+        assert_eq!(count, 1, "rlang should appear exactly once");
+    }
+
+    /// A malformed self-dependency (`Depends:` listing the package's own name)
+    /// is filtered out so we never query a stale installed package of the same
+    /// name.
+    #[test]
+    fn depends_filters_own_package_name() {
+        let s = derive_package_state(
+            &PackageState::default(),
+            &with_description(PackageMode::Auto, "Package: tp\nDepends: tp, ggplot2\n"),
+            &PackageInputDelta::Initial,
+        );
+        let full = &s.scope_contribution.full_imports;
+        assert!(full.contains("ggplot2"), "ggplot2 should be present");
+        assert!(
+            !full.contains("tp"),
+            "own package name must be filtered from full_imports"
+        );
     }
 
     #[test]
