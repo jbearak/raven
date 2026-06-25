@@ -407,5 +407,11 @@ jobs:
           git push --force-with-lease -u origin "$BRANCH"
           gh pr create --base main --head "$BRANCH" \
             --title "raven $VERSION" \
-            --body "Automated formula bump for [raven $VERSION](https://github.com/jbearak/raven/releases/tag/v$VERSION). Checksums recomputed from the release artifacts." \
+            --body "Automated formula bump for [raven $VERSION](https://github.com/jbearak/raven/releases/tag/v$VERSION). Checksum recomputed from the release artifact." \
             || echo "PR for $BRANCH already exists; force-push updated it."
+          # Enable auto-merge: GitHub merges this PR once the tap's required
+          # `test` check passes. Because branch protection requires `test`, the
+          # PR is not immediately mergeable, so --auto is accepted (it waits)
+          # rather than merging instantly. A red check ⇒ it never merges.
+          gh pr merge "$BRANCH" --auto --squash \
+            || echo "Could not enable auto-merge; merge the PR manually."
