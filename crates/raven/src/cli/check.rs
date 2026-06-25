@@ -138,8 +138,10 @@ Options:
 
 R / packages:
   raven check auto-detects R on PATH to resolve installed-package exports and
-  base R symbols. If R is not found, package and base-symbol diagnostics are
-  limited and a note is printed to stderr; all other diagnostics still run.
+  base R symbols. If R is not found and no offline package data is present
+  (`raven packages update`/`freeze`), package symbol resolution is limited to
+  base R (still covered by the embedded database) and a note is printed to
+  stderr; all other diagnostics still run.
 
   --report-uninstalled        Report packages from library() calls that are not
                               present in the local library paths. Disabled by
@@ -382,7 +384,17 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         footer.push(note);
     }
     if !footer.is_empty() {
-        let body = footer.join("\n");
+        // The notes carry no header and no per-line prefix: this is `raven
+        // check`'s own contiguous output, so labeling it `raven check:` mid-stream
+        // is redundant self-reference (cf. ESLint, which prints its trailing
+        // summary unlabeled). A leading blank line separates the block from the
+        // summary line `render` just wrote, and notes are joined by a blank line
+        // so stacked notes read as distinct paragraphs rather than running
+        // together. (The standalone degraded-environment startup note on stderr
+        // keeps a `raven check: ` prefix — there it is a lone line that can
+        // interleave with other programs' output, where the prefix earns its
+        // place; see `degraded_env_note`.)
+        let body = format!("\n{}", footer.join("\n\n"));
         match footer_stream(args.format) {
             FooterStream::Stdout => {
                 use std::io::Write as _;
@@ -563,17 +575,21 @@ fn resolve_project_config_with_options(
 ///
 /// This function owns only the *caller policy*: it always installs the returned
 /// library, then uses `PackageLibraryOutcome::consumer_ready` for the diagnostic
-/// readiness gate. The three R-related degradations each print a one-line note
-/// to stderr so CI shows what was missing; `Disabled` (the user turned package
-/// awareness off in `raven.toml`) is silent, matching the editor.
+/// readiness gate. The three R-related degradations print a one-line note to
+/// stderr so CI shows what was missing — but only when no offline package data
+/// loaded (`!has_providers()`): a degraded R build whose coverage is served by
+/// an updated `names.db` or frozen `.raven/packages.json` is not actually
+/// degraded for package symbols, so warning (and recommending `raven packages
+/// update`, which already ran) would be a false alarm. `Disabled` (the user
+/// turned package awareness off in `raven.toml`) is silent, matching the editor.
 ///
 /// Returns `(shipped_db_load, load_notes)`:
 /// - the build's [`crate::package_library::ShippedDbLoad`] verdict, so the caller can tailor the
 ///   missing-export-metadata warning (absent / loaded / present-but-failed)
 ///   without re-stat-ing disk — the build already knows whether the shipped
 ///   `names.db` actually loaded, which a bare `Path::exists()` cannot tell;
-/// - the present-but-unusable package-DB load notes (each already prefixed
-///   `raven check: `). The caller folds these into the shared footer rather
+/// - the present-but-unusable package-DB load notes (unprefixed; the caller's
+///   footer prints the notes blank-line-separated with no header). The caller folds these into the shared footer rather
 ///   than this function printing them, so they ride the diagnostics' own stream
 ///   (stdout for `text`) instead of being reorderable against the findings on
 ///   stderr. See `footer_stream`.
@@ -605,17 +621,14 @@ async fn maybe_init_r(
     // `text`); printing to stderr inline would let a merged CI consumer reorder
     // them relative to the findings. Extract before the status match below
     // partially moves `outcome`.
-    let load_notes: Vec<String> = outcome
-        .load_notes
-        .iter()
-        .map(|note| format!("raven check: {note}"))
-        .collect();
+    // No `raven check: ` prefix: these ride the caller's shared footer, which
+    // prints its notes blank-line-separated with no header.
+    let load_notes: Vec<String> = outcome.load_notes.clone();
 
     // Always install the returned library: on a non-`Ready` status it may still
     // carry Tier 2/3 providers or bundled base exports, which are the whole
     // point of CI resolution without R. Dropping it here would send `raven
     // check` back to an empty library and lose the offline path.
-    use crate::package_library::PackageLibraryStatus::*;
     state.package_library_ready = outcome.consumer_ready();
     let status = outcome.status;
     let shipped_db_load = outcome.shipped_db_load;
@@ -630,19 +643,54 @@ async fn maybe_init_r(
     // internal as an undefined variable. Runs before `maybe_load_sysdata_fallback`,
     // which may refresh the overlay again after adding R-loaded sysdata names.
     state.refresh_local_dev_overlay();
-    match status {
-        Ready | Disabled => {}
-        RNotFound => eprintln!(
-            "raven check: R not found on PATH; package and base-symbol diagnostics will be limited"
-        ),
-        InitFailed(e) => eprintln!(
-            "raven check: R found but its package library failed to initialize ({e}); package and base-symbol diagnostics will be limited"
-        ),
-        NoLibraryPaths => eprintln!(
-            "raven check: R found but no library paths were discovered; package and base-symbol diagnostics will be limited"
-        ),
+    // The degraded-environment startup note's decision is factored into
+    // `degraded_env_note` (pure, hence unit-testable without an R environment —
+    // `RNotFound` is unreachable end-to-end on any machine with R installed,
+    // because `get_fallback_lib_paths()` finds the framework library and the
+    // build classifies `Ready`). `has_providers()` is the coverage gate: offline
+    // Tier 2/3 data resolves package symbols without R, so the note is suppressed.
+    if let Some(note) = degraded_env_note(&status, state.package_library.has_providers()) {
+        eprintln!("raven check: {note}");
     }
     (shipped_db_load, load_notes)
+}
+
+/// Shared tail of the degraded-environment startup notes: the consequence
+/// (coverage limited to base R, still covered by the embedded database) and the
+/// remedy. Identical across all three causes because the limitation and fix
+/// don't depend on *why* the live R library was unavailable.
+const DEGRADED_ENV_NOTE_TAIL: &str = "package symbol resolution is limited to base R (covered by the embedded database). Run `raven packages update` for broad CRAN/Bioconductor coverage";
+
+/// The degraded-environment startup note for a package-library build, or `None`
+/// when no note should print. (The caller prefixes `raven check: ` and writes it
+/// to stderr.)
+///
+/// `None` when the build is `Ready` (live R) or `Disabled` (package awareness
+/// off) — neither is degraded — or when `has_offline_packages`: an updated
+/// `names.db` or frozen `.raven/packages.json` resolves package symbols without
+/// R, so the warning would be a false alarm (and would tell a CI that already
+/// ran `raven packages update` to run it again). The gate is `has_providers()`,
+/// NOT `consumer_ready()`/`base_exports()`: base-only coverage is exactly the
+/// "limited to base R" case the note exists to flag. `build_package_library`
+/// does not wire a zero-package provider (an empty `names.db` /
+/// `.raven/packages.json`), so `has_providers()` means real package coverage
+/// exists — not merely that an offline file was present.
+fn degraded_env_note(
+    status: &crate::package_library::PackageLibraryStatus,
+    has_offline_packages: bool,
+) -> Option<String> {
+    use crate::package_library::PackageLibraryStatus::*;
+    match status {
+        Ready | Disabled => None,
+        _ if has_offline_packages => None,
+        RNotFound => Some(format!("R not found on PATH; {DEGRADED_ENV_NOTE_TAIL}")),
+        InitFailed(e) => Some(format!(
+            "R found but its package library failed to initialize ({e}); {DEGRADED_ENV_NOTE_TAIL}"
+        )),
+        NoLibraryPaths => Some(format!(
+            "R found but no library paths were discovered; {DEGRADED_ENV_NOTE_TAIL}"
+        )),
+    }
 }
 
 /// `raven check`'s counterpart of the LSP startup's sysdata R fallback (the
@@ -875,7 +923,7 @@ fn format_missing_export_metadata_warning(
     };
 
     let head = format!(
-        "raven check: couldn't load exported symbols for {names}.\n\
+        "couldn't load exported symbols for {names}.\n\
          Some \"Undefined variable\" warnings above may be inaccurate as a result.\n\
          To fix: install {noun} in your R library."
     );
@@ -950,7 +998,7 @@ fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<Stri
     if visited_trunc > 0 {
         let max_visited = state.cross_file_config.max_transitive_dependents_visited;
         lines.push(format!(
-            "raven check: a bounded cross-file neighborhood traversal was truncated \
+            "a bounded cross-file neighborhood traversal was truncated \
              (maxTransitiveDependentsVisited = {max_visited}); some source() edges were \
              not followed, so some \"Undefined variable\" warnings above may be false \
              positives. Raise `crossFile.maxTransitiveDependentsVisited` in raven.toml to \
@@ -960,13 +1008,15 @@ fn format_traversal_budget_note(state: &crate::state::WorldState) -> Option<Stri
     if depth_trunc > 0 {
         let max_chain_depth = state.cross_file_config.max_chain_depth;
         lines.push(format!(
-            "raven check: a cross-file traversal hit the depth limit \
+            "a cross-file traversal hit the depth limit \
              (maxChainDepth = {max_chain_depth}); some deeply-nested source() edges were \
              not followed. Raise `crossFile.maxChainDepth` in raven.toml to analyze deeper \
              dependency chains."
         ));
     }
-    Some(lines.join("\n"))
+    // Blank line between the two sub-notes so they read as distinct paragraphs
+    // in the footer (which carries no header and no per-note prefix).
+    Some(lines.join("\n\n"))
 }
 
 /// Stable, public docs links for the NSE footer. raven has no hosted docs site
@@ -1033,7 +1083,7 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
         )
     };
     let mut out = format!(
-        "raven check: {count} undefined-variable {noun} above {verb} inside {obj}. If one is a \
+        "{count} undefined-variable {noun} above {verb} inside {obj}. If one is a \
          false positive, you can suppress it as with any \
          linter (`# raven: ignore`, `# nolint`, or `# raven: expect`). R has one extra cause: a \
          function that captures an argument via non-standard evaluation (NSE) — as \
@@ -1358,6 +1408,61 @@ mod tests {
 
     fn run_blocking(args: CheckArgs) -> i32 {
         tokio::runtime::Runtime::new().unwrap().block_on(run(args))
+    }
+
+    // ---- degraded_env_note (startup-note decision) ------------------------
+    //
+    // End-to-end coverage is impossible on a machine with R installed:
+    // `get_fallback_lib_paths()` finds the framework library, so the build
+    // classifies `Ready` and `RNotFound`/`NoLibraryPaths` are never reached.
+    // These pure-function tests pin the decision deterministically instead.
+    use crate::package_library::PackageLibraryStatus as S;
+
+    #[test]
+    fn degraded_env_note_silent_when_ready_or_disabled() {
+        // Live R / package awareness off: never degraded, regardless of providers.
+        assert!(degraded_env_note(&S::Ready, false).is_none());
+        assert!(degraded_env_note(&S::Ready, true).is_none());
+        assert!(degraded_env_note(&S::Disabled, false).is_none());
+    }
+
+    #[test]
+    fn degraded_env_note_suppressed_when_offline_packages_present() {
+        // The user's CI report: R absent but `raven packages update`/`freeze`
+        // already loaded offline coverage — the warning would be a false alarm,
+        // and would tell CI to re-run the command it already ran.
+        for status in [
+            S::RNotFound,
+            S::InitFailed("boom".into()),
+            S::NoLibraryPaths,
+        ] {
+            assert!(
+                degraded_env_note(&status, true).is_none(),
+                "note must be suppressed for {status:?} when offline packages loaded"
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_env_note_fires_with_remedy_when_coverage_is_base_only() {
+        // No offline data: coverage really is base-R-only, so each cause names
+        // itself, the consequence (limited to base R), and the remedy.
+        let r_not_found = degraded_env_note(&S::RNotFound, false).expect("note");
+        assert!(r_not_found.starts_with("R not found on PATH;"));
+        assert!(r_not_found.contains("limited to base R"));
+        assert!(r_not_found.contains("raven packages update"));
+        // No `raven check:` prefix — the caller adds it (footer notes don't).
+        assert!(!r_not_found.starts_with("raven check:"));
+
+        let init_failed = degraded_env_note(&S::InitFailed("xyz".into()), false).expect("note");
+        assert!(
+            init_failed.starts_with("R found but its package library failed to initialize (xyz);")
+        );
+        assert!(init_failed.contains("raven packages update"));
+
+        let no_lib = degraded_env_note(&S::NoLibraryPaths, false).expect("note");
+        assert!(no_lib.starts_with("R found but no library paths were discovered;"));
+        assert!(no_lib.contains("raven packages update"));
     }
 
     fn run_with_cwd_blocking(args: CheckArgs, cwd: &Path) -> i32 {

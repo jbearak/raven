@@ -134,6 +134,15 @@ impl RepoDbProvider {
             Err(e) => Err(e),
         }
     }
+
+    /// True when the DB carries no package records. A valid-but-empty
+    /// `.raven/packages.json` (e.g. a `raven packages freeze` that matched no
+    /// external packages) parses to a zero-package provider that resolves
+    /// nothing, so callers gating on "real package coverage" must treat it as no
+    /// coverage rather than as a usable provider.
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
 }
 
 impl PackageMetadataProvider for RepoDbProvider {
