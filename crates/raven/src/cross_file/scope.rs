@@ -735,7 +735,7 @@ pub enum ScopeEvent {
 }
 
 /// A detected `devtools::load_all()` / `pkgload::load_all()` call site
-/// (UTF-16 line, column), recorded by [`collect_definitions`] and consumed by
+/// (UTF-16 line, column), recorded by `collect_definitions` and consumed by
 /// the artifact emission loops to push a sentinel `PackageLoad` event. Every
 /// detected site is recorded (see `ScopeArtifacts::dev_load_all_sites`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1240,7 +1240,7 @@ where
 /// changes a forward child's EOF scope, so a hit is byte-for-byte identical to
 /// a fresh resolution:
 /// - `child_uri`
-/// - `path_fp`: hash of the child's effective [`PathContext`] (file_path,
+/// - `path_fp`: hash of the child's effective [`crate::cross_file::path_resolve::PathContext`] (file_path,
 ///   working_directory, inherited_working_directory, workspace_root), which
 ///   governs how the child resolves *its own* `source()` paths (and whether the
 ///   workspace-root fallback applies). The whole `PathContext` is hashed, not
@@ -1795,7 +1795,7 @@ fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts) {
 /// The function:
 /// - collects symbol and function-scope definitions from the AST,
 /// - records detected `source()` and `rm()/remove()` calls as timeline events,
-/// - sorts the timeline by each event's *effect* position via [`event_effect_position`]
+/// - sorts the timeline by each event's *effect* position via `event_effect_position`
 ///   (for `Def` events this is `visible_from_line/visible_from_column`, not the LHS anchor —
 ///   see the `ScopeEvent::Def` doc for why the two positions diverge),
 /// - constructs a FunctionScopeTree from discovered function scopes and annotates removal events
@@ -2073,7 +2073,7 @@ pub(crate) fn text_calls_dev_load_all(text: &str) -> bool {
 /// - records detected `source()` calls from the AST as timeline events,
 /// - records forward directive sources from metadata as timeline events (avoiding duplicates),
 /// - records `rm()/remove()` calls as timeline events,
-/// - sorts the timeline by each event's *effect* position via [`event_effect_position`]
+/// - sorts the timeline by each event's *effect* position via `event_effect_position`
 ///   (for `Def` events this is `visible_from_line/visible_from_column`, not the LHS anchor —
 ///   see the `ScopeEvent::Def` doc for why the two positions diverge),
 /// - constructs a FunctionScopeTree from discovered function scopes,
@@ -4546,7 +4546,7 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
 ///
 /// # Examples
 ///
-/// ```
+/// ```text
 /// // Given a `node: tree_sitter::Node` and `source: &str`:
 /// // let text = node_text(node, source);
 /// // `text` will be the substring of `source` that corresponds to `node`.
@@ -6979,7 +6979,7 @@ fn compute_contribution_symbol_names(
 }
 
 /// Synthetic `source_uri` used for symbols injected by
-/// [`append_package_contribution`].
+/// `append_package_contribution`.
 ///
 /// Package-mode "contribution" symbols (package-internal defs from sibling
 /// `R/*.R` files and `importFrom` NAMESPACE targets) don't carry per-symbol
@@ -6991,7 +6991,7 @@ fn compute_contribution_symbol_names(
 pub const PACKAGE_INTERNAL_URI: &str = "package:///internal";
 
 /// Returns `true` when `uri` is the synthetic package-internal URI produced by
-/// [`append_package_contribution`].
+/// `append_package_contribution`.
 pub fn is_package_internal_uri(uri: &Url) -> bool {
     uri.as_str() == PACKAGE_INTERNAL_URI
 }
@@ -7322,7 +7322,7 @@ pub(crate) fn append_package_contribution(
 }
 
 /// Returns `true` when the `.Rprofile` prelude applies to `path` given the
-/// current [`PackageScopeContribution`].
+/// current [`crate::package_state::PackageScopeContribution`].
 ///
 /// Conditions (all must hold):
 /// - `contrib.rprofile_root` is `Some` (a prelude was found);
@@ -7667,10 +7667,10 @@ where
         )
     }
 
-    /// As [`ScopeStream::new`], but threads a WI2b persistent standalone-scope
+    /// As `ScopeStream::new`, but threads a WI2b persistent standalone-scope
     /// cache context (issue #483), seeding both the actual-depth and shared
     /// prefix forward-child memos so the EOF hook can consult/populate the
-    /// cross-snapshot cache. `None` is equivalent to [`ScopeStream::new`].
+    /// cross-snapshot cache. `None` is equivalent to `ScopeStream::new`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_standalone_cache(
         queried_uri: &'a Url,
@@ -8889,7 +8889,7 @@ fn seed_base_exports(frame: &mut ScopeFrame, base_exports: &HashSet<String>) {
 ///
 /// **Caller invariant — the cache MUST be snapshot-scoped.** A
 /// `ParentPrefixCache` instance is implicitly bound to the artifacts and
-/// dependency graph captured by exactly one [`DiagnosticsSnapshot`] (or
+/// dependency graph captured by exactly one [`crate::handlers::DiagnosticsSnapshot`] (or
 /// equivalent transient context). The function signature can't enforce
 /// this lifetime: it takes `&RefCell<ParentPrefixCache>` with no
 /// `'snapshot` tag, so a future caller could accidentally reuse the same

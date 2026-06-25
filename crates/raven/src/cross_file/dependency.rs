@@ -1336,8 +1336,8 @@ impl DependencyGraph {
     ///    `once(root).chain(ancestors)` — forward descendants of `root` AND of
     ///    each ancestor (sibling subtrees), sharing one `visited` set.
     ///
-    /// Both [`super::revalidation::compute_affected_dependents_after_edit`]
-    /// (over the FULL graph) and [`crate::handlers::collect_cross_file_nse`]
+    /// Both `super::revalidation::compute_affected_dependents_after_edit`
+    /// (over the FULL graph) and `crate::handlers::collect_cross_file_nse`
     /// (over the TRIMMED snapshot subgraph) build their working set from this
     /// method, so they use the **identical traversal shape** — the same two
     /// graph primitives chained the same way — and can no longer drift in
@@ -1648,7 +1648,7 @@ impl DependencyGraph {
     ///
     /// A shared forward-child memo is byte-identical to the un-memoized resolver
     /// EXCEPT when an entry's resolved scope depends on a per-query input that
-    /// `ForwardChildKey` does not encode (see [`ForwardChildMemo`]'s "never
+    /// `ForwardChildKey` does not encode (see `ForwardChildMemo`'s "never
     /// shared across queries" discipline). Within one stream there are exactly
     /// two such varying inputs, handled by two independent mechanisms:
     ///

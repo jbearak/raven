@@ -255,7 +255,7 @@ fn timeout_from_env() -> Duration {
 /// Returns `Some(String)` containing the help text when R executes successfully, the output is not empty,
 /// and the output does not contain the phrase "No documentation". Returns `None` otherwise.
 ///
-/// The subprocess is killed after [`HELP_TIMEOUT`] to prevent hung R processes from
+/// The subprocess is killed after `HELP_TIMEOUT` to prevent hung R processes from
 /// blocking threads indefinitely.
 ///
 /// # Examples

@@ -2,12 +2,13 @@ This file is intentionally short: a map to the docs and a list of invariants tha
 
 ## CI gates (keep green before committing)
 
-Rust changes must pass two gates in `.github/workflows/integration.yml`. Both run on the toolchain pinned in `rust-toolchain.toml` (currently `1.96.0`, the project MSRV) so results are reproducible — rustup auto-installs it, so a bare `cargo fmt` / `cargo clippy` uses it:
+Rust changes must pass three gates in `.github/workflows/integration.yml`. All run on the toolchain pinned in `rust-toolchain.toml` (currently `1.96.0`, the project MSRV) so results are reproducible — rustup auto-installs it, so a bare `cargo fmt` / `cargo clippy` / `cargo doc` uses it:
 
 - **Formatting** — `cargo fmt --all --check`. Always run `cargo fmt --all` before committing; never hand-format around it.
 - **Clippy** — `cargo clippy --workspace --all-targets --features test-support -- -D warnings`. Zero warnings: every clippy/rustc warning is an error, across lib, tests, benches, and examples.
+- **Rustdoc** — `RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items`. Zero rustdoc warnings: broken intra-doc links, public-doc→private-item leaks, empty/invalid code blocks, and malformed HTML all fail the build. Prefer fixing the link to a resolvable path; demote `` [`X`] `` to plain `` `X` `` when the target is private-from-a-public-doc or not a linkable item. (The `--features test-support` variant surfaces a few extra cases tracked in issue #541.)
 
-Both block merge. Fix the underlying issue rather than suppressing it; when a lint is a genuine, deliberate exception, use a narrowly-scoped `#[allow(...)]` with a one-line reason. Project-wide exceptions live in `crates/raven/Cargo.toml` `[lints]` (currently only `field_reassign_with_default`).
+All three block merge. Fix the underlying issue rather than suppressing it; when a lint is a genuine, deliberate exception, use a narrowly-scoped `#[allow(...)]` with a one-line reason. Project-wide exceptions live in `crates/raven/Cargo.toml` `[lints]` (currently only `field_reassign_with_default`).
 
 ## What to read
 

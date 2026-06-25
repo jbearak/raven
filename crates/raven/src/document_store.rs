@@ -545,7 +545,7 @@ impl DocumentStore {
     /// Use this when metadata has been enriched with inherited_working_directory.
     ///
     /// `precomputed_masked` is forwarded to
-    /// [`compute_derived`](Self::compute_derived): on the `did_change` hot path
+    /// `compute_derived`: on the `did_change` hot path
     /// the caller has already masked this exact raw content for this exact
     /// `chunk_kind` (the legacy [`crate::state::Document`] masks it in
     /// `apply_change`), so it hands the result in to avoid a second

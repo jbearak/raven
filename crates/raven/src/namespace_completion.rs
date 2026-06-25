@@ -37,7 +37,7 @@ pub enum NamespaceCompletionContext {
     /// Cursor on the member (RHS) side — offer `package`'s exported symbols.
     /// `internal` is true for `:::` (deferred, so it yields no items).
     /// `replace_range` is the already-typed member token the accepted completion
-    /// must overwrite (see [`member_replace_range`]).
+    /// must overwrite (see `member_replace_range`).
     Member {
         package: String,
         internal: bool,

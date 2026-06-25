@@ -175,7 +175,7 @@ pub fn absolute_path(base: &Path, path: &Path) -> PathBuf {
 }
 
 /// Recursively collect `.R` / `.r` file paths under `dir`. A thin R-only
-/// wrapper over the shared directory walk [`crate::state::collect_files_matching`]:
+/// wrapper over the shared directory walk `crate::state::collect_files_matching`:
 /// symlinked directories are followed with canonical-path cycle detection and
 /// non-source directories are pruned. Reusing the indexer's walk is what keeps
 /// `raven check`'s *reported* file set equal to its *indexed* set — a `.R` file
@@ -215,7 +215,7 @@ pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 /// single offending byte to name.
 ///
 /// Shared by `raven check` (report loop) and `raven lint` (`walk`) so the two
-/// emit the identical message for an undecodable [`crate::state::read_source`]
+/// emit the identical message for an undecodable `crate::state::read_source`
 /// failure.
 pub fn encoding_diagnostic(offset: usize, byte: u8) -> Diagnostic {
     use tower_lsp::lsp_types::{Position, Range};

@@ -487,7 +487,7 @@ pub fn invalidate_children_on_parent_wd_change(
 ///    even though they are not directly connected in the graph.
 ///
 /// Sharing [`DependencyGraph::revalidation_consistent_set`] with
-/// [`crate::handlers::collect_cross_file_nse`] gives this function and NSE/func
+/// `crate::handlers::collect_cross_file_nse` gives this function and NSE/func
 /// collection the **identical traversal shape**, so they can no longer drift in
 /// edge-selection logic. The full directed-inverse equivalence additionally
 /// relies on both callers passing matching `max_depth` / `max_visited` budgets

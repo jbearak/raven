@@ -89,6 +89,16 @@ jobs:
       - name: Run clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --features test-support -- -D warnings
 
+      # Deny ALL rustdoc warnings (broken intra-doc links, private-item leaks
+      # from public docs, empty/invalid code blocks, malformed HTML) so doc
+      # hygiene can't silently re-accumulate (issue #529). `--document-private-items`
+      # checks internal docs too; `--no-deps` skips dependency docs. Runs here so
+      # it reuses the Clippy job's sccache/registry caches. The default (no-feature)
+      # invocation mirrors the issue's repro exactly; a `--features test-support`
+      # variant is tracked separately in issue #541.
+      - name: Check rustdoc (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items
+
 
   # Build only the release artifacts that genuinely need optimization: the LSP
   # binary (consumed by the vscode-mocha and binary-size jobs) and the
