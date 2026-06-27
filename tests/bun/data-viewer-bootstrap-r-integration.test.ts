@@ -361,6 +361,30 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
         30_000,
     );
 
+    test.skipIf(!HAS_HAVEN || !HAS_ARROW)(
+        'View(ragged list with a short haven_labelled element) NA-pads without crashing',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                // vctrs [ rejects out-of-bounds indices, so over-indexing a
+                // short labelled element to pad it would crash. The values
+                // column must NA-pad to nrow = 4 and keep the labels.
+                const r = await spawnR(cap, viewAndReadback(
+                    'View(list(g = haven::labelled(c(1, 2), c(Male = 1, Female = 2)), n = 1:4))',
+                    'cat("RAVEN_G3_NA=", is.na(.df$g[[3L]]), "\\n", sep = "")',
+                ));
+                expect(r.stdout).toContain('RAVEN_COLS=g,n');
+                expect(r.stdout).toContain('RAVEN_NROW=4');
+                expect(r.stdout).toContain('RAVEN_G3_NA=TRUE');
+                expect(r.stdout).toMatch(/Male/);
+                expect(r.stderr).not.toContain('past the end');
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
     test.skipIf(!HAS_R || !HAS_ARROW)(
         'View(nested list) errors and posts nothing',
         async () => {

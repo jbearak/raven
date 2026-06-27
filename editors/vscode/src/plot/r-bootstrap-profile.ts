@@ -174,21 +174,27 @@ local({
         any(rn != as.character(seq_len(n)))
     }
 
+    # Stamp a named list of equal-length columns as an n-row data.frame
+    # WITHOUT data.frame() — a bare class assignment preserves each
+    # column's class/attributes (factor levels, haven_labelled labels) so
+    # they survive into .raven_encode_col, which data.frame() would coerce
+    # away.
+    .raven_bare_df <- function(cols, n) {
+        class(cols) <- "data.frame"
+        attr(cols, "row.names") <- .set_row_names(n)
+        cols
+    }
+
     # Build a 1- or 2-column data.frame from an atomic / factor /
     # haven_labelled vector: a leading "name" column when names() is
-    # non-NULL, plus a "value" (length 1) / "values" column. Built as a
-    # bare list given the data.frame class — not data.frame() — so the
-    # value vector's class/attributes (factor levels, haven_labelled
-    # labels) survive into .raven_encode_col.
+    # non-NULL, plus a "value" (length 1) / "values" column.
     .raven_vector_to_df <- function(x) {
         n <- length(x)
         cols <- list()
         nm <- names(x)
         if (!is.null(nm)) cols[["name"]] <- as.character(nm)
         cols[[if (n == 1L) "value" else "values"]] <- unname(x)
-        class(cols) <- "data.frame"
-        attr(cols, "row.names") <- .set_row_names(n)
-        cols
+        .raven_bare_df(cols, n)
     }
 
     # Is a list element a plain scalar/vector (so a flat list can become a
@@ -200,12 +206,24 @@ local({
              is.null(dim(el)) && !is.raw(el))
     }
 
+    # Pad a single scalar/vector element to length n, preserving class.
+    # We index with NA for the out-of-range positions rather than
+    # over-indexing (el[seq_len(n)]): base vectors and factors NA-pad on
+    # over-index, but vctrs/haven_labelled's [ method ERRORS on
+    # out-of-bounds subscripts. Indexing existing positions plus NA works
+    # for all three and keeps factor levels / haven_labelled labels.
+    .raven_pad_to <- function(el, n) {
+        if (is.null(el)) return(rep(NA, n))
+        idx <- seq_len(n)
+        idx[idx > length(el)] <- NA_integer_
+        unname(el[idx])
+    }
+
     # Build a data.frame from a flat (non-recursive) list: one column per
-    # element, NA-padded to the longest element. Positional indexing
-    # (el[seq_len(n)]) preserves each element's class — even length-0
-    # typed elements keep their levels/labels; a literal NULL element has
-    # no type and becomes a logical NA column. Column names come from
-    # names(); blank/NA names are filled "V<i>" then make.unique'd.
+    # element, NA-padded to the longest element (see .raven_pad_to). A
+    # literal NULL element has no type and becomes a logical NA column.
+    # Column names come from names(); blank/NA names are filled "V<i>"
+    # then make.unique'd.
     .raven_list_to_df <- function(x) {
         k <- length(x)
         n <- max(c(0L, lengths(x)))
@@ -215,14 +233,9 @@ local({
         nm[blank] <- paste0("V", seq_len(k))[blank]
         nm <- make.unique(nm)
         cols <- vector("list", k)
-        for (i in seq_len(k)) {
-            el <- x[[i]]
-            cols[[i]] <- if (is.null(el)) rep(NA, n) else unname(el[seq_len(n)])
-        }
+        for (i in seq_len(k)) cols[[i]] <- .raven_pad_to(x[[i]], n)
         names(cols) <- nm
-        class(cols) <- "data.frame"
-        attr(cols, "row.names") <- .set_row_names(n)
-        cols
+        .raven_bare_df(cols, n)
     }
 
     # Pre-encode one column for arrow:
@@ -240,7 +253,7 @@ local({
             # "labels" attribute when there is no variable label, which
             # would stamp a bogus length-2 "label" onto the encoded column.
             attr(x, "label") <- attr(col, "label", exact = TRUE)
-            attr(x, "labels") <- attr(col, "labels")
+            attr(x, "labels") <- attr(col, "labels", exact = TRUE)
             return(x)
         }
         if (is.integer(col) || is.double(col) || is.logical(col) ||
@@ -265,8 +278,10 @@ local({
             }, character(1L))
             return(paste0("{", paste(entries, collapse = ","), "}"))
         }
-        labs <- attr(col, "labels")
-        if (is.null(labs)) labs <- attr(col, "value.labels")
+        # exact = TRUE so a "label" / "labelsomething" attribute can't
+        # partial-match where an exact "labels" is absent.
+        labs <- attr(col, "labels", exact = TRUE)
+        if (is.null(labs)) labs <- attr(col, "value.labels", exact = TRUE)
         if (is.null(labs) || is.null(names(labs))) return("")
         entries <- vapply(seq_along(labs), function(i) {
             key <- as.character(labs[[i]])
