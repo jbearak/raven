@@ -377,6 +377,19 @@ export class DataViewerPanel {
                         nrowFiltered: this.filteredIndices.length,
                         fromPersistence: true,
                     } satisfies ExtensionToWebview);
+                    // The filterApplied post is the second (and last)
+                    // post-decision await window. A cancel/lifecycle abort can
+                    // land during it: a lifecycle abort bumped generation →
+                    // bail stale (prefs intact); a user Cancel (no bump) →
+                    // honor as clear-and-forget. Only one cancelRestore is ever
+                    // sent, so this single recheck closes the window.
+                    if (generation !== this.generation || reader !== this.reader) {
+                        return false;
+                    }
+                    if (isCancelled()) {
+                        await this.clearAndForgetNaturalOrder(layoutHash);
+                        return true;
+                    }
                 }
                 if (sortFailed || filterFailed) {
                     const what = sortFailed && filterFailed

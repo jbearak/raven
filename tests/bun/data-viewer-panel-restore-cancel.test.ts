@@ -290,6 +290,38 @@ describe('sendInit restore', () => {
         expect(sortSet).toEqual([]);
     });
 
+    it('honors a cancel that lands during the filterApplied post', async () => {
+        const { panel, posted, filterSet } = await makePanel({
+            storedFilter: STORED_FILTER,
+        });
+        panel.restoreSort = async () => false;
+        panel.restoreFilter = async () => {
+            panel.filter = STORED_FILTER;
+            panel.filteredIndices = new Uint32Array([0, 1, 2]);
+            return false;
+        };
+        // The cancel lands during the (second) post-decision await: the
+        // filterApplied post, after the chips init was already posted.
+        const origPost = panel.webviewPanel.webview.postMessage;
+        panel.webviewPanel.webview.postMessage = (m: any) => {
+            if (m.type === 'filterApplied') {
+                void panel.handleCancelRestore({
+                    type: 'cancelRestore', panelGeneration: 0, restoreId: panel.restoreId,
+                });
+            }
+            return origPost(m);
+        };
+
+        await panel.sendInit();
+
+        // Cancel honored: prefs forgotten, grid ends in natural order.
+        expect(filterSet).toEqual(['cleared']);
+        expect(panel.filteredIndices).toBeUndefined();
+        const last = posted[posted.length - 1];
+        expect(last.type).toBe('replace');
+        expect(last.filter).toEqual(EMPTY_FILTER);
+    });
+
     it('clears restoring even if it throws before posting init (finding #3)', async () => {
         const { panel } = await makePanel({ storedSort: STORED_SORT });
         panel.restoreSort = async () => {
