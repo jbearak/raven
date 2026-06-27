@@ -18,20 +18,29 @@ vector, a single labelled column pulled from an import
 (`View(mydata$education)`), a factor (`View(iris$Species)`), or a flat
 list of columns — all error today.
 
-The fix is almost entirely R-side: the webview, Arrow reader,
-sort/filter/format, copy, and HTTP wire format already render any
-data.frame. We only need to convert an accepted vector / scalar / flat
-list into a data.frame on the R side, in front of the existing pipeline.
-**No webview, wire-format, or Arrow-reader changes.**
+The fix is R-side only, in one place: the type-dispatch in `.raven_view`.
+Today a hard gate (`r-bootstrap-profile.ts:303`) rejects everything that
+is not a data.frame/matrix before any conversion can run; we replace
+that gate with a conversion chain that turns an accepted vector / scalar
+/ flat list into a data.frame. Everything downstream —
+`.raven_encode_col`, `.raven_write_arrow`, the `/view-data` POST, and the
+entire webview / wire-format / Arrow-reader path — is **untouched**,
+because it already renders any data.frame.
 
 ## Scope
 
 In scope — newly `View()`-able:
 
 - **Atomic vectors**: `numeric` / `integer` / `double`, `character`,
-  `logical`, `complex`, `raw`. (`complex` / `raw` aren't Arrow-native;
-  the existing per-column fallback stringifies them, same as today for
+  `logical`, `complex`, plus classed atomic vectors the existing encoder
+  already handles — `Date`, `POSIXct`. (`complex` isn't Arrow-native; the
+  existing per-column fallback stringifies it, same as today for
   unrecognized data.frame columns.)
+- **`raw` is excluded.** A raw vector has no `NA`, so out-of-bounds
+  indexing during ragged-list padding yields `00` bytes rather than a
+  missing cell — a silent-wrong result. To keep one rule across the
+  vector and list branches, `raw` is rejected in both; `View(raw_vec)`
+  keeps erroring.
 - **Scalars** — handled as the length-1 case of the vector path, not
   special-cased.
 - **Standalone `factor` vectors** (e.g. `iris$Species`).
@@ -84,11 +93,13 @@ path, untouched.
 
 ### Vectors / scalars
 
-**Accept** when `is.null(dim(x))` and
+**Accept** when `is.null(dim(x))` and `!is.raw(x)` and
 (`is.atomic(x) || is.factor(x) || inherits(x, "haven_labelled")`). The
-`dim` guard keeps matrices/1-D arrays out of this branch. Plain atomic
-vectors carry no labels, so `factor` / `haven_labelled` are named
-explicitly only to admit those standalone classes.
+`dim` guard keeps matrices/1-D arrays out of this branch; `!is.raw(x)`
+enforces the raw exclusion above. Plain atomic vectors carry no labels,
+so `factor` / `haven_labelled` are named explicitly only to admit those
+standalone classes. `Date` / `POSIXct` are atomic with no `dim`, so they
+are admitted here and rendered by the existing encoder.
 
 **Shape — a leading `name` column (when named) + a value column:**
 
@@ -134,7 +145,7 @@ code. Set `names()`, `class(df) <- "data.frame"`, and
 ```r
 is.null(el) ||
 ((is.atomic(el) || is.factor(el) || inherits(el, "haven_labelled")) &&
- is.null(dim(el)))
+ is.null(dim(el)) && !is.raw(el))
 ```
 
 If any element is itself a list, a data.frame, or has a `dim`
@@ -163,19 +174,27 @@ View(list(a = 1:3, b = c("x", "y"), c = TRUE))
 
 **Per-column construction:**
 
-- Pad each element to `n` via **positional indexing**: `el[seq_len(n)]`.
-  Indexing past the end yields `NA` and preserves class — `factor[...]`
-  keeps levels, `[.haven_labelled` keeps its `labels`. This is why we
-  index rather than `length<-` (which can strip S3 attributes).
-- `NULL` or length-0 elements → an all-`NA` column (`rep(NA, n)`,
-  logical), since `NULL[seq_len(n)]` is `NULL`, not an NA vector.
+- Pad each **non-NULL** element to `n` via **positional indexing**:
+  `el[seq_len(n)]`. Indexing past the end yields `NA` and **preserves
+  class** — `factor[...]` keeps levels, `[.haven_labelled` keeps its
+  `labels`. Crucially this also covers length-0 *typed* elements: a
+  `factor(character(), levels = "a")` or `integer(0)` element indexed to
+  `n` becomes a class-preserving NA column (or a zero-row class-preserving
+  column when `n == 0`), so its levels/labels survive into
+  `.raven_encode_col`. We index rather than `length<-` (which can strip
+  S3 attributes) or `rep(NA, n)` (which would erase type).
+- **Only a literal `NULL` element** → `rep(NA, n)` (logical). `NULL` has
+  no type to preserve, and `NULL[seq_len(n)]` is `NULL`, not an NA vector.
 - Build the columns into a bare list given the `data.frame` class +
   `.set_row_names(n)`, then fall into the existing `.raven_encode_col`
   loop.
 
-**Column names:** from `names(x)`; any missing/`""` name is replaced by a
-position-based `V<i>` and the full set passed through `make.unique`,
-mirroring `as.data.frame(<unnamed list>)`.
+**Column names:** start from `names(x)`, or — when `names(x)` is `NULL`
+(a fully unnamed list, not a character vector with empty slots) — a
+length-`length(x)` vector of `""`. Replace every `""` / `NA` slot with a
+position-based `V<i>`, then pass the whole vector through `make.unique`.
+This mirrors `as.data.frame(<unnamed list>)`. (Column count is
+`length(x)`, independent of the row count `n`.)
 
 ### Vector-vs-list shape divergence (intentional)
 
@@ -219,7 +238,20 @@ A named vector and a list of scalars render differently, by design:
     on `haven` via the existing `r_with(...)` helper);
   - a ragged flat list → element-as-column, `nrow == max(lengths)`, with
     NA padding and per-column types preserved;
-  - a nested list → still errors.
+  - a flat list with a **length-0 typed element** (e.g.
+    `list(a = 1:3, f = factor(character(), levels = "a"))`) → the `f`
+    column is still a factor (levels intact), all-NA, not a logical
+    column — guards finding #2;
+  - an **all-empty** typed list (e.g.
+    `list(f = factor(character(), levels = "a"))`) → a zero-row factor
+    column, levels intact — guards finding #3;
+  - a list with a **`NULL` element** → an all-NA column, no crash;
+  - a fully **unnamed** list → synthesized `V1..Vk` column names;
+  - a `raw` vector and a flat list containing a `raw` element → both
+    **error** (raw is excluded);
+  - a factor with a literal **`NA` level** (`factor(x, exclude = NULL)`)
+    vs. a factor with `NA` *values* → the level/value distinction
+    round-trips correctly through the schema metadata.
   Assert the resulting Arrow file's column names, types, and row count.
 - No webview/TS-grid test changes: the grid already renders arbitrary
   frames; nothing in its contract changes.
@@ -232,12 +264,14 @@ A named vector and a list of scalars render differently, by design:
   vectors (and that the `name` column is dropped when `names()` is NULL);
   that the `name` column mirrors the matrix `rowname` leading column;
   the element-as-column, NA-padded table for lists; that nested/recursive
-  lists are unsupported; and the intentional named-vector-vs-list shape
-  divergence.
+  lists and `raw` vectors are unsupported; and the intentional
+  named-vector-vs-list shape divergence.
 
 ## Non-goals
 
-- No nested/recursive list support. No names-on-hover. No
-  expression-derived headers. No new settings. No webview, wire-format,
-  Arrow-reader, or sort/filter/format/copy changes — this is purely a new
-  R-side conversion in front of the existing pipeline.
+- No nested/recursive list support. No `raw`-vector support. No
+  names-on-hover. No expression-derived headers. No new settings. The
+  only change is the `.raven_view` type-dispatch gate; `.raven_encode_col`,
+  the Arrow write, the `/view-data` POST, and the entire webview /
+  wire-format / Arrow-reader / sort / filter / format / copy path are
+  untouched.
