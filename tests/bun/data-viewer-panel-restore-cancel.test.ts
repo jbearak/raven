@@ -358,6 +358,34 @@ describe('handleCancelRestore', () => {
 });
 
 describe('lifecycle interruptions', () => {
+    it('honors a user cancel even when a webview reload races the abort', async () => {
+        const { panel, posted, sortSet } = await makePanel({ storedSort: STORED_SORT });
+        // An in-flight restore whose read blocks on a gate (the abort is not
+        // observed until released).
+        let release: (() => void) | null = null;
+        const gate = new Promise<void>(r => { release = r; });
+        panel.restoreSort = async () => { await gate; return false; };
+        const p = panel.sendInit();
+        await new Promise(r => setTimeout(r, 0));
+        const rp = posted.find((m: any) => m.type === 'restorePending');
+        expect(rp).toBeDefined();
+        // User clicks Cancel (in-flight): aborts + records the intent.
+        await panel.handleCancelRestore({
+            type: 'cancelRestore', panelGeneration: 0, restoreId: rp.restoreId,
+        });
+        expect(sortSet).toEqual([]); // not forgotten yet (delegated)
+        // A webview reload races in before paintWithRestore observes the abort.
+        // The reload must honor the pending cancel and forget the prefs, not
+        // bail stale and re-restore them.
+        const realSendInit = panel.sendInit.bind(panel);
+        panel.sendInit = async () => {}; // isolate the re-send
+        await panel.handleInner({ type: 'webviewReady' });
+        release!();
+        await p;
+        void realSendInit;
+        expect(sortSet).toEqual(['cleared']);
+    });
+
     it('webviewReady during restore bumps generation + aborts so prefs survive', async () => {
         const { panel } = await makePanel();
         panel.restoring = true;

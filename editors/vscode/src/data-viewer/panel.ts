@@ -103,6 +103,11 @@ export class DataViewerPanel {
     private restoreId = -1;
     /** Source of {@link restoreId}; bumped per restore begun. */
     private restoreSeq = 0;
+    /** True when the user clicked Cancel on an in-flight restore but the
+     *  abort has not yet been observed by paintWithRestore. Lets a webview
+     *  reload that races into that window honor the cancel (forget the
+     *  prefs) instead of bailing stale and re-restoring them. */
+    private restoreCancelRequested = false;
     /** Active toolbar last shipped to the webview, captured so the late
      *  clear-and-forget can rebuild a `replace` without re-loading the
      *  store. */
@@ -230,16 +235,18 @@ export class DataViewerPanel {
     // restores never overlap. The chain wraps only these public entry
     // points; internal delegation (an uninitialized replace) calls the
     // *impl* directly so it never awaits a job queued behind itself.
-    private sendInit(): Promise<boolean> {
-        const next = this.sendChain.catch(() => {}).then(() => this.sendInitImpl());
+    private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+        const next = this.sendChain.catch(() => {}).then(fn);
         this.sendChain = next.then(() => {}, () => {});
         return next;
     }
 
+    private sendInit(): Promise<boolean> {
+        return this.enqueue(() => this.sendInitImpl());
+    }
+
     private sendReplace(): Promise<void> {
-        const next = this.sendChain.catch(() => {}).then(() => this.sendReplaceImpl());
-        this.sendChain = next.then(() => {}, () => {});
-        return next;
+        return this.enqueue(() => this.sendReplaceImpl());
     }
 
     private sendInitImpl(): Promise<boolean> {
@@ -433,6 +440,7 @@ export class DataViewerPanel {
         this.restoreAbort = new AbortController();
         this.restoreId = ++this.restoreSeq;
         this.restoring = true;
+        this.restoreCancelRequested = false;
         void this.webviewPanel.webview.postMessage({
             type: 'restorePending',
             panelGeneration: generation,
@@ -447,6 +455,7 @@ export class DataViewerPanel {
      *  (synchronous). The caller persists the forget separately. */
     private resetRestoredPrefs(): void {
         this.restoreId = -1;
+        this.restoreCancelRequested = false;
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
         this.sortGeneration += 1;
@@ -472,6 +481,7 @@ export class DataViewerPanel {
         this.restoreAbort = null;
         this.restoring = false;
         this.restoreId = -1;
+        this.restoreCancelRequested = false;
     }
 
     /** Schema hash of the live reader — used by the late clear-and-forget
@@ -516,6 +526,10 @@ export class DataViewerPanel {
     ): Promise<void> {
         if (msg.restoreId !== this.restoreId) return;
         if (this.restoring) {
+            // Record the cancel intent so a webview reload that races the
+            // abort (and bumps generation, making paintWithRestore bail
+            // stale) still forgets the prefs rather than re-restoring them.
+            this.restoreCancelRequested = true;
             this.restoreAbort?.abort();
             return;
         }
@@ -677,8 +691,15 @@ export class DataViewerPanel {
             // The queued sendInit re-reads from the store and re-restores
             // (raven has no one-shot restored flags).
             if (this.restoring) {
+                // If the user had clicked Cancel on this restore, honor it:
+                // forget the prefs durably before re-arming, so the queued
+                // re-send shows natural order instead of re-restoring. A pure
+                // reload (no pending cancel) keeps the prefs.
+                const cancelled = this.restoreCancelRequested;
+                const hash = this.currentSchemaHash();
                 this.generation += 1;
                 this.abortAndClearRestore();
+                if (cancelled) await this.forgetPersistedPrefs(hash);
             }
             await this.sendInit();
             return;

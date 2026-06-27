@@ -259,7 +259,7 @@ async function acceptorFor(
             if (ctx.labelsOn) {
                 const labels: string[] = Array.isArray(schema.dictionary)
                     ? schema.dictionary
-                    : await dictFromGetLabels(reader, columnIndex, codes);
+                    : await dictFromGetLabels(reader, columnIndex, codes, signal);
                 return predicate.kind === 'setIn'
                     ? (i) => wantStr.has(labels[codes[i]])
                     : (i) => !wantStr.has(labels[codes[i]]);
@@ -387,10 +387,14 @@ async function dictFromGetLabels(
     reader: ArrowSliceReader,
     columnIndex: number,
     codes: Int32Array,
+    signal?: AbortSignal,
 ): Promise<string[]> {
     const seen = new Set<number>();
     for (let i = 0; i < codes.length; i++) seen.add(codes[i]);
     const labels = await reader.getLabels(columnIndex, [...seen]);
+    // getLabels is an extra async hop after the cancellable column load;
+    // check the signal so a Cancel during it is observed promptly.
+    throwIfAborted(signal);
     const max = [...seen].reduce((a, b) => Math.max(a, b), -1);
     const out: string[] = new Array(max + 1).fill('');
     for (const [k, v] of Object.entries(labels)) out[Number(k)] = v;

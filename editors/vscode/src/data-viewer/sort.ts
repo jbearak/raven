@@ -37,6 +37,7 @@
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { SortKey } from './messages';
 import { iterateBatches } from './batch-iter';
+import { throwIfAborted } from './abort';
 
 /** Toolbar snapshot used to derive sort keys WYSIWYG. */
 export type SortContext = {
@@ -373,6 +374,10 @@ async function buildDictionarySortColumn(
             if (!missing[i]) need.add(codes[i]);
         }
         const fetched = await reader.getLabels(columnIndex, [...need]);
+        // getLabels is an extra async hop after the cancellable batch scan;
+        // check the signal so a Cancel delivered during it is observed
+        // promptly rather than only after the (cheap) compare step.
+        throwIfAborted(signal);
         for (const [k, v] of Object.entries(fetched)) {
             labelByCode.set(Number(k), v);
         }
