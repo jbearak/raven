@@ -430,9 +430,12 @@ local({
                 i <- which(!ok)[[1L]]
                 nm <- names(x)
                 # !is.null(nm) must come first: nm[[i]] errors on a
-                # fully-unnamed list (names() is NULL). A blank or NA
-                # name falls through to the positional "element <i>".
-                label <- if (!is.null(nm) && !is.na(nm[[i]]) && nzchar(nm[[i]])) {
+                # fully-unnamed list (names() is NULL). A blank, NA, or
+                # backtick-containing name (which would break the
+                # backtick quoting below) falls through to the
+                # unambiguous positional "element <i>".
+                label <- if (!is.null(nm) && !is.na(nm[[i]]) && nzchar(nm[[i]]) &&
+                             !grepl("\`", nm[[i]], fixed = TRUE)) {
                     paste0("element \`", nm[[i]], "\`")
                 } else {
                     paste0("element ", i)

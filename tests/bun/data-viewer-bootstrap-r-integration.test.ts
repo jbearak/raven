@@ -479,6 +479,12 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
                 ));
                 expect(na.stderr).toContain('element 2 has class `list`');
                 expect(na.stderr).not.toContain('element `NA`');
+                // A backtick in the name would break the backtick quoting,
+                // so it also falls through to the positional form.
+                const tick = await spawnR(cap, viewExpectError(
+                    'View(setNames(list(list(2)), "a`b"))',
+                ));
+                expect(tick.stderr).toContain('element 1 has class `list`');
                 expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
             } finally {
                 await cap.close();
