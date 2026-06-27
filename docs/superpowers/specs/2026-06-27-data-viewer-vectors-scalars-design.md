@@ -177,17 +177,28 @@ View(list(a = 1:3, b = c("x", "y"), c = TRUE))
 
 **Per-column construction:**
 
-- Pad each **non-NULL** element to `n` via **positional indexing**:
-  `el[seq_len(n)]`. Indexing past the end yields `NA` and **preserves
-  class** — `factor[...]` keeps levels, `[.haven_labelled` keeps its
-  `labels`. Crucially this also covers length-0 *typed* elements: a
-  `factor(character(), levels = "a")` or `integer(0)` element indexed to
+- Pad each **non-NULL** element to `n` by indexing with an **NA-filled
+  index** — *not* by over-indexing with `el[seq_len(n)]`. Build
+  `idx <- seq_len(n)` and set `idx[idx > length(el)] <- NA`, then take
+  `el[idx]`. Indexing existing positions plus `NA` **preserves class**
+  for base vectors, factors, *and* vctrs-backed `haven_labelled`:
+  `factor[...]` keeps levels and `[.haven_labelled` keeps its `labels`.
+
+  > ⚠️ Over-indexing (`el[seq_len(n)]`) is **wrong** here even though it
+  > NA-pads base vectors and factors: a `vctrs`/`haven_labelled` element's
+  > `[` method **errors** on out-of-bounds subscripts ("Can't subset
+  > elements past the end"), aborting `View()`. The NA-index form avoids
+  > the out-of-bounds access entirely, which is the whole reason it is
+  > used. Do not "simplify" it back to `el[seq_len(n)]`.
+
+  This also covers length-0 *typed* elements: a
+  `factor(character(), levels = "a")` or `integer(0)` element padded to
   `n` becomes a class-preserving NA column (or a zero-row class-preserving
   column when `n == 0`), so its levels/labels survive into
-  `.raven_encode_col`. We index rather than `length<-` (which can strip
-  S3 attributes) or `rep(NA, n)` (which would erase type).
+  `.raven_encode_col`. We index this way rather than `length<-` (which
+  can strip S3 attributes) or `rep(NA, n)` (which would erase type).
 - **Only a literal `NULL` element** → `rep(NA, n)` (logical). `NULL` has
-  no type to preserve, and `NULL[seq_len(n)]` is `NULL`, not an NA vector.
+  no type to preserve, and is excluded before any indexing.
 - Build the columns into a bare list given the `data.frame` class +
   `.set_row_names(n)`, then fall into the existing `.raven_encode_col`
   loop.
@@ -227,9 +238,9 @@ A named vector and a list of scalars render differently, by design:
 - `tests/bun/data-viewer-bootstrap-content.test.ts`: assert the bootstrap
   source contains the new vector and list branches, the bare-list /
   `.set_row_names` construction, the `name` + `value`/`values` header
-  selection, the `el[seq_len(n)]` padding, and `make.unique` column
-  naming (string-level checks, matching how this file already pins the
-  View() override).
+  selection, the NA-index padding, and `make.unique` column naming
+  (string-level checks, matching how this file already pins the View()
+  override).
 - `tests/bun/data-viewer-bootstrap-r-integration.test.ts` (runs the
   profile against a real R, gated on `HAS_R` / `HAS_ARROW`, capturing the
   `/view-data` POST): add cases that `View()` —
