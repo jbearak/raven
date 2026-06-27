@@ -427,12 +427,120 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
     );
 
     test.skipIf(!HAS_R || !HAS_ARROW)(
-        'View(nested list) errors and posts nothing',
+        'View(nested list) errors naming the offending element and posts nothing',
         async () => {
             const cap = await start_capture_server();
             try {
                 const r = await spawnR(cap, viewExpectError('View(list(a = 1, b = list(1, 2)))'));
-                expect(r.stderr).toContain("Can't `View()` an object of class");
+                expect(r.stderr).toContain("Can't `View()` this list:");
+                expect(r.stderr).toContain('element `b` has class `list`');
+                expect(r.stderr).toContain('Only flat lists (every element a vector) are supported.');
+                expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(empty list) errors with an empty-list message and posts nothing',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                const r = await spawnR(cap, viewExpectError('View(list())'));
+                expect(r.stderr).toContain("Can't `View()` an empty list.");
+                expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(list with blank/NA-named offender) reports the positional element',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                // Blank name and NA name must both fall through to "element <i>"
+                // rather than "element ``" / "element `NA`".
+                const blank = await spawnR(cap, viewExpectError(
+                    'View(setNames(list(1, list(2)), c("a", "")))',
+                ));
+                expect(blank.stderr).toContain('element 2 has class `list`');
+                expect(blank.stderr).not.toContain('element ``');
+                const na = await spawnR(cap, viewExpectError(
+                    'View(setNames(list(1, list(2)), c("a", NA)))',
+                ));
+                expect(na.stderr).toContain('element 2 has class `list`');
+                expect(na.stderr).not.toContain('element `NA`');
+                expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(1-D array) renders as a vector (single values column)',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                const r = await spawnR(cap, viewAndReadback('View(array(1:3))'));
+                expect(r.stdout).toContain('RAVEN_COLS=values');
+                expect(r.stdout).toContain('RAVEN_NROW=3');
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(named 1-D array) carries dimnames into a leading name column',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                const r = await spawnR(cap, viewAndReadback(
+                    'View(array(1:2, dimnames = list(c("a", "b"))))',
+                ));
+                expect(r.stdout).toContain('RAVEN_COLS=name,values');
+                expect(r.stdout).toContain('RAVEN_NROW=2');
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(3-D array) errors with the dimensionality message and posts nothing',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                const r = await spawnR(cap, viewExpectError('View(array(1:8, c(2, 2, 2)))'));
+                expect(r.stderr).toContain("Can't `View()` an array with 3 dimensions");
+                expect(r.stderr).toContain('the data viewer shows 2-dimensional tables only.');
+                expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(3-way table) hits the dimensionality message (is.array admits tables)',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                // A deterministic 3-way table: dim c(2,2,2), class "table".
+                const r = await spawnR(cap, viewExpectError(
+                    'View(table(c(1,1,2,2), c(1,2,1,2), c(1,1,2,2)))',
+                ));
+                expect(r.stderr).toContain("Can't `View()` an array with 3 dimensions");
                 expect(cap.requests.filter(req => req.headers.includes('POST /view-data')).length).toBe(0);
             } finally {
                 await cap.close();
