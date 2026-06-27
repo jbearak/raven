@@ -174,6 +174,57 @@ local({
         any(rn != as.character(seq_len(n)))
     }
 
+    # Build a 1- or 2-column data.frame from an atomic / factor /
+    # haven_labelled vector: a leading "name" column when names() is
+    # non-NULL, plus a "value" (length 1) / "values" column. Built as a
+    # bare list given the data.frame class — not data.frame() — so the
+    # value vector's class/attributes (factor levels, haven_labelled
+    # labels) survive into .raven_encode_col.
+    .raven_vector_to_df <- function(x) {
+        n <- length(x)
+        cols <- list()
+        nm <- names(x)
+        if (!is.null(nm)) cols[["name"]] <- as.character(nm)
+        cols[[if (n == 1L) "value" else "values"]] <- unname(x)
+        class(cols) <- "data.frame"
+        attr(cols, "row.names") <- .set_row_names(n)
+        cols
+    }
+
+    # Is a list element a plain scalar/vector (so a flat list can become a
+    # table)? NULL is allowed (→ an all-NA column). Nested lists,
+    # data.frames, multi-dimensional objects, and raw are rejected.
+    .raven_list_elem_ok <- function(el) {
+        is.null(el) ||
+            ((is.atomic(el) || is.factor(el) || inherits(el, "haven_labelled")) &&
+             is.null(dim(el)) && !is.raw(el))
+    }
+
+    # Build a data.frame from a flat (non-recursive) list: one column per
+    # element, NA-padded to the longest element. Positional indexing
+    # (el[seq_len(n)]) preserves each element's class — even length-0
+    # typed elements keep their levels/labels; a literal NULL element has
+    # no type and becomes a logical NA column. Column names come from
+    # names(); blank/NA names are filled "V<i>" then make.unique'd.
+    .raven_list_to_df <- function(x) {
+        k <- length(x)
+        n <- max(c(0L, lengths(x)))
+        nm <- names(x)
+        if (is.null(nm)) nm <- rep("", k)
+        blank <- is.na(nm) | !nzchar(nm)
+        nm[blank] <- paste0("V", seq_len(k))[blank]
+        nm <- make.unique(nm)
+        cols <- vector("list", k)
+        for (i in seq_len(k)) {
+            el <- x[[i]]
+            cols[[i]] <- if (is.null(el)) rep(NA, n) else unname(el[seq_len(n)])
+        }
+        names(cols) <- nm
+        class(cols) <- "data.frame"
+        attr(cols, "row.names") <- .set_row_names(n)
+        cols
+    }
+
     # Pre-encode one column for arrow:
     # - factor: keep as-is (arrow handles dictionary)
     # - haven_labelled: strip class, keep underlying numeric/character
@@ -185,7 +236,10 @@ local({
         if (is.factor(col)) return(col)
         if ("haven_labelled" %in% cls) {
             x <- unclass(col)
-            attr(x, "label") <- attr(col, "label")
+            # exact = TRUE: a bare attr(col, "label") partial-matches the
+            # "labels" attribute when there is no variable label, which
+            # would stamp a bogus length-2 "label" onto the encoded column.
+            attr(x, "label") <- attr(col, "label", exact = TRUE)
             attr(x, "labels") <- attr(col, "labels")
             return(x)
         }
@@ -223,7 +277,11 @@ local({
 
     .raven_field_metadata <- function(name, col) {
         md <- list()
-        lbl <- attr(col, "label")
+        # exact = TRUE: without it, attr(col, "label") partial-matches the
+        # "labels" (value-label) attribute on a haven_labelled column that
+        # has no variable label, returning a length-2 vector that then
+        # breaks the && below.
+        lbl <- attr(col, "label", exact = TRUE)
         if (!is.null(lbl) && nzchar(as.character(lbl))) {
             md[["raven.variable_label"]] <- as.character(lbl)
         }
@@ -300,11 +358,12 @@ local({
             s
         }
 
-        if (!is.data.frame(x) && !is.matrix(x)) {
-            stop("Can't \`View()\` an object of class \`",
-                 paste(class(x), collapse = "/"), "\`", call. = FALSE)
-        }
-
+        # Type dispatch: matrix and data.frame are tested first (a
+        # data.frame is also a list). Then an atomic / factor /
+        # haven_labelled vector — the !is.null(x) guard matters because
+        # is.atomic(NULL) is TRUE on R < 4.4, and !is.raw(x) excludes raw
+        # (no NA for ragged-list padding). Finally a flat list. Anything
+        # else errors with the Positron-style message.
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
             if (.raven_meaningful_rownames(x)) {
@@ -312,8 +371,17 @@ local({
             }
             rownames(d) <- NULL
             d
-        } else {
+        } else if (is.data.frame(x)) {
             x
+        } else if (!is.null(x) && is.null(dim(x)) && !is.raw(x) &&
+                   (is.atomic(x) || is.factor(x) || inherits(x, "haven_labelled"))) {
+            .raven_vector_to_df(x)
+        } else if (is.list(x) && length(x) > 0L &&
+                   all(vapply(x, .raven_list_elem_ok, logical(1L)))) {
+            .raven_list_to_df(x)
+        } else {
+            stop("Can't \`View()\` an object of class \`",
+                 paste(class(x), collapse = "/"), "\`", call. = FALSE)
         }
         # Pre-encode every column.
         for (nm in names(df)) df[[nm]] <- .raven_encode_col(df[[nm]])
