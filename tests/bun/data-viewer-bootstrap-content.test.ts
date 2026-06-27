@@ -58,16 +58,32 @@ describe('bootstrap profile: data viewer block', () => {
         expect(src).toContain("Can't `View()` an object of class");
     });
 
-    test('accepts atomic vectors / scalars via a !is.null + !is.raw + dim guard', () => {
+    test('accepts atomic vectors / scalars / 1-D arrays via a !is.null + !is.raw + dim guard', () => {
         const dvIdx = src.indexOf('# Raven data viewer block');
         const slice = src.slice(dvIdx);
         // The vector branch must guard bare NULL (is.atomic(NULL) is TRUE on
-        // R < 4.4) and raw (no NA for ragged padding), and exclude
-        // multi-dimensional objects.
+        // R < 4.4) and raw (no NA for ragged padding). The dim guard admits
+        // plain vectors (dim NULL) and 1-D arrays (dim length 1) but excludes
+        // matrices and higher arrays.
         expect(slice).toContain('!is.null(x)');
         expect(slice).toContain('!is.raw(x)');
-        expect(slice).toContain('is.null(dim(x))');
+        expect(slice).toContain('length(dim(x)) <= 1L');
         expect(slice).toMatch(/is\.atomic\(x\).*is\.factor\(x\).*haven_labelled/s);
+        // 1-D array normalization: carry dimnames to names, drop dim.
+        expect(slice).toContain('dim(x) <- NULL');
+    });
+
+    test('lists report a content-specific reason; >2-D arrays report dimensions', () => {
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        // Empty and non-flat lists name the reason rather than the class.
+        expect(slice).toContain("Can't `View()` an empty list.");
+        expect(slice).toContain("Can't `View()` this list:");
+        expect(slice).toContain('Only flat lists (every element a vector) are supported.');
+        // Higher-dimensional arrays report their dimensionality, gated on
+        // is.array so S4 dim() methods fall through to the generic message.
+        expect(slice).toContain('the data viewer shows 2-dimensional tables only.');
+        expect(slice).toMatch(/is\.array\(x\)\s*&&\s*length\(dim\(x\)\)\s*>\s*2L/);
     });
 
     test('names vector columns name + value(s); drops name column when unnamed', () => {
