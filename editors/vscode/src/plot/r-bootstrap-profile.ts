@@ -300,9 +300,11 @@ local({
         # exact = TRUE: without it, attr(col, "label") partial-matches the
         # "labels" (value-label) attribute on a haven_labelled column that
         # has no variable label, returning a length-2 vector that then
-        # breaks the && below.
+        # breaks the && below. The length(lbl) == 1L guard is belt-and-
+        # suspenders against a non-standard multi-element "label" attribute
+        # (same hazard guarded in the format.* loop below).
         lbl <- attr(col, "label", exact = TRUE)
-        if (!is.null(lbl) && nzchar(as.character(lbl))) {
+        if (!is.null(lbl) && length(lbl) == 1L && nzchar(as.character(lbl))) {
             md[["raven.variable_label"]] <- as.character(lbl)
         }
         vlj <- .raven_value_labels_json(col)

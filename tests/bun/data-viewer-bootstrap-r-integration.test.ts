@@ -406,6 +406,27 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
     );
 
     test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(df with a non-scalar "label" attr) does not crash on the && length check',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                // A malformed length-2 "label" attribute must not blow up the
+                // `&&` in the metadata writer (length>1 → error on R >= 4.4).
+                const r = spawnR(cap,
+                    'df <- data.frame(a = 1:2); attr(df$a, "label") <- c("x", "y"); View(df); Sys.sleep(0.2)');
+                const got = await cap.waitForRequest(
+                    req => req.headers.includes('POST /view-data'), 20_000);
+                const done = await r;
+                expect(got.body).toContain('"nrow":2');
+                expect(done.stderr).not.toContain('length = 2');
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
+    test.skipIf(!HAS_R || !HAS_ARROW)(
         'View(nested list) errors and posts nothing',
         async () => {
             const cap = await start_capture_server();
