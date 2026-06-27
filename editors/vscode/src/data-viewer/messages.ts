@@ -230,6 +230,20 @@ export type ExtensionToWebview =
         state: 'pending' | 'idle';
     }
     | {
+        /** Sent before the host reads columns to reapply a saved
+         *  sort/filter on open (#519), so the webview can explain the wait
+         *  (instead of a bare "Loading…") and offer a Cancel control.
+         *  `restoreId` is a monotonic id (NOT `panelGeneration`, which the
+         *  host bumps only on dataset replace) identifying this restore so
+         *  a `cancelRestore` can be matched to it. `sort` / `filter` say
+         *  which preferences are being applied (for the wording). */
+        type: 'restorePending';
+        panelGeneration: number;
+        restoreId: number;
+        sort: boolean;
+        filter: boolean;
+    }
+    | {
         type: 'copyDone';
         panelGeneration: number;
         requestId: number;
@@ -390,6 +404,16 @@ export type WebviewToExtension =
         panelGeneration: number;
         schemaHash: string;
         filter: FilterState;
+    }
+    | {
+        /** Asks the host to abandon the in-progress restore of a saved
+         *  sort/filter (#519) and show the data unsorted/unfiltered,
+         *  forgetting the saved preferences. `restoreId` echoes the value
+         *  from the `restorePending` being cancelled, so a stale cancel
+         *  from a prior lifecycle is ignored by the host. */
+        type: 'cancelRestore';
+        panelGeneration: number;
+        restoreId: number;
     };
 
 /** Hard cap on the number of cells the extension will materialize for a

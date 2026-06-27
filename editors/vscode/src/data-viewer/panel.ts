@@ -26,6 +26,7 @@ import {
 } from './messages';
 import { computePermutation } from './sort';
 import { computeFilteredIndices } from './filter';
+import { isAbortError } from './abort';
 import { computeHistogramForColumn, isNumericArrowType } from './histograms';
 import { LayoutStore, schemaHash } from './layout-state';
 import { ToolbarState, ToolbarStateStore } from './toolbar-state';
@@ -85,6 +86,31 @@ export class DataViewerPanel {
     private lastViewportRange: { start: number; end: number } | undefined;
     /** Latest selected focus cell observed via lifecycle events. */
     private lastFocusCell: { row: number; col: number } | undefined;
+    // --- Saved-sort/filter restore on open (#519) ---
+    /** Controls the in-flight restore's column reads. A webview Cancel
+     *  aborts it; cancellation is read from the captured signal, not a
+     *  shared boolean, so a concurrent send can't erase an in-flight
+     *  cancel. */
+    private restoreAbort: AbortController | null = null;
+    /** True while a cancellable restore is reading columns. Gates the
+     *  in-flight vs. already-completed cancel paths and makes interactive
+     *  setSort/setFilters no-op so a generation bump can't strand it. */
+    private restoring = false;
+    /** Monotonic id of the active restore (-1 ⇔ none). The
+     *  restorePending/cancelRestore handshake key. NOT `generation` —
+     *  webviewReady reloads do not bump generation, so reusing it would
+     *  alias restores across a reload. */
+    private restoreId = -1;
+    /** Source of {@link restoreId}; bumped per restore begun. */
+    private restoreSeq = 0;
+    /** Active toolbar last shipped to the webview, captured so the late
+     *  clear-and-forget can rebuild a `replace` without re-loading the
+     *  store. */
+    private lastToolbar: ToolbarState | undefined;
+    /** Serializes sendInit/sendReplace so two restores never overlap (a
+     *  reload mid-restore must not start a concurrent send that overwrites
+     *  {@link restoreAbort}). */
+    private sendChain: Promise<void> = Promise.resolve();
 
     private constructor(
         panelName: string,
@@ -157,6 +183,11 @@ export class DataViewerPanel {
             return;
         }
         this.generation += 1;
+        // Abort any in-flight restore from the previous dataset. The
+        // generation bump above makes it bail *stale* (prefs intact); the
+        // abort frees the serialized send chain so sendReplace below isn't
+        // stuck behind the dropped read.
+        this.abortAndClearRestore();
         // Clear cached visible range so a stale range from the previous
         // dataset is never returned for the new one. The next lifecycle
         // event from the webview will repopulate it.
@@ -195,7 +226,46 @@ export class DataViewerPanel {
         };
     }
 
-    private async sendInit(): Promise<boolean> {
+    // sendInit / sendReplace are serialized through `sendChain` so two
+    // restores never overlap. The chain wraps only these public entry
+    // points; internal delegation (an uninitialized replace) calls the
+    // *impl* directly so it never awaits a job queued behind itself.
+    private sendInit(): Promise<boolean> {
+        const next = this.sendChain.catch(() => {}).then(() => this.sendInitImpl());
+        this.sendChain = next.then(() => {}, () => {});
+        return next;
+    }
+
+    private sendReplace(): Promise<void> {
+        const next = this.sendChain.catch(() => {}).then(() => this.sendReplaceImpl());
+        this.sendChain = next.then(() => {}, () => {});
+        return next;
+    }
+
+    private sendInitImpl(): Promise<boolean> {
+        return this.paintWithRestore('init');
+    }
+
+    private async sendReplaceImpl(): Promise<void> {
+        if (!this.webviewInitialized) {
+            await this.sendInitImpl();
+            return;
+        }
+        await this.paintWithRestore('replace');
+    }
+
+    /**
+     * Load persisted state, (re)apply any saved sort/filter against the
+     * current reader, and post the paint-enabling `init`/`replace`. When
+     * a saved pref applies, a cancellable restore is begun first: a
+     * `restorePending` precedes the (potentially long) column reads so the
+     * webview can explain the wait and offer Cancel (#519).
+     *
+     * On Cancel the restore is abandoned, the in-memory sort/filter reset,
+     * the persisted prefs forgotten, and the grid shown in natural order.
+     * A genuine (non-abort) read failure instead keeps the prefs and warns.
+     */
+    private async paintWithRestore(kind: 'init' | 'replace'): Promise<boolean> {
         const generation = this.generation;
         const reader = this.reader;
         const columns = reader.schema.columns;
@@ -215,184 +285,342 @@ export class DataViewerPanel {
         this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
         this.dictionaries = this.collectDictionaries();
         const activeToolbar = toolbar ?? this.defaultToolbar();
-        const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
-        if (generation !== this.generation || reader !== this.reader) return false;
-        const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
-        if (generation !== this.generation || reader !== this.reader) return false;
-        const msg: ExtensionToWebview = {
-            type: 'init',
+        this.lastToolbar = activeToolbar;
+
+        // Begin a cancellable restore if saved prefs apply. `myAbort`
+        // identifies this restore's controller; cancellation is read from
+        // its own signal so a concurrent send reassigning this.restoreAbort
+        // can't change what THIS call sees.
+        const began = this.maybeBeginRestore(generation, savedSort, savedFilter);
+        const myAbort = began ? this.restoreAbort : null;
+        const isCancelled = () => myAbort?.signal.aborted === true;
+        try {
+            // restoreSort/restoreFilter set this.sort/permutation/filter/
+            // filteredIndices as a side effect and return true only on a
+            // genuine (non-abort) failure.
+            const sortFailed = await this.restoreSort(
+                savedSort, activeToolbar, generation, reader, myAbort?.signal,
+            );
+            // A refresh/reload during the read supersedes this attempt; bail
+            // *stale* (prefs intact) before the cancel path. A user Cancel
+            // does NOT bump generation, so it falls through to forget below.
+            if (generation !== this.generation || reader !== this.reader) return false;
+            let filterFailed = false;
+            if (!isCancelled()) {
+                filterFailed = await this.restoreFilter(
+                    savedFilter, activeToolbar, generation, reader, myAbort?.signal,
+                );
+                if (generation !== this.generation || reader !== this.reader) return false;
+            }
+            // Undo a sort that completed before the cancel landed during the
+            // filter read, so chips and effective order agree on natural.
+            if (isCancelled()) this.resetRestoredPrefs();
+
+            await this.postPaint(kind, generation, layoutHash, activeToolbar);
+            if (kind === 'init') this.webviewInitialized = true;
+
+            // A restored filter changes the visible row count; the webview
+            // learns the effective count from filterApplied.
+            if (!isCancelled() && this.filteredIndices) {
+                await this.webviewPanel.webview.postMessage({
+                    type: 'filterApplied',
+                    panelGeneration: generation,
+                    requestId: -1,
+                    filter: this.filter,
+                    nrowFiltered: this.filteredIndices.length,
+                    fromPersistence: true,
+                } satisfies ExtensionToWebview);
+            }
+            // Suppress the failure warning on cancel: a read may have
+            // genuinely failed before the cancel landed, but the user chose
+            // natural order, so a "couldn't reapply" popup would be noise.
+            if (!isCancelled() && (sortFailed || filterFailed)) {
+                const what = sortFailed && filterFailed
+                    ? 'sort and filter'
+                    : sortFailed ? 'sort' : 'filter';
+                vscode.window.showWarningMessage(
+                    `Could not reapply the saved ${what} for this dataset; `
+                    + 'it was not applied.',
+                );
+            }
+            // Persist the forget only after the paint, so a store-write
+            // failure cannot strand the webview waiting on a message it
+            // never receives.
+            if (isCancelled()) await this.forgetPersistedPrefs(layoutHash);
+            return true;
+        } finally {
+            // Only the call that began this restore clears its state, and
+            // only if a concurrent refresh hasn't swapped in a newer one.
+            if (began && this.restoreAbort === myAbort) {
+                this.restoring = false;
+                this.restoreAbort = null;
+            }
+        }
+    }
+
+    /** Build and post the paint-enabling init/replace message from the
+     *  current in-memory state (sort/filter are EMPTY after a cancel, so
+     *  no chips render). */
+    private async postPaint(
+        kind: 'init' | 'replace',
+        generation: number,
+        layoutHash: string,
+        activeToolbar: ToolbarState,
+    ): Promise<void> {
+        const common = {
             panelGeneration: generation,
-            nrow: reader.nrow,
+            nrow: this.reader.nrow,
             columns: this.columns,
             layout: this.layout,
             toolbar: activeToolbar,
-            settings: this.settings,
             dictionaries: this.dictionaries,
             schemaHash: layoutHash,
-            sort: restored,
-            filter: restoredFilter,
+            sort: this.sort,
+            filter: this.filter,
         };
-        this.trace('post-init', {
+        const msg: ExtensionToWebview = kind === 'init'
+            ? { type: 'init', ...common, settings: this.settings }
+            : { type: 'replace', ...common };
+        this.trace(`post-${kind}`, {
             generation,
-            nrow: reader.nrow,
+            nrow: this.reader.nrow,
             columns: this.columns.length,
             schemaHash: layoutHash,
             loadedLayoutHidden: this.layout.hiddenColumns,
-            loadedToolbar: toolbar ?? null,
+            loadedToolbar: activeToolbar,
         });
         await this.webviewPanel.webview.postMessage(msg);
-        this.webviewInitialized = true;
-        if (this.filteredIndices) {
-            await this.webviewPanel.webview.postMessage({
-                type: 'filterApplied',
-                panelGeneration: generation,
-                requestId: -1,
-                filter: this.filter,
-                nrowFiltered: this.filteredIndices.length,
-                fromPersistence: true,
-            } satisfies ExtensionToWebview);
-        }
+    }
+
+    // -------------------------------------------------------
+    // Saved-preference restore handshake (#519)
+    // -------------------------------------------------------
+
+    /** Whether `saved` references only columns that still exist. */
+    private columnsInRange(indices: number[]): boolean {
+        const max = this.columns.length - 1;
+        return indices.every(i => i >= 0 && i <= max);
+    }
+
+    /**
+     * If a saved sort and/or filter applies to the current dataset, arm a
+     * cancellable restore (fresh AbortController, fresh restoreId) and post
+     * `restorePending` before the column reads. Returns whether one began.
+     *
+     * Applicability mirrors the real restore guards: a sort is applicable
+     * iff it has keys all in range (restoreSort drops it otherwise); a
+     * filter iff it has an in-range, enabled entry (restoreFilter rejects
+     * any out-of-range entry, and computeFilteredIndices only reads when an
+     * enabled entry survives) — so the banner appears iff a heavy read will
+     * actually run.
+     */
+    private maybeBeginRestore(
+        generation: number,
+        savedSort: SortState | undefined,
+        savedFilter: FilterState | undefined,
+    ): boolean {
+        const hasSort = this.settings.persistSort
+            && !!savedSort
+            && savedSort.keys.length > 0
+            && this.columnsInRange(savedSort.keys.map(k => k.columnIndex));
+        const hasFilter = this.settings.persistFilters
+            && !!savedFilter
+            && savedFilter.entries.length > 0
+            && this.columnsInRange(savedFilter.entries.map(e => e.columnIndex))
+            && savedFilter.entries.some(e => e.enabled);
+        if (!hasSort && !hasFilter) return false;
+
+        this.restoreAbort = new AbortController();
+        this.restoreId = ++this.restoreSeq;
+        this.restoring = true;
+        void this.webviewPanel.webview.postMessage({
+            type: 'restorePending',
+            panelGeneration: generation,
+            restoreId: this.restoreId,
+            sort: hasSort,
+            filter: hasFilter,
+        } satisfies ExtensionToWebview);
         return true;
     }
 
-    private async sendReplace(): Promise<void> {
-        if (!this.webviewInitialized) {
-            await this.sendInit();
-            return;
+    /** Drop the restored sort/filter from memory and consume the handshake
+     *  (synchronous). The caller persists the forget separately. */
+    private resetRestoredPrefs(): void {
+        this.restoreId = -1;
+        this.sort = EMPTY_SORT;
+        this.permutation = undefined;
+        this.sortGeneration += 1;
+        this.filter = EMPTY_FILTER;
+        this.filteredIndices = undefined;
+        this.filterGeneration += 1;
+    }
+
+    /** Consume the restore handshake because the user superseded the
+     *  restored prefs (a new sort/filter), so a later cancelRestore with
+     *  the old id can no longer reach the clear-and-forget branch. */
+    private consumeRestoreHandshake(): void {
+        this.restoreId = -1;
+    }
+
+    /** Abort the in-flight restore's reads and clear the handshake. Used by
+     *  the lifecycle-interruption paths (a webview reload and replace()):
+     *  both bump generation first, which makes the aborted restore bail
+     *  *stale* (prefs intact), while the abort lets the serialized chain
+     *  advance at once instead of waiting on the dropped read. */
+    private abortAndClearRestore(): void {
+        this.restoreAbort?.abort();
+        this.restoreAbort = null;
+        this.restoring = false;
+        this.restoreId = -1;
+    }
+
+    /** Schema hash of the live reader — used by the late clear-and-forget
+     *  path, which runs outside the send methods (where `layoutHash` is a
+     *  local). */
+    private currentSchemaHash(): string {
+        return schemaHash(this.reader.schema.columns);
+    }
+
+    /** Forget the persisted sort/filter for this dataset × schema. */
+    private async forgetPersistedPrefs(hash: string): Promise<void> {
+        if (this.settings.persistSort) {
+            await this.sortStore.clear(this.panelName, hash);
         }
-        const generation = this.generation;
-        const reader = this.reader;
-        const columns = reader.schema.columns;
-        const layoutHash = schemaHash(columns);
-        const [layout, toolbar, savedSort, savedFilter] = await Promise.all([
-            this.store.load(this.panelName, layoutHash),
-            this.toolbarStore.load(this.panelName, layoutHash),
-            this.settings.persistSort
-                ? this.sortStore.load(this.panelName, layoutHash)
-                : Promise.resolve(undefined),
-            this.settings.persistFilters
-                ? this.filterStore.load(this.panelName, layoutHash)
-                : Promise.resolve(undefined),
-        ]);
-        if (generation !== this.generation || reader !== this.reader) return;
-        this.columns = columns;
-        this.layout = layout ?? { columnWidths: {}, hiddenColumns: [] };
-        this.dictionaries = this.collectDictionaries();
-        const activeToolbar = toolbar ?? this.defaultToolbar();
-        const restored = await this.restoreSort(savedSort, activeToolbar, generation, reader);
-        if (generation !== this.generation || reader !== this.reader) return;
-        const restoredFilter = await this.restoreFilter(savedFilter, activeToolbar, generation, reader);
-        if (generation !== this.generation || reader !== this.reader) return;
-        const msg: ExtensionToWebview = {
-            type: 'replace',
-            panelGeneration: generation,
-            nrow: reader.nrow,
-            columns: this.columns,
-            layout: this.layout,
-            toolbar: activeToolbar,
-            dictionaries: this.dictionaries,
-            schemaHash: layoutHash,
-            sort: restored,
-            filter: restoredFilter,
-        };
-        this.trace('post-replace', {
-            generation,
-            nrow: reader.nrow,
-            columns: this.columns.length,
-            schemaHash: layoutHash,
-            loadedLayoutHidden: this.layout.hiddenColumns,
-            loadedToolbar: toolbar ?? null,
-        });
-        await this.webviewPanel.webview.postMessage(msg);
-        if (this.filteredIndices) {
-            await this.webviewPanel.webview.postMessage({
-                type: 'filterApplied',
-                panelGeneration: generation,
-                requestId: -1,
-                filter: this.filter,
-                nrowFiltered: this.filteredIndices.length,
-                fromPersistence: true,
-            } satisfies ExtensionToWebview);
+        if (this.settings.persistFilters) {
+            await this.filterStore.clear(this.panelName, hash);
         }
     }
 
-    /** Attempt to restore a persisted sort. Returns the SortState to ship
-     *  to the webview, and as a side effect updates `this.sort` and
-     *  `this.permutation`. Always recomputes the permutation against the
-     *  current reader — schema-hash equality is not evidence that two
-     *  datasets share row values, so the only persisted truth is the
-     *  list of sort keys. The state is dropped when:
+    /** Post a natural-order `replace` from in-memory state at the given
+     *  (already-bumped) generation, so the webview adopts the new
+     *  generation and drops chips. Used by the late clear-and-forget. */
+    private async postReplaceNaturalOrder(generation: number): Promise<void> {
+        await this.postPaint(
+            'replace',
+            generation,
+            this.currentSchemaHash(),
+            this.lastToolbar ?? this.defaultToolbar(),
+        );
+    }
+
+    /**
+     * Handle a webview Cancel of the saved-preference restore. Ignores a
+     * stale/consumed id. While the restore is in flight, aborts the column
+     * reads (paintWithRestore's cancelled path forgets + posts natural
+     * order). If the restore already completed (the cross-window race),
+     * honors the click as an explicit clear-and-forget so it is never
+     * silently dropped.
+     */
+    private async handleCancelRestore(
+        msg: Extract<WebviewToExtension, { type: 'cancelRestore' }>,
+    ): Promise<void> {
+        if (msg.restoreId !== this.restoreId) return;
+        if (this.restoring) {
+            this.restoreAbort?.abort();
+            return;
+        }
+        // Invalidate synchronously (bump generation) BEFORE awaiting the
+        // store writes, so an in-flight getRows reply under the old
+        // effective permutation is dropped (panel.ts generation gate) and
+        // the natural-order replace adopts the new generation.
+        const hash = this.currentSchemaHash();
+        this.resetRestoredPrefs();
+        this.generation += 1;
+        await this.postReplaceNaturalOrder(this.generation);
+        await this.forgetPersistedPrefs(hash);
+    }
+
+    /** Attempt to restore a persisted sort, updating `this.sort` and
+     *  `this.permutation` as a side effect (the caller reads them when
+     *  building the paint message). Returns true iff a genuine (non-abort)
+     *  read failure occurred, so the caller can warn and keep the saved
+     *  pref; a user-Cancel abort returns false (silent natural order).
+     *  Always recomputes the permutation against the current reader —
+     *  schema-hash equality is not evidence that two datasets share row
+     *  values, so the only persisted truth is the list of sort keys. The
+     *  sort is dropped (no failure) when:
      *    - persistSort is off,
      *    - no saved state exists,
      *    - the saved state had no keys (already empty), or
      *    - any key references a column that no longer exists.
+     *  An optional `signal` makes the column reads cancellable (#519).
      *  Caller is responsible for the post-await generation check. */
     private async restoreSort(
         saved: SortState | undefined,
         toolbar: ToolbarState,
         generation: number,
         reader: ArrowSliceReader,
-    ): Promise<SortState> {
+        signal?: AbortSignal,
+    ): Promise<boolean> {
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
-        if (!saved || saved.keys.length === 0) return EMPTY_SORT;
+        if (!saved || saved.keys.length === 0) return false;
         const maxColIndex = this.columns.length - 1;
         for (const k of saved.keys) {
-            if (k.columnIndex < 0 || k.columnIndex > maxColIndex) return EMPTY_SORT;
+            if (k.columnIndex < 0 || k.columnIndex > maxColIndex) return false;
         }
         try {
             const perm = await computePermutation(reader, saved.keys, {
                 labelsOn: toolbar.labelsOn,
                 formatOn: toolbar.formatOn,
                 digits: toolbar.digits,
-            });
-            if (generation !== this.generation || reader !== this.reader) return EMPTY_SORT;
+            }, { signal });
+            if (generation !== this.generation || reader !== this.reader) return false;
             this.sort = {
                 keys: saved.keys,
                 labelsOnWhenSorted: toolbar.labelsOn,
             };
             this.permutation = perm;
             this.sortGeneration += 1;
-            return this.sort;
-        } catch {
-            return EMPTY_SORT;
+            return false;
+        } catch (err) {
+            // A user Cancel aborts the read → natural order, silent. A
+            // genuine read failure → natural order, but report so the
+            // caller can warn and keep the saved pref for next time.
+            return !isAbortError(err);
         }
     }
 
-    /** Attempt to restore a persisted filter. Returns the FilterState to
-     *  ship to the webview, and as a side effect updates `this.filter` and
-     *  `this.filteredIndices`. The state is dropped when:
+    /** Attempt to restore a persisted filter, updating `this.filter` and
+     *  `this.filteredIndices` as a side effect. Returns true iff a genuine
+     *  (non-abort) read failure occurred (see {@link restoreSort}); a
+     *  user-Cancel abort returns false. The filter is dropped (no failure)
+     *  when:
      *    - persistFilters is off,
      *    - no saved state exists,
      *    - the saved state had no entries (already empty), or
      *    - any entry references a column that no longer exists.
+     *  An optional `signal` makes the column reads cancellable (#519).
      *  Caller is responsible for the post-await generation check. */
     private async restoreFilter(
         saved: FilterState | undefined,
         toolbar: ToolbarState,
         generation: number,
         reader: ArrowSliceReader,
-    ): Promise<FilterState> {
+        signal?: AbortSignal,
+    ): Promise<boolean> {
         this.filter = EMPTY_FILTER;
         this.filteredIndices = undefined;
-        if (!saved || saved.entries.length === 0) return EMPTY_FILTER;
+        if (!saved || saved.entries.length === 0) return false;
         const maxColIndex = this.columns.length - 1;
         for (const e of saved.entries) {
-            if (e.columnIndex < 0 || e.columnIndex > maxColIndex) return EMPTY_FILTER;
+            if (e.columnIndex < 0 || e.columnIndex > maxColIndex) return false;
         }
         try {
             const indices = await computeFilteredIndices(reader, saved, {
                 labelsOn: toolbar.labelsOn,
                 formatOn: toolbar.formatOn,
                 digits: toolbar.digits,
-            });
-            if (generation !== this.generation || reader !== this.reader) return EMPTY_FILTER;
+            }, { signal });
+            if (generation !== this.generation || reader !== this.reader) return false;
             this.filter = { entries: saved.entries, labelsOnWhenFiltered: toolbar.labelsOn };
             this.filteredIndices = indices;
             this.filterGeneration += 1;
-            return this.filter;
-        } catch {
-            return EMPTY_FILTER;
+            return false;
+        } catch (err) {
+            // Cancel → natural order silently; genuine failure → natural
+            // order, reported so the caller can warn and keep the filter.
+            return !isAbortError(err);
         }
     }
 
@@ -442,7 +670,21 @@ export class DataViewerPanel {
         if (m.type === 'webviewReady') {
             this.trace('webview-ready', { generation: this.generation });
             this.webviewReady = true;
+            // A webview reload mid-restore is a lifecycle interruption, not
+            // a user Cancel: bump generation so the abandoned restore bails
+            // *stale* (prefs intact) rather than taking the cancel/forget
+            // path, then abort it so the serialized chain advances at once.
+            // The queued sendInit re-reads from the store and re-restores
+            // (raven has no one-shot restored flags).
+            if (this.restoring) {
+                this.generation += 1;
+                this.abortAndClearRestore();
+            }
             await this.sendInit();
+            return;
+        }
+        if (m.type === 'cancelRestore') {
+            await this.handleCancelRestore(m);
             return;
         }
         if (m.type === 'lifecycle') {
@@ -675,6 +917,16 @@ export class DataViewerPanel {
         m: Extract<WebviewToExtension, { type: 'setSort' }>,
         gen: number,
     ): Promise<void> {
+        // Ignore interactive sort while a saved-preference restore is in
+        // flight: a generation bump here would make the restore discard its
+        // result without posting init/replace, stranding the panel. The
+        // restore posts authoritative state momentarily.
+        if (this.restoring) return;
+        // The user is superseding the restored prefs, so the restore
+        // handshake is over — a delayed cancelRestore with the old id must
+        // not reach the clear-and-forget branch and wipe this.
+        this.consumeRestoreHandshake();
+
         // Clear the current permutation and let the webview render a
         // "Sorting…" indicator while we work. For empty `keys`, this is
         // also the final state (no apply pass needed).
@@ -765,6 +1017,11 @@ export class DataViewerPanel {
         m: Extract<WebviewToExtension, { type: 'setFilters' }>,
         gen: number,
     ): Promise<void> {
+        // Ignore interactive filter while a restore is in flight (see
+        // handleSetSort), then consume the handshake when superseding.
+        if (this.restoring) return;
+        this.consumeRestoreHandshake();
+
         this.filterGeneration += 1;
         const myFilterGen = this.filterGeneration;
         const next: FilterState = { entries: m.entries, labelsOnWhenFiltered: m.labelsOn };
