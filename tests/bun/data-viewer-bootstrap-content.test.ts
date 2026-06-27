@@ -58,6 +58,42 @@ describe('bootstrap profile: data viewer block', () => {
         expect(src).toContain("Can't `View()` an object of class");
     });
 
+    test('accepts atomic vectors / scalars via a !is.null + !is.raw + dim guard', () => {
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        // The vector branch must guard bare NULL (is.atomic(NULL) is TRUE on
+        // R < 4.4) and raw (no NA for ragged padding), and exclude
+        // multi-dimensional objects.
+        expect(slice).toContain('!is.null(x)');
+        expect(slice).toContain('!is.raw(x)');
+        expect(slice).toContain('is.null(dim(x))');
+        expect(slice).toMatch(/is\.atomic\(x\).*is\.factor\(x\).*haven_labelled/s);
+    });
+
+    test('names vector columns name + value(s); drops name column when unnamed', () => {
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        // Singular value header when length 1, else plural.
+        expect(slice).toContain('"value"');
+        expect(slice).toContain('"values"');
+        // Leading names column headed "name".
+        expect(slice).toContain('"name"');
+        // The names column is conditional on names() being non-NULL.
+        expect(slice).toMatch(/is\.null\(nm\)|is\.null\(names\(/);
+    });
+
+    test('accepts flat lists, excludes nested/recursive and raw elements', () => {
+        const dvIdx = src.indexOf('# Raven data viewer block');
+        const slice = src.slice(dvIdx);
+        // Per-element acceptance check rejects list/data.frame/dim/raw.
+        expect(slice).toMatch(/is\.list\(/);
+        expect(slice).toContain('!is.raw(');
+        // NA-padding via positional indexing (preserves class); make.unique
+        // for column names.
+        expect(slice).toMatch(/seq_len\(/);
+        expect(slice).toContain('make.unique');
+    });
+
     test('truncates panelName to 256 chars with ellipsis', () => {
         const dvIdx = src.indexOf('# Raven data viewer block');
         const slice = src.slice(dvIdx);

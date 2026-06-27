@@ -45,11 +45,27 @@ side-by-side.
 - `matrix`. If the matrix has non-default rownames, they appear as a
   leading `rowname` column; auto-generated `1..N` rownames are dropped
   in favor of the viewer's row-number gutter.
-- Other classes raise an error in R:
+- **Atomic vectors and scalars** (`numeric`, `integer`, `character`,
+  `logical`, `complex`, `Date`, `POSIXct`), plus standalone `factor` and
+  `haven_labelled` vectors. A vector renders as a `values` column (a
+  `value` column when it has length 1). If the vector has `names()`,
+  those appear in a leading `name` column — the same role the `rowname`
+  column plays for a matrix. A standalone `factor` / `haven_labelled`
+  vector keeps its labels, so the [Labels](#labels) toggle works on it.
+- **Flat lists** — a list whose elements are all scalars/vectors. Each
+  element becomes a column, padded with empty (`NA`) cells to the length
+  of the longest element, and each column keeps its own type. Unnamed
+  elements get `V1`, `V2`, … headers. A named vector and a list of
+  scalars therefore render differently — `c(a = 1, b = 2)` is a two-row
+  `name`/`values` table, while `list(a = 1, b = 2)` is a one-row,
+  two-column table — matching `as.data.frame(list(a = 1, b = 2))`.
+- Other classes — including nested/recursive lists (an element that is
+  itself a list or `data.frame`), `raw` vectors, environments, and
+  functions — raise an error in R:
 
   ```r
-  > View(1)
-  Error: Can't `View()` an object of class `numeric`
+  > View(sum)
+  Error: Can't `View()` an object of class `function`
   ```
 
 ## Triggering
