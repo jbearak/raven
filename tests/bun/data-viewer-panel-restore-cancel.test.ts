@@ -264,6 +264,32 @@ describe('sendInit restore', () => {
         expect(last.filter).toEqual(EMPTY_FILTER);
     });
 
+    it('a webview reload during the paint keeps prefs (lifecycle abort, not a cancel)', async () => {
+        const { panel, sortSet } = await makePanel({ storedSort: STORED_SORT });
+        panel.restoreSort = async () => {
+            panel.sort = STORED_SORT; panel.permutation = new Uint32Array(5); return false;
+        };
+        // Prevent the reload's re-send from recursing in this isolated test.
+        panel.sendInit = async () => {};
+        // A webview reload lands during the paint (after the reads completed).
+        // It bumps generation + aborts — but it is NOT a user Cancel, so the
+        // prefs must survive (the queued re-send re-restores them).
+        const origPost = panel.webviewPanel.webview.postMessage;
+        let fired = false;
+        panel.webviewPanel.webview.postMessage = (m: any) => {
+            if (!fired && m.type === 'init') {
+                fired = true;
+                void panel.handleInner({ type: 'webviewReady' });
+            }
+            return origPost(m);
+        };
+
+        await panel.paintWithRestore('init');
+
+        // The reload bailed paintWithRestore stale; prefs were NOT forgotten.
+        expect(sortSet).toEqual([]);
+    });
+
     it('clears restoring even if it throws before posting init (finding #3)', async () => {
         const { panel } = await makePanel({ storedSort: STORED_SORT });
         panel.restoreSort = async () => {

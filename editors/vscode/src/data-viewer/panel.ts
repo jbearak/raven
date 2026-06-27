@@ -342,6 +342,18 @@ export class DataViewerPanel {
             await this.postPaint(kind, generation, layoutHash, activeToolbar);
             if (kind === 'init') this.webviewInitialized = true;
 
+            // A lifecycle interruption (webview reload / replace()) during the
+            // paint bumps generation and aborts our controller. That abort is
+            // NOT a user Cancel, so bail *stale* here — before the cancel
+            // branch below would misread the aborted signal as a Cancel and
+            // wrongly forget the prefs. The interrupting path keeps the prefs
+            // (or forgets them itself if the user had actually cancelled) and
+            // the queued re-send re-restores. A genuine user Cancel never
+            // bumps generation, so it falls through to the branches below.
+            if (generation !== this.generation || reader !== this.reader) {
+                return false;
+            }
+
             if (cancelledBeforePaint) {
                 // Persist the forget only after the paint, so a store-write
                 // failure cannot strand the webview waiting on a message it
@@ -477,7 +489,11 @@ export class DataViewerPanel {
      *  (synchronous). The caller persists the forget separately. */
     private resetRestoredPrefs(): void {
         this.restoreId = -1;
-        this.restoreCancelRequested = false;
+        // NB: deliberately does NOT clear restoreCancelRequested. That flag is
+        // the user's "forget" intent and is consumed only by maybeBeginRestore
+        // (a fresh restore) or abortAndClearRestore (a lifecycle path reads it
+        // first). Clearing it here would let a lifecycle interruption that
+        // races the paint lose a cancel the user already requested.
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
         this.sortGeneration += 1;
