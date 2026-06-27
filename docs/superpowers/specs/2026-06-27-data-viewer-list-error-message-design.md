@@ -24,8 +24,11 @@ unsupported classes (functions, environments, `NULL`, `raw`, S4) but
 wrong for lists.
 
 **The same defect affects arrays.** A 2-D array is a matrix
-(`is.matrix()` is true for any dim-length-2 object) and already renders.
-But an array whose `dim` length is **not** 2 falls through:
+(`is.matrix()` is true for any object with a length-2 `dim` **attribute**
+— a data.frame is not such an object, since its `dim` comes from a
+`dim.data.frame` method, not an attribute, and it is caught by the
+earlier `is.data.frame(x)` branch anyway) and already renders. But an
+array whose `dim` length is **not** 2 falls through:
 
 ```r
 > View(array(1:8, c(2, 2, 2)))
@@ -130,7 +133,7 @@ message. A `data.frame` is also a list, but it is caught by the earlier
              call. = FALSE)
     }
     .raven_list_to_df(x)
-} else if (length(dim(x)) > 2L) {
+} else if (is.array(x) && length(dim(x)) > 2L) {
     stop("Can't `View()` an array with ", length(dim(x)),
          " dimensions; the data viewer shows 2-dimensional tables only.",
          call. = FALSE)
@@ -153,7 +156,12 @@ message. A `data.frame` is also a list, but it is caught by the earlier
   `` Can't `View()` an array with 3 dimensions; the data viewer shows 2-dimensional tables only. ``
   The dim count is interpolated, and is always ≥ 3 here (1-D arrays are
   handled by the vector branch and 2-D arrays by the matrix branch), so
-  the noun is always plural — no singular/plural handling needed.
+  the noun is always plural — no singular/plural handling needed. The
+  branch is gated on **`is.array(x)`** (not bare `length(dim(x)) > 2L`):
+  `is.array` tests the `dim` **attribute**, so it matches base arrays and
+  `table`s (a 3-way table is an array) but **not** an S4 object whose
+  `dim()` *method* returns a length-≥3 vector with no `dim` attribute —
+  that S4 object must fall through to the generic `else`, as promised.
 - **Everything else** (functions, environments, `NULL`, `raw`, S4):
   unchanged — `` Can't `View()` an object of class `<class>` ``.
 
@@ -178,8 +186,17 @@ Wording notes:
 
 The `else` (true non-list) branch is byte-for-byte the existing message,
 so any object that is not a matrix / data.frame / accepted vector /
-list keeps its current behavior, including `View(NULL)` and
+list / array keeps its current behavior, including `View(NULL)` and
 `View(as.raw(1:3))`.
+
+**List-array edge case (intentional):** a list carrying a `dim`
+attribute (e.g. `array(list(1, 2), dim = c(1, 1, 2))`) is still a list,
+so `is.list(x)` catches it in the list branch **before** the array
+branch. It is therefore handled as a (non-flat) list — its elements run
+through `.raven_list_elem_ok` and it gets the list message, never the
+dimension message. This is acceptable: list-arrays are exotic, and the
+list branch's message is still more informative than the old generic
+one. The array branch deliberately handles only **atomic** arrays.
 
 ## Testing
 
@@ -194,6 +211,11 @@ list keeps its current behavior, including `View(NULL)` and
   `` Can't `View()` an empty list. ``; posts nothing.
 - **Add** unnamed offender `View(list(1, list(2)))`: stderr contains
   `element 2 has class `list``; posts nothing.
+- **Add** blank/`NA`-named offender
+  (`View(setNames(list(1, list(2)), c("a", "")))` and an `NA`-name
+  variant): stderr reports the positional `element 2` form — **not**
+  `` element `` `` / `element `NA` `` — guarding the
+  `nzchar`/`!is.na` fall-through to the positional label.
 - **Keep unchanged** `View(as.raw(1:3))` and `View(NULL)`: these hit the
   `else` branch, so they still contain
   `` Can't `View()` an object of class `` — these tests guard that the
@@ -207,6 +229,17 @@ list keeps its current behavior, including `View(NULL)` and
   guards the `dimnames[[1]]` → `names` carry-over.
 - **Add** 3-D array `View(array(1:8, c(2, 2, 2)))`: stderr contains
   `` Can't `View()` an array with 3 dimensions ``; posts nothing.
+- **Add** 3-way table
+  (`View(table(sample(letters[1:2], 8, TRUE), sample(1:2, 8, TRUE), sample(1:2, 8, TRUE)))`
+  or a deterministic equivalent): a 3-way table has `class == "table"`
+  and `length(dim) == 3`; assert it hits the same
+  `` an array with 3 dimensions `` message (guards that the `is.array(x)`
+  gate admits tables); posts nothing.
+- **Non-regression (kept coverage, already exercised but call out
+  explicitly):** the existing accepted set must still post `/view-data`
+  — a `data.frame`, a `matrix`, a flat list, and an atomic / `factor` /
+  `haven_labelled` vector. The 1-D-array additions above must not change
+  any of these.
 
 `tests/bun/data-viewer-bootstrap-content.test.ts` (string-level pin of
 the bootstrap source):
