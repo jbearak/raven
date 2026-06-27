@@ -3,6 +3,8 @@ import {
     buildGridColumns,
     buildVisibleGridColumns,
     clampColumnWidth,
+    describeRestoreMessage,
+    describeToolbarRowCount,
     describeVisibleRows,
     fitLeadingText,
     MAX_COLUMN_WIDTH_PX,
@@ -239,5 +241,29 @@ describe('formatCell', () => {
             .toEqual({ text: '2024-01-15', missing: false });
         expect(formatCell({ _: 'trunc', v: 'long...' }, undefined, undefined, false, false, 3))
             .toEqual({ text: 'long...', missing: false });
+    });
+});
+
+describe('saved sort/filter restore messaging (#519)', () => {
+    test('describeRestoreMessage words by which prefs apply', () => {
+        expect(describeRestoreMessage(true, true))
+            .toBe('Applying your saved sort & filter…');
+        expect(describeRestoreMessage(true, false))
+            .toBe('Applying your saved sort…');
+        expect(describeRestoreMessage(false, true))
+            .toBe('Applying your saved filter…');
+    });
+
+    test('describeToolbarRowCount suppresses the row count while a restore banner shows', () => {
+        // The banner already explains the wait, so the bare "Loading…"
+        // must not stack above it.
+        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, true)).toBe('');
+        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, true)).toBe('');
+    });
+
+    test('describeToolbarRowCount falls through to the normal label when no restore', () => {
+        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, false)).toBe('Loading…');
+        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, false))
+            .toBe('Showing 1-50 of 1,000');
     });
 });

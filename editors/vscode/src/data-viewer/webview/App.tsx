@@ -43,7 +43,8 @@ import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
 import {
     buildGridColumns,
     buildVisibleGridColumns,
-    describeVisibleRows,
+    describeRestoreMessage,
+    describeToolbarRowCount,
     fitLeadingText,
     HEADER_HEIGHT_PX,
     OVERSCAN_ROWS,
@@ -104,6 +105,11 @@ type HeaderTooltipState = {
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
 const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
+
+/** Delay before the saved-sort/filter restore banner appears (#519). A
+ *  restore that finishes faster than this never flashes the message; only a
+ *  genuinely slow restore reveals it (and its Cancel). */
+const RESTORE_DEBOUNCE_MS = 200;
 // Glide's renderer type is invariant, but dispatch is by each renderer's `kind`.
 const DATA_VIEWER_RENDERERS = [
     markerCellRenderer,
@@ -357,6 +363,16 @@ export function App({
      *  restored a non-empty schema from getState (we already have something
      *  to show). */
     const [loading, setLoading] = useState<boolean>(!(restored?.columns && restored.columns.length > 0));
+    // Saved-sort/filter restore banner (#519). `restorePending` is set only
+    // after the debounce timer fires, so a fast restore never flashes it;
+    // `restoreCancelling` shows the optimistic "Cancelling…" until init/replace
+    // lands. The refs hold the live restoreId (echoed on cancelRestore) and the
+    // debounce timer so it can be cleared when the restore completes.
+    const [restorePending, setRestorePending] =
+        useState<{ restoreId: number; sort: boolean; filter: boolean } | null>(null);
+    const [restoreCancelling, setRestoreCancelling] = useState(false);
+    const restoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const restoreIdRef = useRef<number | null>(null);
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
@@ -389,7 +405,17 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
-    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange, loading);
+    // On open, explain (and let the user cancel) the wait while saved
+    // sort/filter preferences are reapplied (#519). While the banner is up it
+    // explains the wait, so the bare "Loading…" row-count is suppressed.
+    const restoreMessage = restorePending
+        ? (restoreCancelling
+            ? 'Cancelling…'
+            : describeRestoreMessage(restorePending.sort, restorePending.filter))
+        : null;
+    const rowCountText = describeToolbarRowCount(
+        effectiveNrow, visibleRange, loading, restoreMessage !== null,
+    );
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale.
@@ -964,14 +990,58 @@ export function App({
         vscode.postMessage({ type: 'webviewReady' });
     }, [vscode]);
 
+    /** Cancel the in-flight saved-sort/filter restore (#519). Posts the
+     *  echoed restoreId so a stale cancel from a prior lifecycle is ignored
+     *  by the host, and optimistically shows "Cancelling…" until the
+     *  natural-order init/replace lands. */
+    const cancelRestore = useCallback(() => {
+        const id = restoreIdRef.current;
+        if (id === null) return;
+        setRestoreCancelling(true);
+        vscode.postMessage({
+            type: 'cancelRestore',
+            panelGeneration,
+            restoreId: id,
+        });
+    }, [vscode, panelGeneration]);
+
     useEffect(() => {
         const onMessage = (event: MessageEvent<ExtensionToWebview>) => {
             const m = event.data;
             if (!m || typeof m !== 'object') return;
             if ('panelGeneration' in m && m.panelGeneration < panelGeneration) return;
             switch (m.type) {
+                case 'restorePending': {
+                    // Defer showing the banner until the debounce elapses; a
+                    // restore that completes sooner clears the timer on
+                    // init/replace below and never flashes the message.
+                    restoreIdRef.current = m.restoreId;
+                    setRestoreCancelling(false);
+                    if (restoreTimerRef.current !== null) {
+                        clearTimeout(restoreTimerRef.current);
+                    }
+                    const info = { restoreId: m.restoreId, sort: m.sort, filter: m.filter };
+                    // If a banner is already visible (a prior restore whose
+                    // debounce elapsed), swap its wording at once rather than
+                    // showing stale text until the timer fires.
+                    setRestorePending(prev => (prev ? info : prev));
+                    restoreTimerRef.current = setTimeout(() => {
+                        setRestorePending(info);
+                        restoreTimerRef.current = null;
+                    }, RESTORE_DEBOUNCE_MS);
+                    return;
+                }
                 case 'init':
                 case 'replace':
+                    // Both the normal and cancelled/late-cancel restore paths
+                    // end by posting init/replace, so clear the banner here.
+                    if (restoreTimerRef.current !== null) {
+                        clearTimeout(restoreTimerRef.current);
+                        restoreTimerRef.current = null;
+                    }
+                    setRestorePending(null);
+                    setRestoreCancelling(false);
+                    restoreIdRef.current = null;
                     applyInitOrReplace(m);
                     return;
                 case 'rows':
@@ -1011,7 +1081,13 @@ export function App({
             }
         };
         window.addEventListener('message', onMessage);
-        return () => window.removeEventListener('message', onMessage);
+        return () => {
+            window.removeEventListener('message', onMessage);
+            if (restoreTimerRef.current !== null) {
+                clearTimeout(restoreTimerRef.current);
+                restoreTimerRef.current = null;
+            }
+        };
     }, [
         applyCopyDone,
         applyFilterApplied,
@@ -1419,6 +1495,20 @@ export function App({
                 ref={toolbarRef}
             >
                 <span className="row-count" ref={rowCountRef}>{rowCountText}</span>
+                {restoreMessage && (
+                    <div className="toolbar-restore" role="status" aria-live="polite">
+                        <span>{restoreMessage}</span>
+                        {!restoreCancelling && (
+                            <button
+                                type="button"
+                                className="restore-cancel"
+                                onClick={cancelRestore}
+                            >
+                                Cancel
+                            </button>
+                        )}
+                    </div>
+                )}
                 <div className="toolbar-chips" ref={toolbarChipsRef}>
                     <ToolbarSortStrip
                         sort={sort}
