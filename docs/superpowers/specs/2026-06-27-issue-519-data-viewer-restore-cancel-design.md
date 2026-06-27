@@ -264,10 +264,16 @@ private lastToolbar: ToolbarState | undefined;
 ```
 
 `sendInitImpl` / `sendReplaceImpl` set `this.lastToolbar = activeToolbar` just
-before posting `init` / `replace`. A small `currentSchemaHash()` helper returns
-`schemaHash(this.reader.schema.columns)` for the forget/late-cancel paths (raven
-recomputes the hash from the live reader rather than threading the `layoutHash`
-local out of the send methods).
+before posting `init` / `replace`. The two forget paths obtain the schema hash
+differently, by context:
+
+- the **in-flight cancelled path** runs *inside* `sendInitImpl` /
+  `sendReplaceImpl`, where the `layoutHash` local is already in scope, so it
+  calls `forgetPersistedPrefs(layoutHash)` directly;
+- the **late clear-and-forget path** runs in `handleCancelRestore`, *outside* any
+  send method, so it uses a small `currentSchemaHash()` helper returning
+  `schemaHash(this.reader.schema.columns)` (same computation as the send methods'
+  local, `panel.ts:202,266`) rather than threading the local out.
 
 ### Serialization without self-deadlock
 
