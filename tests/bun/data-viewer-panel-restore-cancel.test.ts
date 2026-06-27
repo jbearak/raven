@@ -322,6 +322,26 @@ describe('sendInit restore', () => {
         expect(last.filter).toEqual(EMPTY_FILTER);
     });
 
+    it('does not let a fully-honored cancel linger (no spurious forget later)', async () => {
+        const { panel, sortSet } = await makePanel({ storedSort: STORED_SORT });
+        // User cancels during the read (via handleCancelRestore in-flight),
+        // which sets restoreCancelRequested.
+        panel.restoreSort = async () => {
+            await panel.handleCancelRestore({
+                type: 'cancelRestore', panelGeneration: 0, restoreId: panel.restoreId,
+            });
+            return false;
+        };
+
+        await panel.sendInit();
+
+        // The cancel was fully honored (prefs forgotten) AND the intent flag
+        // is cleared — so a later replace() cannot mistake it for a fresh
+        // pending cancel and wrongly forget re-saved prefs.
+        expect(sortSet).toEqual(['cleared']);
+        expect(panel.restoreCancelRequested).toBe(false);
+    });
+
     it('clears restoring even if it throws before posting init (finding #3)', async () => {
         const { panel } = await makePanel({ storedSort: STORED_SORT });
         panel.restoreSort = async () => {

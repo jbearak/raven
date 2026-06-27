@@ -359,6 +359,9 @@ export class DataViewerPanel {
                 // failure cannot strand the webview waiting on a message it
                 // never receives.
                 await this.forgetPersistedPrefs(layoutHash);
+                // Cancel durably honored; clear the intent so it cannot linger
+                // into a later replace()/reload (which would forget again).
+                this.restoreCancelRequested = false;
             } else if (isCancelled()) {
                 // The user cancelled during the paint (after the reads, before
                 // the finally). The chips were already posted; honor the cancel
@@ -603,6 +606,9 @@ export class DataViewerPanel {
         this.generation += 1;
         await this.postReplaceNaturalOrder(this.generation);
         await this.forgetPersistedPrefs(hash);
+        // The cancel is now durably honored; clear the intent so it cannot
+        // linger and cause a later replace()/reload to forget again.
+        this.restoreCancelRequested = false;
     }
 
     /** Attempt to restore a persisted sort, updating `this.sort` and
