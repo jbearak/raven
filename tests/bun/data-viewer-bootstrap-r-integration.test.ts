@@ -341,6 +341,26 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
         30_000,
     );
 
+    test.skipIf(!HAS_R || !HAS_ARROW)(
+        'View(list) — a synthesized V<i> name never steals a real column name',
+        async () => {
+            const cap = await start_capture_server();
+            try {
+                // Element 1 is unnamed → would be filled "V1"; element 2 is
+                // the user's explicit "V1". The user's V1 (value 20) must
+                // survive; the placeholder yields.
+                const r = await spawnR(cap, viewAndReadback(
+                    'View(list(10, V1 = 20))',
+                    'cat("RAVEN_V1=", .df[["V1"]][[1L]], "\\n", sep = "")',
+                ));
+                expect(r.stdout).toContain('RAVEN_V1=20');
+            } finally {
+                await cap.close();
+            }
+        },
+        30_000,
+    );
+
     test.skipIf(!HAS_HAVEN || !HAS_ARROW)(
         'View(haven_labelled) → single value column, labels in schema metadata',
         async () => {

@@ -222,15 +222,20 @@ local({
     # Build a data.frame from a flat (non-recursive) list: one column per
     # element, NA-padded to the longest element (see .raven_pad_to). A
     # literal NULL element has no type and becomes a logical NA column.
-    # Column names come from names(); blank/NA names are filled "V<i>"
-    # then make.unique'd.
+    # Column names come from names(); blank/NA names are filled "V<i>".
+    # Explicit names are authoritative: the "V<i>" placeholders are made
+    # unique against them first, so a user's real column named e.g. "V1"
+    # keeps its name and the placeholder yields (not the reverse).
     .raven_list_to_df <- function(x) {
         k <- length(x)
         n <- max(c(0L, lengths(x)))
         nm <- names(x)
         if (is.null(nm)) nm <- rep("", k)
         blank <- is.na(nm) | !nzchar(nm)
-        nm[blank] <- paste0("V", seq_len(k))[blank]
+        if (any(blank)) {
+            fill <- make.unique(c(nm[!blank], paste0("V", seq_len(k))))
+            nm[blank] <- tail(fill, k)[blank]
+        }
         nm <- make.unique(nm)
         cols <- vector("list", k)
         for (i in seq_len(k)) cols[[i]] <- .raven_pad_to(x[[i]], n)
@@ -309,8 +314,12 @@ local({
         # Used downstream to detect integer-formatted Float columns
         # (e.g. SAS "F8.0" — stored as double, intended as integer).
         for (attr_nm in c("format.stata", "format.sas", "format.spss")) {
-            fmt <- attr(col, attr_nm)
-            if (!is.null(fmt) && nzchar(as.character(fmt))) {
+            # exact = TRUE + the length(fmt) == 1L guard: attr_nm is a
+            # variable, so partial matching is live; a partial match could
+            # return a length>1 vector and turn the nzchar() check into a
+            # length>1 condition (a hard error in the && on R >= 4.4).
+            fmt <- attr(col, attr_nm, exact = TRUE)
+            if (!is.null(fmt) && length(fmt) == 1L && nzchar(as.character(fmt))) {
                 md[["raven.format"]] <- as.character(fmt)
                 break
             }
