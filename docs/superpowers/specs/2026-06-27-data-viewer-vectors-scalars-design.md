@@ -93,8 +93,11 @@ path, untouched.
 
 ### Vectors / scalars
 
-**Accept** when `is.null(dim(x))` and `!is.raw(x)` and
+**Accept** when `!is.null(x)` and `is.null(dim(x))` and `!is.raw(x)` and
 (`is.atomic(x) || is.factor(x) || inherits(x, "haven_labelled")`). The
+`!is.null(x)` guard is required because `is.atomic(NULL)` is `TRUE` on
+R < 4.4 (it became `FALSE` in 4.4.0), so without it `View(NULL)` would
+wrongly enter this branch; instead it must fall through to the error. The
 `dim` guard keeps matrices/1-D arrays out of this branch; `!is.raw(x)`
 enforces the raw exclusion above. Plain atomic vectors carry no labels,
 so `factor` / `haven_labelled` are named explicitly only to admit those
@@ -249,6 +252,8 @@ A named vector and a list of scalars render differently, by design:
   - a fully **unnamed** list → synthesized `V1..Vk` column names;
   - a `raw` vector and a flat list containing a `raw` element → both
     **error** (raw is excluded);
+  - `View(NULL)` → **errors** (must not enter the vector branch on
+    R < 4.4 where `is.atomic(NULL)` is `TRUE`);
   - a factor with a literal **`NA` level** (`factor(x, exclude = NULL)`)
     vs. a factor with `NA` *values* → the level/value distinction
     round-trips correctly through the schema metadata.
