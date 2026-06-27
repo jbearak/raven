@@ -459,10 +459,14 @@ describe('Data viewer bootstrap (real R subprocess)', () => {
     );
 
     test.skipIf(!HAS_R || !HAS_ARROW)(
-        'View(list with blank/NA-named offender) reports the positional element',
+        'View(list offender: unnamed / blank / NA) reports the positional element',
         async () => {
             const cap = await start_capture_server();
             try {
+                // Fully-unnamed list: names(x) is NULL — exercises the
+                // !is.null(nm) short-circuit (nm[[i]] would error otherwise).
+                const unnamed = await spawnR(cap, viewExpectError('View(list(1, list(2)))'));
+                expect(unnamed.stderr).toContain('element 2 has class `list`');
                 // Blank name and NA name must both fall through to "element <i>"
                 // rather than "element ``" / "element `NA`".
                 const blank = await spawnR(cap, viewExpectError(
