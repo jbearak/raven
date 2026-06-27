@@ -3,8 +3,8 @@
 Port of [sight#228](https://github.com/jbearak/sight/pull/228) into raven's
 data viewer, adapted to raven's architecture.
 
-> **Revision 2** — folds in the adversarial spec review (codex). The key
-> corrections: `restoreId` is a dedicated monotonic counter, **not** the
+> **Revision 3** — folds in two rounds of adversarial spec review (codex). The
+> key corrections: `restoreId` is a dedicated monotonic counter, **not** the
 > generation (raven's `webviewReady` does not bump `generation`, so reusing it
 > would alias restores across reloads); reload/refresh paths **bump generation
 > AND abort** so the in-flight send bails as *stale* (keeping prefs) rather than
@@ -256,7 +256,18 @@ private restoring = false;
 private restoreId = -1;          // -1 === no active cancellable restore
 private restoreSeq = 0;          // monotonic source of restoreId
 private sendChain: Promise<void> = Promise.resolve();
+// Last active toolbar posted to the webview, captured so the late
+// clear-and-forget path can rebuild a `replace` without an async store
+// load. (Raven has no persistent host-side toolbar field today; the
+// toolbar is otherwise a local in sendInit/sendReplace, panel.ts:217,281.)
+private lastToolbar: ToolbarState | undefined;
 ```
+
+`sendInitImpl` / `sendReplaceImpl` set `this.lastToolbar = activeToolbar` just
+before posting `init` / `replace`. A small `currentSchemaHash()` helper returns
+`schemaHash(this.reader.schema.columns)` for the forget/late-cancel paths (raven
+recomputes the hash from the live reader rather than threading the `layoutHash`
+local out of the send methods).
 
 ### Serialization without self-deadlock
 
@@ -355,10 +366,16 @@ path, because raven's `webviewReady` does not bump it today.
   - applicable sort ⟺ `persistSort` && `savedSort.keys.length > 0` && every
     `key.columnIndex` is in `[0, columns.length)` (matches `restoreSort`'s
     early-returns);
-  - applicable filter ⟺ `persistFilters` && `savedFilter` has ≥1 **enabled**
-    entry whose `columnIndex` is in range (matches `restoreFilter` +
-    `computeFilteredIndices`, which filters to enabled entries and throws on an
-    unknown column index, `filter.ts:48,69`).
+  - applicable filter ⟺ `persistFilters` && `savedFilter.entries.length > 0` &&
+    **every** entry's `columnIndex` is in range && **at least one** entry is
+    `enabled`. The "every entry in range" clause matches `restoreFilter`, which
+    rejects the *entire* saved filter if **any** entry — enabled or not — is out
+    of range (`panel.ts:380-382`); the "≥1 enabled" clause matches
+    `computeFilteredIndices`, which filters to enabled entries and does the heavy
+    read only if at least one survives (`filter.ts:48-49`). Together they make
+    the banner appear iff a heavy filter read will actually run — no false
+    positive for an all-disabled or any-out-of-range saved filter (which
+    `restoreFilter` would silently drop before reading).
 
   If neither applies, return false. Otherwise arm a fresh `AbortController`, set
   `restoreId = ++this.restoreSeq`, `restoring = true`, post `restorePending {
@@ -374,10 +391,12 @@ path, because raven's `webviewReady` does not bump it today.
   hash)` and `if persistFilters: filterStore.clear(panelName, hash)`. Raven's
   stores delete the entry on `clear`; that is "forget entirely."
 - `postReplaceNaturalOrder(generation)` — builds and posts a `replace` from
-  in-memory `this.columns` / `this.layout` / `this.dictionaries` / active toolbar
-  with `EMPTY_SORT` / `EMPTY_FILTER` at the given (already-bumped) generation,
-  used by the late clear-and-forget so the webview adopts the new generation and
-  drops chips coherently.
+  in-memory `this.columns` / `this.layout` / `this.dictionaries` /
+  `this.lastToolbar ?? this.defaultToolbar()` / `currentSchemaHash()` with
+  `EMPTY_SORT` / `EMPTY_FILTER` at the given (already-bumped) generation, used by
+  the late clear-and-forget so the webview adopts the new generation and drops
+  chips coherently. (Requires `webviewInitialized`, always true on the late path
+  since the restore already posted `init`/`replace`.)
 
 ### Message handling
 
@@ -390,17 +409,21 @@ path, because raven's `webviewReady` does not bump it today.
   - else (the restore already completed and posted `init`/`replace` in the
     cross-window race): honor the click as an explicit **clear-and-forget** so it
     is never silently dropped. In order: `resetRestoredPrefs(); this.generation++;
-    this.rowCache?.clear?.(); recompute effective;
     postReplaceNaturalOrder(this.generation);` (a full natural-order `replace`,
     so the webview adopts the bumped generation — a bare `sortApplied`/
     `filterApplied` would leave the webview on the old generation and its
     subsequent messages would be dropped by `panel.ts:540`); **then** `await
-    this.forgetPersistedPrefs(layoutHash)`. Invalidate (bump generation + clear
-    cache) **before** awaiting the store writes so no in-flight `getRows` lands
-    stale sorted/filtered rows after the cancel.
+    this.forgetPersistedPrefs(currentSchemaHash())`. The `generation++` (before
+    the await) is the invalidation: any in-flight `getRows` reply computed under
+    the old effective permutation is captured at the old generation and dropped
+    by `panel.ts:540` / by the webview (which adopts the new generation from the
+    `replace`). Raven has **no host-side row cache** (the row cache is
+    webview-side, `App.tsx:311`, and is cleared when the webview applies
+    `replace`), so there is nothing host-side to clear — only the generation bump
+    and the `replace` are needed.
 - **`webviewReady`** (`panel.ts:442`): if `this.restoring`, treat as a
-  lifecycle interruption — `this.generation++; this.rowCache?.clear?.();
-  abortAndClearRestore();` **before** `await this.sendInit()`. The generation
+  lifecycle interruption — `this.generation++; abortAndClearRestore();`
+  **before** `await this.sendInit()`. The generation
   bump makes the abandoned in-flight restore bail *stale* (prefs kept); the abort
   frees the serialized chain so the re-send (which re-reads from the store and
   re-restores, since raven has no one-shot flags) can post its own
@@ -525,8 +548,9 @@ Extension-side cases:
    no popup, prefs forgotten.
 10. **handleCancelRestore** — ignores stale/mismatched `restoreId`; aborts
     in-flight on match; late cancel after completion = clear-and-forget that
-    bumps generation, posts a natural-order `replace`, clears cache before
-    awaiting store writes, and is a no-op on a duplicate (id consumed).
+    bumps generation **before** awaiting the store writes, posts a natural-order
+    `replace` (asserts the posted `replace` carries the bumped generation and
+    EMPTY sort/filter), and is a no-op on a duplicate (id consumed).
 11. **handleSetSort / handleSetFilters** consume `restoreId` (a later stale
     cancel cannot clear manual prefs) and are no-ops while restoring.
 12. **Stale restore state does not leak** — a later `sendInit` that begins no
@@ -605,4 +629,19 @@ Findings from the round-1 spec review and how this revision resolves them:
 9. **Checkpoint ordering underspecified** (Med) — pinned to top-of-iteration
    `throwIfAborted`, bottom-of-iteration `yieldToEventLoop` (signal only), and a
    post-loop `throwIfAborted`.
+
+Round-2 review (after Revision 2) confirmed findings 1–4 resolved and raised
+three more, all addressed in Revision 3:
+
+10. **`maybeBeginRestore` filter guard still mismatched** (High) — the guard now
+    requires *every* entry in range (matching `restoreFilter`'s all-or-nothing
+    reject, `panel.ts:380-382`) **and** ≥1 enabled (matching the actual heavy
+    read), so the banner cannot false-positive on a saved filter that
+    `restoreFilter` would silently drop.
+11. **`postReplaceNaturalOrder` toolbar/schemaHash source unspecified** (Med) —
+    added a `lastToolbar` field (set before each post) and a `currentSchemaHash()`
+    helper; the helper now names exact sources.
+12. **Phantom host-side `rowCache`** (Low) — removed; raven's row cache is
+    webview-side and self-clears on `replace`. The generation bump alone is the
+    host-side invalidation.
 ```
