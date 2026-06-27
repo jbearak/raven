@@ -3,6 +3,19 @@
 Port of [sight#228](https://github.com/jbearak/sight/pull/228) into raven's
 data viewer, adapted to raven's architecture.
 
+> **Revision 2** — folds in the adversarial spec review (codex). The key
+> corrections: `restoreId` is a dedicated monotonic counter, **not** the
+> generation (raven's `webviewReady` does not bump `generation`, so reusing it
+> would alias restores across reloads); reload/refresh paths **bump generation
+> AND abort** so the in-flight send bails as *stale* (keeping prefs) rather than
+> as *cancelled* (forgetting them); the `sendInit`/`sendReplace` serialization
+> wraps only the public entry points while internal delegation calls the *impl*
+> (no self-deadlock); the late clear-and-forget posts a full natural-order
+> `replace` so the webview adopts the bumped generation; `maybeBeginRestore`'s
+> applicability mirrors raven's *actual* restore guards (column-in-range +
+> non-empty), not sight's predicate-fits-kind logic. See "Review notes" at the
+> end for the finding-by-finding mapping.
+
 ## Problem
 
 Raven's data viewer opens instantly because the grid is virtualized: only the
@@ -66,11 +79,19 @@ loop so the abort message is observed.
 - **Cancel for interactive sort/filter** (`handleSetSort` / `handleSetFilters`,
   applied after the grid is up). Out of scope; those keep their single-shot
   reads. Possible follow-up.
-- **Interruptible permutation/index computation.** Cancel interrupts the
-  *column-reading* phase (the dominant cost). The final synchronous
-  `permutation.sort()` and the filter `compact()` scan over nrow remain
-  uninterruptible; they are comparatively cheap. Acceptable, documented
-  limitation.
+- **Fully interruptible restore.** Cancel interrupts the *column-loading* phase
+  at **Arrow record-batch granularity** (the dominant cost). The following
+  remain synchronous and uninterruptible once entered, and are accepted,
+  documented limitations:
+  - a single oversized record batch (cancel is observed only at its end);
+  - `filter.ts` `applyEntry`'s per-row mask scan and regex/string predicate
+    evaluation over the loaded column;
+  - the dictionary-code set building after the batch loop in both files;
+  - the final `permutation.sort()` (sort) and `compact()` (filter) over nrow.
+
+  These are comparatively cheap relative to the column I/O; cancel latency is
+  bounded by "the rest of the current column read + the synchronous tail," not
+  "the whole restore."
 - **"Remember but don't auto-apply" semantics.** Cancel means *forget entirely*.
 - **A dependency/library bump.** Unlike sight (whose `@jbearak/dta-parser`
   `read_rows` was synchronous `fs.readSync` and had to be made chunked in the
@@ -86,15 +107,23 @@ message sat unprocessed until the read it targeted had already finished.
 
 Raven differs. `computePermutation` (`sort.ts`) iterates batches with
 `for await (const batch of iterateBatches(reader))`, and `computeFilteredIndices`
-(`filter.ts`) calls `await reader.getBatch(bi)` per batch. Each `getBatch`
-awaits `AsyncRecordBatchFileReader.readRecordBatch(i)` — genuine async I/O on a
-cold cache (the restore-on-open case). So the loop already yields between
-batches. To make cancellation robust even on a warm batch cache (where the
-`await` resolves on a microtask and would not drain the macrotask IPC queue), we
-add an explicit `await setImmediate` yield **between batches, only when a signal
-is present**. `setImmediate` runs in the check phase after the poll phase, so a
-pending webview→host IPC message (the Cancel) is delivered and its handler runs
-`controller.abort()` before the next batch's `signal.aborted` check.
+(`filter.ts`) loops `for (let bi = 0; bi < numBatches; bi++) { await
+reader.getBatch(bi) }`. On a **cold** batch cache (the restore-on-open case)
+`getBatch` awaits `AsyncRecordBatchFileReader.readRecordBatch(i)` — genuine async
+I/O — so the loop already yields between batches. On a **warm** cache `getBatch`
+returns synchronously (`arrow-reader.ts` LRU), so the `await` only drains a
+microtask and would *not* deliver a macrotask IPC message. To make cancellation
+robust in both cases we add an explicit `await setImmediate` yield **between
+batches, only when a signal is present**. `setImmediate` schedules a check-phase
+callback that runs after the poll phase, so a pending webview→host IPC message
+(the Cancel) is delivered and its handler runs `controller.abort()` before the
+next batch's abort check.
+
+> The IPC-ordering reasoning is a claim about Node's event-loop phases, not
+> something unit tests can prove. The test plan therefore includes a real
+> extension-host integration test (open a panel with a persisted sort on a large
+> frame, click Cancel, assert natural-order `init` + forgotten prefs) in
+> addition to the unit tests.
 
 ## Part 1 — interruptible restore reads (`sort.ts`, `filter.ts`)
 
@@ -122,56 +151,77 @@ The `signal` threads down into every full-column read:
 
 - `sort.ts`: `computePermutation` → `buildSortColumn` →
   `buildNumericSortColumn` / the string/bool variants → the `iterateBatches`
-  loop. `iterateBatches` gains an optional signal and performs the per-batch
-  check + yield.
+  loop.
 - `filter.ts`: `computeFilteredIndices` → `applyEntry` →
   `acceptorFor` / `missingMaskFor` → `loadNumeric` / `loadString` / `loadBool`.
-  Each load helper performs the per-batch check + yield.
 
-### Behavior
+### Behavior and checkpoint placement
 
-- **No `signal` (default / existing callers, incl. the viewport `getRows`
-  path):** unchanged — no per-batch checks, no yields, byte-identical results.
-  This is the critical backward-compat guarantee; all existing sort/filter perf
-  and tests are untouched.
-- **With `signal`:** at each batch boundary, in order:
-  1. If `signal.aborted`, throw `new DOMException('The restore was aborted',
-     'AbortError')` (Node provides global `DOMException`).
-  2. Process the batch as today.
-  3. `await new Promise<void>(resolve => setImmediate(resolve))` to release the
-     event loop so a queued abort is observed on the next batch's check.
-
-  A final `signal.aborted` check after the loop, before returning, throws if the
-  abort landed on the last batch.
-
-A small shared helper keeps the two files consistent:
+Two tiny shared helpers are the single source of truth:
 
 ```ts
-// A single source of truth for "throw if aborted, else yield the loop."
-export function checkpoint(signal?: AbortSignal): Promise<void> {
-    if (!signal) return Promise.resolve();
-    if (signal.aborted) {
-        return Promise.reject(
-            new DOMException('The restore was aborted', 'AbortError'),
-        );
+export function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw new DOMException('The restore was aborted', 'AbortError');
     }
+}
+
+export function yieldToEventLoop(): Promise<void> {
     return new Promise<void>(resolve => setImmediate(resolve));
 }
 ```
 
-`isAbortError(err)` matches on `name === 'AbortError'` (the abort is a
-`DOMException`, not an `Error` subclass on every runtime), used by the panel to
-distinguish a cancel from a genuine read failure.
+Each batch loop is instrumented as:
+
+```
+for (each record batch) {
+    throwIfAborted(signal);          // (a) catch an abort raised since last yield
+    ...process this batch...
+    if (signal) await yieldToEventLoop();   // (b) release the loop so a Cancel lands
+}
+throwIfAborted(signal);              // (c) catch an abort during the final batch
+```
+
+- **(a) at the top of each iteration** catches an already-aborted signal *before*
+  any read (so an abort before the first batch reads nothing) and an abort that
+  landed during the previous batch's processing/yield.
+- **(b) at the bottom, only when `signal` is set** keeps the no-signal path
+  byte-identical (no extra turns) and releases the loop exactly once per batch on
+  the restore path.
+- **(c) after the loop** catches an abort that landed during the last batch.
+
+The `iterateBatches` generator in `sort.ts` is the natural home for the sort-side
+instrumentation; the filter-side load helpers (`loadNumeric` etc.) instrument
+their own `for (bi …)` loops. Throwing propagates up through
+`computePermutation` / `computeFilteredIndices` to the panel, which classifies it
+with:
+
+```ts
+export function isAbortError(err: unknown): boolean {
+    return typeof err === 'object' && err !== null
+        && (err as { name?: unknown }).name === 'AbortError';
+}
+```
+
+(Matched on `name` because the abort is a `DOMException`, not an `Error`
+subclass on every runtime.)
+
+### Backward-compat invariant
+
+With no `signal` there are **no** `throwIfAborted` effects (the guard is cheap
+and never throws) and **no** yields. The viewport `getRows` path passes no
+signal and is byte-identical. All existing sort/filter perf and tests are
+untouched.
 
 ### Tests (Part 1)
 
 - **Signal-less equivalence:** `computePermutation` / `computeFilteredIndices`
   with no signal returns identical output to before (covers the fast path).
+- **Signal-but-no-abort equivalence:** completion with a never-aborted signal
+  returns identical output (signal presence alone must not change results).
 - **Abort before first batch:** an already-aborted signal rejects with
-  `AbortError` having read nothing observable.
+  `AbortError`.
 - **Abort mid-read:** aborting after the first yield rejects with `AbortError`.
-- **Completion with signal but no abort:** identical result to the signal-less
-  call (signal presence alone must not change output).
 
 ## Part 2 — panel state machine (`panel.ts`)
 
@@ -186,89 +236,201 @@ distinguish a cancel from a genuine read failure.
 | { type: 'cancelRestore'; panelGeneration: number; restoreId: number }
 ```
 
-`restoreId` is the panel's `generation` captured when `restorePending` is
-posted. It is the dedicated handshake key (distinct from the per-message
-`panelGeneration`) so a stale or crossed cancel from a prior lifecycle is
-dropped at the protocol level. `sort` / `filter` say which prefs are being
-applied (for the wording). `restorePending` is posted whenever an applicable
-stored pref **exists** for this `panelName × schemaHash` — gated on existence,
-not on whether the filter ultimately yields a non-empty survivor set (unknowable
-without the read the UI exists to explain).
+`restoreId` is a **dedicated monotonic counter** (`++this.restoreSeq`), assigned
+when `restorePending` is posted. It is *not* the `generation`: raven bumps
+`generation` only on dataset `replace()` (`panel.ts:159`), **not** on a
+`webviewReady` reload (`panel.ts:442`), so reusing `generation` would alias two
+different restore attempts across a reload and let a stale `cancelRestore` abort
+or clear the wrong one. The counter is monotonic and unique per restore, so a
+crossed/stale cancel never matches a newer restore. `sort` / `filter` say which
+prefs are being applied (for the wording). `restorePending` is posted whenever an
+applicable stored pref **exists** for this `panelName × schemaHash` — gated on
+existence, not on whether the filter ultimately yields a non-empty survivor set
+(unknowable without the read the UI exists to explain).
 
 ### State
 
 ```ts
 private restoreAbort: AbortController | null = null;
 private restoring = false;
-private restoreId = -1;                       // -1 === no cancellable restore
+private restoreId = -1;          // -1 === no active cancellable restore
+private restoreSeq = 0;          // monotonic source of restoreId
 private sendChain: Promise<void> = Promise.resolve();
 ```
 
-`sendChain` serializes **both** `sendInit` and `sendReplace` (raven's two
-paint-enabling entry points; sight had one `send_metadata`). Without it, a
-webview reload during a slow restore starts a concurrent send that overwrites
-the shared `restoreAbort`, so a Cancel could abort the wrong restore.
+### Serialization without self-deadlock
+
+`sendChain` serializes the two paint-enabling entry points so two restores never
+overlap (a webview reload during a slow restore must not start a concurrent send
+that overwrites `restoreAbort`). The wrapping is applied to the **public** methods
+only; the existing internal delegation in `sendReplace` (which calls `sendInit`
+when uninitialized, `panel.ts:259`) is rewritten to call the **impl** directly so
+it does not await a job queued behind itself:
 
 ```ts
 private sendInit(): Promise<boolean> {
     const next = this.sendChain.catch(() => {}).then(() => this.sendInitImpl());
-    // Coerce to void for the chain; callers still get the boolean from `next`.
     this.sendChain = next.then(() => {}, () => {});
     return next;
 }
-// sendReplace wraps sendReplaceImpl identically, sharing the same chain.
+private sendReplace(): Promise<void> {
+    const next = this.sendChain.catch(() => {}).then(() => this.sendReplaceImpl());
+    this.sendChain = next.then(() => {}, () => {});
+    return next;
+}
+// inside sendReplaceImpl: if (!this.webviewInitialized) { await this.sendInitImpl(); return; }
 ```
 
 ### `sendInitImpl` / `sendReplaceImpl` flow
 
 Both share one restore helper. Structure (init shown; replace identical except
-the message `type` and the existing `webviewInitialized` guard):
+the message `type` and the `webviewInitialized` guard above):
 
-1. Capture `const generation = this.generation; const reader = this.reader;`
+1. `const generation = this.generation; const reader = this.reader;`
 2. Load stores (layout, toolbar, sort, filter) as today; bail on
    generation/reader change.
-3. `const began = this.maybeBeginRestore(generation, savedSort, savedFilter);`
-   — posts `restorePending` before the reads if an applicable pref exists; arms
-   `restoreAbort`/`restoreId`/`restoring`; returns whether begun.
+3. `const began = this.maybeBeginRestore(savedSort, savedFilter);` — posts
+   `restorePending` before the reads if an applicable pref exists; arms
+   `restoreAbort` / `restoreId` / `restoring`; returns whether begun.
 4. `const myAbort = began ? this.restoreAbort : null;`
    `const isCancelled = () => myAbort?.signal.aborted === true;`
-   (Read cancellation from the **captured** controller, not `this.restoreAbort`,
-   which a concurrent send could reassign.)
-5. `try { ... } finally { if (began && this.restoreAbort === myAbort) {
+   (Cancellation is read from the **captured** controller, not
+   `this.restoreAbort`, which a concurrent send could reassign.)
+5. `try { … } finally { if (began && this.restoreAbort === myAbort) {
    this.restoring = false; this.restoreAbort = null; } }`
    The ownership guard keeps a superseded call from clobbering a restore a
    concurrent refresh started; the `finally` guarantees an early throw cannot
    strand `restoring`.
-6. Inside the try:
+6. Inside the try, **generation check before cancel handling** (this ordering is
+   load-bearing — see below):
    - `const sortFailed = await this.restoreSort(savedSort, toolbar, generation,
      reader, myAbort?.signal);`
-   - bail if `generation !== this.generation || reader !== this.reader` (a
-     refresh/reload supersedes this attempt — leave prefs intact for the queued
-     re-send).
-   - `let filterFailed = false; if (!isCancelled()) { filterFailed = await
-     this.restoreFilter(savedFilter, toolbar, generation, reader,
-     myAbort?.signal); bail-if-stale; }`
+   - `if (generation !== this.generation || reader !== this.reader) return;`
+     (a refresh/reload superseded this attempt — bail *stale*, leaving prefs
+     intact for the queued re-send).
+   - `let filterFailed = false;`
+     `if (!isCancelled()) { filterFailed = await this.restoreFilter(savedFilter,
+     toolbar, generation, reader, myAbort?.signal);
+     if (generation !== this.generation || reader !== this.reader) return; }`
      (Skip the filter read entirely if the sort read was cancelled.)
-   - `if (isCancelled()) this.resetRestoredPrefs();` — undo a sort that
-     completed before the cancel landed during the filter read.
-   - `this.recomputeEffective();` (or raven's equivalent recompute; see note).
-   - Post `init`/`replace` with `sort`/`filter` reflecting current in-memory
-     state (EMPTY after a cancel → no chips).
+   - `if (isCancelled()) this.resetRestoredPrefs();` — undo a sort that completed
+     before the cancel landed during the filter read.
+   - recompute the effective order (raven's existing combine step; see note).
+   - Post `init` / `replace`. **The message's `sort` / `filter` come from the
+     in-memory `this.sort` / `this.filter`** (which `restoreSort` / `restoreFilter`
+     assign on success and `resetRestoredPrefs` clears) — *not* from a returned
+     `SortState`. After a cancel/failure they are `EMPTY_SORT` / `EMPTY_FILTER`,
+     so no chips render. (This is the wiring change implied by `restoreSort` /
+     `restoreFilter` now returning a boolean instead of the state.)
    - `if (!isCancelled() && this.filteredIndices) postFilterApplied(...)`
-     (`fromPersistence: true`, as today).
+     (`fromPersistence: true`, exactly as today).
    - `if (!isCancelled() && (sortFailed || filterFailed))` →
      `vscode.window.showWarningMessage("Could not reapply the saved <what> for
-     this dataset; it was not applied.")` where `<what>` names only what failed.
-   - `if (isCancelled()) await this.forgetPersistedPrefs(generation-derived
-     schemaHash);` — persist the forget **after** the post, so a store-write
-     failure cannot strand the webview waiting on an `init` it never receives.
+     this dataset; it was not applied.")` where `<what>` is `"sort"`,
+     `"filter"`, or `"sort and filter"` — naming only what actually failed.
+   - `if (isCancelled()) await this.forgetPersistedPrefs(layoutHash);` — persist
+     the forget **after** the post, so a store-write failure cannot strand the
+     webview waiting on an `init` it never receives.
+
+#### Why the generation check must precede the cancel check
+
+A user Cancel and a reload/refresh **both** abort `restoreAbort`, so
+`isCancelled()` is true in both. The *only* discriminator is `generation`:
+
+- **User Cancel** does not bump generation → the generation check passes → the
+  cancelled path runs → prefs forgotten. (Intended.)
+- **Reload/refresh** bumps generation (see Message handling) → the generation
+  check fails first → the send bails *stale* before the cancel path → prefs
+  **kept**. (Intended — a reload must not forget the user's prefs.)
+
+This mirrors sight, whose `ready` path bumped generation for the same reason. The
+correction for raven is that we must *add* the generation bump on the reload
+path, because raven's `webviewReady` does not bump it today.
+
+### Helpers
+
+- `maybeBeginRestore(savedSort, savedFilter): boolean` — returns false unless an
+  **applicable** stored pref exists, gating on raven's *actual* restore guards
+  (not sight's predicate-fits-kind logic, which raven's restore does not do):
+  - applicable sort ⟺ `persistSort` && `savedSort.keys.length > 0` && every
+    `key.columnIndex` is in `[0, columns.length)` (matches `restoreSort`'s
+    early-returns);
+  - applicable filter ⟺ `persistFilters` && `savedFilter` has ≥1 **enabled**
+    entry whose `columnIndex` is in range (matches `restoreFilter` +
+    `computeFilteredIndices`, which filters to enabled entries and throws on an
+    unknown column index, `filter.ts:48,69`).
+
+  If neither applies, return false. Otherwise arm a fresh `AbortController`, set
+  `restoreId = ++this.restoreSeq`, `restoring = true`, post `restorePending {
+  panelGeneration: generation, restoreId, sort, filter }`, return true.
+- `resetRestoredPrefs()` — synchronous: `restoreId = -1; sort = EMPTY_SORT;
+  permutation = undefined; filter = EMPTY_FILTER; filteredIndices = undefined`.
+- `consumeRestoreHandshake()` — `restoreId = -1` only (no sort/filter reset).
+  Deliberately distinct from `resetRestoredPrefs` (shares the `-1` line but must
+  also clear sort/filter); the two must not be merged.
+- `abortAndClearRestore()` — `restoreAbort?.abort(); restoreAbort = null;
+  restoring = false; restoreId = -1`. Used by lifecycle-interruption paths.
+- `forgetPersistedPrefs(hash)` — `if persistSort: sortStore.clear(panelName,
+  hash)` and `if persistFilters: filterStore.clear(panelName, hash)`. Raven's
+  stores delete the entry on `clear`; that is "forget entirely."
+- `postReplaceNaturalOrder(generation)` — builds and posts a `replace` from
+  in-memory `this.columns` / `this.layout` / `this.dictionaries` / active toolbar
+  with `EMPTY_SORT` / `EMPTY_FILTER` at the given (already-bumped) generation,
+  used by the late clear-and-forget so the webview adopts the new generation and
+  drops chips coherently.
+
+### Message handling
+
+- **`cancelRestore`** → `handleCancelRestore(msg)`:
+  - `if (msg.restoreId !== this.restoreId) return;` (stale/consumed id).
+  - `if (this.restoring) { this.restoreAbort?.abort(); return; }` — the in-flight
+    reads observe the aborted signal and `sendInitImpl` takes its cancelled path
+    (forget + natural-order `init`). Generation is *not* bumped here, so the
+    in-flight send does **not** bail stale and correctly runs the cancel path.
+  - else (the restore already completed and posted `init`/`replace` in the
+    cross-window race): honor the click as an explicit **clear-and-forget** so it
+    is never silently dropped. In order: `resetRestoredPrefs(); this.generation++;
+    this.rowCache?.clear?.(); recompute effective;
+    postReplaceNaturalOrder(this.generation);` (a full natural-order `replace`,
+    so the webview adopts the bumped generation — a bare `sortApplied`/
+    `filterApplied` would leave the webview on the old generation and its
+    subsequent messages would be dropped by `panel.ts:540`); **then** `await
+    this.forgetPersistedPrefs(layoutHash)`. Invalidate (bump generation + clear
+    cache) **before** awaiting the store writes so no in-flight `getRows` lands
+    stale sorted/filtered rows after the cancel.
+- **`webviewReady`** (`panel.ts:442`): if `this.restoring`, treat as a
+  lifecycle interruption — `this.generation++; this.rowCache?.clear?.();
+  abortAndClearRestore();` **before** `await this.sendInit()`. The generation
+  bump makes the abandoned in-flight restore bail *stale* (prefs kept); the abort
+  frees the serialized chain so the re-send (which re-reads from the store and
+  re-restores, since raven has no one-shot flags) can post its own
+  `restorePending` immediately instead of waiting behind the dropped read.
+- **`replace()`** (`panel.ts:153`) already bumps generation at line 159; add
+  `this.abortAndClearRestore();` right after the bump so any in-flight restore
+  from the previous dataset bails stale and the chain advances before
+  `sendReplace()`.
+- **`handleSetSort` / `handleSetFilters`** → `if (this.restoring) return;` (a
+  generation bump here would strand the restore with no `init` posted). When not
+  restoring, call `consumeRestoreHandshake()` so a delayed `cancelRestore`
+  carrying the old id cannot wipe a manually-applied sort/filter.
+
+> Note on raven specifics: raven uses `permutation` / `filteredIndices`
+> (undefined === identity) and `EMPTY_SORT` / `EMPTY_FILTER`. "Recompute
+> effective" is raven's existing `composeEffective()` path (`panel.ts:558`);
+> there is no single `effective_perm` field as in sight. `restoreSort` /
+> `restoreFilter` already assign `this.sort` / `this.permutation` /
+> `this.filter` / `this.filteredIndices`; the only behavioral change is they now
+> additionally return a genuine-failure boolean and accept a `signal`.
 
 ### `restoreSort` / `restoreFilter` changes
 
 Today both `catch { return EMPTY }`, silently swallowing every error. They now:
 
 - take an optional `signal` and thread it into `computePermutation` /
-  `computeFilteredIndices`;
+  `computeFilteredIndices` (as `{ signal }`);
+- still set `this.sort` / `this.permutation` (resp. `this.filter` /
+  `this.filteredIndices`) exactly as today on success, and reset them to EMPTY at
+  the top (unchanged);
 - return `boolean` — `true` iff a **genuine (non-abort)** failure occurred:
 
 ```ts
@@ -280,68 +442,8 @@ Today both `catch { return EMPTY }`, silently swallowing every error. They now:
 ```
 
 On a generation/reader change after the await they return `false` (stale, not a
-failure). The success path is unchanged except for returning `false`.
-
-### Helpers
-
-- `maybeBeginRestore(generation, savedSort, savedFilter): boolean` — returns
-  false if neither an applicable stored sort (keys.length > 0, columns in range)
-  nor an applicable stored filter (≥1 entry whose predicate still fits its
-  column's current kind, mirroring `restoreFilter`'s keep logic) exists, or if
-  persistence is disabled for both. Otherwise arms a fresh `AbortController`,
-  sets `restoreId = generation`, `restoring = true`, posts `restorePending`,
-  returns true.
-- `resetRestoredPrefs()` — synchronous: `restoreId = -1; sort = EMPTY_SORT;
-  permutation = undefined; filter = EMPTY_FILTER; filteredIndices = undefined`.
-- `consumeRestoreHandshake()` — `restoreId = -1` only (no sort/filter reset).
-  Deliberately distinct from `resetRestoredPrefs` (which shares the `-1` line but
-  must also clear sort/filter); the two must not be merged.
-- `abortAndClearRestore()` — `restoreAbort?.abort(); restoreAbort = null;
-  restoring = false; restoreId = -1`. Used by lifecycle-interruption paths.
-- `forgetPersistedPrefs(schemaHash)` — `if persistSort:
-  sortStore.clear(panelName, hash)` and `if persistFilters:
-  filterStore.clear(panelName, hash)`. Raven's stores delete the entry on
-  `clear`; that is "forget entirely."
-
-### Message handling
-
-- **`cancelRestore`** → `handleCancelRestore(msg)`:
-  - `if (msg.restoreId !== this.restoreId) return;` (stale/consumed id).
-  - `if (this.restoring) { this.restoreAbort?.abort(); return; }` — the
-    in-flight reads observe the aborted signal and `sendInitImpl` takes its
-    cancelled path (forget + natural-order `init`).
-  - else (the restore already completed and posted `init` in the cross-window
-    race): honor the click as an explicit **clear-and-forget** so it is never
-    silently dropped. Synchronously: `resetRestoredPrefs(); generation++;
-    rowCache.clear(); recomputeEffective(); postSortApplied(); postFilterApplied()`
-    (and an updated `init`/`replace` only if chips must disappear and
-    `*Applied` does not already drop them), **then** `await
-    forgetPersistedPrefs(...)`. Invalidate (bump generation + clear cache)
-    **before** awaiting the store writes so no in-flight `getRows` lands stale
-    sorted/filtered rows after the cancel.
-- **`webviewReady`** while `this.restoring` → `abortAndClearRestore()` before
-  the queued `sendInit` re-runs. Raven re-loads sort/filter from the store on
-  every `sendInit`, so there are no one-shot flags to re-arm — the re-send
-  re-restores naturally; the abort just lets the serialized chain advance at once
-  instead of waiting behind the dropped read.
-- **`replace` / refresh to a new dataset** → `abortAndClearRestore()` after the
-  generation bump (the bump makes the abandoned restore bail before
-  posting/forgetting, so prefs survive; the abort frees the chain).
-- **`handleSetSort` / `handleSetFilters`** → `if (this.restoring) return;` (a
-  generation bump here would strand the restore with no `init` posted). When not
-  restoring, call `consumeRestoreHandshake()` so a delayed `cancelRestore`
-  carrying the old id cannot wipe a manually-applied sort/filter.
-
-> Note on raven specifics: raven uses `permutation` / `filteredIndices`
-> (undefined === identity) and `EMPTY_SORT` / `EMPTY_FILTER`. The "recompute
-> effective" step is whatever raven already does to combine sort+filter for the
-> reader (it does not maintain a single `effective_perm` field the way sight
-> does; the implementer follows the existing `restoreSort`/`restoreFilter`
-> assignment pattern). `postSortApplied` is a new tiny helper mirroring the
-> existing `filterApplied` post; if the existing code updates chips purely via
-> `init`/`replace`, the late-cancel branch posts a fresh `replace` instead of a
-> `sortApplied`/`filterApplied` pair — the implementer picks whichever matches
-> the webview's existing chip-update path.
+failure) and leave state as-is for the caller's stale check to discard. The
+success path returns `false`.
 
 ## Part 3 — webview (`webview/App.tsx`, `webview/grid-model.ts`, `styles.css`)
 
@@ -349,24 +451,27 @@ Raven's webview keeps message handling and state in `App.tsx` (no
 `use-row-loader.ts` hook). Add:
 
 - State `restorePending: { restoreId: number; sort: boolean; filter: boolean } |
-  null` and `restoreCancelling: boolean`, plus a `restoreTimer` ref and a
+  null`, `restoreCancelling: boolean`, plus a `restoreTimer` ref and a
   `restoreIdRef`.
-- On `restorePending`: record `restoreId`; clear `restoreCancelling`; (re)start a
-  `RESTORE_DEBOUNCE_MS = 200` timer that sets `restorePending`. **Debounce:**
-  only reveal the UI if the signal persists past ~200 ms, so fast files never
-  flash it. If a banner is already visible, swap its wording immediately.
+- On `restorePending`: record `restoreId` in the ref; clear `restoreCancelling`;
+  (re)start a `RESTORE_DEBOUNCE_MS = 200` timer that sets `restorePending`.
+  **Debounce:** only reveal the UI if the signal persists past ~200 ms, so fast
+  files never flash it. If a banner is already visible (a prior restore whose
+  debounce elapsed), swap its wording immediately.
 - On `init` / `replace`: clear the timer, `restorePending = null`,
   `restoreCancelling = false`, `restoreIdRef = null` (both the normal and
-  cancelled paths end by posting `init`/`replace`).
-- `cancelRestore()` handler: post `{ type: 'cancelRestore', panelGeneration,
-  restoreId }`, set `restoreCancelling = true` (optimistic *"Cancelling…"*).
-- Render: while `restorePending` is set and the grid is not yet showing, render —
-  in place of the bare `Loading…`, reusing the `toolbar-progress` styling — an
-  explanatory line plus an inline **Cancel** button:
+  cancelled/late-cancel paths end by posting `init`/`replace`).
+- `cancelRestore()` handler: if `restoreIdRef` is null, no-op; else post
+  `{ type: 'cancelRestore', panelGeneration, restoreId }` and set
+  `restoreCancelling = true` (optimistic *"Cancelling…"*).
+- Cleanup: clear the debounce timer on unmount.
+- Render: while `restorePending` is set, render — in place of the bare
+  `Loading…`, reusing the existing toolbar-progress styling — an explanatory line
+  plus an inline **Cancel** button:
   - both → *"Applying your saved sort & filter…"*
   - sort only → *"Applying your saved sort…"*
   - filter only → *"Applying your saved filter…"*
-  - while cancelling → *"Cancelling…"* (no button).
+  - while `restoreCancelling` → *"Cancelling…"* (no button).
 - Suppress the bare `Loading…` row-count while the banner is up so it does not
   stack above the explanation.
 
@@ -388,47 +493,58 @@ adapted to raven's existing toolbar variables.
 
 ## Tests
 
-Ported from sight's `restore-cancel.test.ts` (19 tests) and the `grid-model`
-helper tests, adapted to raven method/field names. Headless: construct a
-`DataViewerPanel` via `Object.create(DataViewerPanel.prototype)` with stubbed
-`reader`, stores, and `panel.webview.postMessage`, then drive the private
-methods (the sight suite does exactly this).
+Ported from sight's `restore-cancel.test.ts` and the `grid-model` helper tests,
+adapted to raven method/field names. Headless: construct a `DataViewerPanel` via
+`Object.create(DataViewerPanel.prototype)` with stubbed `reader`, stores, and
+`webviewPanel.webview.postMessage`, then drive the private methods.
 
 Extension-side cases:
 1. **maybeBeginRestore** posts `restorePending` + arms when prefs apply; no-op
-   when none stored; sort-only vs filter-only flags.
+   when none stored / persistence disabled / columns out of range; sort-only vs
+   filter-only flags; `restoreId` increments per call.
 2. **Completed sort + cancelled filter** ends fully natural — `permutation`
-   undefined, `filteredIndices` undefined, `init` carries no chips, no
+   undefined, `filteredIndices` undefined, `init` carries `EMPTY` sort/filter, no
    `filterApplied`, stores cleared. (Guards against the naive "only omit
    stored_sort" bug.)
 3. **Normal completion** applies + ships saved prefs; `restorePending` precedes
    `init`; nothing forgotten; `filterApplied` posted when filtered.
 4. **Throws before posting `init`** → `restoring` cleared, `restoreAbort` nulled
    (the `finally`).
-5. **Serialization** — two overlapping sends post exactly one `restorePending`.
-6. **Generation bump mid-restore** → no `init` posted, prefs intact.
-7. **Real read error vs cancel** — non-`AbortError` failure opens natural order,
-   warns (naming only what failed), and **keeps** stores; cancel **clears**
-   them.
-8. **Cancel suppresses the failure warning** — a real failure before a cancel →
+5. **Serialization** — two overlapping sends post exactly one `restorePending`;
+   `sendReplaceImpl` delegating to `sendInitImpl` when uninitialized does not
+   deadlock.
+6. **Reload bumps generation → keeps prefs (not forgotten).** A `webviewReady`
+   during an in-flight restore bumps generation + aborts; the in-flight send
+   bails stale; stores are **unchanged** (contrast with user-cancel). This is the
+   raven-specific regression codex flagged.
+7. **Generation bump mid-restore** (refresh) → no `init` posted, prefs intact,
+   in-flight controller aborted before discard.
+8. **Real read error vs cancel** — non-`AbortError` failure opens natural order,
+   warns (naming only what failed), and **keeps** stores; cancel **clears** them.
+9. **Cancel suppresses the failure warning** — a real failure before a cancel →
    no popup, prefs forgotten.
-9. **handleCancelRestore** — ignores stale id; aborts in-flight on match; late
-   cancel after completion = clear-and-forget (+ duplicate late cancel ignored,
-   id consumed).
-10. **Late-cancel ordering** — generation bumped + cache cleared **before**
-    awaiting store writes.
-11. **webviewReady during restore** aborts the in-flight restore so the chain
-    advances; **refresh during restore** aborts before discarding the
-    controller.
-12. **handleSetSort / handleSetFilters** consume `restoreId` (a later stale
+10. **handleCancelRestore** — ignores stale/mismatched `restoreId`; aborts
+    in-flight on match; late cancel after completion = clear-and-forget that
+    bumps generation, posts a natural-order `replace`, clears cache before
+    awaiting store writes, and is a no-op on a duplicate (id consumed).
+11. **handleSetSort / handleSetFilters** consume `restoreId` (a later stale
     cancel cannot clear manual prefs) and are no-ops while restoring.
-13. **Stale restore state does not leak** — a later `sendInit` with no restore
-    begun does not forget manually-applied prefs.
+12. **Stale restore state does not leak** — a later `sendInit` that begins no
+    restore does not forget manually-applied prefs (the captured `myAbort` is
+    null, so `isCancelled()` is false even if a stale aborted controller lingers
+    on the instance).
 
 Part-1 cases: the four `sort.ts` / `filter.ts` signal cases above.
 
 Webview-side: `describeRestoreMessage` wording per flag combo;
 `describeToolbarRowCount` returns '' while restore active, else the normal label.
+
+Integration (vscode test harness, `editors/vscode/src/test`): open a panel with a
+persisted sort on a large frame; assert `restorePending` precedes `init` and,
+without cancel, the restored order is applied; then a second panel where a
+`cancelRestore` posted during the restore yields a natural-order `init` with no
+chips and forgotten prefs. This is the only test that exercises the real
+event-loop/IPC ordering the "Why Cancel works" section relies on.
 
 ## Docs
 
@@ -456,5 +572,37 @@ host:    restorePending {restoreId, sort, filter}
 webview: [Cancel] → cancelRestore {restoreId}
 host:    restoreId matches & restoring → controller.abort()
 host:      reads reject AbortError → reset in-memory sort+filter, recompute, prefs forgotten
-host:    init (no sort/filter)                       ← webview renders natural order, no chips
+host:    init (EMPTY sort/filter)                    ← webview renders natural order, no chips
+```
+
+## Review notes (adversarial review — codex)
+
+Findings from the round-1 spec review and how this revision resolves them:
+
+1. **`webviewReady` mistaken for user Cancel** (High) — reload now bumps
+   generation; the in-flight send bails *stale* before the cancel path (generation
+   check precedes the cancel check). Prefs kept. Test #6.
+2. **`restoreId = generation` not unique** (High) — `restoreId` is now a
+   dedicated monotonic `restoreSeq`, independent of generation. Protocol section.
+3. **`sendChain` self-deadlock via `sendReplace → sendInit`** (High) — wrapping
+   is on the public methods only; internal delegation calls `sendInitImpl`
+   directly. Serialization section + test #5.
+4. **Late clear-and-forget strands the webview on an old generation** (High) —
+   the late path posts a full natural-order `replace` (`postReplaceNaturalOrder`)
+   so the webview adopts the bumped generation. Message handling + test #10.
+5. **`maybeBeginRestore` applicability diverges from real restore** (High) —
+   gating now mirrors raven's actual guards (column-in-range + non-empty +
+   enabled), not sight's predicate-fits-kind logic. Helpers section.
+6. **Interruptibility granularity overstated** (Med-High) — non-goals now
+   enumerate the synchronous tails (single large batch, per-row mask scan, regex,
+   dictionary-set building, final sort/compact) as accepted limitations.
+7. **IPC-ordering claim unprovable by unit tests** (Med-High) — added an
+   extension-host integration test; the claim is scoped as event-loop-phase
+   reasoning, not a unit-test assertion.
+8. **Return-shape wiring underspecified** (Med) — the `init`/`replace` message
+   now explicitly reads `sort`/`filter` from in-memory `this.sort`/`this.filter`;
+   `restoreSort`/`restoreFilter` return only the failure boolean.
+9. **Checkpoint ordering underspecified** (Med) — pinned to top-of-iteration
+   `throwIfAborted`, bottom-of-iteration `yieldToEventLoop` (signal only), and a
+   post-loop `throwIfAborted`.
 ```
