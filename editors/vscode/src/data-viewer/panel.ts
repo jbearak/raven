@@ -191,7 +191,13 @@ export class DataViewerPanel {
         // Abort any in-flight restore from the previous dataset. The
         // generation bump above makes it bail *stale* (prefs intact); the
         // abort frees the serialized send chain so sendReplace below isn't
-        // stuck behind the dropped read.
+        // stuck behind the dropped read. But if the user had clicked Cancel
+        // on that restore, honor it (forget the prev dataset's prefs) before
+        // re-arming — abortAndClearRestore clears the flag, so capture it
+        // (and the prev schema hash, while this.reader is still the old one)
+        // first. Mirrors the webviewReady reload path.
+        const restoreCancelled = this.restoreCancelRequested;
+        const prevSchemaHash = this.currentSchemaHash();
         this.abortAndClearRestore();
         // Clear cached visible range so a stale range from the previous
         // dataset is never returned for the new one. The next lifecycle
@@ -216,6 +222,10 @@ export class DataViewerPanel {
         this.reader = reader;
         this.filePath = filePath;
         this.trace('replace', { filePath, nrow: reader.nrow, columns: reader.schema.columns.length });
+        // Honor a cancel of the previous dataset's restore by forgetting its
+        // prefs before sendReplace re-reads the store (so a same-schema reopen
+        // does not silently re-apply what the user cancelled).
+        if (restoreCancelled) await this.forgetPersistedPrefs(prevSchemaHash);
         if (this.webviewReady) await this.sendReplace();
         await prevReader.close().catch(() => undefined);
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
@@ -319,41 +329,53 @@ export class DataViewerPanel {
                 );
                 if (generation !== this.generation || reader !== this.reader) return false;
             }
-            // Undo a sort that completed before the cancel landed during the
-            // filter read, so chips and effective order agree on natural.
-            if (isCancelled()) this.resetRestoredPrefs();
+            // Snapshot the cancel decision ONCE before the paint. The reads
+            // are done; using a single snapshot for resetRestoredPrefs (below)
+            // keeps the post/forget/filterApplied branches internally
+            // consistent — re-reading the live isCancelled() across the
+            // `await postPaint` could split-brain (e.g. suppress filterApplied
+            // while leaving filteredIndices applied). A cancel that lands
+            // *during* the paint is handled by the cancelledNow branch.
+            const cancelledBeforePaint = isCancelled();
+            if (cancelledBeforePaint) this.resetRestoredPrefs();
 
             await this.postPaint(kind, generation, layoutHash, activeToolbar);
             if (kind === 'init') this.webviewInitialized = true;
 
-            // A restored filter changes the visible row count; the webview
-            // learns the effective count from filterApplied.
-            if (!isCancelled() && this.filteredIndices) {
-                await this.webviewPanel.webview.postMessage({
-                    type: 'filterApplied',
-                    panelGeneration: generation,
-                    requestId: -1,
-                    filter: this.filter,
-                    nrowFiltered: this.filteredIndices.length,
-                    fromPersistence: true,
-                } satisfies ExtensionToWebview);
+            if (cancelledBeforePaint) {
+                // Persist the forget only after the paint, so a store-write
+                // failure cannot strand the webview waiting on a message it
+                // never receives.
+                await this.forgetPersistedPrefs(layoutHash);
+            } else if (isCancelled()) {
+                // The user cancelled during the paint (after the reads, before
+                // the finally). The chips were already posted; honor the cancel
+                // as a clear-and-forget so the grid ends in natural order.
+                await this.clearAndForgetNaturalOrder(layoutHash);
+            } else {
+                // Normal completion. A restored filter changes the visible row
+                // count; the webview learns the effective count from
+                // filterApplied (metadata.nrow stays the full dataset size).
+                if (this.filteredIndices) {
+                    await this.webviewPanel.webview.postMessage({
+                        type: 'filterApplied',
+                        panelGeneration: generation,
+                        requestId: -1,
+                        filter: this.filter,
+                        nrowFiltered: this.filteredIndices.length,
+                        fromPersistence: true,
+                    } satisfies ExtensionToWebview);
+                }
+                if (sortFailed || filterFailed) {
+                    const what = sortFailed && filterFailed
+                        ? 'sort and filter'
+                        : sortFailed ? 'sort' : 'filter';
+                    vscode.window.showWarningMessage(
+                        `Could not reapply the saved ${what} for this dataset; `
+                        + 'it was not applied.',
+                    );
+                }
             }
-            // Suppress the failure warning on cancel: a read may have
-            // genuinely failed before the cancel landed, but the user chose
-            // natural order, so a "couldn't reapply" popup would be noise.
-            if (!isCancelled() && (sortFailed || filterFailed)) {
-                const what = sortFailed && filterFailed
-                    ? 'sort and filter'
-                    : sortFailed ? 'sort' : 'filter';
-                vscode.window.showWarningMessage(
-                    `Could not reapply the saved ${what} for this dataset; `
-                    + 'it was not applied.',
-                );
-            }
-            // Persist the forget only after the paint, so a store-write
-            // failure cannot strand the webview waiting on a message it
-            // never receives.
-            if (isCancelled()) await this.forgetPersistedPrefs(layoutHash);
             return true;
         } finally {
             // Only the call that began this restore clears its state, and
@@ -533,11 +555,21 @@ export class DataViewerPanel {
             this.restoreAbort?.abort();
             return;
         }
-        // Invalidate synchronously (bump generation) BEFORE awaiting the
-        // store writes, so an in-flight getRows reply under the old
-        // effective permutation is dropped (panel.ts generation gate) and
-        // the natural-order replace adopts the new generation.
-        const hash = this.currentSchemaHash();
+        // The restore already completed (the cross-window race): honor the
+        // click as a clear-and-forget so it is never silently dropped.
+        await this.clearAndForgetNaturalOrder(this.currentSchemaHash());
+    }
+
+    /**
+     * Drop the restored sort/filter to natural order and forget the
+     * persisted prefs. Bumps the generation and clears the row state
+     * synchronously (BEFORE awaiting the store writes) so an in-flight
+     * getRows reply under the old effective permutation is dropped by the
+     * generation gate, then posts a natural-order `replace` so the webview
+     * adopts the new generation and drops the chips. Shared by the
+     * late-cancel path and the cancel-during-paint path.
+     */
+    private async clearAndForgetNaturalOrder(hash: string): Promise<void> {
         this.resetRestoredPrefs();
         this.generation += 1;
         await this.postReplaceNaturalOrder(this.generation);

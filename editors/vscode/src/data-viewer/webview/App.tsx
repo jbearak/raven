@@ -1081,13 +1081,7 @@ export function App({
             }
         };
         window.addEventListener('message', onMessage);
-        return () => {
-            window.removeEventListener('message', onMessage);
-            if (restoreTimerRef.current !== null) {
-                clearTimeout(restoreTimerRef.current);
-                restoreTimerRef.current = null;
-            }
-        };
+        return () => window.removeEventListener('message', onMessage);
     }, [
         applyCopyDone,
         applyFilterApplied,
@@ -1103,6 +1097,19 @@ export function App({
         scrollToFraction,
         vscode,
     ]);
+
+    // Clear the restore-banner debounce timer on UNMOUNT only. This must not
+    // live in the message-handler effect's cleanup: that effect re-runs on
+    // every dep change (e.g. a scroll updates visibleRange → applyInitOrReplace
+    // identity changes), which would clear a pending timer and prevent the
+    // banner from ever appearing during a slow restore while the old grid is
+    // still interactive.
+    useEffect(() => () => {
+        if (restoreTimerRef.current !== null) {
+            clearTimeout(restoreTimerRef.current);
+            restoreTimerRef.current = null;
+        }
+    }, []);
 
     useEffect(() => {
         if (!toolbarBootstrappedRef.current || !schemaHash) return;

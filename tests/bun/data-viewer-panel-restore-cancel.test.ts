@@ -222,6 +222,48 @@ describe('sendInit restore', () => {
         expect(panel.restoreAbort).toBeNull();
     });
 
+    it('honors a cancel that lands during the paint, with no split-brain', async () => {
+        const { panel, posted, sortSet, filterSet } = await makePanel({
+            storedSort: STORED_SORT, storedFilter: STORED_FILTER,
+        });
+        panel.restoreSort = async () => {
+            panel.sort = STORED_SORT; panel.permutation = new Uint32Array(5); return false;
+        };
+        panel.restoreFilter = async () => {
+            panel.filter = STORED_FILTER; panel.filteredIndices = new Uint32Array([0, 1, 2]); return false;
+        };
+        // The cancelRestore is dispatched exactly as the chips init is posted
+        // (during paintWithRestore's `await postPaint`), after both reads
+        // already completed — the racy window between reads-done and the
+        // restore's finally.
+        const origPost = panel.webviewPanel.webview.postMessage;
+        let fired = false;
+        panel.webviewPanel.webview.postMessage = (m: any) => {
+            if (!fired && (m.type === 'init' || m.type === 'replace')) {
+                fired = true;
+                void panel.handleCancelRestore({
+                    type: 'cancelRestore', panelGeneration: 0, restoreId: panel.restoreId,
+                });
+            }
+            return origPost(m);
+        };
+
+        await panel.sendInit();
+
+        // Cancel honored: prefs forgotten, in-memory state fully natural.
+        expect(sortSet).toEqual(['cleared']);
+        expect(filterSet).toEqual(['cleared']);
+        expect(panel.sort.keys.length).toBe(0);
+        expect(panel.permutation).toBeUndefined();
+        expect(panel.filteredIndices).toBeUndefined();
+        // No split-brain: no stale filterApplied leaks, and a natural-order
+        // replace lands after the (already-posted) chips init.
+        const last = posted[posted.length - 1];
+        expect(last.type).toBe('replace');
+        expect(last.sort).toEqual(EMPTY_SORT);
+        expect(last.filter).toEqual(EMPTY_FILTER);
+    });
+
     it('clears restoring even if it throws before posting init (finding #3)', async () => {
         const { panel } = await makePanel({ storedSort: STORED_SORT });
         panel.restoreSort = async () => {
@@ -384,6 +426,28 @@ describe('lifecycle interruptions', () => {
         await p;
         void realSendInit;
         expect(sortSet).toEqual(['cleared']);
+    });
+
+    it('replace honors a pending cancel by forgetting the prev dataset prefs', async () => {
+        const { panel, sortSet } = await makePanel({ storedSort: STORED_SORT });
+        panel.filePath = '/tmp/raven-does-not-exist-a.arrow';
+        panel.reader.close = async () => {};
+        panel.webviewReady = false; // skip sendReplace (isolate replace())
+        panel.restoring = true;
+        panel.restoreAbort = new AbortController();
+        panel.restoreId = 1;
+        panel.restoreCancelRequested = true;
+
+        const reader2 = {
+            nrow: 5, batchStarts: [0, 5],
+            schema: { columns: COLUMNS }, close: async () => {},
+        };
+        await panel.replace(reader2, '/tmp/raven-does-not-exist-b.arrow');
+
+        // The cancelled restore's prefs are forgotten before the new dataset
+        // could re-apply them.
+        expect(sortSet).toEqual(['cleared']);
+        expect(panel.restoreCancelRequested).toBe(false);
     });
 
     it('webviewReady during restore bumps generation + aborts so prefs survive', async () => {
