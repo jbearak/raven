@@ -29,7 +29,7 @@ Sort and filter preferences are persisted per `panelName × schemaHash` and
 preferences, `DataViewerPanel.sendInit` (and `sendReplace`) does the heavy
 column reads *before* it posts the `init` / `replace` message:
 
-```
+```text
 webviewReady → sendInit():
     load stores (layout, toolbar, sort, filter)
     restoreSort(savedSort)      // computePermutation: reads sort column(s) fully
@@ -173,7 +173,7 @@ export function yieldToEventLoop(): Promise<void> {
 
 Each batch loop is instrumented as:
 
-```
+```text
 for (each record batch) {
     throwIfAborted(signal);          // (a) catch an abort raised since last yield
     ...process this batch...
@@ -586,7 +586,7 @@ event-loop/IPC ordering the "Why Cancel works" section relies on.
 
 Normal reopen with saved prefs:
 
-```
+```text
 webview: webviewReady
 host:    restorePending {restoreId, sort, filter}   ← webview shows explanation after 200ms
 host:    [chunked, cancellable column reads]
@@ -596,7 +596,7 @@ host:    filterApplied (if filtered)
 
 Cancelled reopen:
 
-```
+```text
 webview: webviewReady
 host:    restorePending {restoreId, sort, filter}
 webview: [Cancel] → cancelRestore {restoreId}

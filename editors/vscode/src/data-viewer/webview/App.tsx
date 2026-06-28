@@ -652,15 +652,16 @@ export function App({
         lastHostFilterRef.current = m.filter;
         // Histograms are fetched lazily per column (getHistogram) the first
         // time a numeric filter popover opens — not shipped in init/replace.
-        // Drop any cached bins + in-flight request markers whenever the
-        // dataset changes (always on replace; on init unless this is the same
-        // dataset being restored from getState, e.g. after a tab hide/show),
-        // since bins are keyed by column index and would be wrong for a
-        // different schema. A same-dataset init keeps the restored cache.
-        if (m.type === 'replace' || !sameDataset) {
-            setHistograms({});
-            histogramRequestedRef.current.clear();
-        }
+        // Drop any cached bins + in-flight request markers on every init AND
+        // replace. Bins are value-derived but keyed only by column index, and
+        // `sameDataset` compares row count + column shape only — it cannot tell
+        // a genuine same-dataset reload (tab hide/show) apart from a different
+        // dataset that happens to share that shape, so keeping the cache risked
+        // showing stale bins from a previous frame after a same-shape swap. The
+        // host treats histograms as reader-scoped and clears them on every
+        // replace; the webview now matches that, refetching lazily on demand.
+        setHistograms({});
+        histogramRequestedRef.current.clear();
         setFilterPending(false);
         setNrowFiltered(undefined);
         setLoading(false);
@@ -1149,8 +1150,15 @@ export function App({
                     // Defer showing the banner until the debounce elapses; a
                     // restore that completes sooner clears the timer on
                     // init/replace below and never flashes the message.
+                    const previousRestoreId = restoreIdRef.current;
                     restoreIdRef.current = m.restoreId;
-                    setRestoreCancelling(false);
+                    // Only reset the canceling state for a genuinely new restore.
+                    // A same-id refresh while a Skip is already in flight must
+                    // not flip the banner back from "Loading…" and re-enable the
+                    // button.
+                    if (previousRestoreId !== m.restoreId) {
+                        setRestoreCancelling(false);
+                    }
                     if (restoreTimerRef.current !== null) {
                         clearTimeout(restoreTimerRef.current);
                     }

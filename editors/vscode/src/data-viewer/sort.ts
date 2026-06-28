@@ -37,7 +37,7 @@
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { SortKey } from './messages';
 import { iterateBatches } from './batch-iter';
-import { throwIfAborted } from './abort';
+import { throwIfAborted, yieldToEventLoop } from './abort';
 
 /** Toolbar snapshot used to derive sort keys WYSIWYG. */
 export type SortContext = {
@@ -94,8 +94,15 @@ export async function computePermutation(
     // Materialize the permutation as a plain number[] for sort(), then
     // copy back. Uint32Array.sort exists but lacks the stability guarantee
     // and the comparator signature isn't well-typed.
-    throwIfAborted(signal);
     const idx: number[] = Array.from(perm);
+    // Yield once more before the (synchronous, potentially expensive) sort so
+    // a Cancel queued during the final column read is delivered and observed
+    // here, leaving the data in natural order rather than running the full
+    // sort first. Only the cancellable restore passes a signal.
+    if (signal) {
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+    }
     idx.sort((a, b) => compareRows(a, b, cols, directions));
     throwIfAborted(signal);
     for (let i = 0; i < nrow; i++) perm[i] = idx[i];

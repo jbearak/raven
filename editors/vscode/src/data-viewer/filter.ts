@@ -34,7 +34,7 @@
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterState } from './messages';
 import { iterateBatches } from './batch-iter';
-import { throwIfAborted } from './abort';
+import { throwIfAborted, yieldToEventLoop } from './abort';
 
 export type FilterContext = {
     labelsOn: boolean;
@@ -83,7 +83,16 @@ async function applyEntry(
     const include = p.kind === 'isEmpty' ? true : entry.includeMissing;
     const missing = await missingMaskFor(reader, entry.columnIndex, schema, signal);
 
-    throwIfAborted(signal);
+    // Yield once more before the synchronous mask scan so a Cancel queued
+    // during the acceptor/missing-mask reads is delivered and observed here,
+    // leaving the data unfiltered rather than publishing filtered indices.
+    // Only the cancellable restore passes a signal.
+    if (signal) {
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+    } else {
+        throwIfAborted(signal);
+    }
     for (let i = 0; i < mask.length; i++) {
         if (mask[i] === 0) continue;
         if (missing[i]) {

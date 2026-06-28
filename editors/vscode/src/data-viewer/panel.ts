@@ -158,6 +158,14 @@ export class DataViewerPanel {
      *  reload that races into that window honor the cancel (forget the
      *  prefs) instead of bailing stale and re-restoring them. */
     private restoreCancelRequested = false;
+    /** Schema hash whose persisted prefs a late clear-and-forget is
+     *  durably clearing. Set before the natural-order post and the store
+     *  writes, cleared once they finish. A `webviewReady`/`replace()` that
+     *  re-reads the store inside that window would otherwise load the
+     *  still-saved prefs and re-restore exactly what the user cancelled;
+     *  `paintWithRestore` honors this marker and drops those prefs. `null`
+     *  when no forget is in flight. */
+    private pendingForgetHash: string | null = null;
     /** Active toolbar last shipped to the webview, captured so the late
      *  clear-and-forget can rebuild a `replace` without re-loading the
      *  store. */
@@ -472,11 +480,20 @@ export class DataViewerPanel {
         const activeToolbar = toolbar ?? this.defaultToolbar();
         this.lastToolbar = activeToolbar;
 
+        // If a late clear-and-forget is durably forgetting this schema's
+        // prefs, the load above may have raced ahead of the store clears and
+        // returned the cancelled prefs. Drop them so this paint shows natural
+        // order instead of re-restoring what the user just cancelled; the
+        // in-flight forget completes the durable clear.
+        const forgetting = this.pendingForgetHash === layoutHash;
+        const sortToRestore = forgetting ? undefined : savedSort;
+        const filterToRestore = forgetting ? undefined : savedFilter;
+
         // Begin a cancellable restore if saved prefs apply. `myAbort`
         // identifies this restore's controller; cancellation is read from
         // its own signal so a concurrent send reassigning this.restoreAbort
         // can't change what THIS call sees.
-        const began = this.maybeBeginRestore(generation, savedSort, savedFilter);
+        const began = this.maybeBeginRestore(generation, sortToRestore, filterToRestore);
         const myAbort = began ? this.restoreAbort : null;
         const isCancelled = () => myAbort?.signal.aborted === true;
         try {
@@ -484,7 +501,7 @@ export class DataViewerPanel {
             // filteredIndices as a side effect and return true only on a
             // genuine (non-abort) failure.
             const sortFailed = await this.restoreSort(
-                savedSort, activeToolbar, generation, reader, myAbort?.signal,
+                sortToRestore, activeToolbar, generation, reader, myAbort?.signal,
             );
             // A refresh/reload during the read supersedes this attempt; bail
             // *stale* (prefs intact) before the cancel path. A user Cancel
@@ -493,7 +510,7 @@ export class DataViewerPanel {
             let filterFailed = false;
             if (!isCancelled()) {
                 filterFailed = await this.restoreFilter(
-                    savedFilter, activeToolbar, generation, reader, myAbort?.signal,
+                    filterToRestore, activeToolbar, generation, reader, myAbort?.signal,
                 );
                 if (generation !== this.generation || reader !== this.reader) return false;
             }
@@ -807,8 +824,14 @@ export class DataViewerPanel {
     private async clearAndForgetNaturalOrder(hash: string): Promise<void> {
         this.resetRestoredPrefs();
         this.generation += 1;
+        // Mark the forget as in flight BEFORE the awaits: a webviewReady or
+        // replace() landing between the natural-order post and the store
+        // clears completing would otherwise re-read the still-saved prefs and
+        // re-restore the cancelled sort/filter. paintWithRestore honors this.
+        this.pendingForgetHash = hash;
         await this.postReplaceNaturalOrder(this.generation);
         await this.forgetPersistedPrefs(hash);
+        if (this.pendingForgetHash === hash) this.pendingForgetHash = null;
         // The cancel is now durably honored; clear the intent so it cannot
         // linger and cause a later replace()/reload to forget again.
         this.restoreCancelRequested = false;

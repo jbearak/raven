@@ -197,6 +197,58 @@ describe('sendInit restore', () => {
         expect(panel.restoreAbort).toBeNull();
     });
 
+    it('drops prefs while a late clear-and-forget is in flight (#548 review)', async () => {
+        // A late clear-and-forget marks pendingForgetHash before awaiting the
+        // store clears. A webviewReady/replace that re-reads the store inside
+        // that window must NOT re-restore the prefs the user just cancelled.
+        const { panel, posted } = await makePanel({
+            storedSort: STORED_SORT, storedFilter: STORED_FILTER,
+        });
+        // Mirror the real restoreSort/restoreFilter: act only when given prefs.
+        panel.restoreSort = async (saved: SortState | undefined) => {
+            if (saved) { panel.sort = STORED_SORT; panel.permutation = new Uint32Array(5); }
+            return false;
+        };
+        panel.restoreFilter = async (saved: FilterState | undefined) => {
+            if (saved) { panel.filter = STORED_FILTER; panel.filteredIndices = new Uint32Array([0, 1, 2]); }
+            return false;
+        };
+        // Simulate the in-flight forget window for this schema.
+        panel.pendingForgetHash = panel.currentSchemaHash();
+
+        await panel.sendInit();
+
+        // No restore begins; the paint shows natural order.
+        expect(posted.filter((m: any) => m.type === 'restorePending')).toEqual([]);
+        expect(panel.restoring).toBe(false);
+        expect(panel.sort.keys.length).toBe(0);
+        expect(panel.filter.entries.length).toBe(0);
+        const init = posted.find((m: any) => m.type === 'init');
+        expect(init.sort).toEqual(EMPTY_SORT);
+        expect(init.filter).toEqual(EMPTY_FILTER);
+    });
+
+    it('restores normally once the forget completes and clears the marker (control)', async () => {
+        const { panel, posted } = await makePanel({
+            storedSort: STORED_SORT, storedFilter: STORED_FILTER,
+        });
+        panel.restoreSort = async (saved: SortState | undefined) => {
+            if (saved) { panel.sort = STORED_SORT; panel.permutation = new Uint32Array(5); }
+            return false;
+        };
+        panel.restoreFilter = async (saved: FilterState | undefined) => {
+            if (saved) { panel.filter = STORED_FILTER; panel.filteredIndices = new Uint32Array([0, 1, 2]); }
+            return false;
+        };
+        panel.pendingForgetHash = null; // forget already finished
+
+        await panel.sendInit();
+
+        expect(posted.filter((m: any) => m.type === 'restorePending').length).toBe(1);
+        expect(panel.sort.keys.length).toBe(1);
+        expect(panel.filter.entries.length).toBe(1);
+    });
+
     it('completed sort + cancelled filter ends in natural order (finding #1)', async () => {
         const { panel, posted, sortSet, filterSet } = await makePanel({
             storedSort: STORED_SORT, storedFilter: STORED_FILTER,
