@@ -158,14 +158,15 @@ export class DataViewerPanel {
      *  reload that races into that window honor the cancel (forget the
      *  prefs) instead of bailing stale and re-restoring them. */
     private restoreCancelRequested = false;
-    /** Schema hash whose persisted prefs a late clear-and-forget is
-     *  durably clearing. Set before the natural-order post and the store
-     *  writes, cleared once they finish. A `webviewReady`/`replace()` that
-     *  re-reads the store inside that window would otherwise load the
-     *  still-saved prefs and re-restore exactly what the user cancelled;
-     *  `paintWithRestore` honors this marker and drops those prefs. `null`
-     *  when no forget is in flight. */
-    private pendingForgetHash: string | null = null;
+    /** Schema hashes whose persisted prefs a late clear-and-forget is
+     *  durably clearing. A hash is added before the natural-order post and
+     *  the store writes, and removed once they finish. A `webviewReady`/
+     *  `replace()` that re-reads the store inside that window would otherwise
+     *  load the still-saved prefs and re-restore exactly what the user
+     *  cancelled; `paintWithRestore` honors this set and drops those prefs.
+     *  A `Set` (not a single hash) so overlapping forgets for two different
+     *  schemas cannot clobber each other's suppression. */
+    private readonly pendingForgetHashes = new Set<string>();
     /** Active toolbar last shipped to the webview, captured so the late
      *  clear-and-forget can rebuild a `replace` without re-loading the
      *  store. */
@@ -485,7 +486,7 @@ export class DataViewerPanel {
         // returned the cancelled prefs. Drop them so this paint shows natural
         // order instead of re-restoring what the user just cancelled; the
         // in-flight forget completes the durable clear.
-        const forgetting = this.pendingForgetHash === layoutHash;
+        const forgetting = this.pendingForgetHashes.has(layoutHash);
         const sortToRestore = forgetting ? undefined : savedSort;
         const filterToRestore = forgetting ? undefined : savedFilter;
 
@@ -828,13 +829,20 @@ export class DataViewerPanel {
         // replace() landing between the natural-order post and the store
         // clears completing would otherwise re-read the still-saved prefs and
         // re-restore the cancelled sort/filter. paintWithRestore honors this.
-        this.pendingForgetHash = hash;
-        await this.postReplaceNaturalOrder(this.generation);
-        await this.forgetPersistedPrefs(hash);
-        if (this.pendingForgetHash === hash) this.pendingForgetHash = null;
-        // The cancel is now durably honored; clear the intent so it cannot
-        // linger and cause a later replace()/reload to forget again.
-        this.restoreCancelRequested = false;
+        this.pendingForgetHashes.add(hash);
+        try {
+            await this.postReplaceNaturalOrder(this.generation);
+            await this.forgetPersistedPrefs(hash);
+        } finally {
+            // Always release the marker, even if the natural-order post rejects
+            // (e.g. a disposed webview): a stuck entry would suppress every
+            // future restore for this schema. Deleting only this call's own
+            // hash leaves a concurrent forget for a different schema intact.
+            this.pendingForgetHashes.delete(hash);
+            // The cancel is now durably honored; clear the intent so it cannot
+            // linger and cause a later replace()/reload to forget again.
+            this.restoreCancelRequested = false;
+        }
     }
 
     /** Attempt to restore a persisted sort, updating `this.sort` and

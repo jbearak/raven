@@ -91,6 +91,7 @@ async function makePanel(opts: {
     panel.restoring = false;
     panel.restoreId = -1;
     panel.restoreSeq = 0;
+    panel.pendingForgetHashes = new Set();
     panel.lastToolbar = undefined;
     panel.sendChain = Promise.resolve();
     panel.transformChain = Promise.resolve();
@@ -214,7 +215,7 @@ describe('sendInit restore', () => {
             return false;
         };
         // Simulate the in-flight forget window for this schema.
-        panel.pendingForgetHash = panel.currentSchemaHash();
+        panel.pendingForgetHashes.add(panel.currentSchemaHash());
 
         await panel.sendInit();
 
@@ -240,13 +241,41 @@ describe('sendInit restore', () => {
             if (saved) { panel.filter = STORED_FILTER; panel.filteredIndices = new Uint32Array([0, 1, 2]); }
             return false;
         };
-        panel.pendingForgetHash = null; // forget already finished
+        // pendingForgetHashes is empty: no forget in flight.
 
         await panel.sendInit();
 
         expect(posted.filter((m: any) => m.type === 'restorePending').length).toBe(1);
         expect(panel.sort.keys.length).toBe(1);
         expect(panel.filter.entries.length).toBe(1);
+    });
+
+    it('tracks overlapping forgets per-schema so they cannot clobber each other (#548 codex)', async () => {
+        // Two late clear-and-forgets for different schemas can be in flight at
+        // once; a single marker would let the second overwrite the first and
+        // un-suppress its restore. The Set keeps them independent.
+        const { panel, posted } = await makePanel({
+            storedSort: STORED_SORT, storedFilter: STORED_FILTER,
+        });
+        panel.restoreSort = async (saved: SortState | undefined) => {
+            if (saved) { panel.sort = STORED_SORT; panel.permutation = new Uint32Array(5); }
+            return false;
+        };
+        panel.restoreFilter = async (saved: FilterState | undefined) => {
+            if (saved) { panel.filter = STORED_FILTER; panel.filteredIndices = new Uint32Array([0, 1, 2]); }
+            return false;
+        };
+        const hashA = panel.currentSchemaHash();
+        panel.pendingForgetHashes.add(hashA);
+        panel.pendingForgetHashes.add('schema-B-hash');
+        // A forget for the OTHER schema completing must not un-suppress schema A.
+        panel.pendingForgetHashes.delete('schema-B-hash');
+
+        await panel.sendInit();
+
+        expect(posted.filter((m: any) => m.type === 'restorePending')).toEqual([]);
+        expect(panel.sort.keys.length).toBe(0);
+        expect(panel.filter.entries.length).toBe(0);
     });
 
     it('completed sort + cancelled filter ends in natural order (finding #1)', async () => {
