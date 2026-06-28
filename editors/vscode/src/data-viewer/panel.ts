@@ -197,7 +197,10 @@ export class DataViewerPanel {
         // (and the prev schema hash, while this.reader is still the old one)
         // first. Mirrors the webviewReady reload path.
         const restoreCancelled = this.restoreCancelRequested;
-        const prevSchemaHash = this.currentSchemaHash();
+        // Hash the PREVIOUS dataset's schema now, while this.reader is still
+        // the old one (the swap below makes currentSchemaHash() return the new
+        // schema). Only needed when honoring a cancel, so skip it otherwise.
+        const prevSchemaHash = restoreCancelled ? this.currentSchemaHash() : undefined;
         this.abortAndClearRestore();
         // Clear cached visible range so a stale range from the previous
         // dataset is never returned for the new one. The next lifecycle
@@ -225,7 +228,12 @@ export class DataViewerPanel {
         // Honor a cancel of the previous dataset's restore by forgetting its
         // prefs before sendReplace re-reads the store (so a same-schema reopen
         // does not silently re-apply what the user cancelled).
-        if (restoreCancelled) await this.forgetPersistedPrefs(prevSchemaHash);
+        // A store-write failure here must not skip the sendReplace / reader
+        // cleanup below and strand the webview, so swallow it (worst case the
+        // cancelled pref survives — same as the genuine-error "keep" path).
+        if (restoreCancelled && prevSchemaHash !== undefined) {
+            await this.forgetPersistedPrefs(prevSchemaHash).catch(() => undefined);
+        }
         if (this.webviewReady) await this.sendReplace();
         await prevReader.close().catch(() => undefined);
         try { await fs.unlink(prevPath); } catch { /* ignore */ }
@@ -491,13 +499,18 @@ export class DataViewerPanel {
         this.restoreId = ++this.restoreSeq;
         this.restoring = true;
         this.restoreCancelRequested = false;
+        // Fire-and-forget so the (potentially long) column reads start at
+        // once; ordering before init/replace is preserved by the transport's
+        // FIFO queue. Catch so a post to an already-disposed webview cannot
+        // surface as an unhandled rejection (every other restore post is
+        // awaited inside paintWithRestore's try).
         void this.webviewPanel.webview.postMessage({
             type: 'restorePending',
             panelGeneration: generation,
             restoreId: this.restoreId,
             sort: hasSort,
             filter: hasFilter,
-        } satisfies ExtensionToWebview);
+        } satisfies ExtensionToWebview).then(undefined, () => undefined);
         return true;
     }
 
@@ -766,7 +779,10 @@ export class DataViewerPanel {
                 const hash = this.currentSchemaHash();
                 this.generation += 1;
                 this.abortAndClearRestore();
-                if (cancelled) await this.forgetPersistedPrefs(hash);
+                // Swallow a store-write failure so it cannot skip the sendInit
+                // below and strand the reloaded webview on a permanent
+                // Loading… (worst case the cancelled pref survives the reload).
+                if (cancelled) await this.forgetPersistedPrefs(hash).catch(() => undefined);
             }
             await this.sendInit();
             return;
