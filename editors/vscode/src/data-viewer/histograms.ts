@@ -25,6 +25,8 @@
 
 import type { ArrowSliceReader } from './arrow-reader';
 import type { HistogramBin } from './messages';
+import { iterateBatches } from './batch-iter';
+import { throwIfAborted } from './abort';
 
 const BIN_COUNT = 50;
 
@@ -40,12 +42,13 @@ export function isNumericArrowType(arrowType: string): boolean {
 
 export async function computeNumericHistograms(
     reader: ArrowSliceReader,
+    opts?: { signal?: AbortSignal },
 ): Promise<Record<number, HistogramBin[]>> {
     const out: Record<number, HistogramBin[]> = {};
     const schema = reader.schema.columns;
     for (let ci = 0; ci < schema.length; ci++) {
         if (!isNumericArrowType(schema[ci].arrowType)) continue;
-        out[ci] = await computeHistogramForColumn(reader, ci);
+        out[ci] = await computeHistogramForColumn(reader, ci, opts);
     }
     return out;
 }
@@ -59,16 +62,15 @@ export async function computeNumericHistograms(
 export async function computeHistogramForColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
+    opts?: { signal?: AbortSignal },
 ): Promise<HistogramBin[]> {
+    const signal = opts?.signal;
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
-    const numBatches = reader.batchStarts.length - 1;
 
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const length = reader.batchStarts[bi + 1] - reader.batchStarts[bi];
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
@@ -80,6 +82,7 @@ export async function computeHistogramForColumn(
         }
     }
 
+    throwIfAborted(signal);
     if (count === 0) return [];
     if (min === max) {
         return [{ lo: min, hi: max, count }];
@@ -92,10 +95,8 @@ export async function computeHistogramForColumn(
     }
     bins[BIN_COUNT - 1].hi = max;
 
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const length = reader.batchStarts[bi + 1] - reader.batchStarts[bi];
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
@@ -107,5 +108,6 @@ export async function computeHistogramForColumn(
             bins[idx].count++;
         }
     }
+    throwIfAborted(signal);
     return bins;
 }

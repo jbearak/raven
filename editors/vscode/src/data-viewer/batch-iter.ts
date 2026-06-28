@@ -1,16 +1,15 @@
 /**
- * Shared record-batch iteration for the sort and filter engines.
+ * Shared record-batch iteration for full-column data-viewer scans.
  *
- * Both engines read whole columns by walking the reader's record
- * batches. Centralizing the walk here gives one place for the
- * cooperative-cancellation checkpoint (#519): when a `signal` is passed
- * (the saved-sort/filter restore on open), the iteration throws an
- * `AbortError` before each batch if aborted and yields the event loop
- * after each batch so a queued webview Cancel is delivered before the
- * next read. With no `signal` (interactive setSort/setFilters, which read
- * whole columns but are not cancellable) it is byte-identical to a plain
- * batch loop — no checks, no yields. The virtualized viewport `getRows`
- * path does not walk batches through here at all.
+ * Sort, filter, and histogram code read whole columns by walking the
+ * reader's record batches. Centralizing the walk here gives one place for the
+ * cooperative-cancellation checkpoint (#519): when a `signal` is passed,
+ * the iteration throws an `AbortError` before each batch if aborted and
+ * yields the event loop after each batch so a queued webview Cancel or
+ * superseding sort/filter is delivered before the next read. With no
+ * `signal` it is byte-identical to a plain batch loop — no checks, no
+ * yields. The virtualized viewport `getRows` path does not walk batches
+ * through here at all.
  */
 import type { ArrowSliceReader } from './arrow-reader';
 import { throwIfAborted, yieldToEventLoop } from './abort';

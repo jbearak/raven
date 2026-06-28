@@ -80,16 +80,20 @@ async function makePanel(opts: {
     panel.sort = EMPTY_SORT;
     panel.permutation = undefined;
     panel.sortGeneration = 0;
+    panel.sortSnapshots = new Map([[0, { sort: EMPTY_SORT }]]);
     panel.filter = EMPTY_FILTER;
     panel.filteredIndices = undefined;
     panel.filterGeneration = 0;
+    panel.filterSnapshots = new Map([[0, { filter: EMPTY_FILTER }]]);
     panel.histogramCache = new Map();
+    panel.histogramAborts = new Set();
     panel.restoreAbort = null;
     panel.restoring = false;
     panel.restoreId = -1;
     panel.restoreSeq = 0;
     panel.lastToolbar = undefined;
     panel.sendChain = Promise.resolve();
+    panel.transformChain = Promise.resolve();
     panel.settings = { persistSort: true, persistFilters: true, defaultDigits: 3 };
     panel.panelName = 'p';
 

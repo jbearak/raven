@@ -1,11 +1,11 @@
 /**
  * DataViewerPanel — owns one webview tab keyed by panel name.
  *
- * Generations: every replace() increments `generation`. The handle()
- * method captures the current generation before any await, and drops
- * the reply if a replace landed in the meantime. The webview also tags
- * its requests with the generation it last received and silently
- * ignores responses tagged with an older one.
+ * Generations: every dataset replace and webviewReady lifecycle increments
+ * `generation`. The handle() method captures the current generation before
+ * any await, and drops the reply if a replace or reload landed in the
+ * meantime. The webview also tags its requests with the generation it last
+ * received and silently ignores responses tagged with an older one.
  */
 
 import * as vscode from 'vscode';
@@ -17,6 +17,7 @@ import {
     EMPTY_FILTER,
     EMPTY_SORT,
     ExtensionToWebview,
+    FilterEntry,
     FilterState,
     HistogramBin,
     Layout,
@@ -38,6 +39,46 @@ import { applyViewerTabIcon } from '../viewer-tab-icon';
 
 let dataViewerTraceOutput: vscode.OutputChannel | undefined;
 
+type SortSnapshot = {
+    sort: SortState;
+    permutation?: Uint32Array;
+};
+
+type FilterSnapshot = {
+    filter: FilterState;
+    filteredIndices?: Uint32Array;
+};
+
+function cloneSortState(sort: SortState): SortState {
+    if (sort.keys.length === 0) return EMPTY_SORT;
+    return {
+        keys: sort.keys.map(k => ({ ...k })),
+        labelsOnWhenSorted: sort.labelsOnWhenSorted,
+    };
+}
+
+function cloneFilterEntry(entry: FilterEntry): FilterEntry {
+    const predicate = entry.predicate.kind === 'setIn' || entry.predicate.kind === 'setNotIn'
+        ? { ...entry.predicate, values: [...entry.predicate.values] }
+        : { ...entry.predicate };
+    return {
+        ...entry,
+        predicate: predicate as FilterEntry['predicate'],
+    };
+}
+
+function cloneFilterState(filter: FilterState): FilterState {
+    if (filter.entries.length === 0) return EMPTY_FILTER;
+    return {
+        entries: filter.entries.map(cloneFilterEntry),
+        labelsOnWhenFiltered: filter.labelsOnWhenFiltered,
+    };
+}
+
+function cloneIndices(indices: Uint32Array | undefined): Uint32Array | undefined {
+    return indices === undefined ? undefined : new Uint32Array(indices);
+}
+
 export class DataViewerPanel {
     readonly panelName: string;
     private readonly webviewPanel: vscode.WebviewPanel;
@@ -57,10 +98,14 @@ export class DataViewerPanel {
     /** Permutation backing the current sort. `undefined` ↔ identity
      *  ordering. Plumbed into every reader.getRows call below. */
     private permutation: Uint32Array | undefined;
-    /** Monotonic counter — every setSort that produces a new permutation
-     *  bumps it. Late-landing `sortApplied` responses tagged with an
-     *  older value are dropped. */
+    /** Monotonic request token — bumped for every setSort and lifecycle
+     *  abort so stale async sort work can be detected and dropped. */
     private sortGeneration = 0;
+    /** Generation-local rollback snapshots keyed by request id. The webview
+     *  tells us which accepted id to roll back to on a later failure; keeping
+     *  this host-side preserves the already-built permutation. Key 0 is the
+     *  current init/replace baseline. */
+    private sortSnapshots = new Map<number, SortSnapshot>([[0, { sort: EMPTY_SORT }]]);
     /** Current filter state. Mirrors what the webview shows in the chip
      *  strip. Updated by `setFilters` and by init/replace's restore path. */
     private filter: FilterState = EMPTY_FILTER;
@@ -70,6 +115,11 @@ export class DataViewerPanel {
     /** Monotonic counter — bumped on every setFilters call so stale
      *  async results can be detected and dropped. */
     private filterGeneration = 0;
+    /** Generation-local rollback snapshots keyed by request id. The webview
+     *  tells us which accepted id to roll back to on a later failure; keeping
+     *  this host-side preserves the already-built filtered index. Key 0 is
+     *  the current init/replace baseline. */
+    private filterSnapshots = new Map<number, FilterSnapshot>([[0, { filter: EMPTY_FILTER }]]);
     /** Per-column numeric histogram cache, keyed by column index, for the
      *  current reader. Populated lazily by the `getHistogram` handler (a
      *  histogram costs two full column scans, so we never recompute one).
@@ -97,9 +147,9 @@ export class DataViewerPanel {
      *  setSort/setFilters no-op so a generation bump can't strand it. */
     private restoring = false;
     /** Monotonic id of the active restore (-1 ⇔ none). The
-     *  restorePending/cancelRestore handshake key. NOT `generation` —
-     *  webviewReady reloads do not bump generation, so reusing it would
-     *  alias restores across a reload. */
+     *  restorePending/cancelRestore handshake key. Kept distinct from
+     *  `generation`, which invalidates stale webview messages across reloads
+     *  and dataset replacement rather than identifying a specific restore. */
     private restoreId = -1;
     /** Source of {@link restoreId}; bumped per restore begun. */
     private restoreSeq = 0;
@@ -116,6 +166,21 @@ export class DataViewerPanel {
      *  reload mid-restore must not start a concurrent send that overwrites
      *  {@link restoreAbort}). */
     private sendChain: Promise<void> = Promise.resolve();
+    /** FIFO queue for full-column scans (saved restore, sort/filter, and
+     *  histogram). The Arrow IPC reader must not service two batch streams
+     *  concurrently; preserving request order is preferable to letting a
+     *  later transform observe a partially-aborted earlier one. Interactive
+     *  sort/filter still post their pending status before entering the queue. */
+    private transformChain: Promise<void> = Promise.resolve();
+    /** Abort controller for the active or queued interactive sort. A newer
+     *  sort supersedes it; filters do not, because sort+filter compose. */
+    private sortAbort: AbortController | null = null;
+    /** Abort controller for the active or queued interactive filter. A newer
+     *  filter supersedes it; sorts do not, because sort+filter compose. */
+    private filterAbort: AbortController | null = null;
+    /** Abort controllers for active or queued histogram scans. Histograms are
+     *  on-demand full-column scans and are stale after reload/replace/close. */
+    private histogramAborts = new Set<AbortController>();
 
     private constructor(
         panelName: string,
@@ -210,6 +275,7 @@ export class DataViewerPanel {
         this.lastFocusCell = undefined;
         // Old permutation cannot be reused — sendReplace below will
         // attempt to restore a saved sort against the new reader.
+        this.abortInteractiveTransforms();
         this.sort = EMPTY_SORT;
         this.permutation = undefined;
         this.sortGeneration += 1;
@@ -218,6 +284,7 @@ export class DataViewerPanel {
         this.filter = EMPTY_FILTER;
         this.filteredIndices = undefined;
         this.filterGeneration += 1;
+        this.resetRollbackSnapshots();
         // Histograms are reader-scoped; the new reader is a different dataset.
         this.histogramCache.clear();
         const prevReader = this.reader;
@@ -249,6 +316,93 @@ export class DataViewerPanel {
         };
     }
 
+    private currentSortSnapshot(): SortSnapshot {
+        return {
+            sort: cloneSortState(this.sort),
+            permutation: cloneIndices(this.permutation),
+        };
+    }
+
+    private applySortSnapshot(snapshot: SortSnapshot): void {
+        this.sort = cloneSortState(snapshot.sort);
+        this.permutation = cloneIndices(snapshot.permutation);
+    }
+
+    private rollbackSortSnapshot(baseRequestId: number | undefined): SortSnapshot {
+        if (baseRequestId !== undefined) {
+            const snapshot = this.sortSnapshots.get(baseRequestId);
+            if (snapshot) {
+                return {
+                    sort: cloneSortState(snapshot.sort),
+                    permutation: cloneIndices(snapshot.permutation),
+                };
+            }
+        }
+        return this.currentSortSnapshot();
+    }
+
+    private recordSortSnapshot(
+        requestId: number,
+        snapshot: SortSnapshot = this.currentSortSnapshot(),
+        keepBaseRequestId?: number,
+    ): void {
+        this.sortSnapshots.set(requestId, {
+            sort: cloneSortState(snapshot.sort),
+            permutation: cloneIndices(snapshot.permutation),
+        });
+        for (const key of this.sortSnapshots.keys()) {
+            if (key !== 0 && key !== requestId && key !== keepBaseRequestId) {
+                this.sortSnapshots.delete(key);
+            }
+        }
+    }
+
+    private currentFilterSnapshot(): FilterSnapshot {
+        return {
+            filter: cloneFilterState(this.filter),
+            filteredIndices: cloneIndices(this.filteredIndices),
+        };
+    }
+
+    private applyFilterSnapshot(snapshot: FilterSnapshot): void {
+        this.filter = cloneFilterState(snapshot.filter);
+        this.filteredIndices = cloneIndices(snapshot.filteredIndices);
+    }
+
+    private rollbackFilterSnapshot(baseRequestId: number | undefined): FilterSnapshot {
+        if (baseRequestId !== undefined) {
+            const snapshot = this.filterSnapshots.get(baseRequestId);
+            if (snapshot) {
+                return {
+                    filter: cloneFilterState(snapshot.filter),
+                    filteredIndices: cloneIndices(snapshot.filteredIndices),
+                };
+            }
+        }
+        return this.currentFilterSnapshot();
+    }
+
+    private recordFilterSnapshot(
+        requestId: number,
+        snapshot: FilterSnapshot = this.currentFilterSnapshot(),
+        keepBaseRequestId?: number,
+    ): void {
+        this.filterSnapshots.set(requestId, {
+            filter: cloneFilterState(snapshot.filter),
+            filteredIndices: cloneIndices(snapshot.filteredIndices),
+        });
+        for (const key of this.filterSnapshots.keys()) {
+            if (key !== 0 && key !== requestId && key !== keepBaseRequestId) {
+                this.filterSnapshots.delete(key);
+            }
+        }
+    }
+
+    private resetRollbackSnapshots(): void {
+        this.sortSnapshots = new Map([[0, this.currentSortSnapshot()]]);
+        this.filterSnapshots = new Map([[0, this.currentFilterSnapshot()]]);
+    }
+
     // sendInit / sendReplace are serialized through `sendChain` so two
     // restores never overlap. The chain wraps only these public entry
     // points; internal delegation (an uninitialized replace) calls the
@@ -256,6 +410,12 @@ export class DataViewerPanel {
     private enqueue<T>(fn: () => Promise<T>): Promise<T> {
         const next = this.sendChain.catch(() => {}).then(fn);
         this.sendChain = next.then(() => {}, () => {});
+        return next;
+    }
+
+    private enqueueTransform<T>(fn: () => Promise<T>): Promise<T> {
+        const next = this.transformChain.catch(() => {}).then(fn);
+        this.transformChain = next.then(() => {}, () => {});
         return next;
     }
 
@@ -388,6 +548,7 @@ export class DataViewerPanel {
                         nrowFiltered: this.filteredIndices.length,
                         fromPersistence: true,
                     } satisfies ExtensionToWebview);
+                    this.recordFilterSnapshot(-1, undefined, 0);
                     // The filterApplied post is the second (and last)
                     // post-decision await window. A cancel/lifecycle abort can
                     // land during it: a lifecycle abort bumped generation →
@@ -455,6 +616,8 @@ export class DataViewerPanel {
             loadedToolbar: activeToolbar,
         });
         await this.webviewPanel.webview.postMessage(msg);
+        this.recordSortSnapshot(0);
+        this.recordFilterSnapshot(0);
     }
 
     // -------------------------------------------------------
@@ -529,6 +692,7 @@ export class DataViewerPanel {
         this.filter = EMPTY_FILTER;
         this.filteredIndices = undefined;
         this.filterGeneration += 1;
+        this.resetRollbackSnapshots();
     }
 
     /** Consume the restore handshake because the user superseded the
@@ -549,6 +713,21 @@ export class DataViewerPanel {
         this.restoring = false;
         this.restoreId = -1;
         this.restoreCancelRequested = false;
+    }
+
+    /** Abort active or queued interactive transforms when the webview
+     *  reloads/replaces/closes. The next init/replace is authoritative for
+     *  display state; stale interactive acks from the old webview must not
+     *  race into the new one. */
+    private abortInteractiveTransforms(): void {
+        this.sortAbort?.abort();
+        this.sortAbort = null;
+        this.sortGeneration += 1;
+        this.filterAbort?.abort();
+        this.filterAbort = null;
+        this.filterGeneration += 1;
+        for (const abort of this.histogramAborts) abort.abort();
+        this.histogramAborts.clear();
     }
 
     /** Schema hash of the live reader — used by the late clear-and-forget
@@ -654,11 +833,19 @@ export class DataViewerPanel {
             if (k.columnIndex < 0 || k.columnIndex > maxColIndex) return false;
         }
         try {
-            const perm = await computePermutation(reader, saved.keys, {
-                labelsOn: toolbar.labelsOn,
-                formatOn: toolbar.formatOn,
-                digits: toolbar.digits,
-            }, { signal });
+            const perm = await this.enqueueTransform(async () => {
+                if (generation !== this.generation
+                    || reader !== this.reader
+                    || signal?.aborted) {
+                    return undefined;
+                }
+                return computePermutation(reader, saved.keys, {
+                    labelsOn: toolbar.labelsOn,
+                    formatOn: toolbar.formatOn,
+                    digits: toolbar.digits,
+                }, { signal });
+            });
+            if (!perm) return false;
             if (generation !== this.generation || reader !== this.reader) return false;
             this.sort = {
                 keys: saved.keys,
@@ -701,14 +888,26 @@ export class DataViewerPanel {
             if (e.columnIndex < 0 || e.columnIndex > maxColIndex) return false;
         }
         try {
-            const indices = await computeFilteredIndices(reader, saved, {
-                labelsOn: toolbar.labelsOn,
-                formatOn: toolbar.formatOn,
-                digits: toolbar.digits,
-            }, { signal });
+            const result = await this.enqueueTransform(async (): Promise<
+                | { stale: true }
+                | { stale: false; indices: Uint32Array | undefined }
+            > => {
+                if (generation !== this.generation
+                    || reader !== this.reader
+                    || signal?.aborted) {
+                    return { stale: true };
+                }
+                const indices = await computeFilteredIndices(reader, saved, {
+                    labelsOn: toolbar.labelsOn,
+                    formatOn: toolbar.formatOn,
+                    digits: toolbar.digits,
+                }, { signal });
+                return { stale: false, indices };
+            });
+            if (result.stale) return false;
             if (generation !== this.generation || reader !== this.reader) return false;
             this.filter = { entries: saved.entries, labelsOnWhenFiltered: toolbar.labelsOn };
-            this.filteredIndices = indices;
+            this.filteredIndices = result.indices;
             this.filterGeneration += 1;
             return false;
         } catch (err) {
@@ -762,6 +961,7 @@ export class DataViewerPanel {
 
     private async handleInner(m: WebviewToExtension): Promise<void> {
         if (m.type === 'webviewReady') {
+            this.generation += 1;
             this.trace('webview-ready', { generation: this.generation });
             this.webviewReady = true;
             // A webview reload mid-restore is a lifecycle interruption, not
@@ -777,13 +977,13 @@ export class DataViewerPanel {
                 // reload (no pending cancel) keeps the prefs.
                 const cancelled = this.restoreCancelRequested;
                 const hash = this.currentSchemaHash();
-                this.generation += 1;
                 this.abortAndClearRestore();
                 // Swallow a store-write failure so it cannot skip the sendInit
                 // below and strand the reloaded webview on a permanent
                 // Loading… (worst case the cancelled pref survives the reload).
                 if (cancelled) await this.forgetPersistedPrefs(hash).catch(() => undefined);
             }
+            this.abortInteractiveTransforms();
             await this.sendInit();
             return;
         }
@@ -965,32 +1165,65 @@ export class DataViewerPanel {
                     // brush stays blank forever with no retry (unlike getRows,
                     // a missing histogram reply is unrecoverable). All degrade
                     // to "no brush". The whole-grid getRows path would also be
-                    // failing if a batch genuinely can't decode, and a decode
+                    // failing if a batch genuinely can't decode. A decode
                     // failure on a fixed Arrow file is deterministic, so the
-                    // empty result is cached below rather than re-scanning on
-                    // every popover reopen.
+                    // empty result from a failed scannable column is cached
+                    // below rather than re-scanning on every popover reopen.
                     const cols = reader.schema.columns;
                     const scannable = Number.isInteger(ci) && ci >= 0 && ci < cols.length
                         && isNumericArrowType(cols[ci].arrowType);
                     if (!scannable) {
                         bins = [];
                     } else {
-                        try {
-                            bins = await computeHistogramForColumn(reader, ci);
-                        } catch {
-                            bins = [];
-                        }
+                        const abort = new AbortController();
+                        this.histogramAborts.add(abort);
+                        bins = await this.enqueueTransform(async () => {
+                            if (this.disposed
+                                || gen !== this.generation
+                                || reader !== this.reader
+                                || abort.signal.aborted) {
+                                this.histogramAborts.delete(abort);
+                                return undefined;
+                            }
+                            const cached = this.histogramCache.get(ci);
+                            if (cached) {
+                                this.histogramAborts.delete(abort);
+                                return cached;
+                            }
+                            let computed: HistogramBin[];
+                            try {
+                                computed = await computeHistogramForColumn(reader, ci, {
+                                    signal: abort.signal,
+                                });
+                            } catch (err) {
+                                if (abort.signal.aborted || isAbortError(err)) {
+                                    this.histogramAborts.delete(abort);
+                                    return undefined;
+                                }
+                                computed = [];
+                            }
+                            // After the await: drop if the panel was disposed
+                            // or the dataset was swapped (mirrors getRows) —
+                            // no reply is owed, the new generation's webview
+                            // already cleared its in-flight marker.
+                            if (this.disposed
+                                || gen !== this.generation
+                                || reader !== this.reader
+                                || abort.signal.aborted) {
+                                this.histogramAborts.delete(abort);
+                                return undefined;
+                            }
+                            const existing = this.histogramCache.get(ci);
+                            if (existing) {
+                                this.histogramAborts.delete(abort);
+                                return existing;
+                            }
+                            this.histogramCache.set(ci, computed);
+                            this.histogramAborts.delete(abort);
+                            return computed;
+                        });
+                        if (bins === undefined) return;
                     }
-                    // After the await: drop if the panel was disposed or the
-                    // dataset was swapped (mirrors the getRows handler) — no
-                    // reply is owed, the new generation's webview already
-                    // cleared its in-flight marker. A concurrent request for
-                    // the same column may have cached a result meanwhile;
-                    // first writer wins so a late error-[] never clobbers it.
-                    if (this.disposed || gen !== this.generation || reader !== this.reader) return;
-                    const existing = this.histogramCache.get(ci);
-                    if (existing) bins = existing;
-                    else this.histogramCache.set(ci, bins);
                 }
                 const reply: ExtensionToWebview = {
                     type: 'histogram',
@@ -1031,14 +1264,20 @@ export class DataViewerPanel {
         // not reach the clear-and-forget branch and wipe this.
         this.consumeRestoreHandshake();
 
-        // Clear the current permutation and let the webview render a
-        // "Sorting…" indicator while we work. For empty `keys`, this is
-        // also the final state (no apply pass needed).
+        // Let the webview render a "Sorting..." indicator while non-empty
+        // sorts compute. The old authoritative permutation stays in place as
+        // the rollback baseline until the new result is ready to publish.
+        // For empty `keys`, clearing is immediate and final.
         this.sortGeneration += 1;
         const mySortGen = this.sortGeneration;
+        this.sortAbort?.abort();
+        const abort = new AbortController();
+        this.sortAbort = abort;
         if (m.keys.length === 0) {
             this.sort = EMPTY_SORT;
             this.permutation = undefined;
+            this.recordSortSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
+            if (this.sortAbort === abort) this.sortAbort = null;
             const ack: ExtensionToWebview = {
                 type: 'sortApplied',
                 panelGeneration: gen,
@@ -1046,16 +1285,34 @@ export class DataViewerPanel {
                 sort: EMPTY_SORT,
                 fromPersistence: false,
             };
-            await this.webviewPanel.webview.postMessage(ack);
+            void this.webviewPanel.webview.postMessage(ack).then(undefined, () => undefined);
             return;
         }
 
         const pending: ExtensionToWebview = {
             type: 'sortStatus',
             panelGeneration: gen,
+            requestId: m.requestId,
             state: 'pending',
         };
         await this.webviewPanel.webview.postMessage(pending);
+
+        await this.enqueueTransform(() => this.runSetSort(m, gen, mySortGen, abort));
+    }
+
+    private async runSetSort(
+        m: Extract<WebviewToExtension, { type: 'setSort' }>,
+        gen: number,
+        mySortGen: number,
+        abort: AbortController,
+    ): Promise<void> {
+        if (gen !== this.generation
+            || mySortGen !== this.sortGeneration
+            || this.disposed
+            || abort.signal.aborted) {
+            if (this.sortAbort === abort) this.sortAbort = null;
+            return;
+        }
 
         let perm: Uint32Array;
         try {
@@ -1063,7 +1320,7 @@ export class DataViewerPanel {
                 labelsOn: m.labelsOn,
                 formatOn: m.formatOn,
                 digits: m.digits,
-            });
+            }, { signal: abort.signal });
         } catch (err) {
             // Drop the failure entirely if a newer setSort or a panel
             // replace landed while computePermutation was in flight —
@@ -1072,27 +1329,63 @@ export class DataViewerPanel {
             // an error that's no longer relevant.
             if (gen !== this.generation
                 || mySortGen !== this.sortGeneration
-                || this.disposed) {
+                || this.disposed
+                || isAbortError(err)) {
+                if (this.sortAbort === abort) this.sortAbort = null;
                 return;
             }
             const idle: ExtensionToWebview = {
                 type: 'sortStatus',
                 panelGeneration: gen,
+                requestId: m.requestId,
                 state: 'idle',
             };
             await this.webviewPanel.webview.postMessage(idle);
-            const errMsg: ExtensionToWebview = {
-                type: 'error',
+            if (gen !== this.generation
+                || mySortGen !== this.sortGeneration
+                || this.disposed
+                || abort.signal.aborted) {
+                if (this.sortAbort === abort) this.sortAbort = null;
+                return;
+            }
+            const rollbackSnapshot = this.rollbackSortSnapshot(m.rollbackBaseRequestId);
+            this.applySortSnapshot(rollbackSnapshot);
+            this.recordSortSnapshot(m.requestId, rollbackSnapshot, m.rollbackBaseRequestId);
+            const rollback: ExtensionToWebview = {
+                type: 'sortApplied',
                 panelGeneration: gen,
-                message: err instanceof Error ? err.message : String(err),
+                requestId: m.requestId,
+                sort: cloneSortState(this.sort),
+                fromPersistence: false,
+                rollback: true,
+                error: err instanceof Error ? err.message : String(err),
             };
-            await this.webviewPanel.webview.postMessage(errMsg);
+            void this.webviewPanel.webview.postMessage(rollback).then(undefined, () => undefined);
+            if (this.sortAbort === abort) this.sortAbort = null;
             return;
         }
 
         // If another setSort raced in front, or the panel was replaced,
         // discard our result without publishing.
-        if (gen !== this.generation || mySortGen !== this.sortGeneration) return;
+        if (gen !== this.generation || mySortGen !== this.sortGeneration) {
+            if (this.sortAbort === abort) this.sortAbort = null;
+            return;
+        }
+
+        const idle: ExtensionToWebview = {
+            type: 'sortStatus',
+            panelGeneration: gen,
+            requestId: m.requestId,
+            state: 'idle',
+        };
+        await this.webviewPanel.webview.postMessage(idle);
+        if (gen !== this.generation
+            || mySortGen !== this.sortGeneration
+            || this.disposed
+            || abort.signal.aborted) {
+            if (this.sortAbort === abort) this.sortAbort = null;
+            return;
+        }
 
         const next: SortState = {
             keys: m.keys,
@@ -1100,13 +1393,7 @@ export class DataViewerPanel {
         };
         this.sort = next;
         this.permutation = perm;
-
-        const idle: ExtensionToWebview = {
-            type: 'sortStatus',
-            panelGeneration: gen,
-            state: 'idle',
-        };
-        await this.webviewPanel.webview.postMessage(idle);
+        this.recordSortSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
         const ack: ExtensionToWebview = {
             type: 'sortApplied',
             panelGeneration: gen,
@@ -1114,7 +1401,8 @@ export class DataViewerPanel {
             sort: next,
             fromPersistence: false,
         };
-        await this.webviewPanel.webview.postMessage(ack);
+        void this.webviewPanel.webview.postMessage(ack).then(undefined, () => undefined);
+        if (this.sortAbort === abort) this.sortAbort = null;
     }
 
     private async handleSetFilters(
@@ -1128,21 +1416,45 @@ export class DataViewerPanel {
 
         this.filterGeneration += 1;
         const myFilterGen = this.filterGeneration;
+        this.filterAbort?.abort();
+        const abort = new AbortController();
+        this.filterAbort = abort;
         const next: FilterState = { entries: m.entries, labelsOnWhenFiltered: m.labelsOn };
 
         if (m.entries.length === 0 || m.entries.every(e => !e.enabled)) {
             this.filter = next;
             this.filteredIndices = undefined;
-            await this.webviewPanel.webview.postMessage({
+            this.recordFilterSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
+            if (this.filterAbort === abort) this.filterAbort = null;
+            void this.webviewPanel.webview.postMessage({
                 type: 'filterApplied', panelGeneration: gen, requestId: m.requestId,
                 filter: next, nrowFiltered: this.reader.nrow, fromPersistence: false,
-            } satisfies ExtensionToWebview);
+            } satisfies ExtensionToWebview).then(undefined, () => undefined);
             return;
         }
 
         await this.webviewPanel.webview.postMessage({
-            type: 'filterStatus', panelGeneration: gen, state: 'pending',
+            type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'pending',
         } satisfies ExtensionToWebview);
+
+        await this.enqueueTransform(() =>
+            this.runSetFilters(m, gen, myFilterGen, abort, next));
+    }
+
+    private async runSetFilters(
+        m: Extract<WebviewToExtension, { type: 'setFilters' }>,
+        gen: number,
+        myFilterGen: number,
+        abort: AbortController,
+        next: FilterState,
+    ): Promise<void> {
+        if (gen !== this.generation
+            || myFilterGen !== this.filterGeneration
+            || this.disposed
+            || abort.signal.aborted) {
+            if (this.filterAbort === abort) this.filterAbort = null;
+            return;
+        }
 
         let indices: Uint32Array | undefined;
         try {
@@ -1150,29 +1462,65 @@ export class DataViewerPanel {
                 labelsOn: m.labelsOn,
                 formatOn: true,
                 digits: this.settings.defaultDigits,
-            });
+            }, { signal: abort.signal });
         } catch (err) {
-            if (gen !== this.generation || myFilterGen !== this.filterGeneration || this.disposed) return;
+            if (gen !== this.generation
+                || myFilterGen !== this.filterGeneration
+                || this.disposed
+                || isAbortError(err)) {
+                if (this.filterAbort === abort) this.filterAbort = null;
+                return;
+            }
             await this.webviewPanel.webview.postMessage({
-                type: 'filterStatus', panelGeneration: gen, state: 'idle',
+                type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
             } satisfies ExtensionToWebview);
-            await this.webviewPanel.webview.postMessage({
-                type: 'error', panelGeneration: gen,
-                message: err instanceof Error ? err.message : String(err),
-            } satisfies ExtensionToWebview);
+            if (gen !== this.generation
+                || myFilterGen !== this.filterGeneration
+                || this.disposed
+                || abort.signal.aborted) {
+                if (this.filterAbort === abort) this.filterAbort = null;
+                return;
+            }
+            const rollbackSnapshot = this.rollbackFilterSnapshot(m.rollbackBaseRequestId);
+            this.applyFilterSnapshot(rollbackSnapshot);
+            this.recordFilterSnapshot(m.requestId, rollbackSnapshot, m.rollbackBaseRequestId);
+            void this.webviewPanel.webview.postMessage({
+                type: 'filterApplied',
+                panelGeneration: gen,
+                requestId: m.requestId,
+                filter: cloneFilterState(this.filter),
+                nrowFiltered: this.filteredIndices?.length ?? this.reader.nrow,
+                fromPersistence: false,
+                rollback: true,
+                error: err instanceof Error ? err.message : String(err),
+            } satisfies ExtensionToWebview).then(undefined, () => undefined);
+            if (this.filterAbort === abort) this.filterAbort = null;
             return;
         }
 
-        if (gen !== this.generation || myFilterGen !== this.filterGeneration) return;
+        if (gen !== this.generation || myFilterGen !== this.filterGeneration) {
+            if (this.filterAbort === abort) this.filterAbort = null;
+            return;
+        }
+        await this.webviewPanel.webview.postMessage({
+            type: 'filterStatus', panelGeneration: gen, requestId: m.requestId, state: 'idle',
+        } satisfies ExtensionToWebview);
+        if (gen !== this.generation
+            || myFilterGen !== this.filterGeneration
+            || this.disposed
+            || abort.signal.aborted) {
+            if (this.filterAbort === abort) this.filterAbort = null;
+            return;
+        }
+
         this.filter = next;
         this.filteredIndices = indices;
-        await this.webviewPanel.webview.postMessage({
-            type: 'filterStatus', panelGeneration: gen, state: 'idle',
-        } satisfies ExtensionToWebview);
-        await this.webviewPanel.webview.postMessage({
+        this.recordFilterSnapshot(m.requestId, undefined, m.rollbackBaseRequestId);
+        void this.webviewPanel.webview.postMessage({
             type: 'filterApplied', panelGeneration: gen, requestId: m.requestId,
             filter: next, nrowFiltered: indices?.length ?? this.reader.nrow, fromPersistence: false,
-        } satisfies ExtensionToWebview);
+        } satisfies ExtensionToWebview).then(undefined, () => undefined);
+        if (this.filterAbort === abort) this.filterAbort = null;
     }
 
     private async handleCopy(
@@ -1305,6 +1653,8 @@ export class DataViewerPanel {
     private async dispose(): Promise<void> {
         if (this.disposed) return;
         this.disposed = true;
+        this.abortInteractiveTransforms();
+        this.abortAndClearRestore();
         this.trace('dispose', {});
         await this.reader.close().catch(() => undefined);
         try { await fs.unlink(this.filePath); } catch { /* ignore */ }

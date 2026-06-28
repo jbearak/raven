@@ -61,6 +61,7 @@ export async function computeFilteredIndices(
         await applyEntry(reader, e, ctx, mask, signal);
         if (allZero(mask)) break;
     }
+    throwIfAborted(signal);
     return compact(mask);
 }
 
@@ -82,6 +83,7 @@ async function applyEntry(
     const include = p.kind === 'isEmpty' ? true : entry.includeMissing;
     const missing = await missingMaskFor(reader, entry.columnIndex, schema, signal);
 
+    throwIfAborted(signal);
     for (let i = 0; i < mask.length; i++) {
         if (mask[i] === 0) continue;
         if (missing[i]) {
@@ -90,6 +92,7 @@ async function applyEntry(
         }
         mask[i] = accept(i) ? 1 : 0;
     }
+    throwIfAborted(signal);
 }
 
 /** Returns a fn `(rowIndex) => boolean` whose domain is **non-missing**
