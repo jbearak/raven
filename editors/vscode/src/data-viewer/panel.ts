@@ -1151,7 +1151,10 @@ export class DataViewerPanel {
             }
             return;
         }
-        if (m.panelGeneration !== this.generation) return;
+        if (m.panelGeneration !== this.generation) {
+            if (m.type === 'copy') await this.postStaleCopyDone(m);
+            return;
+        }
         // Capture generation BEFORE any await so a replace mid-fetch causes
         // us to drop the stale response rather than post under the new
         // generation.
@@ -1591,21 +1594,36 @@ export class DataViewerPanel {
         if (this.filterAbort === abort) this.filterAbort = null;
     }
 
-    private async handleCopy(
+    private async postCopyDone(
         m: Extract<WebviewToExtension, { type: 'copy' }>,
         gen: number,
+        ok: boolean,
+        error?: string,
     ): Promise<void> {
-        const cells = (m.range.rowEnd - m.range.rowStart) * m.range.colIndices.length;
-        const replyDone = (ok: boolean, error?: string): ExtensionToWebview => ({
+        await this.webviewPanel.webview.postMessage({
             type: 'copyDone',
             panelGeneration: gen,
             requestId: m.requestId,
             ok,
             error,
-        });
+        } satisfies ExtensionToWebview);
+    }
+
+    private async postStaleCopyDone(
+        m: Extract<WebviewToExtension, { type: 'copy' }>,
+    ): Promise<void> {
+        await this.postCopyDone(
+            m, m.panelGeneration, false, 'Data changed before copy completed',
+        );
+    }
+
+    private async handleCopy(
+        m: Extract<WebviewToExtension, { type: 'copy' }>,
+        gen: number,
+    ): Promise<void> {
+        const cells = (m.range.rowEnd - m.range.rowStart) * m.range.colIndices.length;
         if (cells > COPY_CELL_LIMIT) {
-            await this.webviewPanel.webview.postMessage(
-                replyDone(false, 'Selection exceeds copy limit'));
+            await this.postCopyDone(m, gen, false, 'Selection exceeds copy limit');
             return;
         }
         const copyPerm = this.composeEffective();
@@ -1616,7 +1634,10 @@ export class DataViewerPanel {
             viewportGeneration: Number.MAX_SAFE_INTEGER,
             permutation: copyPerm,
         });
-        if (gen !== this.generation) return;
+        if (gen !== this.generation) {
+            await this.postStaleCopyDone(m);
+            return;
+        }
 
         // Resolve labels for any non-shipped dictionary columns in the
         // selection so a Labels-on copy renders the level strings the
@@ -1635,7 +1656,10 @@ export class DataViewerPanel {
                 }
                 if (indices.size === 0) continue;
                 const labels = await this.reader.getLabels(colIdx, [...indices]);
-                if (gen !== this.generation) return;
+                if (gen !== this.generation) {
+                    await this.postStaleCopyDone(m);
+                    return;
+                }
                 resolved[colIdx] = labels;
             }
         }
@@ -1646,10 +1670,11 @@ export class DataViewerPanel {
         );
         try {
             await vscode.env.clipboard.writeText(tsv);
-            await this.webviewPanel.webview.postMessage(replyDone(true));
+            await this.postCopyDone(m, gen, true);
         } catch (err) {
-            await this.webviewPanel.webview.postMessage(
-                replyDone(false, err instanceof Error ? err.message : String(err)));
+            await this.postCopyDone(
+                m, gen, false, err instanceof Error ? err.message : String(err),
+            );
         }
     }
 

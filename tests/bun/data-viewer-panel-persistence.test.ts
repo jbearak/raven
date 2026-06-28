@@ -282,4 +282,132 @@ describe('DataViewerPanel persistence round-trip', () => {
         fakePanel.dispose();
         mock.restore();
     });
+
+    test('stale copy request gets copyDone so the webview clears Copying status', async () => {
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
+        const kv = new MemKV();
+        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
+        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+        const sortStore = new sortMod.SortStateStore(kv as any, 100);
+        const filterStore = new filterMod.FilterStateStore(kv as any, 100);
+
+        const path1 = tempCopyOf('tiny.arrow');
+        const reader = await arrowMod.ArrowSliceReader.open(path1);
+        const panel = await panelMod.DataViewerPanel.create(
+            'tiny', reader, path1,
+            layoutStore, toolbarStore, sortStore, filterStore,
+            TEST_SETTINGS,
+            { fsPath: '/x', toString: () => '/x' } as any,
+            () => {},
+        );
+        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        const fakeWebview = fakePanel.webview;
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await new Promise(r => setTimeout(r, 0));
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        expect(init).toBeDefined();
+
+        const path2 = tempCopyOf('tiny.arrow');
+        const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        await panel.replace(reader2, path2);
+        await new Promise(r => setTimeout(r, 0));
+
+        const beforeCopy = fakeWebview.posted.length;
+        fakeWebview.deliverFromWebview({
+            type: 'copy',
+            panelGeneration: init.panelGeneration,
+            requestId: 42,
+            range: { rowStart: 0, rowEnd: 1, colIndices: [0] },
+            labelsOn: true,
+            formatOn: true,
+            digits: 3,
+            includeHeader: false,
+        });
+        await new Promise(r => setTimeout(r, 0));
+
+        const copyDone = fakeWebview.posted.slice(beforeCopy)
+            .find(m => m.type === 'copyDone') as any;
+        expect(copyDone).toEqual({
+            type: 'copyDone',
+            panelGeneration: init.panelGeneration,
+            requestId: 42,
+            ok: false,
+            error: 'Data changed before copy completed',
+        });
+
+        await reader2.close().catch(() => undefined);
+        fakePanel.dispose();
+        mock.restore();
+    });
+
+    test('copy that becomes stale during row read still gets copyDone', async () => {
+        const { panelMod, arrowMod, layoutMod, toolbarMod, sortMod, filterMod } = await loadPanel();
+        const kv = new MemKV();
+        const layoutStore = new layoutMod.LayoutStore(kv as any, 100);
+        const toolbarStore = new toolbarMod.ToolbarStateStore(kv as any, 100);
+        const sortStore = new sortMod.SortStateStore(kv as any, 100);
+        const filterStore = new filterMod.FilterStateStore(kv as any, 100);
+
+        const path1 = tempCopyOf('tiny.arrow');
+        const reader = await arrowMod.ArrowSliceReader.open(path1);
+        let releaseRows!: () => void;
+        let rowsRequested = false;
+        (reader as any).getRows = async () => {
+            rowsRequested = true;
+            await new Promise<void>(resolve => { releaseRows = resolve; });
+            return { rows: [[1]], stale: false };
+        };
+
+        const panel = await panelMod.DataViewerPanel.create(
+            'tiny', reader, path1,
+            layoutStore, toolbarStore, sortStore, filterStore,
+            TEST_SETTINGS,
+            { fsPath: '/x', toString: () => '/x' } as any,
+            () => {},
+        );
+        const fakePanel = (panel as any).webviewPanel as FakeWebviewPanel;
+        const fakeWebview = fakePanel.webview;
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await new Promise(r => setTimeout(r, 0));
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        expect(init).toBeDefined();
+
+        const beforeCopy = fakeWebview.posted.length;
+        fakeWebview.deliverFromWebview({
+            type: 'copy',
+            panelGeneration: init.panelGeneration,
+            requestId: 43,
+            range: { rowStart: 0, rowEnd: 1, colIndices: [0] },
+            labelsOn: false,
+            formatOn: true,
+            digits: 3,
+            includeHeader: false,
+        });
+        await new Promise(r => setTimeout(r, 0));
+        expect(rowsRequested).toBe(true);
+
+        const path2 = tempCopyOf('tiny.arrow');
+        const reader2 = await arrowMod.ArrowSliceReader.open(path2);
+        const replacePromise = panel.replace(reader2, path2);
+        await new Promise(r => setTimeout(r, 0));
+        releaseRows();
+        await replacePromise;
+        await new Promise(r => setTimeout(r, 0));
+
+        const copyDone = fakeWebview.posted.slice(beforeCopy)
+            .find(m => m.type === 'copyDone') as any;
+        expect(copyDone).toEqual({
+            type: 'copyDone',
+            panelGeneration: init.panelGeneration,
+            requestId: 43,
+            ok: false,
+            error: 'Data changed before copy completed',
+        });
+
+        await reader2.close().catch(() => undefined);
+        fakePanel.dispose();
+        mock.restore();
+    });
 });
