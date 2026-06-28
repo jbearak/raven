@@ -38,7 +38,9 @@ export async function* iterateBatches(
 
 /** Bridge into the reader's private batch loader. The reader caches
  *  decoded batches with an LRU, so repeated reads here are cheap and
- *  warm the cache for the subsequent `getRows()` window. */
-export function readerGetBatch(reader: ArrowSliceReader, i: number): Promise<any> {
+ *  warm the cache for the subsequent `getRows()` window. Module-private:
+ *  callers go through {@link iterateBatches} so the cancellation checkpoint
+ *  is never bypassed. */
+function readerGetBatch(reader: ArrowSliceReader, i: number): Promise<any> {
     return (reader as any).getBatch(i);
 }
