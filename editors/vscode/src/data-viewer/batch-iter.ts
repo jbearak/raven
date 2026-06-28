@@ -7,8 +7,10 @@
  * (the saved-sort/filter restore on open), the iteration throws an
  * `AbortError` before each batch if aborted and yields the event loop
  * after each batch so a queued webview Cancel is delivered before the
- * next read. With no `signal` (the viewport `getRows` path) it is
- * byte-identical to a plain batch loop — no checks, no yields.
+ * next read. With no `signal` (interactive setSort/setFilters, which read
+ * whole columns but are not cancellable) it is byte-identical to a plain
+ * batch loop — no checks, no yields. The virtualized viewport `getRows`
+ * path does not walk batches through here at all.
  */
 import type { ArrowSliceReader } from './arrow-reader';
 import { throwIfAborted, yieldToEventLoop } from './abort';

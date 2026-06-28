@@ -312,8 +312,7 @@ async function missingMaskFor(
     const isFloat = schema.arrowType.startsWith('Float');
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const n = length;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) m[start + r] = 1;
             else if (isFloat && typeof v === 'number' && Number.isNaN(v)) m[start + r] = 1;
@@ -327,8 +326,7 @@ async function loadBool(reader: ArrowSliceReader, columnIndex: number, signal?: 
     const values = new Uint8Array(nrow);
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const n = length;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             values[start + r] = v ? 1 : 0;
@@ -342,8 +340,7 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal
     const out = new Float64Array(nrow);
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const n = length;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             // bigint columns (Int64 / Uint64) lossily coerce to Number;
@@ -362,8 +359,7 @@ async function loadString(reader: ArrowSliceReader, columnIndex: number, signal?
     const out: string[] = new Array(nrow).fill('');
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const n = length;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v !== null && v !== undefined) out[start + r] = String(v);
         }
@@ -377,8 +373,7 @@ async function loadFactorCodes(reader: ArrowSliceReader, columnIndex: number, si
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
         const data = child.data[0];
-        const n = length;
-        for (let r = 0; r < n; r++) codes[start + r] = data.values[r] as number;
+        for (let r = 0; r < length; r++) codes[start + r] = data.values[r] as number;
     }
     return codes;
 }
@@ -412,8 +407,7 @@ async function loadValueLabelled(
     const labels = schema.valueLabels ?? {};
     for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const n = length;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             const key = typeof v === 'bigint' ? v.toString() : String(v);
