@@ -36,6 +36,8 @@
 
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { SortKey } from './messages';
+import { iterateBatches } from './batch-iter';
+import { throwIfAborted, yieldToEventLoop } from './abort';
 
 /** Toolbar snapshot used to derive sort keys WYSIWYG. */
 export type SortContext = {
@@ -68,7 +70,9 @@ export async function computePermutation(
     reader: ArrowSliceReader,
     keys: readonly SortKey[],
     ctx: SortContext,
+    opts?: { signal?: AbortSignal },
 ): Promise<Uint32Array> {
+    const signal = opts?.signal;
     const nrow = reader.nrow;
     const perm = new Uint32Array(nrow);
     for (let i = 0; i < nrow; i++) perm[i] = i;
@@ -83,7 +87,7 @@ export async function computePermutation(
                 `computePermutation: unknown columnIndex ${k.columnIndex}`,
             );
         }
-        cols.push(await buildSortColumn(reader, k.columnIndex, schema, ctx));
+        cols.push(await buildSortColumn(reader, k.columnIndex, schema, ctx, signal));
         directions.push(k.direction === 'desc' ? -1 : 1);
     }
 
@@ -91,7 +95,16 @@ export async function computePermutation(
     // copy back. Uint32Array.sort exists but lacks the stability guarantee
     // and the comparator signature isn't well-typed.
     const idx: number[] = Array.from(perm);
+    // Yield once more before the (synchronous, potentially expensive) sort so
+    // a Cancel queued during the final column read is delivered and observed
+    // here, leaving the data in natural order rather than running the full
+    // sort first. Only the cancellable restore passes a signal.
+    if (signal) {
+        await yieldToEventLoop();
+        throwIfAborted(signal);
+    }
     idx.sort((a, b) => compareRows(a, b, cols, directions));
+    throwIfAborted(signal);
     for (let i = 0; i < nrow; i++) perm[i] = idx[i];
     return perm;
 }
@@ -123,11 +136,12 @@ async function buildSortColumn(
     columnIndex: number,
     schema: ColumnSchema,
     ctx: SortContext,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const arrowType = schema.arrowType;
 
     if (arrowType.startsWith('Dictionary')) {
-        return buildDictionarySortColumn(reader, columnIndex, schema, ctx);
+        return buildDictionarySortColumn(reader, columnIndex, schema, ctx, signal);
     }
     // Value-labelled columns (haven_labelled, foreign::value.labels,
     // readstata13) can be backed by any Arrow type whose `.get()`
@@ -142,33 +156,33 @@ async function buildSortColumn(
             || arrowType.startsWith('Float')
             || arrowType === 'Utf8'
             || arrowType === 'LargeUtf8')) {
-        return buildValueLabelledSortColumn(reader, columnIndex, schema);
+        return buildValueLabelledSortColumn(reader, columnIndex, schema, signal);
     }
     if (arrowType === 'Int64') {
         // 64-bit integers exceed Number's 2^53 safe range; use signed
         // BigInt storage + bigint comparator so the order stays exact.
-        return buildBigIntSortColumn(reader, columnIndex, false);
+        return buildBigIntSortColumn(reader, columnIndex, false, signal);
     }
     if (arrowType === 'Uint64') {
         // Same reasoning, but unsigned storage — BigInt64Array would
         // wrap any value above 2^63-1 to a negative two's-complement
         // bigint and corrupt ascending order.
-        return buildBigIntSortColumn(reader, columnIndex, true);
+        return buildBigIntSortColumn(reader, columnIndex, true, signal);
     }
     if (arrowType.startsWith('Int') || arrowType === 'Bool') {
-        return buildNumericSortColumn(reader, columnIndex, false);
+        return buildNumericSortColumn(reader, columnIndex, false, signal);
     }
     if (arrowType.startsWith('Float')) {
-        return buildNumericSortColumn(reader, columnIndex, true);
+        return buildNumericSortColumn(reader, columnIndex, true, signal);
     }
     if (arrowType.startsWith('Date')) {
-        return buildNumericSortColumn(reader, columnIndex, false);
+        return buildNumericSortColumn(reader, columnIndex, false, signal);
     }
     if (arrowType.startsWith('Timestamp')) {
-        return buildTimestampSortColumn(reader, columnIndex);
+        return buildTimestampSortColumn(reader, columnIndex, signal);
     }
     // Utf8 / LargeUtf8 / fallback.
-    return buildStringSortColumn(reader, columnIndex);
+    return buildStringSortColumn(reader, columnIndex, signal);
 }
 
 /** Numeric sort column from Int8/16/32, Bool, Float, or Date columns.
@@ -183,12 +197,13 @@ async function buildNumericSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
     floatNaNMissing: boolean,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const values = new Float64Array(nrow);
     const missing = new Uint8Array(nrow);
     let written = 0;
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const v = child.get(r);
@@ -228,13 +243,14 @@ async function buildBigIntSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
     unsigned: boolean,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const values: BigInt64Array | BigUint64Array = unsigned
         ? new BigUint64Array(nrow)
         : new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const v = child.get(r);
@@ -264,11 +280,12 @@ async function buildBigIntSortColumn(
 async function buildTimestampSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const values = new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         const data = child.data[0];
         for (let r = 0; r < batch.length; r++) {
@@ -293,11 +310,12 @@ async function buildTimestampSortColumn(
 async function buildStringSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const values: string[] = new Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const i = batch.start + r;
@@ -325,11 +343,12 @@ async function buildDictionarySortColumn(
     columnIndex: number,
     schema: ColumnSchema,
     ctx: SortContext,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const codes = new Int32Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         const data = child.data[0];
         for (let r = 0; r < batch.length; r++) {
@@ -364,6 +383,10 @@ async function buildDictionarySortColumn(
             if (!missing[i]) need.add(codes[i]);
         }
         const fetched = await reader.getLabels(columnIndex, [...need]);
+        // getLabels is an extra async hop after the cancellable batch scan;
+        // check the signal so a Cancel delivered during it is observed
+        // promptly rather than only after the (cheap) compare step.
+        throwIfAborted(signal);
         for (const [k, v] of Object.entries(fetched)) {
             labelByCode.set(Number(k), v);
         }
@@ -391,12 +414,13 @@ async function buildValueLabelledSortColumn(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
+    signal?: AbortSignal,
 ): Promise<SortColumn> {
     const nrow = reader.nrow;
     const display: string[] = new Array(nrow);
     const missing = new Uint8Array(nrow);
     const valueLabels = schema.valueLabels ?? {};
-    for await (const batch of iterateBatches(reader)) {
+    for await (const batch of iterateBatches(reader, signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const i = batch.start + r;
@@ -420,27 +444,6 @@ async function buildValueLabelledSortColumn(
         missing,
         compare: (a, b) => COLLATOR.compare(display[a], display[b]),
     };
-}
-
-/** Async iterator over a reader's record batches with their starting
- *  row index. */
-async function* iterateBatches(
-    reader: ArrowSliceReader,
-): AsyncGenerator<{ batch: any; start: number; length: number }> {
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await readerGetBatch(reader, bi);
-        const start = reader.batchStarts[bi];
-        const length = reader.batchStarts[bi + 1] - start;
-        yield { batch, start, length };
-    }
-}
-
-/** Bridge into the reader's private batch loader. The reader caches
- *  decoded batches with an LRU, so repeated reads here are cheap and
- *  warm the cache for the subsequent `getRows()` window. */
-function readerGetBatch(reader: ArrowSliceReader, i: number): Promise<any> {
-    return (reader as any).getBatch(i);
 }
 
 function isNullAt(data: any, row: number): boolean {

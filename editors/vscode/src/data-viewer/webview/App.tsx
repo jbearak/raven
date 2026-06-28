@@ -43,7 +43,8 @@ import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
 import {
     buildGridColumns,
     buildVisibleGridColumns,
-    describeVisibleRows,
+    describeRestoreMessage,
+    describeToolbarRowCount,
     fitLeadingText,
     HEADER_HEIGHT_PX,
     OVERSCAN_ROWS,
@@ -66,6 +67,17 @@ import { FilterStrip } from './filter-strip';
 import { FilterPopover } from './filter-popover';
 import { colKind } from './filter-column-kind';
 import { useToolbarWrap } from './use-toolbar-wrap';
+import {
+    filterEntriesForNextRequest,
+    nextSortKeysForColumn,
+    sortKeysForNextRequest,
+    createIntentRequestState,
+    requestFilterIntent,
+    requestSortIntent,
+    shouldAcceptAppliedResponse,
+    shouldAcceptInteractiveResponse,
+    shouldAcceptSortResponse,
+} from './transform-intent';
 
 type VscodeApi = {
     postMessage(msg: WebviewToExtension): void;
@@ -104,6 +116,11 @@ type HeaderTooltipState = {
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
 const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
+
+/** Delay before the saved-sort/filter restore banner appears (#519). A
+ *  restore that finishes faster than this never flashes the message; only a
+ *  genuinely slow restore reveals it and its skip action. */
+const RESTORE_DEBOUNCE_MS = 200;
 // Glide's renderer type is invariant, but dispatch is by each renderer's `kind`.
 const DATA_VIEWER_RENDERERS = [
     markerCellRenderer,
@@ -312,10 +329,20 @@ export function App({
     const inflightRef = useRef(new Map<number, string>());
     const pendingKeysRef = useRef(new Set<string>());
     const nextRequestIdRef = useRef(0);
+    const intentRequestStateRef = useRef(createIntentRequestState());
+    const panelGenerationRef = useRef(restored?.panelGeneration ?? 0);
     /** Column indices whose histogram has been requested from the host but
      *  not yet received, so the lazy-fetch effect fires at most one
      *  getHistogram per column. Cleared on replace (new dataset). */
-    const histogramRequestedRef = useRef(new Set<number>());
+    const histogramRequestedRef = useRef(new Map<number, number>());
+    const bootstrappingRef = useRef(true);
+    const latestSortRequestIdRef = useRef<number | null>(null);
+    const latestSortIntentRef = useRef<SortState | null>(null);
+    const acceptedSortRequestIdRef = useRef(0);
+    const latestFilterRequestIdRef = useRef<number | null>(null);
+    const latestFilterIntentRef = useRef<FilterState | null>(null);
+    const acceptedFilterRequestIdRef = useRef(0);
+    const restoreInteractionBlockRef = useRef<{ sort: boolean; filter: boolean } | null>(null);
     const viewportGenerationRef = useRef(0);
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
@@ -348,6 +375,7 @@ export function App({
     const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
     const [sortPending, setSortPending] = useState(false);
     const [filter, setFilter] = useState<FilterState>(restored?.filter ?? EMPTY_FILTER);
+    const [pendingFilterIntent, setPendingFilterIntent] = useState<FilterState | null>(null);
     const [filterPending, setFilterPending] = useState(false);
     const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
     const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
@@ -357,12 +385,38 @@ export function App({
      *  restored a non-empty schema from getState (we already have something
      *  to show). */
     const [loading, setLoading] = useState<boolean>(!(restored?.columns && restored.columns.length > 0));
+    // Saved-sort/filter restore banner (#519). `restorePending` is set only
+    // after the debounce timer fires, so a fast restore never flashes it;
+    // `restoreCancelling` shows the optimistic "Loading…" until init/replace
+    // lands. The refs hold the live restoreId (echoed on cancelRestore) and the
+    // debounce timer so it can be cleared when the restore completes.
+    const [restorePending, setRestorePending] =
+        useState<{ restoreId: number; sort: boolean; filter: boolean } | null>(null);
+    const [restoreCancelling, setRestoreCancelling] = useState(false);
+    const restoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const restoreIdRef = useRef<number | null>(null);
+    // The exact filter object the host last sent authoritatively (via
+    // init/replace, or a fromPersistence filterApplied). The debounced
+    // saveFilter effect skips when `filter` is still this object, so the
+    // webview never echoes host-owned state back to the store. This matters
+    // on a genuine restore-filter read failure: the host keeps the saved
+    // filter but sends EMPTY for display; without this guard the webview
+    // would saveFilter(EMPTY) and destroy the very pref the host preserved.
+    // A real user change replaces `filter` with a new object (≠ this ref),
+    // so it still persists normally. (#519)
+    const lastHostFilterRef = useRef<FilterState | null>(null);
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
         leftPx?: number;
         topPx?: number;
     } | null>(null);
+
+    const nextRequestId = useCallback(() => {
+        const requestId = ++nextRequestIdRef.current;
+        intentRequestStateRef.current.nextRequestId = requestId;
+        return requestId;
+    }, []);
 
     const visibleCols = useMemo(
         () => visibleColumnIndices(columns, layout.hiddenColumns),
@@ -389,7 +443,19 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
-    const rowCountText = describeVisibleRows(effectiveNrow, visibleRange, loading);
+    const displayedFilter = pendingFilterIntent ?? filter;
+    // On open, explain the background wait while saved sort/filter
+    // preferences are reapplied (#519). The grid already shows natural-order
+    // data, so the toolbar keeps its row-count while the banner offers a
+    // clearer "skip and show data now" affordance below it.
+    const restoreMessage = restorePending
+        ? (restoreCancelling
+            ? 'Loading…'
+            : describeRestoreMessage(restorePending.sort, restorePending.filter))
+        : null;
+    const rowCountText = describeToolbarRowCount(
+        effectiveNrow, visibleRange, loading, false,
+    );
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale.
@@ -405,7 +471,7 @@ export function App({
         },
         // sortPending/filterPending are deps because the progress pills they
         // drive widen the chip group, which can change whether it must wrap.
-        [sort.keys, filter.entries, rowCountText, layout.hiddenColumns.length, sortPending, filterPending, labelsHaveEffect, formatHasEffect],
+        [sort.keys, displayedFilter.entries, rowCountText, layout.hiddenColumns.length, sortPending, filterPending, labelsHaveEffect, formatHasEffect],
     );
     /** Transient progress pills for the toolbar chip group. The data viewer
      *  has no bottom status bar: the sort/filter chip strips carry the full
@@ -461,11 +527,16 @@ export function App({
         return { row: Math.min(effectiveNrow - 1, visibleRange.start), col: visibleCols[0] };
     }, [effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
 
-    const postLifecycle = useCallback((event: string, range: VisibleRange = visibleRange, selection = gridSelection) => {
+    const postLifecycle = useCallback((
+        event: string,
+        range: VisibleRange = visibleRange,
+        selection = gridSelection,
+        generation = panelGeneration,
+    ) => {
         vscode.postMessage({
             type: 'lifecycle',
             event,
-            panelGeneration,
+            panelGeneration: generation,
             nrow,
             columns: columns.length,
             visibleRows: Math.max(0, range.end - range.start),
@@ -504,6 +575,7 @@ export function App({
     }, []);
 
     const requestRows = useCallback((range: VisibleRange) => {
+        if (bootstrappingRef.current) return;
         if (range.end <= range.start || visibleCols.length === 0) return;
         if (rowCacheRef.current.hasRange(range.start, range.end)) return;
         const columnsKey = visibleCols.join(',');
@@ -511,7 +583,7 @@ export function App({
         if (pendingKeysRef.current.has(key)) return;
 
         viewportGenerationRef.current += 1;
-        const requestId = ++nextRequestIdRef.current;
+        const requestId = nextRequestId();
         pendingKeysRef.current.add(key);
         inflightRef.current.set(requestId, key);
         vscode.postMessage({
@@ -523,7 +595,7 @@ export function App({
             end: range.end,
             columns: visibleCols,
         });
-    }, [panelGeneration, visibleCols, vscode]);
+    }, [nextRequestId, panelGeneration, visibleCols, vscode]);
 
     const scheduleMissingRowRequest = useCallback((row: number) => {
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
@@ -552,9 +624,9 @@ export function App({
     }, []);
 
     const applyInitOrReplace = useCallback((m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>) => {
-        const sameDataset = m.panelGeneration === panelGeneration
-            && m.nrow === nrow
+        const sameDataset = m.nrow === nrow
             && sameColumns(m.columns, columns);
+        panelGenerationRef.current = m.panelGeneration;
         setPanelGeneration(m.panelGeneration);
         setNrow(m.nrow);
         setColumns(m.columns);
@@ -563,34 +635,52 @@ export function App({
         setSchemaHash(m.schemaHash);
         if (m.type === 'init') setSettings(m.settings);
         setToolbar(m.toolbar);
+        latestSortRequestIdRef.current = null;
+        latestSortIntentRef.current = null;
+        acceptedSortRequestIdRef.current = 0;
+        latestFilterRequestIdRef.current = null;
+        latestFilterIntentRef.current = null;
+        acceptedFilterRequestIdRef.current = 0;
+        intentRequestStateRef.current.latestSortIntent = null;
+        intentRequestStateRef.current.latestFilterIntent = null;
+        setPendingFilterIntent(null);
         setSort(m.sort);
         setSortPending(false);
         setFilter(m.filter);
+        // init/replace carries the host's authoritative filter; don't echo it
+        // back via saveFilter (see lastHostFilterRef).
+        lastHostFilterRef.current = m.filter;
         // Histograms are fetched lazily per column (getHistogram) the first
         // time a numeric filter popover opens — not shipped in init/replace.
-        // Drop any cached bins + in-flight request markers whenever the
-        // dataset changes (always on replace; on init unless this is the same
-        // dataset being restored from getState, e.g. after a tab hide/show),
-        // since bins are keyed by column index and would be wrong for a
-        // different schema. A same-dataset init keeps the restored cache.
-        if (m.type === 'replace' || !sameDataset) {
-            setHistograms({});
-            histogramRequestedRef.current.clear();
-        }
+        // Drop any cached bins + in-flight request markers on every init AND
+        // replace. Bins are value-derived but keyed only by column index, and
+        // `sameDataset` compares row count + column shape only — it cannot tell
+        // a genuine same-dataset reload (tab hide/show) apart from a different
+        // dataset that happens to share that shape, so keeping the cache risked
+        // showing stale bins from a previous frame after a same-shape swap. The
+        // host treats histograms as reader-scoped and clears them on every
+        // replace; the webview now matches that, refetching lazily on demand.
+        setHistograms({});
+        histogramRequestedRef.current.clear();
         setFilterPending(false);
-        if (m.filter.entries.length === 0) setNrowFiltered(undefined);
+        setNrowFiltered(undefined);
         setLoading(false);
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
         setGridSelection(createEmptySelection());
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
-        postLifecycle(m.type, sameDataset ? visibleRange : { start: 0, end: 0 }, createEmptySelection());
+        postLifecycle(
+            m.type,
+            sameDataset ? visibleRange : { start: 0, end: 0 },
+            createEmptySelection(),
+            m.panelGeneration,
+        );
         window.setTimeout(() => gridRef.current?.scrollTo(0, 0, 'both'), 0);
     }, [clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
 
     const applyRows = useCallback((m: Extract<ExtensionToWebview, { type: 'rows' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
         const key = inflightRef.current.get(m.requestId);
         if (!key) {
             return;
@@ -612,10 +702,10 @@ export function App({
             gridRef.current?.updateCells(damageList);
         }
         postLifecycle('rows');
-    }, [panelGeneration, postLifecycle, visibleCols.length]);
+    }, [postLifecycle, visibleCols.length]);
 
     const applyLabels = useCallback((m: Extract<ExtensionToWebview, { type: 'labels' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
         setResolvedLabels(previous => ({
             ...previous,
             [m.columnIndex]: {
@@ -632,16 +722,25 @@ export function App({
         if (damageList.length > 0) {
             gridRef.current?.updateCells(damageList);
         }
-    }, [panelGeneration, visibleCols, visibleRange.end, visibleRange.start]);
+    }, [visibleCols, visibleRange.end, visibleRange.start]);
 
     const applyHistogram = useCallback((m: Extract<ExtensionToWebview, { type: 'histogram' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
+        if (histogramRequestedRef.current.get(m.columnIndex) !== m.requestId) return;
         histogramRequestedRef.current.delete(m.columnIndex);
         setHistograms(prev => ({ ...prev, [m.columnIndex]: m.bins }));
-    }, [panelGeneration]);
+    }, []);
 
     const applySortApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'sortApplied' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
+        if (!shouldAcceptSortResponse(
+            latestSortRequestIdRef.current,
+            m.requestId,
+            m.fromPersistence,
+        )) return;
+        latestSortRequestIdRef.current = null;
+        latestSortIntentRef.current = null;
+        acceptedSortRequestIdRef.current = m.requestId;
         setSort(m.sort);
         setSortPending(false);
         // Permutation just changed — every cached row window is now in
@@ -661,9 +760,14 @@ export function App({
                 OVERSCAN_ROWS,
             ));
         }
+        if (m.error) {
+            setCopyStatus('error');
+            setCopyStatusMsg(m.error);
+        }
         // Persist the latest sort. Cleared (empty keys) saves are also
-        // valid — the host treats an empty SortState as a clear.
-        if (schemaHash) {
+        // valid — the host treats an empty SortState as a clear. Rollbacks
+        // are failure recovery, not a new user preference.
+        if (schemaHash && !m.rollback) {
             vscode.postMessage({
                 type: 'saveSort',
                 panelGeneration: m.panelGeneration,
@@ -674,7 +778,6 @@ export function App({
     }, [
         clearRows,
         effectiveNrow,
-        panelGeneration,
         requestRows,
         schemaHash,
         visibleCols.length,
@@ -683,13 +786,50 @@ export function App({
     ]);
 
     const applySortStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'sortStatus' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
+        if (!shouldAcceptSortResponse(latestSortRequestIdRef.current, m.requestId, false)) return;
         setSortPending(m.state === 'pending');
-    }, [panelGeneration]);
+    }, []);
 
     const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
+        if (!shouldAcceptAppliedResponse(
+            latestFilterRequestIdRef.current,
+            m.requestId,
+            m.fromPersistence,
+        )) {
+            if (m.fromPersistence) restoreInteractionBlockRef.current = null;
+            return;
+        }
+        latestFilterRequestIdRef.current = null;
+        latestFilterIntentRef.current = null;
+        acceptedFilterRequestIdRef.current = m.requestId;
+        setPendingFilterIntent(null);
+        if (m.error) {
+            setCopyStatus('error');
+            setCopyStatusMsg(m.error);
+        }
         setFilter(m.filter);
+        // Host-owned state and rollback recovery are not new user
+        // preferences. Successful user filter applies are persisted
+        // immediately (like sort applies), then marked as handled so the
+        // debounced saveFilter effect does not duplicate the write. Persisting
+        // on acknowledgement avoids losing an accepted filter if a later
+        // pending filter cancels the debounce and then rolls back.
+        if (m.fromPersistence) {
+            lastHostFilterRef.current = m.filter;
+            restoreInteractionBlockRef.current = null;
+        } else if (m.rollback) {
+            lastHostFilterRef.current = m.filter;
+        } else if (schemaHash) {
+            vscode.postMessage({
+                type: 'saveFilter',
+                panelGeneration: m.panelGeneration,
+                schemaHash,
+                filter: m.filter,
+            });
+            lastHostFilterRef.current = m.filter;
+        }
         const activeNrowFiltered = m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined;
         setNrowFiltered(activeNrowFiltered);
         setFilterPending(false);
@@ -709,30 +849,47 @@ export function App({
     }, [
         clearRows,
         nrow,
-        panelGeneration,
         requestRows,
+        schemaHash,
         visibleCols.length,
         visibleRange,
+        vscode,
     ]);
 
     const applyFilterStatus = useCallback((m: Extract<ExtensionToWebview, { type: 'filterStatus' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
+        if (!shouldAcceptInteractiveResponse(latestFilterRequestIdRef.current, m.requestId)) return;
         setFilterPending(m.state === 'pending');
-    }, [panelGeneration]);
+    }, []);
 
     /** Send a setFilters request. Empty `entries` clears the filter. The host
      *  replies with `filterApplied` which drives state updates. */
     const applyFilters = useCallback((entries: FilterEntry[]) => {
-        setFilterPending(entries.some(e => e.enabled));
-        const requestId = ++nextRequestIdRef.current;
+        if (bootstrappingRef.current || restoreInteractionBlockRef.current !== null) return;
+        const request = requestFilterIntent(
+            intentRequestStateRef.current,
+            entries,
+            toolbar.labelsOn,
+        );
+        nextRequestIdRef.current = intentRequestStateRef.current.nextRequestId;
+        const next = request.filter;
+        latestFilterIntentRef.current = next;
+        setPendingFilterIntent(next);
+        setFilterPending(next.entries.some(e => e.enabled));
+        latestFilterRequestIdRef.current = request.requestId;
         vscode.postMessage({
             type: 'setFilters',
             panelGeneration,
-            requestId,
-            entries,
-            labelsOn: toolbar.labelsOn,
+            requestId: request.requestId,
+            rollbackBaseRequestId: acceptedFilterRequestIdRef.current,
+            entries: request.entries,
+            labelsOn: next.labelsOnWhenFiltered,
         });
     }, [panelGeneration, toolbar.labelsOn, vscode]);
+
+    const filterEntriesForRequest = useCallback(() => {
+        return filterEntriesForNextRequest(filter.entries, latestFilterIntentRef.current);
+    }, [filter.entries]);
 
     const onEditFilter = useCallback((entry: FilterEntry) => {
         setFilterEditor({ entry });
@@ -741,47 +898,63 @@ export function App({
     /** Open the filter popover for a column, pre-seeded with its active filter
      *  (one-filter-per-column invariant) so editing reflects the live settings.
      *  When the column is unfiltered, `existing` is undefined and the popover
-     *  opens blank — the "add new" path. Keyed on `filter.entries` so callers
-     *  inside effects (e.g. the keyboard handler) never read a stale snapshot. */
+     *  opens blank — the "add new" path. Reads through
+     *  `filterEntriesForRequest` so rapid edits compose from the latest pending
+     *  request rather than the last host acknowledgement. */
     const openFilterEditor = useCallback(
         (columnIndex: number, leftPx: number, topPx: number) => {
-            const existing = filter.entries.find(e => e.columnIndex === columnIndex);
+            const existing = filterEntriesForRequest().find(e => e.columnIndex === columnIndex);
             setFilterEditor({ entry: existing, columnIndex, leftPx, topPx });
         },
-        [filter.entries],
+        [filterEntriesForRequest],
     );
 
     const onToggleFilterEnabled = useCallback((id: string) => {
-        applyFilters(filter.entries.map(e => e.id === id ? { ...e, enabled: !e.enabled } : e));
-    }, [applyFilters, filter.entries]);
+        applyFilters(filterEntriesForRequest().map(e => e.id === id ? { ...e, enabled: !e.enabled } : e));
+    }, [applyFilters, filterEntriesForRequest]);
 
     const onRemoveFilter = useCallback((id: string) => {
-        applyFilters(filter.entries.filter(e => e.id !== id));
-    }, [applyFilters, filter.entries]);
+        applyFilters(filterEntriesForRequest().filter(e => e.id !== id));
+    }, [applyFilters, filterEntriesForRequest]);
 
     const onClearAllFilters = useCallback(() => {
         applyFilters([]);
     }, [applyFilters]);
 
     const clearFilterOnColumn = useCallback((columnIndex: number) => {
-        applyFilters(filter.entries.filter(e => e.columnIndex !== columnIndex));
-    }, [filter, applyFilters]);
+        applyFilters(filterEntriesForRequest().filter(e => e.columnIndex !== columnIndex));
+    }, [filterEntriesForRequest, applyFilters]);
 
     /** Send a setSort request. Empty `keys` clears the sort. The host
      *  replies with `sortApplied` which drives state updates. */
     const applySort = useCallback((keys: SortKey[]) => {
-        setSortPending(true);
-        const requestId = ++nextRequestIdRef.current;
+        if (bootstrappingRef.current || restoreInteractionBlockRef.current !== null) return;
+        const request = requestSortIntent(
+            intentRequestStateRef.current,
+            keys,
+            toolbar.labelsOn,
+        );
+        nextRequestIdRef.current = intentRequestStateRef.current.nextRequestId;
+        const next = request.sort;
+        latestSortIntentRef.current = next;
+        setSort(next);
+        setSortPending(keys.length > 0);
+        latestSortRequestIdRef.current = request.requestId;
         vscode.postMessage({
             type: 'setSort',
             panelGeneration,
-            requestId,
-            keys,
+            requestId: request.requestId,
+            rollbackBaseRequestId: acceptedSortRequestIdRef.current,
+            keys: request.keys,
             labelsOn: toolbar.labelsOn,
             formatOn: toolbar.formatOn,
             digits: toolbar.digits,
         });
     }, [panelGeneration, toolbar, vscode]);
+
+    const sortKeysForRequest = useCallback(() => {
+        return sortKeysForNextRequest(sort.keys, latestSortIntentRef.current);
+    }, [sort.keys]);
 
     /** Pick a direction for `sourceIndex`. When `append` is true, merge
      *  into the existing sort (flipping the column's direction in place
@@ -792,50 +965,32 @@ export function App({
         direction: 'asc' | 'desc',
         append: boolean,
     ) => {
-        const existing = sort.keys.findIndex(k => k.columnIndex === sourceIndex);
-        let next: SortKey[];
-        if (!append) {
-            // Plain pick: this column becomes the sort. If user picks the
-            // same column/direction that's already active, no-op.
-            if (existing >= 0
-                && sort.keys.length === 1
-                && sort.keys[0].direction === direction) {
-                return;
-            }
-            next = [{ columnIndex: sourceIndex, direction }];
-        } else if (existing >= 0) {
-            // Shift+pick on an existing key: flip direction in place,
-            // priority preserved.
-            if (sort.keys[existing].direction === direction) return;
-            next = sort.keys.map((k, i) =>
-                i === existing ? { ...k, direction } : k);
-        } else {
-            // Shift+pick on a new column: append at the end.
-            next = [...sort.keys, { columnIndex: sourceIndex, direction }];
-        }
+        const next = nextSortKeysForColumn(sortKeysForRequest(), sourceIndex, direction, append);
+        if (!next) return;
         applySort(next);
-    }, [applySort, sort.keys]);
+    }, [applySort, sortKeysForRequest]);
 
     const clearSortOnColumn = useCallback((sourceIndex: number) => {
-        const next = sort.keys.filter(k => k.columnIndex !== sourceIndex);
-        if (next.length === sort.keys.length) return;
+        const current = sortKeysForRequest();
+        const next = current.filter(k => k.columnIndex !== sourceIndex);
+        if (next.length === current.length) return;
         applySort(next);
-    }, [applySort, sort.keys]);
+    }, [applySort, sortKeysForRequest]);
 
     const clearAllSorts = useCallback(() => {
-        if (sort.keys.length === 0) return;
+        if (sortKeysForRequest().length === 0) return;
         applySort([]);
-    }, [applySort, sort.keys.length]);
+    }, [applySort, sortKeysForRequest]);
 
     const applyCopyDone = useCallback((m: Extract<ExtensionToWebview, { type: 'copyDone' }>) => {
-        if (m.panelGeneration !== panelGeneration) return;
+        if (m.panelGeneration !== panelGenerationRef.current) return;
         setCopyStatus(m.ok ? 'copied' : 'error');
         setCopyStatusMsg(m.ok ? 'Copied' : (m.error ?? 'Copy failed'));
         window.setTimeout(() => {
             setCopyStatus('');
             setCopyStatusMsg('');
         }, 2500);
-    }, [panelGeneration]);
+    }, []);
 
     const estimatedViewportRowCount = useCallback((): number => {
         const current = visibleRange.end - visibleRange.start;
@@ -961,17 +1116,86 @@ export function App({
     ]);
 
     useEffect(() => {
+        bootstrappingRef.current = true;
         vscode.postMessage({ type: 'webviewReady' });
     }, [vscode]);
+
+    /** Skip the in-flight saved-sort/filter restore (#519). Posts the
+     *  echoed restoreId so a stale cancel from a prior lifecycle is ignored
+     *  by the host, and optimistically shows "Loading…" until the
+     *  natural-order init/replace lands. */
+    const cancelRestore = useCallback(() => {
+        const id = restoreIdRef.current;
+        if (id === null) return;
+        setRestoreCancelling(true);
+        vscode.postMessage({
+            type: 'cancelRestore',
+            panelGeneration,
+            restoreId: id,
+        });
+    }, [vscode, panelGeneration]);
 
     useEffect(() => {
         const onMessage = (event: MessageEvent<ExtensionToWebview>) => {
             const m = event.data;
             if (!m || typeof m !== 'object') return;
-            if ('panelGeneration' in m && m.panelGeneration < panelGeneration) return;
+            const currentGeneration = panelGenerationRef.current;
+            if ('panelGeneration' in m && m.panelGeneration < currentGeneration) return;
+            if ('panelGeneration' in m && bootstrappingRef.current) {
+                if (m.type !== 'init' && m.type !== 'replace' && m.type !== 'restorePending') return;
+                if (m.panelGeneration <= currentGeneration) return;
+            }
             switch (m.type) {
+                case 'restorePending': {
+                    // Defer showing the banner until the debounce elapses; a
+                    // restore that completes sooner clears the timer on
+                    // init/replace below and never flashes the message.
+                    const previousRestoreId = restoreIdRef.current;
+                    restoreIdRef.current = m.restoreId;
+                    // Only reset the canceling state for a genuinely new restore.
+                    // A same-id refresh while a Skip is already in flight must
+                    // not flip the banner back from "Loading…" and re-enable the
+                    // button.
+                    if (previousRestoreId !== m.restoreId) {
+                        setRestoreCancelling(false);
+                    }
+                    if (restoreTimerRef.current !== null) {
+                        clearTimeout(restoreTimerRef.current);
+                    }
+                    const info = { restoreId: m.restoreId, sort: m.sort, filter: m.filter };
+                    restoreInteractionBlockRef.current = { sort: m.sort, filter: m.filter };
+                    // If a banner is already visible (a prior restore whose
+                    // debounce elapsed), swap its wording at once rather than
+                    // showing stale text until the timer fires.
+                    setRestorePending(prev => (prev ? info : prev));
+                    restoreTimerRef.current = setTimeout(() => {
+                        restoreTimerRef.current = null;
+                        // If the restore finished (init/replace cleared
+                        // restoreIdRef) or a newer restore superseded this one
+                        // between scheduling and firing, this banner is stale.
+                        // clearTimeout cannot cancel an already-queued callback,
+                        // so guard here too rather than flashing a dead banner.
+                        if (restoreIdRef.current !== info.restoreId) return;
+                        setRestorePending(info);
+                    }, RESTORE_DEBOUNCE_MS);
+                    return;
+                }
                 case 'init':
                 case 'replace':
+                    bootstrappingRef.current = false;
+                    // Both the normal and cancelled/late-cancel restore paths
+                    // end by posting init/replace, so clear the banner here.
+                    if (restoreTimerRef.current !== null) {
+                        clearTimeout(restoreTimerRef.current);
+                        restoreTimerRef.current = null;
+                    }
+                    setRestorePending(null);
+                    setRestoreCancelling(false);
+                    if (!(restoreInteractionBlockRef.current?.filter
+                        && m.filter.entries.some(e => e.enabled))) {
+                        restoreInteractionBlockRef.current = null;
+                    }
+                    restoreIdRef.current = null;
                     applyInitOrReplace(m);
                     return;
                 case 'rows':
@@ -1028,6 +1252,19 @@ export function App({
         vscode,
     ]);
 
+    // Clear the restore-banner debounce timer on UNMOUNT only. This must not
+    // live in the message-handler effect's cleanup: that effect re-runs on
+    // every dep change (e.g. a scroll updates visibleRange → applyInitOrReplace
+    // identity changes), which would clear a pending timer and prevent the
+    // banner from ever appearing during a slow restore while the old grid is
+    // still interactive.
+    useEffect(() => () => {
+        if (restoreTimerRef.current !== null) {
+            clearTimeout(restoreTimerRef.current);
+            restoreTimerRef.current = null;
+        }
+    }, []);
+
     useEffect(() => {
         if (!toolbarBootstrappedRef.current || !schemaHash) return;
         vscode.postMessage({
@@ -1057,15 +1294,16 @@ export function App({
         if (kind !== 'numeric' && kind !== 'labelledNumeric') return;
         if (histograms[ci] !== undefined) return;          // already cached
         if (histogramRequestedRef.current.has(ci)) return;  // request in flight
-        histogramRequestedRef.current.add(ci);
-        const requestId = ++nextRequestIdRef.current;
+        if (bootstrappingRef.current) return;
+        const requestId = nextRequestId();
+        histogramRequestedRef.current.set(ci, requestId);
         vscode.postMessage({
             type: 'getHistogram',
             panelGeneration,
             requestId,
             columnIndex: ci,
         });
-    }, [filterEditor, columns, histograms, panelGeneration, vscode]);
+    }, [filterEditor, columns, histograms, nextRequestId, panelGeneration, vscode]);
 
     useEffect(() => {
         // Guard on the same bootstrap flag as saveToolbar: until the first
@@ -1073,6 +1311,13 @@ export function App({
         // and saving it would clobber a host-persisted filter before the
         // restore round-trip completes.
         if (!toolbarBootstrappedRef.current || !schemaHash) return;
+        if (pendingFilterIntent !== null || latestFilterRequestIdRef.current !== null) return;
+        // Don't echo a host-owned filter back to the store. On a genuine
+        // restore-filter read failure the host keeps the saved filter but
+        // sends EMPTY for display; echoing that would destroy the pref the
+        // host preserved. A real user change replaces `filter` with a new
+        // object, so it still persists. (#519)
+        if (filter === lastHostFilterRef.current) return;
         const id = window.setTimeout(() => {
             vscode.postMessage({
                 type: 'saveFilter',
@@ -1082,7 +1327,7 @@ export function App({
             });
         }, 300);
         return () => window.clearTimeout(id);
-    }, [filter, panelGeneration, schemaHash, vscode]);
+    }, [filter, panelGeneration, pendingFilterIntent, schemaHash, vscode]);
 
     /** Labels-toggle invalidates sort keys derived from displayed text.
      *  When the active sort touches a factor or value-labelled column
@@ -1110,16 +1355,16 @@ export function App({
      *  filter.labelsOnWhenFiltered = toolbar.labelsOn, making the guard true
      *  on the next render and preventing an infinite re-fire loop. */
     useEffect(() => {
-        if (filter.entries.length === 0) return;
-        if (filter.labelsOnWhenFiltered === toolbar.labelsOn) return;
-        const touchesLabelled = filter.entries.some(e => {
+        if (displayedFilter.entries.length === 0) return;
+        if (displayedFilter.labelsOnWhenFiltered === toolbar.labelsOn) return;
+        const touchesLabelled = displayedFilter.entries.some(e => {
             const col = columns[e.columnIndex];
             if (!col) return false;
             return e.predicate.kind === 'setIn' || e.predicate.kind === 'setNotIn';
         });
         if (!touchesLabelled) return;
-        applyFilters(filter.entries);
-    }, [applyFilters, columns, filter, toolbar.labelsOn]);
+        applyFilters(filterEntriesForRequest());
+    }, [applyFilters, columns, displayedFilter, filterEntriesForRequest, toolbar.labelsOn]);
 
     useEffect(() => {
         if (!toolbar.labelsOn) return;
@@ -1138,7 +1383,7 @@ export function App({
         }
         for (const [colIndexRaw, indices] of Object.entries(wantByColumn)) {
             if (indices.size === 0) continue;
-            const requestId = ++nextRequestIdRef.current;
+            const requestId = nextRequestId();
             vscode.postMessage({
                 type: 'getLabels',
                 panelGeneration,
@@ -1188,7 +1433,7 @@ export function App({
         }
 
         if (rowEnd <= rowStart || colIndices.length === 0) return;
-        const requestId = ++nextRequestIdRef.current;
+        const requestId = nextRequestId();
         setCopyStatus('copying');
         setCopyStatusMsg('Copying...');
         vscode.postMessage({
@@ -1201,7 +1446,7 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
         });
-    }, [effectiveNrow, gridSelection, panelGeneration, toolbar, visibleCols, vscode]);
+    }, [effectiveNrow, gridSelection, nextRequestId, panelGeneration, toolbar, visibleCols, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
@@ -1427,7 +1672,7 @@ export function App({
                         onClearAll={clearAllSorts}
                     />
                     <FilterStrip
-                        filter={filter}
+                        filter={displayedFilter}
                         columns={columns}
                         onEdit={onEditFilter}
                         onToggleEnabled={onToggleFilterEnabled}
@@ -1509,6 +1754,20 @@ export function App({
                     </div>
                 </div>
             </div>
+            {restoreMessage && (
+                <div className="toolbar-restore" role="status" aria-live="polite">
+                    <span>{restoreMessage}</span>
+                    {!restoreCancelling && (
+                        <button
+                            type="button"
+                            className="restore-skip"
+                            onClick={cancelRestore}
+                        >
+                            Skip and show data now
+                        </button>
+                    )}
+                </div>
+            )}
             <div className="grid-shell" ref={gridShellRef}>
                 <DataEditor
                     ref={gridRef}
@@ -1696,10 +1955,10 @@ export function App({
                             : undefined}
                         filter={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
                             ? {
-                                hasFilter: filter.entries.some(
+                                hasFilter: displayedFilter.entries.some(
                                     e => e.columnIndex === contextMenu.columnIndex,
                                 ),
-                                anyFiltered: filter.entries.length > 0,
+                                anyFiltered: displayedFilter.entries.length > 0,
                                 onAddFilter: () => {
                                     openFilterEditor(
                                         contextMenu.columnIndex!,
@@ -1709,7 +1968,7 @@ export function App({
                                     setContextMenu(null);
                                 },
                                 onClearColumn: () => {
-                                    applyFilters(filter.entries.filter(
+                                    applyFilters(filterEntriesForRequest().filter(
                                         e => e.columnIndex !== contextMenu.columnIndex,
                                     ));
                                     setContextMenu(null);
@@ -1746,13 +2005,13 @@ export function App({
                                 const next = (() => {
                                     if (filterEditor.entry) {
                                         // Editing existing: replace by id, also enforce one-per-column.
-                                        const withoutSameCol = filter.entries.filter(
+                                        const withoutSameCol = filterEntriesForRequest().filter(
                                             e => e.id !== entry.id && e.columnIndex !== entry.columnIndex,
                                         );
                                         return [...withoutSameCol, entry];
                                     }
                                     // New: replace any existing entry for this column.
-                                    const withoutCol = filter.entries.filter(
+                                    const withoutCol = filterEntriesForRequest().filter(
                                         e => e.columnIndex !== entry.columnIndex,
                                     );
                                     return [...withoutCol, entry];

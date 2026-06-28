@@ -267,6 +267,25 @@ row values (column names and types can match while values differ).
 Set `raven.dataViewer.persistSort` to `false` to make every panel
 open unsorted.
 
+### Reopening with a saved sort or filter
+
+The grid itself paints instantly because it is virtualized — only the
+visible window of rows is read at a time. Restoring a saved **sort** or
+**filter**, however, requires reading the relevant column(s) in full to
+recompute the permutation / survivor set, which on a multi-million-row
+frame can take a few seconds. During that time the toolbar shows
+**"Applying your saved sort & filter…"** (worded for whichever applies)
+with a **Skip and show data now** link below it. The message only appears
+if the restore takes longer than ~200 ms, so small datasets never flash it.
+
+**Skip and show data now** abandons the restore, **forgets** the saved
+sort/filter for that panel (clears the persisted entries), and shows the
+data in its natural, unsorted/unfiltered order. This is distinct from a
+genuine read failure: if reapplying the saved sort/filter fails for a real
+reason (a corrupt or unreadable column), the panel opens in natural order,
+a notice explains that the saved sort/filter could not be reapplied, and
+the saved preferences are **kept** so the next reopen can retry.
+
 ### Sort indicator
 
 The active sort keys appear as chips in the toolbar — one per key, in

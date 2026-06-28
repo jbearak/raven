@@ -89,6 +89,31 @@ export function describeVisibleRows(nrow: number, range: VisibleRange, loading =
     return `Showing ${start.toLocaleString()}-${end.toLocaleString()} of ${nrow.toLocaleString()}`;
 }
 
+/**
+ * The toolbar row-count text. `restoreActive` is accepted for call sites that
+ * already know about the saved-sort/filter restore lifecycle, but the restore
+ * banner sits below the toolbar, so the count remains visible while prefs
+ * reapply in the background.
+ */
+export function describeToolbarRowCount(
+    nrow: number,
+    range: VisibleRange,
+    loading: boolean,
+    _restoreActive: boolean,
+): string {
+    return describeVisibleRows(nrow, range, loading);
+}
+
+/**
+ * Explains the saved-sort/filter restore wait on open (#519). `sort` /
+ * `filter` say which preferences are being reapplied; at least one is true.
+ */
+export function describeRestoreMessage(sort: boolean, filter: boolean): string {
+    if (sort && filter) return 'Applying your saved sort & filter…';
+    if (sort) return 'Applying your saved sort…';
+    return 'Applying your saved filter…';
+}
+
 /** Labels for the host operations currently in progress, shown as transient
  *  pills in the toolbar chip group. The data viewer has no bottom status bar;
  *  this is the only progress cue for a multi-second sort/filter on a large

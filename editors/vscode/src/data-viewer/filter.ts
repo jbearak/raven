@@ -33,6 +33,8 @@
 
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import type { FilterEntry, FilterState } from './messages';
+import { iterateBatches } from './batch-iter';
+import { throwIfAborted, yieldToEventLoop } from './abort';
 
 export type FilterContext = {
     labelsOn: boolean;
@@ -44,7 +46,9 @@ export async function computeFilteredIndices(
     reader: ArrowSliceReader,
     state: FilterState,
     ctx: FilterContext,
+    opts?: { signal?: AbortSignal },
 ): Promise<Uint32Array | undefined> {
+    const signal = opts?.signal;
     const active = state.entries.filter(e => e.enabled);
     if (active.length === 0) return undefined;
 
@@ -53,9 +57,15 @@ export async function computeFilteredIndices(
     mask.fill(1);
 
     for (const e of active) {
-        await applyEntry(reader, e, ctx, mask);
+        throwIfAborted(signal);
+        await applyEntry(reader, e, ctx, mask, signal);
         if (allZero(mask)) break;
     }
+    // Yield once more before the synchronous compaction tail so a Cancel
+    // queued during the final entry's mask scan is delivered and honored here,
+    // leaving the data unfiltered rather than publishing compacted indices.
+    if (signal) await yieldToEventLoop();
+    throwIfAborted(signal);
     return compact(mask);
 }
 
@@ -64,18 +74,26 @@ async function applyEntry(
     entry: FilterEntry,
     ctx: FilterContext,
     mask: Uint8Array,
+    signal?: AbortSignal,
 ): Promise<void> {
     const schema = reader.schema.columns[entry.columnIndex];
     if (!schema) {
         throw new Error(`computeFilteredIndices: unknown columnIndex ${entry.columnIndex}`);
     }
     const p = entry.predicate;
-    const accept = await acceptorFor(reader, entry.columnIndex, schema, p, ctx);
+    const accept = await acceptorFor(reader, entry.columnIndex, schema, p, ctx, signal);
     // isEmpty targets missing values — they always pass regardless of includeMissing.
     // All other predicates use the entry's includeMissing flag.
     const include = p.kind === 'isEmpty' ? true : entry.includeMissing;
-    const missing = await missingMaskFor(reader, entry.columnIndex, schema);
+    const missing = await missingMaskFor(reader, entry.columnIndex, schema, signal);
 
+    // Yield once more before the synchronous mask scan so a Cancel queued
+    // during the acceptor/missing-mask reads is delivered and observed here,
+    // leaving the data unfiltered rather than publishing filtered indices.
+    // Only the cancellable restore passes a signal; throwIfAborted(undefined)
+    // is a no-op on the interactive path.
+    if (signal) await yieldToEventLoop();
+    throwIfAborted(signal);
     for (let i = 0; i < mask.length; i++) {
         if (mask[i] === 0) continue;
         if (missing[i]) {
@@ -84,6 +102,7 @@ async function applyEntry(
         }
         mask[i] = accept(i) ? 1 : 0;
     }
+    throwIfAborted(signal);
 }
 
 /** Returns a fn `(rowIndex) => boolean` whose domain is **non-missing**
@@ -95,18 +114,19 @@ async function acceptorFor(
     schema: ColumnSchema,
     predicate: FilterEntry['predicate'],
     ctx: FilterContext,
+    signal?: AbortSignal,
 ): Promise<(row: number) => boolean> {
     if (predicate.kind === 'isEmpty') return () => false;
     if (predicate.kind === 'isNotEmpty') return () => true;
 
     if (predicate.kind === 'bool') {
-        const values = await loadBool(reader, columnIndex);
+        const values = await loadBool(reader, columnIndex, signal);
         const want = predicate.value ? 1 : 0;
         return (i) => values[i] === want;
     }
 
     if (predicate.kind === 'numCompare') {
-        const values = await loadNumeric(reader, columnIndex);
+        const values = await loadNumeric(reader, columnIndex, signal);
         const v = predicate.value;
         switch (predicate.op) {
             case '=': return (i) => values[i] === v;
@@ -118,14 +138,14 @@ async function acceptorFor(
         }
     }
     if (predicate.kind === 'numBetween') {
-        const values = await loadNumeric(reader, columnIndex);
+        const values = await loadNumeric(reader, columnIndex, signal);
         const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
         return incl
             ? (i) => values[i] >= lo && values[i] <= hi
             : (i) => values[i] > lo && values[i] < hi;
     }
     if (predicate.kind === 'numNotBetween') {
-        const values = await loadNumeric(reader, columnIndex);
+        const values = await loadNumeric(reader, columnIndex, signal);
         const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
         return incl
             ? (i) => values[i] < lo || values[i] > hi
@@ -137,7 +157,7 @@ async function acceptorFor(
         || predicate.kind === 'strStartsWith'
         || predicate.kind === 'strEndsWith'
         || predicate.kind === 'strRegex') {
-        const values = await loadString(reader, columnIndex);
+        const values = await loadString(reader, columnIndex, signal);
         const cs = predicate.caseSensitive;
         switch (predicate.kind) {
             case 'strCompare': {
@@ -202,7 +222,7 @@ async function acceptorFor(
         // Timestamp columns (bigint microseconds) coerce to Number ms * 1000
         // via loadNumeric's bigint path, which loses sub-ms precision but is
         // fine for user-typed ISO strings.
-        const values = await loadNumeric(reader, columnIndex);
+        const values = await loadNumeric(reader, columnIndex, signal);
         const isTs = schema.arrowType.startsWith('Timestamp');
         const toUnit = (iso: string): number => {
             const ms = Date.parse(iso);
@@ -248,11 +268,11 @@ async function acceptorFor(
         const hasValueLabels = !!schema.valueLabels;
 
         if (isFactor) {
-            const codes = await loadFactorCodes(reader, columnIndex);
+            const codes = await loadFactorCodes(reader, columnIndex, signal);
             if (ctx.labelsOn) {
                 const labels: string[] = Array.isArray(schema.dictionary)
                     ? schema.dictionary
-                    : await dictFromGetLabels(reader, columnIndex, codes);
+                    : await dictFromGetLabels(reader, columnIndex, codes, signal);
                 return predicate.kind === 'setIn'
                     ? (i) => wantStr.has(labels[codes[i]])
                     : (i) => !wantStr.has(labels[codes[i]]);
@@ -271,20 +291,20 @@ async function acceptorFor(
             && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'));
         if (isNumericLabelled) {
             const want = new Set(predicate.values.map(Number));
-            const values = await loadNumeric(reader, columnIndex);
+            const values = await loadNumeric(reader, columnIndex, signal);
             return predicate.kind === 'setIn'
                 ? (i) => want.has(values[i])
                 : (i) => !want.has(values[i]);
         }
 
         if (hasValueLabels && ctx.labelsOn) {
-            const displayed = await loadValueLabelled(reader, columnIndex, schema);
+            const displayed = await loadValueLabelled(reader, columnIndex, schema, signal);
             return predicate.kind === 'setIn'
                 ? (i) => wantStr.has(displayed[i])
                 : (i) => !wantStr.has(displayed[i]);
         }
 
-        const values = await loadString(reader, columnIndex);
+        const values = await loadString(reader, columnIndex, signal);
         return predicate.kind === 'setIn'
             ? (i) => wantStr.has(values[i])
             : (i) => !wantStr.has(values[i]);
@@ -298,17 +318,14 @@ async function missingMaskFor(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
+    signal?: AbortSignal,
 ): Promise<Uint8Array> {
     const nrow = reader.nrow;
     const m = new Uint8Array(nrow);
     const isFloat = schema.arrowType.startsWith('Float');
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const start = reader.batchStarts[bi];
-        const n = (reader.batchStarts[bi + 1] - start);
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) m[start + r] = 1;
             else if (isFloat && typeof v === 'number' && Number.isNaN(v)) m[start + r] = 1;
@@ -317,16 +334,12 @@ async function missingMaskFor(
     return m;
 }
 
-async function loadBool(reader: ArrowSliceReader, columnIndex: number): Promise<Uint8Array> {
+async function loadBool(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Uint8Array> {
     const nrow = reader.nrow;
     const values = new Uint8Array(nrow);
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const start = reader.batchStarts[bi];
-        const n = (reader.batchStarts[bi + 1] - start);
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             values[start + r] = v ? 1 : 0;
@@ -335,16 +348,12 @@ async function loadBool(reader: ArrowSliceReader, columnIndex: number): Promise<
     return values;
 }
 
-async function loadNumeric(reader: ArrowSliceReader, columnIndex: number): Promise<Float64Array> {
+async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Float64Array> {
     const nrow = reader.nrow;
     const out = new Float64Array(nrow);
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const start = reader.batchStarts[bi];
-        const n = reader.batchStarts[bi + 1] - start;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             // bigint columns (Int64 / Uint64) lossily coerce to Number;
@@ -358,16 +367,12 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number): Promi
     return out;
 }
 
-async function loadString(reader: ArrowSliceReader, columnIndex: number): Promise<string[]> {
+async function loadString(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<string[]> {
     const nrow = reader.nrow;
     const out: string[] = new Array(nrow).fill('');
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const start = reader.batchStarts[bi];
-        const n = reader.batchStarts[bi + 1] - start;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v !== null && v !== undefined) out[start + r] = String(v);
         }
@@ -375,17 +380,13 @@ async function loadString(reader: ArrowSliceReader, columnIndex: number): Promis
     return out;
 }
 
-async function loadFactorCodes(reader: ArrowSliceReader, columnIndex: number): Promise<Int32Array> {
+async function loadFactorCodes(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Int32Array> {
     const nrow = reader.nrow;
     const codes = new Int32Array(nrow);
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
         const data = child.data[0];
-        const start = reader.batchStarts[bi];
-        const n = reader.batchStarts[bi + 1] - start;
-        for (let r = 0; r < n; r++) codes[start + r] = data.values[r] as number;
+        for (let r = 0; r < length; r++) codes[start + r] = data.values[r] as number;
     }
     return codes;
 }
@@ -394,10 +395,14 @@ async function dictFromGetLabels(
     reader: ArrowSliceReader,
     columnIndex: number,
     codes: Int32Array,
+    signal?: AbortSignal,
 ): Promise<string[]> {
     const seen = new Set<number>();
     for (let i = 0; i < codes.length; i++) seen.add(codes[i]);
     const labels = await reader.getLabels(columnIndex, [...seen]);
+    // getLabels is an extra async hop after the cancellable column load;
+    // check the signal so a Cancel during it is observed promptly.
+    throwIfAborted(signal);
     const max = [...seen].reduce((a, b) => Math.max(a, b), -1);
     const out: string[] = new Array(max + 1).fill('');
     for (const [k, v] of Object.entries(labels)) out[Number(k)] = v;
@@ -408,17 +413,14 @@ async function loadValueLabelled(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
+    signal?: AbortSignal,
 ): Promise<string[]> {
     const nrow = reader.nrow;
     const out: string[] = new Array(nrow).fill('');
     const labels = schema.valueLabels ?? {};
-    const numBatches = reader.batchStarts.length - 1;
-    for (let bi = 0; bi < numBatches; bi++) {
-        const batch = await (reader as any).getBatch(bi);
+    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
         const child = batch.getChildAt(columnIndex);
-        const start = reader.batchStarts[bi];
-        const n = reader.batchStarts[bi + 1] - start;
-        for (let r = 0; r < n; r++) {
+        for (let r = 0; r < length; r++) {
             const v = child.get(r);
             if (v === null || v === undefined) continue;
             const key = typeof v === 'bigint' ? v.toString() : String(v);
