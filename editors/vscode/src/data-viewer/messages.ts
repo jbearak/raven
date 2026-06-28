@@ -232,7 +232,7 @@ export type ExtensionToWebview =
     | {
         /** Sent before the host reads columns to reapply a saved
          *  sort/filter on open (#519), so the webview can explain the wait
-         *  (instead of a bare "Loading…") and offer a Cancel control.
+         *  (instead of a bare "Loading…") and offer a skip action.
          *  `restoreId` is a monotonic id (NOT `panelGeneration`, which the
          *  host bumps only on dataset replace) identifying this restore so
          *  a `cancelRestore` can be matched to it. `sort` / `filter` say

@@ -90,18 +90,17 @@ export function describeVisibleRows(nrow: number, range: VisibleRange, loading =
 }
 
 /**
- * The toolbar row-count text, suppressed while a saved-sort/filter restore
- * banner is showing (#519). The banner's explanation ("Applying your saved
- * sort…") replaces the unexplained "Loading…" rather than stacking above it,
- * so this returns '' when `restoreActive`; otherwise the normal label.
+ * The toolbar row-count text. `restoreActive` is accepted for call sites that
+ * already know about the saved-sort/filter restore lifecycle, but the restore
+ * banner sits below the toolbar, so the count remains visible while prefs
+ * reapply in the background.
  */
 export function describeToolbarRowCount(
     nrow: number,
     range: VisibleRange,
     loading: boolean,
-    restoreActive: boolean,
+    _restoreActive: boolean,
 ): string {
-    if (restoreActive) return '';
     return describeVisibleRows(nrow, range, loading);
 }
 

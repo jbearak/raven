@@ -254,11 +254,12 @@ describe('saved sort/filter restore messaging (#519)', () => {
             .toBe('Applying your saved filter…');
     });
 
-    test('describeToolbarRowCount suppresses the row count while a restore banner shows', () => {
-        // The banner already explains the wait, so the bare "Loading…"
-        // must not stack above it.
-        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, true)).toBe('');
-        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, true)).toBe('');
+    test('describeToolbarRowCount keeps the row count visible while a restore banner shows', () => {
+        // The restore banner sits below the toolbar, so the row-count
+        // readout remains useful context while the saved prefs reapply.
+        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, true)).toBe('Loading…');
+        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, true))
+            .toBe('Showing 1-50 of 1,000');
     });
 
     test('describeToolbarRowCount falls through to the normal label when no restore', () => {

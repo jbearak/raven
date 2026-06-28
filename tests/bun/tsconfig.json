@@ -44,6 +44,7 @@
     "plot-webview-inline-icons.test.ts",
     "plot-share-popover-position.test.ts",
     "data-viewer-build-bundle.test.ts",
+    "data-viewer-restore-affordance.test.ts",
     "data-viewer-filter-popover-seed.test.ts",
     "data-viewer-abort.test.ts",
     "data-viewer-sort-filter-cancel.test.ts",

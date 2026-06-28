@@ -108,7 +108,7 @@ const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDig
 
 /** Delay before the saved-sort/filter restore banner appears (#519). A
  *  restore that finishes faster than this never flashes the message; only a
- *  genuinely slow restore reveals it (and its Cancel). */
+ *  genuinely slow restore reveals it and its skip action. */
 const RESTORE_DEBOUNCE_MS = 200;
 // Glide's renderer type is invariant, but dispatch is by each renderer's `kind`.
 const DATA_VIEWER_RENDERERS = [
@@ -365,7 +365,7 @@ export function App({
     const [loading, setLoading] = useState<boolean>(!(restored?.columns && restored.columns.length > 0));
     // Saved-sort/filter restore banner (#519). `restorePending` is set only
     // after the debounce timer fires, so a fast restore never flashes it;
-    // `restoreCancelling` shows the optimistic "Cancelling…" until init/replace
+    // `restoreCancelling` shows the optimistic "Loading…" until init/replace
     // lands. The refs hold the live restoreId (echoed on cancelRestore) and the
     // debounce timer so it can be cleared when the restore completes.
     const [restorePending, setRestorePending] =
@@ -415,16 +415,17 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
-    // On open, explain (and let the user cancel) the wait while saved
-    // sort/filter preferences are reapplied (#519). While the banner is up it
-    // explains the wait, so the bare "Loading…" row-count is suppressed.
+    // On open, explain the background wait while saved sort/filter
+    // preferences are reapplied (#519). The grid already shows natural-order
+    // data, so the toolbar keeps its row-count while the banner offers a
+    // clearer "skip and show data now" affordance below it.
     const restoreMessage = restorePending
         ? (restoreCancelling
-            ? 'Cancelling…'
+            ? 'Loading…'
             : describeRestoreMessage(restorePending.sort, restorePending.filter))
         : null;
     const rowCountText = describeToolbarRowCount(
-        effectiveNrow, visibleRange, loading, restoreMessage !== null,
+        effectiveNrow, visibleRange, loading, false,
     );
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
@@ -1008,9 +1009,9 @@ export function App({
         vscode.postMessage({ type: 'webviewReady' });
     }, [vscode]);
 
-    /** Cancel the in-flight saved-sort/filter restore (#519). Posts the
+    /** Skip the in-flight saved-sort/filter restore (#519). Posts the
      *  echoed restoreId so a stale cancel from a prior lifecycle is ignored
-     *  by the host, and optimistically shows "Cancelling…" until the
+     *  by the host, and optimistically shows "Loading…" until the
      *  natural-order init/replace lands. */
     const cancelRestore = useCallback(() => {
         const id = restoreIdRef.current;
@@ -1526,20 +1527,6 @@ export function App({
                 ref={toolbarRef}
             >
                 <span className="row-count" ref={rowCountRef}>{rowCountText}</span>
-                {restoreMessage && (
-                    <div className="toolbar-restore" role="status" aria-live="polite">
-                        <span>{restoreMessage}</span>
-                        {!restoreCancelling && (
-                            <button
-                                type="button"
-                                className="restore-cancel"
-                                onClick={cancelRestore}
-                            >
-                                Cancel
-                            </button>
-                        )}
-                    </div>
-                )}
                 <div className="toolbar-chips" ref={toolbarChipsRef}>
                     <ToolbarSortStrip
                         sort={sort}
@@ -1630,6 +1617,20 @@ export function App({
                     </div>
                 </div>
             </div>
+            {restoreMessage && (
+                <div className="toolbar-restore" role="status" aria-live="polite">
+                    <span>{restoreMessage}</span>
+                    {!restoreCancelling && (
+                        <button
+                            type="button"
+                            className="restore-skip"
+                            onClick={cancelRestore}
+                        >
+                            Skip and show data now
+                        </button>
+                    )}
+                </div>
+            )}
             <div className="grid-shell" ref={gridShellRef}>
                 <DataEditor
                     ref={gridRef}
