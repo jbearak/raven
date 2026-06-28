@@ -2,9 +2,10 @@
  * Protocol types for the data-viewer postMessage channel.
  *
  * Every message after the initial `webviewReady` handshake carries the
- * panel's monotonic `panelGeneration`. Receivers drop messages tagged with
- * an older generation than the receiver's current one — this is how stale
- * `getRows` / `copy` / `labels` responses are filtered out after a `replace`.
+ * panel's monotonic `panelGeneration`. The host bumps it on webview reload
+ * and dataset replacement; receivers drop messages from older generations
+ * so stale `getRows` / `copy` / `labels` / transform responses cannot leak
+ * across those lifecycle boundaries.
  */
 
 import type { Cell } from './wire-format';
@@ -204,12 +205,20 @@ export type ExtensionToWebview =
         requestId: number;
         sort: SortState;
         fromPersistence: boolean;
+        /** True when this is an authoritative rollback after a failed
+         *  interactive setSort request. The webview should update display
+         *  state but must not persist the rolled-back state as a new user
+         *  preference. */
+        rollback?: boolean;
+        /** Optional failure text carried by a rollback response. */
+        error?: string;
     }
     | {
         /** Lifecycle ping driving the toolbar "Sorting…" progress pill.
          *  `state: 'pending'` shows it; `'idle'` clears it. */
         type: 'sortStatus';
         panelGeneration: number;
+        requestId: number;
         state: 'pending' | 'idle';
     }
     | {
@@ -223,20 +232,28 @@ export type ExtensionToWebview =
         filter: FilterState;
         nrowFiltered: number;
         fromPersistence: boolean;
+        /** True when this is an authoritative rollback after a failed
+         *  interactive setFilters request. The webview should clear pending
+         *  intent but must not persist the rolled-back state as a new user
+         *  preference. */
+        rollback?: boolean;
+        /** Optional failure text carried by a rollback response. */
+        error?: string;
     }
     | {
         type: 'filterStatus';
         panelGeneration: number;
+        requestId: number;
         state: 'pending' | 'idle';
     }
     | {
         /** Sent before the host reads columns to reapply a saved
          *  sort/filter on open (#519), so the webview can explain the wait
          *  (instead of a bare "Loading…") and offer a skip action.
-         *  `restoreId` is a monotonic id (NOT `panelGeneration`, which the
-         *  host bumps only on dataset replace) identifying this restore so
-         *  a `cancelRestore` can be matched to it. `sort` / `filter` say
-         *  which preferences are being applied (for the wording). */
+         *  `restoreId` is a monotonic id identifying this restore so a
+         *  `cancelRestore` can be matched to it independently of lifecycle
+         *  generation bumps. `sort` / `filter` say which preferences are
+         *  being applied (for the wording). */
         type: 'restorePending';
         panelGeneration: number;
         restoreId: number;
@@ -374,6 +391,10 @@ export type WebviewToExtension =
         type: 'setSort';
         panelGeneration: number;
         requestId: number;
+        /** Request id of the sort state the webview has actually accepted
+         *  and wants restored if this request fails. Older direct callers may
+         *  omit it; the host then falls back to its current state. */
+        rollbackBaseRequestId?: number;
         keys: SortKey[];
         labelsOn: boolean;
         formatOn: boolean;
@@ -396,6 +417,10 @@ export type WebviewToExtension =
         type: 'setFilters';
         panelGeneration: number;
         requestId: number;
+        /** Request id of the filter state the webview has actually accepted
+         *  and wants restored if this request fails. Older direct callers may
+         *  omit it; the host then falls back to its current state. */
+        rollbackBaseRequestId?: number;
         entries: FilterEntry[];
         labelsOn: boolean;
     }

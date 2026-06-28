@@ -328,6 +328,178 @@ describe('DataViewerPanel: filter round-trips', () => {
         expect(getBatchCalls).toBe(0);
     });
 
+    test('getHistogram and setSort do not read batches concurrently', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>(resolve => { firstEntered = resolve; });
+        let releaseFirst!: () => void;
+        const releaseFirstPromise = new Promise<void>(resolve => { releaseFirst = resolve; });
+        let activeReads = 0;
+        let firstRead = true;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            if (activeReads > 0) throw new Error('concurrent batch read');
+            activeReads += 1;
+            try {
+                if (firstRead) {
+                    firstRead = false;
+                    firstEntered();
+                    await releaseFirstPromise;
+                }
+                return await origGetBatch(i);
+            } finally {
+                activeReads -= 1;
+            }
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 50,
+            columnIndex: 0,
+        });
+        await firstEnteredPromise;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setSort',
+            panelGeneration: init.panelGeneration,
+            requestId: 51,
+            keys: [{ columnIndex: 0, direction: 'desc' }],
+            labelsOn: true,
+            formatOn: true,
+            digits: 3,
+        });
+        await flush();
+        releaseFirst();
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+        const hist = fakeWebview.posted.find(
+            m => m.type === 'histogram' && m.requestId === 50,
+        ) as any;
+        expect(hist).toBeDefined();
+        const sortAck = fakeWebview.posted.find(
+            m => m.type === 'sortApplied' && m.requestId === 51,
+        ) as any;
+        expect(sortAck).toBeDefined();
+        expect(sortAck.sort.keys).toEqual([{ columnIndex: 0, direction: 'desc' }]);
+    });
+
+    test('webview reload aborts an active histogram without replying to the stale request', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        let triggeredReload = false;
+        let readCount = 0;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            readCount += 1;
+            if (readCount > 1) throw new Error('histogram read after abort');
+            if (!triggeredReload) {
+                triggeredReload = true;
+                fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+            }
+            return origGetBatch(i);
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 52,
+            columnIndex: 0,
+        });
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'histogram' && m.requestId === 52))
+            .toEqual([]);
+        expect(readCount).toBe(1);
+        const initMessages = fakeWebview.posted.filter(m => m.type === 'init') as any[];
+        expect(initMessages.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test('webview reload aborts an active filter before the next batch read', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        let readCount = 0;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            readCount += 1;
+            if (readCount === 1) {
+                fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+                return await origGetBatch(i);
+            }
+            throw new Error('filter read after abort');
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: init.panelGeneration,
+            requestId: 54,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'filterApplied' && m.requestId === 54))
+            .toEqual([]);
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+        expect(readCount).toBe(1);
+    });
+
+    test('webview reload suppresses a non-abort error from an aborted histogram', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>(resolve => { firstEntered = resolve; });
+        let rejectRead!: (err: Error) => void;
+        const readPromise = new Promise<never>((_resolve, reject) => { rejectRead = reject; });
+        let firstRead = true;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            if (firstRead) {
+                firstRead = false;
+                firstEntered();
+                return await readPromise;
+            }
+            return await origGetBatch(i);
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'getHistogram',
+            panelGeneration: init.panelGeneration,
+            requestId: 53,
+            columnIndex: 0,
+        });
+        await firstEnteredPromise;
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        rejectRead(new Error('decode failed after abort'));
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'histogram' && m.requestId === 53))
+            .toEqual([]);
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+    });
+
     test('setFilters round-trip: filterStatus pending → filterApplied, then getRows returns matching rows', async () => {
         const { fakeWebview } = await setupPanel();
 
@@ -433,6 +605,466 @@ describe('DataViewerPanel: filter round-trips', () => {
         ) as any;
         expect(rows).toBeDefined();
         expect(rows.rows.map((r: any[]) => r[0])).toEqual([5, 4, 3]);
+    });
+
+    test('overlapping setFilter and setSort serialize and compose', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>(resolve => { firstEntered = resolve; });
+        let releaseFirst!: () => void;
+        const releaseFirstPromise = new Promise<void>(resolve => { releaseFirst = resolve; });
+        let activeReads = 0;
+        let firstRead = true;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            if (activeReads > 0) throw new Error('concurrent batch read');
+            activeReads += 1;
+            try {
+                if (firstRead) {
+                    firstRead = false;
+                    firstEntered();
+                    await releaseFirstPromise;
+                }
+                return await origGetBatch(i);
+            } finally {
+                activeReads -= 1;
+            }
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 80,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await firstEnteredPromise;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setSort',
+            panelGeneration: gen,
+            requestId: 81,
+            keys: [{ columnIndex: 0, direction: 'desc' }],
+            labelsOn: true,
+            formatOn: true,
+            digits: 3,
+        });
+        await flush();
+        releaseFirst();
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+        expect(fakeWebview.posted.find(
+            m => m.type === 'filterApplied' && m.requestId === 80,
+        )).toBeDefined();
+        expect(fakeWebview.posted.find(
+            m => m.type === 'sortApplied' && m.requestId === 81,
+        )).toBeDefined();
+
+        fakeWebview.deliverFromWebview({
+            type: 'getRows',
+            panelGeneration: gen,
+            requestId: 82,
+            viewportGeneration: 1,
+            start: 0,
+            end: 3,
+            columns: [0],
+        });
+        await flush();
+        const rows = fakeWebview.posted.find(
+            m => m.type === 'rows' && m.requestId === 82,
+        ) as any;
+        expect(rows.rows.map((r: any[]) => r[0])).toEqual([5, 4, 3]);
+    });
+
+    test('overlapping setFilters requests do not read batches concurrently and latest wins', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>(resolve => { firstEntered = resolve; });
+        let releaseFirst!: () => void;
+        const releaseFirstPromise = new Promise<void>(resolve => { releaseFirst = resolve; });
+        let activeReads = 0;
+        let firstRead = true;
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async (i: number) => {
+            if (activeReads > 0) throw new Error('concurrent batch read');
+            activeReads += 1;
+            try {
+                if (firstRead) {
+                    firstRead = false;
+                    firstEntered();
+                    await releaseFirstPromise;
+                }
+                return await origGetBatch(i);
+            } finally {
+                activeReads -= 1;
+            }
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 1,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await firstEnteredPromise;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 2,
+            entries: [{
+                id: 'e2',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '<', value: 4 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+        releaseFirst();
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+        const applied = fakeWebview.posted.filter(m => m.type === 'filterApplied') as any[];
+        expect(applied.map(m => m.requestId)).toEqual([2]);
+        expect(applied[0].filter.entries).toEqual([{
+            id: 'e2',
+            columnIndex: 0,
+            predicate: { kind: 'numCompare', op: '<', value: 4 },
+            enabled: true,
+            includeMissing: false,
+        }]);
+        expect(applied[0].nrowFiltered).toBe(3);
+
+        fakeWebview.deliverFromWebview({
+            type: 'getRows',
+            panelGeneration: gen,
+            requestId: 3,
+            viewportGeneration: 1,
+            start: 0,
+            end: 3,
+            columns: [0],
+        });
+        await flush();
+        const rows = fakeWebview.posted.find(
+            m => m.type === 'rows' && m.requestId === 3,
+        ) as any;
+        expect(rows.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3]);
+    });
+
+    test('setFilters read failure rolls back pending state to the authoritative filter', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+        const previousEntry = {
+            id: 'e1',
+            columnIndex: 0,
+            predicate: { kind: 'numCompare' as const, op: '>' as const, value: 2 },
+            enabled: true,
+            includeMissing: false,
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 70,
+            entries: [previousEntry],
+            labelsOn: true,
+        });
+        await flush();
+        const previousApplied = fakeWebview.posted.find(
+            m => m.type === 'filterApplied' && m.requestId === 70,
+        ) as any;
+        expect(previousApplied.nrowFiltered).toBe(3);
+
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async () => {
+            throw new Error('filter decode boom');
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 71,
+            entries: [{
+                id: 'e2',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '<', value: 4 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+
+        const rollback = fakeWebview.posted.find(
+            m => m.type === 'filterApplied' && m.requestId === 71,
+        ) as any;
+        expect(rollback).toBeDefined();
+        expect(rollback.filter.entries).toEqual([previousEntry]);
+        expect(rollback.nrowFiltered).toBe(3);
+        expect(rollback.fromPersistence).toBe(false);
+        expect(rollback.rollback).toBe(true);
+        expect(rollback.error).toBe('filter decode boom');
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+
+        (reader as any).getBatch = origGetBatch;
+        fakeWebview.deliverFromWebview({
+            type: 'getRows',
+            panelGeneration: gen,
+            requestId: 72,
+            viewportGeneration: 1,
+            start: 0,
+            end: 3,
+            columns: [0],
+        });
+        await flush();
+        const rows = fakeWebview.posted.find(
+            m => m.type === 'rows' && m.requestId === 72,
+        ) as any;
+        expect(rows.rows.map((r: any[]) => r[0])).toEqual([3, 4, 5]);
+    });
+
+    test('failed newer filter does not roll back to an unpublished superseded filter', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        let firstIdleReached!: () => void;
+        const firstIdleReachedPromise = new Promise<void>(resolve => { firstIdleReached = resolve; });
+        let releaseFirstIdle!: () => void;
+        const releaseFirstIdlePromise = new Promise<void>(resolve => { releaseFirstIdle = resolve; });
+        const origPostMessage = fakeWebview.postMessage.bind(fakeWebview);
+        fakeWebview.postMessage = ((msg: any) => {
+            const result = origPostMessage(msg);
+            if (msg.type === 'filterStatus' && msg.requestId === 73 && msg.state === 'idle') {
+                firstIdleReached();
+                return releaseFirstIdlePromise.then(() => true);
+            }
+            return result;
+        }) as any;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 73,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await firstIdleReachedPromise;
+
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async () => {
+            throw new Error('second filter decode boom');
+        };
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 74,
+            rollbackBaseRequestId: 0,
+            entries: [{
+                id: 'e2',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '<', value: 4 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+        releaseFirstIdle();
+        await flush();
+
+        const rollback = fakeWebview.posted.find(
+            m => m.type === 'filterApplied' && m.requestId === 74,
+        ) as any;
+        expect(rollback).toBeDefined();
+        expect(rollback.filter.entries).toEqual([]);
+        expect(rollback.nrowFiltered).toBe(5);
+        expect(rollback.rollback).toBe(true);
+        expect(rollback.error).toBe('second filter decode boom');
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+
+        (reader as any).getBatch = origGetBatch;
+        fakeWebview.deliverFromWebview({
+            type: 'getRows',
+            panelGeneration: gen,
+            requestId: 75,
+            viewportGeneration: 1,
+            start: 0,
+            end: 5,
+            columns: [0],
+        });
+        await flush();
+        const rows = fakeWebview.posted.find(
+            m => m.type === 'rows' && m.requestId === 75,
+        ) as any;
+        expect(rows.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    test('failed newer filter does not roll back to an applied ack the webview ignored', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        const origPostMessage = fakeWebview.postMessage.bind(fakeWebview);
+        fakeWebview.postMessage = ((msg: any) => {
+            const result = origPostMessage(msg);
+            if (msg.type === 'filterApplied' && msg.requestId === 76) {
+                return new Promise<boolean>(() => {});
+            }
+            return result;
+        }) as any;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 76,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+
+        const origGetBatch = (reader as any).getBatch.bind(reader);
+        (reader as any).getBatch = async () => {
+            throw new Error('third filter decode boom');
+        };
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 77,
+            rollbackBaseRequestId: 0,
+            entries: [{
+                id: 'e2',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '<', value: 4 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await flush();
+
+        const rollback = fakeWebview.posted.find(
+            m => m.type === 'filterApplied' && m.requestId === 77,
+        ) as any;
+        expect(rollback).toBeDefined();
+        expect(rollback.filter.entries).toEqual([]);
+        expect(rollback.nrowFiltered).toBe(5);
+        expect(rollback.rollback).toBe(true);
+        expect(rollback.error).toBe('third filter decode boom');
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+
+        (reader as any).getBatch = origGetBatch;
+        fakeWebview.deliverFromWebview({
+            type: 'getRows',
+            panelGeneration: gen,
+            requestId: 78,
+            viewportGeneration: 1,
+            start: 0,
+            end: 5,
+            columns: [0],
+        });
+        await flush();
+        const rows = fakeWebview.posted.find(
+            m => m.type === 'rows' && m.requestId === 78,
+        ) as any;
+        expect(rows.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    test('webview reload suppresses a non-abort error from an aborted interactive filter', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const init = fakeWebview.posted.find(m => m.type === 'init') as any;
+        const gen = init.panelGeneration;
+
+        let firstEntered!: () => void;
+        const firstEnteredPromise = new Promise<void>(resolve => { firstEntered = resolve; });
+        let releaseFirst!: () => void;
+        const releaseFirstPromise = new Promise<void>(resolve => { releaseFirst = resolve; });
+        let firstRead = true;
+        (reader as any).getBatch = async () => {
+            if (firstRead) {
+                firstRead = false;
+                firstEntered();
+                await releaseFirstPromise;
+            }
+            throw new Error('late filter decode boom');
+        };
+
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters',
+            panelGeneration: gen,
+            requestId: 60,
+            entries: [{
+                id: 'e1',
+                columnIndex: 0,
+                predicate: { kind: 'numCompare', op: '>', value: 2 },
+                enabled: true,
+                includeMissing: false,
+            }],
+            labelsOn: true,
+        });
+        await firstEnteredPromise;
+
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        releaseFirst();
+        await flush();
+
+        expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
+        expect(fakeWebview.posted.filter(m => m.type === 'filterApplied' && m.requestId === 60))
+            .toEqual([]);
     });
 
     test('saveFilter persists and restore on panel recreate sends filterApplied(fromPersistence:true)', async () => {

@@ -94,8 +94,10 @@ export async function computePermutation(
     // Materialize the permutation as a plain number[] for sort(), then
     // copy back. Uint32Array.sort exists but lacks the stability guarantee
     // and the comparator signature isn't well-typed.
+    throwIfAborted(signal);
     const idx: number[] = Array.from(perm);
     idx.sort((a, b) => compareRows(a, b, cols, directions));
+    throwIfAborted(signal);
     for (let i = 0; i < nrow; i++) perm[i] = idx[i];
     return perm;
 }
