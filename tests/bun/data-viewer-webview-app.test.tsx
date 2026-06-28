@@ -187,3 +187,50 @@ describe('data viewer App filter persistence', () => {
         }]);
     });
 });
+
+describe('data viewer App restore banner debounce', () => {
+    function restorePendingMessage(restoreId: number) {
+        return {
+            type: 'restorePending' as const,
+            panelGeneration: 1,
+            restoreId,
+            sort: true,
+            filter: true,
+        };
+    }
+
+    test('shows the restore banner after the debounce, then clears it on completion', async () => {
+        await renderApp();
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: restorePendingMessage(1) }));
+        });
+        // Debounced: nothing is shown immediately.
+        expect(document.body.textContent).not.toContain('Skip and show data now');
+
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 350)); });
+        expect(document.body.textContent).toContain('Skip and show data now');
+
+        // The restore completing (replace) clears the banner.
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: { ...initMessage(), type: 'replace' } }));
+        });
+        expect(document.body.textContent).not.toContain('Skip and show data now');
+    });
+
+    test('a restore completing before the debounce never flashes a stale banner', async () => {
+        await renderApp();
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: restorePendingMessage(1) }));
+        });
+        // Completes immediately, before the 200ms debounce elapses.
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: { ...initMessage(), type: 'replace' } }));
+        });
+        // Even after the debounce window passes, the superseded timer must not
+        // surface the banner (clearTimeout plus the restoreId staleness guard).
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 350)); });
+        expect(document.body.textContent).not.toContain('Skip and show data now');
+    });
+});

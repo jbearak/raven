@@ -602,4 +602,30 @@ describe('helpers', () => {
         expect(sortSet).toEqual(['cleared']);
         expect(filterSet).toEqual(['cleared']);
     });
+
+    it('forgetPersistedPrefs still clears the filter when the sort clear rejects (#548 review)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        panel.sortStore.clear = async () => { throw new Error('sort clear boom'); };
+        // Must not reject, and must still attempt the filter clear — otherwise a
+        // cancelled restore would forget only the sort and re-restore the filter.
+        await panel.forgetPersistedPrefs('h');
+        expect(sortSet).toEqual([]);
+        expect(filterSet).toEqual(['cleared']);
+    });
+
+    it('forgetPersistedPrefs still clears the sort when the filter clear rejects (#548 review)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        panel.filterStore.clear = async () => { throw new Error('filter clear boom'); };
+        await panel.forgetPersistedPrefs('h');
+        expect(sortSet).toEqual(['cleared']);
+        expect(filterSet).toEqual([]);
+    });
+
+    it('forgetPersistedPrefs honors the persist-* settings (skips disabled stores)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        panel.settings = { persistSort: false, persistFilters: true, defaultDigits: 3 };
+        await panel.forgetPersistedPrefs('h');
+        expect(sortSet).toEqual([]);
+        expect(filterSet).toEqual(['cleared']);
+    });
 });

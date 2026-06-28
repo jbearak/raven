@@ -737,14 +737,25 @@ export class DataViewerPanel {
         return schemaHash(this.reader.schema.columns);
     }
 
-    /** Forget the persisted sort/filter for this dataset × schema. */
+    /** Forget the persisted sort/filter for this dataset × schema.
+     *
+     *  The two clears are attempted independently via `allSettled`: a
+     *  rejection from one store must not skip the other, or honoring a
+     *  Cancel that had both a saved sort AND filter could durably forget
+     *  only one of them, leaving the survivor to re-trigger a restore on
+     *  the next reload despite the user having already declined it. Writes
+     *  are best-effort — every caller already tolerates a forget that
+     *  cannot be persisted (the UI paint is posted first, so a write
+     *  failure never strands the webview). */
     private async forgetPersistedPrefs(hash: string): Promise<void> {
+        const clears: Promise<void>[] = [];
         if (this.settings.persistSort) {
-            await this.sortStore.clear(this.panelName, hash);
+            clears.push(this.sortStore.clear(this.panelName, hash));
         }
         if (this.settings.persistFilters) {
-            await this.filterStore.clear(this.panelName, hash);
+            clears.push(this.filterStore.clear(this.panelName, hash));
         }
+        await Promise.allSettled(clears);
     }
 
     /** Post a natural-order `replace` from in-memory state at the given

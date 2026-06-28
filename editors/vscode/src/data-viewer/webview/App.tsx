@@ -1161,8 +1161,14 @@ export function App({
                     // showing stale text until the timer fires.
                     setRestorePending(prev => (prev ? info : prev));
                     restoreTimerRef.current = setTimeout(() => {
-                        setRestorePending(info);
                         restoreTimerRef.current = null;
+                        // If the restore finished (init/replace cleared
+                        // restoreIdRef) or a newer restore superseded this one
+                        // between scheduling and firing, this banner is stale.
+                        // clearTimeout cannot cancel an already-queued callback,
+                        // so guard here too rather than flashing a dead banner.
+                        if (restoreIdRef.current !== info.restoreId) return;
+                        setRestorePending(info);
                     }, RESTORE_DEBOUNCE_MS);
                     return;
                 }
