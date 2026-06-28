@@ -1123,6 +1123,11 @@ export class DataViewerPanel {
                 schemaHash: m.schemaHash,
                 keys: m.sort.keys,
             });
+            // Drop a save whose schema is being durably forgotten: an
+            // interactive saveSort issued before a restore-cancel can otherwise
+            // interleave its store write after the forget's clear and resurrect
+            // the pref the user just cancelled (handle() is not serialized).
+            if (this.pendingForgetHashes.has(m.schemaHash)) return;
             if (m.schemaHash && this.settings.persistSort) {
                 if (m.sort.keys.length === 0) {
                     await this.sortStore.clear(this.panelName, m.schemaHash);
@@ -1133,6 +1138,10 @@ export class DataViewerPanel {
             return;
         }
         if (m.type === 'saveFilter') {
+            // See saveSort: drop a save for a schema whose prefs are being
+            // durably forgotten so a stale interactive write cannot resurrect
+            // a cancelled filter.
+            if (this.pendingForgetHashes.has(m.schemaHash)) return;
             if (m.schemaHash && this.settings.persistFilters) {
                 if (m.filter.entries.length === 0) {
                     await this.filterStore.clear(this.panelName, m.schemaHash);

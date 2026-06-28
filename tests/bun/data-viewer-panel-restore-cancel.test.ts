@@ -709,4 +709,31 @@ describe('helpers', () => {
         expect(sortSet).toEqual([]);
         expect(filterSet).toEqual(['cleared']);
     });
+
+    it('drops a saveSort/saveFilter for a schema being forgotten (#548 codex write-race)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        // A late clear-and-forget for schema "h" is in flight.
+        panel.pendingForgetHashes.add('h');
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+        });
+        await panel.handleInner({
+            type: 'saveFilter', panelGeneration: 0, schemaHash: 'h', filter: STORED_FILTER,
+        });
+        // Stale interactive writes must not resurrect the cancelled prefs.
+        expect(sortSet).toEqual([]);
+        expect(filterSet).toEqual([]);
+    });
+
+    it('saves a sort/filter normally when no forget is pending for its schema (control)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+        });
+        await panel.handleInner({
+            type: 'saveFilter', panelGeneration: 0, schemaHash: 'h', filter: STORED_FILTER,
+        });
+        expect(sortSet).toEqual([STORED_SORT]);
+        expect(filterSet).toEqual([STORED_FILTER]);
+    });
 });
