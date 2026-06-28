@@ -61,6 +61,10 @@ export async function computeFilteredIndices(
         await applyEntry(reader, e, ctx, mask, signal);
         if (allZero(mask)) break;
     }
+    // Yield once more before the synchronous compaction tail so a Cancel
+    // queued during the final entry's mask scan is delivered and honored here,
+    // leaving the data unfiltered rather than publishing compacted indices.
+    if (signal) await yieldToEventLoop();
     throwIfAborted(signal);
     return compact(mask);
 }

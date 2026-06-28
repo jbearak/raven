@@ -308,7 +308,7 @@ export class DataViewerPanel {
         // cleanup below and strand the webview, so swallow it (worst case the
         // cancelled pref survives — same as the genuine-error "keep" path).
         if (restoreCancelled && prevSchemaHash !== undefined) {
-            await this.forgetPersistedPrefs(prevSchemaHash).catch(() => undefined);
+            await this.forgetPersistedPrefsGuarded(prevSchemaHash).catch(() => undefined);
         }
         if (this.webviewReady) await this.sendReplace();
         await prevReader.close().catch(() => undefined);
@@ -543,8 +543,9 @@ export class DataViewerPanel {
             if (cancelledBeforePaint) {
                 // Persist the forget only after the paint, so a store-write
                 // failure cannot strand the webview waiting on a message it
-                // never receives.
-                await this.forgetPersistedPrefs(layoutHash);
+                // never receives. Guarded so a concurrent reload's re-read
+                // cannot re-restore these prefs mid-clear.
+                await this.forgetPersistedPrefsGuarded(layoutHash);
                 // Cancel durably honored; clear the intent so it cannot linger
                 // into a later replace()/reload (which would forget again).
                 this.restoreCancelRequested = false;
@@ -774,6 +775,22 @@ export class DataViewerPanel {
             clears.push(this.filterStore.clear(this.panelName, hash));
         }
         await Promise.allSettled(clears);
+    }
+
+    /** {@link forgetPersistedPrefs} wrapped in the {@link pendingForgetHashes}
+     *  guard so a `webviewReady`/`replace()` whose `sendInit`/`sendReplace`
+     *  re-reads the store while this clear is still in flight cannot load and
+     *  re-restore the prefs being forgotten. Used by the lifecycle cancel
+     *  paths (replace, webviewReady, cancel-before-paint), which forget
+     *  outside `clearAndForgetNaturalOrder` (that path manages the marker
+     *  itself because its window also spans a natural-order paint). */
+    private async forgetPersistedPrefsGuarded(hash: string): Promise<void> {
+        this.pendingForgetHashes.add(hash);
+        try {
+            await this.forgetPersistedPrefs(hash);
+        } finally {
+            this.pendingForgetHashes.delete(hash);
+        }
     }
 
     /** Post a natural-order `replace` from in-memory state at the given
@@ -1023,7 +1040,7 @@ export class DataViewerPanel {
                 // Swallow a store-write failure so it cannot skip the sendInit
                 // below and strand the reloaded webview on a permanent
                 // Loading… (worst case the cancelled pref survives the reload).
-                if (cancelled) await this.forgetPersistedPrefs(hash).catch(() => undefined);
+                if (cancelled) await this.forgetPersistedPrefsGuarded(hash).catch(() => undefined);
             }
             this.abortInteractiveTransforms();
             await this.sendInit();
