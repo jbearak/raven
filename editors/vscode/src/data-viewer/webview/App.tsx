@@ -373,6 +373,16 @@ export function App({
     const [restoreCancelling, setRestoreCancelling] = useState(false);
     const restoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const restoreIdRef = useRef<number | null>(null);
+    // The exact filter object the host last sent authoritatively (via
+    // init/replace, or a fromPersistence filterApplied). The debounced
+    // saveFilter effect skips when `filter` is still this object, so the
+    // webview never echoes host-owned state back to the store. This matters
+    // on a genuine restore-filter read failure: the host keeps the saved
+    // filter but sends EMPTY for display; without this guard the webview
+    // would saveFilter(EMPTY) and destroy the very pref the host preserved.
+    // A real user change replaces `filter` with a new object (≠ this ref),
+    // so it still persists normally. (#519)
+    const lastHostFilterRef = useRef<FilterState | null>(null);
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
@@ -592,6 +602,9 @@ export function App({
         setSort(m.sort);
         setSortPending(false);
         setFilter(m.filter);
+        // init/replace carries the host's authoritative filter; don't echo it
+        // back via saveFilter (see lastHostFilterRef).
+        lastHostFilterRef.current = m.filter;
         // Histograms are fetched lazily per column (getHistogram) the first
         // time a numeric filter popover opens — not shipped in init/replace.
         // Drop any cached bins + in-flight request markers whenever the
@@ -716,6 +729,11 @@ export function App({
     const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
         if (m.panelGeneration !== panelGeneration) return;
         setFilter(m.filter);
+        // A restore echo (fromPersistence) is host-owned state already in the
+        // store — suppress its redundant save-back. A user-initiated
+        // filterApplied (fromPersistence false) must still persist, so leave
+        // the ref alone in that case.
+        if (m.fromPersistence) lastHostFilterRef.current = m.filter;
         const activeNrowFiltered = m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined;
         setNrowFiltered(activeNrowFiltered);
         setFilterPending(false);
@@ -1156,6 +1174,12 @@ export function App({
         // and saving it would clobber a host-persisted filter before the
         // restore round-trip completes.
         if (!toolbarBootstrappedRef.current || !schemaHash) return;
+        // Don't echo a host-owned filter back to the store. On a genuine
+        // restore-filter read failure the host keeps the saved filter but
+        // sends EMPTY for display; echoing that would destroy the pref the
+        // host preserved. A real user change replaces `filter` with a new
+        // object, so it still persists. (#519)
+        if (filter === lastHostFilterRef.current) return;
         const id = window.setTimeout(() => {
             vscode.postMessage({
                 type: 'saveFilter',
