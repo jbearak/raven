@@ -86,13 +86,10 @@ async function applyEntry(
     // Yield once more before the synchronous mask scan so a Cancel queued
     // during the acceptor/missing-mask reads is delivered and observed here,
     // leaving the data unfiltered rather than publishing filtered indices.
-    // Only the cancellable restore passes a signal.
-    if (signal) {
-        await yieldToEventLoop();
-        throwIfAborted(signal);
-    } else {
-        throwIfAborted(signal);
-    }
+    // Only the cancellable restore passes a signal; throwIfAborted(undefined)
+    // is a no-op on the interactive path.
+    if (signal) await yieldToEventLoop();
+    throwIfAborted(signal);
     for (let i = 0; i < mask.length; i++) {
         if (mask[i] === 0) continue;
         if (missing[i]) {
