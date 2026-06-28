@@ -52,6 +52,8 @@ side-by-side.
   those appear in a leading `name` column — the same role the `rowname`
   column plays for a matrix. A standalone `factor` / `haven_labelled`
   vector keeps its labels, so the [Labels](#labels) toggle works on it.
+  A **1-D array** (`array(1:3)`) is rendered the same way as a vector;
+  its `dimnames` become the `name` column.
 - **Flat lists** — a list whose elements are all scalars/vectors. Each
   element becomes a column, padded with empty (`NA`) cells to the length
   of the longest element, and each column keeps its own type. Unnamed
@@ -59,14 +61,23 @@ side-by-side.
   scalars therefore render differently — `c(a = 1, b = 2)` is a two-row
   `name`/`values` table, while `list(a = 1, b = 2)` is a one-row,
   two-column table — matching `as.data.frame(list(a = 1, b = 2))`.
-- Other classes — including nested/recursive lists (an element that is
-  itself a list or `data.frame`), `raw` vectors, environments, and
-  functions — raise an error in R:
+- Other objects raise an error in R that explains *why*:
 
   ```r
   > View(sum)
   Error: Can't `View()` an object of class `function`
   ```
+
+  - A **nested/recursive list** (an element that is itself a list or
+    `data.frame`, or otherwise not a plain vector) names the offending
+    element rather than blaming the `list` class, e.g.
+    `` Can't `View()` this list: element `b` has class `list`. Only flat lists (every element a vector) are supported. ``
+    An empty list reports `` Can't `View()` an empty list. ``
+  - An **array with more than two dimensions** (a 3-D+ array or a
+    3-way+ `table`) reports its dimension count:
+    `` Can't `View()` an array with 3 dimensions; the data viewer shows 2-dimensional tables only. ``
+  - `raw` vectors, environments, functions, and other unsupported
+    classes keep the class-based message shown above.
 
 ## Triggering
 

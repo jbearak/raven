@@ -386,10 +386,16 @@ local({
 
         # Type dispatch: matrix and data.frame are tested first (a
         # data.frame is also a list). Then an atomic / factor /
-        # haven_labelled vector — the !is.null(x) guard matters because
-        # is.atomic(NULL) is TRUE on R < 4.4, and !is.raw(x) excludes raw
-        # (no NA for ragged-list padding). Finally a flat list. Anything
-        # else errors with the Positron-style message.
+        # haven_labelled vector OR a 1-D array — the !is.null(x) guard
+        # matters because is.atomic(NULL) is TRUE on R < 4.4; the
+        # length(dim(x)) <= 1L guard admits plain vectors (dim NULL ->
+        # length 0) and 1-D arrays (dim length 1) while excluding the
+        # length-2 dim of a matrix and the length->=3 dim of a higher
+        # array; and !is.raw(x) excludes raw (no NA for ragged-list
+        # padding). Then a list (flat -> rendered; empty or non-flat ->
+        # a content-specific error naming the offending element). Then a
+        # >2-D array (a dimensionality error). Anything else errors with
+        # the Positron-style class message.
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
             if (.raven_meaningful_rownames(x)) {
@@ -399,12 +405,53 @@ local({
             d
         } else if (is.data.frame(x)) {
             x
-        } else if (!is.null(x) && is.null(dim(x)) && !is.raw(x) &&
+        } else if (!is.null(x) && length(dim(x)) <= 1L && !is.raw(x) &&
                    (is.atomic(x) || is.factor(x) || inherits(x, "haven_labelled"))) {
+            if (length(dim(x)) == 1L) {
+                # 1-D array: render it as a vector. Carry dimnames[[1]]
+                # over to names() first, then drop dim (which also drops
+                # dimnames) -- this preserves the underlying type and any
+                # non-dim attributes (factor levels, haven_labelled
+                # labels), unlike as.vector(). unname()/names() in
+                # .raven_vector_to_df otherwise trips over a leftover dim.
+                dn <- dimnames(x)
+                dim(x) <- NULL
+                if (!is.null(dn)) names(x) <- dn[[1L]]
+            }
             .raven_vector_to_df(x)
-        } else if (is.list(x) && length(x) > 0L &&
-                   all(vapply(x, .raven_list_elem_ok, logical(1L)))) {
+        } else if (is.list(x)) {
+            # data.frames are caught above, so this is a non-data.frame
+            # list. A flat list renders; otherwise stop with a reason.
+            if (length(x) == 0L) {
+                stop("Can't \`View()\` an empty list.", call. = FALSE)
+            }
+            ok <- vapply(x, .raven_list_elem_ok, logical(1L))
+            if (!all(ok)) {
+                i <- which(!ok)[[1L]]
+                nm <- names(x)
+                # !is.null(nm) must come first: nm[[i]] errors on a
+                # fully-unnamed list (names() is NULL). A blank, NA, or
+                # backtick-containing name (which would break the
+                # backtick quoting below) falls through to the
+                # unambiguous positional "element <i>".
+                label <- if (!is.null(nm) && !is.na(nm[[i]]) && nzchar(nm[[i]]) &&
+                             !grepl("\`", nm[[i]], fixed = TRUE)) {
+                    paste0("element \`", nm[[i]], "\`")
+                } else {
+                    paste0("element ", i)
+                }
+                stop("Can't \`View()\` this list: ", label, " has class \`",
+                     paste(class(x[[i]]), collapse = "/"),
+                     "\`. Only flat lists (every element a vector) are supported.",
+                     call. = FALSE)
+            }
             .raven_list_to_df(x)
+        } else if (is.array(x) && length(dim(x)) > 2L) {
+            # is.array tests the dim attribute (admits base arrays and
+            # tables, excludes S4 objects whose dim() is only a method).
+            stop("Can't \`View()\` an array with ", length(dim(x)),
+                 " dimensions; the data viewer shows 2-dimensional tables only.",
+                 call. = FALSE)
         } else {
             stop("Can't \`View()\` an object of class \`",
                  paste(class(x), collapse = "/"), "\`", call. = FALSE)
