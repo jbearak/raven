@@ -89,6 +89,7 @@ async function makePanel(opts: {
     panel.histogramAborts = new Set();
     panel.restoreAbort = null;
     panel.restoring = false;
+    panel.restorePainted = false;
     panel.restoreId = -1;
     panel.restoreSeq = 0;
     panel.pendingForgetHashes = new Set();
@@ -646,6 +647,115 @@ describe('sort/filter ignored while restoring', () => {
         expect(posted).toEqual([]);
     });
 
+    it('acks a post-paint sort request as a rollback instead of stranding the pill (#550)', async () => {
+        // After paintWithRestore posts init/replace it sets restorePainted, but
+        // `restoring` stays true until its `finally`. A sort fired in that
+        // window must be reconciled (rolled back to the painted sort) so the
+        // webview's optimistic "Sorting…" pill clears, not dropped silently.
+        const { panel, posted, sortSet } = await makePanel();
+        panel.restoring = true;
+        panel.restorePainted = true;
+        panel.sort = STORED_SORT;
+        panel.permutation = new Uint32Array(5);
+        const genBefore = panel.generation;
+
+        await panel.handleSetSort(
+            { type: 'setSort', panelGeneration: 0, requestId: 7, keys: [{ columnIndex: 1, direction: 'desc' }], labelsOn: true, formatOn: true, digits: 3 },
+            panel.generation,
+        );
+
+        // The interactive request is still declined (no generation/sort change)
+        // but the webview is told to roll back to the painted, authoritative sort.
+        expect(panel.generation).toBe(genBefore);
+        expect(panel.sortGeneration).toBe(0);
+        expect(panel.sort).toEqual(STORED_SORT);
+        expect(posted.length).toBe(1);
+        expect(posted[0]).toMatchObject({
+            type: 'sortApplied', requestId: 7, rollback: true, fromPersistence: false,
+        });
+        expect(posted[0].sort).toEqual(STORED_SORT);
+        // A rollback ack must not persist as a new preference.
+        expect(sortSet).toEqual([]);
+    });
+
+    it('acks a post-paint filter request as a rollback instead of stranding the pill (#550)', async () => {
+        const { panel, posted, filterSet } = await makePanel();
+        panel.restoring = true;
+        panel.restorePainted = true;
+        panel.filter = STORED_FILTER;
+        panel.filteredIndices = new Uint32Array([0, 1, 2]);
+        const genBefore = panel.generation;
+
+        await panel.handleSetFilters(
+            { type: 'setFilters', panelGeneration: 0, requestId: 9, rollbackBaseRequestId: 0, entries: [], labelsOn: true },
+            panel.generation,
+        );
+
+        expect(panel.generation).toBe(genBefore);
+        expect(panel.filterGeneration).toBe(0);
+        expect(panel.filter).toEqual(STORED_FILTER);
+        expect(posted.length).toBe(1);
+        expect(posted[0]).toMatchObject({
+            type: 'filterApplied', requestId: 9, rollback: true, fromPersistence: false,
+        });
+        expect(posted[0].filter).toEqual(STORED_FILTER);
+        expect(posted[0].nrowFiltered).toBe(3);
+        expect(filterSet).toEqual([]);
+    });
+
+    it('still drops a pre-paint sort request silently (restore not yet painted)', async () => {
+        // Before the paint, the imminent init/replace resets the webview's
+        // optimistic pill, so the silent drop is correct (and an ack here would
+        // reference the not-yet-restored in-memory sort).
+        const { panel, posted } = await makePanel();
+        panel.restoring = true;
+        panel.restorePainted = false;
+        const genBefore = panel.generation;
+
+        await panel.handleSetSort(
+            { type: 'setSort', panelGeneration: 0, requestId: 3, keys: [{ columnIndex: 0, direction: 'asc' }], labelsOn: true, formatOn: true, digits: 3 },
+            panel.generation,
+        );
+
+        expect(panel.generation).toBe(genBefore);
+        expect(posted).toEqual([]);
+    });
+
+    it('reconciles an interactive sort fired in the post-paint window (#550)', async () => {
+        // End-to-end through paintWithRestore: the webview unblocks on the
+        // restore's filterApplied and immediately fires an interactive setSort,
+        // which reaches the host while `restoring` is still true.
+        const { panel, posted } = await makePanel({ storedFilter: STORED_FILTER });
+        panel.restoreSort = async () => false;
+        panel.restoreFilter = async () => {
+            panel.filter = STORED_FILTER;
+            panel.filteredIndices = new Uint32Array([0, 1, 2]);
+            return false;
+        };
+        const origPost = panel.webviewPanel.webview.postMessage;
+        let fired = false;
+        panel.webviewPanel.webview.postMessage = (m: any) => {
+            const r = origPost(m);
+            if (!fired && m.type === 'filterApplied') {
+                fired = true;
+                void panel.handleSetSort(
+                    { type: 'setSort', panelGeneration: 0, requestId: 42, keys: [{ columnIndex: 0, direction: 'asc' }], labelsOn: true, formatOn: true, digits: 3 },
+                    panel.generation,
+                );
+            }
+            return r;
+        };
+
+        await panel.sendInit();
+
+        // The stray sort got a rollback ack (its pill clears) rather than silence.
+        const ack = posted.find((m: any) => m.type === 'sortApplied' && m.requestId === 42);
+        expect(ack).toBeDefined();
+        expect(ack.rollback).toBe(true);
+        expect(panel.restoring).toBe(false);
+        expect(panel.restorePainted).toBe(false);
+    });
+
     it('handleSetSort consumes restoreId so a later stale cancel cannot clear it', async () => {
         const { panel, sortSet } = await makePanel();
         panel.restoring = false;
@@ -675,6 +785,21 @@ describe('helpers', () => {
         expect(panel.restoreId).toBe(-1);
         expect(sortSet).toEqual([]);
         expect(filterSet).toEqual([]);
+    });
+
+    it('abortAndClearRestore clears restorePainted alongside restoring (#550)', async () => {
+        // restorePainted is part of the restore-in-flight state; a lifecycle
+        // abort must clear it too so it cannot linger stale into a later send.
+        const { panel } = await makePanel();
+        panel.restoring = true;
+        panel.restorePainted = true;
+        panel.restoreAbort = new AbortController();
+        panel.restoreId = 3;
+        panel.abortAndClearRestore();
+        expect(panel.restoring).toBe(false);
+        expect(panel.restorePainted).toBe(false);
+        expect(panel.restoreAbort).toBeNull();
+        expect(panel.restoreId).toBe(-1);
     });
 
     it('forgetPersistedPrefs clears both stores', async () => {
