@@ -348,10 +348,9 @@ export function App({
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
     const missingRowRequestTimerRef = useRef<number | null>(null);
     // Handle for the 2500ms timer that clears a finished copy's
-    // "Copied"/"Copy failed" toast. Tracked so it can be cancelled when a new
-    // copy starts, a fresh copyDone arrives, or a generation replace clears the
-    // toast — otherwise a stale timer could blank a newer copy's in-flight
-    // "Copying..." toast partway through.
+    // "Copied"/"Copy failed" toast. Cancelled by showCopyToast/clearCopyToast
+    // (the only writers of the shared copy-toast slot) so a stale timer can
+    // never blank a newer toast partway through.
     const copyStatusClearTimerRef = useRef<number | null>(null);
     /** Toolbar wrap measurement refs: when the sort/filter chips can't fit
      *  beside the action buttons, the chip group drops to its own second row
@@ -379,7 +378,8 @@ export function App({
     const [copyStatus, setCopyStatus] = useState<'' | 'copying' | 'copied' | 'error'>('');
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
     // Mirrors copyStatus for synchronous reads inside callbacks (e.g.
-    // applyInitOrReplace) without taking copyStatus as a dependency.
+    // applyInitOrReplace) without taking copyStatus as a dependency. Kept in
+    // sync by showCopyToast/clearCopyToast, the only writers of the slot.
     const copyStatusRef = useRef<'' | 'copying' | 'copied' | 'error'>('');
     const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
     const [sortPending, setSortPending] = useState(false);
@@ -642,9 +642,29 @@ export function App({
         }
     }, []);
 
-    useEffect(() => {
-        copyStatusRef.current = copyStatus;
-    }, [copyStatus]);
+    // The copy-toast slot (copyStatus + copyStatusMsg) is shared by copy
+    // progress/result AND sort/filter/host error toasts. Route every write
+    // through these two helpers so the slot is correct by construction: each
+    // cancels the pending auto-clear timer (so a newer toast is never blanked by
+    // the prior toast's timer) and keeps copyStatusRef in sync synchronously
+    // (so callbacks that read it — e.g. applyInitOrReplace — never see a stale
+    // value). copyStatusRef mirrors copyStatus for those synchronous reads.
+    const showCopyToast = useCallback((
+        status: 'copying' | 'copied' | 'error',
+        msg: string,
+    ) => {
+        cancelCopyStatusClear();
+        copyStatusRef.current = status;
+        setCopyStatus(status);
+        setCopyStatusMsg(msg);
+    }, [cancelCopyStatusClear]);
+
+    const clearCopyToast = useCallback(() => {
+        cancelCopyStatusClear();
+        copyStatusRef.current = '';
+        setCopyStatus('');
+        setCopyStatusMsg('');
+    }, [cancelCopyStatusClear]);
 
     const applyInitOrReplace = useCallback((m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>) => {
         const sameDataset = m.nrow === nrow
@@ -701,8 +721,7 @@ export function App({
         // they self-clear via their own timer or are stale-but-harmless, and
         // wiping them here would swallow a just-shown sort/filter/copy result.
         if (copyStatusRef.current === 'copying') {
-            setCopyStatus('');
-            setCopyStatusMsg('');
+            clearCopyToast();
         }
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
         postLifecycle(
@@ -712,7 +731,7 @@ export function App({
             m.panelGeneration,
         );
         window.setTimeout(() => gridRef.current?.scrollTo(0, 0, 'both'), 0);
-    }, [clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
+    }, [clearCopyToast, clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
 
     const applyRows = useCallback((m: Extract<ExtensionToWebview, { type: 'rows' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -796,11 +815,7 @@ export function App({
             ));
         }
         if (m.error) {
-            // The error reuses the shared copy-toast slot; cancel any pending
-            // copy auto-clear timer so it can't blank this error mid-read.
-            cancelCopyStatusClear();
-            setCopyStatus('error');
-            setCopyStatusMsg(m.error);
+            showCopyToast('error', m.error);
         }
         // Persist the latest sort. Cleared (empty keys) saves are also
         // valid — the host treats an empty SortState as a clear. Rollbacks
@@ -814,9 +829,9 @@ export function App({
             });
         }
     }, [
-        cancelCopyStatusClear,
         clearRows,
         effectiveNrow,
+        showCopyToast,
         requestRows,
         schemaHash,
         visibleCols.length,
@@ -845,11 +860,7 @@ export function App({
         acceptedFilterRequestIdRef.current = m.requestId;
         setPendingFilterIntent(null);
         if (m.error) {
-            // Shares the copy-toast slot; cancel any pending copy auto-clear
-            // timer so it can't blank this error mid-read.
-            cancelCopyStatusClear();
-            setCopyStatus('error');
-            setCopyStatusMsg(m.error);
+            showCopyToast('error', m.error);
         }
         setFilter(m.filter);
         // Host-owned state and rollback recovery are not new user
@@ -889,9 +900,9 @@ export function App({
             ));
         }
     }, [
-        cancelCopyStatusClear,
         clearRows,
         nrow,
+        showCopyToast,
         requestRows,
         schemaHash,
         visibleCols.length,
@@ -1027,15 +1038,14 @@ export function App({
 
     const applyCopyDone = useCallback((m: Extract<ExtensionToWebview, { type: 'copyDone' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
-        cancelCopyStatusClear();
-        setCopyStatus(m.ok ? 'copied' : 'error');
-        setCopyStatusMsg(m.ok ? 'Copied' : (m.error ?? 'Copy failed'));
+        showCopyToast(m.ok ? 'copied' : 'error', m.ok ? 'Copied' : (m.error ?? 'Copy failed'));
         copyStatusClearTimerRef.current = window.setTimeout(() => {
             copyStatusClearTimerRef.current = null;
+            copyStatusRef.current = '';
             setCopyStatus('');
             setCopyStatusMsg('');
         }, 2500);
-    }, [cancelCopyStatusClear]);
+    }, [showCopyToast]);
 
     const estimatedViewportRowCount = useCallback((): number => {
         const current = visibleRange.end - visibleRange.start;
@@ -1274,11 +1284,7 @@ export function App({
                     scrollToFraction(m.fraction);
                     return;
                 case 'error':
-                    // Shares the copy-toast slot; cancel any pending copy
-                    // auto-clear timer so it can't blank this error mid-read.
-                    cancelCopyStatusClear();
-                    setCopyStatus('error');
-                    setCopyStatusMsg(m.message);
+                    showCopyToast('error', m.message);
                     return;
             }
         };
@@ -1294,10 +1300,10 @@ export function App({
         applyRows,
         applySortApplied,
         applySortStatus,
-        cancelCopyStatusClear,
         handleTestKey,
         panelGeneration,
         scrollToFraction,
+        showCopyToast,
         vscode,
     ]);
 
@@ -1483,11 +1489,7 @@ export function App({
 
         if (rowEnd <= rowStart || colIndices.length === 0) return;
         const requestId = nextRequestId();
-        // A finished prior copy may still have its 2500ms clear timer pending;
-        // cancel it so it can't blank this new "Copying..." toast mid-flight.
-        cancelCopyStatusClear();
-        setCopyStatus('copying');
-        setCopyStatusMsg('Copying...');
+        showCopyToast('copying', 'Copying...');
         vscode.postMessage({
             type: 'copy',
             panelGeneration,
@@ -1498,7 +1500,7 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
         });
-    }, [cancelCopyStatusClear, effectiveNrow, gridSelection, nextRequestId, panelGeneration, toolbar, visibleCols, vscode]);
+    }, [effectiveNrow, gridSelection, nextRequestId, panelGeneration, showCopyToast, toolbar, visibleCols, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
