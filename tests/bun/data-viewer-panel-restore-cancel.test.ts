@@ -994,11 +994,15 @@ describe('helpers', () => {
         expect(filterSet).toEqual([]);
     });
 
-    it('drops a saveSort with an empty schemaHash (#552 gating)', async () => {
-        const { panel, sortSet } = await makePanel();
+    it('drops a saveSort/saveFilter with an empty schemaHash (#552 gating)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
         await panel.handleInner({
             type: 'saveSort', panelGeneration: 0, schemaHash: '', sort: STORED_SORT,
         });
+        await panel.handleInner({
+            type: 'saveFilter', panelGeneration: 0, schemaHash: '', filter: STORED_FILTER,
+        });
         expect(sortSet).toEqual([]);
+        expect(filterSet).toEqual([]);
     });
 });
