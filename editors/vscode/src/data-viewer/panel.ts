@@ -146,6 +146,15 @@ export class DataViewerPanel {
      *  in-flight vs. already-completed cancel paths and makes interactive
      *  setSort/setFilters no-op so a generation bump can't strand it. */
     private restoring = false;
+    /** True once a restore in flight has posted its paint-enabling
+     *  init/replace (so the webview can unblock and fire interactive
+     *  sort/filter) but has not yet cleared {@link restoring} in
+     *  `paintWithRestore`'s `finally`. In that window `handleSetSort` /
+     *  `handleSetFilters` reconcile a dropped interactive request with a
+     *  rollback ack instead of stranding its optimistic pill, whereas a
+     *  pre-paint request is still dropped silently (the imminent paint
+     *  resets the pill). See #550. */
+    private restorePainted = false;
     /** Monotonic id of the active restore (-1 ⇔ none). The
      *  restorePending/cancelRestore handshake key. Kept distinct from
      *  `generation`, which invalidates stale webview messages across reloads
@@ -540,6 +549,13 @@ export class DataViewerPanel {
                 return false;
             }
 
+            // The paint-enabling init/replace is now posted, so the webview can
+            // unblock and fire an interactive sort/filter before this restore's
+            // `finally` clears `restoring`. From here on, handleSetSort/
+            // handleSetFilters reconcile such a request with a rollback ack
+            // rather than dropping it silently and stranding its pill (#550).
+            this.restorePainted = true;
+
             if (cancelledBeforePaint) {
                 // Persist the forget only after the paint, so a store-write
                 // failure cannot strand the webview waiting on a message it
@@ -598,6 +614,7 @@ export class DataViewerPanel {
             // only if a concurrent refresh hasn't swapped in a newer one.
             if (began && this.restoreAbort === myAbort) {
                 this.restoring = false;
+                this.restorePainted = false;
                 this.restoreAbort = null;
             }
         }
@@ -680,6 +697,7 @@ export class DataViewerPanel {
         this.restoreAbort = new AbortController();
         this.restoreId = ++this.restoreSeq;
         this.restoring = true;
+        this.restorePainted = false;
         this.restoreCancelRequested = false;
         // Fire-and-forget so the (potentially long) column reads start at
         // once; ordering before init/replace is preserved by the transport's
@@ -730,6 +748,7 @@ export class DataViewerPanel {
         this.restoreAbort?.abort();
         this.restoreAbort = null;
         this.restoring = false;
+        this.restorePainted = false;
         this.restoreId = -1;
         this.restoreCancelRequested = false;
     }
@@ -1329,7 +1348,28 @@ export class DataViewerPanel {
         // flight: a generation bump here would make the restore discard its
         // result without posting init/replace, stranding the panel. The
         // restore posts authoritative state momentarily.
-        if (this.restoring) return;
+        if (this.restoring) {
+            // Once the restore has painted (init/replace posted) but before its
+            // `finally` clears `restoring`, the webview can unblock and fire
+            // this request. Dropping it silently strands the optimistic
+            // "Sorting…" pill, so roll the webview back to the painted,
+            // authoritative sort instead (rollback ⇒ not re-persisted). A
+            // pre-paint request needs no ack — the imminent paint resets the
+            // pill. See #550.
+            if (this.restorePainted) {
+                const ack: ExtensionToWebview = {
+                    type: 'sortApplied',
+                    panelGeneration: gen,
+                    requestId: m.requestId,
+                    sort: cloneSortState(this.sort),
+                    fromPersistence: false,
+                    rollback: true,
+                };
+                void this.webviewPanel.webview.postMessage(ack)
+                    .then(undefined, () => undefined);
+            }
+            return;
+        }
         // The user is superseding the restored prefs, so the restore
         // handshake is over — a delayed cancelRestore with the old id must
         // not reach the clear-and-forget branch and wipe this.
@@ -1481,8 +1521,28 @@ export class DataViewerPanel {
         gen: number,
     ): Promise<void> {
         // Ignore interactive filter while a restore is in flight (see
-        // handleSetSort), then consume the handshake when superseding.
-        if (this.restoring) return;
+        // handleSetSort), then consume the handshake when superseding. Once the
+        // restore has painted, roll the webview back to the painted filter so a
+        // request fired in the pre-`finally` window clears its "Filtering…"
+        // pill rather than stranding it (rollback ⇒ not re-persisted; #550).
+        if (this.restoring) {
+            if (this.restorePainted) {
+                const ack: ExtensionToWebview = {
+                    type: 'filterApplied',
+                    panelGeneration: gen,
+                    requestId: m.requestId,
+                    filter: cloneFilterState(this.filter),
+                    nrowFiltered: this.filteredIndices
+                        ? this.filteredIndices.length
+                        : this.reader.nrow,
+                    fromPersistence: false,
+                    rollback: true,
+                };
+                void this.webviewPanel.webview.postMessage(ack)
+                    .then(undefined, () => undefined);
+            }
+            return;
+        }
         this.consumeRestoreHandshake();
 
         this.filterGeneration += 1;
