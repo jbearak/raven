@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, jest, test } from 'bun:test';
 import { JSDOM } from 'jsdom';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -221,28 +221,83 @@ describe('data viewer App copy status', () => {
     test('a stale copy-complete timer does not blank a newer copy in-flight toast', async () => {
         await renderApp();
 
-        // Copy A completes in gen 1 → "Copied" toast plus a 2.5s clear timer.
+        // Fake timers from here so the 2.5s clear timer armed by copyDone can be
+        // advanced synchronously rather than slept on.
+        jest.useFakeTimers();
+        try {
+            // Copy A completes in gen 1 → "Copied" toast plus a 2.5s clear timer.
+            await act(async () => {
+                window.dispatchEvent(new MessageEvent('message', {
+                    data: { type: 'copyDone', panelGeneration: 1, requestId: 0, ok: true },
+                }));
+            });
+            expect(document.body.textContent).toContain('Copied');
+
+            // A replace bumps the generation, then a fresh copy B starts in gen 2.
+            await act(async () => {
+                window.dispatchEvent(new MessageEvent('message', {
+                    data: { ...initMessage(), type: 'replace', panelGeneration: 2 },
+                }));
+            });
+            await act(async () => { dispatchKey('a'); });
+            await act(async () => { dispatchKey('c'); });
+            expect(document.body.textContent).toContain('Copying...');
+
+            // Copy A's stale 2.5s clear timer must have been cancelled; if it
+            // fires it would blank copy B's still-in-flight "Copying..." toast.
+            await act(async () => { jest.advanceTimersByTime(2600); });
+            expect(document.body.textContent).toContain('Copying...');
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    test('a pending copy-clear timer does not blank a later error toast', async () => {
+        await renderApp();
+
+        jest.useFakeTimers();
+        try {
+            // A successful copy arms the 2.5s clear timer.
+            await act(async () => {
+                window.dispatchEvent(new MessageEvent('message', {
+                    data: { type: 'copyDone', panelGeneration: 1, requestId: 0, ok: true },
+                }));
+            });
+            // Within that window a host error reuses the shared toast slot.
+            await act(async () => {
+                window.dispatchEvent(new MessageEvent('message', {
+                    data: { type: 'error', message: 'Boom' },
+                }));
+            });
+            expect(document.body.textContent).toContain('Boom');
+
+            // The copy's stale clear timer must not fire and blank the error.
+            await act(async () => { jest.advanceTimersByTime(2600); });
+            expect(document.body.textContent).toContain('Boom');
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    test('a same-shape replace does not wipe a freshly-shown error toast', async () => {
+        await renderApp();
+
+        // A host error shows in the shared toast slot.
         await act(async () => {
             window.dispatchEvent(new MessageEvent('message', {
-                data: { type: 'copyDone', panelGeneration: 1, requestId: 0, ok: true },
+                data: { type: 'error', message: 'Boom' },
             }));
         });
-        expect(document.body.textContent).toContain('Copied');
+        expect(document.body.textContent).toContain('Boom');
 
-        // A replace bumps the generation, then a fresh copy B starts in gen 2.
+        // A replace that is not superseding an in-flight copy must leave the
+        // error toast in place (only an orphaned "Copying..." is cleared).
         await act(async () => {
             window.dispatchEvent(new MessageEvent('message', {
                 data: { ...initMessage(), type: 'replace', panelGeneration: 2 },
             }));
         });
-        await act(async () => { dispatchKey('a'); });
-        await act(async () => { dispatchKey('c'); });
-        expect(document.body.textContent).toContain('Copying...');
-
-        // Copy A's stale 2.5s clear timer must have been cancelled; if it fires
-        // it would blank copy B's still-in-flight "Copying..." toast.
-        await act(async () => { await new Promise(resolve => setTimeout(resolve, 2600)); });
-        expect(document.body.textContent).toContain('Copying...');
+        expect(document.body.textContent).toContain('Boom');
     });
 });
 

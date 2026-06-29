@@ -378,6 +378,9 @@ export function App({
     const [headerTooltip, setHeaderTooltip] = useState<HeaderTooltipState | null>(null);
     const [copyStatus, setCopyStatus] = useState<'' | 'copying' | 'copied' | 'error'>('');
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
+    // Mirrors copyStatus for synchronous reads inside callbacks (e.g.
+    // applyInitOrReplace) without taking copyStatus as a dependency.
+    const copyStatusRef = useRef<'' | 'copying' | 'copied' | 'error'>('');
     const [sort, setSort] = useState<SortState>(restored?.sort ?? EMPTY_SORT);
     const [sortPending, setSortPending] = useState(false);
     const [filter, setFilter] = useState<FilterState>(restored?.filter ?? EMPTY_FILTER);
@@ -639,6 +642,10 @@ export function App({
         }
     }, []);
 
+    useEffect(() => {
+        copyStatusRef.current = copyStatus;
+    }, [copyStatus]);
+
     const applyInitOrReplace = useCallback((m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>) => {
         const sameDataset = m.nrow === nrow
             && sameColumns(m.columns, columns);
@@ -685,17 +692,18 @@ export function App({
         clearRows();
         setResolvedLabels({});
         setGridSelection(createEmptySelection());
-        // Clear any outstanding copy status: a copy in flight belongs to the
-        // prior generation, and the host's stale `copyDone` carries that old
-        // generation, so it is dropped by the generation guard in the message
-        // handler (and by applyCopyDone) before it can clear the toast. Reset
-        // here so a replace/init that supersedes an in-progress copy doesn't
-        // leave a stuck "Copying..." toast. A fresh copy in the new generation
-        // re-sets this; the stale `copyDone` stays dropped and cannot clobber
-        // it.
-        cancelCopyStatusClear();
-        setCopyStatus('');
-        setCopyStatusMsg('');
+        // Clear only an orphaned in-flight copy: a "copying" toast whose
+        // copyDone will never arrive because this replace/init bumped the
+        // generation. The host does post a stale copyDone, but it carries the
+        // old generation and is dropped by the generation guard in the message
+        // handler (and by applyCopyDone), so without this the "Copying..." toast
+        // would stay stuck. Terminal "copied"/"error" toasts are left alone:
+        // they self-clear via their own timer or are stale-but-harmless, and
+        // wiping them here would swallow a just-shown sort/filter/copy result.
+        if (copyStatusRef.current === 'copying') {
+            setCopyStatus('');
+            setCopyStatusMsg('');
+        }
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
         postLifecycle(
             m.type,
@@ -704,7 +712,7 @@ export function App({
             m.panelGeneration,
         );
         window.setTimeout(() => gridRef.current?.scrollTo(0, 0, 'both'), 0);
-    }, [cancelCopyStatusClear, clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
+    }, [clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
 
     const applyRows = useCallback((m: Extract<ExtensionToWebview, { type: 'rows' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -788,6 +796,9 @@ export function App({
             ));
         }
         if (m.error) {
+            // The error reuses the shared copy-toast slot; cancel any pending
+            // copy auto-clear timer so it can't blank this error mid-read.
+            cancelCopyStatusClear();
             setCopyStatus('error');
             setCopyStatusMsg(m.error);
         }
@@ -803,6 +814,7 @@ export function App({
             });
         }
     }, [
+        cancelCopyStatusClear,
         clearRows,
         effectiveNrow,
         requestRows,
@@ -833,6 +845,9 @@ export function App({
         acceptedFilterRequestIdRef.current = m.requestId;
         setPendingFilterIntent(null);
         if (m.error) {
+            // Shares the copy-toast slot; cancel any pending copy auto-clear
+            // timer so it can't blank this error mid-read.
+            cancelCopyStatusClear();
             setCopyStatus('error');
             setCopyStatusMsg(m.error);
         }
@@ -874,6 +889,7 @@ export function App({
             ));
         }
     }, [
+        cancelCopyStatusClear,
         clearRows,
         nrow,
         requestRows,
@@ -1258,6 +1274,9 @@ export function App({
                     scrollToFraction(m.fraction);
                     return;
                 case 'error':
+                    // Shares the copy-toast slot; cancel any pending copy
+                    // auto-clear timer so it can't blank this error mid-read.
+                    cancelCopyStatusClear();
                     setCopyStatus('error');
                     setCopyStatusMsg(m.message);
                     return;
@@ -1275,6 +1294,7 @@ export function App({
         applyRows,
         applySortApplied,
         applySortStatus,
+        cancelCopyStatusClear,
         handleTestKey,
         panelGeneration,
         scrollToFraction,
