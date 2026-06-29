@@ -217,6 +217,33 @@ describe('data viewer App copy status', () => {
         });
         expect(document.body.textContent).not.toContain('Copying...');
     });
+
+    test('a stale copy-complete timer does not blank a newer copy in-flight toast', async () => {
+        await renderApp();
+
+        // Copy A completes in gen 1 → "Copied" toast plus a 2.5s clear timer.
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', {
+                data: { type: 'copyDone', panelGeneration: 1, requestId: 0, ok: true },
+            }));
+        });
+        expect(document.body.textContent).toContain('Copied');
+
+        // A replace bumps the generation, then a fresh copy B starts in gen 2.
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', {
+                data: { ...initMessage(), type: 'replace', panelGeneration: 2 },
+            }));
+        });
+        await act(async () => { dispatchKey('a'); });
+        await act(async () => { dispatchKey('c'); });
+        expect(document.body.textContent).toContain('Copying...');
+
+        // Copy A's stale 2.5s clear timer must have been cancelled; if it fires
+        // it would blank copy B's still-in-flight "Copying..." toast.
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 2600)); });
+        expect(document.body.textContent).toContain('Copying...');
+    });
 });
 
 describe('data viewer App restore banner debounce', () => {

@@ -347,6 +347,12 @@ export function App({
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
     const missingRowRequestTimerRef = useRef<number | null>(null);
+    // Handle for the 2500ms timer that clears a finished copy's
+    // "Copied"/"Copy failed" toast. Tracked so it can be cancelled when a new
+    // copy starts, a fresh copyDone arrives, or a generation replace clears the
+    // toast — otherwise a stale timer could blank a newer copy's in-flight
+    // "Copying..." toast partway through.
+    const copyStatusClearTimerRef = useRef<number | null>(null);
     /** Toolbar wrap measurement refs: when the sort/filter chips can't fit
      *  beside the action buttons, the chip group drops to its own second row
      *  via `.toolbar.is-wrapped`. See `useToolbarWrap` for the policy. */
@@ -621,6 +627,16 @@ export function App({
         if (missingRowRequestTimerRef.current !== null) {
             window.clearTimeout(missingRowRequestTimerRef.current);
         }
+        if (copyStatusClearTimerRef.current !== null) {
+            window.clearTimeout(copyStatusClearTimerRef.current);
+        }
+    }, []);
+
+    const cancelCopyStatusClear = useCallback(() => {
+        if (copyStatusClearTimerRef.current !== null) {
+            window.clearTimeout(copyStatusClearTimerRef.current);
+            copyStatusClearTimerRef.current = null;
+        }
     }, []);
 
     const applyInitOrReplace = useCallback((m: Extract<ExtensionToWebview, { type: 'init' | 'replace' }>) => {
@@ -677,6 +693,7 @@ export function App({
         // leave a stuck "Copying..." toast. A fresh copy in the new generation
         // re-sets this; the stale `copyDone` stays dropped and cannot clobber
         // it.
+        cancelCopyStatusClear();
         setCopyStatus('');
         setCopyStatusMsg('');
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
@@ -687,7 +704,7 @@ export function App({
             m.panelGeneration,
         );
         window.setTimeout(() => gridRef.current?.scrollTo(0, 0, 'both'), 0);
-    }, [clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
+    }, [cancelCopyStatusClear, clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
 
     const applyRows = useCallback((m: Extract<ExtensionToWebview, { type: 'rows' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -994,13 +1011,15 @@ export function App({
 
     const applyCopyDone = useCallback((m: Extract<ExtensionToWebview, { type: 'copyDone' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
+        cancelCopyStatusClear();
         setCopyStatus(m.ok ? 'copied' : 'error');
         setCopyStatusMsg(m.ok ? 'Copied' : (m.error ?? 'Copy failed'));
-        window.setTimeout(() => {
+        copyStatusClearTimerRef.current = window.setTimeout(() => {
+            copyStatusClearTimerRef.current = null;
             setCopyStatus('');
             setCopyStatusMsg('');
         }, 2500);
-    }, []);
+    }, [cancelCopyStatusClear]);
 
     const estimatedViewportRowCount = useCallback((): number => {
         const current = visibleRange.end - visibleRange.start;
@@ -1444,6 +1463,9 @@ export function App({
 
         if (rowEnd <= rowStart || colIndices.length === 0) return;
         const requestId = nextRequestId();
+        // A finished prior copy may still have its 2500ms clear timer pending;
+        // cancel it so it can't blank this new "Copying..." toast mid-flight.
+        cancelCopyStatusClear();
         setCopyStatus('copying');
         setCopyStatusMsg('Copying...');
         vscode.postMessage({
@@ -1456,7 +1478,7 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
         });
-    }, [effectiveNrow, gridSelection, nextRequestId, panelGeneration, toolbar, visibleCols, vscode]);
+    }, [cancelCopyStatusClear, effectiveNrow, gridSelection, nextRequestId, panelGeneration, toolbar, visibleCols, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
