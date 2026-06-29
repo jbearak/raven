@@ -176,6 +176,23 @@ export class DataViewerPanel {
      *  A `Set` (not a single hash) so overlapping forgets for two different
      *  schemas cannot clobber each other's suppression. */
     private readonly pendingForgetHashes = new Set<string>();
+    /** schemaHash → highest panel generation at which that schema's persisted
+     *  sort/filter were forgotten. A `saveSort`/`saveFilter` whose issuing
+     *  `panelGeneration` is below this epoch is a stale pre-forget write and is
+     *  dropped, so a restore-cancel cannot be resurrected by a late or racing
+     *  save (#552). Durable (never deleted) and monotonic — unlike
+     *  {@link pendingForgetHashes}, which is transient and guards the restore
+     *  *read* path during the clear window. The write-path guard moved here
+     *  because the marker could neither suppress a save landing after it was
+     *  deleted nor distinguish a stale save from a fresh post-cancel one.
+     *
+     *  Not pruned: an entry must outlive every late/debounced save for its
+     *  schema, and a save for a no-longer-current schema can still arrive after
+     *  a `replace()`, so pruning on dataset swap could reopen the resurrection
+     *  window. Growth is bounded by the number of distinct schemas the panel
+     *  ever forgets (one small number per schema) — negligible in practice —
+     *  and the whole map is reclaimed when the panel is disposed. */
+    private readonly lastForgetGen = new Map<string, number>();
     /** Active toolbar last shipped to the webview, captured so the late
      *  clear-and-forget can rebuild a `replace` without re-loading the
      *  store. */
@@ -190,6 +207,15 @@ export class DataViewerPanel {
      *  later transform observe a partially-aborted earlier one. Interactive
      *  sort/filter still post their pending status before entering the queue. */
     private transformChain: Promise<void> = Promise.resolve();
+    /** FIFO chain serializing every sort/filter persisted-pref mutation (save
+     *  AND clear). `onDidReceiveMessage` dispatches handlers without awaiting, so
+     *  a `saveSort`/`saveFilter` and a restore-cancel's forget can be in flight
+     *  at once; routing both through one chain makes the {@link lastForgetGen}
+     *  epoch check atomic with the write (no stale save lands after a clear and
+     *  resurrects a cancelled pref) and lets a forget enqueue its clear ahead of
+     *  any fresh post-paint save (#552). Distinct from {@link transformChain}
+     *  (column scans) — store writes must not wait on long column reads. */
+    private prefStoreChain: Promise<void> = Promise.resolve();
     /** Abort controller for the active or queued interactive sort. A newer
      *  sort supersedes it; filters do not, because sort+filter compose. */
     private sortAbort: AbortController | null = null;
@@ -421,20 +447,36 @@ export class DataViewerPanel {
         this.filterSnapshots = new Map([[0, this.currentFilterSnapshot()]]);
     }
 
+    /** Append `fn` to a FIFO promise chain: it runs after the prior op
+     *  regardless of that op's outcome (a rejection on the consumed side is
+     *  swallowed), and the chain tail is replaced with a rejection-isolated
+     *  follow-on so this op's failure cannot stall later callers. `read`/`write`
+     *  access the specific chain field. Shared by {@link enqueue},
+     *  {@link enqueueTransform}, and {@link enqueuePrefMutation}. */
+    private enqueueSerial<T>(
+        read: () => Promise<void>,
+        write: (tail: Promise<void>) => void,
+        fn: () => Promise<T>,
+    ): Promise<T> {
+        const next = read().catch(() => {}).then(fn);
+        write(next.then(() => {}, () => {}));
+        return next;
+    }
+
     // sendInit / sendReplace are serialized through `sendChain` so two
     // restores never overlap. The chain wraps only these public entry
     // points; internal delegation (an uninitialized replace) calls the
     // *impl* directly so it never awaits a job queued behind itself.
     private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-        const next = this.sendChain.catch(() => {}).then(fn);
-        this.sendChain = next.then(() => {}, () => {});
-        return next;
+        return this.enqueueSerial(
+            () => this.sendChain, (tail) => { this.sendChain = tail; }, fn,
+        );
     }
 
     private enqueueTransform<T>(fn: () => Promise<T>): Promise<T> {
-        const next = this.transformChain.catch(() => {}).then(fn);
-        this.transformChain = next.then(() => {}, () => {});
-        return next;
+        return this.enqueueSerial(
+            () => this.transformChain, (tail) => { this.transformChain = tail; }, fn,
+        );
     }
 
     private sendInit(): Promise<boolean> {
@@ -561,6 +603,19 @@ export class DataViewerPanel {
                 // failure cannot strand the webview waiting on a message it
                 // never receives. Guarded so a concurrent reload's re-read
                 // cannot re-restore these prefs mid-clear.
+                //
+                // Unlike clearAndForgetNaturalOrder, this path forgets AFTER the
+                // paint and does NOT bump `generation`, yet it needs no
+                // enqueue-before-paint ordering: no save can race it. A
+                // saveSort/saveFilter at this paint's `generation` requires the
+                // webview to already hold that generation, which it only learns
+                // from THIS paint (it was on the prior generation before).
+                // Pre-paint saves therefore carry an older generation and are
+                // dropped by the epoch; and from this paint until the `finally`
+                // clears `restoring`, an interactive sort/filter is rolled back
+                // (handleSetSort/handleSetFilters, restoring branch), and the
+                // webview never persists a rollback ack (App.tsx). So the forget
+                // here only ever clears a store with no concurrent writer.
                 await this.forgetPersistedPrefsGuarded(layoutHash);
                 // Cancel durably honored; clear the intent so it cannot linger
                 // into a later replace()/reload (which would forget again).
@@ -786,14 +841,70 @@ export class DataViewerPanel {
      *  cannot be persisted (the UI paint is posted first, so a write
      *  failure never strands the webview). */
     private async forgetPersistedPrefs(hash: string): Promise<void> {
-        const clears: Promise<void>[] = [];
-        if (this.settings.persistSort) {
-            clears.push(this.sortStore.clear(this.panelName, hash));
-        }
-        if (this.settings.persistFilters) {
-            clears.push(this.filterStore.clear(this.panelName, hash));
-        }
-        await Promise.allSettled(clears);
+        // Record the forget epoch synchronously, BEFORE enqueuing the clear, so a
+        // racing save's in-chain check (see enqueuePrefMutation) observes it and a
+        // stale pre-forget save cannot resurrect the cancelled pref (#552). The
+        // epoch is the panel's current (post-bump, where a bump applies)
+        // generation; saves issued from the pre-forget view carry a strictly
+        // older generation and are dropped, saves issued after the webview adopts
+        // the post-forget paint carry this generation or newer and are kept.
+        // `Math.max` keeps the entry a non-decreasing high-water mark: `generation`
+        // only ever increases, so this equals `this.generation` today, but the max
+        // makes the epoch independent of call order rather than assuming it.
+        this.lastForgetGen.set(
+            hash,
+            Math.max(this.lastForgetGen.get(hash) ?? -1, this.generation),
+        );
+        await this.enqueuePrefMutation(async () => {
+            const clears: Promise<void>[] = [];
+            if (this.settings.persistSort) {
+                clears.push(this.sortStore.clear(this.panelName, hash));
+            }
+            if (this.settings.persistFilters) {
+                clears.push(this.filterStore.clear(this.panelName, hash));
+            }
+            await Promise.allSettled(clears);
+        });
+    }
+
+    /** Append a sort/filter persisted-pref mutation (save or clear) to
+     *  {@link prefStoreChain}, serializing it against every other such mutation
+     *  so the {@link lastForgetGen} epoch check is atomic with the write (#552). */
+    private enqueuePrefMutation(op: () => Promise<void>): Promise<void> {
+        return this.enqueueSerial(
+            () => this.prefStoreChain, (tail) => { this.prefStoreChain = tail; }, op,
+        );
+    }
+
+    /** Whether a `saveSort`/`saveFilter` is a stale pre-forget write for its
+     *  schema — its issuing `panelGeneration` predates the schema's recorded
+     *  forget epoch ({@link lastForgetGen}). Such a save would resurrect a
+     *  cancelled pref and is dropped; a save at or above the epoch is a fresh
+     *  post-cancel pref and is kept (#552). Single source of truth for the
+     *  comparison so the fast-path and in-chain re-checks cannot drift. */
+    private isStalePreForgetSave(panelGeneration: number, schemaHash: string): boolean {
+        return panelGeneration < (this.lastForgetGen.get(schemaHash) ?? -1);
+    }
+
+    /** Persist (or clear) a sort/filter pref through the serialized chain,
+     *  dropping a stale pre-forget save. Shared by the `saveSort`/`saveFilter`
+     *  handlers; `mutate` performs the store-specific write. The epoch is
+     *  re-checked inside the chained op so the decision is atomic with the
+     *  write — a forget recorded after the fast-path but before this op runs
+     *  still drops it (#552). */
+    private persistPrefMutation(
+        schemaHash: string,
+        panelGeneration: number,
+        enabled: boolean,
+        mutate: () => Promise<void>,
+    ): Promise<void> {
+        // Fast-path drop (the in-chain re-check below is authoritative).
+        if (this.isStalePreForgetSave(panelGeneration, schemaHash)) return Promise.resolve();
+        if (!schemaHash || !enabled) return Promise.resolve();
+        return this.enqueuePrefMutation(async () => {
+            if (this.isStalePreForgetSave(panelGeneration, schemaHash)) return;
+            await mutate();
+        });
     }
 
     /** {@link forgetPersistedPrefs} wrapped in the {@link pendingForgetHashes}
@@ -866,10 +977,27 @@ export class DataViewerPanel {
         // clears completing would otherwise re-read the still-saved prefs and
         // re-restore the cancelled sort/filter. paintWithRestore honors this.
         this.pendingForgetHashes.add(hash);
+        // Enqueue the store clear onto prefStoreChain BEFORE posting the
+        // natural-order paint: a fresh post-cancel save can only be issued once
+        // the webview adopts that paint, so it is necessarily appended to the
+        // chain AFTER this clear and FIFO preserves it (#552). forgetPersistedPrefs
+        // does its synchronous work (record epoch + enqueue) before its first
+        // await, so the clear is in the chain by the time this returns. The clear
+        // is awaited in the `finally` (not here) so the paint is still posted
+        // first — its failure can't strand the webview — while the clear is
+        // always observed and the marker is held until it completes.
+        const cleared = this.forgetPersistedPrefs(hash);
         try {
             await this.postReplaceNaturalOrder(this.generation);
-            await this.forgetPersistedPrefs(hash);
         } finally {
+            // Await the (best-effort) clear here, even if the paint rejected, for
+            // two reasons: it holds the read-path marker until the clear actually
+            // completes so a concurrent re-read can't observe the still-saved
+            // prefs mid-clear, and it observes `cleared` so a paint rejection
+            // can't leave it as an unhandled rejection. `forgetPersistedPrefs`
+            // is allSettled internally, so this never throws; swallow defensively
+            // so the paint's error (if any) still propagates.
+            await cleared.catch(() => undefined);
             // Always release the marker, even if the natural-order post rejects
             // (e.g. a disposed webview): a stuck entry would suppress every
             // future restore for this schema. Deleting only this call's own
@@ -1142,32 +1270,25 @@ export class DataViewerPanel {
                 schemaHash: m.schemaHash,
                 keys: m.sort.keys,
             });
-            // Drop a save whose schema is being durably forgotten: an
-            // interactive saveSort issued before a restore-cancel can otherwise
-            // interleave its store write after the forget's clear and resurrect
-            // the pref the user just cancelled (handle() is not serialized).
-            if (this.pendingForgetHashes.has(m.schemaHash)) return;
-            if (m.schemaHash && this.settings.persistSort) {
-                if (m.sort.keys.length === 0) {
-                    await this.sortStore.clear(this.panelName, m.schemaHash);
-                } else {
-                    await this.sortStore.save(this.panelName, m.schemaHash, m.sort);
-                }
-            }
+            // Persist through the serialized chain, dropping a stale pre-forget
+            // save so an interactive saveSort issued before a restore-cancel
+            // cannot interleave its store write after the forget's clear and
+            // resurrect the cancelled pref (handle() is not serialized — #552).
+            await this.persistPrefMutation(
+                m.schemaHash, m.panelGeneration, this.settings.persistSort,
+                () => m.sort.keys.length === 0
+                    ? this.sortStore.clear(this.panelName, m.schemaHash)
+                    : this.sortStore.save(this.panelName, m.schemaHash, m.sort),
+            );
             return;
         }
         if (m.type === 'saveFilter') {
-            // See saveSort: drop a save for a schema whose prefs are being
-            // durably forgotten so a stale interactive write cannot resurrect
-            // a cancelled filter.
-            if (this.pendingForgetHashes.has(m.schemaHash)) return;
-            if (m.schemaHash && this.settings.persistFilters) {
-                if (m.filter.entries.length === 0) {
-                    await this.filterStore.clear(this.panelName, m.schemaHash);
-                } else {
-                    await this.filterStore.save(this.panelName, m.schemaHash, m.filter);
-                }
-            }
+            await this.persistPrefMutation(
+                m.schemaHash, m.panelGeneration, this.settings.persistFilters,
+                () => m.filter.entries.length === 0
+                    ? this.filterStore.clear(this.panelName, m.schemaHash)
+                    : this.filterStore.save(this.panelName, m.schemaHash, m.filter),
+            );
             return;
         }
         if (m.panelGeneration !== this.generation) {

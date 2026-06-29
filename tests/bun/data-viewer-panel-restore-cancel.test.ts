@@ -93,9 +93,11 @@ async function makePanel(opts: {
     panel.restoreId = -1;
     panel.restoreSeq = 0;
     panel.pendingForgetHashes = new Set();
+    panel.lastForgetGen = new Map();
     panel.lastToolbar = undefined;
     panel.sendChain = Promise.resolve();
     panel.transformChain = Promise.resolve();
+    panel.prefStoreChain = Promise.resolve();
     panel.settings = { persistSort: true, persistFilters: true, defaultDigits: 3 };
     panel.panelName = 'p';
 
@@ -835,19 +837,123 @@ describe('helpers', () => {
         expect(filterSet).toEqual(['cleared']);
     });
 
-    it('drops a saveSort/saveFilter for a schema being forgotten (#548 codex write-race)', async () => {
+    it('forgetPersistedPrefs records the forget epoch at the current generation (#552)', async () => {
+        const { panel } = await makePanel();
+        panel.generation = 3;
+        await panel.forgetPersistedPrefs('h');
+        expect(panel.lastForgetGen.get('h')).toBe(3);
+    });
+
+    it('drops a stale-generation saveSort/saveFilter below the forget epoch (#552)', async () => {
         const { panel, sortSet, filterSet } = await makePanel();
-        // A late clear-and-forget for schema "h" is in flight.
-        panel.pendingForgetHashes.add('h');
+        // A forget for schema "h" was recorded at generation 2; saves issued from
+        // the pre-forget view (generation 1) are stale and must not resurrect it.
+        panel.lastForgetGen.set('h', 2);
         await panel.handleInner({
-            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+            type: 'saveSort', panelGeneration: 1, schemaHash: 'h', sort: STORED_SORT,
         });
         await panel.handleInner({
-            type: 'saveFilter', panelGeneration: 0, schemaHash: 'h', filter: STORED_FILTER,
+            type: 'saveFilter', panelGeneration: 1, schemaHash: 'h', filter: STORED_FILTER,
         });
-        // Stale interactive writes must not resurrect the cancelled prefs.
         expect(sortSet).toEqual([]);
         expect(filterSet).toEqual([]);
+    });
+
+    it('keeps a saveSort at or above the forget epoch (a fresh post-cancel pref, #552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        panel.lastForgetGen.set('h', 1);
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 1, schemaHash: 'h', sort: STORED_SORT,
+        });
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 2, schemaHash: 'h', sort: STORED_SORT,
+        });
+        // >= keeps the same-generation and newer saves.
+        expect(sortSet).toEqual([STORED_SORT, STORED_SORT]);
+    });
+
+    it('serializes an in-flight save ahead of a forget clear so the pref is not resurrected (#552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        // Gate the in-flight save inside the chain so the forget's clear is
+        // enqueued behind it; FIFO must run the save first, then the clear.
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((r) => { release = r; });
+        const origSave = panel.sortStore.save;
+        panel.sortStore.save = async (p: string, h: string, s: SortState) => {
+            await gate;
+            await origSave(p, h, s);
+        };
+        const savePromise = panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+        });
+        const forgetPromise = panel.forgetPersistedPrefs('h');
+        release();
+        await Promise.all([savePromise, forgetPromise]);
+        // Clear ran last → cancelled pref does not survive.
+        expect(sortSet.at(-1)).toBe('cleared');
+    });
+
+    it('in-chain epoch recheck drops a save when a forget is recorded while it waits in the chain (#552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        // Seed the chain with a gated task so the save cannot start running yet.
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((r) => { release = r; });
+        panel.prefStoreChain = panel.prefStoreChain.then(() => gate);
+        const savePromise = panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+        });
+        // The fast-path passed (epoch unset); record the forget while the save is
+        // still queued behind the gate, so only the in-chain recheck can catch it.
+        panel.lastForgetGen.set('h', 1);
+        release();
+        await savePromise;
+        expect(sortSet).toEqual([]);
+    });
+
+    it('preserves a fresh save enqueued after a forget clear (clear-before-fresh ordering, #552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        panel.generation = 1;
+        // Forget enqueues its clear first (epoch 1); the fresh save (gen 1) is
+        // enqueued after and must survive.
+        const forgetPromise = panel.forgetPersistedPrefs('h');
+        const savePromise = panel.handleInner({
+            type: 'saveSort', panelGeneration: 1, schemaHash: 'h', sort: STORED_SORT,
+        });
+        await Promise.all([forgetPromise, savePromise]);
+        expect(sortSet.at(-1)).toEqual(STORED_SORT);
+    });
+
+    it('a rejecting save op does not stall a later save (chain tail isolation, #552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        // Schema "A" rejects, "B" succeeds. Keyed by schema (not by reassignment)
+        // so the verdict does not depend on when the deferred chain op runs.
+        panel.sortStore.save = async (_p: string, h: string, s: SortState) => {
+            if (h === 'A') throw new Error('boom');
+            sortSet.push(s);
+        };
+        const p1 = panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'A', sort: STORED_SORT,
+        }).catch(() => undefined);
+        const p2 = panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'B', sort: STORED_SORT,
+        });
+        await Promise.all([p1, p2]);
+        // B's save still ran despite A's rejection (chain tail isolated).
+        expect(sortSet).toEqual([STORED_SORT]);
+    });
+
+    it('clearAndForgetNaturalOrder records the epoch, clears, and a fresh post-cancel save survives (#552)', async () => {
+        const { panel, sortSet } = await makePanel();
+        panel.generation = 0;
+        await panel.clearAndForgetNaturalOrder('h');
+        // Epoch recorded at the bumped (post-cancel) generation.
+        expect(panel.lastForgetGen.get('h')).toBe(1);
+        expect(sortSet).toContain('cleared');
+        // A fresh post-cancel save at the new generation is kept.
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 1, schemaHash: 'h', sort: STORED_SORT,
+        });
+        expect(sortSet.at(-1)).toEqual(STORED_SORT);
     });
 
     it('saves a sort/filter normally when no forget is pending for its schema (control)', async () => {
@@ -860,5 +966,39 @@ describe('helpers', () => {
         });
         expect(sortSet).toEqual([STORED_SORT]);
         expect(filterSet).toEqual([STORED_FILTER]);
+    });
+
+    it('persists an empty saveSort/saveFilter as a clear (#552 persistPrefMutation clear branch)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: EMPTY_SORT,
+        });
+        await panel.handleInner({
+            type: 'saveFilter', panelGeneration: 0, schemaHash: 'h', filter: EMPTY_FILTER,
+        });
+        // Empty keys/entries take the clear branch, not save.
+        expect(sortSet).toEqual(['cleared']);
+        expect(filterSet).toEqual(['cleared']);
+    });
+
+    it('drops a saveSort/saveFilter when its persist-* setting is disabled (#552 gating)', async () => {
+        const { panel, sortSet, filterSet } = await makePanel();
+        panel.settings = { persistSort: false, persistFilters: false, defaultDigits: 3 };
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: 'h', sort: STORED_SORT,
+        });
+        await panel.handleInner({
+            type: 'saveFilter', panelGeneration: 0, schemaHash: 'h', filter: STORED_FILTER,
+        });
+        expect(sortSet).toEqual([]);
+        expect(filterSet).toEqual([]);
+    });
+
+    it('drops a saveSort with an empty schemaHash (#552 gating)', async () => {
+        const { panel, sortSet } = await makePanel();
+        await panel.handleInner({
+            type: 'saveSort', panelGeneration: 0, schemaHash: '', sort: STORED_SORT,
+        });
+        expect(sortSet).toEqual([]);
     });
 });
