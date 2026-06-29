@@ -669,6 +669,16 @@ export function App({
         clearRows();
         setResolvedLabels({});
         setGridSelection(createEmptySelection());
+        // Clear any outstanding copy status: a copy in flight belongs to the
+        // prior generation, and the host's stale `copyDone` carries that old
+        // generation, so it is dropped by the generation guard in the message
+        // handler (and by applyCopyDone) before it can clear the toast. Reset
+        // here so a replace/init that supersedes an in-progress copy doesn't
+        // leave a stuck "Copying..." toast. A fresh copy in the new generation
+        // re-sets this; the stale `copyDone` stays dropped and cannot clobber
+        // it.
+        setCopyStatus('');
+        setCopyStatusMsg('');
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
         postLifecycle(
             m.type,

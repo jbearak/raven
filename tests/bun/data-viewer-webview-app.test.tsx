@@ -188,6 +188,37 @@ describe('data viewer App filter persistence', () => {
     });
 });
 
+describe('data viewer App copy status', () => {
+    function dispatchKey(key: string) {
+        window.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key,
+            ctrlKey: true,
+            bubbles: true,
+        }));
+    }
+
+    test('a replace that supersedes an in-flight copy clears the Copying toast', async () => {
+        await renderApp();
+
+        // Select all + copy → the host is sent a `copy` request and the toast
+        // shows "Copying..." while the host reads rows.
+        await act(async () => { dispatchKey('a'); });
+        await act(async () => { dispatchKey('c'); });
+        expect(document.body.textContent).toContain('Copying...');
+
+        // The host bumps the generation (e.g. View() re-run) and replaces the
+        // data before the copy finishes. The stale `copyDone` it posts carries
+        // the old generation and is dropped by the webview's generation guard,
+        // so the replace itself must clear the stuck "Copying..." toast.
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', {
+                data: { ...initMessage(), type: 'replace', panelGeneration: 2 },
+            }));
+        });
+        expect(document.body.textContent).not.toContain('Copying...');
+    });
+});
+
 describe('data viewer App restore banner debounce', () => {
     function restorePendingMessage(restoreId: number) {
         return {
