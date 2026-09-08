@@ -539,8 +539,26 @@ jobs:
               exit 1
             fi
           fi
-          gh pr merge "$BRANCH" --auto --squash \
-            || echo "::warning::could not enable auto-merge; merge $BRANCH manually."
+          PR_URL="$(gh pr view "$BRANCH" --json url --jq '.url')"
+
+          # GitHub reports a new PR as unstable until its checks register. Wait
+          # for apt-raven's validation workflow, then make its result a hard gate
+          # instead of hiding an early auto-merge failure behind a warning.
+          for attempt in {1..24}; do
+            CHECK_COUNT="$(gh pr view "$PR_URL" --json statusCheckRollup \
+              --jq '.statusCheckRollup | length')"
+            if [ "$CHECK_COUNT" -gt 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 24 ]; then
+              echo "::error::no validation checks appeared for $PR_URL" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          gh pr checks "$PR_URL" --watch --fail-fast --interval 5
+          gh pr merge "$PR_URL" --squash --delete-branch
 
   # ── Homebrew tap bump ───────────────────────────────────────────────
   # After the GitHub Release is published, open a PR against the Homebrew
