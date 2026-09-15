@@ -1068,7 +1068,7 @@ fn reported_packages_to_warm(
     // variable check resolves them via `is_package_export` reading the
     // (preamble-injected) `inherited_packages`, which needs the cache warm.
     // Warming is a union, so the source-order gate that governs *visibility*
-    // (see `append_package_contribution`) is irrelevant here.
+    // (see `ScopeContributions`) is irrelevant here.
     for pkgs in state
         .package_state
         .scope_contribution()

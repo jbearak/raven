@@ -1774,7 +1774,7 @@ pub struct PackageScopeContribution {
 
     /// Symbol names contributed by a workspace-root `.Rprofile` prelude
     /// (assignments + transitive `source()` defs). Injected by
-    /// `append_rprofile_prelude` into files where R would source `.Rprofile`
+    /// `ScopeContributions` into files where R would source `.Rprofile`
     /// (gated by `rprofile_withheld_in_package_mode` in package mode).
     /// Suppressive-only.
     pub rprofile_symbols: Arc<BTreeSet<String>>,

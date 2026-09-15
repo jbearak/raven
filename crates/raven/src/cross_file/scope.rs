@@ -23,6 +23,13 @@ use super::static_path::LazyStaticBindings;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
+mod contributions;
+pub(crate) use contributions::rprofile_prelude_applies;
+use contributions::{ScopeContributions, ScopePhase};
+
+#[cfg(all(test, unix))]
+mod contribution_tests;
+
 // ============================================================================
 // Line Index for Fast Lookups
 // ============================================================================
@@ -8627,16 +8634,12 @@ where
     // exports and symbols after the timeline so local definitions retain
     // precedence, but conditional loaders such as bare `p_load()` need the
     // attachment fact before their event is visited.
-    if current_depth == 0
-        && let Some(contrib) = package_contribution
-    {
-        let contribution_uri = package_query_uri.unwrap_or(uri);
-        seed_pre_execution_attached_packages(
-            &mut scope.attached_packages,
-            contribution_uri,
-            contrib,
-        );
-    }
+    let contributions = if current_depth == 0 {
+        ScopeContributions::new(package_query_uri.unwrap_or(uri), package_contribution)
+    } else {
+        ScopeContributions::default()
+    };
+    contributions.seed_attached_packages(&mut scope.attached_packages);
     let needs_attachment_projection = !artifacts.conditional_shiny_deferred_scopes.is_empty()
         || (query_inside_function
             && artifacts.timeline.iter().any(|event| {
@@ -9576,18 +9579,8 @@ where
         );
     }
 
-    // Phase 5a: inject package-mode contribution at depth 0 only.
-    // Appends synthetic ScopedSymbol entries for package-internal symbols and
-    // NAMESPACE-imported symbols that were not already resolved by the
-    // standard scope engine above. This ensures existing local definitions
-    // always take precedence (additive-only).
-    if current_depth == 0
-        && let Some(contrib) = package_contribution
-    {
-        let contribution_uri = package_query_uri.unwrap_or(uri);
-        append_package_contribution(&mut scope, contribution_uri, contrib, query_inside_function);
-        append_rprofile_prelude(&mut scope, contribution_uri, contrib);
-    }
+    // Materialize file-level fallbacks after the timeline so local bindings win.
+    contributions.apply(&mut scope, ScopePhase::from_deferred(query_inside_function));
 
     scope
         .named_search_path
@@ -9610,221 +9603,8 @@ where
     scope
 }
 
-/// Iterate the preamble-file entries of a `tests/testthat` contribution map
-/// (`test_helper_symbols` or `test_helper_attached_packages`) that are
-/// *visible* to `queried_path`, applying testthat's sourcing-order gate:
-///
-/// - a preamble file is only visible to test files in its OWN directory.
-///   testthat sources `helper*.R`/`setup*.R` for the tests in the same
-///   `tests/testthat/` directory; a file under `tests/testit/` (or any other
-///   directory) never sources them, so cross-directory entries are skipped —
-///   without this a `tests/testit/` file would inherit `tests/testthat/`
-///   preamble defs/attaches and silently mute legitimate diagnostics;
-/// - a preamble file never sees its OWN entry (its own defs/attaches are
-///   handled by the standard position-aware in-file path, preserving
-///   forward-reference diagnostics), and
-/// - top-level queries in a preamble file only see files testthat sources
-///   strictly before it (byte-lexicographic `<`, including helpers before
-///   setup files). With `query_inside_function`, symbol lookups see all peer
-///   preambles: a closure called by a test observes the shared environment
-///   after all helpers and setup files have run. Callers pass the existing
-///   hoist-globals-aware function context, so disabling hoisting stays strict.
-///
-/// Package-attachment callers pass `false` to retain their pre-execution
-/// ordering; this deferred exception applies to symbol lookup.
-///
-/// `test-*.R` and other non-preamble test files in the same directory
-/// (`queried_is_preamble == false`) see every entry there. This is the single
-/// source of truth for the gate; [`compute_contribution_symbol_names`] and
-/// [`append_package_contribution`] both consume it so `is_visible` agrees with
-/// `snapshot()`.
-fn visible_preamble_entries<'a, V>(
-    map: &'a std::collections::BTreeMap<std::path::PathBuf, V>,
-    queried_path: &'a std::path::Path,
-    queried_is_preamble: bool,
-    query_inside_function: bool,
-) -> impl Iterator<Item = &'a V> + 'a {
-    map.iter().filter_map(move |(preamble_path, value)| {
-        if preamble_path.as_path() == queried_path {
-            return None;
-        }
-        // Preambles only propagate to test files in the same directory — the
-        // directory testthat actually sources them for. Blocks leakage into
-        // `tests/testit/` (and any nested subdir) when both frameworks coexist.
-        if preamble_path.parent() != queried_path.parent() {
-            return None;
-        }
-        if queried_is_preamble && !query_inside_function && preamble_path.as_path() >= queried_path
-        {
-            return None;
-        }
-        Some(value)
-    })
-}
-
-/// Seed only package-attachment facts that exist before the queried file
-/// executes.
-///
-/// Package/test contribution symbols are deliberately appended after timeline
-/// evaluation so locals win. Attachment prerequisites are different: a
-/// `.Rprofile`, test framework, or earlier test preamble has already run when
-/// the file starts, so conditional package-loader events must see those facts
-/// while the timeline is evaluated. The full appenders later add the matching
-/// inherited/loaded package state idempotently.
-fn seed_pre_execution_attached_packages(
-    attached: &mut HashSet<String>,
-    queried_uri: &Url,
-    contrib: &crate::package_state::PackageScopeContribution,
-) {
-    let Ok(path) = queried_uri.to_file_path() else {
-        return;
-    };
-
-    if rprofile_prelude_applies(&path, contrib) {
-        attached.extend(contrib.rprofile_attached_packages.iter().cloned());
-    }
-
-    let Some(root) = contrib.workspace_root.as_ref() else {
-        return;
-    };
-    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        return;
-    };
-    if kind != crate::package_state::RFileKind::Test
-        || !crate::package_state::is_testthat_or_testit_test(&path, root)
-    {
-        return;
-    }
-
-    attached.extend(contrib.test_attached_packages.iter().cloned());
-    let queried_is_preamble = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(crate::package_state::is_test_preamble_filename)
-        .unwrap_or(false);
-    for packages in visible_preamble_entries(
-        &contrib.test_helper_attached_packages,
-        path.as_path(),
-        queried_is_preamble,
-        false,
-    ) {
-        attached.extend(packages.iter().cloned());
-    }
-}
-
-/// Compute the set of symbol names the package contribution would inject
-/// for `queried_uri`, mirroring [`append_package_contribution`]'s path /
-/// `RFileKind` gating. Returns an empty set when there's no contribution
-/// or when the queried URI isn't under `<root>/R/`, `<root>/tests/testthat/`,
-/// `<root>/tests/testit/`, or directly under `<root>/tests/`.
-///
-/// Used by [`ScopeStream`] so `is_visible` / `symbol_for` agree with
-/// `snapshot()` on which contribution-derived names are in scope — out-of-
-/// scope diagnostics call only `is_visible`, so without this set they
-/// would emit "used before available" misattributions for preamble
-/// (helper*/setup*) symbols.
-///
-/// `test_helper_symbols` keyed by preamble-file path are filtered to
-/// exclude the queried file's own entry, preserving forward-reference
-/// diagnostics inside a helper/setup file.
-fn compute_contribution_symbol_names(
-    queried_uri: &Url,
-    contribution: Option<&crate::package_state::PackageScopeContribution>,
-) -> HashSet<Arc<str>> {
-    let mut out: HashSet<Arc<str>> = HashSet::new();
-    let Some(contrib) = contribution else {
-        return out;
-    };
-    // `.Rprofile` prelude names — independent of the package workspace, so this
-    // runs before the `workspace_root` early-return below (script mode has no
-    // workspace_root but still gets the prelude). Mirrors `append_rprofile_prelude`'s
-    // applicability gate. Attached packages contribute no symbol NAMES here
-    // (their exports resolve via the package library), so only `rprofile_symbols`.
-    if let Ok(qpath) = queried_uri.to_file_path()
-        && rprofile_prelude_applies(&qpath, contrib)
-    {
-        for sym in contrib.rprofile_symbols.iter() {
-            out.insert(Arc::from(sym.as_str()));
-        }
-    }
-    let Some(root) = contrib.workspace_root.as_ref() else {
-        return out;
-    };
-    let Ok(path) = queried_uri.to_file_path() else {
-        return out;
-    };
-
-    // Dataset symbols are visible to any file in the workspace.
-    if crate::package_state::is_package_workspace_r_file(&path, root) {
-        for sym in contrib.dataset_symbols.iter() {
-            out.insert(Arc::from(sym.as_str()));
-        }
-    }
-
-    let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
-    // See `append_package_contribution`: a `load_all()` caller now receives
-    // internals via the `LOAD_ALL_SENTINEL` attached-package route (resolved
-    // position-aware through the package library's local-dev overlay), NOT via
-    // this name set — so there is no bespoke `dev_load_all` branch here.
-    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs see the package's own
-        // internal/exported/sysdata/onload/imported symbols.
-        if is_dev_context {
-            for sym in contrib.r_internal_symbols.iter() {
-                out.insert(Arc::from(sym.as_str()));
-            }
-            for sym in contrib.sysdata_symbols.iter() {
-                out.insert(Arc::from(sym.as_str()));
-            }
-            for sym in contrib.onload_symbols.iter() {
-                out.insert(Arc::from(sym.as_str()));
-            }
-            for sym in contrib.imported_symbols.keys() {
-                out.insert(Arc::from(sym.as_str()));
-            }
-        }
-        return out;
-    };
-    for sym in contrib.r_internal_symbols.iter() {
-        out.insert(Arc::from(sym.as_str()));
-    }
-    for sym in contrib.sysdata_symbols.iter() {
-        out.insert(Arc::from(sym.as_str()));
-    }
-    for sym in contrib.onload_symbols.iter() {
-        out.insert(Arc::from(sym.as_str()));
-    }
-    for sym in contrib.imported_symbols.keys() {
-        out.insert(Arc::from(sym.as_str()));
-    }
-    if kind == crate::package_state::RFileKind::Test
-        && crate::package_state::is_testthat_or_testit_test(&path, root)
-    {
-        // Mirror `append_package_contribution`'s sourcing-order gate so
-        // `is_visible` / `symbol_for` agree with `snapshot()`: top-level
-        // helper/setup queries see earlier peers, while ordinary test files
-        // see the completed preamble environment.
-        let queried_is_preamble = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(crate::package_state::is_test_preamble_filename)
-            .unwrap_or(false);
-        for syms in visible_preamble_entries(
-            &contrib.test_helper_symbols,
-            path.as_path(),
-            queried_is_preamble,
-            false,
-        ) {
-            for sym in syms.iter() {
-                out.insert(Arc::from(sym.as_str()));
-            }
-        }
-    }
-    out
-}
-
 /// Synthetic `source_uri` used for symbols injected by
-/// `append_package_contribution`.
+/// `ScopeContributions`.
 ///
 /// Package-mode "contribution" symbols (package-internal defs from sibling
 /// `R/*.R` files and `importFrom` NAMESPACE targets) don't carry per-symbol
@@ -9872,409 +9652,9 @@ pub(crate) fn package_export_from_uri(uri: &Url) -> Option<std::borrow::Cow<'_, 
 }
 
 /// Returns `true` when `uri` is the synthetic package-internal URI produced by
-/// `append_package_contribution`.
+/// `ScopeContributions`.
 pub fn is_package_internal_uri(uri: &Url) -> bool {
     uri.as_str() == PACKAGE_INTERNAL_URI
-}
-
-/// Inject package-mode symbols into the queried file's scope for Phase 5a.
-///
-/// Called only at depth 0 from `scope_at_position_with_graph_recursive`
-/// (and from the streaming `ScopeStream::snapshot()` path).
-///
-/// For files under `<root>/R/` or `<root>/tests/testthat/`, inserts synthetic
-/// `ScopedSymbol` entries for:
-/// - Every name in `contrib.r_internal_symbols` (package-internal definitions)
-/// - Every key in `contrib.imported_symbols` (NAMESPACE `importFrom` targets)
-///
-/// For files under `<root>/tests/testthat/` additionally:
-/// - Every name in `contrib.test_helper_symbols` (top-level defs from the
-///   testthat preamble files `tests/testthat/helper*.R` and `setup*.R`) is
-///   inserted into the symbol map when visible through
-///   [`visible_preamble_entries`]. Top-level queries use source order;
-///   late-bound function-body queries see all peer preambles.
-/// - Every package in `contrib.test_attached_packages` is added to
-///   `scope.inherited_packages`, modelling the implicit `library(testthat)`
-///   that `tests/testthat.R` performs before sourcing each test file.
-/// - Every package in `contrib.test_helper_attached_packages` (top-level
-///   `library()`/`require()` attaches in the testthat preamble files) is added
-///   to `scope.inherited_packages`, modelling testthat sourcing those preamble
-///   files before each test. Uses the per-path skip and source-order gate
-///   without the function-body exception for symbol lookup.
-///
-/// Names already present in `symbols` are NOT overwritten — local and cross-file
-/// definitions always take precedence. `full_imports` entries are intentionally
-/// skipped: enumerating their symbols requires the package library, which is
-/// handled by the existing `pkg_resolver` / combined-exports path.
-///
-/// `uri` is the URI used for package path classification. For an open
-/// symlink/case alias, callers keep the queried/client URI elsewhere for
-/// diagnostics publishing and pass the authoritative canonical package URI here
-/// so `strip_prefix(root)` and package layout checks see the real package path.
-pub(crate) fn append_package_contribution(
-    scope: &mut ScopeAtPosition,
-    uri: &Url,
-    contrib: &crate::package_state::PackageScopeContribution,
-    query_inside_function: bool,
-) {
-    let Some(root) = contrib.workspace_root.as_ref() else {
-        return;
-    };
-    let Ok(path) = uri.to_file_path() else {
-        return;
-    };
-
-    // Cheap query-file gate for the load_all() sentinel: a file outside the package
-    // root must not attach this package's internals via load_all(). (Deliberately
-    // simpler than gating on the original caller; see the load_all design spec.)
-    let under_package_root = path.strip_prefix(root).is_ok();
-    if !under_package_root {
-        scope
-            .loaded_packages
-            .remove(crate::package_library::LOAD_ALL_SENTINEL);
-        scope
-            .inherited_packages
-            .remove(crate::package_library::LOAD_ALL_SENTINEL);
-    }
-
-    // Use a synthetic URI scheme for package-internal symbols so consumers
-    // can distinguish them from real file-backed definitions.
-    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
-        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
-
-    // Dataset symbols are visible to ANY file in the workspace (R/, tests/,
-    // vignettes/, inst/, demo/, data-raw/).
-    if crate::package_state::is_package_workspace_r_file(&path, root) {
-        for sym in contrib.dataset_symbols.iter() {
-            let name: Arc<str> = Arc::from(sym.as_str());
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                    signature: None,
-                    is_declared: false,
-                });
-        }
-    }
-
-    // Inject r_internal_symbols and imported_symbols for files under
-    // <root>/R/, <root>/tests/, or dev-context dirs (demo/, data-raw/,
-    // vignettes/, man/).
-    let is_dev_context = crate::package_state::is_dev_context_path(&path, root);
-    // A file that calls `devtools::load_all()` no longer gets internals through a
-    // bespoke whole-file injection here. Instead it attaches the package under
-    // development via the `LOAD_ALL_SENTINEL` `PackageLoad` event (Task 1), which
-    // resolves its internals through the package library's local-dev overlay
-    // (Task 2) — position-aware, so internals are visible only AFTER the
-    // `load_all()` call, matching R's runtime semantics. `under_package_root` is
-    // still bound near the top of this function to drive the sentinel query-file
-    // gate.
-    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-        // Dev-context dirs (demo/, data-raw/, vignettes/, man/) see
-        // r_internal_symbols + sysdata + onload + imported_symbols but NOT
-        // test_helper_symbols or test_attached_packages.
-        if !is_dev_context {
-            return;
-        }
-        for sym in contrib.r_internal_symbols.iter() {
-            let name: Arc<str> = Arc::from(sym.as_str());
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                    signature: None,
-                    is_declared: false,
-                });
-        }
-        for sym in contrib.sysdata_symbols.iter() {
-            let name: Arc<str> = Arc::from(sym.as_str());
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                    signature: None,
-                    is_declared: false,
-                });
-        }
-        for sym in contrib.onload_symbols.iter() {
-            let name: Arc<str> = Arc::from(sym.as_str());
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                    signature: None,
-                    is_declared: false,
-                });
-        }
-        for sym in contrib.imported_symbols.keys() {
-            let name: Arc<str> = Arc::from(sym.as_str());
-            scope
-                .symbols
-                .entry(name.clone())
-                .or_insert_with(|| ScopedSymbol {
-                    name,
-                    kind: SymbolKind::Variable,
-                    source_uri: pkg_uri.clone(),
-                    defined_line: 0,
-                    defined_column: 0,
-                    defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                    signature: None,
-                    is_declared: false,
-                });
-        }
-        return;
-    };
-
-    // Use a synthetic URI scheme for package-internal symbols so consumers
-    // can distinguish them from real file-backed definitions.
-    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
-        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
-
-    // `PackageScopeContribution` does not (yet) carry per-symbol metadata, so
-    // we cannot classify injected symbols as function vs. variable. Default
-    // to `Variable` — the neutral choice — so non-function imports and
-    // assignments aren't misclassified as functions. When
-    // `PackageScopeContribution` propagates kind metadata, use it here.
-    for sym in contrib.r_internal_symbols.iter() {
-        let name: Arc<str> = Arc::from(sym.as_str());
-        scope
-            .symbols
-            .entry(name.clone())
-            .or_insert_with(|| ScopedSymbol {
-                name,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri.clone(),
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                signature: None,
-                is_declared: false,
-            });
-    }
-
-    for sym in contrib.sysdata_symbols.iter() {
-        let name: Arc<str> = Arc::from(sym.as_str());
-        scope
-            .symbols
-            .entry(name.clone())
-            .or_insert_with(|| ScopedSymbol {
-                name,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri.clone(),
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                signature: None,
-                is_declared: false,
-            });
-    }
-
-    for sym in contrib.onload_symbols.iter() {
-        let name: Arc<str> = Arc::from(sym.as_str());
-        scope
-            .symbols
-            .entry(name.clone())
-            .or_insert_with(|| ScopedSymbol {
-                name,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri.clone(),
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                signature: None,
-                is_declared: false,
-            });
-    }
-
-    for sym in contrib.imported_symbols.keys() {
-        let name: Arc<str> = Arc::from(sym.as_str());
-        scope
-            .symbols
-            .entry(name.clone())
-            .or_insert_with(|| ScopedSymbol {
-                name,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri.clone(),
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                signature: None,
-                is_declared: false,
-            });
-    }
-
-    // Test-only contributions: only inject when the queried file is under
-    // `tests/testthat/` or `tests/testit/` (NOT plain `tests/*.R`). Helper
-    // symbols are visible to peer test files in the SAME directory; attached
-    // packages model `testthat::test_check`'s implicit `library(testthat)`
-    // before sourcing tests. Neither propagates into R/ or plain test scripts
-    // — that asymmetry is preserved by gating on `is_testthat_or_testit_test`
-    // here. Preamble defs/attaches are further restricted to their own
-    // directory by `visible_preamble_entries`, so `tests/testit/` files never
-    // inherit `tests/testthat/` preambles when both frameworks coexist.
-    if kind == crate::package_state::RFileKind::Test
-        && crate::package_state::is_testthat_or_testit_test(&path, root)
-    {
-        // Per-preamble-file iteration so a preamble file's own top-level
-        // defs are NOT injected back into the file itself — preserves
-        // forward-reference diagnostics inside helper/setup files. Without
-        // this skip, a `use_x()` usage above an `x <- ...` definition
-        // would see `x` via the package contribution and silently mute
-        // the legitimate "undefined variable" / forward-reference
-        // diagnostic.
-        //
-        // Top-level helper/setup code sees earlier preambles. Function-body
-        // queries see every peer, because tests invoke these closures after
-        // the preamble has completed. Keep this shared gate aligned with the
-        // streaming name lookup in `compute_contribution_symbol_names`.
-        let queried_is_preamble = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(crate::package_state::is_test_preamble_filename)
-            .unwrap_or(false);
-        for syms in visible_preamble_entries(
-            &contrib.test_helper_symbols,
-            path.as_path(),
-            queried_is_preamble,
-            query_inside_function,
-        ) {
-            for sym in syms.iter() {
-                let name: Arc<str> = Arc::from(sym.as_str());
-                scope
-                    .symbols
-                    .entry(name.clone())
-                    .or_insert_with(|| ScopedSymbol {
-                        name,
-                        kind: SymbolKind::Variable,
-                        source_uri: pkg_uri.clone(),
-                        defined_line: 0,
-                        defined_column: 0,
-                        defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                        signature: None,
-                        is_declared: false,
-                    });
-            }
-        }
-        for pkg in contrib.test_attached_packages.iter() {
-            scope.inherited_packages.insert(pkg.clone());
-            scope.attached_packages.insert(pkg.clone());
-        }
-        // Issue #432: packages attached by testthat preamble files via a
-        // top-level `library()`/`require()` propagate to sibling tests, exactly
-        // like preamble top-level defs above. Same `visible_preamble_entries`
-        // gate: a preamble file never inherits its OWN attach here (the
-        // standard position-aware `library()` path already handles that, so a
-        // use BEFORE the attach in the same file still fires), and only sees
-        // attaches from preamble files testthat sources strictly before it.
-        // `test-*.R` and other non-preamble test files see them all. These feed
-        // `inherited_packages` (not the symbol set) — the attached package's
-        // exports are resolved by the package library like any other attach.
-        for pkgs in visible_preamble_entries(
-            &contrib.test_helper_attached_packages,
-            path.as_path(),
-            queried_is_preamble,
-            false,
-        ) {
-            for pkg in pkgs.iter() {
-                scope.inherited_packages.insert(pkg.clone());
-                scope.attached_packages.insert(pkg.clone());
-            }
-        }
-    }
-}
-
-/// Returns `true` when the `.Rprofile` prelude applies to `path` given the
-/// current [`crate::package_state::PackageScopeContribution`].
-///
-/// Conditions (all must hold):
-/// - `contrib.rprofile_root` is `Some` (a prelude was found);
-/// - `path` is under that root;
-/// - in package mode (`workspace_root.is_some()`), the path is NOT withheld by
-///   [`crate::package_state::rprofile_withheld_in_package_mode`].
-///
-/// The empty-sets early-return in [`append_rprofile_prelude`] is kept separate
-/// (it short-circuits before URI→path conversion and belongs to that fn only).
-pub(crate) fn rprofile_prelude_applies(
-    path: &std::path::Path,
-    contrib: &crate::package_state::PackageScopeContribution,
-) -> bool {
-    let Some(root) = contrib.rprofile_root.as_ref() else {
-        return false;
-    };
-    if path.strip_prefix(root).is_err() {
-        return false;
-    }
-    let package_mode_active = contrib.workspace_root.is_some();
-    !(package_mode_active && crate::package_state::rprofile_withheld_in_package_mode(path, root))
-}
-
-/// Inject the `.Rprofile` prelude (issue: script-scope prelude) into a queried
-/// file's scope at Phase 5a. Independent of the package-mode contribution:
-/// applies in BOTH package and script mode, gated by
-/// [`crate::package_state::rprofile_withheld_in_package_mode`] in package mode
-/// only. Additive / suppressive only — never overwrites an existing binding (so
-/// local and cross-file defs win), and the attached packages flow to
-/// `inherited_packages` exactly like a helper-file `library()` attach.
-pub(crate) fn append_rprofile_prelude(
-    scope: &mut ScopeAtPosition,
-    uri: &Url,
-    contrib: &crate::package_state::PackageScopeContribution,
-) {
-    if contrib.rprofile_symbols.is_empty() && contrib.rprofile_attached_packages.is_empty() {
-        return;
-    }
-    let Ok(path) = uri.to_file_path() else {
-        return;
-    };
-    if !rprofile_prelude_applies(&path, contrib) {
-        return;
-    }
-    let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
-        .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
-    for sym in contrib.rprofile_symbols.iter() {
-        let name: Arc<str> = Arc::from(sym.as_str());
-        scope
-            .symbols
-            .entry(name.clone())
-            .or_insert_with(|| ScopedSymbol {
-                name,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri.clone(),
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(sym.as_str()),
-                signature: None,
-                is_declared: false,
-            });
-    }
-    for pkg in contrib.rprofile_attached_packages.iter() {
-        scope.inherited_packages.insert(pkg.clone());
-        scope.attached_packages.insert(pkg.clone());
-    }
 }
 
 // ============================================================================
@@ -10491,34 +9871,8 @@ where
     /// Shared prefix cache so child-source recursion benefits from the
     /// same Stage-1 caching as the queried URI.
     prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
-    /// Package-mode contribution. When `Some`, `snapshot()` applies it to
-    /// the materialized `ScopeAtPosition` at the queried URI, mirroring the
-    /// recursive resolver's depth-0 `append_package_contribution` call.
-    /// This ensures the streaming and recursive paths agree on which
-    /// package-internal symbols, imported names, helper top-level defs, and
-    /// test-attached packages (e.g. `testthat` under `tests/testthat/`) are
-    /// visible at the cursor.
-    package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
-    /// Canonical URI used only for scope-contribution path gates. The stream
-    /// still resolves and publishes against `queried_uri`.
-    package_query_uri: Option<&'a Url>,
-
-    /// Pre-computed set of symbol names that the package contribution would
-    /// inject at top level for `queried_uri` (R/ internals + NAMESPACE-imported names +
-    /// top-level defs from peer preamble files (`helper*.R` / `setup*.R`)
-    /// when querying a file under `tests/testthat/`). Consulted by
-    /// `is_visible` and `symbol_for` as a fallthrough so out-of-scope
-    /// diagnostics — which only call `is_visible` — don't misattribute a
-    /// contribution-provided name to a forward `source()` call.
-    ///
-    /// Preamble symbols from the queried file itself are intentionally
-    /// excluded (per-file keying in `test_helper_symbols`) so
-    /// forward-reference diagnostics inside the preamble file still fire.
-    contribution_symbol_names: HashSet<Arc<str>>,
-    /// Additional peer-preamble names, built only on the first strict-set
-    /// miss inside a function. Keeping the two sets separate prevents a later
-    /// top-level query from inheriting the completed helper environment.
-    deferred_contribution_symbol_names: std::cell::OnceCell<HashSet<Arc<str>>>,
+    /// One prepared selection shared by membership and scope materialization.
+    contributions: ScopeContributions<'a>,
 
     /// `data()` file-stem alias provider (issue #429). When `Some`, the
     /// `DataLoad` arms of `apply_event_to_strict` / `apply_event_to_late` bind
@@ -10799,14 +10153,11 @@ where
         let mut global_strict_frame = ScopeFrame::default();
         seed_base_exports(&mut global_strict_frame, base_exports);
         let mut pre_execution_attached_packages = HashSet::new();
-        if let Some(contrib) = package_contribution {
-            let contribution_uri = package_query_uri.unwrap_or(queried_uri);
-            seed_pre_execution_attached_packages(
-                &mut pre_execution_attached_packages,
-                contribution_uri,
-                contrib,
-            );
-        }
+        let contributions = ScopeContributions::new(
+            package_query_uri.unwrap_or(queried_uri),
+            package_contribution,
+        );
+        contributions.seed_attached_packages(&mut pre_execution_attached_packages);
         global_strict_frame
             .attached_packages
             .extend(pre_execution_attached_packages.iter().cloned());
@@ -10835,14 +10186,6 @@ where
                     workspace_root,
                 )
             });
-
-        // Pre-compute the names the package contribution would inject for
-        // `queried_uri`. Doing it once at construction keeps
-        // `is_visible`/`symbol_for` O(1) hash lookups instead of repeatedly
-        // walking the BTreeMap of helper files.
-        let contribution_query_uri = package_query_uri.unwrap_or(queried_uri);
-        let contribution_symbol_names =
-            compute_contribution_symbol_names(contribution_query_uri, package_contribution);
 
         Some(Self {
             queried_uri,
@@ -10874,10 +10217,7 @@ where
             is_cancelled,
             path_ctx,
             prefix_cache,
-            package_contribution,
-            package_query_uri,
-            contribution_symbol_names,
-            deferred_contribution_symbol_names: std::cell::OnceCell::new(),
+            contributions,
             data_alias_provider,
             selective_import_provider,
             forward_child_memo,
@@ -10979,10 +10319,7 @@ where
             is_cancelled,
             path_ctx,
             prefix_cache,
-            package_contribution: None,
-            package_query_uri: None,
-            contribution_symbol_names: HashSet::new(),
-            deferred_contribution_symbol_names: std::cell::OnceCell::new(),
+            contributions: ScopeContributions::default(),
             data_alias_provider,
             // Attachment projection is a backward-parent-style path; selective
             // imports never lend across attach() projections.
@@ -11686,54 +11023,6 @@ where
         self.hoist_globals && !self.function_stack.is_empty()
     }
 
-    /// Match the recursive contribution filter without rescanning helper maps
-    /// for every reference. Only preamble queries can gain deferred names;
-    /// never duplicate the package-wide internal/imported/dataset name set.
-    fn contribution_has_symbol(&self, name: &str) -> bool {
-        self.contribution_symbol_names.contains(name)
-            || (self.query_inside_function()
-                && self
-                    .deferred_contribution_symbol_names
-                    .get_or_init(|| {
-                        let mut names = HashSet::new();
-                        let Some(contrib) = self.package_contribution else {
-                            return names;
-                        };
-                        let Some(root) = contrib.workspace_root.as_ref() else {
-                            return names;
-                        };
-                        let Ok(path) = self
-                            .package_query_uri
-                            .unwrap_or(self.queried_uri)
-                            .to_file_path()
-                        else {
-                            return names;
-                        };
-                        if !crate::package_state::is_testthat_or_testit_test(&path, root)
-                            || !path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .is_some_and(crate::package_state::is_test_preamble_filename)
-                        {
-                            return names;
-                        }
-                        for symbols in visible_preamble_entries(
-                            &contrib.test_helper_symbols,
-                            &path,
-                            true,
-                            true,
-                        ) {
-                            for symbol in symbols.iter() {
-                                if !self.contribution_symbol_names.contains(symbol.as_str()) {
-                                    names.insert(Arc::from(symbol.as_str()));
-                                }
-                            }
-                        }
-                        names
-                    })
-                    .contains(name))
-    }
-
     /// Cheap presence check: is `name` visible at the current cursor?
     ///
     /// Walks frames innermost-first (function_stack reverse → global frame
@@ -11759,7 +11048,10 @@ where
                 // resolver's depth-0 ordering, so we must match that:
                 // a removed name remains visible if the package
                 // contribution would re-add it.
-                return self.contribution_has_symbol(name);
+                return self.contributions.contains(
+                    name,
+                    ScopePhase::from_deferred(self.query_inside_function()),
+                );
             }
         }
         // Global frame: strict or late, depending on hoisting.
@@ -11768,7 +11060,10 @@ where
             return true;
         }
         if global.removed_names.contains(name) {
-            return self.contribution_has_symbol(name);
+            return self.contributions.contains(
+                name,
+                ScopePhase::from_deferred(self.query_inside_function()),
+            );
         }
         // Prefix (parent walk).
         let prefix = self.choose_prefix();
@@ -11777,12 +11072,15 @@ where
         }
         // Package contribution last among lexical bindings — keeps the streaming
         // visibility view aligned with the recursive resolver's depth-0
-        // `append_package_contribution`. The out-of-scope diagnostic collector
+        // `ScopeContributions`. The out-of-scope diagnostic collector
         // and any other `is_visible`-only consumers need this fallthrough;
         // otherwise a contribution-provided name would be misreported as "used
         // before available" relative to a forward `source()` that happens to
         // export the same name.
-        if self.contribution_has_symbol(name) {
+        if self.contributions.contains(
+            name,
+            ScopePhase::from_deferred(self.query_inside_function()),
+        ) {
             return true;
         }
         // Named search-path imports are fallback bindings below every lexical
@@ -12006,21 +11304,10 @@ where
             self.targets_pipeline_packages.iter().map(String::as_str),
         );
 
-        // Apply package-mode contribution at the queried URI, mirroring the
-        // recursive resolver's depth-0 injection. Keeping the call here (not
-        // inside `is_visible` / `symbol_for`) keeps the streaming fast path
-        // cheap; `contribution_has_symbol` applies the same strict/deferred
-        // gate using cached name sets.
-        if let Some(contrib) = self.package_contribution {
-            let contribution_uri = self.package_query_uri.unwrap_or(self.queried_uri);
-            append_package_contribution(
-                &mut scope,
-                contribution_uri,
-                contrib,
-                self.query_inside_function(),
-            );
-            append_rprofile_prelude(&mut scope, contribution_uri, contrib);
-        }
+        self.contributions.apply(
+            &mut scope,
+            ScopePhase::from_deferred(self.query_inside_function()),
+        );
 
         scope
             .named_search_path
@@ -12064,26 +11351,11 @@ where
                 return Some(sym);
             }
         }
-        // Package contribution fallthrough — matches the recursive
-        // resolver's depth-0 `or_insert_with`, where contribution
-        // symbols are added AFTER local timeline events (including rm).
-        // We return a synthetic `ScopedSymbol` whose `source_uri` is the
-        // shared package-internal URI; downstream consumers already
-        // recognize it via [`is_package_internal_uri`].
-        if self.contribution_has_symbol(name) {
-            let pkg_uri = Url::parse(PACKAGE_INTERNAL_URI)
-                .unwrap_or_else(|_| Url::parse("package:internal").unwrap());
-            let name_arc: Arc<str> = Arc::from(name);
-            return Some(ScopedSymbol {
-                name: name_arc,
-                kind: SymbolKind::Variable,
-                source_uri: pkg_uri,
-                defined_line: 0,
-                defined_column: 0,
-                defined_end_column: crate::utf16::utf16_len(name),
-                signature: None,
-                is_declared: false,
-            });
+        if let Some(symbol) = self.contributions.symbol_for(
+            name,
+            ScopePhase::from_deferred(self.query_inside_function()),
+        ) {
+            return Some(symbol);
         }
         for (_iv, frame) in self.function_stack.iter().rev() {
             if let Some(symbol) = frame.named_search_path.get(name) {
@@ -25163,7 +24435,7 @@ sapply(libs, library, character.only = TRUE)
     #[test]
     fn load_all_sentinel_out_of_root_query_file_gated() {
         // Query file is OUTSIDE the package root and itself calls load_all().
-        // The cheap query-file gate in `append_package_contribution` strips the
+        // The cheap query-file gate in `ScopeContributions` strips the
         // sentinel from the resolved package set.
         let contrib = crate::package_state::PackageScopeContribution {
             workspace_root: Some(std::path::PathBuf::from("/pkg")),
@@ -34452,7 +33724,7 @@ mod package_contribution_tests {
     /// Issue #432 leak guard: `tests/testit/` files do NOT source
     /// `tests/testthat/` preambles, so a testthat helper's attach must not be
     /// inherited by a testit sibling (the directory differs).
-    /// `visible_preamble_entries`' same-directory gate enforces this.
+    /// `ScopeContributions`' same-directory gate enforces this.
     #[test]
     fn helper_attached_package_does_not_leak_from_testthat_to_testit() {
         let contrib = make_contribution_with_helper_attaches(
@@ -34766,7 +34038,7 @@ mod package_contribution_tests {
     /// Issue #432 leak guard (definitions, PR #427): a `tests/testthat/`
     /// preamble's top-level defs must not leak to a `tests/testit/` sibling —
     /// testit does not source testthat preambles. The same-directory gate in
-    /// the shared `visible_preamble_entries` helper enforces this for defs
+    /// the shared `ScopeContributions` helper enforces this for defs
     /// exactly as it does for attaches.
     #[test]
     fn testthat_helper_defs_do_not_leak_to_testit() {
