@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// Build a package with ordered helpers, a test, and an unrelated report target.
 fn workspace(earlier: &str, later: &str, test: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("tests/testthat")).unwrap();
@@ -27,6 +28,8 @@ fn workspace(earlier: &str, later: &str, test: &str) -> TempDir {
     dir
 }
 
+/// Require the expected undefined-name findings and identical output when
+/// reporting the whole workspace or only its testthat directory.
 fn check_both_modes(root: &Path, expected: &[&str]) {
     let mut outputs = Vec::new();
     for explicit in [false, true] {
