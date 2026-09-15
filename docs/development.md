@@ -667,6 +667,26 @@ These are two **independent** concepts; do not re-conflate them:
 
 In `resolve_path_rich`, the `try_workspace_fallback` bool now gates **only** the workspace-root fallback; the case-leniency branches are unconditional. Backward resolution (`resolve_path` / `resolve_backward_path_rich`) passes `try_workspace_fallback = false` — gaining the leniency but never the fallback. The backward case-mismatch diagnostic (`collect_backward_case_mismatch_diagnostics_standalone` in `handlers.rs`) reuses the `source-path-case-mismatch` code and `caseMismatchSeverity` policy but with a message that does not claim R errors (R never executes a backward directive).
 
+### Testthat helper scope
+
+`visible_preamble_entries` in `cross_file/scope.rs` filters package-state
+helper/setup contributions to the queried directory and excludes the queried
+file itself. Symbol queries at top level use source order. Queries inside
+functions use all peers when `hoistGlobalsInFunctions` is enabled.
+Both the recursive resolver and `ScopeStream::snapshot` pass this query
+context. The stream's `is_visible` and `symbol_for` use a strict name set and
+lazily cache only additional peer-preamble names, keeping helper-map scans out
+of repeated name lookups. Leaving a function restores strict visibility even after that
+cache has been populated. Package-attachment seeding keeps its existing
+source-order semantics.
+
+The CLI keeps shared Rope snapshots of package R files from the complete scan
+before admitting documents to the bounded workspace index. It converts evicted
+files into package inputs and lets the shared hydration path supply resident
+files. Seeding only from resident documents loses helper and package definitions
+when unrelated files evict them. Both paths reuse scanned text and the shared
+R-file classifier, with no second disk read or duplicate text conversion.
+
 ### Parent-prefix scope and forward-source traversal
 
 Scope resolution has two distinct graph traversals:
