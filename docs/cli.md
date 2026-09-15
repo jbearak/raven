@@ -54,6 +54,10 @@ The workspace is indexed, except for paths matched by `[workspace].exclude`, so 
 - With no `PATHS`, every included R file and standalone `.jags`, `.bugs`, `.bug`, or `.stan` program in the workspace is reported.
 - With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files and standalone `.jags`, `.bugs`, `.bug`, or `.stan` programs. Extension matching is case-insensitive. `.stanfunctions` files are excluded because they are include fragments rather than standalone programs. Indexing still covers the included workspace, so a reported R file's `source()` targets resolve even when they aren't named.
 
+Package definitions and testthat helpers remain available when the workspace
+exceeds the document-cache limit. Unrelated files in a large vendored tree do
+not remove those definitions from package scope.
+
 Model files remain discoverable targets even though their diagnostics default
 to off. Enable `[diagnostics] jags = "on"` for syntax-only JAGS/BUGS
 checking and `[diagnostics] stan = "on"` for Stan syntax plus conservative

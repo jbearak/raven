@@ -1719,8 +1719,9 @@ pub struct PackageScopeContribution {
     /// when querying that file (otherwise a `use_x()` line earlier in the
     /// file would falsely see `x <- ...` defined later in the same file).
     ///
-    /// Visible from any file under `<root>/tests/testthat/` — peer preamble
-    /// files see earlier-sourced ones and `test-*.R` files see them all.
+    /// Visible from files in the same `<root>/tests/testthat/` directory.
+    /// Top-level preamble code sees earlier-sourced peers; late-bound function
+    /// bodies and `test-*.R` files see all peers.
     /// Never injected into files under `R/`. Mirrors `r_internal_symbols`
     /// but with the opposite visibility direction.
     ///
@@ -1739,8 +1740,8 @@ pub struct PackageScopeContribution {
     /// file's `inherited_packages` (NOT to the symbol set — their exports are
     /// resolved by the package library like any other attached package).
     ///
-    /// Keyed by path — and consumed with the same source-order gate as
-    /// `test_helper_symbols` — so a preamble file only inherits attaches from
+    /// Keyed by path and consumed with the top-level source-order gate for
+    /// `test_helper_symbols`, so a preamble file only inherits attaches from
     /// preamble files testthat sources strictly before it, and a preamble
     /// file's own attach is left to the standard position-aware `library()`
     /// path (never re-injected). Visible from any file under

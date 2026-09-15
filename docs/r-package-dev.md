@@ -98,11 +98,16 @@ files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
   because by the time a test runs all helper and setup files have been
   sourced. For example, a setup file defining `CLEAN <- SETUP <- FALSE` makes
   both `CLEAN` and `SETUP` visible to every test file.
-- Between helper/setup files, visibility follows sourcing order: a file sees
-  earlier-sourced peers but not later ones. Helpers are sourced before setup
-  files, and each group in `sort()` order — so `helper-b.R` sees
-  `helper-a.R`'s top-level defs but not `helper-c.R`'s, and every setup file
-  sees all helpers.
+- Top-level code in helper/setup files sees definitions from earlier-sourced
+  peers. Helpers are sourced before setup files, and each group in `sort()`
+  order, so a top-level call in `helper-b.R` can use `helper-a.R`'s definitions
+  but cannot use `helper-c.R`'s.
+- Function bodies in helper/setup files see definitions from every helper
+  and setup file in the same directory. Tests call these functions after the
+  preamble has finished, and R looks up those names when the function runs.
+  For example, `f <- function() later_helper()` in `helper-a.R` can refer to
+  `later_helper` defined in `helper-z.R`. This follows Raven's global-hoisting
+  setting; disabling it keeps source-order visibility inside functions too.
 - Helper/setup files are matched by filename only at the top level of
   `tests/testthat/`; files in subdirectories (e.g.
   `tests/testthat/sub/helper-x.R`) are not auto-sourced by testthat and
@@ -137,8 +142,8 @@ only enable qualified `pkg::fn` access), a `library()` call nested inside a
 function body does not attach until that function runs, and a call captured by a
 quoting wrapper (`quote()`, `bquote()`, `rlang::expr()`, …) is never evaluated —
 so none of these propagate.
-These attaches follow the same visibility rules as the defs above: source-order
-between preamble files, visible to test files **in the same directory**
+These attaches follow source order between preamble files and are visible to
+test files **in the same directory**
 (`tests/testthat/` preambles never reach `tests/testit/` siblings, which don't
 source them), and **never** propagated into `R/`.
 

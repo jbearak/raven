@@ -696,19 +696,34 @@ fn build_indexed_state(
         max_chain_depth,
         &state.workspace_exclusions,
     );
+    // Preserve package text before bounded index admission can evict helpers.
+    // Rope clones share their storage. Materialize and hash only evicted files
+    // below; shared package hydration already supplies every resident file.
+    let scanned_package_files: Vec<_> = entries
+        .iter()
+        .filter_map(|(uri, entry)| {
+            let path = uri.to_file_path().ok()?;
+            let kind = crate::package_state::is_r_source_path(&path, root)?;
+            Some((uri.clone(), path, kind, entry.contents.clone()))
+        })
+        .collect();
     state.apply_workspace_index(entries);
+    let evicted_package_inputs = scanned_package_files
+        .into_iter()
+        .filter(|(uri, ..)| !state.workspace_index.contains(uri))
+        .map(|(_, path, kind, contents)| {
+            (
+                path,
+                crate::backend::package_r_file_input_from_text(contents.to_string().into(), kind),
+            )
+        })
+        .collect();
 
     // Derive package-mode scope (so `R/*.R` files in an R package see each
     // other's top-level definitions without explicit `source()`). This is
     // independent of the R subprocess — it's derived from the workspace files,
-    // DESCRIPTION, and NAMESPACE — but MUST run after `apply_workspace_index`,
-    // which resets package state.
-    //
-    // The disk seed is empty: `initialize_package_inputs_from_state_with_exclusions` hydrates
-    // every package R file from the workspace index we just applied, so reading
-    // them from disk here would only be overwritten. This mirrors the LSP's
-    // with-scan startup path, which seeds package inputs from disk only on the
-    // no-scan branch (see `backend.rs`).
+    // DESCRIPTION, and NAMESPACE. Combine the preserved evicted inputs with
+    // hydration from the resident index so cache capacity cannot lose names.
     let desc_text: Option<std::sync::Arc<str>> = std::fs::read_to_string(root.join("DESCRIPTION"))
         .ok()
         .map(|t| t.into());
@@ -721,7 +736,7 @@ fn build_indexed_state(
         root.to_path_buf(),
         desc_text,
         ns_text,
-        Default::default(),
+        evicted_package_inputs,
         // `raven check` is a single-pass batch with no concurrent writers, so
         // both `None`s let the helper scan `.Rprofile` and the testthat
         // preamble inline (no off-lock precompute needed for either). See

@@ -3695,7 +3695,8 @@ fn collect_package_r_file_inputs_from_disk_with_exclusions(
     r_files
 }
 
-fn package_r_file_input_from_text(
+/// Capture package-source text and its matching content digest.
+pub(crate) fn package_r_file_input_from_text(
     text: std::sync::Arc<str>,
     kind: crate::package_state::RFileKind,
 ) -> crate::package_state::RFileInput {
