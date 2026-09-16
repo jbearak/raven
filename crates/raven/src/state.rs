@@ -1280,6 +1280,14 @@ pub struct WorldState {
     /// Resolved path of the project config currently in effect, if any.
     /// Reported via `raven/projectConfigLoaded` to the client.
     pub project_config_path: Option<PathBuf>,
+    /// Parsed project-only box override; written by config recomputation.
+    pub(crate) box_search_paths: crate::box_use::search_path::SearchPaths,
+    box_search_generation: u64,
+    /// Inherited environment, captured once when this server/CLI state starts.
+    pub(crate) startup_box_search_paths: crate::box_use::search_path::SearchPaths,
+    /// Client support and the successfully registered external box roots.
+    pub(crate) supports_box_path_watches: bool,
+    pub(crate) box_watched_roots: Vec<PathBuf>,
 
     /// Compiled `[[linting.overrides]]` entries. Empty when no overrides
     /// are configured. Per-document resolution scans this list.
@@ -1817,6 +1825,7 @@ enum OpenLifecycleIntentState {
 /// the per-URI token map the derivation CAS keeps is not repeated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanAuthorityStamp {
+    box_search_generation: u64,
     scan_generation: u64,
     tar_source_event_generation: u64,
     analysis_config_generation: AnalysisConfigGeneration,
@@ -1914,6 +1923,7 @@ struct ChunkOverrideGeneration(u64);
 /// allowing an older driver to rebase onto the newer request.
 #[derive(Clone)]
 pub(crate) struct WorkspaceScanInputBasis {
+    box_search_generation: u64,
     intent: WorkspaceScanIntentToken,
     scan_generation: u64,
     tar_source_event_generation: u64,
@@ -2004,6 +2014,7 @@ struct SystemFileRoutingStamp {
 
 #[derive(Clone, PartialEq, Eq)]
 struct AnalysisConfigStamp {
+    box_search_generation: u64,
     workspace_folders: Vec<Url>,
     max_chain_depth: usize,
     max_forward_depth: usize,
@@ -3404,6 +3415,7 @@ pub(crate) struct PreparedOpenAliasReconcileAnalysis {
 /// after the lock is dropped.
 #[derive(Clone)]
 pub(crate) struct CapturedOpenMetadataAnalysis {
+    pub(crate) box_context: crate::box_use::search_path::SearchPathContext,
     basis: AnalysisBasis,
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
@@ -4223,6 +4235,65 @@ impl LibpathWatcherSwapBasis {
 }
 
 impl WorldState {
+    /// Snapshot project box inputs without disk I/O or R parsing. Alias routing
+    /// follows the authoritative open profile; closed text is read off-lock.
+    pub(crate) fn box_search_context(&self) -> crate::box_use::search_path::SearchPathContext {
+        let profile = self
+            .workspace_folders
+            .first()
+            .and_then(|uri| uri.to_file_path().ok())
+            .map(|root| root.join(".Rprofile"))
+            .filter(|path| {
+                !self.workspace_exclusions.is_excluded_path(path)
+                    && !self.workspace_exclusions.is_gitignored(path, false)
+            })
+            .map(|path| {
+                let text = Url::from_file_path(&path)
+                    .ok()
+                    .and_then(|uri| self.open_document_uri_for_authoritative_uri(&uri))
+                    .and_then(|uri| self.documents.get(&uri).map(|doc| doc.contents.clone()));
+                (path, text)
+            });
+        crate::box_use::search_path::SearchPathContext::new(
+            &self.box_search_paths,
+            &self.startup_box_search_paths,
+            profile,
+        )
+        .with_generation((
+            self.analysis_config_generation.0,
+            self.box_search_generation,
+        ))
+    }
+
+    /// Retire detached module-path work without cancelling unrelated diagnostics.
+    pub(crate) fn advance_box_search_generation(&mut self) {
+        self.box_search_generation = self.box_search_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn is_box_profile_uri(&self, uri: &Url) -> bool {
+        self.workspace_folders
+            .first()
+            .and_then(|root| root.to_file_path().ok())
+            .is_some_and(|root| {
+                let path = root.join(".Rprofile");
+                uri.to_file_path().is_ok_and(|candidate| candidate == path)
+                    || self.authoritative_open_uri_for_path(uri, &path).is_some()
+            })
+    }
+
+    pub(crate) fn box_search_context_for_document(
+        &self,
+        uri: &Url,
+        text: &Rope,
+    ) -> crate::box_use::search_path::SearchPathContext {
+        let context = self.box_search_context();
+        if self.is_box_profile_uri(uri) {
+            context.with_profile_text(text.clone())
+        } else {
+            context
+        }
+    }
+
     /// Whether the complete package seed/library/routing record installed by a
     /// seed transaction is still the current owner.
     pub(crate) fn package_seed_installed_identity_is_current(
@@ -6234,6 +6305,7 @@ impl WorldState {
             return None;
         }
         Some(WorkspaceScanInputBasis {
+            box_search_generation: self.box_search_generation,
             intent,
             scan_generation: self.workspace_scan_generation,
             tar_source_event_generation: self.tar_source_event_generation,
@@ -6268,6 +6340,7 @@ impl WorldState {
     /// scan driver's quiet-window wait; not a substitute for the full CAS.
     pub(crate) fn workspace_scan_authority_stamp(&self) -> WorkspaceScanAuthorityStamp {
         WorkspaceScanAuthorityStamp {
+            box_search_generation: self.box_search_generation,
             scan_generation: self.workspace_scan_generation,
             tar_source_event_generation: self.tar_source_event_generation,
             analysis_config_generation: self.analysis_config_generation,
@@ -6293,6 +6366,7 @@ impl WorldState {
     ) -> bool {
         self.workspace_scan_intent_is_current(basis.intent)
             && self.workspace_scan_generation == basis.scan_generation
+            && self.box_search_generation == basis.box_search_generation
             && self.tar_source_event_generation == basis.tar_source_event_generation
             && self.analysis_config_generation == basis.analysis_config_generation
             && self.chunk_override_generation == basis.chunk_override_generation
@@ -7652,6 +7726,11 @@ impl WorldState {
             raw_client_settings: serde_json::Value::Object(serde_json::Map::new()),
             raw_project_settings: None,
             project_config_path: None,
+            box_search_paths: Default::default(),
+            box_search_generation: 0,
+            startup_box_search_paths: crate::box_use::search_path::SearchPaths::startup(),
+            supports_box_path_watches: false,
+            box_watched_roots: Vec::new(),
             lint_overrides: Vec::new(),
             merged_linting_section: serde_json::json!({}),
             effective_lint_config_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -8783,6 +8862,7 @@ impl WorldState {
             package_config_generation: self.package_config_generation,
             system_file_routing: self.system_file_routing_stamp(),
             analysis_config: AnalysisConfigStamp {
+                box_search_generation: self.box_search_generation,
                 workspace_folders: self.workspace_folders.clone(),
                 max_chain_depth: self.cross_file_config.max_chain_depth,
                 max_forward_depth: self.cross_file_config.max_forward_depth,
@@ -9109,6 +9189,7 @@ impl WorldState {
         let (workspace_name, package_workspace_root, library_paths) =
             self.snapshot_system_file_inputs();
         Some(CapturedOpenMetadataAnalysis {
+            box_context: self.box_search_context(),
             basis,
             uri: uri.clone(),
             expected,
@@ -9255,6 +9336,7 @@ impl WorldState {
         basis.system_file_routing == self.system_file_routing_stamp()
             && basis.analysis_config
                 == (AnalysisConfigStamp {
+                    box_search_generation: self.box_search_generation,
                     workspace_folders: self.workspace_folders.clone(),
                     max_chain_depth: self.cross_file_config.max_chain_depth,
                     max_forward_depth: self.cross_file_config.max_forward_depth,
@@ -13032,6 +13114,27 @@ pub fn scan_workspace_with_exclusions(
     max_chain_depth: usize,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> WorkspaceScanResult {
+    let profile = folders
+        .first()
+        .and_then(|uri| uri.to_file_path().ok())
+        .map(|root| root.join(".Rprofile"))
+        .filter(|path| !exclusions.is_excluded_path(path) && !exclusions.is_gitignored(path, false))
+        .map(|path| (path, None));
+    let context = crate::box_use::search_path::SearchPathContext::new(
+        &Default::default(),
+        &Default::default(),
+        profile,
+    );
+    scan_workspace_with_box_context(folders, max_chain_depth, exclusions, &context)
+}
+
+/// Workspace ingestion with the exact captured configuration and startup inputs.
+pub(crate) fn scan_workspace_with_box_context(
+    folders: &[Url],
+    max_chain_depth: usize,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
     // Get workspace root for path resolution
@@ -13138,24 +13241,33 @@ pub fn scan_workspace_with_exclusions(
         }
     }
 
-    for (uri, entry) in &mut entries {
+    // Explicit module edges may leave the workspace (shared libraries). Follow
+    // only referenced files, never recursively scan configured search roots.
+    // Bound both depth and discovery count, and keep each URI at most once.
+    let mut module_queue: std::collections::VecDeque<_> =
+        entries.keys().cloned().map(|uri| (uri, 0)).collect();
+    let mut module_seen: HashSet<Url> = entries.keys().cloned().collect();
+    let mut discovered_modules = 0;
+    while let Some((uri, depth)) = module_queue.pop_front() {
+        let entry = entries.get_mut(&uri).expect("queued module was installed");
         let metadata = Arc::make_mut(&mut entry.metadata);
         let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             metadata,
-            uri,
+            &uri,
             workspace_root.as_ref(),
             exclusions,
         );
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             metadata,
-            uri,
+            &uri,
             workspace_root.as_ref(),
+            box_context,
         );
         let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
+        entry.artifacts = Arc::new(if file_type_from_uri(&uri) == FileType::R {
             match entry.tree.as_ref() {
                 Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-                    uri,
+                    &uri,
                     tree,
                     &analysis,
                     Some(entry.metadata.as_ref()),
@@ -13165,6 +13277,29 @@ pub fn scan_workspace_with_exclusions(
         } else {
             crate::cross_file::scope::ScopeArtifacts::default()
         });
+        if depth < max_chain_depth {
+            let targets: Vec<_> = entry
+                .metadata
+                .selective_import_requests(&uri)
+                .filter_map(|request| request.source.local_module_uri().cloned())
+                .collect();
+            for target in targets {
+                if discovered_modules >= 50_000 || !module_seen.insert(target.clone()) {
+                    continue;
+                }
+                discovered_modules += 1;
+                let Ok(path) = target.to_file_path() else {
+                    continue;
+                };
+                if exclusions.is_excluded_path(&path) {
+                    continue;
+                }
+                if let Some(item) = process_workspace_file(&path) {
+                    entries.insert(item.uri.clone(), item.entry);
+                    module_queue.push_back((item.uri, depth + 1));
+                }
+            }
+        }
     }
 
     log::info!("Scanned {} workspace files", entries.len());

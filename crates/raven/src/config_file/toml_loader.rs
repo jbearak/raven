@@ -226,6 +226,7 @@ fn toml_to_json(value: toml::Value) -> Value {
 }
 
 const KNOWN_TOP_LEVEL: &[&str] = &[
+    "box",
     "linting",
     "crossFile",
     "packages",

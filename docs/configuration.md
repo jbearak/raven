@@ -18,7 +18,7 @@ Per-key. For each setting, project values win over the LSP client's `initializat
 
 ### Schema
 
-Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `workspace`, `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
+Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `workspace`, `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`, `box`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
 
 ```toml
 [workspace]
@@ -100,7 +100,7 @@ Explicit CLI file arguments bypass `[workspace].exclude`: `raven check generated
 
 ### Live reload
 
-In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[workspace]` (`exclude`), `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
+In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[workspace]` (`exclude`), `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`, `[box]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
 
 Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
 
@@ -192,7 +192,7 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Command | File | Contents |
 |---|---|---|
-| `Raven: Create raven.toml` | `raven.toml` | A starter linting-focused project config at the workspace root, with the `[linting]` keys Raven maps from VS Code settings. Add other sections from this reference as needed (`crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`) |
+| `Raven: Create raven.toml` | `raven.toml` | A starter linting-focused project config at the workspace root, with the `[linting]` keys Raven maps from VS Code settings. Add other sections from this reference as needed (`crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`, `box`) |
 | `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
 | `Raven: Create linting settings` | `.vscode/settings.json` | Every project-scoped `raven.linting.*` key Raven maps to `raven.toml`, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments, preserves client-only linting settings such as `raven.linting.readHomeLintr`, and prompts before overwriting an existing project-scoped `raven.linting.*` block |
 
@@ -305,3 +305,17 @@ To disable an individual rule while leaving the rest enabled, set its severity t
 | Setting | Default | Description |
 |---|---|---|
 | `raven.server.path` | `""` | Path to the `raven` binary. Empty by default, in which case the bundled binary is used. |
+
+## Box module search paths
+
+```toml
+[box]
+searchPaths = ["modules", "../shared-r"]
+```
+
+This project-only setting overrides startup `R_BOX_PATH`, inferred project
+`.Rprofile` paths, and Rhino's default root. Entries are relative to the config
+file's directory. An empty list searches only the importing file's directory.
+The setting changes Raven's static analysis, not R's configuration. Reloading or
+removing it refreshes module imports. See [modules](modules.md) for precedence,
+automatic inputs, and external-directory watching.

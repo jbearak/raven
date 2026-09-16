@@ -6022,10 +6022,10 @@ fn hash_box_import_interface<H: std::hash::Hasher>(
             up_levels.hash(state);
             components.hash(state);
         }
-        BoxSpec::SearchPathModule { components, root } => {
+        BoxSpec::SearchPathModule { components, roots } => {
             3u8.hash(state);
             components.hash(state);
-            root.hash(state);
+            roots.hash(state);
         }
         BoxSpec::Unsupported(raw) => {
             2u8.hash(state);

@@ -2785,7 +2785,9 @@ pub(crate) fn arguments_explicitly_target_global(arguments: Node, content: &str)
     })
 }
 
-fn visit_evaluated_capture_parts_for_invalidation<'tree>(
+/// Visit evaluated and possibly evaluated capture parts for conservative invalidation.
+/// The final callback flag marks effects whose execution is definite.
+pub(crate) fn visit_evaluated_capture_parts_for_invalidation<'tree>(
     call: Node<'tree>,
     content: &str,
     kind: CapturingCallKind,

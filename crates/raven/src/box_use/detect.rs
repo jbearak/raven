@@ -415,7 +415,7 @@ fn classify_module(module_str: &str) -> BoxSpec {
     match components {
         Some(components) => BoxSpec::SearchPathModule {
             components,
-            root: None,
+            roots: None,
         },
         None => BoxSpec::Unsupported(module_str.trim().to_string()),
     }
@@ -639,7 +639,7 @@ mod tests {
             spec,
             BoxSpec::SearchPathModule {
                 components: vec!["app".into(), "logic".into(), "say_hello".into()],
-                root: None,
+                roots: None,
             }
         );
         assert_eq!(spec.default_alias().as_deref(), Some("say_hello"));

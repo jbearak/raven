@@ -126,6 +126,11 @@ pub fn merged_settings(state: &crate::state::WorldState) -> serde_json::Value {
 }
 
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
+    let previous_box_paths = state.box_search_paths.clone();
+    state.box_search_paths = crate::box_use::search_path::SearchPaths::project(
+        state.raw_project_settings.as_ref(),
+        state.project_config_path.as_deref(),
+    );
     let previous_cross_file = state.cross_file_config.clone();
     let previous_lint = state.lint_config.clone();
     let previous_linting_section = state.merged_linting_section.clone();
@@ -242,6 +247,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         .cross_file_config
         .analysis_settings_changed(&previous_cross_file)
         || state.lint_config != previous_lint
+        || state.box_search_paths != previous_box_paths
         || state.merged_linting_section != previous_linting_section
         || state.indentation_producer_policy != previous_indentation_producer_policy
         || state.workspace_exclusions.patterns() != previous_exclusions
