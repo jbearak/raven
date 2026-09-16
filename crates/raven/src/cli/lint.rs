@@ -262,6 +262,8 @@ fn run_with_cwd_and_options(
         crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
     let base_section = merged.get("linting").cloned().unwrap_or(json!({}));
     let overrides = crate::config_file::compile_lint_overrides(&merged, &root);
+    let mut exclusions = crate::config_file::compile_workspace_exclusions(&merged, [root.clone()]);
+    exclusions.refresh_gitignore();
 
     let mut diagnostics: Vec<(PathBuf, Diagnostic)> = Vec::new();
     let mut operator_error = false;
@@ -272,15 +274,34 @@ fn run_with_cwd_and_options(
             cwd.join(p)
         }
     }) {
-        walk(
-            &p,
-            &root,
-            &base_section,
-            &lint_config,
-            &overrides,
-            &mut diagnostics,
-            &mut operator_error,
-        );
+        let mut targets = Vec::new();
+        if p.is_dir() {
+            let p = p.canonicalize().unwrap_or(p);
+            let exclusions = exclusions.for_discovery_directory(&p);
+            let errors = crate::state::collect_files_matching_for_discovery_with_errors(
+                &p,
+                &mut targets,
+                |path| is_r_file(path) || is_chunk_file(path),
+                &exclusions,
+            );
+            for (path, error) in errors {
+                eprintln!("raven lint: cannot read dir {}: {error}", path.display());
+                operator_error = true;
+            }
+        } else {
+            targets.push(p);
+        }
+        for target in targets {
+            walk(
+                &target,
+                &root,
+                &base_section,
+                &lint_config,
+                &overrides,
+                &mut diagnostics,
+                &mut operator_error,
+            );
+        }
     }
     if operator_error {
         return EXIT_OPERATOR_ERROR;

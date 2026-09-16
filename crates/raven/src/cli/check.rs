@@ -671,6 +671,7 @@ fn build_indexed_state(
     // It reads `project_config_path` to detect a discovered `.lintr` and gate
     // its auto-enable (which, for the CLI's empty client layer, defaults on).
     crate::config_file::recompute_parsed_configs(&mut state);
+    state.workspace_exclusions.refresh_gitignore();
 
     // A model switch that fails closed is otherwise silent here: the recompute
     // logs it, but the CLI runs without a logger by default, so `stan = "On"`

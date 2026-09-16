@@ -56,6 +56,9 @@ pub fn scan_workspace_rprofile_with_exclusions(
     workspace_root: &Path,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> RprofileScan {
+    if exclusions.is_gitignored(&workspace_root.join(".Rprofile"), false) {
+        return RprofileScan::default();
+    }
     if exclusions.is_empty() {
         return scan_workspace_rprofile(workspace_root);
     }

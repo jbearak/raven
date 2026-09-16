@@ -27,6 +27,7 @@ const TOML_SECTIONS = new Set([
   "indentation",
   "symbols",
   "completion",
+  "workspace",
 ]);
 
 // Server-side knobs the language server reads from `initializationOptions` /
@@ -72,6 +73,7 @@ const DOC_LINKS = {
   help: "help-viewer.md",
   server: "configuration.md",
   trace: "configuration.md",
+  workspace: "configuration.md",
 };
 
 const DOC_LINK_OVERRIDES = {

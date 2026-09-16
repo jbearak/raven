@@ -327,6 +327,28 @@ Keep new scan inputs in the shared two-phase basis so startup, exclusion
 reloads, and package-mode rebuilds cannot drift or introduce blocking
 filesystem work under the state lock.
 
+Discovery uses an immutable `.gitignore` snapshot (`discovery.rs`, backed by the
+Rust `ignore` crate), carried alongside—but evaluated separately from—the
+stronger project exclusions. Snapshots load directory rules and absent-file
+contexts off-lock; matching never reads disk. Nested rule chains share `Arc`s,
+and symlink aliases reuse physical-directory matchers with lexical rule bases.
+The workspace walk retains its hidden/vendor pruning and symlink-cycle policy.
+Package scanners retain their own traversal domains and prune ignored trees
+before capturing file contents.
+
+`begin_discovery_refresh` and `install_discovery_refresh` fence workspace scans,
+analysis/close/watch candidates, and package seeds. Package seed targets compare
+the exact snapshot revision too, so retrying with an old policy cannot acquire
+fresh generation stamps and resurrect ignored inputs. Discovery ownership is
+rooted: eligible files and open buffers retain explicit forward targets and
+backward-directive parents; unrooted ignored cycles are removed. Watch batches
+compute ownership once. Close-time ownership probes cap both scheduled nodes and
+inspected edges at the smaller of the configured visited limit and 4,096, using
+borrowed adjacency iterators. Budget exhaustion retains the file until exact
+batched orphan cleanup after the authoritative close. `.gitignore` watches cover
+every workspace recursively and exact ancestor locations, including absent files. Changes inside pruned
+trees do not trigger a rebuild.
+
 The scan driver (`run_workspace_scan_transaction_using` in `backend.rs`) makes
 up to `WORKSPACE_SCAN_ATTEMPT_LIMIT` full attempts per intent. The derivation
 basis is invalidated by any open-document commit, so on a large workspace a

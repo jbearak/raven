@@ -214,7 +214,8 @@ pub fn collect_r_file_paths_with_exclusions(
     out: &mut Vec<PathBuf>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
-    crate::state::collect_files_matching_with_exclusions(dir, out, is_r_file, exclusions);
+    let exclusions = exclusions.for_discovery_directory(dir);
+    crate::state::collect_files_matching_for_discovery(dir, out, is_r_file, &exclusions);
 }
 
 /// Recursively collect R sources, chunk-bearing documents, and standalone JAGS
@@ -238,11 +239,12 @@ pub fn collect_check_target_paths_with_exclusions(
     out: &mut Vec<PathBuf>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
-    crate::state::collect_files_matching_with_exclusions(
+    let exclusions = exclusions.for_discovery_directory(dir);
+    crate::state::collect_files_matching_for_discovery(
         dir,
         out,
         |p| is_r_file(p) || is_chunk_file(p) || is_jags_file(p) || is_stan_file(p),
-        exclusions,
+        &exclusions,
     );
 }
 

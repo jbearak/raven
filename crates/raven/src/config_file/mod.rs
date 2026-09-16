@@ -130,6 +130,7 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let previous_lint = state.lint_config.clone();
     let previous_linting_section = state.merged_linting_section.clone();
     let previous_exclusions = state.workspace_exclusions.patterns().to_vec();
+    let previous_respect_gitignore = state.workspace_exclusions.respect_gitignore();
     // Read the CACHED derived policy, not a fresh derivation, and not the raw
     // `indentation_config`.
     //
@@ -224,7 +225,9 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     if let Ok(mut cache) = state.effective_lint_config_cache.lock() {
         cache.clear();
     }
-    state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
+    let mut exclusions = compile_workspace_exclusions(&merged, workspace_roots);
+    exclusions.inherit_gitignore(&state.workspace_exclusions);
+    state.workspace_exclusions = exclusions;
 
     // This is the sole parsed-config writer. Advance the typed authority only
     // after every parsed analysis field and compiled exclusion has been
@@ -241,7 +244,8 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         || state.lint_config != previous_lint
         || state.merged_linting_section != previous_linting_section
         || state.indentation_producer_policy != previous_indentation_producer_policy
-        || state.workspace_exclusions.patterns() != previous_exclusions;
+        || state.workspace_exclusions.patterns() != previous_exclusions
+        || state.workspace_exclusions.respect_gitignore() != previous_respect_gitignore;
     if analysis_changed {
         state.cross_file_revalidation.cancel_all();
         state.advance_analysis_config_generation();
@@ -254,6 +258,21 @@ mod tests {
     use crate::state::WorldState;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn respect_gitignore_defaults_on_and_project_overrides_client() {
+        let mut state = WorldState::new();
+        state.workspace_folders =
+            vec![tower_lsp::lsp_types::Url::parse("file:///workspace").unwrap()];
+        recompute_parsed_configs(&mut state);
+        assert!(state.workspace_exclusions.respect_gitignore());
+        state.raw_client_settings = json!({"workspace": {"respectGitignore": false}});
+        recompute_parsed_configs(&mut state);
+        assert!(!state.workspace_exclusions.respect_gitignore());
+        state.raw_project_settings = Some(json!({"workspace": {"respectGitignore": true}}));
+        recompute_parsed_configs(&mut state);
+        assert!(state.workspace_exclusions.respect_gitignore());
+    }
 
     fn state_with(
         client: serde_json::Value,

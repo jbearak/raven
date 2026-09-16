@@ -49,7 +49,7 @@ Diagnostics reported (subject to configured severities — see [diagnostics.md](
 
 ### Workspace and paths
 
-The workspace is indexed, except for paths matched by `[workspace].exclude`, so cross-file resolution is accurate for included files. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
+The workspace is indexed, except for automatically discovered paths ignored by `.gitignore` or `[workspace].exclude`, so cross-file resolution is accurate for included files. Directly resolved `source()` targets bypass `.gitignore`. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
 
 - With no `PATHS`, every included R file and standalone `.jags`, `.bugs`, `.bug`, or `.stan` program in the workspace is reported.
 - With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files and standalone `.jags`, `.bugs`, `.bug`, or `.stan` programs. Extension matching is case-insensitive. `.stanfunctions` files are excluded because they are include fragments rather than standalone programs. Indexing still covers the included workspace, so a reported R file's `source()` targets resolve even when they aren't named.
@@ -81,6 +81,14 @@ strict JAGS-dialect validation, not general OpenBUGS, WinBUGS, MultiBUGS, or
 NIMBLE compatibility. Stan undeclared-variable findings use a separate fixed
 500-per-file semantic bound and the configured undefined-variable severity; the
 syntax cap does not affect them.
+
+`.gitignore` is respected by default for directory/default discovery in `check`
+and `lint`, and by `analysis-stats`. Explicit file arguments bypass this filter.
+`--no-config` still respects `.gitignore`; set `[workspace] respectGitignore = false`
+in `raven.toml` to disable it. `analysis-stats` discovers project configuration from
+its target directory and honors both `workspace.respectGitignore` and
+`workspace.exclude`. Exclusion patterns are relative to the configuration file's
+directory; profiling still scans only the requested target.
 
 `raven.toml` can exclude generated or vendored trees from discovery:
 

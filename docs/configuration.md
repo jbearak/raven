@@ -62,6 +62,30 @@ are specified in [Shared project configuration schema](shared-config-schema.md).
 
 ### Project exclusions
 
+Automatic discovery respects `.gitignore` by default: workspace indexing, CLI
+directory scans, package R definitions, testthat helpers, `.Rprofile`, and data
+harvesting omit ignored files. Explicit CLI file arguments, open editor buffers,
+and directly resolved dependencies (including files sourced by a prelude) still
+work. Closing an ignored buffer removes its buffer-only contribution unless an
+eligible file still needs it as a dependency.
+
+To disable this policy, set `raven.workspace.respectGitignore = false` in the
+editor or use the project override:
+
+```toml
+[workspace]
+respectGitignore = false
+```
+
+Raven reads root and nested `.gitignore` files, plus ancestors up to the nearest
+`.git` file or directory. Without a repository marker, inheritance starts at the
+workspace root. Matching is case-sensitive; the deepest workspace folder owns
+overlapping paths. Git-style negation cannot re-include a child of an ignored
+directory, override `workspace.exclude`, or restore directories pruned by the
+workspace walker. Symlinked `.gitignore` files are not followed. Git need not be
+installed: tracked-file status, global Git excludes, and `.git/info/exclude` are
+not consulted. Ignore-file edits and setting changes refresh discovery live.
+
 `[workspace].exclude` is a `raven.toml`-only list of project-root-relative globs. It is not exposed as a VS Code/LSP client setting. The default is `[]`.
 
 These exclusions are broader than lint overrides: Raven ignores matching files for background workspace indexing, dependency discovery, file-watcher/on-demand indexing, package-mode disk seeding, and default `raven check` discovery. Existing index entries that become excluded after a live `raven.toml` reload are removed from Raven's indexes and dependency graph.

@@ -48,6 +48,7 @@ export interface RavenWorkspaceConfiguration {
  * `parse_cross_file_config()` and related parsing functions.
  */
 export interface RavenInitializationOptions {
+    workspace?: { respectGitignore?: boolean };
     /**
      * VS Code resources represented by a tab or visible peek editor at LSP
      * startup. This is client state, not a user-configurable Raven setting.
@@ -196,6 +197,10 @@ export function getInitializationOptions(
 ): RavenInitializationOptions {
     const options: RavenInitializationOptions = {};
 
+    const respectGitignore = getExplicitSetting<boolean>(config, 'workspace.respectGitignore');
+    if (respectGitignore !== undefined) {
+        options.workspace = { respectGitignore };
+    }
     const backwardDependencies = getExplicitSetting<"auto" | "explicit">(config, 'crossFile.backwardDependencies');
     const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
     const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
