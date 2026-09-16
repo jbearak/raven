@@ -1,54 +1,41 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { describe, expect, test } from "bun:test";
 
 const repoRoot = path.resolve(__dirname, "..", "..");
-const perfWorkflow = readFileSync(
+const workflow = readFileSync(
   path.join(repoRoot, ".github", "workflows", "perf.yml"),
   "utf8",
 );
 
-function stepNamed(name: string): string {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = perfWorkflow.match(
-    new RegExp(
-      `^      - name: ${escaped}\\n(?<body>.*?)(?=^      - name: |(?![\\s\\S]))`,
-      "ms",
-    ),
-  );
-  if (!match?.groups?.body) {
-    throw new Error(`Missing perf.yml step named ${name}`);
-  }
-  return match.groups.body;
-}
-
-describe("perf workflow criterion baseline cache", () => {
-  test("PR benchmark runs restore baselines without saving branch-scoped caches", () => {
-    const restore = stepNamed("Restore Criterion baseline cache");
-    expect(restore).toContain("uses: actions/cache/restore@");
-    expect(restore).toContain("path: target/criterion");
-    expect(restore).toContain("criterion-main-baseline-v2-${{ runner.os }}-main-");
-    expect(restore).toContain("restore-keys:");
-    expect(restore).not.toContain("criterion-baseline-${{ runner.os }}-");
-
-    const save = stepNamed("Save Criterion baseline cache");
-    expect(save).toContain("uses: actions/cache/save@");
-    expect(save).toContain(
-      "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
-    );
-    expect(save).toContain("path: target/criterion");
-    expect(save).toContain("criterion-main-baseline-v2-${{ runner.os }}-main-");
+describe("performance comparison", () => {
+  test("uses the exact event base and never restores cached measurements", () => {
+    expect(workflow).toContain("github.event.pull_request.base.sha || github.event.before");
+    expect(workflow).toContain("--base .perf-base --candidate .");
+    expect(workflow).toContain("--threshold 5");
+    expect(workflow).not.toContain("criterion-main-baseline");
+    expect(workflow).not.toContain("path: target/criterion");
+    expect(workflow).not.toContain("critcmp");
+    expect(workflow).not.toContain("continue-on-error");
+    expect(workflow).not.toContain("pull_request_target");
   });
 
-  test("combined actions/cache is not used for criterion baselines", () => {
-    const baselineStep = stepNamed("Restore Criterion baseline cache");
-    expect(baselineStep).not.toContain("uses: actions/cache@");
+  test("retains evidence after failure and does not try to comment on forks", () => {
+    expect(workflow).toContain("- name: Upload benchmark evidence\n        if: always()");
+    expect(workflow).toContain("raven-performance/results/");
+    expect(workflow).toContain("raven-performance/metadata.json");
+    expect(workflow).toContain("github.event.pull_request.head.repo.full_name == github.repository");
   });
 
-  test("PR comparison checks critcmp baseline names with the baseline listing command", () => {
-    const compare = stepNamed("Compare benchmarks against main baseline");
-    expect(compare).toContain("critcmp --baselines");
-    expect(compare).not.toContain("critcmp --list");
+  test("paired measurement and regression decisions work on synthetic data", () => {
+    const result = spawnSync("python3", ["scripts/test-compare-performance.py"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
   });
 });

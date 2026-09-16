@@ -154,10 +154,16 @@ impl EventContext {
     }
 
     /// Overlay activated deferred bodies on events with ordinary lexical ownership.
+    /// Keep the empty case inline: ordinary files must not pay for conditional
+    /// ownership classification on every timeline event.
+    #[inline]
     pub(super) fn with_conditional_scopes(
         mut self,
         activated: &HashSet<FunctionScopeInterval>,
     ) -> Self {
+        if activated.is_empty() {
+            return self;
+        }
         // Batches are file-environment stages; FunctionScope creates a frame.
         // Neither acquires the ownership of a conditional body at its anchor.
         if !matches!(
@@ -247,9 +253,13 @@ impl<'a> QueryContext<'a> {
         }
     }
 
-    /// Resolve ownership and timing together so event consumers cannot select
-    /// a different environment from the one used by the visibility decision.
-    pub(super) fn evaluate(&self, event: &ScopeEvent) -> (EventContext, EventVisibility) {
+    /// Return the effective owner with the visibility decision. Timing and
+    /// anchor data stay inside the classifier; point consumers need only the
+    /// owner chosen by the same policy that determined visibility.
+    pub(super) fn evaluate(
+        &self,
+        event: &ScopeEvent,
+    ) -> (Option<FunctionScopeInterval>, EventVisibility) {
         let context = EventContext::new(event).with_conditional_scopes(self.conditional_scopes);
         let positional = match context.timing {
             EventTiming::At(position) => position <= self.position,
@@ -258,7 +268,7 @@ impl<'a> QueryContext<'a> {
             }
             EventTiming::FunctionBody(interval) => {
                 return (
-                    context,
+                    context.owner,
                     if !self.position.is_full_eof() && interval.contains(self.position) {
                         EventVisibility::Positional
                     } else {
@@ -268,7 +278,7 @@ impl<'a> QueryContext<'a> {
             }
             EventTiming::PreEntry(boundary) => {
                 return (
-                    context,
+                    context.owner,
                     if self.pre_entry_cutoff.is_none_or(|cutoff| boundary < cutoff) {
                         EventVisibility::Positional
                     } else {
@@ -289,7 +299,7 @@ impl<'a> QueryContext<'a> {
         } else {
             EventVisibility::Hidden
         };
-        (context, visibility)
+        (context.owner, visibility)
     }
 }
 
