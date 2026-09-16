@@ -20,23 +20,7 @@ use tower_lsp::lsp_types::Url;
 use super::{PACKAGE_INTERNAL_URI, ScopeAtPosition, ScopedSymbol, SymbolKind};
 use crate::package_state::{self, PackageScopeContribution, RFileKind};
 
-/// The environment observed by a lookup, after the caller applies its hoisting policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ScopePhase {
-    Immediate,
-    Deferred,
-}
-
-impl ScopePhase {
-    /// Adapt a resolver's hoisting-aware function context to contribution timing.
-    pub(super) fn from_deferred(deferred: bool) -> Self {
-        if deferred {
-            Self::Deferred
-        } else {
-            Self::Immediate
-        }
-    }
-}
+use super::evaluation::ScopePhase;
 
 /// Prepared contributions for one canonical query file, independent of cursor position.
 #[derive(Default)]
