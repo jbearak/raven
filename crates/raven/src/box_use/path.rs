@@ -11,10 +11,11 @@
 //! box module paths obey a different, stricter contract, and folding them into
 //! the general resolver would risk regressing its `# raven: cd` /
 //! testthat-working-directory / workspace-root-fallback behaviour. Specifically,
-//! a local box module:
+//! a box module:
 //!
-//! * resolves **relative to the importing file's own directory** (`./` = that
-//!   directory, each leading `../` ascends one level);
+//! * explicit relative paths resolve from the importing file's directory;
+//! * qualified paths use the persisted nearest `rhino.yml` root discovered by
+//!   detached enrichment; without a root they stay inert;
 //! * **ignores** `# raven: cd`, the implicit testthat/testit working directory,
 //!   and the forward workspace-root fallback — none of them apply to box;
 //! * omits the file extension in the spec; the resolver appends it;
@@ -119,21 +120,36 @@ impl std::error::Error for BoxResolveError {}
 /// Resolve a local box-module [`BoxSpec`] against the importing file.
 ///
 /// Returns [`BoxResolveError::NotLocalModule`] for a package or unsupported
-/// spec. See the module docs for the exact contract (relative-to-importer,
-/// case-sensitive, candidate order, no `cd`/testthat/workspace fallback).
+/// spec, including a qualified path without a known root. See the module docs
+/// for base selection, case checks, candidate order, and working-directory rules.
 pub fn resolve_local_module(
     importing_uri: &Url,
     spec: &BoxSpec,
 ) -> Result<ResolvedModule, BoxResolveError> {
-    let (up_levels, components) = match spec {
+    let (base, components) = module_base(importing_uri, spec)?;
+    resolve_at_base(&base, components)
+}
+
+/// Select a base using only persisted inputs. Root discovery belongs to
+/// detached enrichment, including for missing modules and watched candidates.
+fn module_base<'a>(
+    importing_uri: &Url,
+    spec: &'a BoxSpec,
+) -> Result<(PathBuf, &'a [String]), BoxResolveError> {
+    match spec {
         BoxSpec::LocalModule {
             up_levels,
             components,
-        } => (*up_levels, components.as_slice()),
-        _ => return Err(BoxResolveError::NotLocalModule),
-    };
+        } => Ok((base_directory(importing_uri, *up_levels)?, components)),
+        BoxSpec::SearchPathModule {
+            components,
+            root: Some(root),
+        } => Ok((root.clone(), components)),
+        _ => Err(BoxResolveError::NotLocalModule),
+    }
+}
 
-    let base = base_directory(importing_uri, up_levels)?;
+fn resolve_at_base(base: &Path, components: &[String]) -> Result<ResolvedModule, BoxResolveError> {
     let Some((name, dirs)) = components.split_last() else {
         // classify_module never produces an empty component list, but fail
         // conservatively rather than panic if that invariant is ever violated.
@@ -143,7 +159,7 @@ pub fn resolve_local_module(
 
     // Pass 1: an exact (case-sensitive) match, honouring candidate order.
     for (parts, kind) in &candidates {
-        if let SuffixResolution::Exact(path) = resolve_suffix(&base, parts)
+        if let SuffixResolution::Exact(path) = resolve_suffix(base, parts)
             && let Ok(uri) = Url::from_file_path(&path)
         {
             return Ok(ResolvedModule { uri, kind: *kind });
@@ -153,9 +169,9 @@ pub fn resolve_local_module(
     // Pass 2: a case-only mismatch — a real error to diagnose, not a match. The
     // first candidate that exists case-insensitively wins the report.
     for (parts, _) in &candidates {
-        if let SuffixResolution::Folded(found) = resolve_suffix(&base, parts) {
+        if let SuffixResolution::Folded(found) = resolve_suffix(base, parts) {
             return Err(BoxResolveError::CaseMismatch {
-                expected: join_parts(&base, parts),
+                expected: join_parts(base, parts),
                 found,
             });
         }
@@ -164,7 +180,7 @@ pub fn resolve_local_module(
     Err(BoxResolveError::NotFound {
         searched: candidates
             .iter()
-            .map(|(parts, _)| join_parts(&base, parts))
+            .map(|(parts, _)| join_parts(base, parts))
             .collect(),
     })
 }
@@ -174,10 +190,21 @@ pub fn resolve_local_module(
 /// run only in detached analysis/rebuild work, never while a `WorldState` guard
 /// is held and never from an interactive request path.
 pub(crate) fn enrich_local_imports(importing_uri: &Url, imports: &mut [BoxImport]) {
+    // One ancestor walk per import batch, and none for ordinary package or
+    // explicit-relative imports. Never cache across edits or watcher events:
+    // adding/removing a nested marker changes the selected root.
+    let root = imports
+        .iter()
+        .any(|import| matches!(import.spec, BoxSpec::SearchPathModule { .. }))
+        .then(|| rhino_root(importing_uri))
+        .flatten();
     for import in imports {
-        if !matches!(import.spec, BoxSpec::LocalModule { .. }) {
-            import.local_resolution = None;
-            continue;
+        import.local_resolution = None;
+        if let BoxSpec::SearchPathModule {
+            root: import_root, ..
+        } = &mut import.spec
+        {
+            import_root.clone_from(&root);
         }
         import.local_resolution = Some(match resolve_local_module(importing_uri, &import.spec) {
             Ok(resolved) => LocalModuleResolution::Resolved(resolved.uri),
@@ -192,20 +219,25 @@ pub(crate) fn enrich_local_imports(importing_uri: &Url, imports: &mut [BoxImport
     }
 }
 
+/// Rhino's default `box.path` is its application root. The nearest ancestor
+/// with a regular `rhino.yml` file identifies that root, even when the editor
+/// opens a parent monorepo or an application subdirectory. The marker's contents
+/// do not affect this convention. No R code or runtime search path is evaluated.
+fn rhino_root(importing_uri: &Url) -> Option<PathBuf> {
+    let file = importing_uri.to_file_path().ok()?;
+    file.parent()?
+        .ancestors()
+        .find(|dir| dir.join("rhino.yml").is_file())
+        .map(Path::to_path_buf)
+}
+
 /// The absolute candidate module-file paths a local spec would search, in
 /// candidate order. Empty for a non-local spec.
 ///
 /// Exposed for diagnostics (listing what was searched) and tests. Does not touch
 /// the filesystem.
 pub fn candidate_paths(importing_uri: &Url, spec: &BoxSpec) -> Vec<PathBuf> {
-    let (up_levels, components) = match spec {
-        BoxSpec::LocalModule {
-            up_levels,
-            components,
-        } => (*up_levels, components.as_slice()),
-        _ => return Vec::new(),
-    };
-    let Ok(base) = base_directory(importing_uri, up_levels) else {
+    let Ok((base, components)) = module_base(importing_uri, spec) else {
         return Vec::new();
     };
     let Some((name, dirs)) = components.split_last() else {
@@ -226,6 +258,18 @@ pub(crate) fn candidate_set_matches_path(
     spec: &BoxSpec,
     changed_path: &Path,
 ) -> bool {
+    // Marker creation/removal can make an inert import resolvable or select a
+    // nearer root. Check ancestors lexically, without I/O under the state lock.
+    if matches!(spec, BoxSpec::SearchPathModule { .. })
+        && changed_path.file_name() == Some(OsStr::new("rhino.yml"))
+        && let Ok(importer) = importing_uri.to_file_path()
+        && let Some(parent) = importer.parent()
+        && parent
+            .ancestors()
+            .any(|dir| Some(dir) == changed_path.parent())
+    {
+        return true;
+    }
     let changed = changed_path.to_string_lossy();
     candidate_paths(importing_uri, spec)
         .iter()
@@ -380,6 +424,116 @@ mod tests {
             up_levels: up,
             components: components.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    fn enriched(importer: &Url, code: &str) -> Vec<BoxImport> {
+        let mut metadata = crate::cross_file::extract_metadata(code);
+        enrich_local_imports(importer, &mut metadata.box_imports);
+        metadata.box_imports
+    }
+
+    #[test]
+    fn rhino_qualified_modules_use_nearest_marker_and_preserve_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("apps/demo");
+        fs::create_dir_all(root.join("app/logic")).unwrap();
+        fs::create_dir_all(root.join("app/view")).unwrap();
+        fs::write(dir.path().join("rhino.yml"), "").unwrap();
+        fs::write(root.join("rhino.yml"), "").unwrap();
+        fs::write(root.join("app/logic/math.R"), "").unwrap();
+        fs::write(root.join("app/view/helper.R"), "").unwrap();
+        let importer = uri(&root.join("app/view/main.R"));
+        let imports = enriched(
+            &importer,
+            "# raven: cd /elsewhere\nbox::use(app/logic/math, ./helper, stats[lm])\n",
+        );
+        assert_eq!(
+            imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(uri(
+                &root.join("app/logic/math.R")
+            )))
+        );
+        assert_eq!(
+            imports[1].local_resolution,
+            Some(LocalModuleResolution::Resolved(uri(
+                &root.join("app/view/helper.R")
+            )))
+        );
+        assert!(matches!(
+            imports[2].resolved_source(),
+            Some(crate::selective_import::ImportSource::Package(_))
+        ));
+        assert!(candidate_set_matches_path(
+            &importer,
+            &imports[0].spec,
+            &root.join("app/logic/math.r")
+        ));
+        assert!(!candidate_set_matches_path(
+            &importer,
+            &imports[0].spec,
+            &dir.path().join("app/logic/math.R")
+        ));
+        assert!(candidate_set_matches_path(
+            &importer,
+            &imports[0].spec,
+            &root.join("app/rhino.yml")
+        ));
+        // Candidate matching is pure even if the persisted root disappears.
+        fs::remove_file(root.join("rhino.yml")).unwrap();
+        assert_eq!(
+            candidate_paths(&importer, &imports[0].spec)[1],
+            root.join("app/logic/math.R")
+        );
+    }
+
+    #[test]
+    fn qualified_modules_without_rhino_marker_stay_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("app/logic")).unwrap();
+        fs::write(dir.path().join("app/logic/math.R"), "").unwrap();
+        let importer = uri(&dir.path().join("main.R"));
+        let imports = enriched(&importer, "box::use(app/logic/math)\n");
+        assert_eq!(imports[0].local_resolution, None);
+        assert_eq!(imports[0].resolved_source(), None);
+        assert!(candidate_paths(&importer, &imports[0].spec).is_empty());
+        assert!(candidate_set_matches_path(
+            &importer,
+            &imports[0].spec,
+            &dir.path().join("rhino.yml")
+        ));
+    }
+
+    #[test]
+    fn rhino_modules_share_candidate_order_case_checks_and_missing_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("rhino.yml"), "").unwrap();
+        fs::create_dir_all(dir.path().join("app/logic/math")).unwrap();
+        fs::write(dir.path().join("app/logic/math/__init__.R"), "").unwrap();
+        let importer = uri(&dir.path().join("app/main.R"));
+        let code = "box::use(app/logic/math, app/logic/missing, App/logic/math)\n";
+        let imports = enriched(&importer, code);
+        assert_eq!(
+            imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(uri(&dir
+                .path()
+                .join("app/logic/math/__init__.R"))))
+        );
+        assert_eq!(
+            imports[1].local_resolution,
+            Some(LocalModuleResolution::Missing)
+        );
+        assert!(matches!(
+            imports[2].local_resolution,
+            Some(LocalModuleResolution::CaseMismatch { .. })
+        ));
+        fs::write(dir.path().join("app/logic/math.R"), "").unwrap();
+        let imports = enriched(&importer, code);
+        assert_eq!(
+            imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(uri(&dir
+                .path()
+                .join("app/logic/math.R"))))
+        );
     }
 
     #[test]

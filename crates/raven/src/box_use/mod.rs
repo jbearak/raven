@@ -27,17 +27,17 @@
 //! )
 //! ```
 //!
-//! # Supported scope (v0.18.0)
+//! # Supported scope
 //!
 //! * **Static `box::use()` only** — a literal `box::use(...)` / `box:::use(...)`
 //!   call. Programmatic invocation (`do.call`, aliasing `box::use`) is not
 //!   recognised.
-//! * **Bare name = installed package.** A **local module MUST begin with `./`
-//!   or `../`.** Non-local module search paths (`foo/bar`, `options(box.path)`,
-//!   `R_BOX_PATH`, remote/global modules) are **unsupported** and fail
-//!   conservatively — recorded as [`BoxSpec::Unsupported`] so they neither bind
-//!   nor emit misleading diagnostics.
-//! * Local paths resolve **relative to the importing file's directory**, ignore
+//! * **Bare name = installed package.** Explicit relative modules begin with
+//!   `./` or `../`. Qualified paths such as `app/logic/math` use the nearest
+//!   ancestor containing `rhino.yml`, matching Rhino's default `box.path`.
+//!   Without that marker they stay inert. Custom runtime search paths and
+//!   remote/global module directories are not evaluated.
+//! * Explicit relative paths resolve **relative to the importing file's directory**, ignore
 //!   `# raven: cd`, the implicit testthat working directory, and the
 //!   workspace-root fallback, and omit the file extension. Resolution is
 //!   **case-sensitive** (box module names are case-sensitive); a case-only
@@ -149,9 +149,21 @@ pub enum BoxSpec {
         /// Path parts after the leading markers; last is the module name.
         components: Vec<String>,
     },
+    /// A qualified module path such as `app/logic/helpers`.
+    ///
+    /// Detached enrichment discovers the nearest ancestor containing
+    /// `rhino.yml` and persists it in `root`. No root means the search path is
+    /// unknown, so the import stays inert. Consumers must never discover roots
+    /// themselves or substitute the importing file's directory.
+    SearchPathModule {
+        /// At least two static path components, ending with the module name.
+        components: Vec<String>,
+        /// Rhino application root, populated only by detached enrichment.
+        #[serde(default)]
+        root: Option<std::path::PathBuf>,
+    },
     /// A spec we recognise syntactically but deliberately do not support
-    /// (non-local module search path such as `foo/bar`, or an otherwise
-    /// malformed spec). Retained verbatim so tooling can explain the gap and so
+    /// (a dynamic or malformed spec). Retained verbatim so tooling can explain the gap and so
     /// it never silently binds. Fails conservatively.
     Unsupported(String),
 }
@@ -162,7 +174,8 @@ impl BoxSpec {
     pub fn default_alias(&self) -> Option<String> {
         match self {
             BoxSpec::Package(name) => Some(name.clone()),
-            BoxSpec::LocalModule { components, .. } => components.last().cloned(),
+            BoxSpec::LocalModule { components, .. }
+            | BoxSpec::SearchPathModule { components, .. } => components.last().cloned(),
             BoxSpec::Unsupported(_) => None,
         }
     }
@@ -196,13 +209,15 @@ impl BoxImport {
     pub fn resolved_source(&self) -> Option<ImportSource> {
         match (&self.spec, &self.local_resolution) {
             (BoxSpec::Package(package), _) => Some(ImportSource::Package(package.clone())),
-            (BoxSpec::LocalModule { .. }, Some(LocalModuleResolution::Resolved(uri))) => {
-                Some(ImportSource::LocalModule(LocalModuleIdentity::new(
-                    uri.clone(),
-                    LocalModuleDialect::Box,
-                )))
-            }
-            (BoxSpec::LocalModule { .. }, _) | (BoxSpec::Unsupported(_), _) => None,
+            (
+                BoxSpec::LocalModule { .. } | BoxSpec::SearchPathModule { .. },
+                Some(LocalModuleResolution::Resolved(uri)),
+            ) => Some(ImportSource::LocalModule(LocalModuleIdentity::new(
+                uri.clone(),
+                LocalModuleDialect::Box,
+            ))),
+            (BoxSpec::LocalModule { .. } | BoxSpec::SearchPathModule { .. }, _)
+            | (BoxSpec::Unsupported(_), _) => None,
         }
     }
 
@@ -285,8 +300,10 @@ impl BoxImport {
 /// # Symbolic re-exports
 ///
 /// A `#' @export` tag on a `box::use()` argument re-exports what that import
-/// brought in. Namespace aliases are enumerated directly into
-/// [`members`](Self::members). Named, renamed, and wildcard attachments depend on
+/// brought in. Package and explicit-relative namespace aliases are enumerated
+/// directly into [`members`](Self::members). Qualified namespace aliases wait
+/// in [`reexports`](Self::reexports) until their search root and source resolve.
+/// Named, renamed, and wildcard attachments depend on
 /// the imported source's effective export boundary, so the full import is stored
 /// in [`reexports`](Self::reexports) and expanded at resolution time by
 /// [`resolve::resolve_module_export_set`], with cycle bounds. This both preserves
@@ -299,9 +316,11 @@ pub struct BoxExports {
     pub members: BTreeSet<String>,
     /// How the export set was determined.
     pub mode: ExportMode,
-    /// Attachment re-exports awaiting resolution: each is the re-exported
+    /// Attachment and qualified-namespace re-exports awaiting resolution. Each
+    /// is the re-exported
     /// [`BoxImport`] whose named, renamed, or wildcard attachments are validated
-    /// against the source export set. Empty when no tagged import attaches names.
+    /// against the source export set. Qualified namespace aliases also require
+    /// a resolved source before contributing a name.
     #[serde(default)]
     pub reexports: Vec<BoxImport>,
 }

@@ -37,8 +37,9 @@
 //! # Re-exports
 //!
 //! A `#' @export` on a `box::use()` re-exports what the import brought in.
-//! Namespace aliases are known immediately; named, renamed, and wildcard
-//! attachments are recorded symbolically in [`BoxExports::reexports`] and
+//! Package and explicit-relative namespace aliases are known immediately.
+//! Qualified namespace aliases and named, renamed, and wildcard attachments
+//! are recorded symbolically in [`BoxExports::reexports`] and
 //! resolved against the imported source's export boundary. This prevents a
 //! stale/private source member from being re-exported merely because its name
 //! appeared in the declaration, while preserving wildcard re-exports exactly.
@@ -115,14 +116,14 @@ pub fn parse_box_exports(tree: &Tree, content: &str) -> Option<BoxExports> {
             // Re-export: the local names this import binds. Re-exports are
             // module-level, so function_scoped is false here.
             for imp in parse_use_call_node(child, content, false) {
-                // A namespace alias is introduced independently of the source's
-                // member set, so it is statically known. Attached names must be
-                // validated against the resolved source export boundary: record
-                // every attachment re-export symbolically, not only wildcards.
-                if let Some(alias) = imp.effective_alias() {
+                // Qualified imports may have no known search root and remain
+                // inert. Keep their namespace aliases symbolic until detached
+                // resolution, just as attachments need their source boundary.
+                let qualified = matches!(imp.spec, super::BoxSpec::SearchPathModule { .. });
+                if !qualified && let Some(alias) = imp.effective_alias() {
                     members.insert(alias);
                 }
-                if !imp.attach.is_empty() {
+                if qualified || !imp.attach.is_empty() {
                     reexports.push(imp);
                 }
             }

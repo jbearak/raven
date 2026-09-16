@@ -1352,47 +1352,59 @@ f(beta = 2)
 
     #[test]
     fn renamed_local_module_function_uses_retained_signature() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let module_path = tmp.path().join("mod.r");
-        let importer_path = tmp.path().join("main.R");
-        let module_code = "box::export(original)\noriginal <- function(x = m[1, 2], y = c(1, 2), label = \"a,b\", `a,b` = 1, ...) x\n";
-        let importer_code = "box::use(./mod[renamed = original])\nrenamed(\n";
-        std::fs::write(&module_path, module_code).unwrap();
-        std::fs::write(&importer_path, importer_code).unwrap();
+        for rhino in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let module_path = tmp.path().join("app/mod.r");
+            let importer_path = tmp.path().join("app/main.R");
+            let module_code = "box::export(original)\noriginal <- function(x = m[1, 2], y = c(1, 2), label = \"a,b\", `a,b` = 1, ...) x\n";
+            std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+            if rhino {
+                std::fs::write(tmp.path().join("rhino.yml"), "").unwrap();
+            }
+            let importer_code = "box::use(./mod[renamed = original])\nrenamed(\n";
+            let importer_text = if rhino {
+                importer_code.replace("./mod", "app/mod")
+            } else {
+                importer_code.to_string()
+            };
+            let importer_code = importer_text.as_str();
+            std::fs::write(&module_path, module_code).unwrap();
+            std::fs::write(&importer_path, importer_code).unwrap();
 
-        let module_uri = Url::from_file_path(&module_path).unwrap();
-        let importer_uri = Url::from_file_path(&importer_path).unwrap();
-        let mut state = WorldState::new();
-        state.workspace_scan_complete = true;
-        state.open_document(module_uri.clone(), module_code, Some(1));
-        state.open_document(importer_uri.clone(), importer_code, Some(1));
+            let module_uri = Url::from_file_path(&module_path).unwrap();
+            let importer_uri = Url::from_file_path(&importer_path).unwrap();
+            let mut state = WorldState::new();
+            state.workspace_scan_complete = true;
+            state.open_document(module_uri.clone(), module_code, Some(1));
+            state.open_document(importer_uri.clone(), importer_code, Some(1));
 
-        let signature = resolve_user_only(
-            &state,
-            "renamed",
-            &importer_uri,
-            tower_lsp::lsp_types::Position::new(1, 8),
-        )
-        .expect("renamed module function must retain its source signature");
-        assert!(matches!(
-            signature.source,
-            SignatureSource::CrossFile { ref uri, line: 1 } if uri == &module_uri
-        ));
-        let labels = signature
-            .parameters
-            .iter()
-            .map(ParameterInfo::label)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec![
-                "x = m[1, 2]",
-                "y = c(1, 2)",
-                "label = \"a,b\"",
-                "`a,b` = 1",
-                "...",
-            ]
-        );
+            let signature = resolve_user_only(
+                &state,
+                "renamed",
+                &importer_uri,
+                tower_lsp::lsp_types::Position::new(1, 8),
+            )
+            .expect("renamed module function must retain its source signature");
+            assert!(matches!(
+                signature.source,
+                SignatureSource::CrossFile { ref uri, line: 1 } if uri == &module_uri
+            ));
+            let labels = signature
+                .parameters
+                .iter()
+                .map(ParameterInfo::label)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                labels,
+                vec![
+                    "x = m[1, 2]",
+                    "y = c(1, 2)",
+                    "label = \"a,b\"",
+                    "`a,b` = 1",
+                    "...",
+                ]
+            );
+        }
     }
 
     #[tokio::test]

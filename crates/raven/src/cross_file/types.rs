@@ -393,6 +393,7 @@ impl CrossFileMetadata {
                     .filter_map(|import| match &import.spec {
                         crate::box_use::BoxSpec::Package(package) => Some(package.as_str()),
                         crate::box_use::BoxSpec::LocalModule { .. }
+                        | crate::box_use::BoxSpec::SearchPathModule { .. }
                         | crate::box_use::BoxSpec::Unsupported(_) => None,
                     }),
             )

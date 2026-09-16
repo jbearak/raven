@@ -403,9 +403,22 @@ fn classify_module(module_str: &str) -> BoxSpec {
             .unwrap_or_else(|| BoxSpec::Unsupported(module_str.trim().to_string()));
     }
 
-    // Multi-component path not beginning with `./` or `../` → non-local module
-    // search path (`foo/bar`). Unsupported, fails conservatively.
-    BoxSpec::Unsupported(module_str.trim().to_string())
+    // Qualified modules need a known search root at detached enrichment time.
+    // Reject traversal/separators even inside quoted components.
+    let components: Option<Vec<String>> = parts
+        .iter()
+        .map(|part| {
+            static_name(part)
+                .filter(|name| name != "." && name != ".." && !name.contains(['/', '\\']))
+        })
+        .collect();
+    match components {
+        Some(components) => BoxSpec::SearchPathModule {
+            components,
+            root: None,
+        },
+        None => BoxSpec::Unsupported(module_str.trim().to_string()),
+    }
 }
 
 /// Parse the comma-separated inner text of an attach list. `base_offset` is the
@@ -620,8 +633,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_spec_unsupported_nonlocal_paths() {
-        assert!(matches!(parse_spec("foo/bar").0, BoxSpec::Unsupported(_)));
+    fn parse_spec_qualified_modules() {
+        let (spec, attach) = parse_spec("app / logic / say_hello[greet = say_hello]");
+        assert_eq!(
+            spec,
+            BoxSpec::SearchPathModule {
+                components: vec!["app".into(), "logic".into(), "say_hello".into()],
+                root: None,
+            }
+        );
+        assert_eq!(spec.default_alias().as_deref(), Some("say_hello"));
+        assert_eq!(
+            attach,
+            vec![BoxAttach::Renamed {
+                local: "greet".into(),
+                exported: "say_hello".into()
+            }]
+        );
+        for invalid in [
+            "app/../secret",
+            "app/`..`/secret",
+            "app/`/tmp`/x",
+            "app/f()",
+            "app//x",
+        ] {
+            assert!(
+                matches!(parse_spec(invalid).0, BoxSpec::Unsupported(_)),
+                "{invalid}"
+            );
+        }
         assert!(matches!(parse_spec("./").0, BoxSpec::Unsupported(_)));
         assert!(matches!(parse_spec("../").0, BoxSpec::Unsupported(_)));
     }

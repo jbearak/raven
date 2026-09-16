@@ -16790,6 +16790,14 @@ fn collect_watched_resync(
         .then(|| state.discovery_owned_uris());
     for change in changes {
         let uri = &change.uri;
+        // Rhino markers have already refreshed selective-module importers.
+        // They are configuration markers, not R source files to index.
+        if uri
+            .to_file_path()
+            .is_ok_and(|path| path.file_name().is_some_and(|name| name == "rhino.yml"))
+        {
+            continue;
+        }
         if state.is_document_open_or_alias(uri) {
             log::trace!("Skipping watched file change for open document: {}", uri);
             continue;
@@ -20381,6 +20389,52 @@ impl LanguageServer for Backend {
             box_candidate_importers_for_changes(&state, &params.changes)
         };
         let box_candidate_importers = enrich_box_candidate_importers(box_candidate_importers);
+
+        // A marker can expose existing modules outside the workspace scan without
+        // any R-file event. Load their artifacts before publishing the refreshed
+        // importer, including transitive reexports. The ordinary watched batch
+        // only loads files named in the notification and unchanged closed importers.
+        if params.changes.iter().any(|change| {
+            change
+                .uri
+                .to_file_path()
+                .is_ok_and(|path| path.file_name().is_some_and(|name| name == "rhino.yml"))
+        }) {
+            let (on_demand, max_depth, workspace_root) = {
+                let state = self.state.read().await;
+                (
+                    state.cross_file_config.on_demand_indexing_enabled,
+                    state.cross_file_config.max_forward_depth,
+                    state.workspace_folders.first().cloned(),
+                )
+            };
+            if on_demand {
+                let mut targets: Vec<Url> = box_candidate_importers
+                    .iter()
+                    .flat_map(|importer| importer.metadata.box_imports.iter())
+                    .filter_map(|import| import.resolved_source())
+                    .filter_map(|source| source.local_module_uri().cloned())
+                    .collect();
+                targets.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+                targets.dedup();
+                for target in targets {
+                    let needs_indexing = {
+                        let state = self.state.read().await;
+                        !state.is_document_open_or_alias(&target)
+                            && !state.workspace_index.is_complete(&target)
+                    };
+                    if needs_indexing {
+                        self.index_file_on_demand(&target).await;
+                    }
+                    self.index_forward_chain(
+                        &target,
+                        max_depth.saturating_sub(1),
+                        workspace_root.as_ref(),
+                    )
+                    .await;
+                }
+            }
+        }
 
         if !open_tar_source_parents.is_empty() {
             let source_sysdata_event = project_root
@@ -39329,126 +39383,268 @@ mod project_config_initialize_tests {
 
     #[test]
     fn watched_box_candidate_changes_add_and_retarget_import_edges() {
+        for rhino in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let importer_path = tmp.path().join("app/main.R");
+            let fallback_path = tmp.path().join("app/mod").join("__init__.r");
+            let preferred_path = tmp.path().join("app/mod.r");
+            std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+            if rhino {
+                std::fs::write(tmp.path().join("rhino.yml"), "").unwrap();
+            }
+            let importer_code = "box::use(./mod)\n";
+            let importer_text = if rhino {
+                importer_code.replace("./mod", "app/mod")
+            } else {
+                importer_code.to_string()
+            };
+            let importer_code = importer_text.as_str();
+            fs::write(&importer_path, importer_code).unwrap();
+
+            let importer_uri = Url::from_file_path(&importer_path).unwrap();
+            let fallback_uri = Url::from_file_path(&fallback_path).unwrap();
+            let preferred_uri = Url::from_file_path(&preferred_path).unwrap();
+            let selective_target = |state: &WorldState| {
+                state
+                    .documents
+                    .get_record(&importer_uri)
+                    .and_then(|record| {
+                        record
+                            .artifacts()
+                            .timeline
+                            .iter()
+                            .find_map(|event| match event {
+                                crate::cross_file::scope::ScopeEvent::SelectiveImport {
+                                    request,
+                                    ..
+                                } => request.source.local_module_uri().cloned(),
+                                _ => None,
+                            })
+                    })
+            };
+            let mut state = WorldState::new();
+            state
+                .workspace_folders
+                .push(Url::from_file_path(tmp.path()).unwrap());
+            state.open_document(importer_uri.clone(), importer_code, Some(1));
+            let metadata = crate::cross_file::extract_metadata(importer_code);
+            state
+                .cross_file_graph
+                .update_file(&importer_uri, &metadata, None, |_| None);
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&importer_uri)
+                    .is_empty()
+            );
+
+            fs::create_dir(tmp.path().join("app/mod")).unwrap();
+            fs::write(&fallback_path, "fallback <- 1\n").unwrap();
+            let fallback_change = [FileEvent {
+                uri: fallback_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }];
+            let candidate_importers = box_candidate_importers_for_changes(&state, &fallback_change);
+            let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+            let collected =
+                collect_watched_resync(&mut state, &fallback_change, candidate_importers);
+            assert!(collected.affected.contains(&importer_uri));
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&importer_uri)
+                    .iter()
+                    .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
+            );
+            assert_eq!(
+                selective_target(&state),
+                Some(fallback_uri.clone()),
+                "candidate creation must rebuild the open importer's scope artifacts"
+            );
+
+            fs::write(&preferred_path, "preferred <- 1\n").unwrap();
+            let preferred_change = [FileEvent {
+                uri: preferred_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }];
+            let candidate_importers =
+                box_candidate_importers_for_changes(&state, &preferred_change);
+            assert!(
+                candidate_importers
+                    .iter()
+                    .any(|candidate| candidate.uri == importer_uri),
+                "preferred candidate creation must rediscover the unchanged importer"
+            );
+            let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+            collect_watched_resync(&mut state, &preferred_change, candidate_importers);
+            let preferred_dependencies = state.cross_file_graph.get_dependencies(&importer_uri);
+            assert!(
+                preferred_dependencies
+                    .iter()
+                    .any(|edge| edge.to == preferred_uri && edge.is_selective_module()),
+                "preferred candidate must retarget the edge: {preferred_dependencies:?}"
+            );
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&importer_uri)
+                    .iter()
+                    .any(|edge| edge.to == fallback_uri)
+            );
+            assert_eq!(
+                selective_target(&state),
+                Some(preferred_uri.clone()),
+                "priority changes must retarget the open importer's scope artifacts"
+            );
+
+            fs::remove_file(&preferred_path).unwrap();
+            let preferred_deletion = [FileEvent {
+                uri: preferred_uri,
+                typ: FileChangeType::DELETED,
+            }];
+            let candidate_importers =
+                box_candidate_importers_for_changes(&state, &preferred_deletion);
+            let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+            collect_watched_resync(&mut state, &preferred_deletion, candidate_importers);
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&importer_uri)
+                    .iter()
+                    .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
+            );
+            assert_eq!(
+                selective_target(&state),
+                Some(fallback_uri),
+                "candidate deletion must rebuild artifacts for the fallback target"
+            );
+        }
+    }
+
+    #[test]
+    fn watched_rhino_marker_changes_refresh_importers_without_indexing_yaml() {
         let tmp = TempDir::new().unwrap();
-        let importer_path = tmp.path().join("main.R");
-        let fallback_path = tmp.path().join("mod").join("__init__.r");
-        let preferred_path = tmp.path().join("mod.r");
-        let importer_code = "box::use(./mod)\n";
-        fs::write(&importer_path, importer_code).unwrap();
-
-        let importer_uri = Url::from_file_path(&importer_path).unwrap();
-        let fallback_uri = Url::from_file_path(&fallback_path).unwrap();
-        let preferred_uri = Url::from_file_path(&preferred_path).unwrap();
-        let selective_target = |state: &WorldState| {
-            state
-                .documents
-                .get_record(&importer_uri)
-                .and_then(|record| {
-                    record
-                        .artifacts()
-                        .timeline
-                        .iter()
-                        .find_map(|event| match event {
-                            crate::cross_file::scope::ScopeEvent::SelectiveImport {
-                                request,
-                                ..
-                            } => request.source.local_module_uri().cloned(),
-                            _ => None,
-                        })
-                })
-        };
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(
+            tmp.path().join("app/mod.R"),
+            "box::export(value)\nvalue <- 1\n",
+        )
+        .unwrap();
+        let importer_uri = Url::from_file_path(tmp.path().join("app/main.R")).unwrap();
+        let module_uri = Url::from_file_path(tmp.path().join("app/mod.R")).unwrap();
+        let marker = tmp.path().join("rhino.yml");
+        let marker_uri = Url::from_file_path(&marker).unwrap();
         let mut state = WorldState::new();
-        state
-            .workspace_folders
-            .push(Url::from_file_path(tmp.path()).unwrap());
-        state.open_document(importer_uri.clone(), importer_code, Some(1));
-        let metadata = crate::cross_file::extract_metadata(importer_code);
-        state
-            .cross_file_graph
-            .update_file(&importer_uri, &metadata, None, |_| None);
-        assert!(
-            state
+        state.open_document(importer_uri.clone(), "box::use(app/mod)\n", Some(1));
+        for change in [FileChangeType::CREATED, FileChangeType::DELETED] {
+            if change == FileChangeType::CREATED {
+                fs::write(&marker, "").unwrap();
+            } else {
+                fs::remove_file(&marker).unwrap();
+            }
+            let events = [FileEvent {
+                uri: marker_uri.clone(),
+                typ: change,
+            }];
+            let importers = box_candidate_importers_for_changes(&state, &events);
+            assert_eq!(importers.len(), 1);
+            let importers = enrich_box_candidate_importers(importers);
+            let collected = collect_watched_resync(&mut state, &events, importers);
+            assert!(collected.affected.contains(&importer_uri));
+            assert!(collected.updates.is_empty());
+            assert!(collected.deletions.is_empty());
+            let has_edge = state
                 .cross_file_graph
                 .get_dependencies(&importer_uri)
-                .is_empty()
+                .iter()
+                .any(|edge| edge.to == module_uri && edge.is_selective_module());
+            assert_eq!(has_edge, change == FileChangeType::CREATED);
+            let metadata = state.get_enriched_metadata(&importer_uri).unwrap();
+            assert_eq!(
+                metadata.box_imports[0].resolved_source().is_some(),
+                has_edge
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watched_rhino_marker_loads_cold_module_reexports() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+        fs::write(
+            tmp.path().join("app/implementation.R"),
+            "box::export(public)\npublic <- function(x) x\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("app/facade.R"),
+            "#' @export\nbox::use(app/implementation[public])\n",
+        )
+        .unwrap();
+        let facade_uri = Url::from_file_path(tmp.path().join("app/facade.R")).unwrap();
+        let implementation_uri =
+            Url::from_file_path(tmp.path().join("app/implementation.R")).unwrap();
+        let marker = tmp.path().join("rhino.yml");
+        let importer_code = "box::use(app/facade)\nfacade$public(1)\n";
+        fs::write(tmp.path().join("app/main.R"), importer_code).unwrap();
+        let (service, importer_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "app/main.R", "r", importer_code).await;
+        let backend = service.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.max_forward_depth = 3;
+            assert!(!state.workspace_index.contains_artifacts(&facade_uri));
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&importer_uri)
+                    .is_empty()
+            );
+        }
+
+        fs::write(&marker, "").unwrap();
+        let marker_uri = Url::from_file_path(marker).unwrap();
+        let final_handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm_for(marker_uri.as_str());
+        let task_backend = backend.clone();
+        let handler = tokio::spawn(async move {
+            task_backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent {
+                        uri: marker_uri,
+                        typ: FileChangeType::CREATED,
+                    }],
+                })
+                .await;
+        });
+        let handoff =
+            wait_final_handoff_payload(backend, &final_handoff, "rhino-marker", &[&importer_uri])
+                .await;
+        release_and_wait_final_handoff(backend, &final_handoff, "rhino-marker", &[&importer_uri])
+            .await;
+        handler.await.unwrap();
+        assert_eq!(
+            handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
         );
 
-        fs::create_dir(tmp.path().join("mod")).unwrap();
-        fs::write(&fallback_path, "fallback <- 1\n").unwrap();
-        let fallback_change = [FileEvent {
-            uri: fallback_uri.clone(),
-            typ: FileChangeType::CREATED,
-        }];
-        let candidate_importers = box_candidate_importers_for_changes(&state, &fallback_change);
-        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
-        let collected = collect_watched_resync(&mut state, &fallback_change, candidate_importers);
-        assert!(collected.affected.contains(&importer_uri));
+        let state = backend.state.read().await;
+        assert!(state.workspace_index.contains_artifacts(&facade_uri));
         assert!(
             state
-                .cross_file_graph
-                .get_dependencies(&importer_uri)
-                .iter()
-                .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
+                .workspace_index
+                .contains_artifacts(&implementation_uri)
         );
-        assert_eq!(
-            selective_target(&state),
-            Some(fallback_uri.clone()),
-            "candidate creation must rebuild the open importer's scope artifacts"
-        );
-
-        fs::write(&preferred_path, "preferred <- 1\n").unwrap();
-        let preferred_change = [FileEvent {
-            uri: preferred_uri.clone(),
-            typ: FileChangeType::CREATED,
-        }];
-        let candidate_importers = box_candidate_importers_for_changes(&state, &preferred_change);
+        let definition = handlers::goto_definition(&state, &importer_uri, Position::new(1, 9));
         assert!(
-            candidate_importers
-                .iter()
-                .any(|candidate| candidate.uri == importer_uri),
-            "preferred candidate creation must rediscover the unchanged importer"
-        );
-        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
-        collect_watched_resync(&mut state, &preferred_change, candidate_importers);
-        let preferred_dependencies = state.cross_file_graph.get_dependencies(&importer_uri);
-        assert!(
-            preferred_dependencies
-                .iter()
-                .any(|edge| edge.to == preferred_uri && edge.is_selective_module()),
-            "preferred candidate must retarget the edge: {preferred_dependencies:?}"
-        );
-        assert!(
-            !state
-                .cross_file_graph
-                .get_dependencies(&importer_uri)
-                .iter()
-                .any(|edge| edge.to == fallback_uri)
-        );
-        assert_eq!(
-            selective_target(&state),
-            Some(preferred_uri.clone()),
-            "priority changes must retarget the open importer's scope artifacts"
-        );
-
-        fs::remove_file(&preferred_path).unwrap();
-        let preferred_deletion = [FileEvent {
-            uri: preferred_uri,
-            typ: FileChangeType::DELETED,
-        }];
-        let candidate_importers = box_candidate_importers_for_changes(&state, &preferred_deletion);
-        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
-        collect_watched_resync(&mut state, &preferred_deletion, candidate_importers);
-        assert!(
-            state
-                .cross_file_graph
-                .get_dependencies(&importer_uri)
-                .iter()
-                .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
-        );
-        assert_eq!(
-            selective_target(&state),
-            Some(fallback_uri),
-            "candidate deletion must rebuild artifacts for the fallback target"
+            matches!(definition, Some(GotoDefinitionResponse::Scalar(location))
+                if location.uri == implementation_uri && location.range.start.line == 1),
+            "marker creation must resolve members through previously unindexed reexports"
         );
     }
 

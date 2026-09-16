@@ -19,13 +19,15 @@ Raven models the statically analyzable subset of the [box](https://klmr.me/box/)
 
 **Only static `box::use()` is recognised.** The call must be a literal `box::use(...)` / `box:::use(...)`. Programmatic invocation — `do.call(box::use, ...)`, aliasing `box::use` to another name, or building the argument list at runtime — is not recognised.
 
-**Local modules must be explicit relative paths.** A bare name is always treated as an installed package; a local module *must* begin with `./` or `../`. The following non-local module lookups are **not** supported and fail conservatively (they neither bind names nor emit misleading diagnostics):
+**Qualified module paths require a Rhino root.** A bare name is always an
+installed package. Paths beginning with `./` or `../` are file-relative.
+Qualified paths such as `app/logic/helpers` resolve from the nearest ancestor
+containing `rhino.yml`, using Rhino's default application-root convention.
+Without that marker they remain inert. Raven does not evaluate custom
+`options(box.path = ...)`, read `R_BOX_PATH`, or search remote/global modules.
+A custom runtime search path can therefore differ from Raven's Rhino resolution.
 
-- Non-local search-path specs such as `foo/bar` (a module found via a search path rather than relative to the importing file).
-- `options(box.path = ...)` and the `R_BOX_PATH` environment variable.
-- Remote modules and box's global-module directory.
-
-**Local resolution differs from `source()`.** box paths resolve relative to the importing file's own directory and intentionally ignore `# raven: cd`, the implicit testthat/testit working directory, and the workspace-root fallback. Resolution is case-sensitive: a path that exists only under a different case is reported as a mismatch, not silently corrected. Ambiguous case-insensitive collisions (only possible on a case-sensitive filesystem) fail closed.
+**Local resolution differs from `source()`.** explicit relative box paths resolve relative to the importing file's own directory and intentionally ignore `# raven: cd`, the implicit testthat/testit working directory, and the workspace-root fallback. Resolution is case-sensitive: a path that exists only under a different case is reported as a mismatch, not silently corrected. Ambiguous case-insensitive collisions (only possible on a case-sensitive filesystem) fail closed.
 
 ## import package
 

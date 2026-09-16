@@ -28,22 +28,53 @@ box::use(
   dplyr[...],            # attach every export
   ./helpers,             # local module: helpers.r or helpers/__init__.r
   ../lib/util[foo],      # attach `foo` from a module one directory up
+  app/logic/math,       # Rhino module, relative to the application root
 )
 ```
 
-- A **bare name** is an installed package; a **local module** must begin with
-  `./` or `../`. Both top-level and function-scoped calls are recognised, as is
+- A **bare name** is an installed package. Explicit relative modules begin with
+  `./` or `../`; qualified paths such as `app/logic/math` resolve in Rhino
+  applications. Both top-level and function-scoped calls are recognised, as is
   the `box:::use()` spelling.
 - The default namespace name is the final path/package component (`../lib/util`
   binds `util`); write `alias = spec` to override it.
 - An **attach-only** spec (`pkg[a, b]`, `pkg[...]`) binds no namespace object
   unless you also alias it (`alias = pkg[...]`).
 
-**Local modules** resolve relative to the importing file's own directory — box
+**Explicit relative modules** resolve relative to the importing file's own directory — box
 does not use Raven's `source()` working-directory or workspace-root fallback
 rules. The extension is omitted in the spec; Raven tries `path.r`, `path.R`,
 `path/__init__.r`, then `path/__init__.R` (so a file module wins over a package
 module), and resolution is case-sensitive.
+
+**Rhino applications** can use non-relative module paths:
+
+```r
+box::use(app/view/hello)
+box::use(
+  app/logic/say_hello[say_hello],
+)
+```
+
+Raven uses the nearest ancestor directory containing a `rhino.yml` file as the
+application root. This follows [Rhino's default `box.path` convention](https://github.com/Appsilon/rhino/blob/main/R/app.R).
+For example, `app/logic/say_hello` finds `<root>/app/logic/say_hello.R` from
+any file beneath that root, including nested view modules. The same candidate
+order and case checks apply, including `__init__.R` modules. Aliases, renamed
+attachments, wildcard imports, reexports, and editor features work as they do
+for explicit relative modules. A bare `app` still means an installed package.
+
+The marker identifies the root even when you open a parent repository or a
+subdirectory in the editor. A nested `rhino.yml` starts a separate application;
+Raven does not fall back to an outer application if a module is missing there.
+VS Code watches marker creation and deletion within opened workspace folders,
+along with module file changes. If you open only a subdirectory, changes to an
+ancestor marker require reopening or editing the importing file, or opening
+the application root as a workspace folder. Other LSP clients must forward
+`rhino.yml` file events for live root changes.
+Without a marker, qualified imports stay unresolved without module-not-found
+diagnostics. Custom `options(box.path = ...)` and `R_BOX_PATH` values are not
+read or evaluated, including overrides inside a Rhino application.
 
 **Exports** come from `box::export()` and `#' @export` tags. When either is
 present the interface is authoritative, so a missing member (`module$typo`) is
