@@ -71,18 +71,13 @@ impl<'a> ScopeContributions<'a> {
             ]);
             selected.imported_names = Some(&contrib.imported_symbols);
         }
-        if kind != Some(RFileKind::Test) || !package_state::is_testthat_or_testit_test(&path, root)
-        {
+        let Some(is_preamble) = test_preamble_context(&path, root, kind) else {
             return selected;
-        }
+        };
 
         selected
             .attachment_groups
             .push(&contrib.test_attached_packages);
-        let is_preamble = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(package_state::is_test_preamble_filename);
         for (peer, names) in contrib.test_helper_symbols.iter() {
             match preamble_phase(peer, &path, is_preamble) {
                 Some(ScopePhase::Immediate) => selected.immediate_groups.push(names),
@@ -157,6 +152,7 @@ impl<'a> ScopeContributions<'a> {
     /// imports remain the package library's responsibility. The load-all gate
     /// filters loaded/inherited packages only; attachment projection is unchanged.
     pub(super) fn apply(&self, scope: &mut ScopeAtPosition, phase: ScopePhase) {
+        scope.contributions_deferred = phase.is_deferred();
         if self.remove_load_all {
             scope
                 .loaded_packages
@@ -196,6 +192,45 @@ impl<'a> ScopeContributions<'a> {
             is_declared: false,
         }
     }
+}
+
+/// Candidate origins for an already-resolved synthetic helper binding, newest
+/// first. Shares the contribution selector's directory, own-file, source-order,
+/// and hoisting gates. Names remain location-free on diagnostic hot paths;
+/// interactive consumers recover provenance only for the requested name.
+pub(crate) fn test_helper_sources_for_symbol<'a>(
+    uri: &Url,
+    deferred: bool,
+    contribution: &'a PackageScopeContribution,
+    name: &'a str,
+) -> impl Iterator<Item = &'a Path> {
+    let context = uri.to_file_path().ok().and_then(|path| {
+        let root = contribution.workspace_root.as_ref()?;
+        let is_preamble =
+            test_preamble_context(&path, root, package_state::is_r_source_path(&path, root))?;
+        Some((path, is_preamble))
+    });
+    contribution
+        .test_helper_symbols
+        .iter()
+        .rev()
+        .filter_map(move |(peer, names)| {
+            let (path, is_preamble) = context.as_ref()?;
+            let phase = preamble_phase(peer, path, *is_preamble)?;
+            (names.contains(name) && (phase == ScopePhase::Immediate || deferred))
+                .then_some(peer.as_path())
+        })
+}
+
+/// Classify a query using the same package-layout gate for visibility and origin.
+fn test_preamble_context(path: &Path, root: &Path, kind: Option<RFileKind>) -> Option<bool> {
+    (kind == Some(RFileKind::Test) && package_state::is_testthat_or_testit_test(path, root)).then(
+        || {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(package_state::is_test_preamble_filename)
+        },
+    )
 }
 
 /// Classify a peer by testthat's same-directory, byte-lexicographic source order.

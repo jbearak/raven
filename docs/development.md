@@ -722,6 +722,16 @@ membership index. `scope/contribution_tests.rs` checks the same behavioral
 contract through recursive resolution, `is_visible`, `symbol_for`, and snapshots,
 including canonical aliases and attachment timing.
 
+Helper hover recovers provenance lazily after scope selects a synthetic binding.
+It uses the shared contribution directory/order gates to choose the last eligible
+preamble contributing the requested name, then resolves that preamble at EOF
+with its inherited attachments. Only file-backed definitions produced by that
+preamble or its forward sources qualify; parent-only bindings and synthetic
+fallbacks do not. This reuses static-source, deferred-body, and removal semantics
+without adding locations or per-name allocations to diagnostic contributions.
+Unavailable definitions remain location-free instead of falling back to an older
+helper or an unrelated workspace definition.
+
 The CLI keeps shared Rope snapshots of package R files from the complete scan
 before admitting documents to the bounded workspace index. It converts evicted
 files into package inputs and lets the shared hydration path supply resident

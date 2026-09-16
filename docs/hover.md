@@ -70,6 +70,12 @@ When the hover is built from a local or sourced definition, Raven adds one line 
 
 The relative path is computed against the workspace root when one is available, so hovering a symbol defined in `R/utils.R` shows exactly that — not an absolute URI. The link points at the same file go-to-definition navigates to (go-to-definition additionally positions the cursor on the definition); see [Go-to-Definition](go-to-definition.md#cross-file-navigation).
 
+Testthat helper/setup bindings also show their definition and file location,
+including later helpers visible inside function bodies and definitions loaded by
+static `source()` calls. Hover respects helper source order and
+`hoistGlobalsInFunctions`. If a contributed name has no recoverable definition,
+hover shows the name without a fabricated file location.
+
 ## Declared Symbols
 
 Symbols declared via [`# raven: var` or `# raven: func`](directives.md#declaration-directives) hover as an R code block with the declaration, followed by the directive line and (for cross-file declarations) a file attribution. For a function declared in another file, the hover renders the code block:

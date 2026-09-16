@@ -5397,6 +5397,7 @@ impl HierarchyBuilder {
 /// # Returns
 ///
 /// A `HashMap` mapping symbol names to their corresponding `ScopedSymbol` entries.
+#[cfg(test)]
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
@@ -26116,6 +26117,47 @@ pub struct DefinitionInfo {
     pub line: u32,
 }
 
+#[cfg(test)]
+mod test_helper_hover_tests;
+
+/// Recover a test-preamble binding's real definition only after scope resolution
+/// selected the location-free internal sentinel. The latest eligible contributing
+/// preamble wins; if its live definition is unavailable or removed, do not invent
+/// a location from an older helper or an unrelated workspace file. Its completed
+/// scope follows static sources and attachment-dependent deferred bodies. Accept
+/// only file-backed definitions produced by that helper or its forward sources;
+/// parent-only bindings and synthetic contribution fallbacks are not provenance.
+fn test_helper_definition_symbol(
+    state: &WorldState,
+    uri: &Url,
+    deferred: bool,
+    name: &str,
+) -> Option<ScopedSymbol> {
+    let contribution = state.package_state.scope_contribution();
+    let root = contribution.workspace_root.as_ref()?;
+    let query_uri = state
+        .authoritative_workspace_query_uri_for_open_document(uri, root)
+        .unwrap_or_else(|| uri.clone());
+    let peer =
+        scope::test_helper_sources_for_symbol(&query_uri, deferred, contribution, name).next()?;
+    let peer_uri = Url::from_file_path(peer).ok()?;
+    let mut helper_scope = get_cross_file_scope(
+        state,
+        &peer_uri,
+        u32::MAX,
+        u32::MAX,
+        &DiagCancelToken::never(),
+        Some(contribution),
+    );
+    if helper_scope.parent_prefix_symbol_names.contains(name) {
+        return None;
+    }
+    helper_scope
+        .symbols
+        .remove(name)
+        .filter(|symbol| symbol.source_uri.scheme() == "file")
+}
+
 pub fn extract_definition_statement(
     symbol: &ScopedSymbol,
     state: &WorldState,
@@ -26945,8 +26987,16 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     }
 
     // Try cross-file symbols (includes local scope with definition extraction)
-    log::trace!("Calling get_cross_file_symbols for hover");
-    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    log::trace!("Calling get_cross_file_scope for hover");
+    let cross_file_scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    );
+    let cross_file_symbols = &cross_file_scope.symbols;
     log::trace!(
         "Got {} symbols from cross-file scope",
         cross_file_symbols.len()
@@ -26962,6 +27012,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         .get(name)
         .or_else(|| cross_file_symbols.get(symbol_key))
     {
+        let helper_symbol = scope::is_package_internal_uri(&symbol.source_uri)
+            .then(|| {
+                test_helper_definition_symbol(
+                    state,
+                    uri,
+                    cross_file_scope.contributions_deferred,
+                    &symbol.name,
+                )
+            })
+            .flatten();
+        let symbol = helper_symbol.as_ref().unwrap_or(symbol);
         log::trace!(
             "hover: found symbol '{}' in cross_file_symbols, source_uri={}, is_declared={}",
             name,
@@ -27094,14 +27155,18 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     }
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
-                    if symbol.source_uri != *uri {
+                    if symbol.source_uri != *uri
+                        && !scope::is_package_internal_uri(&symbol.source_uri)
+                    {
                         let relative_path =
                             compute_relative_path(&symbol.source_uri, workspace_root);
                         value.push_str(&format!("\n*Defined in {}*", relative_path));
                     }
                 } else {
                     value.push_str(&format!("```r\n{}\n```\n", name));
-                    if symbol.source_uri != *uri {
+                    if symbol.source_uri != *uri
+                        && !scope::is_package_internal_uri(&symbol.source_uri)
+                    {
                         let relative_path =
                             compute_relative_path(&symbol.source_uri, workspace_root);
                         value.push_str(&format!("\n*Defined in {}*", relative_path));
