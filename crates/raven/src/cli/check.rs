@@ -1112,6 +1112,7 @@ fn reported_packages_to_warm(
                 |import| match &import.spec {
                     crate::box_use::BoxSpec::Package(package) => Some(package.clone()),
                     crate::box_use::BoxSpec::LocalModule { .. }
+                    | crate::box_use::BoxSpec::SearchPathModule { .. }
                     | crate::box_use::BoxSpec::Unsupported(_) => None,
                 },
             ));
@@ -1161,6 +1162,7 @@ fn reported_packages_to_warm(
                     |import| match &import.spec {
                         crate::box_use::BoxSpec::Package(package) => Some(package.clone()),
                         crate::box_use::BoxSpec::LocalModule { .. }
+                        | crate::box_use::BoxSpec::SearchPathModule { .. }
                         | crate::box_use::BoxSpec::Unsupported(_) => None,
                     },
                 ));

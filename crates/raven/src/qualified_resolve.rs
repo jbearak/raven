@@ -2471,11 +2471,16 @@ mod tests {
 
     #[test]
     fn selective_namespace_completion_and_definition_respect_exports() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let module_path = dir.path().join("mod.r");
-        let importer_path = dir.path().join("main.R");
-        let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
-        let importer_code = "\
+        for rhino in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let module_path = dir.path().join("app/mod.r");
+            let importer_path = dir.path().join("app/main.R");
+            let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
+            std::fs::create_dir_all(dir.path().join("app")).unwrap();
+            if rhino {
+                std::fs::write(dir.path().join("rhino.yml"), "").unwrap();
+            }
+            let importer_code = "\
 box::use(./mod)
 mod$
 mod$public
@@ -2483,86 +2488,93 @@ mod$private
 mod[[\"public\"]]
 mod$public$child
 ";
-        fs::write(&module_path, module_code).expect("write module");
-        fs::write(&importer_path, importer_code).expect("write importer");
+            let importer_text = if rhino {
+                importer_code.replace("./mod", "app/mod")
+            } else {
+                importer_code.to_string()
+            };
+            let importer_code = importer_text.as_str();
+            fs::write(&module_path, module_code).expect("write module");
+            fs::write(&importer_path, importer_code).expect("write importer");
 
-        let mut state = fresh_state();
-        let module_url = Url::from_file_path(&module_path).expect("module url");
-        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
-        add_indexed_doc(&mut state, module_url.as_str(), module_code);
-        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+            let mut state = fresh_state();
+            let module_url = Url::from_file_path(&module_path).expect("module url");
+            let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+            add_indexed_doc(&mut state, module_url.as_str(), module_code);
+            add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
 
-        let module_spec = loc(goto_definition(&state, &importer_url, Position::new(0, 12)));
-        assert_eq!(module_spec.uri, module_url);
-        assert_eq!(module_spec.range, tower_lsp::lsp_types::Range::default());
+            let module_spec = loc(goto_definition(&state, &importer_url, Position::new(0, 12)));
+            assert_eq!(module_spec.uri, module_url);
+            assert_eq!(module_spec.range, tower_lsp::lsp_types::Range::default());
 
-        let path = dollar_path("mod", &[]);
-        let dollar = super::complete_qualified_members(
-            &state,
-            &importer_url,
-            Position::new(1, 4),
-            &path,
-            crate::extract_op::ExtractOp::Dollar,
-        );
-        let at = super::complete_qualified_members(
-            &state,
-            &importer_url,
-            Position::new(1, 4),
-            &path,
-            crate::extract_op::ExtractOp::At,
-        );
-        assert_eq!(
-            dollar
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["public"]
-        );
-        assert_eq!(at, dollar, "`$` and `@` must share the export boundary");
-
-        let definition = super::resolve_qualified_member(
-            &state,
-            &importer_url,
-            Position::new(2, 5),
-            &path,
-            "public",
-            crate::extract_op::ExtractOp::Dollar,
-        )
-        .expect("exported member definition");
-        assert_eq!(definition.uri, module_url);
-        assert_eq!(definition.range.start, Position::new(1, 0));
-        assert_eq!(definition.range.end, Position::new(1, 6));
-
-        assert!(
-            super::resolve_qualified_member(
+            let path = dollar_path("mod", &[]);
+            let dollar = super::complete_qualified_members(
                 &state,
                 &importer_url,
-                Position::new(3, 5),
+                Position::new(1, 4),
                 &path,
-                "private",
                 crate::extract_op::ExtractOp::Dollar,
-            )
-            .is_none(),
-            "non-exported module objects must remain private"
-        );
-
-        let literal = loc(goto_definition(&state, &importer_url, Position::new(4, 7)));
-        assert_eq!(literal.uri, module_url);
-        assert_eq!(literal.range.start, Position::new(1, 0));
-        assert_eq!(literal.range.end, Position::new(1, 6));
-
-        assert!(
-            super::resolve_qualified_member(
+            );
+            let at = super::complete_qualified_members(
                 &state,
                 &importer_url,
-                Position::new(5, 12),
-                &dollar_path("mod", &["public"]),
-                "child",
+                Position::new(1, 4),
+                &path,
+                crate::extract_op::ExtractOp::At,
+            );
+            assert_eq!(
+                dollar
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["public"]
+            );
+            assert_eq!(at, dollar, "`$` and `@` must share the export boundary");
+
+            let definition = super::resolve_qualified_member(
+                &state,
+                &importer_url,
+                Position::new(2, 5),
+                &path,
+                "public",
                 crate::extract_op::ExtractOp::Dollar,
             )
-            .is_none(),
-            "nested module values must not fall back to ordinary object scanning"
-        );
+            .expect("exported member definition");
+            assert_eq!(definition.uri, module_url);
+            assert_eq!(definition.range.start, Position::new(1, 0));
+            assert_eq!(definition.range.end, Position::new(1, 6));
+
+            assert!(
+                super::resolve_qualified_member(
+                    &state,
+                    &importer_url,
+                    Position::new(3, 5),
+                    &path,
+                    "private",
+                    crate::extract_op::ExtractOp::Dollar,
+                )
+                .is_none(),
+                "non-exported module objects must remain private"
+            );
+
+            let literal = loc(goto_definition(&state, &importer_url, Position::new(4, 7)));
+            assert_eq!(literal.uri, module_url);
+            assert_eq!(literal.range.start, Position::new(1, 0));
+            assert_eq!(literal.range.end, Position::new(1, 6));
+
+            assert!(
+                super::resolve_qualified_member(
+                    &state,
+                    &importer_url,
+                    Position::new(5, 12),
+                    &dollar_path("mod", &["public"]),
+                    "child",
+                    crate::extract_op::ExtractOp::Dollar,
+                )
+                .is_none(),
+                "nested module values must not fall back to ordinary object scanning"
+            );
+        }
     }
 
     #[test]
@@ -2833,51 +2845,63 @@ mod$public
 
     #[test]
     fn selective_namespace_hover_uses_closed_module_provenance() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let module_path = dir.path().join("mod.r");
-        let importer_path = dir.path().join("main.R");
-        let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
-        let importer_code = "\
+        for rhino in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let module_path = dir.path().join("app/mod.r");
+            let importer_path = dir.path().join("app/main.R");
+            let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
+            std::fs::create_dir_all(dir.path().join("app")).unwrap();
+            if rhino {
+                std::fs::write(dir.path().join("rhino.yml"), "").unwrap();
+            }
+            let importer_code = "\
 box::use(./mod)
 mod$public
 mod@public
 mod[[\"public\"]]
 mod$private
 ";
-        fs::write(&module_path, module_code).expect("write module");
-        fs::write(&importer_path, importer_code).expect("write importer");
-
-        let mut state = fresh_state();
-        let module_url = Url::from_file_path(&module_path).expect("module url");
-        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
-        add_indexed_doc(&mut state, module_url.as_str(), module_code);
-        state.open_document(importer_url.clone(), importer_code, Some(1));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        for position in [
-            Position::new(1, 6),
-            Position::new(2, 6),
-            Position::new(3, 7),
-        ] {
-            let result = runtime
-                .block_on(hover(&state, &importer_url, position))
-                .expect("exported member hover");
-            let value = match result.contents {
-                tower_lsp::lsp_types::HoverContents::Markup(markup) => markup.value,
-                other => panic!("expected markup hover, got {other:?}"),
+            let importer_text = if rhino {
+                importer_code.replace("./mod", "app/mod")
+            } else {
+                importer_code.to_string()
             };
-            assert!(value.contains("public <- 1"), "hover was {value:?}");
-        }
+            let importer_code = importer_text.as_str();
+            fs::write(&module_path, module_code).expect("write module");
+            fs::write(&importer_path, importer_code).expect("write importer");
 
-        assert!(
-            runtime
-                .block_on(hover(&state, &importer_url, Position::new(4, 6)))
-                .is_none(),
-            "private module members must not receive hover"
-        );
+            let mut state = fresh_state();
+            let module_url = Url::from_file_path(&module_path).expect("module url");
+            let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+            add_indexed_doc(&mut state, module_url.as_str(), module_code);
+            state.open_document(importer_url.clone(), importer_code, Some(1));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            for position in [
+                Position::new(1, 6),
+                Position::new(2, 6),
+                Position::new(3, 7),
+            ] {
+                let result = runtime
+                    .block_on(hover(&state, &importer_url, position))
+                    .expect("exported member hover");
+                let value = match result.contents {
+                    tower_lsp::lsp_types::HoverContents::Markup(markup) => markup.value,
+                    other => panic!("expected markup hover, got {other:?}"),
+                };
+                assert!(value.contains("public <- 1"), "hover was {value:?}");
+            }
+
+            assert!(
+                runtime
+                    .block_on(hover(&state, &importer_url, Position::new(4, 6)))
+                    .is_none(),
+                "private module members must not receive hover"
+            );
+        }
     }
 
     #[test]

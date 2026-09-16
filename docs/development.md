@@ -636,8 +636,12 @@ modules own it, split by concern:
     re-exported imports and symbolic wildcard re-exports. Marker-less modules
     derive their partial legacy fallback from the canonical live top-level
     scope rather than from a separate definition scanner.
-  - `path.rs` resolves a local `BoxSpec::LocalModule` without reusing
-    `path_resolve.rs`: box paths are file-relative, ignore `# raven: cd` /
+  - `path.rs` resolves `BoxSpec::LocalModule` and `BoxSpec::SearchPathModule`
+    without reusing `path_resolve.rs`. Explicit relative paths use the importing
+    file's directory; qualified paths use the nearest ancestor with `rhino.yml`.
+    Detached enrichment discovers this root once per import batch and persists
+    it in the search-path spec. No marker means an inert import, without missing
+    module diagnostics. Both path forms ignore `# raven: cd` /
     testthat WD / workspace-root fallback, are case-sensitive, and try
     `path.r`, `path.R`, `path/__init__.r`, `path/__init__.R`. The resolved URI
     stays raw/non-canonicalised, matching Raven's URI identity convention.
@@ -659,9 +663,13 @@ scan, watched resync, on-demand indexing, excluded-file, and CLI preparation
 seams enrich it only after dropping any `WorldState` guard. Graph construction,
 scope/artifact resolution, diagnostics, navigation, references, and hover
 consume the persisted outcome and must never probe the filesystem themselves.
-Watched candidate events re-enrich unchanged importers off-lock and guard an
+Watched candidate events, including ancestor `rhino.yml` creation/deletion,
+re-enrich unchanged importers off-lock and guard an
 open-record replacement by its never-reused analysis generation, so a stale
-watch refresh cannot overwrite newer editor text.
+watch refresh cannot overwrite newer editor text. Marker-only events also load
+newly resolved targets and their forward dependencies through the existing
+on-demand indexer before committing importer metadata, so a cold module can
+supply exports without waiting for an R-file event.
 
 `ScopeEvent::SelectiveImport` places resolved imports in the ordinary ordered
 scope timeline; the same `SelectiveImportProvider` seam is used by recursive and

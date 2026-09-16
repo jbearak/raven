@@ -11,7 +11,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 | Literal-string `[[` subscript (`foo[["bar"]]`) | Same as `` foo$`bar` `` — `[[` is the `$`-equivalent extractor; see [$ and @ Member Resolution](#-and--member-resolution) |
 | Symbol declared via `# raven: var` / `# raven: func` | The directive line itself — see [Declared Symbols](#declared-symbols) |
 | File path inside `source()` or a path directive | The referenced file, opened at line 0 |
-| Static relative module spec inside `box::use(./module)` | The resolved file module or package-style `__init__.r` / `__init__.R` |
+| Static relative or Rhino module spec inside `box::use()` | The resolved file module or package-style `__init__.r` / `__init__.R` |
 | Exported member of a box namespace alias, or an attached/renamed box binding | The original local-module definition, including through named, renamed, and wildcard re-exports; installed-package members remain non-navigable |
 | Literal `.R`/`.r` source or selected/renamed local member in a static `import::` call | The exact script file or original top-level definition |
 | Identifier in `.stan`, `.jags`, `.bugs`, or `.bug` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
@@ -87,7 +87,7 @@ See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Direct
 
 ### box module paths and exports
 
-Cmd-click on a static relative [`box::use()` module spec](modules.md#box-modules-boxuse) opens the exact resolved module. box path resolution is file-relative and case-sensitive, ignores Raven's `source()` working-directory/fallback rules, and checks `path.r`, `path.R`, `path/__init__.r`, then `path/__init__.R`.
+Cmd-click on a static relative or Rhino [`box::use()` module spec](modules.md#box-modules-boxuse) opens the exact resolved module. Explicit relative paths use the importing file's directory; qualified Rhino paths use the nearest `rhino.yml` root. Resolution is case-sensitive, ignores Raven's `source()` working-directory/fallback rules, and checks `path.r`, `path.R`, `path/__init__.r`, then `path/__init__.R`.
 
 For namespace aliases and attached/renamed bindings, navigation crosses only the exported interface. `$`, `@`, and a single positional literal-string `[[...]]` access resolve to the original local-module definition, following named, renamed, or wildcard re-export chains with cycle guards. Private names and merely transitive imports do not navigate. Installed-package box imports reuse package export metadata but remain non-navigable for the same reason as other installed package exports.
 

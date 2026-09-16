@@ -7956,7 +7956,8 @@ fn collect_box_import_diagnostics_from_snapshot(
             crate::box_use::BoxSpec::Package(package) => {
                 crate::selective_import::ImportSource::Package(package.clone())
             }
-            crate::box_use::BoxSpec::LocalModule { .. } => match &import.local_resolution {
+            crate::box_use::BoxSpec::LocalModule { .. }
+            | crate::box_use::BoxSpec::SearchPathModule { .. } => match &import.local_resolution {
                 Some(crate::box_use::LocalModuleResolution::Resolved(uri)) => {
                     crate::selective_import::ImportSource::LocalModule(
                         crate::selective_import::LocalModuleIdentity::new(

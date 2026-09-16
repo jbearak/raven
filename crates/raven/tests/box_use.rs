@@ -83,3 +83,44 @@ fn missing_module_and_complete_export_absence_are_reported() {
         "an unresolved static local module must be reported:\n{output}"
     );
 }
+
+#[test]
+fn rhino_qualified_imports_and_reexports_work_from_nested_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("apps/demo");
+    std::fs::create_dir_all(root.join("app/logic/greetings")).unwrap();
+    std::fs::create_dir_all(root.join("app/view")).unwrap();
+    std::fs::write(root.join("rhino.yml"), "").unwrap();
+    std::fs::write(
+        root.join("app/logic/say_hello.R"),
+        "box::export(say_hello)\nsay_hello <- function(name) name\nprivate <- 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/logic/greetings/__init__.R"),
+        "#' @export\nbox::use(app/logic/say_hello[greet = say_hello])\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("app/view/hello.R"),
+        "box::use(\n  app/logic/say_hello,\n  app/logic/greetings[greet],\n)\nsay_hello$say_hello('world')\ngreet('world')\nprivate\n").unwrap();
+    let output = run_check(dir.path());
+    for unexpected in [
+        "say_hello is not defined",
+        "greet is not defined",
+        "app is not defined",
+        "logic is not defined",
+        "box-module-not-found",
+        "box-export-not-found",
+    ] {
+        assert!(!output.contains(unexpected), "{unexpected}:\n{output}");
+    }
+    assert!(output.contains("private is not defined"), "{output}");
+    std::fs::write(
+        root.join("app/view/broken.R"),
+        "box::use(app/logic/absent, app/logic/say_hello[private])\n",
+    )
+    .unwrap();
+    let output = run_check(dir.path());
+    assert!(output.contains("box-module-not-found"), "{output}");
+    assert!(output.contains("box-export-not-found"), "{output}");
+}

@@ -443,10 +443,11 @@ impl ImportEnv for ArtifactModuleExportEnv<'_> {
 ///
 /// Starts a fresh cycle-guard. Marker-less modules return their
 /// [`legacy_exports`](ModuleExportEnv::legacy_exports); modules with explicit
-/// exports return those unioned with every expanded re-export. A re-export that
-/// cannot be resolved (missing/case-mismatched local module, unsupported spec,
-/// cycle, depth overflow) contributes [`ExportSet::unresolved`], which weakens
-/// the union's completeness (via [`ExportSet::union_with`]) but never drops the
+/// exports return those unioned with every expanded re-export. Qualified imports
+/// without a resolved source contribute no bindings. Other unresolved sources,
+/// cycles, and depth overflow produce an [`ExportSet::unresolved`] source set:
+/// named attachments remain possible, while wildcard attachments weaken the
+/// union's completeness via [`ExportSet::union_with`]. Neither drops the
 /// statically-known members.
 pub fn resolve_module_export_set(uri: &Url, env: &dyn ModuleExportEnv) -> ExportSet {
     let mut visited = HashSet::new();
@@ -496,6 +497,21 @@ fn resolve_reexport_source(
     visited: &mut HashSet<Url>,
     depth: usize,
 ) -> ExportSet {
+    let mut contribution = ExportSet::complete(std::iter::empty::<String>());
+    if matches!(reexport.spec, super::BoxSpec::SearchPathModule { .. }) {
+        // An unknown search root cannot introduce bindings, even through a
+        // tagged namespace or named attachment. Own same-name exports remain
+        // in the caller's set and are unaffected by this empty contribution.
+        if reexport.resolved_source().is_none() {
+            return contribution;
+        }
+        if let Some(alias) = reexport.effective_alias() {
+            contribution.members.insert(alias);
+        }
+        if reexport.attach.is_empty() {
+            return contribution;
+        }
+    }
     let source_exports = match reexport.resolved_source() {
         Some(ImportSource::Package(name)) => env.package_exports(&name),
         Some(ImportSource::LocalModule(module)) => {
@@ -504,7 +520,6 @@ fn resolve_reexport_source(
         None => ExportSet::unresolved(),
     };
 
-    let mut contribution = ExportSet::complete(std::iter::empty::<String>());
     for attach in &reexport.attach {
         match attach {
             BoxAttach::Named(name) => {
@@ -583,6 +598,53 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn qualified_reexports_stay_inert_until_their_source_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let importer = Url::from_file_path(dir.path().join("mod.R")).unwrap();
+        let module = Url::from_file_path(dir.path().join("app/helper.R")).unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/helper.R"), "").unwrap();
+        let code = "#' @export\nbox::use(app/helper, named = app/helper[value], app/helper[renamed = value])\n#' @export\nown <- 1\n";
+        let mut env = MapEnv::default();
+        env.legacy.insert(
+            module.to_string(),
+            ExportSet::complete(["value".to_string()]),
+        );
+        for has_root in [false, true] {
+            if has_root {
+                std::fs::write(dir.path().join("rhino.yml"), "").unwrap();
+            }
+            let mut metadata = crate::cross_file::extract_metadata(code);
+            crate::cross_file::enrich_box_import_resolutions(&mut metadata, &importer);
+            env.box_exports
+                .insert(importer.to_string(), metadata.box_exports.unwrap());
+            let exports = resolve_module_export_set(&importer, &env);
+            let expected: std::collections::BTreeSet<String> = if has_root {
+                ["helper", "named", "value", "renamed", "own"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            } else {
+                ["own".to_string()].into_iter().collect()
+            };
+            assert_eq!(exports.members, expected);
+            assert_eq!(exports.completeness, ExportCompleteness::Complete);
+        }
+        std::fs::remove_file(dir.path().join("rhino.yml")).unwrap();
+        let mut metadata = crate::cross_file::extract_metadata(
+            "#' @export\nbox::use(app/helper)\n#' @export\nhelper <- 1\n",
+        );
+        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &importer);
+        env.box_exports
+            .insert(importer.to_string(), metadata.box_exports.unwrap());
+        assert!(
+            resolve_module_export_set(&importer, &env)
+                .members
+                .contains("helper")
+        );
+    }
 
     fn box_module(uri: Url) -> ImportSource {
         ImportSource::LocalModule(LocalModuleIdentity::new(uri, LocalModuleDialect::Box))

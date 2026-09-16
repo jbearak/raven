@@ -35,8 +35,8 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `syntax-error` | Parse errors (the umbrella code; most parse errors carry it directly, but `chained-comparison` is a sub-kind that carries its own code) | No |
 | `unresolved-source-path` | A `source()` / forward-directive path (`# raven: source` / `# raven: run` / `# raven: include`) or backward-directive path (`# raven: sourced-by` / `# raven: run-by` / `# raven: included-by`) that does not resolve to a file — missing, outside the workspace, or case-ambiguous (2+ case-insensitive matches); also a missing literal `tar_render()` / `tar_knit()` / single-document `tar_quarto()` path | No |
 | `source-path-case-mismatch` | A `source()` / forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename (`templates.r` vs `templates.R`) | No |
-| `box-module-not-found` | A static relative `box::use(./module)` target does not resolve to a file module or `__init__.r` / `__init__.R` module | No |
-| `box-module-case-mismatch` | A static relative box module target exists only under a different filename case | No |
+| `box-module-not-found` | A static relative or Rhino `box::use()` target does not resolve to a file module or `__init__.r` / `__init__.R` module | No |
+| `box-module-case-mismatch` | A static relative or Rhino box module target exists only under a different filename case | No |
 | `box-export-not-found` | A named/renamed box attachment is absent from a complete module or package export set | Yes |
 | `import-module-not-found` | A literal `.R`/`.r` `{import}` script module cannot be resolved | No |
 | `import-module-case-mismatch` | A literal `{import}` script path exists only under a different filename case | No |

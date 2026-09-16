@@ -303,7 +303,8 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             // `.Rmarkdown`, and `.qmd` are included so workspace file events
             // for those documents reach the server too. `raven.toml` and
             // `.lintr` are watched so portable project-config edits reach the
-            // server for live reconfiguration.
+            // server for live reconfiguration. `rhino.yml` marks the application
+            // root for qualified box module paths.
             fileEvents: [
                 vscode.workspace.createFileSystemWatcher(
                     '**/*.{r,R,rmd,Rmd,RMD,rmarkdown,Rmarkdown,RMARKDOWN,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,bug,buG,bUg,bUG,Bug,BuG,BUg,BUG,stan,Stan,STAN}',
@@ -311,6 +312,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 vscode.workspace.createFileSystemWatcher('**/raven.toml'),
                 vscode.workspace.createFileSystemWatcher('**/.lintr'),
                 vscode.workspace.createFileSystemWatcher('**/.Rprofile'),
+                vscode.workspace.createFileSystemWatcher('**/rhino.yml'),
                 vscode.workspace.createFileSystemWatcher('**/.gitignore'),
             ],
         },
