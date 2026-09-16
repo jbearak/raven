@@ -696,6 +696,38 @@ files. Seeding only from resident documents loses helper and package definitions
 when unrelated files evict them. Both paths reuse scanned text and the shared
 R-file classifier, with no second disk read or duplicate text conversion.
 
+### Scope event evaluation
+
+`cross_file/scope/evaluation.rs` owns event timing and environment membership.
+`EventContext` classifies each `ScopeEvent` once: the anchor chooses its owning
+function, while the activation boundary controls visibility. Definitions use
+their recorded boundary, including assignment RHS completion; sources and
+removals use a strict call-site boundary;
+function-frame events contribute parameters only within their interval; ordered
+pre-entry batches retain their separate stage cutoff.
+
+`QueryContext` combines lexical and already-activated Shiny scopes with the
+cursor and hoisting setting. Single-file and graph-aware point resolvers ask it
+whether each event is positional, hoisted, or hidden before applying mutations.
+The streaming resolver uses the same event classification for ordering, frame
+routing, and completed-global filtering. Global events may be hoisted inside a
+function, while local events remain position-aware within their owning frame.
+The positional/hoisted distinction also preserves removal tombstone behavior.
+
+Traversal and mutation stay with their existing owners. Ordered attachment
+projection still discovers conditional Shiny scopes; the evaluation module only
+consumes those intervals. Source locality, source-batch execution, recursion
+budgets, frame lifetimes, and caches are unchanged. Parent-prefix cache selection
+continues to use its existing lexical context before conditional scope discovery.
+The ordinary active-scope set is borrowed; only conditional-scope unions allocate.
+
+`scope/evaluation_tests.rs` asserts independent expected visibility and package
+facts, then compares point, cached point, single-file, and streaming interfaces.
+Each streaming contract uses both monotonic checkpoints and direct jumps. The
+matrix covers assignment RHS boundaries, global hoisting versus local ordering,
+sibling frames, full EOF versus an end-of-line column, source/removal boundaries,
+data and selective imports, and ordered Shiny activation.
+
 ### Parent-prefix scope and forward-source traversal
 
 Scope resolution has two distinct graph traversals:

@@ -24,8 +24,17 @@ use super::types::{ForwardSource, byte_offset_to_utf16_column};
 use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
 mod contributions;
+use contributions::ScopeContributions;
 pub(crate) use contributions::rprofile_prelude_applies;
-use contributions::{ScopeContributions, ScopePhase};
+mod evaluation;
+pub(super) use evaluation::event_effect_position;
+use evaluation::{
+    EventContext, EventVisibility, QueryContext, ScopePhase, event_sort_key,
+    innermost_effective_scope,
+};
+
+#[cfg(all(test, unix))]
+mod evaluation_tests;
 
 #[cfg(all(test, unix))]
 mod contribution_tests;
@@ -672,8 +681,7 @@ pub enum ScopeEvent {
     ///
     /// `visible_from_line/visible_from_column` is the *effect position* —
     /// when the new binding actually enters scope. It is what
-    /// `is_symbol_visible` (and the inline check in
-    /// `scope_at_position_with_packages`) compares against, **and it is the
+    /// the shared evaluation policy compares against, **and it is the
     /// key the timeline is sorted by** (see `event_effect_position`).
     ///
     /// For most definitions the two positions are identical (e.g. `for`
@@ -1838,89 +1846,6 @@ fn active_function_scopes_at(
     }
 }
 
-/// Position at which a `ScopeEvent` *takes effect* in document order.
-///
-/// For most events this is the anchor position (`line`/`column`). For
-/// `ScopeEvent::Def` it is `visible_from_line/visible_from_column`, because
-/// the binding is observable only after the defining expression has been
-/// evaluated (R installs `<-`/`=`/`<<-` bindings *after* the RHS, and the
-/// `assign()` call is treated the same way). Sorting the timeline by this
-/// position is what guarantees the resolver applies events in execution
-/// order — for example, the `rm(x)` inside `x <- { rm(x); 1 }` is processed
-/// *before* the `Def x` it sits inside, so the new binding is not silently
-/// dropped at positions past the assignment.
-fn event_sort_key(event: &ScopeEvent) -> (u8, u32, u32) {
-    let pre_entry = matches!(
-        event,
-        ScopeEvent::SourceBatch { kind, .. } if kind.is_pre_entry()
-    );
-    let (line, column) = event_effect_position(event);
-    (u8::from(!pre_entry), line, column)
-}
-
-pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
-    match event {
-        ScopeEvent::Def {
-            visible_from_line,
-            visible_from_column,
-            ..
-        } => (*visible_from_line, *visible_from_column),
-        // Source: child symbols are visible only AFTER the call site, so the
-        // effect position is one column past the call — matching the strict-<
-        // check in `scope_at_position_with_graph_recursive` (line 3448).
-        // `saturating_add` guards against the (theoretical) u32::MAX column.
-        ScopeEvent::Source { line, column, .. } => (*line, column.saturating_add(1)),
-        ScopeEvent::SourceBatch {
-            line, column, kind, ..
-        } => {
-            if kind.is_pre_entry() {
-                (0, 0)
-            } else {
-                (*line, column.saturating_add(1))
-            }
-        }
-        ScopeEvent::FunctionScope {
-            start_line,
-            start_column,
-            ..
-        } => (*start_line, *start_column),
-        // Removal: the recursive resolver applies a `rm(x)` only when its
-        // anchor is *strictly* before the query (`scope.rs:3683`,
-        // `(rm_line, rm_col) < (line, column)`). `ScopeStream::advance_to`
-        // applies any event whose effect position is `<= target`. Bumping
-        // the column by one keeps the streaming `<=` compare equivalent
-        // to the recursive `<` compare, mirroring the same trick `Source`
-        // events use just above.
-        ScopeEvent::Removal { line, column, .. } => (*line, column.saturating_add(1)),
-        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
-        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
-        // A selective import's bindings are visible from the call site onward,
-        // like a `Def`/`Declaration` (the `<=` visibility check applies).
-        ScopeEvent::SelectiveImport { line, column, .. } => (*line, *column),
-    }
-}
-
-fn is_symbol_visible(
-    def_line: u32,
-    def_col: u32,
-    function_scope: Option<FunctionScopeInterval>,
-    active_function_scopes: &HashSet<FunctionScopeInterval>,
-    line: u32,
-    column: u32,
-    query_inside_function: bool,
-) -> bool {
-    let passes_position = (def_line, def_col) <= (line, column);
-    if !passes_position && !query_inside_function {
-        return false;
-    }
-
-    match function_scope {
-        None => true,
-        Some(def_scope) => passes_position && active_function_scopes.contains(&def_scope),
-    }
-}
-
 fn is_same_or_descendant_function_scope(
     scope: Option<FunctionScopeInterval>,
     ancestor_scope: FunctionScopeInterval,
@@ -1957,30 +1882,25 @@ fn shiny_attached_at_position(
     query_inside_function: bool,
 ) -> bool {
     let mut attached = seed_attached_packages.clone();
+    let conditional_scopes = HashSet::new();
+    let query = QueryContext::new(
+        Position::new(line, column),
+        query_inside_function,
+        active_function_scopes,
+        &conditional_scopes,
+        None,
+    );
     for event in &artifacts.timeline {
         let ScopeEvent::PackageLoad {
-            line: package_line,
-            column: package_column,
             package,
             attaches,
             requires_attached,
-            function_scope,
             ..
         } = event
         else {
             continue;
         };
-        let passes_position = (*package_line, *package_column) <= (line, column);
-        if !passes_position && !query_inside_function {
-            continue;
-        }
-        let applies = match function_scope {
-            None => true,
-            Some(package_scope) => {
-                passes_position && active_function_scopes.contains(package_scope)
-            }
-        };
-        if applies
+        if query.evaluate(event).1 != EventVisibility::Hidden
             && package_load_requirement_satisfied_at_query(requires_attached.as_deref(), &attached)
             && *attaches
         {
@@ -2090,86 +2010,14 @@ fn single_file_attachment_projection(
     (active, late_attached)
 }
 
-fn innermost_effective_scope(
-    active_conditional_scopes: &HashSet<FunctionScopeInterval>,
-    line: u32,
-    column: u32,
-    ordinary_scope: Option<FunctionScopeInterval>,
-) -> Option<FunctionScopeInterval> {
-    if active_conditional_scopes.is_empty() {
-        return ordinary_scope;
-    }
-
-    let position = Position::new(line, column);
-    active_conditional_scopes
-        .iter()
-        .filter(|scope| scope.contains(position))
-        .copied()
-        .chain(ordinary_scope)
-        .max_by_key(|scope| scope.start)
-}
-
-fn active_effective_scopes_at<'a>(
-    ordinary_scopes: &'a HashSet<FunctionScopeInterval>,
-    active_conditional_scopes: &HashSet<FunctionScopeInterval>,
-    line: u32,
-    column: u32,
-) -> std::borrow::Cow<'a, HashSet<FunctionScopeInterval>> {
-    if active_conditional_scopes.is_empty() {
-        return std::borrow::Cow::Borrowed(ordinary_scopes);
-    }
-
-    let query = Position::new(line, column);
-    std::borrow::Cow::Owned(
-        ordinary_scopes
-            .iter()
-            .copied()
-            .chain(
-                active_conditional_scopes
-                    .iter()
-                    .filter(|scope| scope.contains(query))
-                    .copied(),
-            )
-            .collect(),
-    )
-}
-
-/// Remove the given symbols from a computed scope when the removal applies.
-///
-/// If `removal_scope` is `None`, this removes all listed `symbols` from `scope.symbols`.
-/// If `removal_scope` is `Some(scope)` the removal is applied only when that scope is
-/// present in `active_function_scopes`; otherwise the call is a no-op.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::collections::HashMap;
-/// // Illustrative example (types elided for brevity):
-/// // let mut scope = ScopeAtPosition { symbols: HashMap::new(), chain: vec![], depth_exceeded: vec![] };
-/// // scope.symbols.insert("x".to_string(), /* ScopedSymbol */);
-/// // apply_removal(&mut scope, &[], None, &["x".to_string()]);
-/// // assert!(!scope.symbols.contains_key("x"));
-/// ```
-fn apply_removal(
-    scope: &mut ScopeAtPosition,
-    active_function_scopes: &HashSet<FunctionScopeInterval>,
-    removal_scope: Option<FunctionScopeInterval>,
-    symbols: &[String],
-) {
-    match removal_scope {
-        None => {
-            for sym in symbols {
-                scope.symbols.remove(sym.as_str());
-                scope.removed_names.insert(Arc::from(sym.as_str()));
-            }
+/// Apply an already-eligible removal. Positional removals record tombstones;
+/// hoisted global removals preserve the point resolver's symbol-only projection.
+fn apply_removal(scope: &mut ScopeAtPosition, symbols: &[String], visibility: EventVisibility) {
+    for name in symbols {
+        scope.symbols.remove(name.as_str());
+        if visibility == EventVisibility::Positional {
+            scope.removed_names.insert(Arc::from(name.as_str()));
         }
-        Some(rm_scope) if active_function_scopes.contains(&rm_scope) => {
-            for sym in symbols {
-                scope.symbols.remove(sym.as_str());
-                scope.removed_names.insert(Arc::from(sym.as_str()));
-            }
-        }
-        _ => {}
     }
 }
 
@@ -2931,197 +2779,80 @@ pub fn scope_at_position(
 ) -> ScopeAtPosition {
     let mut scope = ScopeAtPosition::default();
 
-    // Use interval tree for O(log n) query instead of linear scan
-    let is_full_eof_position = Position::new(line, column).is_full_eof();
     let active_function_scopes =
         active_function_scopes_at(&artifacts.function_scope_tree, line, column);
-
-    // When hoisting is enabled and we're inside a function body, global definitions
-    // are visible regardless of position (R has late-binding semantics).
-    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
     let (active_conditional_shiny_scopes, in_function_attachment_seed) =
         single_file_attachment_projection(artifacts, line, column, hoist_globals);
-    let query_inside_function = query_inside_function
-        || (hoist_globals
-            && active_conditional_shiny_scopes
-                .iter()
-                .any(|scope| scope.contains(Position::new(line, column))));
-    let active_effective_scopes = active_effective_scopes_at(
+    let query = QueryContext::new(
+        Position::new(line, column),
+        hoist_globals,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
-        line,
-        column,
+        None,
     );
+    let query_inside_function = query.phase.is_deferred();
 
-    // Process events and apply function scope filtering.
-    // Use the def event's `visible_from` position for visibility checks; the
-    // `line/column` anchor is only used for function-scope annotation and is
-    // irrelevant once the timeline has been built.
+    // The shared classifier keeps each event's owning frame separate from its
+    // activation boundary, including assignment RHS completion.
     for event in &artifacts.timeline {
+        let (event_context, visibility) = query.evaluate(event);
+        if visibility == EventVisibility::Hidden {
+            continue;
+        }
         match event {
-            ScopeEvent::Def {
-                line: def_line,
-                column: def_column,
-                visible_from_line,
-                visible_from_column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *def_line,
-                    *def_column,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *visible_from_line,
-                    *visible_from_column,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                }
+            ScopeEvent::Def { symbol, .. } => {
+                scope.symbols.insert(symbol.name.clone(), symbol.clone());
             }
             ScopeEvent::Source { .. } | ScopeEvent::SourceBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                parameters,
-            } => {
-                // Include function parameters if position is within function body
-                // Skip EOF sentinel positions to avoid matching all functions
-                if !is_full_eof_position
-                    && (*start_line, *start_column) <= (line, column)
-                    && (line, column) <= (*end_line, *end_column)
-                {
-                    for param in parameters {
-                        scope.symbols.insert(param.name.clone(), param.clone());
-                    }
+            ScopeEvent::FunctionScope { parameters, .. } => {
+                for param in parameters {
+                    scope.symbols.insert(param.name.clone(), param.clone());
                 }
             }
-            ScopeEvent::Removal {
-                line: rm_line,
-                column: rm_col,
-                symbols,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *rm_line,
-                    *rm_col,
-                    *function_scope,
-                );
-                let passes_position = (*rm_line, *rm_col) < (line, column);
-                if passes_position || query_inside_function {
-                    // For hoisted removals, only apply global ones
-                    if !passes_position {
-                        // Hoisted path: only apply if this is a global removal
-                        if effective_scope.is_none() {
-                            for sym_name in symbols {
-                                scope.symbols.remove(sym_name.as_str());
-                            }
-                        }
-                    } else {
-                        apply_removal(
-                            &mut scope,
-                            &active_effective_scopes,
-                            effective_scope,
-                            symbols,
-                        );
-                    }
-                }
+            ScopeEvent::Removal { symbols, .. } => {
+                apply_removal(&mut scope, symbols, visibility);
             }
             ScopeEvent::PackageLoad {
-                line: pkg_line,
-                column: pkg_col,
                 package,
                 attaches,
                 requires_attached,
-                function_scope,
                 ..
             } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *pkg_line,
-                    *pkg_col,
-                    *function_scope,
+                let effective_scope = event_context.owner;
+                let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                    requires_attached.as_deref(),
+                    &scope.attached_packages,
                 );
-                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Check function scope compatibility
-                    let should_include = match effective_scope {
-                        None => true, // Global package load - include (hoisted or positional)
-                        Some(pkg_scope) => {
-                            // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_effective_scopes.contains(&pkg_scope)
-                        }
-                    };
-
-                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                let late_requirement_satisfied = effective_scope.is_some()
+                    && query_inside_function
+                    && package_load_requirement_satisfied(
                         requires_attached.as_deref(),
-                        &scope.attached_packages,
+                        &in_function_attachment_seed,
                     );
-                    let late_requirement_satisfied = effective_scope.is_some()
-                        && query_inside_function
-                        && package_load_requirement_satisfied(
-                            requires_attached.as_deref(),
-                            &in_function_attachment_seed,
-                        );
-                    if should_include
-                        && (running_requirement_satisfied || late_requirement_satisfied)
-                    {
-                        // No URI to record as origin in this single-file path —
-                        // there is no cross-file recursion in `scope_at_position`,
-                        // so origin tracking is not needed for leak detection.
-                        scope.loaded_packages.insert(package.clone());
-                        if *attaches {
-                            scope.attached_packages.insert(package.clone());
-                        }
+                if running_requirement_satisfied || late_requirement_satisfied {
+                    // No URI to record as origin in this single-file path —
+                    // there is no cross-file recursion in `scope_at_position`,
+                    // so origin tracking is not needed for leak detection.
+                    scope.loaded_packages.insert(package.clone());
+                    if *attaches {
+                        scope.attached_packages.insert(package.clone());
                     }
                 }
             }
-            ScopeEvent::Declaration {
-                line: decl_line,
-                column: decl_col,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *decl_line,
-                    *decl_col,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *decl_line,
-                    *decl_col,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    scope
-                        .symbols
-                        .entry(symbol.name.clone())
-                        .and_modify(|existing| {
-                            if existing.is_declared {
-                                *existing = symbol.clone();
-                            }
-                        })
-                        .or_insert_with(|| symbol.clone());
-                }
+            ScopeEvent::Declaration { symbol, .. } => {
+                // Real bindings win over declarations; later declarations replace earlier ones.
+                scope
+                    .symbols
+                    .entry(symbol.name.clone())
+                    .and_modify(|existing| {
+                        if existing.is_declared {
+                            *existing = symbol.clone();
+                        }
+                    })
+                    .or_insert_with(|| symbol.clone());
             }
             ScopeEvent::DataLoad { .. } => {
                 // No `data()` alias expansion here (issue #429): these
@@ -3204,27 +2935,18 @@ where
         );
     }
 
-    // Use interval tree for O(log n) query instead of linear scan
-    let is_full_eof_position = Position::new(line, column).is_full_eof();
     let active_function_scopes =
         active_function_scopes_at(&artifacts.function_scope_tree, line, column);
-
-    // When hoisting is enabled and we're inside a function body, global definitions
-    // are visible regardless of position (R has late-binding semantics).
-    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
     let (active_conditional_shiny_scopes, in_function_attachment_seed) =
         single_file_attachment_projection(artifacts, line, column, hoist_globals);
-    let query_inside_function = query_inside_function
-        || (hoist_globals
-            && active_conditional_shiny_scopes
-                .iter()
-                .any(|scope| scope.contains(Position::new(line, column))));
-    let active_effective_scopes = active_effective_scopes_at(
+    let query = QueryContext::new(
+        Position::new(line, column),
+        hoist_globals,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
-        line,
-        column,
+        None,
     );
+    let query_inside_function = query.phase.is_deferred();
 
     // Process events and apply function scope filtering.
     // Use the def event's `visible_from` position for visibility checks.
@@ -3232,204 +2954,98 @@ where
     // because we use insert() for definitions (which overwrites) and entry().or_insert_with()
     // for package loads (which preserves existing entries including local definitions).
     for event in &artifacts.timeline {
+        let (event_context, visibility) = query.evaluate(event);
+        if visibility == EventVisibility::Hidden {
+            continue;
+        }
         match event {
-            ScopeEvent::Def {
-                line: def_line,
-                column: def_column,
-                visible_from_line,
-                visible_from_column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *def_line,
-                    *def_column,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *visible_from_line,
-                    *visible_from_column,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                }
+            ScopeEvent::Def { symbol, .. } => {
+                scope.symbols.insert(symbol.name.clone(), symbol.clone());
             }
             ScopeEvent::Source { .. } | ScopeEvent::SourceBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                parameters,
-            } => {
-                // Include function parameters if position is within function body
-                // Skip EOF sentinel positions to avoid matching all functions
-                if !is_full_eof_position
-                    && (*start_line, *start_column) <= (line, column)
-                    && (line, column) <= (*end_line, *end_column)
-                {
-                    for param in parameters {
-                        scope.symbols.insert(param.name.clone(), param.clone());
-                    }
+            ScopeEvent::FunctionScope { parameters, .. } => {
+                for param in parameters {
+                    scope.symbols.insert(param.name.clone(), param.clone());
                 }
             }
-            ScopeEvent::Removal {
-                line: rm_line,
-                column: rm_col,
-                symbols,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *rm_line,
-                    *rm_col,
-                    *function_scope,
-                );
-                let passes_position = (*rm_line, *rm_col) < (line, column);
-                if passes_position || query_inside_function {
-                    if !passes_position {
-                        // Hoisted path: only apply global removals
-                        if effective_scope.is_none() {
-                            for sym_name in symbols {
-                                scope.symbols.remove(sym_name.as_str());
-                            }
-                        }
-                    } else {
-                        apply_removal(
-                            &mut scope,
-                            &active_effective_scopes,
-                            effective_scope,
-                            symbols,
-                        );
-                    }
-                }
+            ScopeEvent::Removal { symbols, .. } => {
+                apply_removal(&mut scope, symbols, visibility);
             }
             ScopeEvent::PackageLoad {
-                line: pkg_line,
-                column: pkg_col,
                 package,
                 attaches,
                 requires_attached,
-                function_scope,
                 ..
             } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *pkg_line,
-                    *pkg_col,
-                    *function_scope,
+                let effective_scope = event_context.owner;
+                let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                    requires_attached.as_deref(),
+                    &scope.attached_packages,
                 );
-                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    let should_include = match effective_scope {
-                        None => true, // Global package load - include (hoisted or positional)
-                        Some(pkg_scope) => {
-                            // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_effective_scopes.contains(&pkg_scope)
-                        }
-                    };
-
-                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                let late_requirement_satisfied = effective_scope.is_some()
+                    && query_inside_function
+                    && package_load_requirement_satisfied(
                         requires_attached.as_deref(),
-                        &scope.attached_packages,
+                        &in_function_attachment_seed,
                     );
-                    let late_requirement_satisfied = effective_scope.is_some()
-                        && query_inside_function
-                        && package_load_requirement_satisfied(
-                            requires_attached.as_deref(),
-                            &in_function_attachment_seed,
-                        );
-                    if should_include
-                        && (running_requirement_satisfied || late_requirement_satisfied)
+                if running_requirement_satisfied || late_requirement_satisfied {
+                    if package.is_empty()
+                        || package.contains('/')
+                        || package.contains('\\')
+                        || package.contains(char::is_whitespace)
                     {
-                        if package.is_empty()
-                            || package.contains('/')
-                            || package.contains('\\')
-                            || package.contains(char::is_whitespace)
-                        {
-                            continue;
-                        }
+                        continue;
+                    }
 
-                        scope.loaded_packages.insert(package.clone());
-                        if *attaches {
-                            scope.attached_packages.insert(package.clone());
-                        }
+                    scope.loaded_packages.insert(package.clone());
+                    if *attaches {
+                        scope.attached_packages.insert(package.clone());
+                    }
 
-                        let exports = get_package_exports(package);
-                        let package_uri = Url::parse(&format!("package:{}", package))
-                            .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+                    let exports = get_package_exports(package);
+                    let package_uri = Url::parse(&format!("package:{}", package))
+                        .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
 
-                        for export_name in exports {
-                            let should_insert = match scope.symbols.get(export_name.as_str()) {
-                                None => true,
-                                Some(existing) => {
-                                    existing.source_uri.as_str().starts_with("package:")
-                                }
-                            };
+                    for export_name in exports {
+                        let should_insert = match scope.symbols.get(export_name.as_str()) {
+                            None => true,
+                            Some(existing) => existing.source_uri.as_str().starts_with("package:"),
+                        };
 
-                            if should_insert {
-                                let name: Arc<str> = Arc::from(export_name);
-                                let defined_end_column = crate::utf16::utf16_len(&name);
-                                scope.symbols.insert(
-                                    name.clone(),
-                                    ScopedSymbol {
-                                        name,
-                                        kind: SymbolKind::Variable,
-                                        source_uri: package_uri.clone(),
-                                        defined_line: 0,
-                                        defined_column: 0,
-                                        defined_end_column,
-                                        signature: None,
-                                        is_declared: false,
-                                    },
-                                );
-                            }
+                        if should_insert {
+                            let name: Arc<str> = Arc::from(export_name);
+                            let defined_end_column = crate::utf16::utf16_len(&name);
+                            scope.symbols.insert(
+                                name.clone(),
+                                ScopedSymbol {
+                                    name,
+                                    kind: SymbolKind::Variable,
+                                    source_uri: package_uri.clone(),
+                                    defined_line: 0,
+                                    defined_column: 0,
+                                    defined_end_column,
+                                    signature: None,
+                                    is_declared: false,
+                                },
+                            );
                         }
                     }
                 }
             }
-            ScopeEvent::Declaration {
-                line: decl_line,
-                column: decl_col,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *decl_line,
-                    *decl_col,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *decl_line,
-                    *decl_col,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    scope
-                        .symbols
-                        .entry(symbol.name.clone())
-                        .and_modify(|existing| {
-                            if existing.is_declared {
-                                *existing = symbol.clone();
-                            }
-                        })
-                        .or_insert_with(|| symbol.clone());
-                }
+            ScopeEvent::Declaration { symbol, .. } => {
+                // Real bindings win over declarations; later declarations replace earlier ones.
+                scope
+                    .symbols
+                    .entry(symbol.name.clone())
+                    .and_modify(|existing| {
+                        if existing.is_declared {
+                            *existing = symbol.clone();
+                        }
+                    })
+                    .or_insert_with(|| symbol.clone());
             }
             ScopeEvent::DataLoad { .. } => {
                 // No `data()` alias expansion here (issue #429): these
@@ -6520,9 +6136,9 @@ fn combine_provider_fps(data_alias_fp: usize, selective_import_fp: usize) -> usi
 /// position, shared by the recursive resolver and the streaming path so both
 /// agree on what a selective import makes visible (issue #662, requirement #4).
 ///
-/// Visibility is gated exactly like a `Def`/`Declaration`: the import's bindings
-/// are visible from its call site onward and, when function-scoped, only inside
-/// that function. When visible, the request is resolved against `provider`
+/// The shared evaluation policy gates visibility before this mutation: imports
+/// are visible from their call site onward and function-local imports remain in
+/// their owning function. The request is resolved against `provider`
 /// (or a fail-closed [`UnresolvedImportEnv`] when `None`) and only *concrete*
 /// bindings are injected:
 ///
@@ -6537,39 +6153,14 @@ fn combine_provider_fps(data_alias_fp: usize, selective_import_fp: usize) -> usi
 ///
 /// Later timeline events overwrite these bindings (source order / shadowing) and
 /// a preceding `rm()` tombstone is cleared, matching `Def` semantics.
-#[allow(clippy::too_many_arguments)]
 fn apply_selective_import(
     scope: &mut ScopeAtPosition,
     importing_uri: &Url,
     imp_line: u32,
     imp_col: u32,
     request: &SelectiveImportRequest,
-    function_scope: Option<FunctionScopeInterval>,
-    active_conditional_shiny_scopes: &HashSet<FunctionScopeInterval>,
-    active_effective_scopes: &HashSet<FunctionScopeInterval>,
-    query_line: u32,
-    query_column: u32,
-    query_inside_function: bool,
     provider: Option<&SelectiveImportProvider<'_>>,
 ) {
-    let effective_scope = innermost_effective_scope(
-        active_conditional_shiny_scopes,
-        imp_line,
-        imp_col,
-        function_scope,
-    );
-    if !is_symbol_visible(
-        imp_line,
-        imp_col,
-        effective_scope,
-        active_effective_scopes,
-        query_line,
-        query_column,
-        query_inside_function,
-    ) {
-        return;
-    }
-
     let (symbols, aliases) =
         resolve_selective_import_bindings(request, importing_uri, imp_line, imp_col, provider);
     match &request.destination {
@@ -8718,17 +8309,14 @@ where
             hoist_globals,
         )
     });
-    let query_inside_function = query_inside_function
-        || (hoist_globals
-            && active_conditional_shiny_scopes
-                .iter()
-                .any(|scope| scope.contains(Position::new(line, column))));
-    let active_effective_scopes = active_effective_scopes_at(
+    let query = QueryContext::new(
+        Position::new(line, column),
+        hoist_globals,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
-        line,
-        column,
+        pre_entry_batch_cutoff,
     );
+    let query_inside_function = query.phase.is_deferred();
 
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Second pass: process events and apply function scope filtering.
@@ -8745,521 +8333,470 @@ where
     // the hub is itself forward-sourced. Recording it here lets us reconcile.
     let mut forward_contributed: HashSet<Arc<str>> = HashSet::new();
     for event in &artifacts.timeline {
+        let (event_context, visibility) = query.evaluate(event);
+        if visibility == EventVisibility::Hidden {
+            continue;
+        }
         match event {
-            ScopeEvent::Def {
-                line: def_line,
-                column: def_column,
-                visible_from_line,
-                visible_from_column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *def_line,
-                    *def_column,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *visible_from_line,
-                    *visible_from_column,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    scope.removed_names.remove(&symbol.name);
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
-                    scope.parent_prefix_symbol_names.remove(&symbol.name);
-                }
+            ScopeEvent::Def { symbol, .. } => {
+                scope.removed_names.remove(&symbol.name);
+                scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                scope.parent_prefix_symbol_names.remove(&symbol.name);
             }
             ScopeEvent::Source {
                 line: src_line,
                 column: src_col,
                 source,
-                function_scope,
                 ..
             } => {
-                let effective_function_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *src_line,
-                    *src_col,
-                    *function_scope,
-                );
-                // Include source() if before position, or if hoisting and it's a global source()
-                let passes_position = (*src_line, *src_col) < (line, column);
-                if let Some(src_scope) = effective_function_scope
-                    && !active_effective_scopes.contains(&src_scope)
+                let effective_function_scope = event_context.owner;
+                let package_effects_only =
+                    source.locality == super::types::SourceLocality::NonInheriting;
+                // A top-level CurrentFrame source contributes no child state to
+                // this file. A NonInheriting source likewise lends no symbols,
+                // but its orderable package-attachment side effects still apply
+                // to R's process search path after the call.
+                if should_apply_local_scoping(source)
+                    && effective_function_scope.is_none()
+                    && !package_effects_only
                 {
                     continue;
                 }
-                let is_global_source = query_inside_function && effective_function_scope.is_none();
-                if passes_position || is_global_source {
-                    let package_effects_only =
-                        source.locality == super::types::SourceLocality::NonInheriting;
-                    // A top-level CurrentFrame source contributes no child state to
-                    // this file. A NonInheriting source likewise lends no symbols,
-                    // but its orderable package-attachment side effects still apply
-                    // to R's process search path after the call.
-                    if should_apply_local_scoping(source)
-                        && effective_function_scope.is_none()
-                        && !package_effects_only
-                    {
+
+                // Resolve the child URI: prefer pre-computed dependency graph edges
+                // (which use workspace-root fallback) over re-resolving the path
+                // (which doesn't). This ensures paths like source("subdir/file.R")
+                // that rely on workspace-root-relative resolution work correctly
+                // in scope resolution, matching the dependency graph's behavior.
+                let resolve_lexically = || {
+                    path_ctx.as_ref().and_then(|ctx| {
+                        let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
+                            &source.path,
+                            ctx,
+                        )?;
+                        super::path_resolve::path_to_uri(&resolved)
+                    })
+                };
+                let graph_uri = || {
+                    graph
+                        .get_dependencies(uri)
+                        .iter()
+                        .find(|edge| {
+                            edge.is_ordinary_source()
+                                && edge.call_site_line == Some(*src_line)
+                                && edge.call_site_column == Some(*src_col)
+                        })
+                        .map(|edge| edge.to.clone())
+                };
+                let child_uri = if prefer_supplied_path_context && source.system_file.is_none() {
+                    resolve_lexically()
+                        .or_else(|| source.resolved_uri.clone())
+                        .or_else(graph_uri)
+                } else {
+                    graph_uri()
+                        .or_else(|| source.resolved_uri.clone())
+                        .or_else(resolve_lexically)
+                };
+
+                if let Some(child_uri) = child_uri {
+                    // Check if we would exceed max depth
+                    if current_depth + 1 >= max_depth {
+                        scope
+                            .depth_exceeded
+                            .push((uri.clone(), *src_line, *src_col));
                         continue;
                     }
 
-                    // Resolve the child URI: prefer pre-computed dependency graph edges
-                    // (which use workspace-root fallback) over re-resolving the path
-                    // (which doesn't). This ensures paths like source("subdir/file.R")
-                    // that rely on workspace-root-relative resolution work correctly
-                    // in scope resolution, matching the dependency graph's behavior.
-                    let resolve_lexically = || {
-                        path_ctx.as_ref().and_then(|ctx| {
-                            let resolved =
-                                super::path_resolve::resolve_path_with_workspace_fallback(
-                                    &source.path,
-                                    ctx,
-                                )?;
-                            super::path_resolve::path_to_uri(&resolved)
-                        })
-                    };
-                    let graph_uri = || {
-                        graph
-                            .get_dependencies(uri)
-                            .iter()
-                            .find(|edge| {
-                                edge.is_ordinary_source()
-                                    && edge.call_site_line == Some(*src_line)
-                                    && edge.call_site_column == Some(*src_col)
-                            })
-                            .map(|edge| edge.to.clone())
-                    };
-                    let child_uri = if prefer_supplied_path_context && source.system_file.is_none()
-                    {
-                        resolve_lexically()
-                            .or_else(|| source.resolved_uri.clone())
-                            .or_else(graph_uri)
-                    } else {
-                        graph_uri()
-                            .or_else(|| source.resolved_uri.clone())
-                            .or_else(resolve_lexically)
-                    };
+                    // Requirements 5.1, 5.3: Collect packages to pass to the child file.
+                    // The child will have access to these packages from position (0, 0).
+                    // Three sources: inherited_packages (from parent), extra_packages (this
+                    // file's own library() calls before the source()), and loaded_packages
+                    // (packages from previously-sourced sibling files).
+                    // Get the function scope of the source() call for filtering function-scoped packages
+                    let source_function_scope = effective_function_scope;
 
-                    if let Some(child_uri) = child_uri {
-                        // Check if we would exceed max depth
-                        if current_depth + 1 >= max_depth {
-                            scope
-                                .depth_exceeded
-                                .push((uri.clone(), *src_line, *src_col));
-                            continue;
-                        }
+                    let mut extra_packages: HashSet<String> = HashSet::new();
+                    let mut extra_attached_packages: HashSet<String> = HashSet::new();
 
-                        // Requirements 5.1, 5.3: Collect packages to pass to the child file.
-                        // The child will have access to these packages from position (0, 0).
-                        // Three sources: inherited_packages (from parent), extra_packages (this
-                        // file's own library() calls before the source()), and loaded_packages
-                        // (packages from previously-sourced sibling files).
-                        // Get the function scope of the source() call for filtering function-scoped packages
-                        let source_function_scope = effective_function_scope;
+                    // Collect packages from this file's timeline that are loaded before the source() call
+                    for pkg_event in &artifacts.timeline {
+                        if let ScopeEvent::PackageLoad {
+                            line: pkg_line,
+                            column: pkg_col,
+                            package,
+                            attaches,
+                            requires_attached,
+                            function_scope,
+                            ..
+                        } = pkg_event
+                        {
+                            // Only include packages loaded before the source() call
+                            if (*pkg_line, *pkg_col) < (*src_line, *src_col) {
+                                // Check function scope compatibility
+                                let package_function_scope = innermost_effective_scope(
+                                    &active_conditional_shiny_scopes,
+                                    *pkg_line,
+                                    *pkg_col,
+                                    *function_scope,
+                                );
+                                let should_include = match package_function_scope {
+                                    None => true, // Global package load - always include
+                                    Some(pkg_scope) => {
+                                        // Function-scoped package load - only include if:
+                                        // 1. The source() call is in the same function scope, OR
+                                        // 2. The source() call is nested within the package's function scope
+                                        is_same_or_descendant_function_scope(
+                                            source_function_scope,
+                                            pkg_scope,
+                                        )
+                                    }
+                                };
 
-                        let mut extra_packages: HashSet<String> = HashSet::new();
-                        let mut extra_attached_packages: HashSet<String> = HashSet::new();
-
-                        // Collect packages from this file's timeline that are loaded before the source() call
-                        for pkg_event in &artifacts.timeline {
-                            if let ScopeEvent::PackageLoad {
-                                line: pkg_line,
-                                column: pkg_col,
-                                package,
-                                attaches,
-                                requires_attached,
-                                function_scope,
-                                ..
-                            } = pkg_event
-                            {
-                                // Only include packages loaded before the source() call
-                                if (*pkg_line, *pkg_col) < (*src_line, *src_col) {
-                                    // Check function scope compatibility
-                                    let package_function_scope = innermost_effective_scope(
-                                        &active_conditional_shiny_scopes,
-                                        *pkg_line,
-                                        *pkg_col,
-                                        *function_scope,
-                                    );
-                                    let should_include = match package_function_scope {
-                                        None => true, // Global package load - always include
-                                        Some(pkg_scope) => {
-                                            // Function-scoped package load - only include if:
-                                            // 1. The source() call is in the same function scope, OR
-                                            // 2. The source() call is nested within the package's function scope
-                                            is_same_or_descendant_function_scope(
-                                                source_function_scope,
-                                                pkg_scope,
-                                            )
-                                        }
-                                    };
-
-                                    let requirement_satisfied =
-                                        requires_attached.as_ref().is_none_or(|required| {
-                                            scope.attached_packages.contains(required)
-                                                || extra_attached_packages.contains(required)
-                                        });
-                                    if should_include
-                                        && requirement_satisfied
-                                        && !scope.inherited_packages.contains(package)
-                                    {
-                                        extra_packages.insert(package.clone());
-                                        if *attaches {
-                                            extra_attached_packages.insert(package.clone());
-                                        }
+                                let requirement_satisfied =
+                                    requires_attached.as_ref().is_none_or(|required| {
+                                        scope.attached_packages.contains(required)
+                                            || extra_attached_packages.contains(required)
+                                    });
+                                if should_include
+                                    && requirement_satisfied
+                                    && !scope.inherited_packages.contains(package)
+                                {
+                                    extra_packages.insert(package.clone());
+                                    if *attaches {
+                                        extra_attached_packages.insert(package.clone());
                                     }
                                 }
                             }
                         }
+                    }
 
-                        // Issue #483 part 2: a `# raven: standalone` callee is
-                        // resolved with caller-independent inputs — empty
-                        // packages, no `data()` provider, and its OWN
-                        // PathContext (never the caller's inherited/chdir working
-                        // directory). This makes the callee's isolated scope a
-                        // pure function of `(C, C's forward closure)`, the
-                        // precondition that lets the WI2b cache key on C's URI
-                        // alone. Safe-direction and opt-in: at worst a false
-                        // "undefined" inside the standalone file's contribution.
-                        let child_is_standalone =
-                            get_metadata(&child_uri).is_some_and(|m| m.standalone);
-                        let package_effects_only =
-                            source.locality == super::types::SourceLocality::NonInheriting;
-                        let child_provider = if child_is_standalone {
-                            None
+                    // Issue #483 part 2: a `# raven: standalone` callee is
+                    // resolved with caller-independent inputs — empty
+                    // packages, no `data()` provider, and its OWN
+                    // PathContext (never the caller's inherited/chdir working
+                    // directory). This makes the callee's isolated scope a
+                    // pure function of `(C, C's forward closure)`, the
+                    // precondition that lets the WI2b cache key on C's URI
+                    // alone. Safe-direction and opt-in: at worst a false
+                    // "undefined" inside the standalone file's contribution.
+                    let child_is_standalone =
+                        get_metadata(&child_uri).is_some_and(|m| m.standalone);
+                    let package_effects_only =
+                        source.locality == super::types::SourceLocality::NonInheriting;
+                    let child_provider = if child_is_standalone {
+                        None
+                    } else {
+                        data_alias_provider
+                    };
+                    // Selective-import provider mirrors `child_provider`: a
+                    // standalone child severs it (its imports resolve in
+                    // isolation), otherwise it inherits the caller's.
+                    let child_selective_provider = if child_is_standalone {
+                        None
+                    } else {
+                        selective_import_provider
+                    };
+                    let empty_packages_for_child = HashSet::new();
+                    let owned_packages: HashSet<String>;
+                    let packages_for_child: &HashSet<String> =
+                        if child_is_standalone || package_effects_only {
+                            &empty_packages_for_child
+                        } else if extra_packages.is_empty()
+                            && scope.loaded_packages.is_empty()
+                            && scope.targets_only_loaded_packages.is_empty()
+                        {
+                            &scope.inherited_packages
                         } else {
-                            data_alias_provider
+                            owned_packages = scope
+                                .inherited_packages
+                                .iter()
+                                .chain(scope.loaded_packages.iter())
+                                .filter(|package| {
+                                    !scope.targets_only_loaded_packages.contains(*package)
+                                })
+                                .chain(extra_packages.iter())
+                                .cloned()
+                                .collect();
+                            &owned_packages
                         };
-                        // Selective-import provider mirrors `child_provider`: a
-                        // standalone child severs it (its imports resolve in
-                        // isolation), otherwise it inherits the caller's.
-                        let child_selective_provider = if child_is_standalone {
-                            None
+                    let attached_union_matches_packages =
+                        packages_for_child.iter().all(|package| {
+                            scope.attached_packages.contains(package)
+                                || extra_attached_packages.contains(package)
+                        }) && scope
+                            .attached_packages
+                            .iter()
+                            .filter(|package| {
+                                !scope.targets_only_attached_packages.contains(*package)
+                            })
+                            .chain(extra_attached_packages.iter())
+                            .all(|package| packages_for_child.contains(package));
+                    let owned_attached_packages: HashSet<String>;
+                    let attached_packages_for_child: &HashSet<String> =
+                        if child_is_standalone || package_effects_only {
+                            &empty_packages_for_child
+                        } else if attached_union_matches_packages {
+                            // Reuse only after proving set equality in both
+                            // directions. A one-way loaded ⊆ attached check
+                            // is unsound because pre-execution attachments
+                            // may not yet appear in the loaded-package set.
+                            packages_for_child
+                        } else if extra_attached_packages.is_empty()
+                            && scope.targets_only_attached_packages.is_empty()
+                        {
+                            &scope.attached_packages
                         } else {
-                            selective_import_provider
-                        };
-                        let empty_packages_for_child = HashSet::new();
-                        let owned_packages: HashSet<String>;
-                        let packages_for_child: &HashSet<String> =
-                            if child_is_standalone || package_effects_only {
-                                &empty_packages_for_child
-                            } else if extra_packages.is_empty()
-                                && scope.loaded_packages.is_empty()
-                                && scope.targets_only_loaded_packages.is_empty()
-                            {
-                                &scope.inherited_packages
-                            } else {
-                                owned_packages = scope
-                                    .inherited_packages
-                                    .iter()
-                                    .chain(scope.loaded_packages.iter())
-                                    .filter(|package| {
-                                        !scope.targets_only_loaded_packages.contains(*package)
-                                    })
-                                    .chain(extra_packages.iter())
-                                    .cloned()
-                                    .collect();
-                                &owned_packages
-                            };
-                        let attached_union_matches_packages =
-                            packages_for_child.iter().all(|package| {
-                                scope.attached_packages.contains(package)
-                                    || extra_attached_packages.contains(package)
-                            }) && scope
+                            owned_attached_packages = scope
                                 .attached_packages
                                 .iter()
                                 .filter(|package| {
                                     !scope.targets_only_attached_packages.contains(*package)
                                 })
                                 .chain(extra_attached_packages.iter())
-                                .all(|package| packages_for_child.contains(package));
-                        let owned_attached_packages: HashSet<String>;
-                        let attached_packages_for_child: &HashSet<String> =
-                            if child_is_standalone || package_effects_only {
-                                &empty_packages_for_child
-                            } else if attached_union_matches_packages {
-                                // Reuse only after proving set equality in both
-                                // directions. A one-way loaded ⊆ attached check
-                                // is unsound because pre-execution attachments
-                                // may not yet appear in the loaded-package set.
-                                packages_for_child
-                            } else if extra_attached_packages.is_empty()
-                                && scope.targets_only_attached_packages.is_empty()
-                            {
-                                &scope.attached_packages
-                            } else {
-                                owned_attached_packages = scope
-                                    .attached_packages
-                                    .iter()
-                                    .filter(|package| {
-                                        !scope.targets_only_attached_packages.contains(*package)
-                                    })
-                                    .chain(extra_attached_packages.iter())
-                                    .cloned()
-                                    .collect();
-                                &owned_attached_packages
-                            };
-
-                        // Build child PathContext, respecting chdir flag. A
-                        // standalone callee (part 2) uses its OWN context,
-                        // ignoring the caller's chdir / inherited working dir.
-                        let child_ctx = build_forward_child_path_context(
-                            &child_uri,
-                            child_is_standalone,
-                            source.chdir,
-                            path_ctx.as_ref(),
-                            workspace_root,
-                            get_metadata,
-                        );
-                        let child_prefer_supplied_path_context =
-                            prefer_supplied_path_context && !child_is_standalone;
-
-                        // Early exit on cancellation before expensive recursive traversal
-                        if is_cancelled() {
-                            return scope;
-                        }
-
-                        let child_scope = if isolate_forward_source_visits {
-                            // Keep the cycle guard path-local for real
-                            // forward source execution. The current path's
-                            // visits must still be visible to the child so
-                            // cycles short-circuit, but recursive visits from
-                            // one sourced sibling must not mark another later
-                            // sibling as already visited. Clone the ancestor
-                            // snapshot taken before STEP 1 (not the live
-                            // `visited`), so cousin files that STEP 1's parent
-                            // walk expanded do not falsely short-circuit this
-                            // file's own forward source() targets.
-                            // Memoize the child's EOF scope per (child, path
-                            // context, package set), skipping cyclic children
-                            // (issue #472). `path_fp` is computed before the
-                            // closure moves `child_ctx`. The `child_visited`
-                            // clone is built INSIDE the closure so a memo hit
-                            // (the common case in the dense graphs this targets)
-                            // pays nothing for it.
-                            let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = combine_provider_fps(
-                                data_alias_provider_fp(child_provider),
-                                selective_import_provider_fp(child_selective_provider),
-                            );
-                            resolve_forward_child_memoized(
-                                forward_child_memo,
-                                graph,
-                                &child_uri,
-                                path_fp,
-                                provider_fp,
-                                child_prefer_supplied_path_context,
-                                current_depth + 1,
-                                packages_for_child,
-                                attached_packages_for_child,
-                                is_cancelled,
-                                || {
-                                    // Clone the ancestor snapshot taken before
-                                    // STEP 1 (not the live `visited`), so cousin
-                                    // files that STEP 1's parent walk expanded do
-                                    // not falsely short-circuit this file's own
-                                    // forward source() targets.
-                                    let mut child_visited = forward_visited_base
-                                        .clone()
-                                        .unwrap_or_else(|| visited.clone());
-                                    scope_at_position_with_graph_recursive(
-                                        &child_uri,
-                                        u32::MAX, // Include all symbols from sourced file
-                                        u32::MAX,
-                                        get_artifacts,
-                                        get_metadata,
-                                        graph,
-                                        workspace_root,
-                                        child_ctx,
-                                        max_depth,
-                                        current_depth + 1,
-                                        &mut child_visited,
-                                        packages_for_child, // Pass inherited packages to child
-                                        attached_packages_for_child,
-                                        true,
-                                        base_exports,
-                                        hoist_globals,
-                                        backward_dep_mode,
-                                        is_cancelled,
-                                        true,
-                                        None,
-                                        None,
-                                        None,
-                                        child_provider,
-                                        child_selective_provider,
-                                        child_prefer_supplied_path_context,
-                                        None,
-                                        forward_child_memo,
-                                    )
-                                },
-                            )
-                        } else {
-                            scope_at_position_with_graph_recursive(
-                                &child_uri,
-                                u32::MAX, // Include all symbols from sourced file
-                                u32::MAX,
-                                get_artifacts,
-                                get_metadata,
-                                graph,
-                                workspace_root,
-                                child_ctx,
-                                max_depth,
-                                current_depth + 1,
-                                visited,
-                                packages_for_child, // Pass inherited packages to child
-                                attached_packages_for_child,
-                                true,
-                                base_exports,
-                                hoist_globals,
-                                backward_dep_mode,
-                                is_cancelled,
-                                false,
-                                None,
-                                None,
-                                None,
-                                child_provider,
-                                child_selective_provider,
-                                child_prefer_supplied_path_context,
-                                None,
-                                forward_child_memo,
-                            )
+                                .cloned()
+                                .collect();
+                            &owned_attached_packages
                         };
-                        extend_visible_positions(
-                            &mut scope.visible_positions,
-                            &child_scope.visible_positions,
+
+                    // Build child PathContext, respecting chdir flag. A
+                    // standalone callee (part 2) uses its OWN context,
+                    // ignoring the caller's chdir / inherited working dir.
+                    let child_ctx = build_forward_child_path_context(
+                        &child_uri,
+                        child_is_standalone,
+                        source.chdir,
+                        path_ctx.as_ref(),
+                        workspace_root,
+                        get_metadata,
+                    );
+                    let child_prefer_supplied_path_context =
+                        prefer_supplied_path_context && !child_is_standalone;
+
+                    // Early exit on cancellation before expensive recursive traversal
+                    if is_cancelled() {
+                        return scope;
+                    }
+
+                    let child_scope = if isolate_forward_source_visits {
+                        // Keep the cycle guard path-local for real
+                        // forward source execution. The current path's
+                        // visits must still be visible to the child so
+                        // cycles short-circuit, but recursive visits from
+                        // one sourced sibling must not mark another later
+                        // sibling as already visited. Clone the ancestor
+                        // snapshot taken before STEP 1 (not the live
+                        // `visited`), so cousin files that STEP 1's parent
+                        // walk expanded do not falsely short-circuit this
+                        // file's own forward source() targets.
+                        // Memoize the child's EOF scope per (child, path
+                        // context, package set), skipping cyclic children
+                        // (issue #472). `path_fp` is computed before the
+                        // closure moves `child_ctx`. The `child_visited`
+                        // clone is built INSIDE the closure so a memo hit
+                        // (the common case in the dense graphs this targets)
+                        // pays nothing for it.
+                        let path_fp = path_context_fingerprint(child_ctx.as_ref());
+                        let provider_fp = combine_provider_fps(
+                            data_alias_provider_fp(child_provider),
+                            selective_import_provider_fp(child_selective_provider),
                         );
-                        if !package_effects_only {
-                            // Merge child lexical/current-environment symbols and
-                            // attached search-path environments as distinct layers.
-                            // The child scope's final flat projection contains both;
-                            // projected fallbacks must not become lexical bindings in
-                            // the parent or block a later, closer attachment.
-                            scope
-                                .named_search_path
-                                .merge_from(&child_scope.named_search_path);
-                            // The forward-source leak rule (same-file +
-                            // parent-prefix-only) lives in
-                            // `child_source_symbol_is_leak`.
-                            let child_parent_prefix_symbol_names =
-                                child_scope.parent_prefix_symbol_names.clone();
-                            for (name, symbol) in child_scope.symbols {
-                                if child_scope.named_search_path.is_projected(&name)
-                                    || child_source_symbol_is_leak(
-                                        &symbol,
-                                        &name,
-                                        uri,
-                                        &child_parent_prefix_symbol_names,
-                                    )
-                                {
-                                    continue;
-                                }
-                                // This name is genuinely produced by executing this
-                                // file's forward source() (it passed the child leak
-                                // filter). Record it BEFORE the identical-binding
-                                // no-op so even an identical re-export clears the
-                                // stale parent-prefix marker after the loop (#476).
-                                // Only names currently marked parent-prefix-only can
-                                // be affected by the post-loop `retain`, so guard the
-                                // insert on membership — in the common case (the name
-                                // is not in the prefix) this skips the alloc/clone
-                                // entirely, keeping the hot forward path cheap.
-                                if scope.parent_prefix_symbol_names.contains(&name) {
-                                    forward_contributed.insert(name.clone());
-                                }
-                                // The identical-binding no-op and marker-override
-                                // merge below stay recursive-only: they preserve
-                                // this frame's `parent_prefix_symbol_names` marker,
-                                // which streaming has no equivalent of (its prefix
-                                // is held separately and combined at snapshot).
-                                // Pinned by
-                                // `test_scope_stream_parent_prefix_override_matches_recursive`.
-                                //
-                                // A sourced file's resolved scope includes symbols
-                                // it inherited from its own parents. Re-exporting
-                                // an identical already-visible binding is a no-op
-                                // at runtime and must not consume the marker that
-                                // allows a later real source/local definition to
-                                // override a parent-prefix binding.
-                                if scope
-                                    .symbols
-                                    .get(&name)
-                                    .map(|existing| existing == &symbol)
-                                    .unwrap_or(false)
-                                {
-                                    continue;
-                                }
-                                if scope.parent_prefix_symbol_names.remove(&name) {
-                                    scope.removed_names.remove(&name);
-                                    scope.symbols.insert(name, symbol);
-                                } else {
-                                    scope.removed_names.remove(&name);
-                                    scope.symbols.entry(name).or_insert(symbol);
-                                }
+                        resolve_forward_child_memoized(
+                            forward_child_memo,
+                            graph,
+                            &child_uri,
+                            path_fp,
+                            provider_fp,
+                            child_prefer_supplied_path_context,
+                            current_depth + 1,
+                            packages_for_child,
+                            attached_packages_for_child,
+                            is_cancelled,
+                            || {
+                                // Clone the ancestor snapshot taken before
+                                // STEP 1 (not the live `visited`), so cousin
+                                // files that STEP 1's parent walk expanded do
+                                // not falsely short-circuit this file's own
+                                // forward source() targets.
+                                let mut child_visited = forward_visited_base
+                                    .clone()
+                                    .unwrap_or_else(|| visited.clone());
+                                scope_at_position_with_graph_recursive(
+                                    &child_uri,
+                                    u32::MAX, // Include all symbols from sourced file
+                                    u32::MAX,
+                                    get_artifacts,
+                                    get_metadata,
+                                    graph,
+                                    workspace_root,
+                                    child_ctx,
+                                    max_depth,
+                                    current_depth + 1,
+                                    &mut child_visited,
+                                    packages_for_child, // Pass inherited packages to child
+                                    attached_packages_for_child,
+                                    true,
+                                    base_exports,
+                                    hoist_globals,
+                                    backward_dep_mode,
+                                    is_cancelled,
+                                    true,
+                                    None,
+                                    None,
+                                    None,
+                                    child_provider,
+                                    child_selective_provider,
+                                    child_prefer_supplied_path_context,
+                                    None,
+                                    forward_child_memo,
+                                )
+                            },
+                        )
+                    } else {
+                        scope_at_position_with_graph_recursive(
+                            &child_uri,
+                            u32::MAX, // Include all symbols from sourced file
+                            u32::MAX,
+                            get_artifacts,
+                            get_metadata,
+                            graph,
+                            workspace_root,
+                            child_ctx,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                            packages_for_child, // Pass inherited packages to child
+                            attached_packages_for_child,
+                            true,
+                            base_exports,
+                            hoist_globals,
+                            backward_dep_mode,
+                            is_cancelled,
+                            false,
+                            None,
+                            None,
+                            None,
+                            child_provider,
+                            child_selective_provider,
+                            child_prefer_supplied_path_context,
+                            None,
+                            forward_child_memo,
+                        )
+                    };
+                    extend_visible_positions(
+                        &mut scope.visible_positions,
+                        &child_scope.visible_positions,
+                    );
+                    if !package_effects_only {
+                        // Merge child lexical/current-environment symbols and
+                        // attached search-path environments as distinct layers.
+                        // The child scope's final flat projection contains both;
+                        // projected fallbacks must not become lexical bindings in
+                        // the parent or block a later, closer attachment.
+                        scope
+                            .named_search_path
+                            .merge_from(&child_scope.named_search_path);
+                        // The forward-source leak rule (same-file +
+                        // parent-prefix-only) lives in
+                        // `child_source_symbol_is_leak`.
+                        let child_parent_prefix_symbol_names =
+                            child_scope.parent_prefix_symbol_names.clone();
+                        for (name, symbol) in child_scope.symbols {
+                            if child_scope.named_search_path.is_projected(&name)
+                                || child_source_symbol_is_leak(
+                                    &symbol,
+                                    &name,
+                                    uri,
+                                    &child_parent_prefix_symbol_names,
+                                )
+                            {
+                                continue;
+                            }
+                            // This name is genuinely produced by executing this
+                            // file's forward source() (it passed the child leak
+                            // filter). Record it BEFORE the identical-binding
+                            // no-op so even an identical re-export clears the
+                            // stale parent-prefix marker after the loop (#476).
+                            // Only names currently marked parent-prefix-only can
+                            // be affected by the post-loop `retain`, so guard the
+                            // insert on membership — in the common case (the name
+                            // is not in the prefix) this skips the alloc/clone
+                            // entirely, keeping the hot forward path cheap.
+                            if scope.parent_prefix_symbol_names.contains(&name) {
+                                forward_contributed.insert(name.clone());
+                            }
+                            // The identical-binding no-op and marker-override
+                            // merge below stay recursive-only: they preserve
+                            // this frame's `parent_prefix_symbol_names` marker,
+                            // which streaming has no equivalent of (its prefix
+                            // is held separately and combined at snapshot).
+                            // Pinned by
+                            // `test_scope_stream_parent_prefix_override_matches_recursive`.
+                            //
+                            // A sourced file's resolved scope includes symbols
+                            // it inherited from its own parents. Re-exporting
+                            // an identical already-visible binding is a no-op
+                            // at runtime and must not consume the marker that
+                            // allows a later real source/local definition to
+                            // override a parent-prefix binding.
+                            if scope
+                                .symbols
+                                .get(&name)
+                                .map(|existing| existing == &symbol)
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            if scope.parent_prefix_symbol_names.remove(&name) {
+                                scope.removed_names.remove(&name);
+                                scope.symbols.insert(name, symbol);
+                            } else {
+                                scope.removed_names.remove(&name);
+                                scope.symbols.entry(name).or_insert(symbol);
                             }
                         }
-                        scope.chain.extend(child_scope.chain);
-                        scope.depth_exceeded.extend(child_scope.depth_exceeded);
-
-                        // Package attachments are process-wide side effects. A
-                        // NonInheriting source exports only packages definitely
-                        // attached while executing the child; it does not re-export
-                        // packages the isolated child merely inherited elsewhere.
-                        let empty_inherited = HashSet::new();
-                        let child_inherited_packages = if package_effects_only {
-                            &empty_inherited
-                        } else {
-                            &child_scope.inherited_packages
-                        };
-                        merge_child_source_packages(
-                            &child_scope.loaded_packages,
-                            child_inherited_packages,
-                            &child_scope.targets_only_loaded_packages,
-                            &child_scope.package_origins,
-                            uri,
-                            (
-                                &mut scope.loaded_packages,
-                                Some(&mut scope.targets_only_loaded_packages),
-                            ),
-                            &mut scope.package_origins,
-                        );
-                        merge_child_source_attachments(
-                            &child_scope.attached_packages,
-                            package_effects_only.then_some(&child_scope.loaded_packages),
-                            &child_scope.targets_only_attached_packages,
-                            &child_scope.package_origins,
-                            uri,
-                            &mut scope.attached_packages,
-                            Some(&mut scope.targets_only_attached_packages),
-                        );
                     }
+                    scope.chain.extend(child_scope.chain);
+                    scope.depth_exceeded.extend(child_scope.depth_exceeded);
+
+                    // Package attachments are process-wide side effects. A
+                    // NonInheriting source exports only packages definitely
+                    // attached while executing the child; it does not re-export
+                    // packages the isolated child merely inherited elsewhere.
+                    let empty_inherited = HashSet::new();
+                    let child_inherited_packages = if package_effects_only {
+                        &empty_inherited
+                    } else {
+                        &child_scope.inherited_packages
+                    };
+                    merge_child_source_packages(
+                        &child_scope.loaded_packages,
+                        child_inherited_packages,
+                        &child_scope.targets_only_loaded_packages,
+                        &child_scope.package_origins,
+                        uri,
+                        (
+                            &mut scope.loaded_packages,
+                            Some(&mut scope.targets_only_loaded_packages),
+                        ),
+                        &mut scope.package_origins,
+                    );
+                    merge_child_source_attachments(
+                        &child_scope.attached_packages,
+                        package_effects_only.then_some(&child_scope.loaded_packages),
+                        &child_scope.targets_only_attached_packages,
+                        &child_scope.package_origins,
+                        uri,
+                        &mut scope.attached_packages,
+                        Some(&mut scope.targets_only_attached_packages),
+                    );
                 }
             }
             ScopeEvent::SourceBatch {
                 line: batch_line,
                 column: batch_column,
-                kind,
                 members,
+                ..
             } => {
-                let boundary = SourceBatchBoundary {
-                    line: *batch_line,
-                    column: *batch_column,
-                    kind: *kind,
-                };
-                let passes_position = if kind.is_pre_entry() {
-                    pre_entry_batch_cutoff.is_none_or(|cutoff| boundary < cutoff)
-                } else {
-                    (*batch_line, *batch_column) < (line, column) || query_inside_function
-                };
-                if !passes_position {
-                    continue;
-                }
                 if current_depth + 1 >= max_depth {
                     scope
                         .depth_exceeded
@@ -9337,188 +8874,69 @@ where
                     scope.attached_packages.insert(package);
                 }
             }
-            ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                parameters,
-            } => {
-                // Include function parameters if position is within function body
-                // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX && column == u32::MAX;
-                if !is_eof_position
-                    && (*start_line, *start_column) <= (line, column)
-                    && (line, column) <= (*end_line, *end_column)
-                {
-                    for param in parameters {
-                        scope.removed_names.remove(&param.name);
-                        scope.symbols.insert(param.name.clone(), param.clone());
-                        scope.parent_prefix_symbol_names.remove(&param.name);
-                    }
+            ScopeEvent::FunctionScope { parameters, .. } => {
+                for param in parameters {
+                    scope.removed_names.remove(&param.name);
+                    scope.symbols.insert(param.name.clone(), param.clone());
+                    scope.parent_prefix_symbol_names.remove(&param.name);
                 }
             }
-            ScopeEvent::Removal {
-                line: rm_line,
-                column: rm_col,
-                symbols,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *rm_line,
-                    *rm_col,
-                    *function_scope,
-                );
-                let passes_position = (*rm_line, *rm_col) < (line, column);
-                if passes_position || query_inside_function {
-                    if !passes_position {
-                        // Hoisted path: only apply global removals
-                        if effective_scope.is_none() {
-                            for sym_name in symbols {
-                                scope.symbols.remove(sym_name.as_str());
-                            }
-                        }
-                    } else {
-                        apply_removal(
-                            &mut scope,
-                            &active_effective_scopes,
-                            effective_scope,
-                            symbols,
-                        );
-                    }
-                }
+            ScopeEvent::Removal { symbols, .. } => {
+                apply_removal(&mut scope, symbols, visibility);
             }
             ScopeEvent::PackageLoad {
-                line: pkg_line,
-                column: pkg_col,
                 package,
                 attaches,
                 requires_attached,
-                function_scope,
                 ..
             } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *pkg_line,
-                    *pkg_col,
-                    *function_scope,
+                let effective_scope = event_context.owner;
+                let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                    requires_attached.as_deref(),
+                    &scope.attached_packages,
                 );
-                let passes_position = (*pkg_line, *pkg_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    let should_include = match effective_scope {
-                        None => true, // Global package load - include (hoisted or positional)
-                        Some(pkg_scope) => {
-                            // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_effective_scopes.contains(&pkg_scope)
-                        }
-                    };
-
-                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                let late_requirement_satisfied = effective_scope.is_some()
+                    && query_inside_function
+                    && package_load_requirement_satisfied(
                         requires_attached.as_deref(),
-                        &scope.attached_packages,
+                        &in_function_attachment_seed,
                     );
-                    let late_requirement_satisfied = effective_scope.is_some()
-                        && query_inside_function
-                        && package_load_requirement_satisfied(
-                            requires_attached.as_deref(),
-                            &in_function_attachment_seed,
-                        );
-                    if should_include
-                        && (running_requirement_satisfied || late_requirement_satisfied)
-                    {
-                        scope.targets_only_loaded_packages.remove(package);
-                        scope.loaded_packages.insert(package.clone());
-                        if *attaches {
-                            scope.targets_only_attached_packages.remove(package);
-                            scope.attached_packages.insert(package.clone());
-                        }
-                        record_package_origin(&mut scope.package_origins, package, uri);
+                if running_requirement_satisfied || late_requirement_satisfied {
+                    scope.targets_only_loaded_packages.remove(package);
+                    scope.loaded_packages.insert(package.clone());
+                    if *attaches {
+                        scope.targets_only_attached_packages.remove(package);
+                        scope.attached_packages.insert(package.clone());
                     }
+                    record_package_origin(&mut scope.package_origins, package, uri);
                 }
             }
-            ScopeEvent::Declaration {
-                line: decl_line,
-                column: decl_col,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let effective_scope = innermost_effective_scope(
-                    &active_conditional_shiny_scopes,
-                    *decl_line,
-                    *decl_col,
-                    *function_scope,
-                );
-                if is_symbol_visible(
-                    *decl_line,
-                    *decl_col,
-                    effective_scope,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
-                ) {
-                    // Only insert if no real (non-declared) definition exists;
-                    // among declared symbols, later ones win (timeline is sorted).
-                    scope
-                        .symbols
-                        .entry(symbol.name.clone())
-                        .and_modify(|existing| {
-                            if existing.is_declared {
-                                *existing = symbol.clone();
-                            }
-                        })
-                        .or_insert_with(|| symbol.clone());
-                    scope.removed_names.remove(&symbol.name);
-                }
+            ScopeEvent::Declaration { symbol, .. } => {
+                // Real bindings win over declarations; later declarations replace earlier ones.
+                scope
+                    .symbols
+                    .entry(symbol.name.clone())
+                    .and_modify(|existing| {
+                        if existing.is_declared {
+                            *existing = symbol.clone();
+                        }
+                    })
+                    .or_insert_with(|| symbol.clone());
+                scope.removed_names.remove(&symbol.name);
             }
-            ScopeEvent::DataLoad {
-                line: dl_line,
-                column: dl_col,
-                stems,
-                package,
-                function_scope,
-                ..
-            } => {
-                // Expand `data()` file-stem aliases to the dataset object names
-                // they bind (issue #429). Mirrors the PackageLoad arm above for
-                // position/function-scope gating; binds the expanded names as
-                // definitions at this timeline point. That means `data()` can
-                // overwrite earlier locals/package symbols in the same
-                // environment, matching R, and later local defs can overwrite
-                // the aliases again. `attached_packages` for the bare
-                // `data(stem)` form is the set attached at-or-before this
-                // event.
+            ScopeEvent::DataLoad { stems, package, .. } => {
                 if let Some(provider) = data_alias_provider {
-                    let effective_scope = innermost_effective_scope(
-                        &active_conditional_shiny_scopes,
-                        *dl_line,
-                        *dl_col,
-                        *function_scope,
-                    );
-                    let passes_position = (*dl_line, *dl_col) <= (line, column);
-                    let should_include = match effective_scope {
-                        None => passes_position || query_inside_function,
-                        Some(dl_scope) => {
-                            passes_position && active_effective_scopes.contains(&dl_scope)
-                        }
+                    // Only the bare `data(stem)` form consults the attached
+                    // set; skip building it for explicit `package =` calls.
+                    let attached: HashSet<String> = if package.is_none() {
+                        scope.attached_packages.clone()
+                    } else {
+                        HashSet::new()
                     };
-                    if should_include {
-                        // Only the bare `data(stem)` form consults the attached
-                        // set; skip building it for explicit `package =` calls.
-                        let attached: HashSet<String> = if package.is_none() {
-                            scope.attached_packages.clone()
-                        } else {
-                            HashSet::new()
-                        };
-                        for (name, symbol) in expand_data_load(stems, package, &attached, provider)
-                        {
-                            scope.removed_names.remove(&name);
-                            scope.parent_prefix_symbol_names.remove(&name);
-                            scope.symbols.insert(name, symbol);
-                        }
+                    for (name, symbol) in expand_data_load(stems, package, &attached, provider) {
+                        scope.removed_names.remove(&name);
+                        scope.parent_prefix_symbol_names.remove(&name);
+                        scope.symbols.insert(name, symbol);
                     }
                 }
             }
@@ -9526,7 +8944,6 @@ where
                 line: imp_line,
                 column: imp_col,
                 request,
-                function_scope,
                 ..
             } => {
                 apply_selective_import(
@@ -9535,12 +8952,6 @@ where
                     *imp_line,
                     *imp_col,
                     request,
-                    *function_scope,
-                    &active_conditional_shiny_scopes,
-                    &active_effective_scopes,
-                    line,
-                    column,
-                    query_inside_function,
                     selective_import_provider,
                 );
             }
@@ -9580,7 +8991,7 @@ where
     }
 
     // Materialize file-level fallbacks after the timeline so local bindings win.
-    contributions.apply(&mut scope, ScopePhase::from_deferred(query_inside_function));
+    contributions.apply(&mut scope, query.phase);
 
     scope
         .named_search_path
@@ -10517,6 +9928,12 @@ where
         // Removal); cloning is cheap relative to the work that follows.
         // SAFETY-equivalent: all events are `Clone`.
         let event = self.artifacts.timeline[event_index].clone();
+        let event_context = EventContext::new(&event)
+            .with_conditional_scopes(&self.active_conditional_shiny_scopes);
+        let function_scope = event_context.owner;
+        if !self.conditional_scope_applies(function_scope) {
+            return;
+        }
         match event {
             ScopeEvent::FunctionScope {
                 start_line,
@@ -10535,35 +9952,13 @@ where
                 }
                 self.function_stack.push((interval, frame));
             }
-            ScopeEvent::Def {
-                line,
-                column,
-                visible_from_line: _,
-                visible_from_column: _,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
+            ScopeEvent::Def { symbol, .. } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame.removed_names.remove(&symbol.name);
                     frame.symbols.insert(symbol.name.clone(), symbol);
                 }
             }
-            ScopeEvent::Removal {
-                line,
-                column,
-                symbols,
-                function_scope,
-                ..
-            } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
+            ScopeEvent::Removal { symbols, .. } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     for sym_name in &symbols {
                         let key: Arc<str> = Arc::from(sym_name.as_str());
@@ -10573,18 +9968,11 @@ where
                 }
             }
             ScopeEvent::PackageLoad {
-                line,
-                column,
                 package,
                 attaches,
                 requires_attached,
-                function_scope,
                 ..
             } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
                 if function_scope.is_some() && self.hoist_globals {
                     self.ensure_global_late_frame();
                 }
@@ -10607,14 +9995,8 @@ where
                 line: src_line,
                 column: src_col,
                 source,
-                function_scope,
                 ..
             } => {
-                let function_scope =
-                    self.conditional_event_scope(src_line, src_col, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
                 // Top-level CurrentFrame sources contribute nothing. An
                 // orderable NonInheriting source still contributes process-wide
                 // package attachments, while `resolve_source_contribution`
@@ -10701,17 +10083,7 @@ where
                 let contribution = self.tar_batch_contributions[&key].clone();
                 merge_tar_batch_into_frame(&mut self.global_strict_frame, contribution);
             }
-            ScopeEvent::Declaration {
-                line,
-                column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
+            ScopeEvent::Declaration { symbol, .. } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     // Mirror the recursive resolver's
                     // `entry().and_modify().or_insert_with()` semantics:
@@ -10731,18 +10103,7 @@ where
                     }
                 }
             }
-            ScopeEvent::DataLoad {
-                line,
-                column,
-                stems,
-                package,
-                function_scope,
-                ..
-            } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
+            ScopeEvent::DataLoad { stems, package, .. } => {
                 // Expand `data()` file-stem aliases to dataset object names
                 // (issue #429), mirroring the recursive resolver's DataLoad arm.
                 // `advance_to` only reaches this event when its effect position
@@ -10777,13 +10138,8 @@ where
                 line,
                 column,
                 request,
-                function_scope,
                 ..
             } => {
-                let function_scope = self.conditional_event_scope(line, column, function_scope);
-                if !self.conditional_scope_applies(function_scope) {
-                    return;
-                }
                 // Resolve the import against the streamed provider and inject its
                 // concrete bindings, mirroring the recursive resolver's
                 // `apply_selective_import`. `advance_to` only reaches this event
@@ -10952,20 +10308,6 @@ where
                 .push((self.queried_uri.clone(), line, column));
         }
         contribution
-    }
-
-    fn conditional_event_scope(
-        &self,
-        line: u32,
-        column: u32,
-        ordinary_scope: Option<FunctionScopeInterval>,
-    ) -> Option<FunctionScopeInterval> {
-        innermost_effective_scope(
-            &self.active_conditional_shiny_scopes,
-            line,
-            column,
-            ordinary_scope,
-        )
     }
 
     /// Ensure an activated conditional interval has a frame when the current
@@ -11465,45 +10807,25 @@ where
         self.global_late_frame = Some(frame);
     }
 
-    /// Apply one event to the supplied `frame` if it's global. Mirrors
-    /// `apply_event_to_strict` but only for events with `function_scope ==
-    /// None` and writes to a caller-owned frame instead of `self`'s
-    /// strict/function frames. FunctionScope events themselves are also
-    /// skipped (they push function-stack frames, not global state).
+    /// Apply events classified as global to the completed frame. The shared
+    /// classifier excludes function-frame events and effective local owners,
+    /// including activated conditional bodies. Execution still uses the same
+    /// source caches and package prerequisites as the strict path.
     fn apply_event_to_late(&mut self, frame: &mut ScopeFrame, event: &ScopeEvent) {
+        let event_context =
+            EventContext::new(event).with_conditional_scopes(&self.active_conditional_shiny_scopes);
+        if !event_context.is_global() {
+            return;
+        }
         match event {
             ScopeEvent::FunctionScope { .. } => {
                 // Not a global event — skip.
             }
-            ScopeEvent::Def {
-                line,
-                column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
+            ScopeEvent::Def { symbol, .. } => {
                 frame.removed_names.remove(&symbol.name);
                 frame.symbols.insert(symbol.name.clone(), symbol.clone());
             }
-            ScopeEvent::Removal {
-                line,
-                column,
-                symbols,
-                function_scope,
-                ..
-            } => {
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
+            ScopeEvent::Removal { symbols, .. } => {
                 for sym_name in symbols {
                     let key: Arc<str> = Arc::from(sym_name.as_str());
                     frame.symbols.remove(&key);
@@ -11511,20 +10833,11 @@ where
                 }
             }
             ScopeEvent::PackageLoad {
-                line,
-                column,
                 package,
                 attaches,
                 requires_attached,
-                function_scope,
                 ..
             } => {
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
                 if requires_attached.as_deref().is_some_and(|required| {
                     !frame.attached_packages.contains(required)
                         && !self.prefix_in_function.attached_packages.contains(required)
@@ -11541,15 +10854,8 @@ where
                 line: src_line,
                 column: src_col,
                 source,
-                function_scope,
                 ..
             } => {
-                if self
-                    .conditional_event_scope(*src_line, *src_col, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
                 if should_apply_local_scoping(source)
                     && source.locality != super::types::SourceLocality::NonInheriting
                 {
@@ -11619,49 +10925,22 @@ where
                 let contribution = self.tar_batch_contributions[&key].clone();
                 merge_tar_batch_into_frame(frame, contribution);
             }
-            ScopeEvent::Declaration {
-                line,
-                column,
-                symbol,
-                function_scope,
-                ..
-            } => {
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
+            ScopeEvent::Declaration { symbol, .. } => match frame.symbols.get_mut(&symbol.name) {
+                Some(existing) if existing.is_declared => {
+                    *existing = symbol.clone();
                 }
-                match frame.symbols.get_mut(&symbol.name) {
-                    Some(existing) if existing.is_declared => {
-                        *existing = symbol.clone();
-                    }
-                    Some(_) => {}
-                    None => {
-                        frame.removed_names.remove(&symbol.name);
-                        frame.symbols.insert(symbol.name.clone(), symbol.clone());
-                    }
+                Some(_) => {}
+                None => {
+                    frame.removed_names.remove(&symbol.name);
+                    frame.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
-            }
-            ScopeEvent::DataLoad {
-                line,
-                column,
-                stems,
-                package,
-                function_scope,
-                ..
-            } => {
+            },
+            ScopeEvent::DataLoad { stems, package, .. } => {
                 // Global `data()` calls only (late frame is the hoisted global
                 // scope). Expand into the late frame as definitions at this
                 // timeline point, mirroring `apply_event_to_strict`'s DataLoad
                 // arm. Attached packages for the bare form are the late frame's
                 // own global packages plus the prefix's inherited packages.
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
                 if let Some(provider) = self.data_alias_provider {
                     // Only the bare `data(stem)` form consults the attached
                     // set; skip building it for explicit `package =` calls.
@@ -11680,19 +10959,12 @@ where
                 line,
                 column,
                 request,
-                function_scope,
                 ..
             } => {
                 // Global (top-level) selective imports only — the late frame is
                 // the hoisted global scope, so a function-scoped import is skipped
                 // here and applied in its own strict frame. Mirrors the recursive
                 // resolver's `apply_selective_import`.
-                if self
-                    .conditional_event_scope(*line, *column, *function_scope)
-                    .is_some()
-                {
-                    return;
-                }
                 let (symbols, aliases) = resolve_selective_import_bindings(
                     request,
                     self.queried_uri,
