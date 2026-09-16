@@ -1073,9 +1073,6 @@ pub fn scan_own_package_data_dir_with_exclusions(
     workspace_root: &Path,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> BTreeSet<String> {
-    if exclusions.is_empty() {
-        return scan_own_package_data_dir(workspace_root);
-    }
     scan_own_package_data_dir_impl::<true>(workspace_root, Some(exclusions))
 }
 
@@ -1098,7 +1095,10 @@ fn scan_own_package_data_dir_impl<const USE_EXCLUSIONS: bool>(
 
     // datalist file (same format as installed packages)
     let datalist_path = data_dir.join("datalist");
-    if (!USE_EXCLUSIONS || !exclusions.is_some_and(|e| e.is_excluded_path(&datalist_path)))
+    if (!USE_EXCLUSIONS
+        || !exclusions.is_some_and(|e| {
+            e.is_excluded_path(&datalist_path) || e.is_gitignored(&datalist_path, false)
+        }))
         && let Ok(content) = fs::read_to_string(&datalist_path)
     {
         for line in content.lines() {
@@ -1138,7 +1138,10 @@ fn scan_own_package_data_dir_impl<const USE_EXCLUSIONS: bool>(
             continue;
         }
         let path = entry.path();
-        if USE_EXCLUSIONS && exclusions.is_some_and(|e| e.is_excluded_path(&path)) {
+        if USE_EXCLUSIONS
+            && exclusions
+                .is_some_and(|e| e.is_excluded_path(&path) || e.is_gitignored(&path, false))
+        {
             continue;
         }
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {

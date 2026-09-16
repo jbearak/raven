@@ -33,13 +33,12 @@ pub fn scan_sysdata_generating_scripts_with_exclusions(
     workspace_root: &Path,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> BTreeSet<String> {
-    if exclusions.is_empty() {
-        return scan_sysdata_generating_scripts(workspace_root);
-    }
-
     let mut symbols = BTreeSet::new();
     let data_raw = workspace_root.join("data-raw");
-    if data_raw.is_dir() && !exclusions.can_prune_directory(&data_raw) {
+    if data_raw.is_dir()
+        && !exclusions.can_prune_directory(&data_raw)
+        && !exclusions.is_gitignored(&data_raw, true)
+    {
         scan_dir_recursive_with_exclusions(&data_raw, exclusions, &mut symbols);
     }
     symbols
@@ -83,11 +82,12 @@ fn scan_dir_recursive_with_exclusions(
         };
         let path = entry.path();
         if ft.is_dir() && !ft.is_symlink() {
-            if !exclusions.can_prune_directory(&path) {
+            if !exclusions.can_prune_directory(&path) && !exclusions.is_gitignored(&path, true) {
                 scan_dir_recursive_with_exclusions(&path, exclusions, symbols);
             }
         } else if (ft.is_file() || (ft.is_symlink() && path.is_file()))
             && !exclusions.is_excluded_path(&path)
+            && !exclusions.is_gitignored(&path, false)
             && matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
             && let Ok(content) = fs::read_to_string(&path)
         {

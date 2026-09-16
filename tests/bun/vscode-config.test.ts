@@ -36,6 +36,15 @@ test("initialization options keep diagnostic defaults", () => {
   });
 });
 
+test("gitignore policy preserves explicit false and leaves the default to the server", () => {
+  expect(getInitializationOptions(createMockConfig(new Map())).workspace).toBeUndefined();
+  for (const respectGitignore of [false, true]) {
+    expect(getInitializationOptions(createMockConfig(new Map([
+      ["workspace.respectGitignore", respectGitignore],
+    ]))).workspace).toEqual({ respectGitignore });
+  }
+});
+
 test("initialization options forward explicitly configured settings", () => {
   const options = getInitializationOptions(
     createMockConfig(

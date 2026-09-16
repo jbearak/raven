@@ -1,5 +1,12 @@
 # R Package Development
 
+Automatic package-definition, testthat-helper, `.Rprofile`, and data discovery
+respects `.gitignore`. Ignored open buffers remain available while open, and
+explicit `source()` dependencies remain usable without promoting those files
+into automatic package scope. See [discovery configuration](configuration.md#project-exclusions)
+for inheritance rules and the `workspace.respectGitignore` opt-out. Package
+manifests and installed-library metadata are not discovery candidates.
+
 Raven automatically detects R package workspaces and provides enhanced code intelligence tailored to package development workflows.
 
 ## How It Works

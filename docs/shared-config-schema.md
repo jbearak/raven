@@ -10,6 +10,7 @@ defaults.
 | Concept | Canonical TOML path |
 |---|---|
 | Workspace exclusions | `workspace.exclude` |
+| Respect Git ignore files during discovery | `workspace.respectGitignore` (default `true`) |
 | Diagnostics master switch | `diagnostics.enabled` |
 | Undefined-variable severity | `diagnostics.severity.undefinedVariable` |
 | Workspace indexing | `crossFile.indexWorkspace` |

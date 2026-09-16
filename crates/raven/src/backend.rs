@@ -2154,6 +2154,117 @@ enum PackageInitAttempt {
 }
 
 impl Backend {
+    async fn refresh_discovery_policy(&self) -> bool {
+        let (generation, mut exclusions) = {
+            let mut state = self.state.write().await;
+            (
+                state.begin_discovery_refresh(),
+                state.workspace_exclusions.clone(),
+            )
+        };
+        let refreshed = tokio::task::spawn_blocking(move || {
+            exclusions.refresh_gitignore();
+            exclusions
+        })
+        .await;
+        let Ok(refreshed) = refreshed else {
+            log::warn!("Workspace ignore snapshot failed");
+            return false;
+        };
+        self.state
+            .write()
+            .await
+            .install_discovery_refresh(generation, &refreshed)
+    }
+
+    async fn register_gitignore_watchers(&self, replace: bool) {
+        let watchers = {
+            let state = self.state.read().await;
+            let mut watchers: Vec<_> = state
+                .workspace_folders
+                .iter()
+                .map(|root| FileSystemWatcher {
+                    glob_pattern: GlobPattern::Relative(RelativePattern {
+                        base_uri: OneOf::Right(root.clone()),
+                        pattern: "**/.gitignore".into(),
+                    }),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                })
+                .collect();
+            watchers.extend(
+                state
+                    .workspace_exclusions
+                    .ancestor_ignore_files()
+                    .iter()
+                    .filter_map(|path| {
+                        Some(FileSystemWatcher {
+                            glob_pattern: GlobPattern::Relative(RelativePattern {
+                                base_uri: OneOf::Right(Url::from_file_path(path.parent()?).ok()?),
+                                pattern: ".gitignore".into(),
+                            }),
+                            kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                        })
+                    }),
+            );
+            watchers
+        };
+        let client = self.client.clone();
+        if replace {
+            let _ = client
+                .unregister_capability(vec![Unregistration {
+                    id: "raven-gitignore-files".into(),
+                    method: "workspace/didChangeWatchedFiles".into(),
+                }])
+                .await;
+        }
+        if watchers.is_empty() {
+            return;
+        }
+        if let Err(error) = client
+            .register_capability(vec![Registration {
+                id: "raven-gitignore-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .unwrap(),
+                ),
+            }])
+            .await
+        {
+            log::warn!("gitignore watch registration failed: {error}");
+        }
+    }
+
+    async fn register_workspace_config_watchers(&self, folders: &[Url], replace: bool) {
+        if replace {
+            let _ = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: "raven-config-files".into(),
+                    method: "workspace/didChangeWatchedFiles".into(),
+                }])
+                .await;
+        }
+        let watchers = build_workspace_project_config_watchers(folders);
+        if watchers.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .client
+            .register_capability(vec![Registration {
+                id: "raven-config-files".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .unwrap(),
+                ),
+            }])
+            .await
+        {
+            log::warn!("dynamic config watch registration failed: {error}");
+        }
+    }
+
     /// Surface present-but-unusable package-DB load notes (e.g. a
     /// `.raven/packages.json` from a newer Raven, or a corrupt/incompatible
     /// `names.db`) to the editor as warnings. Single source for how these
@@ -3664,11 +3775,16 @@ fn collect_package_r_file_inputs_from_disk_with_exclusions(
         for entry in walkdir::WalkDir::new(base)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir()
+                    || (!exclusions.can_prune_directory(entry.path())
+                        && !exclusions.is_gitignored(entry.path(), true))
+            })
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_file())
         {
             let path = entry.into_path();
-            if exclusions.is_excluded_path(&path) {
+            if exclusions.is_excluded_path(&path) || exclusions.is_gitignored(&path, false) {
                 continue;
             }
             let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
@@ -4171,7 +4287,8 @@ fn hydrate_package_r_files_from_state(
         if open_or_alias {
             continue;
         }
-        if state.is_project_excluded_uri(&uri) {
+        if state.is_project_excluded_uri(&uri) || state.workspace_exclusions.is_gitignored_uri(&uri)
+        {
             continue;
         }
         if let Ok(path) = uri.to_file_path()
@@ -4338,27 +4455,27 @@ async fn prepare_workspace_scan(
         let index_snapshot = state.workspace_index.authority_snapshot();
         let basis =
             state.capture_workspace_scan_derivation_basis(&inputs.basis, &index_snapshot)?;
-        let dynamic_artifact_uris: std::collections::HashSet<_> = index_snapshot
+        let retained_artifact_uris: std::collections::HashSet<_> = index_snapshot
             .artifacts
             .iter()
-            .filter(|(_, artifact)| {
+            .filter(|(uri, artifact)| {
                 artifact.provenance == crate::workspace_index::ClosedProvenance::Dynamic
+                    || inputs.exclusions.is_gitignored_uri(uri)
             })
             .map(|(uri, _)| uri.clone())
             .collect();
         let retained_entries = index_snapshot
             .full
             .iter()
-            .filter(|(uri, _)| dynamic_artifact_uris.contains(uri))
+            .filter(|(uri, _)| retained_artifact_uris.contains(uri))
             .filter(|(uri, _)| !state.is_project_excluded_uri(uri))
             .cloned()
             .collect::<HashMap<_, _>>();
         let retained_artifacts = index_snapshot
             .artifacts
             .iter()
-            .filter(|(uri, artifact)| {
-                artifact.provenance == crate::workspace_index::ClosedProvenance::Dynamic
-                    && !state.is_project_excluded_uri(uri)
+            .filter(|(uri, _)| {
+                retained_artifact_uris.contains(uri) && !state.is_project_excluded_uri(uri)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4414,6 +4531,26 @@ async fn prepare_workspace_scan(
     };
     let (complete_graph, complete_open_metadata) =
         derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context, true);
+    // Ignore filtering applies to roots, not edges. Dynamic entries must not
+    // keep ignored caller cycles alive solely because they were indexed once.
+    let mut pending: Vec<_> = graph_entries
+        .keys()
+        .filter(|uri| {
+            !inputs.exclusions.respect_gitignore()
+                || inputs.exclusions.is_automatic_discovery_uri(uri)
+        })
+        .cloned()
+        .collect();
+    pending.extend(
+        open_overlays
+            .iter()
+            .flat_map(|overlay| overlay.graph_roots.iter().cloned()),
+    );
+    let reachable = crate::discovery::owned_files(&complete_graph, pending);
+    graph_entries
+        .retain(|uri, _| !inputs.exclusions.is_gitignored_uri(uri) || reachable.contains(uri));
+    complete_entries
+        .retain(|uri, _| !inputs.exclusions.is_gitignored_uri(uri) || reachable.contains(uri));
     for overlay in &mut open_overlays {
         if let Some(metadata) = complete_open_metadata.get(&overlay.uri) {
             overlay.metadata = Some(metadata.clone());
@@ -7096,6 +7233,8 @@ struct PackageSeedInputSnapshot {
     workspace_root: Option<std::path::PathBuf>,
     generation: u64,
     exclusion_patterns: Vec<String>,
+    discovery_revision: u64,
+    respect_gitignore: bool,
     workspace_folders: Vec<Url>,
     package_mode: crate::cross_file::config::PackageMode,
     model_rprofile: bool,
@@ -7110,6 +7249,8 @@ impl PackageSeedInputSnapshot {
             workspace_root: state.package_inputs.workspace_root.clone(),
             generation: state.package_input_generation(),
             exclusion_patterns: exclusions.patterns().to_vec(),
+            discovery_revision: exclusions.discovery_revision(),
+            respect_gitignore: exclusions.respect_gitignore(),
             workspace_folders: state.workspace_folders.clone(),
             package_mode: state.package_inputs.package_mode,
             model_rprofile: state.package_inputs.model_rprofile,
@@ -7138,6 +7279,10 @@ impl PackageSeedInputSnapshot {
             && state.package_inputs.workspace_root == self.workspace_root
             && state.workspace_exclusions.patterns() == self.exclusion_patterns.as_slice()
             && exclusions.patterns() == self.exclusion_patterns.as_slice()
+            && state.workspace_exclusions.discovery_revision() == self.discovery_revision
+            && exclusions.discovery_revision() == self.discovery_revision
+            && state.workspace_exclusions.respect_gitignore() == self.respect_gitignore
+            && exclusions.respect_gitignore() == self.respect_gitignore
             && state.workspace_folders == self.workspace_folders
             && state.package_inputs.package_mode == self.package_mode
             && state.package_inputs.model_rprofile == self.model_rprofile
@@ -7215,6 +7360,7 @@ struct PackageSeedDiskProjection {
     exact_paths: Vec<std::path::PathBuf>,
     ignored_open_paths: std::collections::BTreeSet<std::path::PathBuf>,
     entries: std::collections::BTreeMap<std::path::PathBuf, PackageSeedDiskIdentity>,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
 }
 
 impl PackageSeedDiskProjection {
@@ -7223,6 +7369,7 @@ impl PackageSeedDiskProjection {
             self.recursive_roots.clone(),
             self.exact_paths.clone(),
             self.ignored_open_paths.clone(),
+            &self.exclusions,
         )
         .entries
             == self.entries
@@ -7411,6 +7558,7 @@ impl PrecomputedPackageSeed {
                     &projection_capture.open_events,
                     &preamble_overrides,
                     scan_r_files,
+                    &compute_exclusions,
                 );
                 let install = compute_package_seed_install_from_projection(
                     &compute_root,
@@ -7434,6 +7582,7 @@ impl PrecomputedPackageSeed {
                     disk_projection.recursive_roots.clone(),
                     disk_projection.exact_paths.clone(),
                     disk_projection.ignored_open_paths.clone(),
+                    &compute_exclusions,
                 );
                 if stable_projection != disk_projection {
                     return Err(PackageSeedComputeError {
@@ -8755,8 +8904,17 @@ fn capture_source_following_scans(
 ) -> CapturedSourceFollowingScans {
     let mut disk = SourceFollowingDiskProjection::default();
     let rprofile_root = root.join(".Rprofile");
+    let include_root = |path: &std::path::Path| {
+        !exclusions.is_gitignored(path, false) || overrides.contains_key(path)
+    };
+    let include_rprofile = include_root(&rprofile_root);
+    let refresh_preambles = !preamble_roots.is_empty();
+    let preamble_roots: Vec<_> = preamble_roots
+        .into_iter()
+        .filter(|path| include_root(path))
+        .collect();
     let mut pending = std::collections::BTreeSet::new();
-    if refresh_rprofile {
+    if refresh_rprofile && include_rprofile {
         pending.insert(rprofile_root);
     }
     pending.extend(preamble_roots.iter().cloned());
@@ -8783,13 +8941,16 @@ fn capture_source_following_scans(
         }
 
         let rprofile = refresh_rprofile.then(|| {
+            if !include_rprofile {
+                return Default::default();
+            }
             crate::package_state::rprofile::scan_workspace_rprofile_from_captured_texts_and_exclusions(
                 root,
                 &overrides,
                 exclusions,
             )
         });
-        let preambles = (!preamble_roots.is_empty()).then(|| {
+        let preambles = refresh_preambles.then(|| {
             crate::package_state::preamble::scan_testthat_preambles_from_captured_texts_and_exclusions(
                 root,
                 preamble_roots.clone(),
@@ -8825,6 +8986,7 @@ fn capture_package_seed_disk_projection(
     mut recursive_roots: Vec<std::path::PathBuf>,
     mut exact_paths: Vec<std::path::PathBuf>,
     ignored_open_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> PackageSeedDiskProjection {
     recursive_roots.sort();
     recursive_roots.dedup();
@@ -8839,6 +9001,15 @@ fn capture_package_seed_disk_projection(
                 walkdir::WalkDir::new(root)
                     .follow_links(false)
                     .into_iter()
+                    .filter_entry(|entry| {
+                        if entry.file_type().is_dir() {
+                            !exclusions.can_prune_directory(entry.path())
+                                && !exclusions.is_gitignored(entry.path(), true)
+                        } else {
+                            !exclusions.is_excluded_path(entry.path())
+                                && !exclusions.is_gitignored(entry.path(), false)
+                        }
+                    })
                     .filter_map(|entry| entry.ok())
                     .map(walkdir::DirEntry::into_path),
             );
@@ -8857,6 +9028,7 @@ fn capture_package_seed_disk_projection(
         exact_paths,
         ignored_open_paths,
         entries,
+        exclusions: exclusions.clone(),
     }
 }
 
@@ -8866,6 +9038,7 @@ fn capture_package_seed_projection_for_install(
     open_events: &[crate::package_state::event::HandlerEvent],
     open_overrides: &crate::package_state::preamble::PreambleTextOverrides,
     scan_r_files: bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> PackageSeedDiskProjection {
     let mut recursive_roots = vec![
         root.join("data"),
@@ -8908,7 +9081,12 @@ fn capture_package_seed_projection_for_install(
             ignored_open_paths.insert(path.clone());
         }
     }
-    capture_package_seed_disk_projection(recursive_roots, exact_paths, ignored_open_paths)
+    capture_package_seed_disk_projection(
+        recursive_roots,
+        exact_paths,
+        ignored_open_paths,
+        exclusions,
+    )
 }
 
 fn package_seed_projection_text(
@@ -8955,6 +9133,7 @@ fn package_seed_dataset_names(
     let mut names = std::collections::BTreeSet::new();
     let datalist = data.join("datalist");
     if !exclusions.is_excluded_path(&datalist)
+        && !exclusions.is_gitignored(&datalist, false)
         && let Some(text) = package_seed_projection_text(projection, &datalist)
     {
         for line in text.lines().map(str::trim) {
@@ -8974,6 +9153,7 @@ fn package_seed_dataset_names(
     for path in projection.entries.keys().filter(|path| {
         path.parent() == Some(data.as_path())
             && !exclusions.is_excluded_path(path)
+            && !exclusions.is_gitignored(path, false)
             && matches!(
                 projection.entries.get(*path),
                 Some(PackageSeedDiskIdentity::Valid { .. })
@@ -9030,7 +9210,7 @@ fn compute_package_seed_install_from_projection(
     let mut disk_r_files = std::collections::BTreeMap::new();
     if scan_r_files {
         for path in projection.entries.keys() {
-            if exclusions.is_excluded_path(path) {
+            if exclusions.is_excluded_path(path) || exclusions.is_gitignored(path, false) {
                 continue;
             }
             let Some(kind) = crate::package_state::is_r_source_path(path, root) else {
@@ -9050,7 +9230,10 @@ fn compute_package_seed_install_from_projection(
         }
     }
     source_overrides.extend(open_overrides.clone());
-    let rprofile_scan = if model_rprofile && !rprofile_open {
+    let rprofile_scan = if model_rprofile
+        && !rprofile_open
+        && !exclusions.is_gitignored(&root.join(".Rprofile"), false)
+    {
         crate::package_state::rprofile::scan_workspace_rprofile_from_captured_texts_and_exclusions(
             root,
             &source_overrides,
@@ -9065,6 +9248,9 @@ fn compute_package_seed_install_from_projection(
             .keys()
             .chain(source_overrides.keys())
             .filter(|path| crate::package_state::preamble::is_testthat_preamble_path(path, root))
+            .filter(|path| {
+                !exclusions.is_gitignored(path, false) || open_overrides.contains_key(*path)
+            })
             .cloned()
             .collect();
         preamble_paths.sort();
@@ -9086,6 +9272,7 @@ fn compute_package_seed_install_from_projection(
         .filter(|path| path.starts_with(&data_raw))
     {
         if !exclusions.is_excluded_path(path)
+            && !exclusions.is_gitignored(path, false)
             && matches!(
                 path.extension().and_then(|extension| extension.to_str()),
                 Some("R" | "r")
@@ -10300,8 +10487,19 @@ fn remove_project_excluded_index_entries(state: &mut WorldState) -> Vec<Url> {
 
     let mut affected = Vec::new();
     let mut affected_set = std::collections::HashSet::new();
+    let owned = state.discovery_owned_uris();
+    let ignored: std::collections::HashSet<_> = candidates
+        .iter()
+        .filter(|uri| state.workspace_exclusions.is_gitignored_uri(uri) && !owned.contains(*uri))
+        .cloned()
+        .collect();
     for uri in candidates {
-        if let Some(neighbors) = remove_project_excluded_file_from_cross_file_state(state, &uri) {
+        let neighbors = if ignored.contains(&uri) {
+            Some(remove_file_from_cross_file_state(state, &uri))
+        } else {
+            remove_project_excluded_file_from_cross_file_state(state, &uri)
+        };
+        if let Some(neighbors) = neighbors {
             for dep in neighbors {
                 if affected_set.insert(dep.clone()) {
                     affected.push(dep);
@@ -11605,7 +11803,11 @@ fn capture_open_close_analysis(
                         .cloned()
                 })
         };
-        let retained_shadow = next_owner.is_none() && state.workspace_index.get(&root).is_some();
+        let ignored_after_close = next_owner.is_none()
+            && state.is_unreferenced_gitignored_uri_after_close(&root, Some(&uri));
+        let retained_shadow = !ignored_after_close
+            && next_owner.is_none()
+            && state.workspace_index.get(&root).is_some();
         let (metadata, content, interface_hash) = if let Some(owner) = next_owner.as_ref() {
             let next = state
                 .documents
@@ -11616,7 +11818,7 @@ fn capture_open_close_analysis(
                 Some(next.document().text()),
                 Some(next.artifacts().interface_hash),
             )
-        } else if let Some(entry) = state.workspace_index.get(&root) {
+        } else if !ignored_after_close && let Some(entry) = state.workspace_index.get(&root) {
             (
                 Some(entry.metadata.clone()),
                 Some(entry.contents.to_string()),
@@ -11636,7 +11838,7 @@ fn capture_open_close_analysis(
                 .is_some_and(|owner| state.is_project_excluded_uri(owner))
                 || state.is_project_excluded_uri(&root),
             retained_shadow,
-            excluded: state.is_project_excluded_uri(&root),
+            excluded: state.is_project_excluded_uri(&root) || ignored_after_close,
         });
         if let Some(metadata) = roots.last().and_then(|root| root.metadata.clone()) {
             metadata_map.insert(root.clone(), metadata);
@@ -11654,7 +11856,9 @@ fn capture_open_close_analysis(
         package_text_overrides.remove(path);
     }
     for root in &roots {
-        if let (Ok(path), Some(content)) = (root.uri.to_file_path(), root.content.as_ref()) {
+        if (root.owner_uri.is_some() || !state.workspace_exclusions.is_gitignored_uri(&root.uri))
+            && let (Ok(path), Some(content)) = (root.uri.to_file_path(), root.content.as_ref())
+        {
             package_text_overrides.insert(path, ropey::Rope::from_str(content));
         }
     }
@@ -11678,9 +11882,11 @@ fn capture_open_close_analysis(
             .is_some_and(|root| root.owner_uri.is_some())
     });
     let package_close_excluded = state.is_project_excluded_uri(&uri)
-        || package_close_uri
-            .as_ref()
-            .is_some_and(|package_uri| state.is_project_excluded_uri(package_uri));
+        || state.workspace_exclusions.is_gitignored_uri(&uri)
+        || package_close_uri.as_ref().is_some_and(|package_uri| {
+            state.is_project_excluded_uri(package_uri)
+                || state.workspace_exclusions.is_gitignored_uri(package_uri)
+        });
     let mut package_fanout_uris: Vec<Url> = package_workspace_root
         .as_deref()
         .map(|root| {
@@ -11876,9 +12082,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
         captured
             .content_map
             .insert(root.uri.clone(), content.clone());
-        captured
-            .package_text_overrides
-            .insert(path, ropey::Rope::from_str(&content));
+        if !captured.exclusions.is_gitignored(&path, false) {
+            captured
+                .package_text_overrides
+                .insert(path, ropey::Rope::from_str(&content));
+        }
         if captured.package_close_uri.as_ref() == Some(&root.uri) {
             captured.package_close_text = Some(Arc::<str>::from(content.as_str()));
         }
@@ -12006,10 +12214,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
     let mut inputs = captured.package_inputs;
     let mut deltas = Vec::new();
     if let Some(package_uri) = captured.package_close_uri {
-        let package_close_text = if captured.package_close_has_live_owner
-            || captured.package_close_excluded
-            || captured.package_close_text.is_some()
+        let package_close_text = if captured.package_close_excluded
+            && !captured.package_close_has_live_owner
         {
+            None
+        } else if captured.package_close_has_live_owner || captured.package_close_text.is_some() {
             captured.package_close_text
         } else {
             package_uri.to_file_path().ok().and_then(|path| {
@@ -13798,7 +14007,7 @@ async fn resync_file_from_disk(
 ) -> ResyncOutcome {
     {
         let mut state = state_arc.write().await;
-        if state.is_project_excluded_uri(uri) {
+        if state.is_project_excluded_uri(uri) || state.is_unreferenced_gitignored_uri(uri) {
             if state.is_document_open_or_alias(uri) {
                 log::trace!(
                     "Disk resync excluded-file removal vetoed by open document: {}",
@@ -13954,6 +14163,9 @@ async fn resync_file_from_disk(
     // the eventual commit.
     let (analysis_basis, workspace_root, exclusions, mut consumed_context_uris) = {
         let state = state_arc.read().await;
+        if state.is_project_excluded_uri(uri) || state.is_unreferenced_gitignored_uri(uri) {
+            return ResyncOutcome::Skipped;
+        }
         if state.is_document_open_or_alias(uri) {
             log::trace!("Disk resync preparation vetoed by reopen: {}", uri);
             return ResyncOutcome::Vetoed;
@@ -16424,7 +16636,32 @@ enum WatchedChangeAdmission {
     Pruned,
 }
 
+#[cfg(test)]
 fn watched_change_admission(state: &WorldState, uri: &Url) -> WatchedChangeAdmission {
+    watched_change_admission_with_owned(state, uri, None)
+}
+
+fn watched_change_admission_with_owned(
+    state: &WorldState,
+    uri: &Url,
+    owned: Option<&std::collections::HashSet<Url>>,
+) -> WatchedChangeAdmission {
+    let unreferenced = owned.map_or_else(
+        || state.is_unreferenced_gitignored_uri(uri),
+        |owned| state.workspace_exclusions.is_gitignored_uri(uri) && !owned.contains(uri),
+    );
+    if unreferenced {
+        if watched_manifest_change_for_uri(state, uri, false).is_some() {
+            return WatchedChangeAdmission::PackageInputOnly;
+        }
+        if uri.to_file_path().is_ok_and(|path| {
+            path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
+                || path_in_rprofile_sourced_set(&path, &state.package_inputs.preamble_sourced_files)
+        }) {
+            return WatchedChangeAdmission::PackageInputOnly;
+        }
+        return WatchedChangeAdmission::Pruned;
+    }
     if state.workspace_index.contains(uri)
         || state.workspace_index.contains_artifacts(uri)
         || !state.cross_file_graph.get_dependents(uri).is_empty()
@@ -16547,6 +16784,10 @@ fn collect_watched_resync(
     }
     state.recompute_open_neighborhood_pins();
 
+    let owned = changes
+        .iter()
+        .any(|change| state.workspace_exclusions.is_gitignored_uri(&change.uri))
+        .then(|| state.discovery_owned_uris());
     for change in changes {
         let uri = &change.uri;
         if state.is_document_open_or_alias(uri) {
@@ -16575,20 +16816,21 @@ fn collect_watched_resync(
                 if queued_updates.contains(uri) {
                     continue;
                 }
-                let package_input_only = match watched_change_admission(state, uri) {
-                    WatchedChangeAdmission::Pruned => {
-                        log::trace!("Ignoring watched change under a pruned directory: {uri}");
-                        continue;
-                    }
-                    WatchedChangeAdmission::PackageInputOnly => {
-                        log::trace!(
-                            "Carrying watched change under a pruned directory to the package \
+                let package_input_only =
+                    match watched_change_admission_with_owned(state, uri, owned.as_deref()) {
+                        WatchedChangeAdmission::Pruned => {
+                            log::trace!("Ignoring watched change under a pruned directory: {uri}");
+                            continue;
+                        }
+                        WatchedChangeAdmission::PackageInputOnly => {
+                            log::trace!(
+                                "Carrying watched change under a pruned directory to the package \
                              reseed only: {uri}"
-                        );
-                        true
-                    }
-                    WatchedChangeAdmission::Index => false,
-                };
+                            );
+                            true
+                        }
+                        WatchedChangeAdmission::Index => false,
+                    };
                 let generation = bump_watched_file_resync_generation(state, uri);
                 if !package_input_only {
                     state.workspace_index.schedule_update(uri.clone());
@@ -17429,6 +17671,7 @@ fn external_project_config_watch_changed(
 /// which downstream rebuilds to run.
 #[derive(Debug, Clone)]
 struct ConfigChangeSnapshot {
+    prev_workspace_folders: Vec<Url>,
     prev_cross_file: crate::cross_file::CrossFileConfig,
     prev_lint: crate::linting::LintConfig,
     /// Raw merged linting section, including per-document overrides that do
@@ -17438,12 +17681,16 @@ struct ConfigChangeSnapshot {
     /// including whether a host/project policy is available at all.
     prev_indentation_producer_policy: Option<crate::linting::IndentationProducerPolicy>,
     prev_completion: crate::state::CompletionConfig,
-    prev_workspace_exclusions: Vec<String>,
+    prev_workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
     /// `recompute_parsed_configs` resets `symbol_config` to defaults. The
     /// helper restores `hierarchical_document_symbol_support` from this
     /// value (set from client capabilities at initialize time).
     prev_hier_support: bool,
 }
+
+#[cfg(test)]
+#[path = "backend_discovery_tests.rs"]
+mod discovery_tests;
 
 impl ConfigChangeSnapshot {
     /// Capture every pre-recompute input used by downstream change detection.
@@ -17451,6 +17698,7 @@ impl ConfigChangeSnapshot {
     /// omitting a newly added diagnostic-affecting field.
     fn capture(state: &WorldState) -> Self {
         Self {
+            prev_workspace_folders: state.workspace_folders.clone(),
             prev_cross_file: state.cross_file_config.clone(),
             prev_lint: state.lint_config.clone(),
             prev_merged_linting_section: state.merged_linting_section.clone(),
@@ -17458,7 +17706,7 @@ impl ConfigChangeSnapshot {
                 state,
             ),
             prev_completion: state.completion_config.clone(),
-            prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
+            prev_workspace_exclusions: state.workspace_exclusions.clone(),
             prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
         }
     }
@@ -18188,6 +18436,7 @@ impl LanguageServer for Backend {
             // separate `compile_lint_overrides` step.
             crate::config_file::recompute_parsed_configs(&mut state);
         }
+        self.refresh_discovery_policy().await;
 
         // NOTE: the `raven/projectConfigLoaded` notification is NOT sent
         // from here. Per the LSP spec, the server MUST NOT send any
@@ -18246,6 +18495,13 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    ..Default::default()
+                }),
                 document_on_type_formatting_provider: Some(
                     indentation::on_type_formatting_capability(),
                 ),
@@ -18278,6 +18534,7 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         let init_start = std::time::Instant::now();
+        self.register_gitignore_watchers(false).await;
 
         let reconcile_wake = {
             let state = self.state.read().await;
@@ -18616,7 +18873,6 @@ impl LanguageServer for Backend {
         // these names; the handler below filters those events back to the
         // same discovery walk before reloading.
         {
-            use tower_lsp::lsp_types::Registration;
             let (workspace_folders, raw_client) = {
                 let state = self.state.read().await;
                 (
@@ -18625,20 +18881,8 @@ impl LanguageServer for Backend {
                 )
             };
             let discovery_options = self.discovery_options_from_client_settings(&raw_client);
-            let watchers = build_workspace_project_config_watchers(&workspace_folders);
-            if !watchers.is_empty() {
-                let reg = Registration {
-                    id: "raven-config-files".into(),
-                    method: "workspace/didChangeWatchedFiles".into(),
-                    register_options: Some(
-                        serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
-                            .unwrap(),
-                    ),
-                };
-                if let Err(e) = self.client.register_capability(vec![reg]).await {
-                    log::warn!("dynamic watch registration failed: {e}");
-                }
-            }
+            self.register_workspace_config_watchers(&workspace_folders, false)
+                .await;
             self.register_external_project_config_watch(workspace_folders, discovery_options)
                 .await;
         }
@@ -19648,23 +19892,90 @@ impl LanguageServer for Backend {
         did_close_transactional(self, uri).await;
     }
 
-    /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
-    ///
-    /// This handles parsing the new cross-file configuration from the provided LSP settings, applies it to shared state if valid, invalidates cross-file resolution caches, marks open documents for force republish, optionally reinitializes the PackageLibrary when package-related settings change, and schedules diagnostics publication for every open document.
-    ///
-    /// # Parameters
-    ///
-    /// - `params`: LSP DidChangeConfigurationParams containing the new settings to parse and apply.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// // Called from an async context when the client sends updated configuration.
-    /// # use tower_lsp::LanguageServer;
-    /// # async fn example(backend: &raven::backend::Backend, params: tower_lsp::lsp_types::DidChangeConfigurationParams) {
-    /// backend.did_change_configuration(params).await;
-    /// # }
-    /// ```
+    /// Reconcile automatic discovery, project configuration, and package
+    /// construction authority after workspace folders change.
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let (previous, folders, raw_client) = {
+            let mut state = self.state.write().await;
+            let previous = ConfigChangeSnapshot::capture(&state);
+            state
+                .workspace_folders
+                .retain(|uri| !params.event.removed.iter().any(|folder| &folder.uri == uri));
+            for folder in params.event.added {
+                if !state.workspace_folders.contains(&folder.uri) {
+                    state.workspace_folders.push(folder.uri);
+                }
+            }
+            state.begin_discovery_refresh();
+            // Removed workspace roots cease to own automatic entries. Preserve
+            // only those still consumed from remaining roots or open buffers.
+            let inside = |uri: &Url, folders: &[Url]| {
+                uri.to_file_path().is_ok_and(|path| {
+                    folders.iter().any(|folder| {
+                        folder
+                            .to_file_path()
+                            .is_ok_and(|root| path.starts_with(root))
+                    })
+                })
+            };
+            let candidates: std::collections::HashSet<_> = state
+                .workspace_index
+                .artifact_uris()
+                .into_iter()
+                .chain(state.workspace_index.uris())
+                .filter(|uri| {
+                    inside(uri, &previous.prev_workspace_folders)
+                        && !inside(uri, &state.workspace_folders)
+                })
+                .collect();
+            let mut roots: Vec<_> = state
+                .workspace_index
+                .artifact_uris()
+                .into_iter()
+                .filter(|uri| !candidates.contains(uri) && !state.is_project_excluded_uri(uri))
+                .collect();
+            for uri in state.documents.keys() {
+                roots.push(uri.clone());
+                roots.extend(state.authoritative_revalidation_roots_for_uri(uri));
+            }
+            let owned = crate::discovery::owned_files(&state.cross_file_graph, roots);
+            for uri in candidates.difference(&owned) {
+                remove_file_from_cross_file_state(&mut state, uri);
+            }
+            state.recompute_open_neighborhood_pins();
+            (
+                previous,
+                state.workspace_folders.clone(),
+                state.raw_client_settings.clone(),
+            )
+        };
+        let options = self.discovery_options_from_client_settings(&raw_client);
+        let layer = folders
+            .first()
+            .and_then(|uri| uri.to_file_path().ok())
+            .map(|root| crate::config_file::discover_and_load_with_options(&root, &options))
+            .unwrap_or(crate::config_file::DiscoveredLoad::None);
+        log_project_config_warnings(&layer);
+        {
+            let mut state = self.state.write().await;
+            apply_project_config_layer(&mut state, layer);
+            crate::config_file::recompute_parsed_configs(&mut state);
+        }
+        self.register_workspace_config_watchers(&folders, true)
+            .await;
+        let to_publish = self.reconcile_after_config_recompute(previous).await;
+        self.refresh_external_project_config_watch(folders, options)
+            .await;
+        self.publish_config_reload_diagnostics(
+            to_publish,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+    }
+
+    /// Recompute merged client/project settings, reconcile derived state, and
+    /// republish open documents when diagnostic-affecting settings change.
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
@@ -19835,6 +20146,15 @@ impl LanguageServer for Backend {
                 .collect();
             let mut state = self.state.write().await;
             state.advance_workspace_scan_generation();
+            if event_uris.iter().any(|uri| {
+                uri.to_file_path().is_ok_and(|path| {
+                    state
+                        .workspace_exclusions
+                        .gitignore_event_affects_discovery(&path)
+                })
+            }) {
+                state.begin_discovery_refresh();
+            }
             state.record_tar_source_filesystem_events(event_uris)
         };
 
@@ -19860,7 +20180,7 @@ impl LanguageServer for Backend {
                 let Ok(p) = c.uri.to_file_path() else {
                     return false;
                 };
-                is_project_config_file(&p)
+                is_project_config_file(&p) || p.file_name().is_some_and(|name| name == ".gitignore")
             })
             .map(|c| c.uri.clone())
             .collect();
@@ -19877,6 +20197,17 @@ impl LanguageServer for Backend {
                 &discovery_options,
             )
         });
+        let gitignore_changed = {
+            let state = self.state.read().await;
+            state.workspace_exclusions.respect_gitignore()
+                && params.changes.iter().any(|event| {
+                    event.uri.to_file_path().is_ok_and(|path| {
+                        state
+                            .workspace_exclusions
+                            .gitignore_event_affects_discovery(&path)
+                    })
+                })
+        };
         let has_non_config_changes = params
             .changes
             .iter()
@@ -19884,7 +20215,7 @@ impl LanguageServer for Backend {
         let mut deferred_config_publish = Vec::new();
         let mut notification_receipt = None;
 
-        if project_config_changed {
+        if project_config_changed || gitignore_changed {
             // Step 1 (lock-free I/O): snapshot the workspace root, then run
             // discovery + config-file loading off-lock. Holding the write lock across
             // disk I/O violates the locking-discipline invariant in
@@ -19915,7 +20246,9 @@ impl LanguageServer for Backend {
 
                 // Re-run discovery from the workspace root. Order matters:
                 // raven.toml beats .lintr (DiscoveredConfig embodies that).
-                apply_project_config_layer(&mut state, project_layer);
+                if project_config_changed {
+                    apply_project_config_layer(&mut state, project_layer);
+                }
 
                 // `recompute_parsed_configs` now also recompiles
                 // `state.lint_overrides` from the merged settings.
@@ -19930,6 +20263,9 @@ impl LanguageServer for Backend {
 
                 (prev, warnings)
             };
+            if gitignore_changed && !self.refresh_discovery_policy().await {
+                return;
+            }
             for message in model_switch_warnings {
                 self.client
                     .show_message(MessageType::WARNING, message)
@@ -20985,6 +21321,26 @@ impl Backend {
     /// `packagesWatch*` flipped — nothing about diagnostic content moved,
     /// so the workspace-wide republish is a waste.
     async fn reconcile_after_config_recompute(&self, prev: ConfigChangeSnapshot) -> Vec<Url> {
+        let discovery_inputs_changed = {
+            let state = self.state.read().await;
+            !state
+                .workspace_exclusions
+                .same_discovery_inputs(&prev.prev_workspace_exclusions)
+        };
+        if discovery_inputs_changed {
+            if !self.refresh_discovery_policy().await {
+                return Vec::new();
+            }
+            let watchers_changed = {
+                let state = self.state.read().await;
+                state.workspace_folders != prev.prev_workspace_folders
+                    || state.workspace_exclusions.respect_gitignore()
+                        != prev.prev_workspace_exclusions.respect_gitignore()
+            };
+            if watchers_changed {
+                self.register_gitignore_watchers(true).await;
+            }
+        }
         // Brief write lock: change detection, package_mode translate,
         // hier_support restore, force-republish marking. NO blocking I/O
         // happens inside this scope.
@@ -21008,6 +21364,7 @@ impl Backend {
             // subprocess call (~100ms). Keep this narrow.
             let package_settings_changed = state.cross_file_config.packages_enabled
                 != prev.prev_cross_file.packages_enabled
+                || state.workspace_folders != prev.prev_workspace_folders
                 || state.cross_file_config.packages_r_path != prev.prev_cross_file.packages_r_path
                 || state.cross_file_config.packages_additional_library_paths
                     != prev.prev_cross_file.packages_additional_library_paths;
@@ -21037,8 +21394,11 @@ impl Backend {
             let indentation_producer_policy_changed =
                 crate::handlers::base_indentation_producer_policy(&state)
                     != prev.prev_indentation_producer_policy;
-            let workspace_exclusions_changed =
-                state.workspace_exclusions.patterns() != prev.prev_workspace_exclusions.as_slice();
+            let workspace_exclusions_changed = !state
+                .workspace_exclusions
+                .same_discovery_inputs(&prev.prev_workspace_exclusions)
+                || state.workspace_exclusions.discovery_revision()
+                    != prev.prev_workspace_exclusions.discovery_revision();
             let max_chain_depth_changed =
                 state.cross_file_config.max_chain_depth != prev.prev_cross_file.max_chain_depth;
             let max_transitive_dependents_visited_changed =
@@ -21066,6 +21426,33 @@ impl Backend {
                 // matcher before any off-lock rescan begins.
                 state.record_package_input_mutation();
             }
+            let package_root_changed =
+                prev.prev_workspace_folders.first() != state.workspace_folders.first();
+            let folder_routing = if package_root_changed {
+                state.package_inputs = crate::package_state::PackageInputs {
+                    workspace_root: state
+                        .workspace_folders
+                        .first()
+                        .and_then(|uri| uri.to_file_path().ok()),
+                    package_mode: state.cross_file_config.package_mode,
+                    model_rprofile: state.cross_file_config.model_rprofile,
+                    ..Default::default()
+                };
+                state.record_package_input_mutation();
+                state
+                    .apply_package_event_with_routing_owner(
+                        &crate::package_state::PackageInputDelta::Initial,
+                    )
+                    .map(|owner| crate::state::PackageRoutingCommitEffects {
+                        owner,
+                        candidates: state.capture_analysis_transfer_candidates(
+                            state.documents.keys().cloned().collect::<Vec<_>>(),
+                        ),
+                        handoff: None,
+                    })
+            } else {
+                None
+            };
             let workspace_exclusion_package_reseed = workspace_exclusions_changed.then(|| {
                 state
                     .package_inputs
@@ -21135,6 +21522,7 @@ impl Backend {
             } else {
                 (None, None)
             };
+            let disabled_package_routing = disabled_package_routing.or(folder_routing);
 
             let model_rprofile_changed =
                 state.cross_file_config.model_rprofile != prev.prev_cross_file.model_rprofile;

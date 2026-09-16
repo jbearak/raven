@@ -324,7 +324,7 @@ fn translate_watched(
     // (DESCRIPTION/NAMESPACE/.Rprofile/r-source/data(-raw)/generic-dir) already
     // has correct "file gone" cleanup logic, so folding exclusion into
     // `deleted` reuses it instead of duplicating removal logic per branch.
-    let deleted = deleted || (!exclusions.is_empty() && exclusions.is_excluded_path(&path));
+    let deleted = deleted || exclusions.is_excluded_path(&path);
 
     if canonical_path == canonical_desc || path == root.join("DESCRIPTION") {
         if deleted {
@@ -351,6 +351,7 @@ fn translate_watched(
     }
 
     let canonical_rprofile = canonical_root.join(".Rprofile");
+    let deleted = deleted || exclusions.is_gitignored(&path, false);
     if canonical_path == canonical_rprofile || path == root.join(".Rprofile") {
         // `WatchedFileChanged` MAY do disk I/O (see `translate`'s doc comment):
         // scan `.Rprofile` from disk unless it was deleted or modeling is off,
@@ -497,7 +498,7 @@ fn translate_watched_directory(
 
     let complete_scan = if deleted {
         true
-    } else if exclusions.is_empty() {
+    } else if exclusions.is_empty() && !exclusions.respect_gitignore() {
         collect_r_file_inputs_from_dir(inputs, root, path, &mut seen, &mut deltas)
     } else {
         collect_r_file_inputs_from_dir_with_exclusions(
@@ -625,7 +626,7 @@ fn collect_r_file_inputs_from_dir_with_exclusions(
     seen: &mut BTreeSet<std::path::PathBuf>,
     deltas: &mut Vec<PackageInputDelta>,
 ) -> bool {
-    if exclusions.can_prune_directory(dir) {
+    if exclusions.can_prune_directory(dir) || exclusions.is_gitignored(dir, true) {
         return true;
     }
 
@@ -634,7 +635,9 @@ fn collect_r_file_inputs_from_dir_with_exclusions(
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            !entry.file_type().is_dir() || !exclusions.can_prune_directory(entry.path())
+            !entry.file_type().is_dir()
+                || (!exclusions.can_prune_directory(entry.path())
+                    && !exclusions.is_gitignored(entry.path(), true))
         })
     {
         let entry = match entry {
@@ -653,7 +656,7 @@ fn collect_r_file_inputs_from_dir_with_exclusions(
             continue;
         }
         let path = entry.into_path();
-        if exclusions.is_excluded_path(&path) {
+        if exclusions.is_excluded_path(&path) || exclusions.is_gitignored(&path, false) {
             continue;
         }
         let Some(kind) = is_r_source_path(&path, root) else {

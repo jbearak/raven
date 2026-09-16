@@ -311,6 +311,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 vscode.workspace.createFileSystemWatcher('**/raven.toml'),
                 vscode.workspace.createFileSystemWatcher('**/.lintr'),
                 vscode.workspace.createFileSystemWatcher('**/.Rprofile'),
+                vscode.workspace.createFileSystemWatcher('**/.gitignore'),
             ],
         },
         outputChannel: outputChannel,

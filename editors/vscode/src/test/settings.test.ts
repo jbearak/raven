@@ -79,6 +79,7 @@ const SETTINGS_MAPPING: Array<{
     defaultWhenUnconfigured?: unknown;
 }> = [
     // Cross-file depth settings
+    { vsCodeKey: 'workspace.respectGitignore', jsonPath: ['workspace', 'respectGitignore'], type: 'boolean' },
     { vsCodeKey: 'crossFile.backwardDependencies', jsonPath: ['crossFile', 'backwardDependencies'], type: 'enum', enumValues: ['auto', 'explicit'] as const },
     { vsCodeKey: 'crossFile.maxBackwardDepth', jsonPath: ['crossFile', 'maxBackwardDepth'], type: 'number' },
     { vsCodeKey: 'crossFile.maxForwardDepth', jsonPath: ['crossFile', 'maxForwardDepth'], type: 'number' },

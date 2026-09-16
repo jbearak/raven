@@ -122,3 +122,4 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.server.path` | `""` | string | — | [configuration](configuration.md) | Path to the raven binary; if empty, the bundled binary is used. |
 | `raven.symbols.workspaceMaxResults` | `1000` | number (100–10000) | `symbols.workspaceMaxResults` | [document-outline](document-outline.md) | Maximum number of symbols returned by workspace symbol search (Ctrl+T / Cmd+T). |
 | `raven.trace.server` | `"off"` | `"off"` \| `"messages"` \| `"verbose"` | — | [configuration](configuration.md) | Trace level for the Raven language server. 'messages' shows debug output, 'verbose' shows full trace output including diagnostic decisions. |
+| `raven.workspace.respectGitignore` | `true` | boolean | — | — | Respect .gitignore during automatic workspace, package, and CLI discovery. |

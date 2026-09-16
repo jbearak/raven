@@ -1309,6 +1309,7 @@ pub struct WorldState {
     /// exclusions are configured. These apply to workspace/default discovery,
     /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
     pub workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    discovery_ownership_cache: parking_lot::Mutex<Option<DiscoveryOwnershipCache>>,
 
     /// Per-document editor options sent by the client via
     /// `raven/documentIndentUnitsChanged`, keyed by URI string. All fields are
@@ -1432,6 +1433,7 @@ pub struct WorldState {
     /// this before their state can race a scan. A scan claims the exact token
     /// under the final write lock before installing its complete candidate.
     workspace_scan_generation: u64,
+    discovery_refresh_generation: u64,
     /// Latest-arrival owner for top-level full workspace scans.
     workspace_scan_intent: Option<WorkspaceScanIntentState>,
     /// Unmarked diagnostic fanout owned by successful analysis commits.
@@ -1829,6 +1831,12 @@ pub(crate) struct WorkspaceScanAuthorityStamp {
     system_file_routing_owner: SystemFileRoutingOwnerIdentity,
     package_library_install_id: u64,
     package_library_content_generation: u64,
+}
+
+struct DiscoveryOwnershipCache {
+    stamp: WorkspaceScanAuthorityStamp,
+    policy: crate::config_file::CompiledWorkspaceExclusions,
+    owned: Arc<HashSet<Url>>,
 }
 
 /// Latest-arrival ownership for one top-level full workspace scan.
@@ -6433,6 +6441,36 @@ impl WorldState {
         self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
     }
 
+    /// Fence scans, analysis (including watched/close candidates), and package
+    /// seeds both before off-lock discovery I/O and at its atomic installation.
+    pub(crate) fn begin_discovery_refresh(&mut self) -> u64 {
+        self.discovery_refresh_generation = self.discovery_refresh_generation.wrapping_add(1);
+        self.invalidate_discovery_consumers();
+        self.discovery_refresh_generation
+    }
+
+    fn invalidate_discovery_consumers(&mut self) {
+        self.advance_workspace_scan_generation();
+        self.advance_analysis_config_generation();
+        self.cross_file_revalidation.cancel_all();
+        self.record_package_input_mutation();
+    }
+
+    pub(crate) fn install_discovery_refresh(
+        &mut self,
+        generation: u64,
+        refreshed: &crate::config_file::CompiledWorkspaceExclusions,
+    ) -> bool {
+        if self.discovery_refresh_generation != generation
+            || !self.workspace_exclusions.same_discovery_inputs(refreshed)
+        {
+            return false;
+        }
+        self.workspace_exclusions.install_gitignore(refreshed);
+        self.invalidate_discovery_consumers();
+        true
+    }
+
     /// Fence detached tar expansion before consulting the reverse registry,
     /// then return every finalized parent whose request may overlap an event.
     ///
@@ -7024,6 +7062,141 @@ impl WorldState {
         self.workspace_exclusions.is_excluded_uri(uri)
     }
 
+    /// Ignored closed files need an eligible or open owner. Reverse ownership
+    /// follows forward callers and backward-directive children, never arbitrary
+    /// neighbors or self-sustaining ignored cycles.
+    pub(crate) fn is_unreferenced_gitignored_uri(&self, uri: &Url) -> bool {
+        self.workspace_exclusions.is_gitignored_uri(uri)
+            && !self.discovery_owned_uris().contains(uri)
+    }
+
+    /// Batch equivalent of the reverse single-file query. Compute once for
+    /// a watch receipt or policy cleanup, not once per candidate in a cycle.
+    pub(crate) fn discovery_owned_uris(&self) -> Arc<HashSet<Url>> {
+        let stamp = self.workspace_scan_authority_stamp();
+        let mut cache = self.discovery_ownership_cache.lock();
+        if let Some(cached) = cache.as_ref()
+            && cached.stamp == stamp
+            && cached.policy == self.workspace_exclusions
+        {
+            return cached.owned.clone();
+        }
+        let mut roots: Vec<_> = self
+            .workspace_index
+            .artifact_uris()
+            .into_iter()
+            .chain(self.workspace_index.uris())
+            .filter(|uri| self.workspace_exclusions.is_automatic_discovery_uri(uri))
+            .collect();
+        for uri in self.documents.keys() {
+            roots.push(uri.clone());
+            roots.extend(self.authoritative_revalidation_roots_for_uri(uri));
+        }
+        let owned = Arc::new(crate::discovery::owned_files(&self.cross_file_graph, roots));
+        *cache = Some(DiscoveryOwnershipCache {
+            stamp,
+            policy: self.workspace_exclusions.clone(),
+            owned: owned.clone(),
+        });
+        owned
+    }
+
+    pub(crate) fn is_unreferenced_gitignored_uri_after_close(
+        &self,
+        uri: &Url,
+        closing: Option<&Url>,
+    ) -> bool {
+        if !self.workspace_exclusions.is_gitignored_uri(uri) {
+            return false;
+        }
+        let mut pending = vec![uri.clone()];
+        let mut seen = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            let open_owner = (self.documents.contains_key(&candidate)
+                && Some(&candidate) != closing)
+                || self
+                    .open_document_aliases
+                    .open_uris_for_canonical(&candidate)
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            Some(owner) != closing && self.documents.contains_key(owner)
+                        })
+                    });
+            if open_owner
+                || (self
+                    .workspace_exclusions
+                    .is_automatic_discovery_uri(&candidate)
+                    && (self.workspace_index.contains_artifacts(&candidate)
+                        || self.workspace_index.contains(&candidate)))
+            {
+                return false;
+            }
+            pending.extend(
+                self.cross_file_graph
+                    .get_dependents(&candidate)
+                    .into_iter()
+                    .filter(|edge| !edge.is_backward_directive)
+                    .map(|edge| edge.from.clone()),
+            );
+            pending.extend(
+                self.cross_file_graph
+                    .get_dependencies(&candidate)
+                    .into_iter()
+                    .filter(|edge| edge.is_backward_directive)
+                    .map(|edge| edge.to.clone()),
+            );
+        }
+        true
+    }
+
+    /// Retire ignored closed dependencies when their final root disappears.
+    /// Call only after an authoritative open/closed graph update, never during
+    /// prerequisite on-demand indexing before its requesting open commit.
+    /// Mass removal conservatively revalidates open buffers once, avoiding a
+    /// separate graph traversal for every member of an orphaned closure.
+    fn prune_orphaned_gitignored_files(&mut self) -> Vec<Url> {
+        if !self.workspace_exclusions.respect_gitignore() {
+            return Vec::new();
+        }
+        let mut removed: Vec<_> = self
+            .workspace_index
+            .artifact_uris()
+            .into_iter()
+            .filter(|uri| {
+                self.workspace_exclusions.is_gitignored_uri(uri)
+                    && !self.is_document_open_or_alias(uri)
+            })
+            .collect();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        // An open transition has replaced records but has not yet advanced its
+        // outer authority stamp. Do not reuse ownership from before that swap.
+        self.discovery_ownership_cache.lock().take();
+        let owned = self.discovery_owned_uris();
+        removed.retain(|uri| !owned.contains(uri));
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        let affected = self.documents.keys().cloned().collect();
+        for uri in &removed {
+            self.workspace_index.invalidate(uri);
+            self.cross_file_graph.remove_file(uri);
+            self.cross_file_file_cache.invalidate(uri);
+            self.cross_file_meta.remove(uri);
+            self.prune_editor_chunk_kind_override(uri);
+            self.watched_file_resync_generations.remove(uri);
+        }
+        self.advance_workspace_scan_generation();
+        self.advance_workspace_graph_authority_generation();
+        self.refresh_tar_source_watch_parents(removed);
+        self.recompute_open_neighborhood_pins();
+        affected
+    }
+
     /// Whether the workspace walk would never have reached `uri`: some
     /// directory component of its path *below a workspace folder* is one
     /// [`should_skip_directory`] prunes (hidden, or the fixed vendored list).
@@ -7460,6 +7633,7 @@ impl WorldState {
             merged_linting_section: serde_json::json!({}),
             effective_lint_config_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
+            discovery_ownership_cache: parking_lot::Mutex::new(None),
             per_document_indent_options: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
@@ -7486,6 +7660,7 @@ impl WorldState {
             libpath_watcher_owner_generation: Self::mint_libpath_watcher_owner_generation(),
             package_library_ready: false,
             workspace_scan_generation: 0,
+            discovery_refresh_generation: 0,
             workspace_scan_intent: None,
             analysis_transfers: HashMap::new(),
             analysis_transfer_successors: HashMap::new(),
@@ -10327,6 +10502,11 @@ impl WorldState {
             .iter()
             .flat_map(|root| self.affected_open_dependents_after_edit(root, true, true))
             .collect();
+        let orphaned_neighbors = if closing_subject || capture_pre_graph || edges_changed {
+            self.prune_orphaned_gitignored_files()
+        } else {
+            Vec::new()
+        };
 
         let mut package_visibility_changed = false;
         let mut package_routing_owner = None;
@@ -10362,6 +10542,7 @@ impl WorldState {
         let mut affected: HashSet<Url> = plan.seed_revalidation_uris.into_iter().collect();
         affected.extend(close_pre_graph_neighbors);
         affected.extend(close_post_graph_neighbors);
+        affected.extend(orphaned_neighbors);
         if plan.direct_subject_publish || closing_subject {
             affected.remove(uri);
         } else {
@@ -10520,6 +10701,14 @@ impl WorldState {
         };
         let mut post_fanout = Vec::new();
         let mut graph_changed = false;
+        // Pending/Complete upserts hydrate prerequisites before their caller's
+        // graph exists. Only observed disk mutations can retire their ownership.
+        let authoritative_mutation = mutations.iter().any(|mutation| match mutation {
+            PreparedClosedMutation::Upsert(prepared) => {
+                matches!(prepared.basis.subject, AnalysisSubjectBasis::Observed(_))
+            }
+            PreparedClosedMutation::Remove { .. } => true,
+        });
         for mutation in mutations {
             match mutation {
                 PreparedClosedMutation::Upsert(prepared) => {
@@ -10637,6 +10826,14 @@ impl WorldState {
         if graph_changed {
             self.advance_workspace_graph_authority_generation();
             self.recompute_open_neighborhood_pins();
+            if authoritative_mutation {
+                let orphan_fanout = self.prune_orphaned_gitignored_files();
+                if reserve_closed_fanout {
+                    affected.extend(orphan_fanout);
+                } else {
+                    affected_candidates.extend(orphan_fanout);
+                }
+            }
         }
         affected_candidates.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         affected_candidates.dedup();
@@ -12448,9 +12645,10 @@ pub(crate) fn collect_files_matching(
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
 ) {
-    collect_files_matching_impl(dir, out, accept, None);
+    collect_files_matching_impl(dir, out, accept, None, false, &mut Vec::new());
 }
 
+#[cfg(test)]
 pub(crate) fn collect_files_matching_with_exclusions(
     dir: &Path,
     out: &mut Vec<PathBuf>,
@@ -12462,7 +12660,31 @@ pub(crate) fn collect_files_matching_with_exclusions(
         out,
         accept,
         (!exclusions.is_empty()).then_some(exclusions),
+        false,
+        &mut Vec::new(),
     );
+}
+
+pub(crate) fn collect_files_matching_for_discovery(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    let _ = collect_files_matching_for_discovery_with_errors(dir, out, accept, exclusions);
+}
+
+pub(crate) fn collect_files_matching_for_discovery_with_errors(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> Vec<(PathBuf, std::io::Error)> {
+    let mut errors = Vec::new();
+    if !exclusions.is_gitignored(dir, true) {
+        collect_files_matching_impl(dir, out, accept, Some(exclusions), true, &mut errors);
+    }
+    errors
 }
 
 fn collect_files_matching_impl(
@@ -12470,6 +12692,8 @@ fn collect_files_matching_impl(
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+    discovery: bool,
+    errors: &mut Vec<(PathBuf, std::io::Error)>,
 ) {
     let mut visited = HashSet::new();
     // Seed with the canonical root so a symlink pointing back at the root (or
@@ -12477,7 +12701,15 @@ fn collect_files_matching_impl(
     if let Ok(canonical) = fs::canonicalize(dir) {
         visited.insert(canonical);
     }
-    collect_files_matching_inner(dir, out, &mut visited, accept, exclusions);
+    collect_files_matching_inner(
+        dir,
+        out,
+        &mut visited,
+        accept,
+        exclusions,
+        discovery,
+        errors,
+    );
 }
 
 fn collect_files_matching_inner(
@@ -12486,12 +12718,25 @@ fn collect_files_matching_inner(
     visited: &mut HashSet<PathBuf>,
     accept: fn(&Path) -> bool,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+    discovery: bool,
+    errors: &mut Vec<(PathBuf, std::io::Error)>,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push((dir.to_path_buf(), error));
+            return;
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push((dir.to_path_buf(), error));
+                continue;
+            }
+        };
         let path = entry.path();
 
         // `is_dir()` follows symlinks, so a symlink to a directory is walked
@@ -12508,7 +12753,10 @@ fn collect_files_matching_inner(
                 log::trace!("Skipping directory: {}", path.display());
                 continue;
             }
-            if exclusions.is_some_and(|exclusions| exclusions.can_prune_directory(&path)) {
+            if exclusions.is_some_and(|exclusions| {
+                exclusions.can_prune_directory(&path)
+                    || (discovery && exclusions.is_gitignored(&path, true))
+            }) {
                 log::trace!("Skipping excluded directory: {}", path.display());
                 continue;
             }
@@ -12516,6 +12764,7 @@ fn collect_files_matching_inner(
                 Ok(c) => c,
                 Err(e) => {
                     log::trace!("Skipping unresolvable dir {}: {}", path.display(), e);
+                    errors.push((path, e));
                     continue;
                 }
             };
@@ -12541,9 +12790,13 @@ fn collect_files_matching_inner(
                 log::trace!("Skipping symlink cycle: {}", path.display());
                 continue;
             }
-            collect_files_matching_inner(&path, out, visited, accept, exclusions);
+            collect_files_matching_inner(
+                &path, out, visited, accept, exclusions, discovery, errors,
+            );
         } else if accept(&path)
             && !exclusions.is_some_and(|exclusions| exclusions.is_excluded_path(&path))
+            && !(discovery
+                && exclusions.is_some_and(|exclusions| exclusions.is_gitignored(&path, false)))
         {
             out.push(path);
         }
@@ -12743,7 +12996,11 @@ pub(crate) fn apply_workspace_scan_chunk_overrides(
 }
 
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
-    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    let mut exclusions = crate::config_file::compile_workspace_exclusions(
+        &serde_json::Value::Null,
+        folders.iter().filter_map(|uri| uri.to_file_path().ok()),
+    );
+    exclusions.refresh_gitignore();
     scan_workspace_with_exclusions(folders, max_chain_depth, &exclusions)
 }
 
@@ -12762,7 +13019,7 @@ pub fn scan_workspace_with_exclusions(
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            collect_files_matching_with_exclusions(
+            collect_files_matching_for_discovery(
                 &path,
                 &mut file_paths,
                 is_stat_model_extension,

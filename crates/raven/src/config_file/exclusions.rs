@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde_json::Value;
@@ -31,9 +32,117 @@ pub struct CompiledWorkspaceExclusions {
     patterns: Vec<String>,
     rules: Vec<ExclusionRule>,
     has_negation: bool,
+    respect_gitignore: bool,
+    gitignore: Arc<crate::discovery::GitignoreSnapshot>,
 }
 
+impl PartialEq for CompiledWorkspaceExclusions {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_discovery_inputs(other) && self.discovery_revision() == other.discovery_revision()
+    }
+}
+impl Eq for CompiledWorkspaceExclusions {}
+
 impl CompiledWorkspaceExclusions {
+    pub fn respect_gitignore(&self) -> bool {
+        self.respect_gitignore
+    }
+
+    /// Discovery-only rule evaluation. Never use this for explicit source
+    /// edges or to mark graph edges non-lending.
+    pub fn is_gitignored(&self, path: &Path, directory: bool) -> bool {
+        self.respect_gitignore && self.gitignore.is_ignored(path, directory)
+    }
+
+    pub fn is_gitignored_uri(&self, uri: &Url) -> bool {
+        uri.to_file_path()
+            .ok()
+            .is_some_and(|path| self.is_gitignored(&path, false))
+    }
+
+    pub(crate) fn is_automatic_discovery_uri(&self, uri: &Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        let relative = self.gitignore.relative_workspace_path(&path).or_else(|| {
+            self.roots
+                .iter()
+                .filter_map(|root| path.strip_prefix(root).ok())
+                .min_by_key(|relative| relative.components().count())
+        });
+        let Some(relative) = relative else {
+            return false;
+        };
+        !relative.parent().is_some_and(|parent| {
+            parent.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(crate::state::should_skip_directory)
+            })
+        }) && !self.is_gitignored(&path, false)
+            && !self.is_excluded_path(&path)
+    }
+
+    /// An explicitly requested directory outside the workspace has its own
+    /// bounded Git context. Project exclusions stay rooted in the workspace.
+    pub(crate) fn for_discovery_directory<'a>(&'a self, directory: &Path) -> Cow<'a, Self> {
+        if !self.respect_gitignore || self.gitignore.relative_workspace_path(directory).is_some() {
+            return Cow::Borrowed(self);
+        }
+        let mut policy = self.clone();
+        policy.gitignore = Arc::new(crate::discovery::GitignoreSnapshot::build_with_pruning(
+            &[directory.to_path_buf()],
+            |_| false,
+        ));
+        Cow::Owned(policy)
+    }
+
+    pub(crate) fn discovery_revision(&self) -> u64 {
+        self.gitignore.revision()
+    }
+
+    pub(crate) fn ancestor_ignore_files(&self) -> &[PathBuf] {
+        &self.gitignore.ancestor_files
+    }
+
+    pub(crate) fn gitignore_event_affects_discovery(&self, path: &Path) -> bool {
+        self.respect_gitignore
+            && path.file_name().is_some_and(|name| name == ".gitignore")
+            && self.gitignore.watches(path)
+            && !path
+                .parent()
+                .is_some_and(|parent| self.can_prune_directory(parent))
+    }
+
+    /// Read ignore files once for a new immutable discovery generation. Call
+    /// off state locks, then install through the state's policy-swap seam.
+    pub fn refresh_gitignore(&mut self) {
+        self.gitignore = Arc::new(if self.respect_gitignore {
+            crate::discovery::GitignoreSnapshot::build_with_pruning(&self.roots, |path| {
+                self.can_prune_directory(path)
+            })
+        } else {
+            crate::discovery::GitignoreSnapshot::default()
+        });
+    }
+
+    pub(crate) fn inherit_gitignore(&mut self, previous: &Self) {
+        if self.roots == previous.roots {
+            self.gitignore = previous.gitignore.clone();
+        }
+    }
+
+    pub(crate) fn install_gitignore(&mut self, refreshed: &Self) {
+        self.gitignore = refreshed.gitignore.clone();
+    }
+
+    pub(crate) fn same_discovery_inputs(&self, other: &Self) -> bool {
+        self.roots == other.roots
+            && self.respect_gitignore == other.respect_gitignore
+            && self.patterns == other.patterns
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
@@ -161,19 +270,16 @@ pub fn compile_workspace_exclusions(
         return CompiledWorkspaceExclusions::default();
     }
 
-    let Some(arr) = merged
+    let arr = merged
         .get("workspace")
         .and_then(|v| v.get("exclude"))
-        .and_then(|v| v.as_array())
-    else {
-        return CompiledWorkspaceExclusions::default();
-    };
+        .and_then(|v| v.as_array());
 
     let mut patterns = Vec::new();
     let mut rules = Vec::new();
     let mut has_negation = false;
 
-    for raw in arr {
+    for raw in arr.into_iter().flatten() {
         let Some(raw) = raw.as_str() else {
             log::warn!("raven.toml: workspace.exclude entries must be strings; skipping {raw:?}");
             continue;
@@ -211,6 +317,12 @@ pub fn compile_workspace_exclusions(
         patterns,
         rules,
         has_negation,
+        respect_gitignore: merged
+            .get("workspace")
+            .and_then(|value| value.get("respectGitignore"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        gitignore: Arc::default(),
     }
 }
 

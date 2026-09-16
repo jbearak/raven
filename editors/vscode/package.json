@@ -1092,6 +1092,11 @@
           "deprecationMessage": "Renamed to raven.editor.dotInWord. Raven migrates this value automatically on activation; you can delete this setting.",
           "markdownDeprecationMessage": "Renamed to `raven.editor.dotInWord`. Raven migrates this value automatically on activation; you can delete this setting."
         },
+        "raven.workspace.respectGitignore": {
+          "type": "boolean",
+          "default": true,
+          "description": "Respect .gitignore during automatic workspace, package, and CLI discovery. Open files and explicit source dependencies remain available. Can also be set with workspace.respectGitignore in raven.toml."
+        },
         "raven.crossFile.maxBackwardDepth": {
           "type": "number",
           "default": 10,

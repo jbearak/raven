@@ -173,6 +173,7 @@ pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file())
+        .filter(|p| !exclusions.is_gitignored(p, false))
         .filter_map(|p| lexical_testthat_preamble_path(&p, workspace_root))
         .collect();
     preamble_paths.extend(
@@ -443,7 +444,10 @@ fn scan_preamble_into(
     allow_disk_fallback: bool,
     initial_attached: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
+    if exclusions.is_excluded_path(&preamble_path)
+        || (exclusions.is_gitignored(&preamble_path, false)
+            && !overrides.contains_key(&preamble_path))
+    {
         return initial_attached.clone();
     }
     let Some(text) = read_source_with_overrides(&preamble_path, overrides, allow_disk_fallback)

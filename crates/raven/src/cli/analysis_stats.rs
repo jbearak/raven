@@ -353,7 +353,12 @@ pub fn print_results_csv(results: &[PhaseResult]) {
 /// diagnostic tool, so it emits no findings.
 fn discover_r_files(root: &Path) -> Vec<(PathBuf, String)> {
     let mut paths = Vec::new();
-    crate::cli::shared::collect_r_file_paths(root, &mut paths);
+    let mut exclusions = crate::config_file::compile_workspace_exclusions(
+        &serde_json::Value::Null,
+        [root.to_path_buf()],
+    );
+    exclusions.refresh_gitignore();
+    crate::cli::shared::collect_r_file_paths_with_exclusions(root, &mut paths, &exclusions);
     let mut files: Vec<(PathBuf, String)> = paths
         .into_iter()
         .filter_map(|p| {
