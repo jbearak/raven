@@ -25,7 +25,7 @@ use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
 mod contributions;
 use contributions::ScopeContributions;
-pub(crate) use contributions::rprofile_prelude_applies;
+pub(crate) use contributions::{rprofile_prelude_applies, test_helper_sources_for_symbol};
 mod evaluation;
 pub(super) use evaluation::event_effect_position;
 use evaluation::{
@@ -925,6 +925,10 @@ impl Default for ScopeArtifacts {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeAtPosition {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    /// Phase used for file-level contribution selection, including conditional
+    /// deferred bodies activated by package attachments. Interactive provenance
+    /// recovery must reuse it instead of inferring phase from lexical scopes.
+    pub(crate) contributions_deferred: bool,
     /// Lower-priority named `{import}` search-path environments. Kept separate
     /// while events execute so lexical/current-environment bindings always win.
     named_search_path: NamedSearchPath,
@@ -10268,6 +10272,7 @@ where
 
         ScopeAtPosition {
             symbols,
+            contributions_deferred: false,
             named_search_path,
             removed_names: frame.removed_names.clone(),
             chain: Vec::new(),
@@ -10488,6 +10493,7 @@ where
         );
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
+            contributions_deferred: false,
             named_search_path: prefix.named_search_path.clone(),
             removed_names: HashSet::new(),
             chain,
