@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "raven"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-jags"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "cc",
  "serde_json",
