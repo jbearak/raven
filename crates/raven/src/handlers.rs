@@ -9115,7 +9115,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // rare would-fire point, not per usage — so the streaming fast path
             // stays cheap; `get_scope` is memoized in `scope_cache`.
             // Position-awareness AND the load_all out-of-root sentinel gate both
-            // come for free from `get_scope`'s `append_package_contribution`.
+            // come for free from `get_scope`'s `ScopeContributions`.
             if snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready {
                 let scope = scope_cache
                     .entry((*usage_line, *usage_col))
@@ -23466,7 +23466,7 @@ fn is_package_export(
 /// Used by the out-of-scope diagnostic collector to suppress
 /// misattribution of these packages' exports to a later `source()` call.
 /// The undefined-variable collector achieves the same effect via
-/// `scope.inherited_packages` (which `append_package_contribution`
+/// `scope.inherited_packages` (which `ScopeContributions`
 /// populates), but `ScopeStream::is_visible` only consults the symbol
 /// set, so the out-of-scope path needs this explicit guard.
 ///
@@ -23475,7 +23475,7 @@ fn is_package_export(
 /// `source()` exports the same name, so flattening can at worst skip that one
 /// narrow misattribution for a name that a preamble attaches later — and the
 /// undefined-variable collector (which IS source-order-gated via
-/// `append_package_contribution`) still reports the genuine case. This matches
+/// `ScopeContributions`) still reports the genuine case. This matches
 /// the flat treatment of `test_attached_packages` (testthat itself).
 fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
     if snapshot
@@ -25129,7 +25129,7 @@ fn push_scoped_symbol_completion(
     // Ordinary external package-export pseudo-URIs (`package:dplyr`,
     // `package:base`, ...) are added via the separate per-package loop later;
     // skip them here to avoid duplicate entries. Package-internal symbols
-    // injected by `append_package_contribution` use the synthetic URI
+    // injected by `ScopeContributions` use the synthetic URI
     // `scope::PACKAGE_INTERNAL_URI` and must pass through this filter.
     let is_package_internal = crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri);
     let source_uri_str = symbol.source_uri.as_str();
@@ -35955,7 +35955,7 @@ clean_data <- function(x) {
     // ========================================================================
 
     /// Package-internal symbols (from sibling `R/*.R` files) injected via
-    /// `append_package_contribution` must appear in completions.
+    /// `ScopeContributions` must appear in completions.
     ///
     /// Regression: `push_scoped_symbol_completion` previously filtered every
     /// URI starting with `"package:"`, which unintentionally caught the
@@ -39290,7 +39290,7 @@ y <- totally_undefined_baseline()
     /// Issue #567 round 7: a non-package workspace script opened through a
     /// symlink alias still gets the workspace-root `.Rprofile` prelude. The
     /// publish/document URI remains the raw alias; only the contribution query
-    /// URI is canonicalized so `append_rprofile_prelude` can match the real
+    /// URI is canonicalized so `ScopeContributions` can match the real
     /// workspace root.
     #[cfg(unix)]
     #[test]
@@ -39358,7 +39358,7 @@ y <- totally_undefined_baseline()
     /// diagnostics in peer files under `tests/testthat/`.
     ///
     /// The synthetic `helper-*.R` symbol contribution flows through the
-    /// recursive resolver's depth-0 `append_package_contribution`; the
+    /// recursive resolver's depth-0 `ScopeContributions`; the
     /// streaming diagnostic loop catches it via `parent_symbol_names`
     /// (computed by `snapshot.get_scope(uri, 0, 0)` — the recursive path
     /// with the package contribution applied).
