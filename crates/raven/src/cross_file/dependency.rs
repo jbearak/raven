@@ -1580,6 +1580,16 @@ impl DependencyGraph {
             .unwrap_or_default()
     }
 
+    /// Borrow outgoing edges so bounded callers need not allocate the whole adjacency list.
+    pub(crate) fn iter_dependencies(&self, uri: &Url) -> impl Iterator<Item = &DependencyEdge> {
+        self.forward.get(uri).into_iter().flatten()
+    }
+
+    /// Borrow incoming edges so bounded callers need not allocate the whole adjacency list.
+    pub(crate) fn iter_dependents(&self, uri: &Url) -> impl Iterator<Item = &DependencyEdge> {
+        self.backward.get(uri).into_iter().flatten()
+    }
+
     /// Return `roots` plus every local module reachable only through typed
     /// [`DependencyEdgeKind::SelectiveModule`] edges.
     ///

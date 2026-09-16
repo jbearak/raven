@@ -118,13 +118,27 @@ impl CompiledWorkspaceExclusions {
     /// Read ignore files once for a new immutable discovery generation. Call
     /// off state locks, then install through the state's policy-swap seam.
     pub fn refresh_gitignore(&mut self) {
-        self.gitignore = Arc::new(if self.respect_gitignore {
-            crate::discovery::GitignoreSnapshot::build_with_pruning(&self.roots, |path| {
+        self.gitignore = self.build_gitignore_snapshot(&self.roots);
+    }
+
+    /// Build ignore rules for a requested scan directory without moving the
+    /// configuration-relative `workspace.exclude` anchor. This performs I/O;
+    /// callers must keep it outside state locks.
+    pub(crate) fn refresh_gitignore_for_directory(&mut self, directory: &Path) {
+        self.gitignore = self.build_gitignore_snapshot(&[directory.to_path_buf()]);
+    }
+
+    fn build_gitignore_snapshot(
+        &self,
+        roots: &[PathBuf],
+    ) -> Arc<crate::discovery::GitignoreSnapshot> {
+        Arc::new(if self.respect_gitignore {
+            crate::discovery::GitignoreSnapshot::build_with_pruning(roots, |path| {
                 self.can_prune_directory(path)
             })
         } else {
             crate::discovery::GitignoreSnapshot::default()
-        });
+        })
     }
 
     pub(crate) fn inherit_gitignore(&mut self, previous: &Self) {

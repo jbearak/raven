@@ -351,13 +351,34 @@ pub fn print_results_csv(results: &[PhaseResult]) {
 /// so the profiler sees the same decoded text the scan does. Unreadable or
 /// undecodable files are silently skipped — this is a profiler, not a
 /// diagnostic tool, so it emits no findings.
+/// Project discovery settings come from the nearest shared configuration. Strong
+/// exclusions remain relative to that configuration's directory. Ignore-rule
+/// discovery and the file walk start at the requested profiling target, so an
+/// outer configuration cannot move its Git boundary or scan unrelated trees.
 fn discover_r_files(root: &Path) -> Vec<(PathBuf, String)> {
     let mut paths = Vec::new();
-    let mut exclusions = crate::config_file::compile_workspace_exclusions(
-        &serde_json::Value::Null,
-        [root.to_path_buf()],
-    );
-    exclusions.refresh_gitignore();
+    let (config_root, settings) = match crate::config_file::discover_and_load(root) {
+        crate::config_file::DiscoveredLoad::Loaded {
+            path,
+            settings,
+            warnings,
+        } => {
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+            (path.parent().unwrap_or(root).to_path_buf(), settings)
+        }
+        crate::config_file::DiscoveredLoad::LoadFailed { path } => {
+            eprintln!(
+                "raven analysis-stats: failed to load {}; using default discovery settings",
+                path.display()
+            );
+            (root.to_path_buf(), serde_json::Value::Null)
+        }
+        crate::config_file::DiscoveredLoad::None => (root.to_path_buf(), serde_json::Value::Null),
+    };
+    let mut exclusions = crate::config_file::compile_workspace_exclusions(&settings, [config_root]);
+    exclusions.refresh_gitignore_for_directory(root);
     crate::cli::shared::collect_r_file_paths_with_exclusions(root, &mut paths, &exclusions);
     let mut files: Vec<(PathBuf, String)> = paths
         .into_iter()
@@ -582,6 +603,80 @@ mod tests {
         assert_eq!(files.len(), 2);
         // Should be sorted
         assert!(files[0].0 < files[1].0);
+    }
+
+    #[test]
+    fn analysis_stats_honors_default_and_configured_gitignore_policy() {
+        for (setting, expected_count) in [(None, 1), (Some(true), 1), (Some(false), 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".gitignore"), "ignored.R\n").unwrap();
+            std::fs::write(dir.path().join("visible.R"), "visible <- 1\n").unwrap();
+            std::fs::write(dir.path().join("ignored.R"), "ignored <- 1\n").unwrap();
+            if let Some(setting) = setting {
+                std::fs::write(
+                    dir.path().join("raven.toml"),
+                    format!("[workspace]\nrespectGitignore = {setting}\n"),
+                )
+                .unwrap();
+            }
+            let args = AnalysisStatsArgs {
+                path: dir.path().to_path_buf(),
+                csv: false,
+                only: Some("scan".to_owned()),
+            };
+            let results = run_analysis_stats(&args);
+            assert_eq!(results[0].detail, format!("{expected_count} files"));
+        }
+    }
+
+    #[test]
+    fn analysis_stats_parent_config_anchors_exclusions_without_broadening_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested");
+        std::fs::create_dir_all(target.join("generated")).unwrap();
+        std::fs::write(
+            dir.path().join("raven.toml"),
+            "[workspace]\nrespectGitignore = false\nexclude = [\"nested/generated/**\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.R\n").unwrap();
+        std::fs::write(dir.path().join("outside.R"), "outside <- 1\n").unwrap();
+        std::fs::write(target.join("included.R"), "included <- 1\n").unwrap();
+        std::fs::write(target.join("generated/excluded.R"), "excluded <- 1\n").unwrap();
+        let files = discover_r_files(&target);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, target.join("included.R"));
+
+        // The untimed discovery path used when scan is omitted uses the same
+        // settings, including when a parent config disabled Git ignore rules.
+        let results = run_analysis_stats(&AnalysisStatsArgs {
+            path: target,
+            csv: false,
+            only: Some("parse".to_owned()),
+        });
+        assert_eq!(results[0].detail, "1 files parsed (1 succeeded)");
+    }
+
+    #[test]
+    fn analysis_stats_parent_config_does_not_move_target_git_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested");
+        std::fs::create_dir_all(target.join("generated")).unwrap();
+        std::fs::write(
+            dir.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"nested/generated/**\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.R\n").unwrap();
+        std::fs::write(target.join(".git"), "gitdir: elsewhere\n").unwrap();
+        std::fs::write(target.join(".gitignore"), "local.R\n").unwrap();
+        std::fs::write(target.join("included.R"), "included <- 1\n").unwrap();
+        std::fs::write(target.join("local.R"), "local <- 1\n").unwrap();
+        std::fs::write(target.join("generated/excluded.R"), "excluded <- 1\n").unwrap();
+
+        let files = discover_r_files(&target);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].0, target.join("included.R"));
     }
 
     #[test]

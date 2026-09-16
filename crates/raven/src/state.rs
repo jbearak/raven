@@ -7101,6 +7101,11 @@ impl WorldState {
         owned
     }
 
+    /// Prove that closing a buffer leaves an ignored file without an owner.
+    /// This interactive check holds the state read lock, so scheduled nodes and
+    /// inspected edges each use the configured visited budget, capped at 4,096.
+    /// Exhaustion means ownership is unknown: retain the file and let the exact
+    /// batched orphan cleanup decide after the authoritative close commits.
     pub(crate) fn is_unreferenced_gitignored_uri_after_close(
         &self,
         uri: &Url,
@@ -7109,12 +7114,17 @@ impl WorldState {
         if !self.workspace_exclusions.is_gitignored_uri(uri) {
             return false;
         }
+        let limit = self
+            .cross_file_config
+            .max_transitive_dependents_visited
+            .min(4_096);
+        if limit == 0 {
+            return false;
+        }
         let mut pending = vec![uri.clone()];
-        let mut seen = HashSet::new();
+        let mut scheduled = HashSet::from([uri.clone()]);
+        let mut remaining_edges = limit;
         while let Some(candidate) = pending.pop() {
-            if !seen.insert(candidate.clone()) {
-                continue;
-            }
             let open_owner = (self.documents.contains_key(&candidate)
                 && Some(&candidate) != closing)
                 || self
@@ -7134,20 +7144,33 @@ impl WorldState {
             {
                 return false;
             }
-            pending.extend(
-                self.cross_file_graph
-                    .get_dependents(&candidate)
-                    .into_iter()
-                    .filter(|edge| !edge.is_backward_directive)
-                    .map(|edge| edge.from.clone()),
-            );
-            pending.extend(
-                self.cross_file_graph
-                    .get_dependencies(&candidate)
-                    .into_iter()
-                    .filter(|edge| edge.is_backward_directive)
-                    .map(|edge| edge.to.clone()),
-            );
+            let edges = self
+                .cross_file_graph
+                .iter_dependents(&candidate)
+                .map(|edge| (edge, false))
+                .chain(
+                    self.cross_file_graph
+                        .iter_dependencies(&candidate)
+                        .map(|edge| (edge, true)),
+                );
+            for (edge, backward) in edges {
+                if remaining_edges == 0 {
+                    return false;
+                }
+                remaining_edges -= 1;
+                if edge.is_backward_directive != backward {
+                    continue;
+                }
+                let owner = if backward { &edge.to } else { &edge.from };
+                if scheduled.contains(owner) {
+                    continue;
+                }
+                if scheduled.len() >= limit {
+                    return false;
+                }
+                scheduled.insert(owner.clone());
+                pending.push(owner.clone());
+            }
         }
         true
     }
@@ -13231,6 +13254,94 @@ fn is_stat_model_extension(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    fn ignored_close_ownership_fixture() -> (tempfile::TempDir, WorldState, Url) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(".gitignore"), "*.R\n").unwrap();
+        let uri = Url::from_file_path(directory.path().join("target.R")).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::Value::Null,
+            [directory.path().to_path_buf()],
+        );
+        state.workspace_exclusions.refresh_gitignore();
+        state
+            .documents
+            .insert(uri.clone(), Document::new("", Some(1)));
+        (directory, state, uri)
+    }
+
+    fn set_close_ownership_sources(state: &mut WorldState, caller: &Url, targets: &[Url]) {
+        let metadata = crate::cross_file::CrossFileMetadata {
+            sources: targets
+                .iter()
+                .enumerate()
+                .map(|(line, target)| crate::cross_file::ForwardSource {
+                    line: line as u32,
+                    resolved_uri: Some(target.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        state
+            .cross_file_graph
+            .update_file(caller, &metadata, None, |_| None);
+    }
+
+    #[test]
+    fn close_ownership_budget_retains_an_unproven_cycle() {
+        let (_directory, mut state, target) = ignored_close_ownership_fixture();
+        let peer = target.join("peer.R").unwrap();
+        set_close_ownership_sources(&mut state, &target, std::slice::from_ref(&peer));
+        set_close_ownership_sources(&mut state, &peer, std::slice::from_ref(&target));
+        for budget in [0, 1, 2] {
+            state.cross_file_config.max_transitive_dependents_visited = budget;
+            assert!(
+                !state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)),
+                "an exhausted budget must not prove a cycle unowned: {budget}"
+            );
+        }
+        state.cross_file_config.max_transitive_dependents_visited = 4;
+        assert!(state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)));
+    }
+
+    #[test]
+    fn close_ownership_budget_preserves_a_distant_open_owner() {
+        let (_directory, mut state, target) = ignored_close_ownership_fixture();
+        let peer = target.join("peer.R").unwrap();
+        let owner = target.join("owner.R").unwrap();
+        set_close_ownership_sources(&mut state, &peer, std::slice::from_ref(&target));
+        set_close_ownership_sources(&mut state, &owner, std::slice::from_ref(&peer));
+        state
+            .documents
+            .insert(owner.clone(), Document::new("", Some(1)));
+        for budget in [1, 8] {
+            state.cross_file_config.max_transitive_dependents_visited = budget;
+            assert!(
+                !state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)),
+                "a surviving owner must retain the helper with budget {budget}"
+            );
+        }
+        state.documents.close(&owner);
+        assert!(state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)));
+    }
+
+    #[test]
+    fn close_ownership_budget_caps_wide_non_owning_adjacency() {
+        let (_directory, mut state, target) = ignored_close_ownership_fixture();
+        let targets: Vec<_> = (0..4_097)
+            .map(|index| target.join(&format!("child-{index}.R")).unwrap())
+            .collect();
+        set_close_ownership_sources(&mut state, &target, &targets);
+        state.cross_file_config.max_transitive_dependents_visited = usize::MAX;
+        assert!(
+            !state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)),
+            "even rejected-direction edges must respect the interactive ceiling"
+        );
+        set_close_ownership_sources(&mut state, &target, &targets[..3]);
+        assert!(state.is_unreferenced_gitignored_uri_after_close(&target, Some(&target)));
+    }
 
     #[tokio::test]
     async fn final_handoff_completion_is_durable_before_waiter_arrives() {

@@ -342,8 +342,11 @@ the exact snapshot revision too, so retrying with an old policy cannot acquire
 fresh generation stamps and resurrect ignored inputs. Discovery ownership is
 rooted: eligible files and open buffers retain explicit forward targets and
 backward-directive parents; unrooted ignored cycles are removed. Watch batches
-compute ownership once. `.gitignore` watches cover every workspace recursively
-and exact ancestor locations, including absent files. Changes inside pruned
+compute ownership once. Close-time ownership probes cap both scheduled nodes and
+inspected edges at the smaller of the configured visited limit and 4,096, using
+borrowed adjacency iterators. Budget exhaustion retains the file until exact
+batched orphan cleanup after the authoritative close. `.gitignore` watches cover
+every workspace recursively and exact ancestor locations, including absent files. Changes inside pruned
 trees do not trigger a rebuild.
 
 The scan driver (`run_workspace_scan_transaction_using` in `backend.rs`) makes

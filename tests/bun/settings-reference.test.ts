@@ -140,6 +140,19 @@ test("settings reference explains dash raven.toml paths accurately", () => {
   }
 });
 
+test("settings reference documents workspace discovery configuration", () => {
+  const settingsReference = readFileSync(
+    path.join(repoRoot, "docs", "settings-reference.md"),
+    "utf8",
+  );
+  const row = settingsReference
+    .split("\n")
+    .find((line) => line.startsWith("| `raven.workspace.respectGitignore` |"));
+  if (!row?.includes("| `workspace.respectGitignore` | [configuration](configuration.md) |")) {
+    throw new Error(`Expected workspace discovery TOML path and documentation link; got:\n${row}`);
+  }
+});
+
 test("settings reference marks readHomeLintr as VS Code-only", () => {
   const settingsReference = readFileSync(
     path.join(repoRoot, "docs", "settings-reference.md"),

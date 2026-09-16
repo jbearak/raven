@@ -85,7 +85,10 @@ syntax cap does not affect them.
 `.gitignore` is respected by default for directory/default discovery in `check`
 and `lint`, and by `analysis-stats`. Explicit file arguments bypass this filter.
 `--no-config` still respects `.gitignore`; set `[workspace] respectGitignore = false`
-in `raven.toml` to disable it for `check` and `lint`.
+in `raven.toml` to disable it. `analysis-stats` discovers project configuration from
+its target directory and honors both `workspace.respectGitignore` and
+`workspace.exclude`. Exclusion patterns are relative to the configuration file's
+directory; profiling still scans only the requested target.
 
 `raven.toml` can exclude generated or vendored trees from discovery:
 
