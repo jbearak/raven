@@ -636,15 +636,28 @@ modules own it, split by concern:
     re-exported imports and symbolic wildcard re-exports. Marker-less modules
     derive their partial legacy fallback from the canonical live top-level
     scope rather than from a separate definition scanner.
+  - `search_path.rs` captures project-only `box.searchPaths`, the environment
+    inherited at state creation, and an authoritative root `.Rprofile` text
+    snapshot (or a deferred disk read). One shared cell resolves each detached
+    context at most once. The scanner uses the shared binding analysis for
+    masked helpers; absent, known-empty, known-path, and unknown inputs remain
+    distinct. This is independent of the suppressive package prelude. A dedicated
+    box-input generation retires detached metadata and scan work on profile
+    changes without cancelling unrelated diagnostics. The diagnostics-coherence
+    boundary spans profile installation and importer refresh. External-root
+    watches admit referenced or package-input files, never an entire shared
+    library through unrelated file events. Plain boxed-future constructors keep
+    refresh, target loading, and watched-transaction temporaries out of nested
+    handler poll frames. Preserve those boundaries for default-stack safety.
   - `path.rs` resolves `BoxSpec::LocalModule` and `BoxSpec::SearchPathModule`
     without reusing `path_resolve.rs`. Explicit relative paths use the importing
-    file's directory; qualified paths use the nearest ancestor with `rhino.yml`.
-    Detached enrichment discovers this root once per import batch and persists
-    it in the search-path spec. No marker means an inert import, without missing
-    module diagnostics. Both path forms ignore `# raven: cd` /
-    testthat WD / workspace-root fallback, are case-sensitive, and try
-    `path.r`, `path.R`, `path/__init__.r`, `path/__init__.R`. The resolved URI
-    stays raw/non-canonicalised, matching Raven's URI identity convention.
+    file's directory. Qualified imports persist an ordered root list selected
+    from the captured static inputs or the nearest `rhino.yml`. Unknown inputs
+    remain inert. Explicit lists append the importing directory last. Paths
+    ignore `# raven: cd` / testthat WD / ordinary-source workspace fallback,
+    remain case-sensitive, and try `path.r`, `path.R`, `path/__init__.r`, then
+    `path/__init__.R` per root. Exact matches across all roots precede mismatch
+    diagnostics. URIs remain raw/non-canonicalised.
   - `resolve.rs` combines explicit or legacy module exports with package
     snapshots, resolves recursive named/renamed/wildcard re-exports with cycle
     and depth guards, and preserves exact original-definition provenance.
@@ -663,6 +676,15 @@ scan, watched resync, on-demand indexing, excluded-file, and CLI preparation
 seams enrich it only after dropping any `WorldState` guard. Graph construction,
 scope/artifact resolution, diagnostics, navigation, references, and hover
 consume the persisted outcome and must never probe the filesystem themselves.
+Workspace ingestion follows referenced selective-module files outside the scan
+roots, bounded by chain depth and 50,000 newly discovered targets. It does not
+walk external directories. Initial open prerequisites likewise load selective
+targets before committing the importing document. Input changes reuse watched
+resync transactions to refresh open and closed importers and cold reexports.
+The search context records analysis-config authority and open-profile identity;
+stale input snapshots cannot replace newer import metadata. Profile changes
+retire old diagnostic work even when package-prelude modeling is disabled.
+
 Watched candidate events, including ancestor `rhino.yml` creation/deletion,
 re-enrich unchanged importers off-lock and guard an
 open-record replacement by its never-reused analysis generation, so a stale

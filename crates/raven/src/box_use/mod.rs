@@ -33,10 +33,10 @@
 //!   call. Programmatic invocation (`do.call`, aliasing `box::use`) is not
 //!   recognised.
 //! * **Bare name = installed package.** Explicit relative modules begin with
-//!   `./` or `../`. Qualified paths such as `app/logic/math` use the nearest
-//!   ancestor containing `rhino.yml`, matching Rhino's default `box.path`.
-//!   Without that marker they stay inert. Custom runtime search paths and
-//!   remote/global module directories are not evaluated.
+//!   `./` or `../`. Qualified paths such as `app/logic/math` use configured
+//!   static search paths (`box.searchPaths`, startup `R_BOX_PATH`, and simple
+//!   project `.Rprofile` declarations), or the nearest `rhino.yml` root.
+//!   Unknown inputs stay inert. No R code is executed.
 //! * Explicit relative paths resolve **relative to the importing file's directory**, ignore
 //!   `# raven: cd`, the implicit testthat working directory, and the
 //!   workspace-root fallback, and omit the file extension. Resolution is
@@ -58,6 +58,7 @@ pub mod detect;
 pub mod exports;
 pub mod path;
 pub mod resolve;
+pub(crate) mod search_path;
 
 pub use detect::detect_box_imports;
 pub use exports::{ExportMode, parse_box_exports};
@@ -151,16 +152,15 @@ pub enum BoxSpec {
     },
     /// A qualified module path such as `app/logic/helpers`.
     ///
-    /// Detached enrichment discovers the nearest ancestor containing
-    /// `rhino.yml` and persists it in `root`. No root means the search path is
-    /// unknown, so the import stays inert. Consumers must never discover roots
-    /// themselves or substitute the importing file's directory.
+    /// Detached enrichment selects static search paths or the nearest Rhino
+    /// root and persists the complete ordered candidate roots. `None` means
+    /// unknown/inert. Consumers never discover roots or add fallback paths.
     SearchPathModule {
         /// At least two static path components, ending with the module name.
         components: Vec<String>,
-        /// Rhino application root, populated only by detached enrichment.
+        /// Ordered candidate roots, populated only by detached enrichment.
         #[serde(default)]
-        root: Option<std::path::PathBuf>,
+        roots: Option<Vec<std::path::PathBuf>>,
     },
     /// A spec we recognise syntactically but deliberately do not support
     /// (a dynamic or malformed spec). Retained verbatim so tooling can explain the gap and so

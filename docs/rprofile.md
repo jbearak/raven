@@ -121,3 +121,17 @@ The `.Rprofile` startup prelude is enabled by default. Set
 [packages]
 rprofilePrelude = false
 ```
+
+## Static box search paths
+
+Raven also reads simple top-level `options(box.path = ...)` declarations in the
+workspace-root `.Rprofile` as module search-path configuration. This is separate
+from the suppressive scope prelude: it applies even when `packages.enabled` or
+`packages.rprofilePrelude` is false, including to imports in package files and
+tests. Excluded/gitignored profiles do not contribute. No R code is executed.
+
+Only the root profile supplies these paths; the prelude's transitive source
+walker is not used. A conditional or dynamic write makes the value unknown,
+rather than preserving an earlier literal. Live root-buffer edits and closing
+without saving update resolution. See [modules](modules.md) for the accepted
+syntax, precedence, relative-path anchors, and explicit overrides.

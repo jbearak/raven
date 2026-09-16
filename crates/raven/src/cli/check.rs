@@ -239,10 +239,11 @@ fn open_disk_fallback_target(
             workspace_root.as_ref(),
             &state.workspace_exclusions,
         );
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut meta,
             uri,
             workspace_root.as_ref(),
+            &state.box_search_context(),
         );
     }
     state.open_document_with_language_id_and_metadata(
@@ -419,10 +420,11 @@ fn materialize_cli_contextual_provider(
             workspace_root,
             &state.workspace_exclusions,
         );
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut metadata,
             &execution.uri,
             workspace_root,
+            &state.box_search_context(),
         );
     }
     let artifacts = std::sync::Arc::new(document.cross_file_artifacts(&execution.uri, &metadata));
@@ -692,10 +694,11 @@ fn build_indexed_state(
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let entries = crate::state::scan_workspace_with_exclusions(
+    let entries = crate::state::scan_workspace_with_box_context(
         std::slice::from_ref(workspace_url),
         max_chain_depth,
         &state.workspace_exclusions,
+        &state.box_search_context(),
     );
     // Preserve package text before bounded index admission can evict helpers.
     // Rope clones share their storage. Materialize and hash only evicted files
@@ -1138,10 +1141,11 @@ fn reported_packages_to_warm(
                 packages.extend(doc.loaded_packages.iter().cloned());
                 packages.extend(doc.data_packages.iter().cloned());
                 let mut metadata = crate::cross_file::extract_metadata(&doc.analysis_text());
-                crate::cross_file::enrich_selective_import_resolutions(
+                crate::cross_file::enrich_selective_import_resolutions_with_context(
                     &mut metadata,
                     &uri,
                     workspace_root,
+                    &state.box_search_context(),
                 );
                 selective_roots.extend(metadata.selective_import_requests(&uri).filter_map(
                     |request| match request.source {

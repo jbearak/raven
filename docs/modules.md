@@ -72,9 +72,68 @@ along with module file changes. If you open only a subdirectory, changes to an
 ancestor marker require reopening or editing the importing file, or opening
 the application root as a workspace folder. Other LSP clients must forward
 `rhino.yml` file events for live root changes.
-Without a marker, qualified imports stay unresolved without module-not-found
-diagnostics. Custom `options(box.path = ...)` and `R_BOX_PATH` values are not
-read or evaluated, including overrides inside a Rhino application.
+Without a marker or a known custom search path, qualified imports stay unresolved
+without module-not-found diagnostics.
+
+**Custom search paths** work in Rhino applications and other projects. Raven
+selects one input, in this order:
+
+1. Project-only `box.searchPaths` in `raven.toml`.
+2. A nonempty `R_BOX_PATH` inherited when Raven starts.
+3. Statically readable `options(box.path = ...)` in the workspace-root `.Rprofile`.
+4. The nearest Rhino application root, when none of the above supplies a value.
+
+For example:
+
+```toml
+[box]
+searchPaths = ["modules", "../shared-r"]
+```
+
+Config entries are relative to the directory containing `raven.toml`. The setting
+controls Raven's analysis; it does not change R's options. Alternatively, reuse
+an existing project startup declaration:
+
+```r
+options(box.path = c("modules", "../shared-r"))
+```
+
+Profile entries are relative to the workspace root. Raven accepts unconditional
+top-level calls with a literal string, `c()` of literal strings, `NULL`, or
+`character(0)`, including `base::`-qualified calls and R raw strings. Strings
+requiring escape evaluation and computed expressions remain unknown. Declarations
+apply in order; a later dynamic or conditional write invalidates an earlier
+known value. Function bodies and quoted expressions do not set paths. Masking
+`options`, `c`, or `character` prevents inference from the unqualified call.
+Raven reads only the root profile for this purpose, not sourced helpers, home
+profiles, or `.Renviron`.
+
+`R_BOX_PATH` uses `:` on Unix and `;` on Windows. Relative entries use Raven's
+startup working directory. An empty environment value is ignored. Restart Raven
+to pick up a changed environment. Raven never executes startup code or
+synchronizes with a running R session.
+
+For an explicit path list, roots are searched in order, followed by the importing
+file's directory. Each root uses the file/`__init__` candidate order above. An
+exact match in a later root wins over a case mismatch in an earlier root.
+An empty configured list or `character(0)` uses only the importing directory;
+`NULL` removes the option, allowing Rhino's default. An unknown profile value
+stays unresolved rather than falling back to a potentially wrong Rhino module;
+explicit configuration or the startup environment can override it. Paths are
+literal: shell substitutions and `~` expansion are not supported.
+
+Profile path inference is independent of `packages.enabled` and
+`packages.rprofilePrelude`, and applies to qualified imports in all file
+contexts, including package tests. This is a project analysis convention; it
+does not imply that a clean R test process executes `.Rprofile`. Excluded or
+gitignored profiles do not contribute paths.
+
+Config reloads and `.Rprofile` open/edit/close or watched changes refresh imports.
+Raven loads referenced files outside the workspace without scanning entire
+search roots. For clients supporting dynamic relative file watches (including
+VS Code), it registers external roots for R-file creation, changes, and deletion.
+Other clients must forward those events for live updates. Module creation in a
+higher-priority root and deletion of a selected module retarget the import.
 
 **Exports** come from `box::export()` and `#' @export` tags. When either is
 present the interface is authoritative, so a missing member (`module$typo`) is

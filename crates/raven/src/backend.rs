@@ -4307,6 +4307,7 @@ fn hydrate_package_r_files_from_state(
 struct WorkspaceScanInputs {
     basis: WorkspaceScanInputBasis,
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    box_context: crate::box_use::search_path::SearchPathContext,
 }
 
 impl WorkspaceScanInputs {
@@ -4315,6 +4316,7 @@ impl WorkspaceScanInputs {
             .capture_workspace_scan_input_basis(intent)
             .map(|basis| Self {
                 basis,
+                box_context: state.box_search_context(),
                 exclusions: state.workspace_exclusions.clone(),
             })
     }
@@ -4897,10 +4899,11 @@ async fn run_workspace_scan_transaction_in(
     run_workspace_scan_transaction_with(state_arc, mode, |inputs| async move {
         match tokio::task::spawn_blocking(move || {
             let scan_start = std::time::Instant::now();
-            let result = crate::state::scan_workspace_with_exclusions(
+            let result = crate::state::scan_workspace_with_box_context(
                 &inputs.basis.workspace_folders,
                 inputs.basis.max_chain_depth,
                 &inputs.exclusions,
+                &inputs.box_context,
             );
             let scan_duration = scan_start.elapsed();
             let file_count = result.len();
@@ -7049,7 +7052,7 @@ pub async fn run_system_file_convergence_for_test(
 async fn replay_open_documents_after_workspace_index_apply(
     state_arc: &Arc<RwLock<WorldState>>,
 ) -> Vec<Url> {
-    let (mut prepared, workspace_root) = {
+    let (mut prepared, workspace_root, box_context) = {
         let state = state_arc.read().await;
         let mut open_docs: Vec<_> = state
             .documents
@@ -7068,18 +7071,24 @@ async fn replay_open_documents_after_workspace_index_apply(
             })
             .collect();
         open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
-        (open_docs, state.workspace_folders.first().cloned())
+        (
+            open_docs,
+            state.workspace_folders.first().cloned(),
+            state.box_search_context(),
+        )
     };
 
     // Local-module resolution performs filesystem I/O. Keep it outside every
     // WorldState lock, then generation-check each derived record at commit.
     let expansion_root = workspace_root.clone();
+    let captured_context = box_context.clone();
     prepared = match tokio::task::spawn_blocking(move || {
         for (uri, _, metadata) in &mut prepared {
-            crate::cross_file::enrich_selective_import_resolutions(
+            crate::cross_file::enrich_selective_import_resolutions_with_context(
                 metadata,
                 uri,
                 expansion_root.as_ref(),
+                &box_context,
             );
         }
         prepared
@@ -7094,6 +7103,29 @@ async fn replay_open_documents_after_workspace_index_apply(
     };
 
     let mut state = state_arc.write().await;
+    commit_open_document_replay(
+        &mut state,
+        prepared,
+        workspace_root.as_ref(),
+        &captured_context,
+    )
+}
+
+/// A newer profile/config owner must retain the importer generation it captured.
+/// Reject the whole stale replay before touching any open-record authority.
+fn commit_open_document_replay(
+    state: &mut WorldState,
+    prepared: Vec<(
+        Url,
+        crate::open_document_store::AnalysisGeneration,
+        crate::cross_file::CrossFileMetadata,
+    )>,
+    workspace_root: Option<&Url>,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) -> Vec<Url> {
+    if !box_context.same_inputs(&state.box_search_context()) {
+        return Vec::new();
+    }
     let mut source_batch_parents = Vec::new();
     for (uri, generation, meta) in prepared {
         if state
@@ -7108,19 +7140,14 @@ async fn replay_open_documents_after_workspace_index_apply(
 
         if state.is_project_excluded_uri(&uri) {
             for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
-                remove_file_from_cross_file_state(&mut state, &graph_root);
+                remove_file_from_cross_file_state(state, &graph_root);
             }
-            update_project_excluded_live_graph(&mut state, &uri, &meta, workspace_root.as_ref());
+            update_project_excluded_live_graph(state, &uri, &meta, workspace_root);
             continue;
         }
 
         let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-        let _ = update_cross_file_graph_for_roots(
-            &mut state,
-            &graph_roots,
-            &meta,
-            workspace_root.as_ref(),
-        );
+        let _ = update_cross_file_graph_for_roots(state, &graph_roots, &meta, workspace_root);
     }
 
     state.recompute_open_neighborhood_pins();
@@ -10845,6 +10872,7 @@ struct CapturedOpenEditFallback {
     data_packages: Vec<String>,
     packages_enabled: bool,
     plan: PreparedOpenCommitPlan,
+    box_context: crate::box_use::search_path::SearchPathContext,
 }
 
 fn capture_open_edit_fallback(
@@ -10896,6 +10924,7 @@ fn capture_open_edit_fallback(
     plan.seed_revalidation_uris
         .extend(state.documents.keys().cloned());
     CapturedOpenEditFallback {
+        box_context: state.box_search_context_for_document(uri, &prepared.document().contents),
         chunk_kind: prepared.document().chunk_kind,
         file_type: prepared.document().file_type,
         analysis_text: prepared.document().analysis_text(),
@@ -10947,10 +10976,11 @@ fn derive_open_edit_fallback(
         metadata
     });
     if let Some(primary_uri) = captured.graph_roots.first() {
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut local_metadata,
             primary_uri,
             captured.workspace_root.as_ref(),
+            &captured.box_context,
         );
     }
     let graph = captured
@@ -11343,7 +11373,7 @@ async fn commit_detached_live_package_open_edit(
         if shutdown.is_cancelled() {
             return None;
         }
-        let (mut metadata, attempted_contexts, workspace_root, exclusions) = {
+        let (mut metadata, attempted_contexts, workspace_root, exclusions, box_context) = {
             let state = state_arc.read().await;
             prepared = state.rebase_open_edit_if_subject_current(prepared)?;
             let document = prepared.document();
@@ -11360,14 +11390,16 @@ async fn commit_detached_live_package_open_edit(
                 attempted_contexts,
                 state.workspace_folders.first().cloned(),
                 state.workspace_exclusions.clone(),
+                state.box_search_context(),
             )
         };
         let expansion_uri = uri.clone();
         metadata = tokio::task::spawn_blocking(move || {
-            crate::cross_file::enrich_selective_import_resolutions(
+            crate::cross_file::enrich_selective_import_resolutions_with_context(
                 &mut metadata,
                 &expansion_uri,
                 workspace_root.as_ref(),
+                &box_context,
             );
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut metadata,
@@ -11745,6 +11777,7 @@ struct CapturedOpenCloseAnalysis {
     rprofile_fanout_uris: Vec<Url>,
     preamble_fanout_uris: Vec<Url>,
     watched_generations: HashMap<Url, Option<u64>>,
+    box_context: crate::box_use::search_path::SearchPathContext,
 }
 
 fn capture_open_close_analysis(
@@ -11950,6 +11983,7 @@ fn capture_open_close_analysis(
         .unwrap_or_default();
 
     Some(CapturedOpenCloseAnalysis {
+        box_context: state.box_search_context(),
         basis,
         intent: intent.clone(),
         uri,
@@ -12125,10 +12159,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                         captured.max_chain_depth,
                     );
                 }
-                crate::cross_file::enrich_selective_import_resolutions(
+                crate::cross_file::enrich_selective_import_resolutions_with_context(
                     &mut semantic,
                     &root.uri,
                     captured.workspace_root.as_ref(),
+                    &captured.box_context,
                 );
                 let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                     &mut semantic,
@@ -12401,6 +12436,7 @@ struct CapturedOpenInstallAnalysis {
     preamble_fanout_uris: Vec<Url>,
     package_source_interface_fanout: bool,
     revalidation_debounce_ms: u64,
+    box_context: crate::box_use::search_path::SearchPathContext,
 }
 
 fn capture_open_install_analysis(
@@ -12544,6 +12580,7 @@ fn capture_open_install_analysis(
         .unwrap_or_default();
     let (workspace_name, system_package_root, library_paths) = state.snapshot_system_file_inputs();
     Some(CapturedOpenInstallAnalysis {
+        box_context: state.box_search_context_for_document(&uri, &document.contents),
         basis,
         intent: intent.clone(),
         uri: uri.clone(),
@@ -12635,10 +12672,11 @@ fn derive_open_install_analysis(
         );
     }
     let selected_shiny_entry = if is_r {
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
+            &captured.box_context,
         );
         crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut metadata,
@@ -12712,6 +12750,22 @@ fn derive_open_install_analysis(
                     source_uri,
                     forward_ctx.forward_child_inherited_wd(&resolved, source.chdir),
                 ));
+            }
+        }
+
+        for request in metadata.selective_import_requests(&captured.uri) {
+            let Some(target) = request.source.local_module_uri() else {
+                continue;
+            };
+            if !captured.exclusions.is_excluded_uri(target)
+                && !captured.metadata_map.contains_key(target)
+                && !prerequisites
+                    .direct_sources
+                    .iter()
+                    .any(|(uri, _)| uri == target)
+            {
+                // Selective imports never inherit source() working directories.
+                prerequisites.direct_sources.push((target.clone(), None));
             }
         }
 
@@ -13073,10 +13127,11 @@ fn derive_open_metadata_reenrichment(
             metadata_lookup,
             captured.max_chain_depth,
         );
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
+            &captured.box_context,
         );
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
@@ -14161,7 +14216,7 @@ async fn resync_file_from_disk(
     // source-batch enumeration. The directory walk below is detached from
     // `WorldState`; the captured basis makes any intervening state change veto
     // the eventual commit.
-    let (analysis_basis, workspace_root, exclusions, mut consumed_context_uris) = {
+    let (analysis_basis, workspace_root, exclusions, mut consumed_context_uris, box_context) = {
         let state = state_arc.read().await;
         if state.is_project_excluded_uri(uri) || state.is_unreferenced_gitignored_uri(uri) {
             return ResyncOutcome::Skipped;
@@ -14210,14 +14265,16 @@ async fn resync_file_from_disk(
             workspace_root,
             state.workspace_exclusions.clone(),
             consumed_context_uris.into_inner(),
+            state.box_search_context(),
         )
     };
 
     if non_r_document.is_none() {
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             &mut cross_file_meta,
             uri,
             workspace_root.as_ref(),
+            &box_context,
         );
         let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut cross_file_meta,
@@ -16506,6 +16563,7 @@ struct BoxCandidateImporterRefresh {
     metadata: Arc<crate::cross_file::CrossFileMetadata>,
     open_generation: Option<crate::open_document_store::AnalysisGeneration>,
     workspace_root: Option<Url>,
+    box_context: crate::box_use::search_path::SearchPathContext,
 }
 
 /// Snapshot importers whose persisted local-module outcome may have changed.
@@ -16517,6 +16575,17 @@ fn box_candidate_importers_for_changes(
     state: &WorldState,
     changes: &[FileEvent],
 ) -> Vec<BoxCandidateImporterRefresh> {
+    let refresh_all = changes
+        .iter()
+        .any(|change| state.is_box_profile_uri(&change.uri));
+    box_candidate_importers(state, changes, refresh_all)
+}
+
+fn box_candidate_importers(
+    state: &WorldState,
+    changes: &[FileEvent],
+    refresh_all: bool,
+) -> Vec<BoxCandidateImporterRefresh> {
     let changed_paths: Vec<std::path::PathBuf> = changes
         .iter()
         .filter(|change| {
@@ -16527,19 +16596,25 @@ fn box_candidate_importers_for_changes(
         })
         .filter_map(|change| change.uri.to_file_path().ok())
         .collect();
-    if changed_paths.is_empty() {
+    if changed_paths.is_empty() && !refresh_all {
         return Vec::new();
     }
 
+    let box_context = state.box_search_context();
     let matches = |importer_uri: &Url, metadata: &crate::cross_file::CrossFileMetadata| {
         metadata.box_imports.iter().any(|import| {
-            changed_paths.iter().any(|changed_path| {
-                crate::box_use::path::candidate_set_matches_path(
-                    importer_uri,
-                    &import.spec,
-                    changed_path,
-                )
-            })
+            (refresh_all
+                && matches!(
+                    import.spec,
+                    crate::box_use::BoxSpec::SearchPathModule { .. }
+                ))
+                || changed_paths.iter().any(|changed_path| {
+                    crate::box_use::path::candidate_set_matches_path(
+                        importer_uri,
+                        &import.spec,
+                        changed_path,
+                    )
+                })
         }) || metadata.import_calls.iter().any(|import| {
             changed_paths.iter().any(|changed_path| {
                 crate::import_pkg::path::candidate_set_matches_path(
@@ -16579,6 +16654,7 @@ fn box_candidate_importers_for_changes(
                 .get_record(&uri)
                 .map(|record| record.generation());
             Some(BoxCandidateImporterRefresh {
+                box_context: box_context.clone(),
                 uri,
                 metadata,
                 open_generation,
@@ -16593,10 +16669,11 @@ fn enrich_box_candidate_importers(
     mut importers: Vec<BoxCandidateImporterRefresh>,
 ) -> Vec<BoxCandidateImporterRefresh> {
     for importer in &mut importers {
-        crate::cross_file::enrich_selective_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
             Arc::make_mut(&mut importer.metadata),
             &importer.uri,
             importer.workspace_root.as_ref(),
+            &importer.box_context,
         );
     }
     importers
@@ -16665,7 +16742,18 @@ fn watched_change_admission_with_owned(
     if state.workspace_index.contains(uri)
         || state.workspace_index.contains_artifacts(uri)
         || !state.cross_file_graph.get_dependents(uri).is_empty()
-        || !state.is_bulk_discovery_pruned_uri(uri)
+        || (!state.is_bulk_discovery_pruned_uri(uri)
+            && !uri.to_file_path().is_ok_and(|path| {
+                state
+                    .box_watched_roots
+                    .iter()
+                    .any(|root| path.starts_with(root))
+                    && !state.workspace_folders.iter().any(|folder| {
+                        folder
+                            .to_file_path()
+                            .is_ok_and(|root| path.starts_with(root))
+                    })
+            }))
     {
         return WatchedChangeAdmission::Index;
     }
@@ -16723,7 +16811,11 @@ fn collect_watched_resync(
     // open records can be refreshed synchronously from their immutable document,
     // while closed importers re-enter the existing guarded watched batch.
     let workspace_root = state.workspace_folders.first().cloned();
+    let box_context = state.box_search_context();
     for importer in candidate_importers {
+        if !importer.box_context.same_inputs(&box_context) {
+            continue;
+        }
         let importer_uri = importer.uri;
         let metadata = importer.metadata;
         if let Some(generation) = importer.open_generation {
@@ -17679,6 +17771,7 @@ fn external_project_config_watch_changed(
 /// which downstream rebuilds to run.
 #[derive(Debug, Clone)]
 struct ConfigChangeSnapshot {
+    prev_box_paths: crate::box_use::search_path::SearchPaths,
     prev_workspace_folders: Vec<Url>,
     prev_cross_file: crate::cross_file::CrossFileConfig,
     prev_lint: crate::linting::LintConfig,
@@ -17706,6 +17799,7 @@ impl ConfigChangeSnapshot {
     /// omitting a newly added diagnostic-affecting field.
     fn capture(state: &WorldState) -> Self {
         Self {
+            prev_box_paths: state.box_search_paths.clone(),
             prev_workspace_folders: state.workspace_folders.clone(),
             prev_cross_file: state.cross_file_config.clone(),
             prev_lint: state.lint_config.clone(),
@@ -18398,6 +18492,15 @@ impl LanguageServer for Backend {
         // off-lock discovery + I/O.
         let project_root: Option<std::path::PathBuf> = {
             let mut state = self.state.write().await;
+            state.supports_box_path_watches = params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+                .is_some_and(|watch| {
+                    watch.dynamic_registration == Some(true)
+                        && watch.relative_pattern_support == Some(true)
+                });
             if let Some(folders) = params.workspace_folders.clone() {
                 for folder in folders {
                     log::info!("Adding workspace folder: {}", folder.uri);
@@ -18893,6 +18996,7 @@ impl LanguageServer for Backend {
                 .await;
             self.register_external_project_config_watch(workspace_folders, discovery_options)
                 .await;
+            self.refresh_box_path_watches().await;
         }
 
         let init_duration = init_start.elapsed();
@@ -19247,6 +19351,7 @@ impl LanguageServer for Backend {
     /// [`crate::utf16::strip_leading_bom_for_scan`]. Issues #345, #346.
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
+        let box_coherence = self.begin_box_profile_change(&uri).await;
         let language_id = params.text_document.language_id;
         let text = params.text_document.text;
         let version = params.text_document.version;
@@ -19258,6 +19363,8 @@ impl LanguageServer for Backend {
         );
 
         did_open_transactional(self, &uri, &language_id, &text, version).await;
+        self.refresh_box_profile_importers(&uri, box_coherence)
+            .await;
     }
 
     /// Handle a text-document change: update in-memory state, compute affected documents, and schedule debounced diagnostics and optional package prefetching.
@@ -19278,6 +19385,7 @@ impl LanguageServer for Backend {
     /// ```
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
+        let box_coherence = self.begin_box_profile_change(&uri).await;
         let version = params.text_document.version;
         let changes = params.content_changes;
 
@@ -19859,6 +19967,8 @@ impl LanguageServer for Backend {
             });
         }
 
+        self.refresh_box_profile_importers(&uri, box_coherence)
+            .await;
         if let Some(routing) = deferred_package_routing {
             let state = self.state.clone();
             let client = self.client.clone();
@@ -19896,8 +20006,10 @@ impl LanguageServer for Backend {
     /// new `didOpen` and repopulate the diagnostics.
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
+        let box_coherence = self.begin_box_profile_change(uri).await;
         log::trace!("diagnostics lifecycle: didClose uri={}", uri);
         did_close_transactional(self, uri).await;
+        self.refresh_box_profile_importers(uri, box_coherence).await;
     }
 
     /// Reconcile automatic discovery, project configuration, and package
@@ -20144,6 +20256,22 @@ impl LanguageServer for Backend {
                 state.config_reload_publish_test_capture.claim(),
             )
         };
+        let profile_changed = {
+            let state = self.state.read().await;
+            params
+                .changes
+                .iter()
+                .any(|change| state.is_box_profile_uri(&change.uri))
+        };
+        let mut notification_receipt = if profile_changed {
+            let receipt = OpenSourceBatchCompletionReceipt::new();
+            receipt.install_diagnostics_coherence_guard(
+                begin_diagnostics_coherence(&self.state).await,
+            );
+            Some(receipt)
+        } else {
+            None
+        };
         let tar_source_parents = if params.changes.is_empty() {
             Vec::new()
         } else {
@@ -20154,6 +20282,9 @@ impl LanguageServer for Backend {
                 .collect();
             let mut state = self.state.write().await;
             state.advance_workspace_scan_generation();
+            if event_uris.iter().any(|uri| state.is_box_profile_uri(uri)) {
+                state.advance_box_search_generation();
+            }
             if event_uris.iter().any(|uri| {
                 uri.to_file_path().is_ok_and(|path| {
                     state
@@ -20221,7 +20352,6 @@ impl LanguageServer for Backend {
             .iter()
             .any(|change| !config_file_change_uris.contains(&change.uri));
         let mut deferred_config_publish = Vec::new();
-        let mut notification_receipt = None;
 
         if project_config_changed || gitignore_changed {
             // Step 1 (lock-free I/O): snapshot the workspace root, then run
@@ -20235,7 +20365,7 @@ impl LanguageServer for Backend {
                 })
                 .unwrap_or(crate::config_file::DiscoveredLoad::None);
             log_project_config_warnings(&project_layer);
-            if has_non_config_changes {
+            if has_non_config_changes && notification_receipt.is_none() {
                 let receipt = OpenSourceBatchCompletionReceipt::new();
                 receipt.install_diagnostics_coherence_guard(
                     begin_diagnostics_coherence(&self.state).await,
@@ -20389,17 +20519,15 @@ impl LanguageServer for Backend {
             box_candidate_importers_for_changes(&state, &params.changes)
         };
         let box_candidate_importers = enrich_box_candidate_importers(box_candidate_importers);
+        if profile_changed {
+            self.refresh_box_path_watches().await;
+        }
 
         // A marker can expose existing modules outside the workspace scan without
         // any R-file event. Load their artifacts before publishing the refreshed
         // importer, including transitive reexports. The ordinary watched batch
         // only loads files named in the notification and unchanged closed importers.
-        if params.changes.iter().any(|change| {
-            change
-                .uri
-                .to_file_path()
-                .is_ok_and(|path| path.file_name().is_some_and(|name| name == "rhino.yml"))
-        }) {
+        if !box_candidate_importers.is_empty() {
             let (on_demand, max_depth, workspace_root) = {
                 let state = self.state.read().await;
                 (
@@ -21291,6 +21419,234 @@ impl Backend {
         }
     }
 
+    /// Reuse watched-file transactions for changed search inputs, including
+    /// closed importers and cold external targets. The caller awaits completion
+    /// before releasing the input change's diagnostics-coherence boundary.
+    async fn refresh_box_search_importers(&self) {
+        self.refresh_box_search_importers_with_guard(None).await;
+    }
+
+    /// Construct the large refresh future outside its caller's poll frame.
+    /// Boxing inside an async caller still reserves the temporary on that
+    /// caller's stack, including while it polls the nested watched transaction.
+    fn refresh_box_search_importers_with_guard(
+        &self,
+        coherence: Option<crate::state::DiagnosticsCoherenceGuard>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.refresh_box_search_importers_inner(coherence))
+    }
+
+    async fn refresh_box_search_importers_inner(
+        &self,
+        coherence: Option<crate::state::DiagnosticsCoherenceGuard>,
+    ) {
+        self.refresh_box_path_watches().await;
+        let coherence = match coherence {
+            Some(guard) => guard,
+            None => begin_diagnostics_coherence(&self.state).await,
+        };
+        let importers = {
+            let mut state = self.state.write().await;
+            // A profile edit is an analysis configuration change even when the
+            // optional suppressive package prelude is disabled.
+            state.advance_box_search_generation();
+            box_candidate_importers(&state, &[], true)
+        };
+        if importers.is_empty() {
+            return;
+        }
+        let importers =
+            match tokio::task::spawn_blocking(move || enrich_box_candidate_importers(importers))
+                .await
+            {
+                Ok(importers) => importers,
+                Err(error) => {
+                    log::warn!("box search-path refresh failed: {error}");
+                    return;
+                }
+            };
+        self.index_box_search_targets(&importers).await;
+        let batch = {
+            let mut state = self.state.write().await;
+            collect_watched_resync(&mut state, &[], importers)
+        };
+        self.run_box_search_refresh_batch(batch, coherence).await;
+    }
+
+    /// Keep on-demand parse/index futures out of the refresh poll frame, including
+    /// refreshes whose new paths resolve no targets at all.
+    fn index_box_search_targets<'a>(
+        &'a self,
+        importers: &'a [BoxCandidateImporterRefresh],
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let (on_demand, depth, root) = {
+                let state = self.state.read().await;
+                (
+                    state.cross_file_config.on_demand_indexing_enabled,
+                    state.cross_file_config.max_forward_depth,
+                    state.workspace_folders.first().cloned(),
+                )
+            };
+            if on_demand {
+                let mut targets: Vec<_> = importers
+                    .iter()
+                    .flat_map(|importer| importer.metadata.box_imports.iter())
+                    .filter_map(|import| import.resolved_source())
+                    .filter_map(|source| source.local_module_uri().cloned())
+                    .collect();
+                targets.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                targets.dedup();
+                for target in targets {
+                    self.index_file_on_demand(&target).await;
+                    self.index_forward_chain(&target, depth.saturating_sub(1), root.as_ref())
+                        .await;
+                }
+            }
+        })
+    }
+
+    /// Return before polling the watched transaction, so its construction
+    /// temporaries do not add to the nested document-handler stack.
+    fn run_box_search_refresh_batch(
+        &self,
+        batch: CollectedWatchedResync,
+        coherence: crate::state::DiagnosticsCoherenceGuard,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + '_>> {
+        let receipt = OpenSourceBatchCompletionReceipt::new();
+        receipt.install_diagnostics_coherence_guard(coherence);
+        Box::pin(run_watched_resync_batch_owned(
+            self.state.clone(),
+            self.client.clone(),
+            self.traversal_truncation.clone(),
+            self.routing_tasks.clone(),
+            WatchedTaskAdmission::UntrackedBoundary,
+            WatchedResyncBatch {
+                updates: batch.updates,
+                affected: batch.affected,
+                deletions: batch.deletions,
+                reserved_tickets: Vec::new(),
+                transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::InvocationOwned {
+                    post_commit: None,
+                    receipt,
+                    boundary_waiter: true,
+                },
+                mode: WatchedResyncBatchMode::Immediate,
+                attempts_remaining: 2,
+                #[cfg(test)]
+                final_handoff_test_capture: None,
+            },
+        ))
+    }
+
+    async fn begin_box_profile_change(
+        &self,
+        uri: &Url,
+    ) -> Option<crate::state::DiagnosticsCoherenceGuard> {
+        let is_profile = self.state.read().await.is_box_profile_uri(uri);
+        if !is_profile {
+            return None;
+        }
+        let guard = begin_diagnostics_coherence(&self.state).await;
+        self.state.write().await.advance_box_search_generation();
+        Some(guard)
+    }
+
+    async fn refresh_box_profile_importers(
+        &self,
+        uri: &Url,
+        coherence: Option<crate::state::DiagnosticsCoherenceGuard>,
+    ) {
+        let is_profile = self.state.read().await.is_box_profile_uri(uri);
+        if is_profile || coherence.is_some() {
+            self.refresh_box_search_importers_with_guard(coherence)
+                .await;
+            self.publish_diagnostics(uri).await;
+        }
+    }
+
+    /// Register only explicit external module roots, never home/library-wide
+    /// fallback scans. Clients without dynamic relative watches retain static
+    /// resolution and may forward ordinary watched-file events themselves.
+    async fn refresh_box_path_watches(&self) {
+        let (context, folders, previous) = {
+            let state = self.state.read().await;
+            if !state.supports_box_path_watches {
+                return;
+            }
+            (
+                state.box_search_context(),
+                state.workspace_folders.clone(),
+                state.box_watched_roots.clone(),
+            )
+        };
+        let roots = match context.paths() {
+            crate::box_use::search_path::SearchPaths::Known(roots) => roots.clone(),
+            _ => Vec::new(),
+        };
+        let mut roots: Vec<_> = roots
+            .into_iter()
+            .filter(|path| {
+                !folders.iter().any(|folder| {
+                    folder
+                        .to_file_path()
+                        .is_ok_and(|folder| path.starts_with(folder))
+                })
+            })
+            .collect();
+        roots.sort();
+        roots.dedup();
+        if roots == previous {
+            return;
+        }
+        let id = "raven-box-search-paths";
+        if !previous.is_empty() {
+            if let Err(error) = self
+                .client
+                .unregister_capability(vec![Unregistration {
+                    id: id.into(),
+                    method: "workspace/didChangeWatchedFiles".into(),
+                }])
+                .await
+            {
+                log::warn!("box path watch removal failed: {error}");
+                return;
+            }
+            self.state.write().await.box_watched_roots.clear();
+        }
+        let watchers: Vec<_> = roots
+            .iter()
+            .filter_map(|root| {
+                Some(FileSystemWatcher {
+                    glob_pattern: GlobPattern::Relative(RelativePattern {
+                        base_uri: OneOf::Right(Url::from_file_path(root).ok()?),
+                        pattern: "**/*.{r,R}".into(),
+                    }),
+                    kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
+                })
+            })
+            .collect();
+        if watchers.is_empty() {
+            return;
+        }
+        match self
+            .client
+            .register_capability(vec![Registration {
+                id: id.into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers })
+                        .unwrap(),
+                ),
+            }])
+            .await
+        {
+            Ok(()) => self.state.write().await.box_watched_roots = roots,
+            Err(error) => log::warn!("box path watch registration failed: {error}"),
+        }
+    }
+
     async fn refresh_external_project_config_watch(
         &self,
         workspace_folders: Vec<Url>,
@@ -21395,6 +21751,17 @@ impl Backend {
                 self.register_gitignore_watchers(true).await;
             }
         }
+        let box_inputs_changed = {
+            let state = self.state.read().await;
+            state.box_search_paths != prev.prev_box_paths
+                || state.workspace_folders != prev.prev_workspace_folders
+                || discovery_inputs_changed
+                || state.workspace_exclusions.discovery_revision()
+                    != prev.prev_workspace_exclusions.discovery_revision()
+        };
+        if box_inputs_changed {
+            self.refresh_box_search_importers().await;
+        }
         // Brief write lock: change detection, package_mode translate,
         // hier_support restore, force-republish marking. NO blocking I/O
         // happens inside this scope.
@@ -21408,7 +21775,8 @@ impl Backend {
 
             let scope_changed = prev
                 .prev_cross_file
-                .scope_settings_changed(&state.cross_file_config);
+                .scope_settings_changed(&state.cross_file_config)
+                || box_inputs_changed;
 
             let old_diagnostics_enabled = prev.prev_cross_file.diagnostics_enabled;
             let new_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
@@ -21535,7 +21903,8 @@ impl Backend {
                 && !lint_config_changed
                 && !linting_section_changed
                 && !indentation_producer_policy_changed
-                && !workspace_exclusions_changed;
+                && !workspace_exclusions_changed
+                && !box_inputs_changed;
 
             // If `package_mode` changed, apply the setting change via the
             // event-driven path. For Disabled: translate immediately
@@ -22999,6 +23368,7 @@ impl Backend {
             sys_file_lib_paths,
             exclusions,
             analysis_basis,
+            box_context,
         ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
@@ -23059,16 +23429,18 @@ impl Backend {
                 lib_paths,
                 state.workspace_exclusions.clone(),
                 analysis_basis,
+                state.box_search_context(),
             )
         };
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
         if non_r_document.is_none() {
-            crate::cross_file::enrich_selective_import_resolutions(
+            crate::cross_file::enrich_selective_import_resolutions_with_context(
                 &mut cross_file_meta,
                 file_uri,
                 workspace_root.as_ref(),
+                &box_context,
             );
 
             // Resolve system.file() source entries into concrete paths so
@@ -23264,14 +23636,20 @@ impl Backend {
         }
     }
 
-    async fn index_forward_chain(
-        &self,
-        start_uri: &Url,
+    /// Allocate traversal state before polling so this forwarding layer does
+    /// not retain a large temporary frame inside a document/config handler.
+    fn index_forward_chain<'a>(
+        &'a self,
+        start_uri: &'a Url,
         max_depth: usize,
-        workspace_root: Option<&Url>,
-    ) {
-        self.index_forward_chain_with_effect_sink(start_uri, max_depth, workspace_root, None)
-            .await;
+        workspace_root: Option<&'a Url>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.index_forward_chain_with_effect_sink(
+            start_uri,
+            max_depth,
+            workspace_root,
+            None,
+        ))
     }
 
     async fn index_forward_chain_with_effect_sink(
@@ -23559,6 +23937,7 @@ impl Backend {
             sys_file_lib_paths,
             exclusions,
             analysis_basis,
+            box_context,
         ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
@@ -23613,16 +23992,18 @@ impl Backend {
                 lib_paths,
                 state.workspace_exclusions.clone(),
                 analysis_basis,
+                state.box_search_context(),
             )
         };
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
         if non_r_document.is_none() {
-            crate::cross_file::enrich_selective_import_resolutions(
+            crate::cross_file::enrich_selective_import_resolutions_with_context(
                 &mut cross_file_meta,
                 file_uri,
                 workspace_root.as_ref(),
+                &box_context,
             );
 
             // Resolve system.file() source entries into concrete paths so
@@ -39725,6 +40106,209 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test]
+    async fn box_search_profile_edits_and_config_reload_retarget_definitions() {
+        let tmp = TempDir::new().unwrap();
+        for root in ["first", "second"] {
+            fs::create_dir_all(tmp.path().join(root).join("org")).unwrap();
+            fs::write(
+                tmp.path().join(root).join("org/math.R"),
+                "box::export(add)\nadd <- function(x, y) x + y\n",
+            )
+            .unwrap();
+        }
+        fs::write(tmp.path().join(".Rprofile"), "options(box.path='first')\n").unwrap();
+        let code = "box::use(org/math)\nmath$add(1, 2)\n";
+        fs::write(tmp.path().join("main.R"), code).unwrap();
+        let (svc, importer) = open_in_settled_quiescent_workspace(&tmp, "main.R", "r", code).await;
+        let backend = svc.inner();
+        let target = |state: &WorldState| match handlers::goto_definition(
+            state,
+            &importer,
+            Position::new(1, 6),
+        ) {
+            Some(GotoDefinitionResponse::Scalar(location)) => Some(location.uri),
+            _ => None,
+        };
+        let first = Url::from_file_path(tmp.path().join("first/org/math.R")).unwrap();
+        let second = Url::from_file_path(tmp.path().join("second/org/math.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                target(&state),
+                Some(first.clone()),
+                "metadata={:?}, target={:?}, indexed={:?}",
+                state.get_enriched_metadata(&importer),
+                first,
+                state.workspace_index.get_metadata(&first)
+            );
+        }
+
+        let profile = Url::from_file_path(tmp.path().join(".Rprofile")).unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: profile.clone(),
+                    language_id: "r".into(),
+                    version: 1,
+                    text: "options(box.path='second')\n".into(),
+                },
+            })
+            .await;
+        assert_eq!(target(&*backend.state.read().await), Some(second.clone()));
+        change_doc(backend, &profile, 2, "options(box.path=dynamic())\n").await;
+        assert_eq!(target(&*backend.state.read().await), None);
+        close_doc(backend, &profile).await;
+        assert_eq!(target(&*backend.state.read().await), Some(first.clone()));
+
+        // Disk profile events and ignore-policy changes work without a workspace scan.
+        fs::write(tmp.path().join(".Rprofile"), "options(box.path='second')\n").unwrap();
+        send_watched_change(backend, &profile).await;
+        assert_eq!(target(&*backend.state.read().await), Some(second.clone()));
+        let ignore = tmp.path().join(".gitignore");
+        let ignore_uri = Url::from_file_path(&ignore).unwrap();
+        fs::write(&ignore, ".Rprofile\n").unwrap();
+        send_watched_change(backend, &ignore_uri).await;
+        assert_eq!(target(&*backend.state.read().await), None);
+        fs::write(&ignore, "").unwrap();
+        send_watched_change(backend, &ignore_uri).await;
+        assert_eq!(target(&*backend.state.read().await), Some(second.clone()));
+        fs::write(tmp.path().join(".Rprofile"), "options(box.path='first')\n").unwrap();
+        send_watched_change(backend, &profile).await;
+        assert_eq!(target(&*backend.state.read().await), Some(first.clone()));
+
+        // Project config overrides the profile, even with package/prelude support off.
+        let config = tmp.path().join("raven.toml");
+        fs::write(&config, "[box]\nsearchPaths=['second']\n[packages]\nenabled=false\nrprofilePrelude=false\n[crossFile]\nindexWorkspace=false\n").unwrap();
+        let config_uri = Url::from_file_path(&config).unwrap();
+        send_watched_change(backend, &config_uri).await;
+        assert_eq!(target(&*backend.state.read().await), Some(second));
+        fs::remove_file(&config).unwrap();
+        send_watched_change(backend, &config_uri).await;
+        assert_eq!(target(&*backend.state.read().await), Some(first));
+    }
+
+    #[test]
+    fn external_box_watches_admit_only_referenced_modules() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        let shared = tmp.path().join("shared");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(shared.join("org")).unwrap();
+        fs::write(shared.join("org/math.R"), "value <- 1\n").unwrap();
+        let module = Url::from_file_path(shared.join("org/math.R")).unwrap();
+        let unused = Url::from_file_path(shared.join("unused.R")).unwrap();
+        let importer = Url::from_file_path(root.join("main.R")).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::from_file_path(&root).unwrap()];
+        state.box_watched_roots = vec![shared, tmp.path().to_path_buf()];
+        assert_eq!(
+            watched_change_admission(&state, &Url::from_file_path(root.join("new.R")).unwrap()),
+            WatchedChangeAdmission::Index
+        );
+        state.project_config_path = Some(root.join("raven.toml"));
+        state.raw_project_settings = Some(serde_json::json!({"box":{"searchPaths":["../shared"]}}));
+        crate::config_file::recompute_parsed_configs(&mut state);
+        state.open_document(importer, "box::use(org/math)\n", Some(1));
+        assert_eq!(
+            watched_change_admission(&state, &unused),
+            WatchedChangeAdmission::Pruned
+        );
+        let initial = enrich_box_candidate_importers(box_candidate_importers(&state, &[], true));
+        collect_watched_resync(&mut state, &[], initial);
+        let changes = [FileEvent {
+            uri: module.clone(),
+            typ: FileChangeType::CREATED,
+        }];
+        let candidates =
+            enrich_box_candidate_importers(box_candidate_importers_for_changes(&state, &changes));
+        let batch = collect_watched_resync(&mut state, &changes, candidates);
+        assert!(batch.updates.iter().any(|item| item.uri == module));
+        assert_eq!(
+            watched_change_admission(&state, &module),
+            WatchedChangeAdmission::Index
+        );
+        assert_eq!(
+            watched_change_admission(&state, &unused),
+            WatchedChangeAdmission::Pruned
+        );
+    }
+
+    #[test]
+    fn box_search_stale_workspace_replay_preserves_current_refresh_authority() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("org")).unwrap();
+        fs::write(tmp.path().join("org/math.R"), "value <- 1\n").unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let importer = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root.clone()];
+        state.project_config_path = Some(tmp.path().join("raven.toml"));
+        state.raw_project_settings = Some(serde_json::json!({"box":{"searchPaths":["."]}}));
+        crate::config_file::recompute_parsed_configs(&mut state);
+        state.open_document(importer.clone(), "box::use(org/math)\n", Some(1));
+        let generation = state.documents.get_record(&importer).unwrap().generation();
+        let old_context = state.box_search_context();
+        let mut old_metadata = crate::cross_file::extract_metadata("box::use(org/math)\n");
+        crate::cross_file::enrich_selective_import_resolutions_with_context(
+            &mut old_metadata,
+            &importer,
+            Some(&root),
+            &old_context,
+        );
+        state.advance_box_search_generation();
+        let current = enrich_box_candidate_importers(box_candidate_importers(&state, &[], true));
+        commit_open_document_replay(
+            &mut state,
+            vec![(importer.clone(), generation, old_metadata)],
+            Some(&root),
+            &old_context,
+        );
+        assert_eq!(
+            state.documents.get_record(&importer).unwrap().generation(),
+            generation
+        );
+        let refreshed = collect_watched_resync(&mut state, &[], current);
+        assert!(refreshed.affected.contains(&importer));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer)
+                .iter()
+                .any(|edge| edge.is_selective_module())
+        );
+    }
+
+    #[test]
+    fn box_search_refresh_rejects_changed_input_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("org")).unwrap();
+        fs::write(
+            tmp.path().join("org/math.R"),
+            "box::export(value)\nvalue <- 1\n",
+        )
+        .unwrap();
+        let importer = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+        state.project_config_path = Some(tmp.path().join("raven.toml"));
+        state.raw_project_settings = Some(serde_json::json!({"box":{"searchPaths":["."]}}));
+        crate::config_file::recompute_parsed_configs(&mut state);
+        state.open_document(importer.clone(), "box::use(org/math)\n", Some(1));
+        let captured = box_candidate_importers(&state, &[], true);
+        let captured = enrich_box_candidate_importers(captured);
+        state.raw_project_settings = Some(serde_json::json!({"box":{"searchPaths":["elsewhere"]}}));
+        crate::config_file::recompute_parsed_configs(&mut state);
+        let result = collect_watched_resync(&mut state, &[], captured);
+        assert!(result.affected.is_empty());
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer)
+                .is_empty()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watched_box_candidate_change_rebuilds_unchanged_closed_importer() {
         let tmp = TempDir::new().unwrap();
@@ -47058,6 +47642,44 @@ mod project_config_initialize_tests {
             "recreated external raven.toml must take precedence over fallback .lintr"
         );
         assert_eq!(state.lint_config.line_length, 180);
+    }
+
+    #[tokio::test]
+    async fn initialized_box_watches_require_client_support_and_deduplicate_external_roots() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[box]\nsearchPaths=['.', '../shared', '../shared']\n",
+        )
+        .unwrap();
+        for (dynamic, relative, expected) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+        ] {
+            let registrations = initialized_registrations(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder { uri: Url::from_file_path(&root).unwrap(), name: "test".into() }]),
+                initialization_options: Some(serde_json::json!({"crossFile":{"indexWorkspace":false}, "packages":{"enabled":false}})),
+                capabilities: serde_json::from_value(serde_json::json!({"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":dynamic,"relativePatternSupport":relative}}})).unwrap(),
+                ..Default::default()
+            }).await;
+            let registration = registrations
+                .into_iter()
+                .find(|r| r.id == "raven-box-search-paths");
+            assert_eq!(registration.is_some(), expected);
+            if let Some(registration) = registration {
+                let options = watcher_options(registration);
+                assert_eq!(options.watchers.len(), 1);
+                assert_has_exact_watcher(
+                    &options.watchers,
+                    &Url::from_file_path(tmp.path().join("shared")).unwrap(),
+                    "**/*.{r,R}",
+                );
+                assert_all_watchers_cover_config_file_events(&options.watchers);
+            }
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,16 @@ fn raven_binary() -> std::path::PathBuf {
 }
 
 fn run_check(workspace: &std::path::Path) -> String {
-    let output = Command::new(raven_binary())
+    run_check_with_env(workspace, None)
+}
+
+fn run_check_with_env(workspace: &std::path::Path, box_path: Option<&std::path::Path>) -> String {
+    let mut command = Command::new(raven_binary());
+    command.env_remove("R_BOX_PATH");
+    if let Some(path) = box_path {
+        command.env("R_BOX_PATH", path);
+    }
+    let output = command
         .args(["check", "--workspace"])
         .arg(workspace)
         .args(["--max-severity", "off", "--no-color"])
@@ -28,6 +37,59 @@ fn run_check(workspace: &std::path::Path) -> String {
         String::from_utf8_lossy(&output.stderr),
     );
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[test]
+fn static_search_inputs_resolve_external_modules_and_reexports() {
+    for input in ["config", "environment", "profile"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::create_dir_all(shared.join("org/api")).unwrap();
+        std::fs::write(
+            shared.join("org/math.R"),
+            "box::export(add)\nadd <- function(x, y) x + y\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shared.join("org/api/__init__.R"),
+            "#' @export\nbox::use(org/math[sum_values = add])\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("scripts/main.R"), "box::use(org/api[sum_values], org/math)\nsum_values(1, 2)\nmath$add(1, 2)\nbox::use(org/math[missing])\n").unwrap();
+        std::fs::write(
+            root.join("raven.toml"),
+            "[packages]\nenabled=false\nrprofilePrelude=false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::write(
+            root.join("tests/testthat/test-module.R"),
+            "box::use(org/math)\nmath$add(1, 2)\n",
+        )
+        .unwrap();
+        match input {
+            "config" => std::fs::write(root.join("raven.toml"), "[box]\nsearchPaths = ['../shared']\n[packages]\nenabled=false\nrprofilePrelude=false\n").unwrap(),
+            "profile" => std::fs::write(root.join(".Rprofile"), "options(box.path='../shared')\n").unwrap(),
+            _ => {}
+        }
+        let output =
+            run_check_with_env(&root, (input == "environment").then_some(shared.as_path()));
+        assert!(
+            !output.contains("box-module-not-found"),
+            "{input}: {output}"
+        );
+        assert!(
+            !output.contains("sum_values is not defined"),
+            "{input}: {output}"
+        );
+        assert!(!output.contains("math is not defined"), "{input}: {output}");
+        assert!(
+            output.contains("box-export-not-found"),
+            "{input}: external module exports must be loaded: {output}"
+        );
+    }
 }
 
 #[test]

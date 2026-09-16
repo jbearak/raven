@@ -291,14 +291,35 @@ pub(crate) fn enrich_box_import_resolutions(
 
 /// Enrich both selective-import dialects, supplying the workspace root needed
 /// by `{import}`'s normal forward fallback tiers.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn enrich_selective_import_resolutions(
     meta: &mut CrossFileMetadata,
     importing_uri: &tower_lsp::lsp_types::Url,
     workspace_root: Option<&tower_lsp::lsp_types::Url>,
 ) {
-    crate::box_use::path::enrich_local_imports(importing_uri, &mut meta.box_imports);
+    enrich_selective_import_resolutions_with_context(
+        meta,
+        importing_uri,
+        workspace_root,
+        &Default::default(),
+    );
+}
+
+/// Shared detached resolver with captured static box inputs. No caller may hold
+/// a `WorldState` guard while this performs filesystem probes.
+pub(crate) fn enrich_selective_import_resolutions_with_context(
+    meta: &mut CrossFileMetadata,
+    importing_uri: &tower_lsp::lsp_types::Url,
+    workspace_root: Option<&tower_lsp::lsp_types::Url>,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) {
+    crate::box_use::path::enrich_local_imports(importing_uri, &mut meta.box_imports, box_context);
     if let Some(exports) = &mut meta.box_exports {
-        crate::box_use::path::enrich_local_imports(importing_uri, &mut exports.reexports);
+        crate::box_use::path::enrich_local_imports(
+            importing_uri,
+            &mut exports.reexports,
+            box_context,
+        );
     }
     let metadata_snapshot = meta.clone();
     crate::import_pkg::path::enrich_local_imports(

@@ -14,8 +14,9 @@
 //! a box module:
 //!
 //! * explicit relative paths resolve from the importing file's directory;
-//! * qualified paths use the persisted nearest `rhino.yml` root discovered by
-//!   detached enrichment; without a root they stay inert;
+//! * qualified paths use persisted ordered static roots selected by detached
+//!   enrichment, with Rhino inference when no explicit input is present;
+//!   unknown inputs stay inert;
 //! * **ignores** `# raven: cd`, the implicit testthat/testit working directory,
 //!   and the forward workspace-root fallback — none of them apply to box;
 //! * omits the file extension in the spec; the resolver appends it;
@@ -126,25 +127,41 @@ pub fn resolve_local_module(
     importing_uri: &Url,
     spec: &BoxSpec,
 ) -> Result<ResolvedModule, BoxResolveError> {
-    let (base, components) = module_base(importing_uri, spec)?;
-    resolve_at_base(&base, components)
+    let (bases, components) = module_bases(importing_uri, spec)?;
+    let mut mismatch = None;
+    let mut searched = Vec::new();
+    for base in bases {
+        match resolve_at_base(&base, components) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error @ BoxResolveError::CaseMismatch { .. }) => {
+                if mismatch.is_none() {
+                    mismatch = Some(error);
+                }
+            }
+            Err(BoxResolveError::NotFound {
+                searched: candidates,
+            }) => searched.extend(candidates),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(mismatch.unwrap_or(BoxResolveError::NotFound { searched }))
 }
 
 /// Select a base using only persisted inputs. Root discovery belongs to
 /// detached enrichment, including for missing modules and watched candidates.
-fn module_base<'a>(
+fn module_bases<'a>(
     importing_uri: &Url,
     spec: &'a BoxSpec,
-) -> Result<(PathBuf, &'a [String]), BoxResolveError> {
+) -> Result<(Vec<PathBuf>, &'a [String]), BoxResolveError> {
     match spec {
         BoxSpec::LocalModule {
             up_levels,
             components,
-        } => Ok((base_directory(importing_uri, *up_levels)?, components)),
+        } => Ok((vec![base_directory(importing_uri, *up_levels)?], components)),
         BoxSpec::SearchPathModule {
             components,
-            root: Some(root),
-        } => Ok((root.clone(), components)),
+            roots: Some(roots),
+        } => Ok((roots.clone(), components)),
         _ => Err(BoxResolveError::NotLocalModule),
     }
 }
@@ -189,22 +206,41 @@ fn resolve_at_base(base: &Path, components: &[String]) -> Result<ResolvedModule,
 /// lock-held consumers. This function performs filesystem I/O and therefore must
 /// run only in detached analysis/rebuild work, never while a `WorldState` guard
 /// is held and never from an interactive request path.
-pub(crate) fn enrich_local_imports(importing_uri: &Url, imports: &mut [BoxImport]) {
+pub(crate) fn enrich_local_imports(
+    importing_uri: &Url,
+    imports: &mut [BoxImport],
+    context: &super::search_path::SearchPathContext,
+) {
     // One ancestor walk per import batch, and none for ordinary package or
     // explicit-relative imports. Never cache across edits or watcher events:
     // adding/removing a nested marker changes the selected root.
-    let root = imports
+    let roots = imports
         .iter()
         .any(|import| matches!(import.spec, BoxSpec::SearchPathModule { .. }))
-        .then(|| rhino_root(importing_uri))
+        .then(|| match context.paths() {
+            super::search_path::SearchPaths::Known(paths) => {
+                let mut paths = paths.clone();
+                if let Ok(directory) = base_directory(importing_uri, 0)
+                    && !paths.contains(&directory)
+                {
+                    paths.push(directory);
+                }
+                Some(paths)
+            }
+            super::search_path::SearchPaths::Absent => {
+                rhino_root(importing_uri).map(|root| vec![root])
+            }
+            super::search_path::SearchPaths::Unknown => None,
+        })
         .flatten();
     for import in imports {
         import.local_resolution = None;
         if let BoxSpec::SearchPathModule {
-            root: import_root, ..
+            roots: import_roots,
+            ..
         } = &mut import.spec
         {
-            import_root.clone_from(&root);
+            import_roots.clone_from(&roots);
         }
         import.local_resolution = Some(match resolve_local_module(importing_uri, &import.spec) {
             Ok(resolved) => LocalModuleResolution::Resolved(resolved.uri),
@@ -237,15 +273,20 @@ fn rhino_root(importing_uri: &Url) -> Option<PathBuf> {
 /// Exposed for diagnostics (listing what was searched) and tests. Does not touch
 /// the filesystem.
 pub fn candidate_paths(importing_uri: &Url, spec: &BoxSpec) -> Vec<PathBuf> {
-    let Ok((base, components)) = module_base(importing_uri, spec) else {
+    let Ok((bases, components)) = module_bases(importing_uri, spec) else {
         return Vec::new();
     };
     let Some((name, dirs)) = components.split_last() else {
         return Vec::new();
     };
-    candidate_part_lists(dirs, name)
+    bases
         .iter()
-        .map(|(parts, _)| join_parts(&base, parts))
+        .flat_map(|base| {
+            candidate_part_lists(dirs, name)
+                .into_iter()
+                .map(|(parts, _)| join_parts(base, &parts))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -413,6 +454,91 @@ fn join_parts(base: &Path, parts: &[String]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_empty_roots_suppress_rhino_but_keep_importer_fallback() {
+        use crate::box_use::search_path::{SearchPathContext, SearchPaths};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("org")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts/org")).unwrap();
+        std::fs::write(tmp.path().join("rhino.yml"), "").unwrap();
+        std::fs::write(tmp.path().join("org/math.R"), "root <- 1").unwrap();
+        std::fs::write(tmp.path().join("scripts/org/math.R"), "local <- 1").unwrap();
+        let importer = Url::from_file_path(tmp.path().join("scripts/main.R")).unwrap();
+        for (paths, target) in [
+            (SearchPaths::Absent, Some("org/math.R")),
+            (SearchPaths::Known(vec![]), Some("scripts/org/math.R")),
+            (SearchPaths::Unknown, None),
+        ] {
+            let context = SearchPathContext::new(&paths, &SearchPaths::Absent, None);
+            let mut metadata = crate::cross_file::extract_metadata("box::use(org/math)");
+            enrich_local_imports(&importer, &mut metadata.box_imports, &context);
+            assert_eq!(
+                metadata.box_imports[0]
+                    .resolved_source()
+                    .and_then(|s| s.local_module_uri().cloned()),
+                target.map(|path| Url::from_file_path(tmp.path().join(path)).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_custom_roots_shadow_fallback_and_track_all_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        for root in ["first", "second", "scripts"] {
+            std::fs::create_dir_all(dir.path().join(root).join("org")).unwrap();
+        }
+        let first = dir.path().join("first/org/math.R");
+        let second = dir.path().join("second/org/math.R");
+        std::fs::write(&second, "").unwrap();
+        let importer = Url::from_file_path(dir.path().join("scripts/main.R")).unwrap();
+        let context = super::super::search_path::SearchPathContext::new(
+            &super::super::search_path::SearchPaths::Known(vec![
+                dir.path().join("first"),
+                dir.path().join("second"),
+            ]),
+            &Default::default(),
+            None,
+        );
+        let mut metadata = crate::cross_file::extract_metadata("box::use(org/math, ./org/math)");
+        enrich_local_imports(&importer, &mut metadata.box_imports, &context);
+        assert_eq!(
+            metadata.box_imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(
+                Url::from_file_path(&second).unwrap()
+            ))
+        );
+        assert_eq!(
+            metadata.box_imports[1].local_resolution,
+            Some(LocalModuleResolution::Missing)
+        );
+        assert_eq!(
+            candidate_paths(&importer, &metadata.box_imports[0].spec).len(),
+            12
+        );
+        assert!(candidate_set_matches_path(
+            &importer,
+            &metadata.box_imports[0].spec,
+            &first
+        ));
+        std::fs::write(&first, "").unwrap();
+        enrich_local_imports(&importer, &mut metadata.box_imports, &context);
+        assert_eq!(
+            metadata.box_imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(
+                Url::from_file_path(&first).unwrap()
+            ))
+        );
+        std::fs::remove_file(&first).unwrap();
+        std::fs::write(dir.path().join("first/org/Math.R"), "").unwrap();
+        enrich_local_imports(&importer, &mut metadata.box_imports, &context);
+        assert_eq!(
+            metadata.box_imports[0].local_resolution,
+            Some(LocalModuleResolution::Resolved(
+                Url::from_file_path(&second).unwrap()
+            ))
+        );
+    }
     use std::fs;
 
     fn uri(p: &Path) -> Url {
@@ -428,7 +554,7 @@ mod tests {
 
     fn enriched(importer: &Url, code: &str) -> Vec<BoxImport> {
         let mut metadata = crate::cross_file::extract_metadata(code);
-        enrich_local_imports(importer, &mut metadata.box_imports);
+        enrich_local_imports(importer, &mut metadata.box_imports, &Default::default());
         metadata.box_imports
     }
 
