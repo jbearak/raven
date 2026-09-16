@@ -1,7 +1,8 @@
 // alloc_counter.rs — Global allocator wrapper that counts allocations.
 //
-// Gated behind the `RAVEN_BENCH_ALLOC=1` environment variable (checked at
-// runtime). When the env-var is unset or not `"1"`, the wrapper delegates
+// Gated behind the `RAVEN_BENCH_ALLOC=1` environment variable, checked by an
+// explicit `is_tracking_enabled()` call before measurement. When the env-var
+// is unset or not `"1"`, the wrapper delegates
 // directly to `std::alloc::System` with zero bookkeeping overhead beyond
 // the atomic load on the fast path.
 //
@@ -21,6 +22,9 @@
 // Then, around the code region of interest:
 //
 // ```rust
+// if !alloc_counter::is_tracking_enabled() {
+//     return;
+// }
 // alloc_counter::reset();
 // /* … work … */
 // let n = alloc_counter::allocation_count();
@@ -30,6 +34,7 @@
 // Requirements: 6.2
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -45,27 +50,18 @@ static DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Total bytes requested via `alloc` since the last `reset()`.
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Whether tracking is enabled. Resolved lazily on first allocation.
+/// Whether tracking is enabled. False until explicit initialization outside
+/// allocator callbacks, so startup and environment lookup are not counted.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether we have already checked the environment variable.
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Read the environment once, outside allocator callbacks. Environment lookup
+/// can allocate, so performing it in a callback would recurse into this allocator.
+static INITIALIZE: Once = Once::new();
 
-/// Check (once) whether `RAVEN_BENCH_ALLOC=1` is set.
+/// Allocation callbacks only read the flag; they must never initialize it.
 #[inline]
 fn is_enabled() -> bool {
-    // Fast path: already initialised. Use Acquire to pair with the Release
-    // store below, ensuring visibility of the ENABLED store.
-    if INITIALIZED.load(Ordering::Acquire) {
-        return ENABLED.load(Ordering::Relaxed);
-    }
-    // Slow path (runs at most once per process).
-    let val = std::env::var("RAVEN_BENCH_ALLOC")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    ENABLED.store(val, Ordering::Relaxed);
-    INITIALIZED.store(true, Ordering::Release);
-    val
+    ENABLED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -94,9 +90,16 @@ pub fn allocated_bytes() -> u64 {
     ALLOC_BYTES.load(Ordering::Relaxed)
 }
 
-/// Returns `true` when allocation tracking is active
-/// (`RAVEN_BENCH_ALLOC=1`).
+/// Initialize tracking from `RAVEN_BENCH_ALLOC` once and return whether it is
+/// active. Call this before resetting counters and measuring. Initialization
+/// must stay outside allocator callbacks because environment lookup allocates.
 pub fn is_tracking_enabled() -> bool {
+    INITIALIZE.call_once(|| {
+        let enabled = std::env::var("RAVEN_BENCH_ALLOC")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        ENABLED.store(enabled, Ordering::Relaxed);
+    });
     is_enabled()
 }
 

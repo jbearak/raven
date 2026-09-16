@@ -77,25 +77,57 @@ render a webview.
 
 ### Benchmarks
 
-All benchmarks except `startup` require `--features test-support`. Set `RAVEN_BENCH_ALLOC=1` for allocation tracking.
+Run these benchmarks with `--features test-support`. The `startup` benchmark
+supports allocation reports with `RAVEN_BENCH_ALLOC=1`; it initializes tracking
+outside allocator callbacks before measuring.
 
-- `cargo bench --bench startup`
+- `cargo bench --bench startup --features test-support`
 - `cargo bench --bench lsp_operations --features test-support`
 - `cargo bench --bench cross_file --features test-support`
 - `cargo bench --bench libpath_capture --features test-support`
 - `cargo bench --bench edit_to_publish --features test-support`
 - `cargo bench --bench indentation --features test-support`
 
-The `Performance` GitHub Actions workflow tracks `startup`, `indentation`, and
-the standalone-cache subset of `cross_file` for PR comparison comments.
-Criterion's `main` baseline is cached from push-to-`main` runs only; PR runs
-restore that cache and save their results as a local `pr` baseline, but must
-not write the `target/criterion` cache. Allowing PRs to save the cache can
-create branch-scoped entries that contain only `pr`, which then shadow the
-default-branch cache and make future PRs report "No `main` baseline found".
-The PR comparison guard must use `critcmp --baselines` to detect saved baseline
-names; `critcmp --list` formats comparison output and does not prove that a
-restored `main` baseline exists.
+The `Performance` workflow builds the exact PR base and tested candidate before
+running either. Push-to-main jobs compare against the event's preceding commit.
+Both builds use the candidate's pinned Rust toolchain and the same runner. Each
+benchmark suite runs in three serial pairs, reversing order in the middle pair.
+Only compiler/download caches are reused; measurements are never restored from
+another job. Each revision gets a new target directory. Separate source
+directories alone are insufficient: matching Cargo package identities and older
+candidate timestamps can cause Cargo to reuse the base executable. The script
+rejects reused benchmark artifacts and executable paths outside that revision's
+target directory, then copies the verified executables for measurement.
+
+CI covers all `startup` and `indentation` benchmarks, plus `cross_file`'s
+standalone cache, helper/package contributions, nested scopes through single-file
+and production graph/streaming queries, deep graph scopes, and streaming sweeps
+at depths 1 and 5. Each invocation requests a 1-second warmup, 2-second measurement, and
+20 samples; benchmark groups can override the sample count.
+
+The check fails when a benchmark's median paired slowdown exceeds 5% and, in
+all three pairs, the candidate's lower 95% mean-estimate bound exceeds the base's
+upper bound. This repeatability rule catches persistent costs while rejecting a
+single noisy repeat; it does not establish a combined confidence level. Reports
+show every paired change, including noisy results that do not fail the gate.
+Missing/invalid measurements and benchmark-set drift between repeats fail the
+job. Added or removed benchmarks are listed explicitly and do not suppress
+comparisons of common benchmarks. The `performance-comparison` artifact retains
+raw Criterion data, logs, revision and compiler identities, executable hashes,
+tracked working-tree diff digests, and CPU information even when comparison fails.
+Fork PRs receive the same gate and artifact without a PR comment.
+
+To reproduce with two checkouts and a new output directory:
+
+```bash
+python3 scripts/compare-performance.py --base /path/to/base \
+  --candidate /path/to/candidate --output /tmp/raven-perf-comparison
+```
+
+Use Python 3.11 or later and install the candidate's pinned Rust toolchain first.
+`--threshold` changes the local slowdown limit; CI fixes it at 5%. Inspect the
+paired results and controls before attributing changes to code. A green job
+alone is insufficient when the report identifies noisy measurements.
 
 ## Profiling startup
 
@@ -682,9 +714,10 @@ Attachments always use pre-execution source order and seed conditional loaders
 before the timeline runs. Profile applicability remains independent of package
 mode, with package-layout withholding applied by the shared selector.
 
-The stream lazily builds a membership index and caches only additional later
-preamble names for deferred lookups. Leaving a function restores strict
-visibility. Point queries iterate the borrowed groups without constructing a
+The stream lazily builds a membership index of string slices borrowed from the
+contribution snapshot, without allocating a string for each name. It caches only
+additional later preamble names for deferred lookups. Leaving a function restores
+strict visibility. Point queries iterate the borrowed groups without constructing a
 membership index. `scope/contribution_tests.rs` checks the same behavioral
 contract through recursive resolution, `is_visible`, `symbol_for`, and snapshots,
 including canonical aliases and attachment timing.
@@ -720,6 +753,12 @@ consumes those intervals. Source locality, source-batch execution, recursion
 budgets, frame lifetimes, and caches are unchanged. Parent-prefix cache selection
 continues to use its existing lexical context before conditional scope discovery.
 The ordinary active-scope set is borrowed; only conditional-scope unions allocate.
+Single-file attachment projection reuses the point query's active-scope set.
+Events bypass conditional ownership classification when no conditional scopes
+are active. Keep that common path inline, since the classifier runs for every
+event. Strict streaming borrows timeline events through a retained artifact
+`Arc` and clones only values stored in frames, as the completed-global walk does.
+This avoids copying discarded events and source-batch payloads.
 
 `scope/evaluation_tests.rs` asserts independent expected visibility and package
 facts, then compares point, cached point, single-file, and streaming interfaces.

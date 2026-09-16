@@ -7,8 +7,10 @@
 //! describe the environment before the queried file executes. Own-file entries
 //! are excluded because the ordinary timeline owns their position and hoisting.
 //!
-//! Membership indexes are lazy and retained for a stream. Point queries iterate
-//! the borrowed groups directly, avoiding an extra name set when building a scope.
+//! Membership indexes are lazy and retained for a stream. They borrow names from
+//! the contribution snapshot, whose lifetime covers the stream, so indexing does
+//! not copy name bytes or allocate an `Arc` per name. Point queries iterate the
+//! borrowed groups directly, avoiding an extra name set when building a scope.
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -30,8 +32,8 @@ pub(super) struct ScopeContributions<'a> {
     deferred_helper_groups: Vec<&'a BTreeSet<String>>,
     attachment_groups: Vec<&'a BTreeSet<String>>,
     remove_load_all: bool,
-    immediate_names: OnceCell<HashSet<Arc<str>>>,
-    deferred_names: OnceCell<HashSet<Arc<str>>>,
+    immediate_names: OnceCell<HashSet<&'a str>>,
+    deferred_names: OnceCell<HashSet<&'a str>>,
     symbol_uri: OnceCell<Url>,
 }
 
@@ -97,10 +99,10 @@ impl<'a> ScopeContributions<'a> {
     }
 
     /// Iterate strict names without allocating the stream's membership index.
-    fn immediate_symbols(&self) -> impl Iterator<Item = &String> {
+    fn immediate_symbols(&self) -> impl Iterator<Item = &'a String> + '_ {
         self.immediate_groups
             .iter()
-            .flat_map(|names| names.iter())
+            .flat_map(|&names| names.iter())
             .chain(
                 self.imported_names
                     .into_iter()
@@ -109,10 +111,10 @@ impl<'a> ScopeContributions<'a> {
     }
 
     /// Iterate only definitions that require the completed preamble environment.
-    fn deferred_symbols(&self) -> impl Iterator<Item = &String> {
+    fn deferred_symbols(&self) -> impl Iterator<Item = &'a String> + '_ {
         self.deferred_helper_groups
             .iter()
-            .flat_map(|names| names.iter())
+            .flat_map(|&names| names.iter())
     }
 
     /// Seed prerequisites before evaluating conditional loaders on the timeline.
@@ -127,11 +129,9 @@ impl<'a> ScopeContributions<'a> {
 
     /// Test membership with at most one index build per phase in a stream.
     pub(super) fn contains(&self, name: &str, phase: ScopePhase) -> bool {
-        let immediate = self.immediate_names.get_or_init(|| {
-            self.immediate_symbols()
-                .map(|name| Arc::from(name.as_str()))
-                .collect()
-        });
+        let immediate = self
+            .immediate_names
+            .get_or_init(|| self.immediate_symbols().map(String::as_str).collect());
         immediate.contains(name)
             || (phase == ScopePhase::Deferred
                 && self
@@ -139,7 +139,7 @@ impl<'a> ScopeContributions<'a> {
                     .get_or_init(|| {
                         self.deferred_symbols()
                             .filter(|name| !immediate.contains(name.as_str()))
-                            .map(|name| Arc::from(name.as_str()))
+                            .map(String::as_str)
                             .collect()
                     })
                     .contains(name))

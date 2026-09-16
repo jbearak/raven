@@ -3,8 +3,6 @@
 // Run with: cargo bench --bench cross_file
 // Compare baselines: cargo bench --bench cross_file -- --baseline before
 //
-// Allocation tracking: set RAVEN_BENCH_ALLOC=1 to report allocation counts.
-//
 // Requirements: 1.4, 1.3
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -431,11 +429,11 @@ fn bench_scope_hotspots(c: &mut Criterion) {
 
     let the_nested_cases: &[(usize, usize)] = &[(16, 16), (32, 32)];
     for &(depth, defs_per_scope) in the_nested_cases {
-        let (_uri, artifacts, query_line, query_column) =
+        let (uri, artifacts, query_line, query_column) =
             build_nested_scope_artifacts(depth, defs_per_scope);
         let label = format!("depth_{depth}_defs_{defs_per_scope}");
         group.bench_with_input(
-            BenchmarkId::new("nested_scope", label),
+            BenchmarkId::new("nested_scope", &label),
             &artifacts,
             |b, artifacts| {
                 b.iter(|| {
@@ -448,6 +446,56 @@ fn bench_scope_hotspots(c: &mut Criterion) {
                 })
             },
         );
+
+        // Exercise the production point and streaming consumers as well as the
+        // single-file helper. Setup stays outside the measured query.
+        let graph = DependencyGraph::new();
+        let base_exports = HashSet::new();
+        let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+        let get_metadata = |_target: &Url| None;
+        group.bench_function(BenchmarkId::new("nested_graph", &label), |b| {
+            b.iter(|| {
+                black_box(raven::cross_file::scope_at_position_with_graph(
+                    &uri,
+                    black_box(query_line),
+                    black_box(query_column),
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    None,
+                    20,
+                    &base_exports,
+                    false,
+                    BackwardDependencyMode::Explicit,
+                    &|| false,
+                    None,
+                    None,
+                ))
+            })
+        });
+        let positions = [(query_line, query_column)];
+        let names = ["local_0_0", "arg_0", "missing_sym"];
+        group.bench_function(BenchmarkId::new("nested_stream", &label), |b| {
+            b.iter(|| {
+                let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+                black_box(raven::cross_file::bench_scope_stream_sweep(
+                    &uri,
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    None,
+                    20,
+                    &base_exports,
+                    false,
+                    BackwardDependencyMode::Explicit,
+                    &|| false,
+                    &prefix_cache,
+                    None,
+                    black_box(&positions),
+                    black_box(&names),
+                ))
+            })
+        });
     }
 
     group.finish();
@@ -489,6 +537,73 @@ fn bench_interval_tree_queries(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+/// A diagnostics sweep builds each contributed-name index once, then reuses it
+/// for top-level and deferred lookups. Keep fixture construction outside timing.
+fn bench_scope_contributions(c: &mut Criterion) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let test_dir = root.join("tests/testthat");
+    let uri = Url::from_file_path(test_dir.join("helper-025.R")).unwrap();
+    let content = "top_level_marker\nuses_later <- function() {\n    body_marker\n}\n";
+    let tree = raven::parser_pool::with_parser(|parser| parser.parse(content, None)).unwrap();
+    let artifacts = Arc::new(compute_artifacts(&uri, &tree, content));
+    let contribution = raven::package_state::PackageScopeContribution {
+        workspace_root: Some(root.to_path_buf()),
+        r_internal_symbols: Arc::new((0..2000).map(|i| format!("internal_{i}")).collect()),
+        imported_symbols: Arc::new(
+            (0..500)
+                .map(|i| (format!("imported_{i}"), BTreeSet::from(["pkg".to_owned()])))
+                .collect(),
+        ),
+        test_helper_symbols: Arc::new(
+            (0..50)
+                .map(|peer| {
+                    (
+                        test_dir.join(format!("helper-{peer:03}.R")),
+                        Arc::new((0..100).map(|i| format!("helper_{peer}_{i}")).collect()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        ),
+        ..Default::default()
+    };
+    let graph = DependencyGraph::new();
+    let base_exports = HashSet::new();
+    let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+    let get_metadata = |_target: &Url| None;
+    let positions: Vec<_> = std::iter::repeat_n((0, 0), 50)
+        .chain(std::iter::repeat_n((2, 4), 50))
+        .collect();
+    let names = ["helper_0_0", "helper_49_0", "internal_0", "missing_sym"];
+    let sweep = || {
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        raven::cross_file::bench_scope_stream_sweep(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            20,
+            &base_exports,
+            true,
+            BackwardDependencyMode::Explicit,
+            &|| false,
+            &prefix_cache,
+            Some(&contribution),
+            black_box(&positions),
+            black_box(&names),
+        )
+    };
+    // Earlier helpers and internals are visible at both positions; later
+    // helpers appear only in the body, and the missing name remains absent.
+    assert_eq!(sweep(), 250);
+    c.bench_function("cross_file_scope_contributions/helper_directory", |b| {
+        b.iter(|| black_box(sweep()))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -761,5 +876,6 @@ criterion_group!(
     bench_interval_tree_queries,
     bench_forward_child_memo,
     bench_standalone_cache,
+    bench_scope_contributions,
 );
 criterion_main!(benches);

@@ -21,11 +21,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Criterion benchmarks with baseline management ──────────────────────
+  # Build both revisions before comparing them on the same runner.
   benchmarks:
     name: Criterion Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -34,9 +34,20 @@ jobs:
         with:
           persist-credentials: false
 
-      # rust-toolchain.toml pins the version (rustup auto-installs on first
-      # `cargo` use). Pinning also keeps PR-vs-main benchmark baselines
-      # comparable on the same compiler instead of drifting with floating stable.
+      - name: Check out comparison base
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          # The push comparison uses the exact prior main commit. PRs use the
+          # event's base SHA, never whichever cached main run happened last.
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          path: .perf-base
+          persist-credentials: false
+
+      - name: Install the pinned compiler
+        # Going through the rustup cargo shim installs rust-toolchain.toml.
+        # The comparison script explicitly selects this version for both builds.
+        run: cargo --version
+
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
 
@@ -67,56 +78,36 @@ jobs:
       - name: Reset sccache stats
         run: sccache --zero-stats
 
-      # Criterion baselines are stored under target/criterion/.
-      # PR runs restore the main-branch baseline but must not save their
-      # branch-local `pr` baseline, or future PR runs can shadow the default
-      # branch cache with a cache that contains no `main` baseline.
-      - name: Restore Criterion baseline cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: target/criterion
-          key: criterion-main-baseline-v2-${{ runner.os }}-main-${{ github.run_id }}
-          restore-keys: |
-            criterion-main-baseline-v2-${{ runner.os }}-main-
+      - name: Verify benchmark build isolation
+        run: python3 scripts/test-performance-build.py
 
-      - name: Install critcmp
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        id: critcmp-cache
-        with:
-          path: ~/.cargo/bin/critcmp
-          key: critcmp-${{ runner.os }}-v0.1
-
-      - name: Build critcmp
-        if: steps.critcmp-cache.outputs.cache-hit != 'true'
-        run: cargo install critcmp
-
-      # On push to main: save results as the new baseline.
-      # On PRs: compare against the main baseline.
-      # The startup bench, indentation producer/lint group, and WI2b
-      # standalone-cache group are tracked for CI regressions. The
-      # standalone-cache group is filtered out of the otherwise-heavy
-      # `cross_file` bench (the rest of cross_file and lsp_operations are run
-      # locally with `cargo bench`).
-      - name: Run benchmarks (push to main — save baseline)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Compare revisions on this runner
         run: |
-          cargo bench -p raven --features test-support --bench startup -- --save-baseline main
-          cargo bench -p raven --features test-support --bench indentation -- --save-baseline main
-          cargo bench -p raven --features test-support --bench cross_file -- --save-baseline main cross_file_standalone_cache
+          python3 scripts/compare-performance.py \
+            --base .perf-base --candidate . \
+            --output "${{ runner.temp }}/raven-performance" --threshold 5
 
-      - name: Run benchmarks (PR — compare against main)
-        if: github.event_name == 'pull_request'
+      - name: Publish benchmark summary
+        if: always()
         run: |
-          cargo bench -p raven --features test-support --bench startup -- --save-baseline pr
-          cargo bench -p raven --features test-support --bench indentation -- --save-baseline pr
-          cargo bench -p raven --features test-support --bench cross_file -- --save-baseline pr cross_file_standalone_cache
+          if [ -f "${{ runner.temp }}/raven-performance/report.md" ]; then
+            cat "${{ runner.temp }}/raven-performance/report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark comparison failed before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      - name: Save Criterion baseline cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: target/criterion
-          key: criterion-main-baseline-v2-${{ runner.os }}-main-${{ github.run_id }}
+          name: performance-comparison
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/raven-performance/metadata.json
+            ${{ runner.temp }}/raven-performance/report.*
+            ${{ runner.temp }}/raven-performance/results/
+            ${{ runner.temp }}/raven-performance/logs/
 
       - name: Report cache status
         if: always()
@@ -124,86 +115,27 @@ jobs:
           echo "::notice title=Cache status::cargo-hit=${{ steps.cargo-cache.outputs.cache-hit }} sccache-exact-hit=${{ steps.sccache-cache.outputs.cache-hit }}"
           sccache --show-stats
 
-      # ── PR regression comment via critcmp ────────────────────────────────
-      - name: Compare benchmarks against main baseline
-        if: github.event_name == 'pull_request'
-        id: critcmp
-        run: |
-          if ! critcmp --baselines 2>/dev/null | grep -q '^main$'; then
-            echo "No main baseline found — skipping comparison."
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
-            echo "no_baseline=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "no_baseline=false" >> "$GITHUB_OUTPUT"
-          if critcmp main pr --threshold 5 > /tmp/critcmp-output.txt 2>&1; then
-            if [ -s /tmp/critcmp-output.txt ]; then
-              echo "has_diff=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "has_diff=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "::warning::critcmp failed; treating as diff to surface in PR comment"
-            echo "has_diff=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Post or update PR comment
-        if: github.event_name == 'pull_request'
+        # Fork PRs still run the gate and upload evidence. Their token cannot
+        # write comments. Never elevate untrusted benchmark code via target events.
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          MARKER="<!-- raven-benchmark-comparison -->"
-          BODY_FILE=$(mktemp)
-          trap 'rm -f "$BODY_FILE"' EXIT
-
-          if [ "${{ steps.critcmp.outputs.no_baseline }}" = "true" ]; then
-            cat > "$BODY_FILE" <<'ENDOFBODY'
-          <!-- raven-benchmark-comparison -->
-          ## Benchmark Comparison
-
-          No `main` baseline found — benchmark comparison skipped.
-
-          A baseline will be created when this branch (or a future PR) is merged to `main`.
-          ENDOFBODY
-          elif [ "${{ steps.critcmp.outputs.has_diff }}" = "true" ]; then
-            {
-              cat <<'ENDOFBODY'
-          <!-- raven-benchmark-comparison -->
-          ## Benchmark Comparison
-
-          Showing benchmarks with **>5% change** vs `main`:
-
-          ```
-          ENDOFBODY
-              cat /tmp/critcmp-output.txt
-              cat <<'ENDOFBODY'
-          ```
-
-          _Generated by `critcmp --threshold 5`. Criterion baselines compared: `main` → `pr`._
-          ENDOFBODY
-            } > "$BODY_FILE"
-          else
-            cat > "$BODY_FILE" <<'ENDOFBODY'
-          <!-- raven-benchmark-comparison -->
-          ## Benchmark Comparison
-
-          No benchmarks changed by more than 5% vs `main`.
-
-          _Generated by `critcmp --threshold 5`._
-          ENDOFBODY
+          BODY_FILE="${{ runner.temp }}/raven-performance/report.md"
+          if [ ! -f "$BODY_FILE" ]; then
+            BODY_FILE=$(mktemp)
+            trap 'rm -f "$BODY_FILE"' EXIT
+            printf '%s\n' '<!-- raven-benchmark-comparison -->' '## Benchmark comparison failed' '' 'The job failed before producing a report. Inspect its logs.' > "$BODY_FILE"
           fi
-
-          EXISTING_COMMENT_ID=$(gh api \
-            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --paginate -q ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+          EXISTING_COMMENT_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --paginate -q '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- raven-benchmark-comparison -->"))) | .id' \
             | head -1)
-
           if [ -n "$EXISTING_COMMENT_ID" ]; then
             jq -Rs '{"body": .}' < "$BODY_FILE" | \
-              gh api \
-                "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
-                -X PATCH --input -
+              gh api "repos/${REPOSITORY}/issues/comments/${EXISTING_COMMENT_ID}" -X PATCH --input -
           else
             gh pr comment "${PR_NUMBER}" --body-file "$BODY_FILE"
           fi

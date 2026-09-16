@@ -1941,13 +1941,15 @@ fn active_conditional_shiny_scopes(
     active
 }
 
+/// Reuse the point query's lexical scopes; attachment projection must not rebuild
+/// the same interval query and membership set on the ordinary-file fast path.
 fn single_file_attachment_projection(
     artifacts: &ScopeArtifacts,
     line: u32,
     column: u32,
     hoist_globals: bool,
+    ordinary_scopes: &HashSet<FunctionScopeInterval>,
 ) -> (HashSet<FunctionScopeInterval>, HashSet<String>) {
-    let ordinary_scopes = active_function_scopes_at(&artifacts.function_scope_tree, line, column);
     let needs_late_conditional_load = hoist_globals
         && !ordinary_scopes.is_empty()
         && artifacts.timeline.iter().any(|event| {
@@ -1996,7 +1998,7 @@ fn single_file_attachment_projection(
     stream.advance_to(line, column);
     let active = stream.active_conditional_shiny_scopes.clone();
     let query_inside = hoist_globals
-        && (!active_function_scopes_at(&artifacts.function_scope_tree, line, column).is_empty()
+        && (!ordinary_scopes.is_empty()
             || active
                 .iter()
                 .any(|scope| scope.contains(Position::new(line, column))));
@@ -2782,7 +2784,13 @@ pub fn scope_at_position(
     let active_function_scopes =
         active_function_scopes_at(&artifacts.function_scope_tree, line, column);
     let (active_conditional_shiny_scopes, in_function_attachment_seed) =
-        single_file_attachment_projection(artifacts, line, column, hoist_globals);
+        single_file_attachment_projection(
+            artifacts,
+            line,
+            column,
+            hoist_globals,
+            &active_function_scopes,
+        );
     let query = QueryContext::new(
         Position::new(line, column),
         hoist_globals,
@@ -2795,7 +2803,7 @@ pub fn scope_at_position(
     // The shared classifier keeps each event's owning frame separate from its
     // activation boundary, including assignment RHS completion.
     for event in &artifacts.timeline {
-        let (event_context, visibility) = query.evaluate(event);
+        let (event_owner, visibility) = query.evaluate(event);
         if visibility == EventVisibility::Hidden {
             continue;
         }
@@ -2821,7 +2829,7 @@ pub fn scope_at_position(
                 requires_attached,
                 ..
             } => {
-                let effective_scope = event_context.owner;
+                let effective_scope = event_owner;
                 let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
                     requires_attached.as_deref(),
                     &scope.attached_packages,
@@ -2938,7 +2946,13 @@ where
     let active_function_scopes =
         active_function_scopes_at(&artifacts.function_scope_tree, line, column);
     let (active_conditional_shiny_scopes, in_function_attachment_seed) =
-        single_file_attachment_projection(artifacts, line, column, hoist_globals);
+        single_file_attachment_projection(
+            artifacts,
+            line,
+            column,
+            hoist_globals,
+            &active_function_scopes,
+        );
     let query = QueryContext::new(
         Position::new(line, column),
         hoist_globals,
@@ -2954,7 +2968,7 @@ where
     // because we use insert() for definitions (which overwrites) and entry().or_insert_with()
     // for package loads (which preserves existing entries including local definitions).
     for event in &artifacts.timeline {
-        let (event_context, visibility) = query.evaluate(event);
+        let (event_owner, visibility) = query.evaluate(event);
         if visibility == EventVisibility::Hidden {
             continue;
         }
@@ -2980,7 +2994,7 @@ where
                 requires_attached,
                 ..
             } => {
-                let effective_scope = event_context.owner;
+                let effective_scope = event_owner;
                 let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
                     requires_attached.as_deref(),
                     &scope.attached_packages,
@@ -8333,7 +8347,7 @@ where
     // the hub is itself forward-sourced. Recording it here lets us reconcile.
     let mut forward_contributed: HashSet<Arc<str>> = HashSet::new();
     for event in &artifacts.timeline {
-        let (event_context, visibility) = query.evaluate(event);
+        let (event_owner, visibility) = query.evaluate(event);
         if visibility == EventVisibility::Hidden {
             continue;
         }
@@ -8349,7 +8363,7 @@ where
                 source,
                 ..
             } => {
-                let effective_function_scope = event_context.owner;
+                let effective_function_scope = event_owner;
                 let package_effects_only =
                     source.locality == super::types::SourceLocality::NonInheriting;
                 // A top-level CurrentFrame source contributes no child state to
@@ -8890,7 +8904,7 @@ where
                 requires_attached,
                 ..
             } => {
-                let effective_scope = event_context.owner;
+                let effective_scope = event_owner;
                 let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
                     requires_attached.as_deref(),
                     &scope.attached_packages,
@@ -9761,6 +9775,10 @@ where
         // `compute_artifacts*`). Conditional Shiny candidates are interleaved
         // at their call positions so a preceding source-produced attachment is
         // visible, while a later one cannot retroactively activate the body.
+        // Retain the artifacts only if an event advances, so repeated lookups
+        // between events need no extra Arc operations. The separate owner lets
+        // event processing mutate the stream while borrowing timeline payloads.
+        let mut retained_artifacts = None;
         let timeline_len = self.artifacts.timeline.len();
         let mut i = self.timeline_cursor;
         loop {
@@ -9783,7 +9801,9 @@ where
                     self.evaluate_conditional_shiny_candidate(candidate);
                 }
                 (Some(_), _) => {
-                    self.apply_event_to_strict(i);
+                    let artifacts =
+                        retained_artifacts.get_or_insert_with(|| self.artifacts.clone());
+                    self.apply_event_to_strict(&artifacts.timeline[i]);
                     i += 1;
                 }
                 (None, Some(_)) => unreachable!("candidate arm handles this case"),
@@ -9922,14 +9942,9 @@ where
     /// Apply a single timeline event to the streaming state (strict frame
     /// or whichever frame matches its `function_scope`). Cached source
     /// contributions are reused if already resolved.
-    fn apply_event_to_strict(&mut self, event_index: usize) {
-        // Clone the event so we can mutate `self` freely. Timeline events
-        // are small (one HashMap-like ScopedSymbol or a Vec<String> for
-        // Removal); cloning is cheap relative to the work that follows.
-        // SAFETY-equivalent: all events are `Clone`.
-        let event = self.artifacts.timeline[event_index].clone();
-        let event_context = EventContext::new(&event)
-            .with_conditional_scopes(&self.active_conditional_shiny_scopes);
+    fn apply_event_to_strict(&mut self, event: &ScopeEvent) {
+        let event_context =
+            EventContext::new(event).with_conditional_scopes(&self.active_conditional_shiny_scopes);
         let function_scope = event_context.owner;
         if !self.conditional_scope_applies(function_scope) {
             return;
@@ -9943,24 +9958,24 @@ where
                 parameters,
             } => {
                 let interval = FunctionScopeInterval::new(
-                    Position::new(start_line, start_column),
-                    Position::new(end_line, end_column),
+                    Position::new(*start_line, *start_column),
+                    Position::new(*end_line, *end_column),
                 );
                 let mut frame = ScopeFrame::default();
                 for param in parameters {
-                    frame.symbols.insert(param.name.clone(), param);
+                    frame.symbols.insert(param.name.clone(), param.clone());
                 }
                 self.function_stack.push((interval, frame));
             }
             ScopeEvent::Def { symbol, .. } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame.removed_names.remove(&symbol.name);
-                    frame.symbols.insert(symbol.name.clone(), symbol);
+                    frame.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
             ScopeEvent::Removal { symbols, .. } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
-                    for sym_name in &symbols {
+                    for sym_name in symbols {
                         let key: Arc<str> = Arc::from(sym_name.as_str());
                         frame.symbols.remove(&key);
                         frame.removed_names.insert(key);
@@ -9985,10 +10000,10 @@ where
                 let queried_uri = self.queried_uri.clone();
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame.packages.insert(package.clone());
-                    if attaches {
+                    if *attaches {
                         frame.attached_packages.insert(package.clone());
                     }
-                    record_package_origin(&mut frame.package_origins, &package, &queried_uri);
+                    record_package_origin(&mut frame.package_origins, package, &queried_uri);
                 }
             }
             ScopeEvent::Source {
@@ -10001,7 +10016,7 @@ where
                 // orderable NonInheriting source still contributes process-wide
                 // package attachments, while `resolve_source_contribution`
                 // suppresses all of its child symbols.
-                if should_apply_local_scoping(&source)
+                if should_apply_local_scoping(source)
                     && function_scope.is_none()
                     && source.locality != super::types::SourceLocality::NonInheriting
                 {
@@ -10011,15 +10026,15 @@ where
                 // with the same inherited attachment environment.
                 let attached_for_child = self.attached_packages_for_ordinary_source();
                 let key = (
-                    src_line,
-                    src_col,
+                    *src_line,
+                    *src_col,
                     package_set_fingerprint(&attached_for_child),
                 );
                 if !self.source_contributions.contains_key(&key) {
                     let contrib = self.resolve_source_contribution(
-                        src_line,
-                        src_col,
-                        &source,
+                        *src_line,
+                        *src_col,
+                        source,
                         &attached_for_child,
                     );
                     self.source_contributions.insert(key, contrib);
@@ -10065,11 +10080,11 @@ where
                 kind,
                 members,
             } => {
-                let key = (line, column, kind, false);
+                let key = (*line, *column, *kind, false);
                 if !self.tar_batch_contributions.contains_key(&key) {
                     let mut initial_scope =
                         Self::tar_batch_initial_scope(&self.prefix_top, &self.global_strict_frame);
-                    if is_tar_source_batch(&members) {
+                    if is_tar_source_batch(members) {
                         append_targets_pipeline_packages(
                             &mut initial_scope,
                             self.queried_uri,
@@ -10077,7 +10092,7 @@ where
                         );
                     }
                     let contribution =
-                        self.resolve_tar_batch(line, column, &members, &initial_scope);
+                        self.resolve_tar_batch(*line, *column, members, &initial_scope);
                     self.tar_batch_contributions.insert(key, contribution);
                 }
                 let contribution = self.tar_batch_contributions[&key].clone();
@@ -10091,14 +10106,14 @@ where
                     // entries, last write wins (matches timeline order).
                     match frame.symbols.get_mut(&symbol.name) {
                         Some(existing) if existing.is_declared => {
-                            *existing = symbol;
+                            *existing = symbol.clone();
                         }
                         Some(_) => {
                             // Real symbol already present — keep it.
                         }
                         None => {
                             frame.removed_names.remove(&symbol.name);
-                            frame.symbols.insert(symbol.name.clone(), symbol);
+                            frame.symbols.insert(symbol.name.clone(), symbol.clone());
                         }
                     }
                 }
@@ -10125,7 +10140,7 @@ where
                     } else {
                         HashSet::new()
                     };
-                    let expanded = expand_data_load(&stems, &package, &attached, provider);
+                    let expanded = expand_data_load(stems, package, &attached, provider);
                     if let Some(frame) = self.pick_frame_mut(function_scope) {
                         for (name, symbol) in expanded {
                             frame.removed_names.remove(&name);
@@ -10150,10 +10165,10 @@ where
                 let provider = self.selective_import_provider;
                 let importing_uri = self.queried_uri.clone();
                 let (symbols, aliases) = resolve_selective_import_bindings(
-                    &request,
+                    request,
                     &importing_uri,
-                    line,
-                    column,
+                    *line,
+                    *column,
                     provider,
                 );
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
