@@ -29,6 +29,16 @@ describe("performance comparison", () => {
     expect(workflow).toContain("github.event.pull_request.head.repo.full_name == github.repository");
   });
 
+  test("real build regression runs after the performance job prepares Rust", () => {
+    const fixture = workflow.indexOf("run: python3 scripts/test-performance-build.py");
+    for (const name of ["Install the pinned compiler", "Install mold linker", "Set up sccache"]) {
+      const setup = workflow.indexOf(`- name: ${name}`);
+      expect(setup).toBeGreaterThanOrEqual(0);
+      expect(fixture).toBeGreaterThan(setup);
+    }
+    expect(fixture).toBeLessThan(workflow.indexOf("- name: Compare revisions on this runner"));
+  });
+
   test("paired measurement and regression decisions work on synthetic data", () => {
     const result = spawnSync("python3", ["scripts/test-compare-performance.py"], {
       cwd: repoRoot,

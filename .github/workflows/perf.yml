@@ -78,6 +78,9 @@ jobs:
       - name: Reset sccache stats
         run: sccache --zero-stats
 
+      - name: Verify benchmark build isolation
+        run: python3 scripts/test-performance-build.py
+
       - name: Compare revisions on this runner
         run: |
           python3 scripts/compare-performance.py \

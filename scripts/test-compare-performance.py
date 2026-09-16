@@ -143,24 +143,44 @@ mean = 100 if label == 'base' else 110
             with self.assertRaisesRegex(ValueError, "No Criterion measurements"):
                 PERF.read_estimates(root / "absent")
 
-    def test_build_copies_the_reported_executable_before_target_reuse(self):
+    def test_build_copies_verified_artifacts_from_distinct_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "logs").mkdir()
             (root / "binaries").mkdir()
-            artifact = root / "reused-executable"
+            targets = []
 
             def fake_build(command, *, cwd, env, stdout, stderr, check):
                 self.assertEqual(command[:4], ["rustup", "run", "1.96.0", "cargo"])
                 self.assertIn("--locked", command)
+                target = Path(env["CARGO_TARGET_DIR"])
+                targets.append(target)
+                artifact = target / "reported-executable"
                 artifact.write_text(cwd.name)
-                stdout.write(json.dumps({"reason": "compiler-artifact", "target": {"name": "startup", "kind": ["bench"]}, "executable": str(artifact)}) + "\n")
+                stdout.write(json.dumps({"reason": "compiler-artifact", "target": {"name": "startup", "kind": ["bench"]}, "executable": str(artifact), "fresh": False}) + "\n")
 
             with patch.object(PERF, "SUITES", {"startup": ""}), patch.object(PERF.subprocess, "run", fake_build):
                 base = PERF.build(root / "base", "base", root, "1.96.0")
                 candidate = PERF.build(root / "candidate", "candidate", root, "1.96.0")
             self.assertEqual(base["startup"].read_text(), "base")
             self.assertEqual(candidate["startup"].read_text(), "candidate")
+            self.assertEqual(targets, [root / "build/base", root / "build/candidate"])
+
+    def test_reused_or_misplaced_artifacts_fail(self):
+        for fresh, outside in ((True, False), (False, True)):
+            with self.subTest(fresh=fresh, outside=outside), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "logs").mkdir()
+                (root / "binaries").mkdir()
+
+                def fake_build(command, *, cwd, env, stdout, stderr, check):
+                    artifact = (root if outside else Path(env["CARGO_TARGET_DIR"])) / "binary"
+                    artifact.write_text("untrusted output")
+                    stdout.write(json.dumps({"reason": "compiler-artifact", "target": {"name": "startup", "kind": ["bench"]}, "executable": str(artifact), "fresh": fresh}) + "\n")
+
+                with patch.object(PERF, "SUITES", {"startup": ""}), patch.object(PERF.subprocess, "run", fake_build):
+                    with self.assertRaisesRegex(ValueError, "Reused or misplaced"):
+                        PERF.build(root / "source", "candidate", root, "1.96.0")
 
 
 if __name__ == "__main__":

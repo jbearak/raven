@@ -2,9 +2,10 @@
 """Build and compare two revisions on one machine, without cached measurements.
 
 Builds finish before three serial paired measurements start. The middle pair
-reverses execution order to expose drift. Separate source roots let Cargo track
-each revision correctly; executables are copied before the shared build target
-is reused. Criterion output directories are unique to each invocation.
+reverses execution order to expose drift. Each revision gets a new target
+directory: Cargo can reuse stale executables across separate source roots when
+package identities match and the second checkout has older timestamps. Compiler
+caches may be shared, but Cargo build state and measurement directories are not.
 """
 
 import argparse
@@ -49,14 +50,16 @@ def binary_hash(path):
 
 
 def build(source, label, output, toolchain):
-    """Use Cargo's artifact messages, never a stale executable glob."""
+    """Compile in a new per-revision target and copy verified Cargo artifacts."""
+    target_directory = output / "build" / label
+    target_directory.mkdir(parents=True, exist_ok=False)
     command = [
         "rustup", "run", toolchain, "cargo", "bench", "--locked", "-p", "raven",
         "--features", "test-support", "--no-run", "--message-format=json",
     ]
     for suite in SUITES:
         command.extend(["--bench", suite])
-    env = {**os.environ, "CARGO_TARGET_DIR": str(output / "build")}
+    env = {**os.environ, "CARGO_TARGET_DIR": str(target_directory)}
     print(f"Building {label}: {source}", flush=True)
     log_path = output / "logs" / f"{label}-build.jsonl"
     with log_path.open("w") as log, (output / "logs" / f"{label}-build.log").open("w") as errors:
@@ -68,8 +71,11 @@ def build(source, label, output, toolchain):
             continue
         target = message["target"]
         if "bench" in target["kind"] and target["name"] in SUITES:
+            executable = Path(message["executable"]).resolve()
+            if message.get("fresh") is not False or not executable.is_relative_to(target_directory.resolve()):
+                raise ValueError(f"Reused or misplaced {label} benchmark artifact: {executable}")
             destination = output / "binaries" / f"{label}-{target['name']}"
-            shutil.copy2(message["executable"], destination)
+            shutil.copy2(executable, destination)
             binaries[target["name"]] = destination
     if binaries.keys() != SUITES.keys():
         raise ValueError(f"Missing {label} benchmark executables: {SUITES.keys() - binaries.keys()}")

@@ -93,8 +93,11 @@ running either. Push-to-main jobs compare against the event's preceding commit.
 Both builds use the candidate's pinned Rust toolchain and the same runner. Each
 benchmark suite runs in three serial pairs, reversing order in the middle pair.
 Only compiler/download caches are reused; measurements are never restored from
-another job. Cargo sees separate source directories, and the script copies each
-revision's executables before reusing the build target directory.
+another job. Each revision gets a new target directory. Separate source
+directories alone are insufficient: matching Cargo package identities and older
+candidate timestamps can cause Cargo to reuse the base executable. The script
+rejects reused benchmark artifacts and executable paths outside that revision's
+target directory, then copies the verified executables for measurement.
 
 CI covers all `startup` and `indentation` benchmarks, plus `cross_file`'s
 standalone cache, helper/package contributions, nested scopes through single-file
