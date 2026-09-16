@@ -646,7 +646,9 @@ modules own it, split by concern:
     changes without cancelling unrelated diagnostics. The diagnostics-coherence
     boundary spans profile installation and importer refresh. External-root
     watches admit referenced or package-input files, never an entire shared
-    library through unrelated file events.
+    library through unrelated file events. Plain boxed-future constructors keep
+    refresh, target loading, and watched-transaction temporaries out of nested
+    handler poll frames. Preserve those boundaries for default-stack safety.
   - `path.rs` resolves `BoxSpec::LocalModule` and `BoxSpec::SearchPathModule`
     without reusing `path_resolve.rs`. Explicit relative paths use the importing
     file's directory. Qualified imports persist an ordered root list selected

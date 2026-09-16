@@ -20519,14 +20519,7 @@ impl LanguageServer for Backend {
             box_candidate_importers_for_changes(&state, &params.changes)
         };
         let box_candidate_importers = enrich_box_candidate_importers(box_candidate_importers);
-        if params.changes.iter().any(|change| {
-            project_root.as_ref().is_some_and(|root| {
-                change
-                    .uri
-                    .to_file_path()
-                    .is_ok_and(|path| path == root.join(".Rprofile"))
-            })
-        }) {
+        if profile_changed {
             self.refresh_box_path_watches().await;
         }
 
@@ -21433,7 +21426,17 @@ impl Backend {
         self.refresh_box_search_importers_with_guard(None).await;
     }
 
-    async fn refresh_box_search_importers_with_guard(
+    /// Construct the large refresh future outside its caller's poll frame.
+    /// Boxing inside an async caller still reserves the temporary on that
+    /// caller's stack, including while it polls the nested watched transaction.
+    fn refresh_box_search_importers_with_guard(
+        &self,
+        coherence: Option<crate::state::DiagnosticsCoherenceGuard>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.refresh_box_search_importers_inner(coherence))
+    }
+
+    async fn refresh_box_search_importers_inner(
         &self,
         coherence: Option<crate::state::DiagnosticsCoherenceGuard>,
     ) {
@@ -21462,36 +21465,56 @@ impl Backend {
                     return;
                 }
             };
-        let (on_demand, depth, root) = {
-            let state = self.state.read().await;
-            (
-                state.cross_file_config.on_demand_indexing_enabled,
-                state.cross_file_config.max_forward_depth,
-                state.workspace_folders.first().cloned(),
-            )
-        };
-        if on_demand {
-            let mut targets: Vec<_> = importers
-                .iter()
-                .flat_map(|importer| importer.metadata.box_imports.iter())
-                .filter_map(|import| import.resolved_source())
-                .filter_map(|source| source.local_module_uri().cloned())
-                .collect();
-            targets.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-            targets.dedup();
-            for target in targets {
-                self.index_file_on_demand(&target).await;
-                self.index_forward_chain(&target, depth.saturating_sub(1), root.as_ref())
-                    .await;
-            }
-        }
+        self.index_box_search_targets(&importers).await;
         let batch = {
             let mut state = self.state.write().await;
             collect_watched_resync(&mut state, &[], importers)
         };
+        self.run_box_search_refresh_batch(batch, coherence).await;
+    }
+
+    /// Keep on-demand parse/index futures out of the refresh poll frame, including
+    /// refreshes whose new paths resolve no targets at all.
+    fn index_box_search_targets<'a>(
+        &'a self,
+        importers: &'a [BoxCandidateImporterRefresh],
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let (on_demand, depth, root) = {
+                let state = self.state.read().await;
+                (
+                    state.cross_file_config.on_demand_indexing_enabled,
+                    state.cross_file_config.max_forward_depth,
+                    state.workspace_folders.first().cloned(),
+                )
+            };
+            if on_demand {
+                let mut targets: Vec<_> = importers
+                    .iter()
+                    .flat_map(|importer| importer.metadata.box_imports.iter())
+                    .filter_map(|import| import.resolved_source())
+                    .filter_map(|source| source.local_module_uri().cloned())
+                    .collect();
+                targets.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                targets.dedup();
+                for target in targets {
+                    self.index_file_on_demand(&target).await;
+                    self.index_forward_chain(&target, depth.saturating_sub(1), root.as_ref())
+                        .await;
+                }
+            }
+        })
+    }
+
+    /// Return before polling the watched transaction, so its construction
+    /// temporaries do not add to the nested document-handler stack.
+    fn run_box_search_refresh_batch(
+        &self,
+        batch: CollectedWatchedResync,
+        coherence: crate::state::DiagnosticsCoherenceGuard,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + '_>> {
         let receipt = OpenSourceBatchCompletionReceipt::new();
         receipt.install_diagnostics_coherence_guard(coherence);
-        // Keep the large watched-transaction future off ordinary document stacks.
         Box::pin(run_watched_resync_batch_owned(
             self.state.clone(),
             self.client.clone(),
@@ -21515,7 +21538,6 @@ impl Backend {
                 final_handoff_test_capture: None,
             },
         ))
-        .await;
     }
 
     async fn begin_box_profile_change(
@@ -21538,7 +21560,8 @@ impl Backend {
     ) {
         let is_profile = self.state.read().await.is_box_profile_uri(uri);
         if is_profile || coherence.is_some() {
-            Box::pin(self.refresh_box_search_importers_with_guard(coherence)).await;
+            self.refresh_box_search_importers_with_guard(coherence)
+                .await;
             self.publish_diagnostics(uri).await;
         }
     }
@@ -23613,14 +23636,20 @@ impl Backend {
         }
     }
 
-    async fn index_forward_chain(
-        &self,
-        start_uri: &Url,
+    /// Allocate traversal state before polling so this forwarding layer does
+    /// not retain a large temporary frame inside a document/config handler.
+    fn index_forward_chain<'a>(
+        &'a self,
+        start_uri: &'a Url,
         max_depth: usize,
-        workspace_root: Option<&Url>,
-    ) {
-        self.index_forward_chain_with_effect_sink(start_uri, max_depth, workspace_root, None)
-            .await;
+        workspace_root: Option<&'a Url>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.index_forward_chain_with_effect_sink(
+            start_uri,
+            max_depth,
+            workspace_root,
+            None,
+        ))
     }
 
     async fn index_forward_chain_with_effect_sink(
