@@ -2304,7 +2304,8 @@ impl DependencyGraph {
             .0
     }
 
-    fn collect_neighborhood_multi_with_truncation(
+    /// Multi-seed snapshot walk retaining authoritative budget truncation.
+    pub(crate) fn collect_neighborhood_multi_with_truncation(
         &self,
         seeds: impl IntoIterator<Item = Url>,
         max_depth: usize,

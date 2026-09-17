@@ -162,6 +162,303 @@ async fn package_namespace_bindings_follow_open_edits_close_and_description_remo
     );
 }
 
+async fn complete_handoff<T: Clone>(
+    capture: &crate::state::FinalHandoffCaptureHandle<T>,
+    handler: impl std::future::Future<Output = ()>,
+) -> T {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (_, payload) = tokio::join!(handler, async {
+            let payload = capture.wait_payload().await;
+            capture.release();
+            capture.wait_completed().await;
+            payload
+        });
+        payload
+    })
+    .await
+    .unwrap_or_else(|_| panic!("R6 lifecycle handoff timed out: {:?}", capture.status()));
+    assert!(
+        capture.status().abnormal_exits.is_empty(),
+        "{:?}",
+        capture.status()
+    );
+    result
+}
+async fn open_with_handoff(backend: &Backend, uri: &Url, text: &str) {
+    let capture = backend
+        .state
+        .read()
+        .await
+        .analysis_revalidation_final_handoff_test_capture
+        .arm_for(uri.as_str());
+    complete_handoff(&capture, open(backend, uri, text)).await;
+}
+async fn watched_with_handoff(
+    backend: &Backend,
+    uri: Url,
+    typ: FileChangeType,
+) -> crate::state::WatchedFinalHandoffForTest {
+    let capture = backend
+        .state
+        .read()
+        .await
+        .watched_final_handoff_test_capture
+        .arm_for(uri.as_str());
+    let payload = complete_handoff(
+        &capture,
+        backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent { uri, typ }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        payload.outcome,
+        crate::state::WatchedFinalHandoffOutcome::Finalized
+    );
+    payload
+}
+
+#[tokio::test]
+async fn r6_inheritance_tracks_overlays_eviction_exclusion_and_package_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write(root, "DESCRIPTION", "Package: r6probe\nVersion: 0.0.1\n");
+    let base_text = "Base <- R6::R6Class(portable=FALSE, public=list(inherited=1))\n";
+    let base = write(root, "R/base.R", base_text);
+    let code = "Child <- R6::R6Class(inherit=Base, portable=FALSE, public=list(run=function() { inherited; r6_typo }))\n";
+    let child = write(root, "R/child.R", code);
+    let demo = write(root, "demo/child.R", code);
+    let service = service();
+    let backend = service.inner();
+    initialize(backend, root, true).await;
+    run_workspace_scan_transaction_inline(&backend.state)
+        .await
+        .expect_committed();
+    let exclusions = backend.state.read().await.workspace_exclusions.clone();
+    backend
+        .reseed_package_inputs_and_refresh(root.into(), exclusions, true)
+        .await
+        .unwrap();
+    open_with_handoff(backend, &child, code).await;
+    open_with_handoff(backend, &demo, code).await;
+
+    async fn messages(backend: &Backend, uri: &Url) -> Vec<String> {
+        let snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::build(&state, uri).unwrap()
+        };
+        crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".into())))
+        .map(|d| d.message)
+        .collect()
+    }
+    async fn assert_member(backend: &Backend, uri: &Url, present: bool) {
+        let messages = messages(backend, uri).await;
+        assert!(messages.contains(&"r6_typo is not defined".into()));
+        assert_eq!(
+            messages.contains(&"inherited is not defined".into()),
+            !present,
+            "{messages:?}"
+        );
+    }
+    assert_member(backend, &child, true).await;
+    // Package facts outlive the ordinary artifact LRU.
+    backend
+        .state
+        .read()
+        .await
+        .workspace_index
+        .resize_artifacts_with_evictions(1);
+    assert_member(backend, &child, true).await;
+    open_with_handoff(backend, &base, base_text).await;
+    for (version, text, present) in [
+        (
+            2,
+            "Base <- R6::R6Class(portable=FALSE, public=list(renamed=1))\n",
+            false,
+        ),
+        (
+            3,
+            "Base <- R6::R6Class(portable=TRUE, public=list(inherited=1))\n",
+            false,
+        ),
+        (4, base_text, true),
+        (
+            5,
+            "Base <- R6::R6Class(portable=FALSE, public=list(renamed=1))\n",
+            false,
+        ),
+    ] {
+        let capture = backend
+            .state
+            .read()
+            .await
+            .analysis_revalidation_final_handoff_test_capture
+            .arm_for(base.as_str());
+        let tickets = complete_handoff(
+            &capture,
+            backend.did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: base.clone(),
+                    version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                }],
+            }),
+        )
+        .await;
+        assert!(
+            tickets.iter().any(|ticket| ticket.uri == demo),
+            "dev-context consumer missing from edit handoff: {tickets:?}"
+        );
+        assert_member(backend, &child, present).await;
+        assert_member(backend, &demo, present).await;
+    }
+    let capture = backend
+        .state
+        .read()
+        .await
+        .close_resync_final_handoff_test_capture
+        .arm_for(base.as_str());
+    complete_handoff(
+        &capture,
+        backend.did_close(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: base.clone() },
+        }),
+    )
+    .await;
+    assert_member(backend, &child, true).await;
+    std::fs::remove_file(base.to_file_path().unwrap()).unwrap();
+    watched_with_handoff(backend, base.clone(), FileChangeType::DELETED).await;
+    assert_member(backend, &child, false).await;
+    write(root, "R/base.R", base_text);
+    watched_with_handoff(backend, base.clone(), FileChangeType::CREATED).await;
+    assert_member(backend, &child, true).await;
+    let ignore = write(root, ".gitignore", "R/base.R\n");
+    watched_with_handoff(backend, ignore.clone(), FileChangeType::CREATED).await;
+    assert_member(backend, &child, false).await;
+    std::fs::remove_file(ignore.to_file_path().unwrap()).unwrap();
+    watched_with_handoff(backend, ignore, FileChangeType::DELETED).await;
+    assert_member(backend, &child, true).await;
+    let description = Url::from_file_path(root.join("DESCRIPTION")).unwrap();
+    std::fs::remove_file(description.to_file_path().unwrap()).unwrap();
+    watched_with_handoff(backend, description.clone(), FileChangeType::DELETED).await;
+    assert_member(backend, &child, false).await;
+    write(root, "DESCRIPTION", "Package: r6probe\nVersion: 0.0.1\n");
+    watched_with_handoff(backend, description, FileChangeType::CREATED).await;
+    assert_member(backend, &child, true).await;
+}
+
+#[tokio::test]
+async fn r6_creator_source_order_preserves_ordinary_scope_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let base = write(
+        root,
+        "next.R",
+        "Base <- R6::R6Class(portable=FALSE, public=list(member=1))\n",
+    );
+    let code = "Base <- NULL\nsource('next.R')\nChild <- R6::R6Class(inherit=Base, portable=FALSE, public=list(run=function() member))\nordinary <- Base\n";
+    let main = write(root, "main.R", code);
+    let service = service();
+    let backend = service.inner();
+    initialize(backend, root, true).await;
+    run_workspace_scan_transaction_inline(&backend.state)
+        .await
+        .expect_committed();
+    open_with_handoff(backend, &main, code).await;
+    let state = backend.state.read().await;
+    let inherited = crate::handlers::goto_definition(&state, &main, Position::new(2, 29)).unwrap();
+    assert!(matches!(inherited, GotoDefinitionResponse::Scalar(location) if location.uri == base));
+    let ordinary = crate::handlers::goto_definition(&state, &main, Position::new(3, 13)).unwrap();
+    assert!(
+        matches!(ordinary, GotoDefinitionResponse::Scalar(location) if location.uri == main && location.range.start.line == 0)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn r6_open_aliases_keep_canonical_creator_and_display_provenance() {
+    for package_mode in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let (open_uri, open_text, child, child_text) = if package_mode {
+            write(
+                &root,
+                "DESCRIPTION",
+                "Package: r6aliasprobe\nVersion: 0.0.1\n",
+            );
+            let text = "Base <- R6::R6Class(portable=FALSE, public=list(inherited=1))\nChild <- R6::R6Class(inherit=Base, portable=FALSE, public=list(run=function() { inherited; r6_typo }))\n";
+            write(&root, "R/a.R", text);
+            write(&root, "R/z.R", "Base <- NULL\n");
+            let uri = Url::from_file_path(alias.join("R/a.R")).unwrap();
+            (uri.clone(), text, uri, text)
+        } else {
+            write(
+                &root,
+                "parent.R",
+                "Parent <- R6::R6Class(portable=FALSE, public=list(inherited=1))\n",
+            );
+            let text = "source('parent.R')\nBase <- R6::R6Class(inherit=Parent, portable=FALSE)\n";
+            write(&root, "base.R", text);
+            let child_text = "source('base.R')\nChild <- R6::R6Class(inherit=Base, portable=FALSE, public=list(run=function() { inherited; r6_typo }))\n";
+            let child = write(&root, "child.R", child_text);
+            (
+                Url::from_file_path(alias.join("base.R")).unwrap(),
+                text,
+                child,
+                child_text,
+            )
+        };
+        let service = service();
+        let backend = service.inner();
+        initialize(backend, &root, true).await;
+        run_workspace_scan_transaction_inline(&backend.state)
+            .await
+            .expect_committed();
+        if package_mode {
+            let exclusions = backend.state.read().await.workspace_exclusions.clone();
+            backend
+                .reseed_package_inputs_and_refresh(root.clone(), exclusions, true)
+                .await
+                .unwrap();
+        }
+        open_with_handoff(backend, &open_uri, open_text).await;
+        if child != open_uri {
+            open_with_handoff(backend, &child, child_text).await;
+        }
+        let snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::build(&state, &child).unwrap()
+        };
+        let diagnostics = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &child,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap();
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.contains(&"r6_typo is not defined"), "{messages:?}");
+        assert_eq!(
+            messages.contains(&"inherited is not defined"),
+            package_mode,
+            "package={package_mode}: {messages:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn gitignore_reload_removes_dynamic_cycles_but_preserves_explicit_sources() {
     let temp = tempfile::tempdir().unwrap();
@@ -702,4 +999,124 @@ async fn gitignored_prerequisite_chain_survives_until_open_owner_commits() {
             .iter()
             .any(|edge| edge.to == helper)
     );
+}
+
+#[tokio::test]
+async fn r6_external_parent_context_transitions_refresh_package_consumers() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write(root, "DESCRIPTION", "Package: r6probe\nVersion: 0.0.1\n");
+    write(
+        root,
+        "R/base.R",
+        "Base <- R6::R6Class(portable=FALSE, public=list(inherited=1))\n",
+    );
+    write(
+        root,
+        "R/mid.R",
+        "Mid <- R6::R6Class(inherit=Base, portable=FALSE)\n",
+    );
+    let child_text = "Child <- R6::R6Class(inherit=Mid, portable=FALSE, public=list(run=function() c(inherited, typo)))\n";
+    let child = write(root, "R/child.R", child_text);
+    let parent = write(root, "parent.R", "NULL\n");
+    let service = service();
+    let backend = service.inner();
+    initialize(backend, root, true).await;
+    run_workspace_scan_transaction_inline(&backend.state)
+        .await
+        .expect_committed();
+    let exclusions = backend.state.read().await.workspace_exclusions.clone();
+    backend
+        .reseed_package_inputs_and_refresh(root.into(), exclusions, true)
+        .await
+        .unwrap();
+    open_with_handoff(backend, &child, child_text).await;
+    open_with_handoff(backend, &parent, "NULL\n").await;
+    async fn assert_inherited(backend: &Backend, uri: &Url, expected: bool) {
+        let snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::build(&state, uri).unwrap()
+        };
+        let diagnostics = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message == "inherited is not defined"),
+            expected,
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "typo is not defined")
+        );
+    }
+    assert_inherited(backend, &child, true).await;
+    for (version, text, expected) in [
+        (2, "source('R/mid.R')\nBase <- NULL\n", false),
+        (3, "NULL\n", true),
+    ] {
+        let capture = backend
+            .state
+            .read()
+            .await
+            .analysis_revalidation_final_handoff_test_capture
+            .arm_for(parent.as_str());
+        let tickets = complete_handoff(
+            &capture,
+            backend.did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: parent.clone(),
+                    version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                }],
+            }),
+        )
+        .await;
+        assert!(
+            tickets.iter().any(|ticket| ticket.uri == child),
+            "{tickets:?}"
+        );
+        assert_inherited(backend, &child, expected).await;
+    }
+    let capture = backend
+        .state
+        .read()
+        .await
+        .close_resync_final_handoff_test_capture
+        .arm_for(parent.as_str());
+    complete_handoff(
+        &capture,
+        backend.did_close(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: parent.clone(),
+            },
+        }),
+    )
+    .await;
+    for (text, expected) in [
+        ("source('R/mid.R')\nBase <- NULL\n", false),
+        ("NULL\n", true),
+    ] {
+        write(root, "parent.R", text);
+        let payload = watched_with_handoff(backend, parent.clone(), FileChangeType::CHANGED).await;
+        assert!(
+            payload
+                .reserved
+                .iter()
+                .chain(&payload.transferred)
+                .any(|ticket| ticket.uri == child),
+            "{payload:?}"
+        );
+        assert_inherited(backend, &child, expected).await;
+    }
 }

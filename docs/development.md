@@ -100,7 +100,7 @@ rejects reused benchmark artifacts and executable paths outside that revision's
 target directory, then copies the verified executables for measurement.
 
 CI covers all `startup` and `indentation` benchmarks, plus `cross_file`'s
-standalone cache, helper/package contributions, nested scopes through single-file
+standalone cache, helper/package contributions, R6 method scopes and extraction, nested scopes through single-file
 and production graph/streaming queries, deep graph scopes, and streaming sweeps
 at depths 1 and 5. Each invocation requests a 1-second warmup, 2-second measurement, and
 20 samples; benchmark groups can override the sample count.
@@ -750,6 +750,46 @@ These are two **independent** concepts; do not re-conflate them:
 - **Workspace-root fallback** (above) — try the path relative to the workspace root. This stays **forward-only**.
 
 In `resolve_path_rich`, the `try_workspace_fallback` bool now gates **only** the workspace-root fallback; the case-leniency branches are unconditional. Backward resolution (`resolve_path` / `resolve_backward_path_rich`) passes `try_workspace_fallback = false` — gaining the leniency but never the fallback. The backward case-mismatch diagnostic (`collect_backward_case_mismatch_diagnostics_standalone` in `handlers.rs`) reuses the `source-path-case-mismatch` code and `caseMismatchSeverity` policy but with a message that does not claim R errors (R never executes a backward directive).
+
+### R6 instance scope
+
+`cross_file/scope/r6.rs` extracts immutable class facts during ordinary artifact
+construction and resolves them into shared method environments. It retains no
+ASTs. `ScopeArtifacts` hashes those facts; package `RFileFacts` retains them
+independently of the artifact LRU, and `PackageScopeContribution` indexes only
+source declarations with ambiguity and helper-masking checks. Fact equality
+reuses existing package refresh and source-graph invalidation. Method ownership
+intervals are refreshed with local artifacts but excluded from inherited-interface
+equality and hashing, so body-only endpoint edits do not fan out to package consumers.
+
+The scope stream installs instance-parent bindings on method frames, below
+parameters/locals and above the creator's lexical environment. Point queries at
+R6 scope positions delegate to that stream, so source/import ownership has one
+implementation. Captured superclass expressions use a completed parent prefix
+plus EOF own-file scope, excluding method locals. Its private execution-order
+source mode reuses recursive path/ownership/leak handling while honoring sourced
+rebindings and removals; ordinary scope retains its existing merge policy. The
+creator prefix and EOF walks use separate fresh memos, outside the ordinary
+prefix and persistent standalone caches. Provider/graph URIs remain distinct
+from display URIs: superclass facts match exact declaration provenance among
+visible contributors. Package source changes also refresh admitted dev-context
+consumers such as `demo/`. Diagnostic forward-reference checks distinguish these deferred bindings from same-file source-cycle leaks.
+
+Resolution is lazy per stream, cancellation-aware, depth/member bounded, and
+shares immutable member layers across methods. Creator scopes are resolved once
+per participating file. Missing isolated siblings can use compact package facts;
+retained source/import/removal effects require a complete creator context. Missing
+contributors and truncated graph walks fail closed, preserving independently
+proven qualified own members. Package snapshots capture omitted creator parents
+from the full graph, and any neighborhood budget truncation vetoes creator-context
+inference (including in script workspaces). Completed-parent lookup stays at EOF
+through every ancestor. Parent-context transitions reuse package-consumer fanout and
+existing commit receipts. Conflicting caller/child writes are vetoed per name
+without affecting unrelated members. There is no persistent resolved-class cache or separate
+lifecycle generation. Ordinary files without R6 facts take the empty path.
+`r6_member_scope` covers CLI behavior; module tests compare stream/point lookup
+and provenance; the backend lifecycle regression exercises edits, disk restore,
+eviction, deletion/recreation, exclusions, and package-mode changes.
 
 ### File-level scope contributions
 
@@ -2111,6 +2151,17 @@ cargo test -p raven --test package_corpus -- --ignored --nocapture
 - `RAVEN_CORPUS_PACKAGES=dplyr,DT` — run only the named packages.
 - `RAVEN_CORPUS_ALLOW_UNCLASSIFIED=1` — pass when a new diagnostic appears that hasn't been triaged yet; without it, unclassified findings fail the run.
 - `RAVEN_CORPUS_KEEP_TEMP=1` — preserve fetched package sources for local inspection.
+
+The opt-in `RAVEN_CORPUS_GROUPS=modules-r6` group checks Rhino, box, box.lsp,
+and targets at full pinned Git revisions. It requires zero diagnostics in their
+production `R/` trees. Reports record the full revision and `diagnostic_scope`;
+raw test fixtures and external harness scripts are outside this group's assertion.
+The scanner still analyzes the whole checkout so package context is preserved.
+No fallback to a different source revision is allowed. Run it with:
+
+```bash
+RAVEN_CORPUS_GROUPS=modules-r6 cargo test -p raven --test package_corpus -- --ignored --nocapture
+```
 
 ## Coding conventions (repo-level)
 

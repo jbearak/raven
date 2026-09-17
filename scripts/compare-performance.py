@@ -28,6 +28,7 @@ SUITES = {
     "cross_file": (
         "^cross_file_standalone_cache/|"
         "^cross_file_scope_contributions/|"
+        "^cross_file_r6/|"
         "^cross_file_scope_hotspots/(nested_scope|nested_graph|nested_stream|graph_scope)/|"
         "^cross_file_diagnostic_sweep/streaming/(1|5)$"
     ),

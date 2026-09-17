@@ -867,6 +867,72 @@ fn bench_standalone_cache(c: &mut Criterion) {
     group.finish();
 }
 
+/// Repeated method queries share class layers and completed creator scopes.
+/// Keep parsing outside the diagnostic sweep, and measure extraction separately.
+fn bench_r6_method_scope(c: &mut Criterion) {
+    for (class_count, member_count) in [(8usize, 64), (128usize, 4)] {
+        let uri = Url::parse("file:///r6-benchmark.R").unwrap();
+        let mut text = String::new();
+        let mut positions = Vec::new();
+        for class in 0..class_count {
+            let inherit = if class == 0 {
+                String::new()
+            } else {
+                format!(", inherit=C{}", class - 1)
+            };
+            text.push_str(&format!(
+                "C{class} <- R6::R6Class(portable=FALSE{inherit}, public=base::list(\n"
+            ));
+            for member in 0..member_count {
+                text.push_str(&format!("m{class}_{member}=1,\n"));
+            }
+            for method in 0..8 {
+                positions.push((text.lines().count() as u32, 30));
+                text.push_str(&format!(
+                    "method{method}=function() {{ m0_0; m7_0; missing }}{}\n",
+                    if method == 7 { "" } else { "," }
+                ));
+            }
+            text.push_str("))\n");
+        }
+        let tree = raven::parser_pool::with_parser(|parser| parser.parse(&text, None)).unwrap();
+        let artifacts = Arc::new(compute_artifacts(&uri, &tree, &text));
+        let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+        let get_metadata = |_target: &Url| None;
+        let graph = DependencyGraph::new();
+        let exports = HashSet::new();
+        let sweep = || {
+            let cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            raven::cross_file::bench_scope_stream_sweep(
+                &uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                None,
+                20,
+                &exports,
+                true,
+                BackwardDependencyMode::Explicit,
+                &|| false,
+                &cache,
+                None,
+                &positions,
+                &["m0_0", "m7_0", "missing"],
+            )
+        };
+        assert_eq!(
+            sweep(),
+            8 * (class_count.min(32) + class_count.saturating_sub(7).min(32))
+        );
+        c.bench_function(&format!("cross_file_r6/method_sweep/{class_count}"), |b| {
+            b.iter(|| black_box(sweep()))
+        });
+        c.bench_function(&format!("cross_file_r6/extract/{class_count}"), |b| {
+            b.iter(|| black_box(compute_artifacts(&uri, &tree, &text)))
+        });
+    }
+}
+
 criterion_group!(
     benches,
     bench_scope_resolution,
@@ -877,5 +943,6 @@ criterion_group!(
     bench_forward_child_memo,
     bench_standalone_cache,
     bench_scope_contributions,
+    bench_r6_method_scope,
 );
 criterion_main!(benches);

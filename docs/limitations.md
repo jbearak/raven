@@ -73,6 +73,24 @@ only by the report do not lend target declarations back into the pipeline.
 unshadowed `c(name, ...)`; dynamic tidyselect expressions are not expanded. See
 [Cross-file awareness — tarchetypes target factories and report documents](./cross-file.md#tarchetypes-target-factories-and-report-documents).
 
+## R6 classes
+
+- Bare instance members require literal `portable = FALSE` and inline member
+  lists. Computed lists, class aliases, runtime `$set()` changes, and methods
+  supplied as separate function variables are not resolved.
+- Static inheritance follows top-level class bindings in the same file, eligible
+  package source files, or explicit source relationships. Nested class factories,
+  computed superclass expressions, explicit `parent_env`, and ambiguous package
+  class names do not contribute inherited members. Proven own members remain
+  available when an ancestor cannot be resolved.
+- If a sibling class changes its creator environment through `source()`, imports,
+  or removals, Raven needs that creator context in the current analysis snapshot.
+  An unavailable or truncated context contributes no guessed inherited members.
+- Conflicting writes in a source caller and child can leave superclass execution
+  order uncertain. Those names do not contribute inherited members.
+- Inheritance is cycle-safe and bounded to 32 classes and 4,096 member entries.
+  Raven does not inspect live R6 instances or synchronize with a running R session.
+
 ## R Markdown / Quarto
 
 R chunk bodies in `.Rmd` / `.Rmarkdown` / `.qmd` documents are fully analyzed as first-class R code. The following gaps are accepted limitations of the current implementation:

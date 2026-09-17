@@ -3058,8 +3058,8 @@ fn extend_with_watched_pre_update_dependents(
 /// `load_all()` sentinel package, so an `R/`-change-driven recompute of the
 /// [`crate::package_state::PackageScopeContribution`] re-diagnoses them.
 ///
-/// The package-visibility fanout in `did_change_watched_files` only force-marks
-/// open files that are `is_r_source_path` (under `R/` or `tests/testthat/`).
+/// The package-visibility fanout already marks source/test and dev-context
+/// files admitted by package scope contributions.
 /// A `devtools::load_all()` *carrier* — e.g. a root-level `analysis.R` or a
 /// `scripts/` file — is not `is_r_source_path`, so a change to the loaded
 /// package's `R/` would silently leave the carrier (and its source-graph
@@ -3147,7 +3147,7 @@ fn extend_affected_for_load_all_revalidation(
 /// then widens `affected` / `affected_set`. Lock-safe — touches only cache
 /// peeks, graph reachability, and per-doc booleans. Called from the
 /// package-visibility-change blocks of `did_change_watched_files` alongside
-/// the existing `R/`+`tests/` fanout.
+/// the existing package-scope consumer fanout.
 fn extend_affected_for_load_all_revalidation_from_state(
     affected: &mut Vec<Url>,
     affected_set: &mut std::collections::HashSet<Url>,
@@ -4006,12 +4006,22 @@ fn authoritative_package_r_file_kind_for_open_document(
         .and_then(|path| crate::package_state::is_r_source_path(&path, root))
 }
 
-fn is_authoritative_package_source_open_uri(
+/// Open consumers admitted by the shared package contribution selector. Dev
+/// contexts borrow namespace symbols/classes too, so source edits must refresh
+/// them even when they are not package-input files themselves.
+pub(crate) fn is_authoritative_package_scope_consumer_open_uri(
     state: &WorldState,
     open_uri: &Url,
     root: &std::path::Path,
 ) -> bool {
     authoritative_package_r_file_kind_for_open_document(state, open_uri, root).is_some()
+        || state
+            .authoritative_workspace_query_uri_for_open_document(open_uri, root)
+            .as_ref()
+            .unwrap_or(open_uri)
+            .to_file_path()
+            .ok()
+            .is_some_and(|path| crate::package_state::is_dev_context_path(&path, root))
 }
 
 fn package_scope_workspace_r_path_for_open_document(
@@ -10898,23 +10908,24 @@ fn capture_open_edit_fallback(
     let package_text = package_event_uri
         .as_ref()
         .map(|_| Arc::<str>::from(prepared.document().text()));
-    let (package_fanout_uris, package_source_interface_fanout) =
-        if !subject_excluded && let Some(package) = state.package_workspace() {
-            (
-                state
-                    .documents
-                    .keys()
-                    .filter(|open_uri| {
-                        is_authoritative_package_source_open_uri(state, open_uri, &package.root)
-                    })
-                    .cloned()
-                    .collect(),
-                authoritative_package_r_file_kind_for_open_document(state, uri, &package.root)
-                    == Some(crate::package_state::RFileKind::Source),
-            )
-        } else {
-            (Vec::new(), false)
-        };
+    let (package_fanout_uris, package_source_interface_fanout) = if !subject_excluded
+        && let Some(package) = state.package_workspace()
+    {
+        (
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    is_authoritative_package_scope_consumer_open_uri(state, open_uri, &package.root)
+                })
+                .cloned()
+                .collect(),
+            authoritative_package_r_file_kind_for_open_document(state, uri, &package.root)
+                == Some(crate::package_state::RFileKind::Source),
+        )
+    } else {
+        (Vec::new(), false)
+    };
     let mut plan = PreparedOpenCommitPlan {
         package_event: package_event_uri.zip(package_text),
         package_fanout_uris,
@@ -11094,7 +11105,7 @@ fn capture_live_package_open_edit_with_metadata(
                 .documents
                 .keys()
                 .filter(|open_uri| {
-                    is_authoritative_package_source_open_uri(state, open_uri, &package.root)
+                    is_authoritative_package_scope_consumer_open_uri(state, open_uri, &package.root)
                 })
                 .cloned()
                 .collect();
@@ -11928,7 +11939,7 @@ fn capture_open_close_analysis(
                 .keys()
                 .filter(|open_uri| {
                     *open_uri != &uri
-                        && is_authoritative_package_source_open_uri(state, open_uri, root)
+                        && is_authoritative_package_scope_consumer_open_uri(state, open_uri, root)
                 })
                 .cloned()
                 .collect()
@@ -12545,7 +12556,9 @@ fn capture_open_install_analysis(
             state
                 .documents
                 .keys()
-                .filter(|open_uri| is_authoritative_package_source_open_uri(state, open_uri, root))
+                .filter(|open_uri| {
+                    is_authoritative_package_scope_consumer_open_uri(state, open_uri, root)
+                })
                 .cloned()
                 .collect()
         })
@@ -13217,22 +13230,23 @@ fn commit_open_metadata_reenrichment(
     crate::state::AnalysisCommitRejected,
 > {
     let uri = captured.uri.clone();
-    let (package_fanout_uris, package_source_interface_fanout) = if let Some(pkg) =
-        state.package_workspace()
-    {
-        let fanout = state
-            .documents
-            .keys()
-            .filter(|open_uri| is_authoritative_package_source_open_uri(state, open_uri, &pkg.root))
-            .cloned()
-            .collect();
-        let source_edit =
-            authoritative_package_r_file_kind_for_open_document(state, &uri, &pkg.root)
-                == Some(crate::package_state::RFileKind::Source);
-        (fanout, source_edit)
-    } else {
-        (Vec::new(), false)
-    };
+    let (package_fanout_uris, package_source_interface_fanout) =
+        if let Some(pkg) = state.package_workspace() {
+            let fanout = state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    is_authoritative_package_scope_consumer_open_uri(state, open_uri, &pkg.root)
+                })
+                .cloned()
+                .collect();
+            let source_edit =
+                authoritative_package_r_file_kind_for_open_document(state, &uri, &pkg.root)
+                    == Some(crate::package_state::RFileKind::Source);
+            (fanout, source_edit)
+        } else {
+            (Vec::new(), false)
+        };
     let plan = PreparedOpenCommitPlan {
         graph: derived.graph,
         package_fanout_uris,
@@ -19717,24 +19731,25 @@ impl LanguageServer for Backend {
                 let package_text = package_event_uri
                     .as_ref()
                     .map(|_| Arc::<str>::from(prepared.document().text()));
-                let (package_fanout_uris, package_source_interface_fanout) = if let Some(pkg) =
-                    state.package_workspace()
-                {
-                    let fanout = state
-                        .documents
-                        .keys()
-                        .filter(|open_uri| {
-                            is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root)
-                        })
-                        .cloned()
-                        .collect();
-                    let source_edit = authoritative_package_r_file_kind_for_open_document(
-                        &state, &uri, &pkg.root,
-                    ) == Some(crate::package_state::RFileKind::Source);
-                    (fanout, source_edit)
-                } else {
-                    (Vec::new(), false)
-                };
+                let (package_fanout_uris, package_source_interface_fanout) =
+                    if let Some(pkg) = state.package_workspace() {
+                        let fanout = state
+                            .documents
+                            .keys()
+                            .filter(|open_uri| {
+                                is_authoritative_package_scope_consumer_open_uri(
+                                    &state, open_uri, &pkg.root,
+                                )
+                            })
+                            .cloned()
+                            .collect();
+                        let source_edit = authoritative_package_r_file_kind_for_open_document(
+                            &state, &uri, &pkg.root,
+                        ) == Some(crate::package_state::RFileKind::Source);
+                        (fanout, source_edit)
+                    } else {
+                        (Vec::new(), false)
+                    };
                 let plan = PreparedOpenCommitPlan {
                     graph,
                     package_event: package_event_uri.zip(package_text),

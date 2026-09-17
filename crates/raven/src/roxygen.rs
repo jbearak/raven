@@ -1591,25 +1591,35 @@ fn extract_first_identifier(line: &str) -> Option<String> {
 /// diagnostics once dev-context dirs (demo/, vignettes/, …) gained package
 /// visibility — e.g. stats `demo/smooth.R`'s genuine `x1` bug.
 pub fn extract_top_level_defs(text: &str) -> std::collections::BTreeSet<String> {
+    let uri = tower_lsp::lsp_types::Url::parse("memory:///derive.R").expect("static URI");
+    extract_top_level_facts(&uri, text).0
+}
+
+/// Package derivation reuses this parse for names and compact R6 declarations;
+/// the authoritative file URI preserves inherited member navigation provenance.
+pub(crate) fn extract_top_level_facts(
+    uri: &tower_lsp::lsp_types::Url,
+    text: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::sync::Arc<crate::cross_file::scope::r6::FileFacts>,
+) {
     use tree_sitter::Parser;
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .is_err()
     {
-        return std::collections::BTreeSet::new();
+        return Default::default();
     }
     let Some(tree) = parser.parse(text, None) else {
-        return std::collections::BTreeSet::new();
+        return Default::default();
     };
-    let uri = match tower_lsp::lsp_types::Url::parse("memory:///derive.R") {
-        Ok(u) => u,
-        Err(_) => return std::collections::BTreeSet::new(),
-    };
-    let artifacts = crate::cross_file::scope::compute_artifacts(&uri, &tree, text);
-    crate::cross_file::scope::live_top_level_exports(&artifacts)
+    let artifacts = crate::cross_file::scope::compute_artifacts(uri, &tree, text);
+    let names = crate::cross_file::scope::live_top_level_exports(&artifacts)
         .into_iter()
-        .collect()
+        .collect();
+    (names, artifacts.r6)
 }
 
 #[cfg(test)]

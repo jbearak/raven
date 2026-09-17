@@ -1,6 +1,8 @@
 # Package namespace and non-portable R6 false positives
 
-Status: PR 1 implementation and review in progress; PR 2 is planned.
+Status: PR 1 merged as [#769](https://github.com/jbearak/raven/pull/769).
+PR 2 implementation and architecture review are complete. Local validation and
+independent review precede publication; CI and PR review gate the merge.
 
 ## Scope and success criteria
 
@@ -164,6 +166,45 @@ but does not model bare member bindings. Targets declares its affected classes
 with `portable = FALSE`. Most findings refer to members declared in the same
 class; others, such as `scheduler` and `seconds_meta_append`, are inherited
 from classes in other `R/` files.
+
+### Selected architecture
+
+The dedicated architecture review used the `codebase-design` skill. Read-only
+design preparation overlapped PR 1's final benchmark wait; implementation starts
+from its merged commit. The selected module has two responsibilities behind a
+small interface: extract immutable per-file class facts and resolve those facts
+into method environments using existing scope inputs. It owns constructor/list
+identity, argument matching, member declarations, inheritance, and traversal
+budgets. Class identity includes declaration provenance, not just the class name.
+
+`ScopeArtifacts` retains the facts from its existing parse. Package `RFileFacts`
+retains compact facts independently of the artifact LRU, and the package
+contribution carries only eligible source declarations. Semantic fact changes
+participate in artifact hashing and package contribution equality, reusing the
+existing revalidation paths. No persistent inheritance cache is needed.
+
+Method environments become instance-parent bindings on existing stream function
+frames: method and nested-closure locals win, then instance members, then the
+enclosing lexical/package environment. Point queries inside recognized R6 methods
+delegate to the same stream. Ordinary point queries and internal recursive
+source/prefix walks keep their existing path. This avoids adding a second model
+of source/import/data binding ownership to the flat point evaluator.
+
+Rejected alternatives were file-level scope contributions (wrong lifetime and
+precedence), diagnostic-only suppression (different behavior for interactive
+consumers), and extending the flat evaluator with a second frame-ownership model
+(larger regression surface). The stream is the existing shared implementation
+with the needed ownership information.
+
+Superclass lookup uses the completed creator environment, never method locals.
+The initial static subset covers top-level same-file/package classes and explicit
+source relationships with proven binding provenance. Nested classes can receive
+own members; arbitrary explicit `parent_env`, factories, aliases, runtime `$set`,
+and unresolved creator environments contribute no guessed inherited members.
+Resolution is bounded and cycle-safe; unavailable ancestors do not erase proven
+own members. Defaults are part of method scope, while field initializers remain
+outside it. Tests cross the same extraction/resolution and scope interfaces used
+by production callers.
 
 1. Add a small shared R6 scope module, with a single implementation of call
    recognition, class facts, and member visibility. Capture compact facts during

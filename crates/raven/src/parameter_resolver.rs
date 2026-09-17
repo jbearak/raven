@@ -15,6 +15,7 @@ use lru::LruCache;
 use tree_sitter::Node;
 use url::Url;
 
+use crate::content_provider::ContentProvider;
 use crate::cross_file::SymbolKind;
 use crate::cross_file::scope::ScopeAtPosition;
 use crate::state::WorldState;
@@ -350,6 +351,50 @@ pub fn resolve_user_only(
     current_uri: &Url,
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
+    // R6 method frames can shadow a same-named file function with a member
+    // whose definition is an argument tag rather than an assignment. Resolve
+    // through the shared frame scope before the assignment-only AST search.
+    if state
+        .content_provider()
+        .get_artifacts(current_uri)
+        .is_some_and(|artifacts| {
+            artifacts
+                .r6
+                .contains_scope_point(crate::cross_file::scope::Position::new(
+                    position.line,
+                    position.character,
+                ))
+        })
+    {
+        let scope = get_scope(state, current_uri, position);
+        let name = crate::handlers::unquote_backtick_name(function_name).unwrap_or(function_name);
+        let symbol = scope
+            .symbols
+            .get(function_name)
+            .or_else(|| scope.symbols.get(name))?;
+        if symbol.kind != SymbolKind::Function || symbol.source_uri.scheme() == "package" {
+            return None;
+        }
+        return symbol
+            .signature
+            .as_ref()
+            .map(|signature| FunctionSignature {
+                name: function_name.to_owned(),
+                parameters: parse_signature_parameters(signature),
+                source: if symbol.source_uri == *current_uri {
+                    SignatureSource::CurrentFile {
+                        uri: symbol.source_uri.clone(),
+                        line: symbol.defined_line,
+                    }
+                } else {
+                    SignatureSource::CrossFile {
+                        uri: symbol.source_uri.clone(),
+                        line: symbol.defined_line,
+                    }
+                },
+            });
+    }
+
     // Phase 1: Local AST search (current file)
     if let Some(sig) = resolve_from_current_file(state, function_name, current_uri, position) {
         return Some(sig);

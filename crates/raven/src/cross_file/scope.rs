@@ -24,6 +24,7 @@ use super::types::{ForwardSource, byte_offset_to_utf16_column};
 use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
 mod contributions;
+pub mod r6;
 use contributions::ScopeContributions;
 pub(crate) use contributions::{rprofile_prelude_applies, test_helper_sources_for_symbol};
 mod evaluation;
@@ -846,6 +847,8 @@ pub struct ConditionalShinyDeferredScope {
 /// Per-file scope artifacts
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
+    /// Immutable R6 declarations, shared with package facts and scope streams.
+    pub r6: Arc<r6::FileFacts>,
     /// All symbols **defined anywhere** in this file, INCLUDING ones bound
     /// inside function bodies (e.g. a local `x <- 1` within `f <- function()
     /// { x <- 1 }`). This is a flat, scope-blind, rm-blind map.
@@ -910,6 +913,7 @@ impl Default for ScopeArtifacts {
     /// ```
     fn default() -> Self {
         Self {
+            r6: Arc::default(),
             exported_interface: HashMap::new(),
             timeline: Vec::new(),
             interface_hash: 0,
@@ -2757,6 +2761,21 @@ pub fn compute_artifacts_with_metadata(
         box_exports,
     );
 
+    if content.contains("R6Class") {
+        let completed_scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        artifacts.r6 = Arc::new(r6::extract(
+            uri,
+            root,
+            content,
+            &mut capture_bindings,
+            &completed_scope,
+            &artifacts.timeline,
+        ));
+        let mut hash = DefaultHasher::new();
+        artifacts.interface_hash.hash(&mut hash);
+        artifacts.r6.hash(&mut hash);
+        artifacts.interface_hash = hash.finish();
+    }
     artifacts
 }
 
@@ -6480,6 +6499,37 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
+    // R6 needs the stream's actual frame ownership for local source/import
+    // bindings. Internal recursive/EOF walks keep the ordinary point path.
+    if get_artifacts(uri).is_some_and(|artifacts| {
+        artifacts
+            .r6
+            .contains_scope_point(Position::new(line, column))
+    }) {
+        let cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        if let Some(mut stream) = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            &cache,
+            package_contribution,
+            data_alias_provider,
+            selective_import_provider,
+            None,
+            package_query_uri,
+        ) {
+            stream.advance_to(line, column);
+            return stream.snapshot();
+        }
+    }
+
     let mut visited = HashMap::new();
 
     // Build initial PathContext for the root file
@@ -6521,6 +6571,7 @@ where
         false,
         None,
         &forward_child_memo,
+        SourceBindingMerge::Ordinary,
     )
 }
 
@@ -6754,6 +6805,39 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
+    if get_artifacts(uri).is_some_and(|artifacts| {
+        artifacts
+            .r6
+            .contains_scope_point(Position::new(line, column))
+    }) {
+        let cache = std::cell::RefCell::new(std::mem::take(prefix_cache));
+        let result = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            &cache,
+            package_contribution,
+            data_alias_provider,
+            selective_import_provider,
+            standalone_ctx,
+            package_query_uri,
+        )
+        .map(|mut stream| {
+            stream.advance_to(line, column);
+            stream.snapshot()
+        })
+        .unwrap_or_default();
+        *prefix_cache = cache.into_inner();
+        return result;
+    }
+
     // Determine query_inside_function for the queried URI at (line, column).
     // This is the only bit that splits the cache for a given URI.
     let inside = match get_artifacts(uri) {
@@ -6803,6 +6887,7 @@ where
                 backward_dep_mode,
                 is_cancelled,
                 &forward_child_memo,
+                SourceBindingMerge::Ordinary,
             );
             let arc = Arc::new(computed);
             prefix_cache
@@ -6853,7 +6938,23 @@ where
         false,
         None,
         &forward_child_memo,
+        SourceBindingMerge::Ordinary,
     )
+}
+
+/// Shared parent eligibility for ordinary scope and R6 context completeness.
+/// Non-lending relationships never establish a creator environment; explicit
+/// backward declarations opt out of unrelated AST callers in Auto mode.
+pub(crate) fn parent_edge_lends_scope(
+    edge: &super::dependency::DependencyEdge,
+    metadata: Option<&super::types::CrossFileMetadata>,
+    mode: super::config::BackwardDependencyMode,
+) -> bool {
+    let explicit_only = mode == super::config::BackwardDependencyMode::Explicit
+        || metadata.is_some_and(|metadata| !metadata.sourced_by.is_empty());
+    !metadata.is_some_and(|metadata| metadata.standalone)
+        && edge.lends_scope()
+        && (!explicit_only || edge.is_backward_directive)
 }
 
 /// Cached result of STEP 1 (the parent walk) for a queried URI.
@@ -6870,6 +6971,9 @@ where
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParentPrefix {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    // Only execution-order creator queries propagate parent removal vetoes.
+    // Ordinary source scope keeps its established approximation unchanged.
+    removed_names: HashSet<Arc<str>>,
     named_search_path: NamedSearchPath,
     pub chain: Vec<Url>,
     pub visible_positions: HashMap<Url, (u32, u32)>,
@@ -6900,6 +7004,7 @@ impl ParentPrefix {
         // WI2b hook cache/serve a caller-dependent scope under a URI-only key.
         let Self {
             symbols,
+            removed_names,
             named_search_path,
             chain,
             visible_positions,
@@ -6911,6 +7016,7 @@ impl ParentPrefix {
             package_origins,
         } = self;
         symbols.is_empty()
+            && removed_names.is_empty()
             && named_search_path.environments.is_empty()
             && chain.is_empty()
             && visible_positions.is_empty()
@@ -6966,6 +7072,7 @@ fn parent_prefix_at<F, G>(
     // forward-source expansions share the same forward-child memo as STEP 2
     // (issue #472).
     forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
+    merge_policy: SourceBindingMerge<'_>,
 ) -> ParentPrefix
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7001,7 +7108,8 @@ where
     // safe-direction: if the file actually relied on a caller-provided binding,
     // the worst case is a false "undefined" INSIDE the file — never a hidden bug
     // in a caller.
-    if get_metadata(uri).is_some_and(|m| m.standalone) {
+    let child_metadata = get_metadata(uri);
+    if child_metadata.as_ref().is_some_and(|m| m.standalone) {
         return prefix;
     }
 
@@ -7009,12 +7117,6 @@ where
     // be applied before same-parent grouping: otherwise a later AST edge can
     // displace an earlier backward directive and then itself be filtered out in
     // Explicit mode (or Auto's per-file explicit opt-out).
-    let require_backward_directive = match backward_dep_mode {
-        super::config::BackwardDependencyMode::Explicit => true,
-        super::config::BackwardDependencyMode::Auto => {
-            get_metadata(uri).is_some_and(|m| !m.sourced_by.is_empty())
-        }
-    };
 
     // Multiple real invocations from one parent are substitutable only when they
     // use the same symbol-inheritance and package-flow policies. Top-level calls
@@ -7041,7 +7143,7 @@ where
         // A selective `box::use()` module edge never lends parent prefix/scope
         // (issue #662); `lends_scope()` folds that in with the `non_lending`
         // exclusion so both stay in lockstep.
-        if !edge.lends_scope() || (require_backward_directive && !edge.is_backward_directive) {
+        if !parent_edge_lends_scope(edge, child_metadata.as_deref(), backward_dep_mode) {
             continue;
         }
 
@@ -7222,6 +7324,7 @@ where
                     kind,
                 }),
             forward_child_memo,
+            merge_policy,
         );
 
         // A queried tar member sees the exact prefix of siblings executed
@@ -7270,6 +7373,7 @@ where
                 None,
                 // Backward parent walk: selective imports never lend upward.
                 None,
+                merge_policy,
             );
             for name in std::mem::take(&mut parent_scope.named_search_path.projected_names) {
                 parent_scope.symbols.remove(&name);
@@ -7323,6 +7427,12 @@ where
         // fallbacks. Carry the environments separately and omit those projected
         // names from the lexical prefix, otherwise a child attachment can never
         // outrank an older parent attachment.
+        if merge_policy.is_execution_order() && !declared_only_parent {
+            for name in &parent_scope.removed_names {
+                prefix.symbols.remove(name);
+                prefix.removed_names.insert(name.clone());
+            }
+        }
         let parent_projected_names = parent_scope.named_search_path.projected_names.clone();
         if !declared_only_parent {
             prefix
@@ -7346,7 +7456,10 @@ where
             if i & 63 == 0 && is_cancelled() {
                 return prefix;
             }
-            if symbol.source_uri == *uri || parent_projected_names.contains(&name) {
+            if symbol.source_uri == *uri
+                || parent_projected_names.contains(&name)
+                || prefix.removed_names.contains(&name)
+            {
                 continue;
             }
             if declared_only_parent {
@@ -7542,6 +7655,49 @@ where
     prefix
 }
 
+/// Ordinary scope keeps its established local-first source approximation.
+/// R6 creator lookup needs execution-order replacement to prove which class a
+/// captured superclass names. That mode uses fresh forward memos and no shared
+/// prefix/standalone cache; the public scope interface stays unchanged.
+#[derive(Clone, Copy)]
+enum SourceBindingMerge<'a> {
+    Ordinary,
+    ExecutionOrder(&'a std::cell::RefCell<HashSet<Arc<str>>>),
+}
+
+impl SourceBindingMerge<'_> {
+    fn is_execution_order(self) -> bool {
+        matches!(self, Self::ExecutionOrder(_))
+    }
+
+    /// Any ancestor's completed parent may conflict with that ancestor's replay.
+    /// Accumulate uncertainty for this creator query, including recursive walks;
+    /// no uncertainty is retained in ordinary scopes or persistent caches.
+    fn record_parent_conflicts(
+        self,
+        parent_symbols: &HashMap<Arc<str>, ScopedSymbol>,
+        parent_removals: &HashSet<Arc<str>>,
+        scope: &ScopeAtPosition,
+    ) {
+        if let Self::ExecutionOrder(uncertain) = self {
+            uncertain.borrow_mut().extend(
+                parent_symbols
+                    .iter()
+                    .filter(|(name, symbol)| {
+                        scope.symbols.get(*name).is_some_and(|own| own != *symbol)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .chain(
+                        parent_removals
+                            .iter()
+                            .filter(|name| scope.symbols.contains_key(*name))
+                            .cloned(),
+                    ),
+            );
+        }
+    }
+}
+
 /// Resolve one ordered `tar_source()` batch without walking a member's
 /// backward parents.
 ///
@@ -7573,6 +7729,7 @@ fn resolve_tar_batch_contribution<F, G>(
     is_cancelled: &dyn Fn() -> bool,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
     selective_import_provider: Option<&SelectiveImportProvider<'_>>,
+    merge_policy: SourceBindingMerge<'_>,
 ) -> ChildSourceContribution
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7701,6 +7858,7 @@ where
             true,
             None,
             &member_forward_memo,
+            merge_policy,
         );
 
         extend_visible_positions(
@@ -7905,6 +8063,7 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // distinct `(child, path context, loaded package set, attached package
     // set)` is resolved once per top-level query. See [`ForwardChildMemo`].
     forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
+    merge_policy: SourceBindingMerge<'_>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7944,7 +8103,8 @@ where
     let standalone_store: Option<(
         super::standalone_cache::StandaloneCacheCtx,
         super::standalone_cache::StandaloneScopeKey,
-    )> = if line == u32::MAX
+    )> = if !merge_policy.is_execution_order()
+        && line == u32::MAX
         && column == u32::MAX
         && current_depth >= 1
         && data_alias_provider.is_none()
@@ -8119,7 +8279,8 @@ where
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
-    let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+    let query_inside_function = (hoist_globals && !active_function_scopes.is_empty())
+        || (merge_policy.is_execution_order() && line == u32::MAX && column == u32::MAX);
 
     // STEP 1: Process parent context from dependency graph edges
     // Skip on re-visit: parent symbols were already collected on the first visit.
@@ -8148,6 +8309,10 @@ where
                             entry.insert(symbol.clone());
                         }
                     }
+                }
+                for name in &prefix.removed_names {
+                    scope.symbols.remove(name);
+                    scope.removed_names.insert(name.clone());
                 }
                 scope.chain.extend(prefix.chain.iter().cloned());
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
@@ -8192,6 +8357,7 @@ where
                     backward_dep_mode,
                     is_cancelled,
                     forward_child_memo,
+                    merge_policy,
                 );
 
                 scope
@@ -8208,6 +8374,10 @@ where
                             entry.insert(symbol);
                         }
                     }
+                }
+                for name in prefix.removed_names {
+                    scope.symbols.remove(&name);
+                    scope.removed_names.insert(name);
                 }
                 scope.chain.extend(prefix.chain);
                 extend_visible_positions(&mut scope.visible_positions, &prefix.visible_positions);
@@ -8242,6 +8412,26 @@ where
             return scope;
         }
     } // end if !is_revisit (STEP 1)
+
+    // Only discovered completed parents have uncertain execution order. An
+    // explicit batch prefix is ordered input, while the outer creator adapter
+    // checks its own precomputed completed prefix separately.
+    let creator_parent_state = (merge_policy.is_execution_order() && pre_computed_prefix.is_none())
+        .then(|| {
+            (
+                scope
+                    .parent_prefix_symbol_names
+                    .iter()
+                    .filter_map(|name| {
+                        scope
+                            .symbols
+                            .get(name)
+                            .map(|symbol| (name.clone(), symbol.clone()))
+                    })
+                    .collect(),
+                scope.removed_names.clone(),
+            )
+        });
 
     // Attachments established before this file executes must participate in
     // position-aware timeline evaluation. Phase 5a still appends their package
@@ -8382,6 +8572,7 @@ where
                 if should_apply_local_scoping(source)
                     && effective_function_scope.is_none()
                     && !package_effects_only
+                    && !merge_policy.is_execution_order()
                 {
                     continue;
                 }
@@ -8671,6 +8862,7 @@ where
                                     child_prefer_supplied_path_context,
                                     None,
                                     forward_child_memo,
+                                    merge_policy,
                                 )
                             },
                         )
@@ -8703,6 +8895,7 @@ where
                             child_prefer_supplied_path_context,
                             None,
                             forward_child_memo,
+                            merge_policy,
                         )
                     };
                     extend_visible_positions(
@@ -8723,6 +8916,13 @@ where
                         // `child_source_symbol_is_leak`.
                         let child_parent_prefix_symbol_names =
                             child_scope.parent_prefix_symbol_names.clone();
+                        if merge_policy.is_execution_order() {
+                            for name in &child_scope.removed_names {
+                                scope.symbols.remove(name);
+                                scope.parent_prefix_symbol_names.remove(name);
+                                scope.removed_names.insert(name.clone());
+                            }
+                        }
                         for (name, symbol) in child_scope.symbols {
                             if child_scope.named_search_path.is_projected(&name)
                                 || child_source_symbol_is_leak(
@@ -8769,7 +8969,9 @@ where
                             {
                                 continue;
                             }
-                            if scope.parent_prefix_symbol_names.remove(&name) {
+                            if scope.parent_prefix_symbol_names.remove(&name)
+                                || merge_policy.is_execution_order()
+                            {
                                 scope.removed_names.remove(&name);
                                 scope.symbols.insert(name, symbol);
                             } else {
@@ -8858,6 +9060,7 @@ where
                     is_cancelled,
                     data_alias_provider,
                     selective_import_provider,
+                    merge_policy,
                 );
                 scope
                     .named_search_path
@@ -8979,6 +9182,10 @@ where
                 );
             }
         }
+    }
+
+    if let Some((parent_symbols, parent_removals)) = creator_parent_state {
+        merge_policy.record_parent_conflicts(&parent_symbols, &parent_removals, &scope);
     }
 
     // Reconcile stale parent-prefix markers (issue #476). A name this file
@@ -9106,6 +9313,8 @@ pub fn is_package_internal_uri(uri: &Url) -> bool {
 /// calls `scope.symbols.remove(...)` over the merged map).
 #[derive(Debug, Clone, Default)]
 struct ScopeFrame {
+    /// Instance bindings are the method's parent environment, below its locals.
+    r6_parent: Option<Arc<r6::MethodEnvironment>>,
     symbols: HashMap<Arc<str>, ScopedSymbol>,
     named_search_path: NamedSearchPath,
     packages: HashSet<String>,
@@ -9228,6 +9437,10 @@ where
 {
     queried_uri: &'a Url,
     artifacts: Arc<ScopeArtifacts>,
+    r6_methods: Option<r6::ResolvedScopes>,
+    /// Authoritative root identity for R6 creator/package lookup; symbols keep
+    /// their display URI for navigation through open aliases.
+    r6_creator_uri: &'a Url,
 
     /// Stage-1 prefix cache slots (top-level vs inside-function), pre-computed
     /// at construction. Both point into the snapshot's shared
@@ -9624,6 +9837,8 @@ where
         Some(Self {
             queried_uri,
             artifacts,
+            r6_methods: None,
+            r6_creator_uri: package_query_uri.unwrap_or(queried_uri),
             prefix_top,
             prefix_in_function,
             global_strict_frame,
@@ -9726,6 +9941,9 @@ where
         Some(Self {
             queried_uri,
             artifacts,
+            // This stream computes attachment activation, not lexical bindings.
+            r6_methods: Some(r6::ResolvedScopes::default()),
+            r6_creator_uri: queried_uri,
             prefix_top: prefix.clone(),
             prefix_in_function: prefix,
             global_strict_frame,
@@ -9971,6 +10189,12 @@ where
                     Position::new(*end_line, *end_column),
                 );
                 let mut frame = ScopeFrame::default();
+                self.ensure_r6_methods();
+                frame.r6_parent = self
+                    .r6_methods
+                    .as_ref()
+                    .and_then(|methods| methods.methods.get(&interval))
+                    .cloned();
                 for param in parameters {
                     frame.symbols.insert(param.name.clone(), param.clone());
                 }
@@ -10326,6 +10550,7 @@ where
             self.is_cancelled,
             self.data_alias_provider,
             self.selective_import_provider,
+            SourceBindingMerge::Ordinary,
         );
         if self.resolution_depth + 1 >= self.max_depth && contribution.depth_exceeded.is_empty() {
             contribution
@@ -10400,17 +10625,32 @@ where
     /// Takes `&mut self` because in-function queries with hoisting build
     /// `global_late_frame` lazily on first need.
     pub fn is_visible(&mut self, name: &str) -> bool {
+        self.ensure_r6_methods();
+        if self
+            .captured_r6_base()
+            .is_some_and(|symbol| symbol.name.as_ref() == name)
+        {
+            return true;
+        }
         if self.query_inside_function() {
             self.ensure_global_late_frame();
         }
         // Innermost function frames first — a body-local `x` masks any
         // outer `x`, but a `rm("x")` in this frame removes the visibility
         // entirely (same merged-scope semantics as `apply_removal`).
+        let instance_member = self.is_r6_member(name);
         for (_iv, frame) in self.function_stack.iter().rev() {
             if frame.symbols.contains_key(name) {
                 return true;
             }
-            if frame.removed_names.contains(name) {
+            if frame
+                .r6_parent
+                .as_ref()
+                .is_some_and(|parent| parent.contains(name))
+            {
+                return true;
+            }
+            if frame.removed_names.contains(name) && !instance_member {
                 // Contribution re-injects after rm() in the recursive
                 // resolver's depth-0 ordering, so we must match that:
                 // a removed name remains visible if the package
@@ -10478,6 +10718,7 @@ where
     /// Takes `&mut self` because in-function queries with hoisting build
     /// `global_late_frame` lazily on first need.
     pub fn snapshot(&mut self) -> ScopeAtPosition {
+        self.ensure_r6_methods();
         if self.query_inside_function() {
             self.ensure_global_late_frame();
         }
@@ -10561,6 +10802,9 @@ where
 
         // Layer each function frame, outermost-to-innermost so innermost wins.
         for (_iv, frame) in &self.function_stack {
+            if let Some(parent) = &frame.r6_parent {
+                parent.apply(&mut scope.symbols);
+            }
             for (name, symbol) in &frame.symbols {
                 scope.symbols.insert(name.clone(), symbol.clone());
             }
@@ -10611,13 +10855,17 @@ where
         // Def would resurrect it — the insertion order for removals into the
         // flat set is consistent with the recursive resolver's timeline order.
         for name in &global.removed_names {
-            scope.symbols.remove(name);
-            scope.removed_names.insert(name.clone());
+            if !self.is_r6_member(name) {
+                scope.symbols.remove(name);
+                scope.removed_names.insert(name.clone());
+            }
         }
         for (_iv, frame) in &self.function_stack {
             for name in &frame.removed_names {
-                scope.symbols.remove(name);
-                scope.removed_names.insert(name.clone());
+                if !self.is_r6_member(name) {
+                    scope.symbols.remove(name);
+                    scope.removed_names.insert(name.clone());
+                }
             }
         }
 
@@ -10681,6 +10929,9 @@ where
             .named_search_path
             .project_fallbacks(&mut scope.symbols);
         retain_current_namespace_import_aliases(&mut scope);
+        if let Some(symbol) = self.captured_r6_base() {
+            scope.symbols.insert(symbol.name.clone(), symbol.clone());
+        }
         scope
     }
 
@@ -10691,15 +10942,30 @@ where
     /// Walk order matches `is_visible` and `snapshot`: innermost function
     /// frame wins, then global frame, then prefix.
     pub fn symbol_for(&mut self, name: &str) -> Option<ScopedSymbol> {
+        self.ensure_r6_methods();
+        if let Some(symbol) = self
+            .captured_r6_base()
+            .filter(|symbol| symbol.name.as_ref() == name)
+        {
+            return Some(symbol.clone());
+        }
         if self.query_inside_function() {
             self.ensure_global_late_frame();
         }
         let mut removed = false;
+        let instance_member = self.is_r6_member(name);
         for (_iv, frame) in self.function_stack.iter().rev() {
             if let Some(sym) = frame.symbols.get(name) {
                 return Some(sym.clone());
             }
-            if frame.removed_names.contains(name) {
+            if let Some(symbol) = frame
+                .r6_parent
+                .as_ref()
+                .and_then(|parent| parent.symbol_for(name))
+            {
+                return Some(symbol);
+            }
+            if frame.removed_names.contains(name) && !instance_member {
                 removed = true;
                 break;
             }
@@ -10734,6 +11000,178 @@ where
             return Some(symbol.clone());
         }
         self.choose_prefix().named_search_path.get(name).cloned()
+    }
+
+    /// Removing a method-local binding reveals its instance parent. Existing
+    /// merged removal behavior is preserved for names outside R6 environments.
+    /// Initialize only when entering a function, sharing one environment per
+    /// class for this stream. Attachment-only projections never need R6 scopes.
+    fn ensure_r6_methods(&mut self) {
+        if self.r6_methods.is_none() {
+            self.r6_methods = Some(if self.artifacts.r6.is_empty() {
+                r6::ResolvedScopes::default()
+            } else {
+                r6::resolve_methods(
+                    &self.artifacts.r6,
+                    self.r6_creator_uri,
+                    self.contributions.r6_classes(),
+                    |uri| (self.get_artifacts)(uri).map(|artifacts| artifacts.r6.clone()),
+                    |uri| self.completed_creator_scope(uri),
+                    self.is_cancelled,
+                )
+            });
+        }
+    }
+
+    /// R6 evaluates a captured superclass in the completed creator environment.
+    /// Use the deferred parent prefix with an EOF own-file query: a method's
+    /// parameters and locals must never affect superclass or helper identity.
+    fn completed_creator_scope(&self, uri: &Url) -> r6::CreatorScope {
+        if self.contributions.r6_context_incomplete(uri) {
+            return r6::CreatorScope::Incomplete;
+        }
+        let unavailable = std::cell::Cell::new(false);
+        // Erase adapter types: recursive scope evaluation creates attachment
+        // streams, which can in turn instantiate this same creator adapter.
+        let get_artifacts: &dyn Fn(&Url) -> Option<Arc<ScopeArtifacts>> = &|target: &Url| {
+            if target == self.r6_creator_uri {
+                Some(self.artifacts.clone())
+            } else {
+                let artifacts = (self.get_artifacts)(target);
+                if artifacts.is_none() {
+                    unavailable.set(true);
+                }
+                artifacts
+            }
+        };
+        let get_metadata: &dyn Fn(&Url) -> Option<Arc<super::types::CrossFileMetadata>> =
+            &|target: &Url| {
+                (self.get_metadata)(target).or_else(|| {
+                    (target == self.r6_creator_uri)
+                        .then(|| (self.get_metadata)(self.queried_uri))
+                        .flatten()
+                })
+            };
+        if get_artifacts(uri).is_none() {
+            // Package facts suffice only for an isolated file with no retained
+            // creator effects. A graph-connected sibling needs its neighborhood.
+            let metadata = get_metadata(uri);
+            return if !self.graph.iter_dependents(uri).any(|edge| {
+                parent_edge_lends_scope(edge, metadata.as_deref(), self.backward_dep_mode)
+            }) {
+                r6::CreatorScope::MissingFile
+            } else {
+                r6::CreatorScope::Incomplete
+            };
+        }
+        let uncertain_names = std::cell::RefCell::new(HashSet::new());
+        let merge_policy = SourceBindingMerge::ExecutionOrder(&uncertain_names);
+        let mut prefix_visited = HashMap::from([(uri.clone(), (u32::MAX, u32::MAX))]);
+        let prefix = Arc::new(parent_prefix_at(
+            uri,
+            true,
+            &get_artifacts,
+            &get_metadata,
+            self.graph,
+            self.workspace_root,
+            self.max_depth,
+            0,
+            &mut prefix_visited,
+            self.base_exports,
+            true,
+            self.backward_dep_mode,
+            self.is_cancelled,
+            &std::cell::RefCell::new(ForwardChildMemo::default()),
+            merge_policy,
+        ));
+        let metadata = get_metadata(uri);
+        let path_ctx = metadata
+            .as_ref()
+            .and_then(|metadata| {
+                super::path_resolve::PathContext::from_metadata(uri, metadata, self.workspace_root)
+            })
+            .or_else(|| {
+                super::path_resolve::PathContext::forward_without_metadata(uri, self.workspace_root)
+            });
+        let scope = scope_at_position_with_graph_recursive(
+            uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            self.graph,
+            self.workspace_root,
+            path_ctx,
+            self.max_depth,
+            0,
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+            self.base_exports,
+            true,
+            self.backward_dep_mode,
+            self.is_cancelled,
+            true,
+            Some(&prefix),
+            None,
+            None,
+            self.data_alias_provider,
+            self.selective_import_provider,
+            false,
+            None,
+            &std::cell::RefCell::new(ForwardChildMemo::default()),
+            merge_policy,
+        );
+        if unavailable.get() || !scope.depth_exceeded.is_empty() || (self.is_cancelled)() {
+            r6::CreatorScope::Incomplete
+        } else {
+            // Parent EOF effects and a child replay do not establish a unique
+            // order when both write the same name. Reject only those names;
+            // unrelated and qualified own members remain independently proven.
+            merge_policy.record_parent_conflicts(&prefix.symbols, &prefix.removed_names, &scope);
+            r6::CreatorScope::Complete {
+                scope: Box::new(scope),
+                uncertain_names: uncertain_names.into_inner(),
+            }
+        }
+    }
+
+    /// An instance binding is available when the method runs even if its source
+    /// token occurs later. Diagnostic forward-reference guards must distinguish
+    /// this from a later file export leaking through a source-graph cycle.
+    pub(crate) fn is_deferred_binding(&self, symbol: &ScopedSymbol) -> bool {
+        if self.captured_r6_base() == Some(symbol) {
+            return true;
+        }
+        for (_, frame) in self.function_stack.iter().rev() {
+            if frame.symbols.contains_key(&symbol.name) {
+                return false;
+            }
+            if let Some(member) = frame
+                .r6_parent
+                .as_ref()
+                .and_then(|parent| parent.symbol_for(&symbol.name))
+            {
+                return member == *symbol;
+            }
+        }
+        false
+    }
+
+    fn captured_r6_base(&self) -> Option<&ScopedSymbol> {
+        self.r6_methods
+            .as_ref()
+            .and_then(|scopes| scopes.captured_base(Position::new(self.cursor.0, self.cursor.1)))
+    }
+
+    fn is_r6_member(&self, name: &str) -> bool {
+        self.function_stack.iter().any(|(_, frame)| {
+            frame
+                .r6_parent
+                .as_ref()
+                .is_some_and(|parent| parent.contains(name))
+        })
     }
 
     /// Pick the prefix slot matching the cursor's current state. With
@@ -11202,6 +11640,7 @@ where
                     false,
                     None,
                     &self.forward_child_memo,
+                    SourceBindingMerge::Ordinary,
                 )
             },
         );
@@ -11480,6 +11919,7 @@ where
         backward_dep_mode,
         is_cancelled,
         prefix_forward_child_memo,
+        SourceBindingMerge::Ordinary,
     );
     let arc = Arc::new(computed);
     let mut cache = prefix_cache.borrow_mut();

@@ -8467,6 +8467,68 @@ impl WorldState {
         )
     }
 
+    /// Summarize only retained R6 creators against the full graph. A trimmed
+    /// neighborhood cannot prove that a missing sibling has no source parents.
+    /// With no neighborhood, this is also the package-consumer invalidation key:
+    /// parent-presence transitions change whether compact fallback is sound.
+    fn r6_creator_parent_context(&self, neighborhood: Option<&HashSet<Url>>) -> HashSet<Url> {
+        self.package_state
+            .scope_contribution()
+            .r6
+            .creator_uris()
+            .filter(|uri| {
+                if !self
+                    .cross_file_graph
+                    .iter_dependents(uri)
+                    .any(|edge| edge.lends_scope())
+                {
+                    return false;
+                }
+                let metadata = self.get_enriched_metadata(uri);
+                self.cross_file_graph.iter_dependents(uri).any(|edge| {
+                    crate::cross_file::scope::parent_edge_lends_scope(
+                        edge,
+                        metadata.as_deref(),
+                        self.cross_file_config.backward_dependencies,
+                    ) && neighborhood.is_none_or(|members| {
+                        !members.contains(&edge.from) || !members.contains(&edge.to)
+                    })
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Borrow package facts while retaining uncertainty omitted by graph trimming.
+    pub(crate) fn package_scope_contribution_snapshot(
+        &self,
+        neighborhood: &HashSet<Url>,
+        truncated: bool,
+    ) -> crate::package_state::PackageScopeContribution {
+        let mut contribution = self.package_state.scope_contribution().clone();
+        contribution.r6_graph_context_truncated = truncated;
+        contribution.r6_omitted_parent_context =
+            Arc::new(self.r6_creator_parent_context(Some(neighborhood)));
+        contribution
+    }
+
+    fn r6_package_consumers(&self) -> Vec<Url> {
+        let Some(package) = self.package_state.workspace() else {
+            return Vec::new();
+        };
+        self.documents
+            .keys()
+            .filter(|uri| {
+                crate::backend::is_authoritative_package_scope_consumer_open_uri(
+                    self,
+                    uri,
+                    &package.root,
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Build a snapshot of the dependency neighborhood for package scope
     /// resolution. The snapshot includes artifacts/metadata for all files
     /// reachable from `docs` via the cross-file dependency graph (not just
@@ -8501,11 +8563,13 @@ impl WorldState {
             .min(max_visited.saturating_mul(50))
             .min(Self::MULTI_SEED_VISITED_CEILING);
 
-        let neighborhood = self.cross_file_graph.collect_neighborhood_multi(
-            docs.iter().map(|(uri, _)| uri.clone()),
-            max_depth,
-            effective_max_visited,
-        );
+        let (neighborhood, truncation) = self
+            .cross_file_graph
+            .collect_neighborhood_multi_with_truncation(
+                docs.iter().map(|(uri, _)| uri.clone()),
+                max_depth,
+                effective_max_visited,
+            );
 
         let content_provider = self.content_provider();
         let mut artifacts_map = HashMap::with_capacity(neighborhood.len());
@@ -8545,7 +8609,8 @@ impl WorldState {
             workspace_folder: self.workspace_folders.first().cloned(),
             max_chain_depth: self.cross_file_config.max_chain_depth,
             backward_dependencies: self.cross_file_config.backward_dependencies,
-            scope_contribution: self.package_state.scope_contribution().clone(),
+            scope_contribution: self
+                .package_scope_contribution_snapshot(&neighborhood, truncation.is_truncated()),
         }
     }
 
@@ -10557,6 +10622,8 @@ impl WorldState {
                     || old.working_directory != new.working_directory
                     || old.inherited_working_directory != new.inherited_working_directory
             });
+        let previous_r6_parent_context =
+            capture_pre_graph.then(|| self.r6_creator_parent_context(None));
         let pre_graph_neighbors = if capture_pre_graph {
             self.affected_open_dependents_after_edit(uri, true, true)
         } else {
@@ -10666,7 +10733,10 @@ impl WorldState {
                 affected.insert(open_child);
             }
         }
-        if package_visibility_changed || (interface_changed && plan.package_source_interface_fanout)
+        if package_visibility_changed
+            || previous_r6_parent_context
+                .is_some_and(|previous| previous != self.r6_creator_parent_context(None))
+            || (interface_changed && plan.package_source_interface_fanout)
         {
             affected.extend(plan.package_fanout_uris);
         }
@@ -10783,6 +10853,7 @@ impl WorldState {
             return Err(AnalysisCommitRejected::StaleBasis);
         }
 
+        let previous_r6_parent_context = self.r6_creator_parent_context(None);
         // Removal fanout must be derived from the old graph. Collect every
         // target before applying the first mutation so a multi-file batch is
         // all-or-none both for authority mutation and fanout ownership.
@@ -10938,6 +11009,14 @@ impl WorldState {
                 } else {
                     affected_candidates.extend(orphan_fanout);
                 }
+            }
+        }
+        if previous_r6_parent_context != self.r6_creator_parent_context(None) {
+            let consumers = self.r6_package_consumers();
+            if reserve_closed_fanout {
+                affected.extend(consumers);
+            } else {
+                affected_candidates.extend(consumers);
             }
         }
         affected_candidates.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
