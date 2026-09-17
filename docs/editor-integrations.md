@@ -4,7 +4,7 @@ Raven runs over stdio (`raven --stdio`) and works with any editor that has an LS
 
 ## Getting the binary
 
-The VS Code extension bundles the binary — no separate download needed. For all other editors, download a pre-built `raven` binary from the [GitHub releases page](https://github.com/jbearak/raven/releases) and place it on your PATH (or note the full path for the snippets below).
+The VS Code extension bundles the binary. For other editors, download a pre-built `raven` binary from the [GitHub releases page](https://github.com/jbearak/raven/releases), or use the [macOS, Ubuntu, and Arch Linux packages](../README.md#command-line). Make sure `raven` is on your PATH, or use its full path in the snippets below.
 
 ## VS Code
 
