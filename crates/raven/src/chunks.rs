@@ -121,6 +121,8 @@ pub fn detect_chunks(text: &str, kind: ChunkKind) -> Vec<Chunk> {
     }
 }
 
+/// Detect fenced chunks and resolve their eval flags within each matched body.
+/// Header/closing-fence geometry stays independent of whether eval is disabled.
 fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let header_re = fence_header_re();
@@ -1435,6 +1437,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    /// Keep eval inference aligned with the editor detector, including open fences.
     fn body_eval_shared_fixtures() {
         #[derive(serde::Deserialize)]
         struct Case {
@@ -1459,6 +1462,7 @@ mod tests {
     }
 
     #[test]
+    /// Exhausting a YAML parsing budget must preserve diagnostics in the body.
     fn body_eval_limits_keep_analysis_enabled() {
         for options in [
             format!("#| eval: false\n#| caption: {}", "x".repeat(64 * 1024)),

@@ -326,6 +326,7 @@ export function detect_chunks(lines: string[], kind: DocumentKind): Chunk[] {
     return detect_r_cells(lines);
 }
 
+/** Detect fenced chunks; resolve eval inside each body without changing its bounds. */
 function detect_rmd_chunks(lines: string[]): Chunk[] {
     const chunks: Chunk[] = [];
     let i = 0;
