@@ -70,23 +70,35 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 ## Installation
 
-**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) 
+### Editors
+
+**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r).
 
 **Cursor, Positron, and other VS Code-based editors:** Install from [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r) or download the .vsix file from the [releases page](https://github.com/jbearak/raven/releases) and install manually.
 
-**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
+**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), or install with the macOS, Ubuntu, or Arch Linux packages [below](#command-line). Configure your editor's LSP client to run `raven --stdio`. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
-**Homebrew (macOS on Apple Silicon):** Install the pre-built CLI and language server from the [Raven Homebrew tap](https://github.com/jbearak/homebrew-raven) with `brew install jbearak/raven/raven`. Use the fully qualified name because Homebrew/core has a different `raven` package.
+### Command line
+
+The same `raven` binary provides the language server and command-line checks. Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), use a package below, or build from source.
+
+**Homebrew (macOS on Apple Silicon):** Install from the [Raven Homebrew tap](https://github.com/jbearak/homebrew-raven) with `brew install jbearak/raven/raven`. Use the fully qualified name because Homebrew/core has a different `raven` package.
 
 **Arch Linux:** Community-maintained PKGBUILDs are available in [Novica's packaging repository](https://github.com/novica/aur-packages).
 
-**Automated checks / CI:** Use `raven check` in GitHub Actions, Bitbucket Pipelines, or another CI system to catch analyzer diagnostics before code merges. See [Automated checks in CI](docs/ci.md).
+**Ubuntu:** Install from Raven's signed apt repository. See [Ubuntu installation](docs/cli.md#ubuntu-installation) for setup, then use apt to install and update Raven on your desktop, server, or CI runner.
+
+**Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
+
+Run `raven check` for full diagnostics or `raven lint` for style checks. See [CLI](docs/cli.md) for usage and options.
+
+### CI
+
+Use `raven check` in GitHub Actions, Bitbucket Pipelines, or another CI system to catch analyzer diagnostics before code merges. See [Automated checks in CI](docs/ci.md).
 
 **GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
 
 **Bitbucket Pipelines and Ubuntu CI:** Install Raven from the signed apt repository in an Ubuntu image, then run `raven check`. See [CLI](docs/cli.md#bitbucket-pipelines-example).
-
-**Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
 
 ## Documentation
 

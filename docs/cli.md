@@ -15,6 +15,31 @@ If your codebase imports R packages, Raven needs to know the symbols those packa
 
 If you are new to CI, start with [Automated checks in CI](ci.md). It explains what CI is, how Raven checks R code without running the analysis, and gives copyable GitHub Actions and Bitbucket Pipelines files.
 
+## Ubuntu installation
+
+Raven's signed apt repository supplies the same CLI and language server for Ubuntu desktops, servers, and CI runners, with packages for amd64 and arm64. Set it up once:
+
+```bash
+(
+  set -e
+  sudo apt-get update
+  sudo apt-get install -y ca-certificates curl
+  keyring=$(mktemp)
+  trap 'rm -f "$keyring"' EXIT
+  curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o "$keyring"
+  echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  $keyring" | sha256sum -c -
+  sudo install -d -m 0755 /etc/apt/keyrings
+  sudo install -m 0644 "$keyring" /etc/apt/keyrings/raven-archive-keyring.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" | sudo tee /etc/apt/sources.list.d/raven.list > /dev/null
+  sudo apt-get update
+  sudo apt-get install -y raven
+)
+```
+
+The checksum verifies the downloaded keyring before apt trusts it. The package installs `raven` on your PATH for `raven check`, `raven lint`, and editor clients using `raven --stdio`. Future releases are available through apt updates. To update Raven specifically, run `sudo apt-get update` followed by `sudo apt-get install --only-upgrade raven`.
+
+For a CI configuration that runs these steps as root, see the [Bitbucket Pipelines example](#bitbucket-pipelines-example).
+
 ## Why Raven analyzes R without running it
 
 Most language ecosystems have a CI checker that reads code without executing it — `cargo check`, `tsc`, `pyright`, `ruff`. R's tooling grew up around a different need: `R CMD check` and the CI ecosystem around it verify *packages*, which means installing every dependency and running code. There's little equivalent for *analysis repositories* — the scripts that make up most scientific and statistical work — and that gap is what these commands fill.
