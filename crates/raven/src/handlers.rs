@@ -45801,6 +45801,53 @@ result <- data %>% filter(x > 0)
     }
 
     #[test]
+    fn quarto_body_eval_false_chunk_not_diagnosed() {
+        let code = "```{r}\n#| eval: false\nx <- (\n```\n";
+        let diags = rmd_diagnostics(code, "file:///eval.qmd", |_| {});
+        assert!(diags.is_empty(), "disabled chunk diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn quarto_body_eval_false_matches_header_scope() {
+        let code = "---\ntitle: \"eval: false\"\n---\n\n```{r}\n#| eval: false\nnever_body <- 1\n```\n\n```{r not-run, eval=FALSE}\nnever_header <- 1\n```\n\n```{r}\nprint(never_body)\nprint(never_header)\n```\n";
+        let diags = rmd_diagnostics(code, "file:///repro.qmd", |_| {});
+        let actual: Vec<_> = diags
+            .iter()
+            .map(|d| (d.range.start.line, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (14, "never_body is not defined"),
+                (15, "never_header is not defined"),
+            ],
+        );
+    }
+
+    #[test]
+    fn quarto_body_eval_precedence_preserves_live_diagnostics() {
+        let code = "```{r, eval=TRUE}\n#| eval: false\ndead<-missing_dead\n```\n\n```{r, eval=FALSE}\n#| eval: true\nlive<-missing_live\n```\n";
+        let diags = rmd_diagnostics(code, "file:///precedence.qmd", |state| {
+            state.lint_config = crate::linting::LintConfig {
+                enabled: true,
+                infix_spaces_severity: Some(DiagnosticSeverity::WARNING),
+                ..crate::linting::LintConfig::default()
+            };
+        });
+        assert!(!diags.is_empty());
+        assert!(diags.iter().all(|d| d.range.start.line == 7), "{diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message == "missing_live is not defined")
+        );
+        assert!(diags.iter().any(|d| d.code
+            == Some(NumberOrString::String(
+                crate::linting::rule_ids::INFIX_SPACES.into()
+            ))));
+    }
+
+    #[test]
     fn test_document_symbol_includes_chunks_for_untitled_rmd_buffer() {
         // Untitled buffers have no extension to inspect. The `languageId`
         // is the only signal we have for distinguishing Rmd/Quarto from

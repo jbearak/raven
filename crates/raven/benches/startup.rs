@@ -353,6 +353,22 @@ my_func <- function(x) { x + 1 }
     group.finish();
 }
 
+/// Exercise the analysis mask on ordinary and option-heavy Quarto documents.
+fn bench_chunk_mask(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_mask");
+    for (name, options) in [
+        ("plain", ""),
+        ("body_active", "#| label: example\n#| eval: true\n"),
+        ("body_disabled", "#| label: example\n#| eval: false\n"),
+    ] {
+        let document = format!("Prose.\n\n```{{r}}\n{options}x <- 1\nprint(x)\n```\n").repeat(100);
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(raven::chunks::mask_to_r(black_box(&document))))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_metadata_extraction,
@@ -360,5 +376,6 @@ criterion_group!(
     bench_batch_init_parsing,
     bench_tree_sitter_parsing,
     bench_alloc_report,
+    bench_chunk_mask,
 );
 criterion_main!(benches);

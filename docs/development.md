@@ -1161,6 +1161,16 @@ See `index_file_on_demand` / `index_forward_chain` / `index_backward_chain` in
 
 ### Rmd/Quarto raw-content vs masked-analysis split (#343)
 
+Chunk detection computes one static eval flag for both header and leading
+`#| ` YAML body options. The Rust detector and VS Code detector share the
+fixtures in `crates/raven/tests/fixtures/chunk_eval.json`. Body precedence,
+unknown-value fallback, and parsing bounds are documented beside
+`body_eval_false` in each implementation. YAML parsing never evaluates R or
+loads includes. Disabled bodies are blanked before metadata extraction, so
+their definitions, imports, and source edges cannot enter live analysis.
+The `chunk_mask` startup benchmarks cover documents with and without body
+options.
+
 For `.Rmd` / `.Rmarkdown` / `.qmd` documents, everywhere we store or extract cross-file data we keep two views distinct (mirroring the `Document` type docs in `state.rs`):
 
 - **Raw content** — `OpenDocumentRecord::document().contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.

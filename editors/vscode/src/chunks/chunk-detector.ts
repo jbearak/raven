@@ -1,3 +1,5 @@
+import * as yaml from 'js-yaml';
+
 const MarkdownIt = require('markdown-it') as new (options?: { html?: boolean }) => {
     parse(source: string, env: Record<string, never>): MarkdownItToken[];
 };
@@ -55,7 +57,7 @@ export interface Chunk {
     label: string | null;
     /** Parsed `key=value` options from the header (unquoted, trimmed). */
     options: Record<string, string>;
-    /** True when `eval = FALSE` (or `F`) is present in the header options. */
+    /** Static eval flag, with leading YAML body options overriding the header. */
     is_eval_false: boolean;
     /** Marker for which detection path produced this chunk. */
     kind: ChunkKind;
@@ -217,6 +219,103 @@ function eval_false_from_options(options: Record<string, string>): boolean {
     return v === 'F' || v === 'FALSE';
 }
 
+/** ASCII option names, excluding scalar spellings even when quoted. */
+function body_option_key_supported(key: unknown): boolean {
+    return typeof key === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key)
+        && !/^(?:null|Null|NULL|true|True|TRUE|false|False|FALSE)$/.test(key);
+}
+
+/**
+ * Inspect the leading contiguous `#| ` YAML block using knitr/xfun's first-line
+ * discriminator. Body options override the fence header. Undefined means no
+ * override; false keeps analysis enabled for unknown or invalid metadata.
+ *
+ * Parse structure so nested values and multiline strings cannot masquerade as
+ * eval options. Infer only YAML boolean scalars, never execute tags, and
+ * reject anchors/aliases. Size/depth limits bound work during editor updates.
+ * Keep this contract aligned with chunks::body_eval_false in Rust.
+ */
+function body_eval_false(lines: string[], start: number, end: number): boolean | undefined {
+    if (start >= end || !lines[start].startsWith('#| ')) return undefined;
+    if (!/^[^ :]+:(?:\s|$)/.test(lines[start].slice(3))) return false;
+
+    const parts: string[] = [];
+    let bytes = 0;
+    for (let i = start; i < end && lines[i].startsWith('#| '); i++) {
+        const option = lines[i].slice(3);
+        bytes += Buffer.byteLength(option, 'utf8') + 1;
+        if (bytes > 64 * 1024) return false;
+        parts.push(option);
+    }
+    try {
+        const frames: {
+            start: number;
+            child_end: number;
+            key: boolean;
+            valid_keys: boolean;
+            objects?: Set<object>;
+        }[] = [];
+        const value = yaml.load(parts.join('\n'), {
+            schema: yaml.JSON_SCHEMA,
+            listener: (event, state) => {
+                if (event === 'open') {
+                    if (frames.length > 32) throw new Error('Chunk option depth limit');
+                    // A ':' between sibling nodes marks a mapping value. Flow
+                    // mappings may consume whitespace/comments before opening
+                    // it. Explicit keys with omitted values have no callback,
+                    // so alternating key/value callbacks is not sufficient.
+                    const parent = frames[frames.length - 1];
+                    const separator = parent ? state.input.slice(parent.child_end, state.position) : '';
+                    frames.push({
+                        start: state.position,
+                        child_end: state.position,
+                        key: !/^(?:\s|#[^\r\n]*(?:\r?\n|$))*:/.test(separator),
+                        valid_keys: true,
+                    });
+                } else {
+                    const frame = frames.pop()!;
+                    if (state.kind === 'mapping' && !frame.valid_keys) {
+                        throw new Error('Unsupported chunk option key');
+                    }
+                    // Compact pairs such as [name: value] create map objects
+                    // without a mapping callback. Require explicit {...} nodes
+                    // so key and depth validation sees every mapping.
+                    if (state.kind === 'sequence' && (state.result as unknown[]).some(item =>
+                        item !== null && typeof item === 'object' && !frame.objects?.has(item))) {
+                        throw new Error('Implicit flow mapping is unsupported');
+                    }
+                    const parent = frames[frames.length - 1];
+                    if (parent && frame.key && (state.kind !== 'scalar'
+                        || !body_option_key_supported(state.result))) {
+                        parent.valid_keys = false;
+                    }
+                    if (parent) {
+                        parent.child_end = state.position;
+                        if (state.result !== null && typeof state.result === 'object') {
+                            (parent.objects ??= new Set()).add(state.result);
+                        }
+                    }
+                    if (frames.length === 32 && state.kind !== 'scalar' && state.kind !== null) {
+                        throw new Error('Chunk option depth limit');
+                    }
+                    if (/^(?:\s|#[^\r\n]*(?:\r?\n|$))*!/.test(state.input.slice(frame.start, state.position))) {
+                        throw new Error('Chunk option tags are unsupported');
+                    }
+                    // js-yaml exposes anchor in listener state; @types omits it.
+                    if ((state as yaml.State & { anchor: string | null }).anchor !== null) {
+                        throw new Error('Chunk option anchors are unsupported');
+                    }
+                }
+            },
+        });
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+        const options = value as Record<string, unknown>;
+        return Object.prototype.hasOwnProperty.call(options, 'eval') ? options.eval === false : undefined;
+    } catch {
+        return false;
+    }
+}
+
 /**
  * Detect all chunks in the document, in source order.
  * `kind` controls which form to look for (caller decides via `classify_chunk_document`).
@@ -227,6 +326,7 @@ export function detect_chunks(lines: string[], kind: DocumentKind): Chunk[] {
     return detect_r_cells(lines);
 }
 
+/** Detect fenced chunks; resolve eval inside each body without changing its bounds. */
 function detect_rmd_chunks(lines: string[]): Chunk[] {
     const chunks: Chunk[] = [];
     let i = 0;
@@ -259,7 +359,8 @@ function detect_rmd_chunks(lines: string[]): Chunk[] {
             language: lang,
             label,
             options,
-            is_eval_false: eval_false_from_options(options),
+            is_eval_false: body_eval_false(lines, i + 1, closing_line ?? lines.length)
+                ?? eval_false_from_options(options),
             kind: 'rmd',
         });
         i = closing_line !== null ? closing_line + 1 : lines.length;
