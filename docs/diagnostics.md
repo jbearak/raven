@@ -276,6 +276,11 @@ Raven also recognizes a few call forms that bind a name at runtime, so the bound
 - rlang's `env_bind_active(current_env(), a = ..., b = ...)` and `env_bind_lazy(current_env(), ...)` bind each *named* argument (`a`, `b`) in the enclosing environment. Only the `current_env()` form is modeled — binding into some other environment is not assumed local.
 - `utils::globalVariables(c("a", "b"))` (R's own mechanism for declaring names bound at runtime, used to silence `R CMD check`) makes each listed name resolve package-wide. The bare `.` pronoun is deliberately **not** honored this way — Raven resolves `.` precisely by context (see below), and accepting a blanket `globalVariables(".")` would mask genuine `.`-misuse bugs.
 - An active binding installed in a package's `.onLoad`/`.onAttach` hook via `makeActiveBinding("name", fn, env)` — when `env` is the package namespace (e.g. `asNamespace(...)`, `topenv(...)`, or `environment(<a package function>)`) — contributes `name` to the package's internal scope, alongside the existing `assign("name", ..., envir = ns)` and `ns$name <- ...` recognition.
+- Package source and testthat package tests recognize R's implicit `.packageName`.
+  Direct hook assignments through `ns <- base::topenv(); ns$name <- value`
+  also contribute package-internal names. See [namespace runtime
+  bindings](r-package-dev.md#namespace-runtime-bindings) for the static subset
+  and context restrictions.
 
 When you are developing an R package, a script anywhere in its source tree (`inst/`, `tools/`, `data-raw/`, `debug/`, …) that calls `devtools::load_all()` / `pkgload::load_all()` (or a bare `load_all()`) is modeled as attaching the package under development: the package's own internal, exported, sysdata, and `.onLoad`/`.onAttach`-bound symbols become visible in that file, mirroring what `load_all()` does at runtime. Genuinely-undefined names not provided by the package still flag.
 

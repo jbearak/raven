@@ -24,6 +24,11 @@ use crate::package_state::{self, PackageScopeContribution, RFileKind};
 
 use super::evaluation::ScopePhase;
 
+/// R installs this binding in the namespace, not the attached package environment.
+/// Keep it separate from package internals exposed by `load_all(export_all=TRUE)`.
+static NAMESPACE_RUNTIME_SYMBOLS: std::sync::LazyLock<BTreeSet<String>> =
+    std::sync::LazyLock::new(|| BTreeSet::from([".packageName".to_owned()]));
+
 /// Prepared contributions for one canonical query file, independent of cursor position.
 #[derive(Default)]
 pub(super) struct ScopeContributions<'a> {
@@ -63,6 +68,15 @@ impl<'a> ScopeContributions<'a> {
             selected.immediate_groups.push(&contrib.dataset_symbols);
         }
         let kind = package_state::is_r_source_path(&path, root);
+        // testthat evaluates package tests in a child of the namespace. Other
+        // test frameworks and dev-context scripts only get the existing package
+        // contribution approximation, not namespace-runtime bindings.
+        if kind == Some(RFileKind::Source)
+            || (kind == Some(RFileKind::Test)
+                && path.starts_with(root.join("tests").join("testthat")))
+        {
+            selected.immediate_groups.push(&NAMESPACE_RUNTIME_SYMBOLS);
+        }
         if kind.is_some() || package_state::is_dev_context_path(&path, root) {
             selected.immediate_groups.extend([
                 contrib.r_internal_symbols.as_ref(),
