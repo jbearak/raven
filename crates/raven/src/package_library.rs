@@ -4615,7 +4615,16 @@ mod tests {
             .await
             .expect("the follower survives leader cancellation");
         assert!(second.unwrap().is_ok());
-        assert!(!provider_load_registry().lock().active.contains_key(&key));
+        // Result publication precedes registry cleanup, so awaiting the follower
+        // does not join the physical load's cleanup. Other tests can own global
+        // permits; wait only for this test's unique key to retire.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while provider_load_registry().lock().active.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the physical load retires its registry entry after publication");
     }
 
     /// Seed a `combined_entries` cache entry directly, bypassing `get_all_exports`.
