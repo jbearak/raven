@@ -76,6 +76,8 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 **Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
+**Arch Linux:** Community-maintained PKGBUILDs are available in [Novica's packaging repository](https://github.com/novica/aur-packages).
+
 **Automated checks / CI:** Use `raven check` in GitHub Actions, Bitbucket Pipelines, or another CI system to catch analyzer diagnostics before code merges. See [Automated checks in CI](docs/ci.md).
 
 **GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
