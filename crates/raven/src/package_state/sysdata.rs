@@ -320,12 +320,18 @@ fn is_direct_package_statement(node: Node) -> bool {
 /// An overwritten/removed hook will not run. This supplemental policy does not
 /// attempt to interpret which conditional declaration eventually wins.
 fn is_unique_package_hook(hook: Node, content: &str) -> bool {
-    fn other_binding(node: Node, hook: Node, name: &str, content: &str) -> bool {
+    fn other_binding(
+        node: Node,
+        hook: Node,
+        name: &str,
+        content: &str,
+        bare_removals_trusted: bool,
+    ) -> bool {
         if node.id() == hook.id() || node.kind() == "function_definition" {
             return false;
         }
         if matches!(node.kind(), "call" | "for_statement")
-            && (is_alias_removal_call(node, content)
+            && (removal_may_target(node, content, name, bare_removals_trusted)
                 || crate::cross_file::binding::subtree_may_bind_name(node, content, name))
         {
             return true;
@@ -346,7 +352,7 @@ fn is_unique_package_hook(hook: Node, content: &str) -> bool {
             }
         }
         node.named_children(&mut node.walk())
-            .any(|child| other_binding(child, hook, name, content))
+            .any(|child| other_binding(child, hook, name, content, bare_removals_trusted))
     }
     let mut root = hook;
     while let Some(parent) = root.parent() {
@@ -358,7 +364,10 @@ fn is_unique_package_hook(hook: Node, content: &str) -> bool {
     else {
         return false;
     };
-    !other_binding(root, hook, name, content)
+    let bare_removals_trusted = ["rm", "remove"]
+        .iter()
+        .all(|name| !crate::cross_file::binding::subtree_may_bind_name(root, content, name));
+    !other_binding(root, hook, name, content, bare_removals_trusted)
 }
 
 /// Removals invalidate aliases rather than creating bindings, so the shared
@@ -379,6 +388,56 @@ fn is_alias_removal_call(node: Node, content: &str) -> bool {
                 crate::cross_file::binding::plain_argument_name(leaf, content).as_deref(),
                 Some("rm" | "remove")
             )
+        })
+}
+
+/// Ignore only removals whose targets are provably unrelated to the hook.
+/// Dynamic `list` values, options, and unknown namespaces stay conservative;
+/// positional identifiers are quoted names, whereas `list` is evaluated.
+fn removal_may_target(node: Node, content: &str, name: &str, bare_removals_trusted: bool) -> bool {
+    use crate::cross_file::binding::{extract_plain_string, plain_argument_name};
+
+    if !is_alias_removal_call(node, content) {
+        return false;
+    }
+    if node
+        .child_by_field_name("function")
+        .is_some_and(|function| {
+            if function.kind() == "namespace_operator" {
+                function
+                    .child_by_field_name("lhs")
+                    .is_none_or(|namespace| node_text(namespace, content) != "base")
+            } else {
+                !bare_removals_trusted
+            }
+        })
+    {
+        return true;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return true;
+    };
+    arguments
+        .named_children(&mut arguments.walk())
+        .filter(|argument| argument.kind() == "argument")
+        .any(|argument| {
+            let Some(value) = argument.child_by_field_name("value") else {
+                return true;
+            };
+            if !matches!(value.kind(), "identifier" | "string" | "raw_string_literal") {
+                return true;
+            }
+            let target = match argument.child_by_field_name("name") {
+                None => plain_argument_name(value, content),
+                Some(tag)
+                    if plain_argument_name(tag, content).as_deref() == Some("list")
+                        && matches!(value.kind(), "string" | "raw_string_literal") =>
+                {
+                    extract_plain_string(value, content).map(Into::into)
+                }
+                Some(_) => return true,
+            };
+            target.is_none_or(|target| target == name)
         })
 }
 
@@ -464,11 +523,16 @@ fn extract_qualified_topenv_bindings(
         aliases.clear();
         return;
     };
-    if has_alias_barrier(rhs, content) {
-        aliases.clear();
-    } else {
-        aliases
-            .retain(|name| !crate::cross_file::binding::subtree_may_bind_name(rhs, content, name));
+    // Creating a function executes neither its defaults nor its body. Its
+    // deferred mutations cannot invalidate the alias used to store the closure.
+    if rhs.kind() != "function_definition" {
+        if has_alias_barrier(rhs, content) {
+            aliases.clear();
+        } else {
+            aliases.retain(|name| {
+                !crate::cross_file::binding::subtree_may_bind_name(rhs, content, name)
+            });
+        }
     }
     if lhs.kind() == "identifier" {
         let Some(name) = crate::cross_file::binding::plain_identifier_name(lhs, content) else {
@@ -1301,6 +1365,11 @@ mod tests {
         for suffix in [
             ".onLoad <- function(...) NULL",
             "rm(.onLoad)",
+            "rm(list = '.onLoad')",
+            "rm(list = dynamic_names)",
+            "`%pick%` <- function(x, y) y; rm(list = 'tmp' %pick% '.onLoad')",
+            "rm <- function(...) { .onLoad <<- function(...) NULL }; rm(tmp)",
+            "remove <- function(...) { .onLoad <<- function(...) NULL }; remove(tmp)",
             "invisible(rm(.onLoad))",
             "\".onLoad\" <- function(...) NULL",
             "for (.onLoad in list(function(...) NULL)) {}",
@@ -1310,6 +1379,34 @@ mod tests {
                 format!(".onLoad <- function(...) {{ ns <- base::topenv(); ns$x <- 1 }}; {suffix}");
             assert!(extract_onload_bindings(&code).is_empty(), "{code}");
         }
+    }
+
+    #[test]
+    fn onload_qualified_bindings_survive_unrelated_removals() {
+        for removal in ["rm(tmp)", "base::remove('tmp')", "rm(list = 'tmp')"] {
+            let code = format!(
+                ".onLoad <- function(...) {{ ns <- base::topenv(); ns$x <- 1 }}; {removal}"
+            );
+            assert_eq!(extract_onload_bindings(&code), BTreeSet::from(["x".into()]));
+        }
+    }
+
+    #[test]
+    fn onload_qualified_function_values_do_not_execute_their_bodies() {
+        let code = r#"
+.onLoad <- function(...) {
+  ns <- base::topenv()
+  ns$factory <- function(ns = { rm(ns); NULL }) {
+    ns <- new.env()
+    ns$deferred <- 1
+  }
+  ns$after <- 2
+}
+"#;
+        assert_eq!(
+            extract_onload_bindings(code),
+            BTreeSet::from(["factory".into(), "after".into()])
+        );
     }
 
     #[test]

@@ -246,10 +246,11 @@ Update `docs/development.md` for any new facts, caches, or invalidation paths.
 Put implementation invariants next to the responsible functions. Declare any
 new top-level Rust module in `crates/raven/src/lib.rs`.
 
-For each implementation PR, use the pinned Rust 1.96.0 toolchain and require:
+For each implementation PR, use the pinned Rust 1.96.0 toolchain. Run
+`cargo fmt --all` as preparation before reviewing and committing the changes.
+Then validate the resulting tree with these read-only gates:
 
 ```sh
-cargo fmt --all
 cargo fmt --all --check
 cargo test -p raven --features test-support
 cargo test -p tree-sitter-jags
