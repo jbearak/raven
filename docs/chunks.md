@@ -178,10 +178,34 @@ Raven parses the header inside `{…}` and recognizes:
 
 Two options affect Raven specifically:
 
-- `eval = FALSE` (or `eval = F`) — Raven dims the chunk's background tint to signal that it will not be evaluated by `knitr` or `quarto render`. The CodeLens still offers to run the chunk manually if you want.
+- `eval = FALSE` (or `eval = F`) in the header, or `#| eval: false` in the body, dims the chunk's background tint and suppresses diagnostics inside it. Its definitions and imports do not enter the scope of other chunks. The CodeLens still offers to run the chunk manually.
 - `raven.ignore` — suppresses Raven's diagnostics for the chunk body: `raven.ignore=TRUE` silences everything, `raven.ignore="undefined-variable, line-length"` narrows it to the listed codes (`raven.ignore=FALSE` is the default no-op). See [Suppressing diagnostics in a chunk](#suppressing-diagnostics-in-a-chunk).
 
 Every other option is preserved on the parsed chunk but Raven does not interpret it.
+
+For Quarto and R Markdown, Raven also reads `eval` from the contiguous block of
+`#| ` YAML option lines immediately after the opening fence:
+
+````qmd
+```{r}
+#| label: example
+#| eval: false
+unfinished <- (
+```
+````
+
+A body `eval` option overrides the header, so `#| eval: true` re-enables a
+chunk with header `eval=FALSE`. A blank line, ordinary comment, or R code ends
+the option block. Nested `eval` keys and text inside captions are not chunk
+options. Raven infers YAML booleans `false`, `False`, and `FALSE`; quoted values and expressions
+such as `!expr` do not disable analysis. Invalid options, aliases, merge keys,
+and explicit tags leave analysis enabled. Mapping keys must be ASCII names
+such as `eval`, `fig-width`, or `fig.cap`, not numeric, boolean, null, or
+collection keys. This also applies inside nested option values. Mappings in
+flow sequences need braces, such as `[{name: value}]` instead of `[name: value]`.
+Parsing is limited to 64 KiB of body options and bounded nesting. R-style
+`#| eval=FALSE` body options are not interpreted. These rules do not apply to
+`.R` cells or ordinary Markdown fences.
 
 ## Highlighting
 

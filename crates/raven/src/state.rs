@@ -16159,6 +16159,45 @@ tarchetypes::tar_render(nested, "nested.Rmd")
     }
 
     #[test]
+    fn quarto_body_eval_edits_update_packages_and_source_metadata() {
+        let src = "```{r}\n#| eval: false\nlibrary(dplyr)\nsource('disabled.R')\ndisabled <- 1\n```\n\n```{r}\nlibrary(stats)\nsource('live.R')\nlive <- 1\n```\n";
+        for uri in ["file:///report.qmd", "untitled:report"] {
+            let uri = Url::parse(uri).unwrap();
+            let mut doc = Document::new_with_language_id(src, Some(1), &uri, Some("quarto"));
+            for value in ["false", "true", "false"] {
+                doc.apply_change(TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(1, 0), Position::new(2, 0))),
+                    range_length: None,
+                    text: format!("#| eval: {value}\n"),
+                });
+                let enabled = value == "true";
+                let expected_packages = if enabled {
+                    vec!["dplyr", "stats"]
+                } else {
+                    vec!["stats"]
+                };
+                assert_eq!(doc.loaded_packages, expected_packages);
+                let metadata = doc.cross_file_metadata();
+                let paths: Vec<_> = metadata
+                    .sources
+                    .iter()
+                    .map(|source| source.path.as_str())
+                    .collect();
+                let expected_paths = if enabled {
+                    vec!["disabled.R", "live.R"]
+                } else {
+                    vec!["live.R"]
+                };
+                assert_eq!(paths, expected_paths);
+                let analysis = doc.analysis_text();
+                let tree = doc.tree.as_ref().unwrap();
+                assert_eq!(tree_has_identifier(tree, &analysis, "disabled"), enabled);
+                assert!(tree_has_identifier(tree, &analysis, "live"));
+            }
+        }
+    }
+
+    #[test]
     fn rmd_apply_change_inside_chunk_reparses_from_masked_text() {
         let src = "prose\n```{r}\nx <- 1\n```\n";
         let mut doc = Document::new_with_uri(src, Some(1), &rmd_uri());

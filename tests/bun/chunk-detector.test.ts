@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import eval_cases from '../../crates/raven/tests/fixtures/chunk_eval.json';
 import {
     classify_chunk_document,
     classify_chunk_document_for_document,
@@ -325,6 +326,39 @@ describe('detect_chunks — Rmd/Qmd fenced blocks', () => {
         ].join('\n'));
         const chunks = detect_chunks(src, 'rmd');
         expect(chunks[0].is_eval_false).toBe(true);
+    });
+
+    test('recognizes Quarto body eval: false', () => {
+        const chunks = detect_chunks(['```{r}', '#| eval: false', 'x <- 1', '```'], 'rmd');
+        expect(chunks[0].is_eval_false).toBe(true);
+    });
+
+    for (const fixture of eval_cases) {
+        test(`body eval shared fixture: ${fixture.name}`, () => {
+            for (const closing of ['\n```', '']) {
+                const source = `\`\`\`{r${fixture.header}}\n${fixture.body}${closing}`;
+                const chunks = detect_chunks(lines(source), 'rmd');
+                expect(chunks).toHaveLength(1);
+                expect(chunks[0].is_eval_false).toBe(fixture.disabled);
+            }
+        });
+    }
+
+    test('body eval parsing limits keep analysis enabled', () => {
+        for (const options of [
+            `#| eval: false\n#| caption: ${'x'.repeat(64 * 1024)}`,
+            `#| eval: false\n#| nested: ${'['.repeat(64)}0${']'.repeat(64)}`,
+        ]) {
+            const source = `\`\`\`{r, eval=FALSE}\n${options}\nx <- 1\n\`\`\``;
+            expect(detect_chunks(lines(source), 'rmd')[0].is_eval_false).toBe(false);
+        }
+    });
+
+    test('body eval options do not disable R cells or ordinary Markdown fences', () => {
+        const cell = detect_chunks(['# %%', '#| eval: false', 'x <- 1'], 'r')[0];
+        const fence = detect_chunks(['```r', '#| eval: false', 'x <- 1', '```'], 'markdown')[0];
+        expect(cell.is_eval_false).toBe(false);
+        expect(fence.is_eval_false).toBe(false);
     });
 
     test('recognizes upper-case R language tag', () => {

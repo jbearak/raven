@@ -42,10 +42,9 @@ pub struct Chunk {
     /// `{r setup, eval=FALSE}`), or — for `# %%` cells — the text after the
     /// marker. `None` when no label is present.
     pub label: Option<String>,
-    /// `true` when the chunk header contains a literal `eval = FALSE` or
-    /// `eval = F` option. Such chunks are display-only (never executed by
-    /// knitr) and their body may contain intentionally malformed R — blanking
-    /// them in [`mask_to_r`] prevents spurious syntax diagnostics.
+    /// Static eval flag from header `eval = FALSE` / `eval = F` or leading
+    /// YAML body `#| eval: false`. Body options take precedence. Such chunks
+    /// may contain intentionally malformed R; [`mask_to_r`] blanks their bodies.
     pub eval_disabled: bool,
 }
 
@@ -142,7 +141,6 @@ fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
             .unwrap_or_default();
         let header_rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
         let label = parse_header_label(header_rest);
-        let eval_disabled = has_eval_false(header_rest);
 
         let fence_char = fence.chars().next().unwrap_or('`');
         let min_len = fence.len();
@@ -164,6 +162,9 @@ fn detect_rmd_chunks(lines: &[&str]) -> Vec<Chunk> {
             None => (lines.len().saturating_sub(1)) as u32,
         };
         let end_line = end_line.max(header_line);
+        let body_end = closing_line.map_or(lines.len(), |line| line as usize);
+        let eval_disabled =
+            body_eval_false(&lines[i + 1..body_end]).unwrap_or_else(|| has_eval_false(header_rest));
 
         chunks.push(Chunk {
             header_line,
@@ -286,6 +287,135 @@ fn has_eval_false(header_rest: &str) -> bool {
         }
     }
     false
+}
+
+/// Read a static YAML `eval` option from the leading contiguous `#| ` block.
+///
+/// Body options override the fence header. `None` means no body override;
+/// `Some(false)` keeps analysis enabled for non-false values or metadata we
+/// cannot safely interpret. Match knitr/xfun's first-line YAML discriminator
+/// and exact comment prefix, so later comments and R strings cannot disable
+/// analysis. CSV-style body options are not interpreted.
+///
+/// Parse YAML structure rather than searching lines: nested values, block
+/// scalars and multiline quotes can all contain apparent `eval: false` lines.
+/// Only YAML boolean scalars are inferred. Tags such as `!expr` are
+/// never evaluated, aliases are rejected, and parsing has size/depth budgets.
+/// Keep this contract aligned with `body_eval_false` in chunk-detector.ts.
+fn body_eval_false(lines: &[&str]) -> Option<bool> {
+    use yaml_rust2::parser::{Event, Parser};
+    use yaml_rust2::{Yaml, YamlLoader};
+
+    let first = lines.first()?.strip_prefix("#| ")?;
+    let Some((key, rest)) = first.split_once(':') else {
+        return Some(false);
+    };
+    if key.is_empty()
+        || key.contains(' ')
+        || !rest.starts_with(char::is_whitespace) && !rest.is_empty()
+    {
+        return Some(false);
+    }
+
+    const MAX_BYTES: usize = 64 * 1024;
+    let mut yaml = String::new();
+    for line in lines {
+        let Some(option) = line.strip_prefix("#| ") else {
+            break;
+        };
+        if yaml.len() + option.len() + 1 > MAX_BYTES {
+            return Some(false);
+        }
+        yaml.push_str(option);
+        yaml.push('\n');
+    }
+    // Validate before building values: aliases can amplify memory during
+    // loading, and deeply nested values would also recurse during destruction.
+    let chars: Vec<_> = yaml.chars().collect();
+    // yaml-rust2's global marker index can mix byte and character counts after
+    // block scalars. Line/column lookup avoids that drift. Recognize CRLF as
+    // one break and lone CR/LF as breaks, matching the YAML scanner.
+    let mut line_starts = vec![0];
+    for (index, &ch) in chars.iter().enumerate() {
+        if ch == '\n' || (ch == '\r' && chars.get(index + 1) != Some(&'\n')) {
+            line_starts.push(index + 1);
+        }
+    }
+    let mut parser = Parser::new(chars.iter().copied());
+    let mut flow_sequences = Vec::new();
+    loop {
+        match parser.next_token() {
+            Ok((Event::StreamEnd, _)) => break,
+            Ok((
+                ref event @ (Event::MappingStart(anchor, ref tag)
+                | Event::SequenceStart(anchor, ref tag)),
+                mark,
+            )) => {
+                let mapping = matches!(event, Event::MappingStart(..));
+                if flow_sequences.len() >= 32 || anchor != 0 || tag.is_some() {
+                    return Some(false);
+                }
+                // js-yaml does not expose these implicit mapping nodes to its
+                // listener. Require explicit braces for flow-sequence pairs so
+                // both detectors validate the same keys and structural depth.
+                let opener = line_starts
+                    .get(mark.line().saturating_sub(1))
+                    .and_then(|start| chars.get(start + mark.col()));
+                if mapping && flow_sequences.last() == Some(&true) && opener != Some(&'{') {
+                    return Some(false);
+                }
+                flow_sequences.push(!mapping && opener == Some(&'['));
+            }
+            Ok((Event::MappingEnd | Event::SequenceEnd, _)) => {
+                flow_sequences.pop();
+            }
+            Ok((Event::Scalar(_, _, anchor, tag), _)) if anchor != 0 || tag.is_some() => {
+                return Some(false);
+            }
+            Ok((Event::Alias(_), _)) | Err(_) => return Some(false),
+            _ => {}
+        }
+    }
+    let Ok(documents) = YamlLoader::load_from_str(&yaml) else {
+        return Some(false);
+    };
+    let [Yaml::Hash(values)] = documents.as_slice() else {
+        return Some(false);
+    };
+    if !body_option_keys_supported(&documents[0]) {
+        return Some(false);
+    }
+    values
+        .get(&Yaml::String("eval".into()))
+        .map(|value| value.as_bool() == Some(false))
+}
+
+/// Restrict all option mappings to ASCII names so YAML schema differences in
+/// numeric/null keys and duplicate-key equality cannot change the eval flag.
+/// Called only after depth validation; aliases are never expanded.
+fn body_option_keys_supported(value: &yaml_rust2::Yaml) -> bool {
+    use yaml_rust2::Yaml;
+    match value {
+        Yaml::Hash(values) => values.iter().all(|(key, value)| {
+            key.as_str().is_some_and(body_option_key_supported) && body_option_keys_supported(value)
+        }),
+        Yaml::Array(values) => values.iter().all(body_option_keys_supported),
+        _ => true,
+    }
+}
+
+/// Shared with `body_option_key_supported` in chunk-detector.ts. Even quoted
+/// scalar-looking names are excluded so key validation is representation-free.
+fn body_option_key_supported(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && !matches!(
+            key,
+            "null" | "Null" | "NULL" | "true" | "True" | "TRUE" | "false" | "False" | "FALSE"
+        )
 }
 
 /// True for chunk language tags that should be parsed as R. Pandoc/knitr
@@ -1303,6 +1433,46 @@ mod tests {
     // =========================================================================
     // eval=FALSE chunk blanking tests
     // =========================================================================
+
+    #[test]
+    fn body_eval_shared_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            header: String,
+            body: String,
+            disabled: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/chunk_eval.json")).unwrap();
+        for case in cases {
+            for closing in ["\n```", ""] {
+                let src = format!("```{{r{}}}\n{}{closing}", case.header, case.body);
+                let chunks = detect_chunks(&src, ChunkKind::Rmd);
+                assert_eq!(chunks.len(), 1, "{}", case.name);
+                assert_eq!(chunks[0].eval_disabled, case.disabled, "{}", case.name);
+                if case.disabled {
+                    assert!(mask_to_r(&src).trim().is_empty(), "{}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_eval_limits_keep_analysis_enabled() {
+        for options in [
+            format!("#| eval: false\n#| caption: {}", "x".repeat(64 * 1024)),
+            format!(
+                "#| eval: false\n#| nested: {}0{}",
+                "[".repeat(64),
+                "]".repeat(64)
+            ),
+        ] {
+            let src = format!("```{{r, eval=FALSE}}\n{options}\nx <- 1\n```");
+            assert!(!detect_chunks(&src, ChunkKind::Rmd)[0].eval_disabled);
+            assert!(mask_to_r(&src).contains("x <- 1"));
+        }
+    }
 
     #[test]
     fn mask_blanks_eval_false_chunk() {
