@@ -30,6 +30,50 @@ fn names(values: &[&str]) -> Arc<BTreeSet<String>> {
     Arc::new(values.iter().map(|value| (*value).to_owned()).collect())
 }
 
+#[test]
+fn namespace_runtime_binding_is_not_a_load_all_export() {
+    let contribution = contribution_fixture();
+    assert!(
+        !contribution
+            .local_dev_internal_symbols()
+            .any(|name| name == ".packageName")
+    );
+    for (path, visible) in [
+        ("R/main.R", true),
+        ("R/windows/main.R", true),
+        ("tests/testthat/test-main.R", true),
+        ("tests/testit/test-main.R", false),
+        ("tests/plain.R", false),
+        ("inst/unitTests/main.R", false),
+        ("vignettes/main.Rmd", false),
+        ("R/scripts/main.R", false),
+        ("../other/R/main.R", false),
+    ] {
+        let uri = Url::parse("file:///work/pkg/").unwrap().join(path).unwrap();
+        let prepared = ScopeContributions::new(&uri, Some(&contribution));
+        assert_eq!(
+            prepared.contains(".packageName", ScopePhase::Immediate),
+            visible,
+            "{path}"
+        );
+        assert_eq!(
+            prepared
+                .symbol_for(".packageName", ScopePhase::Deferred)
+                .is_some(),
+            visible,
+            "{path}"
+        );
+        let mut scope = ScopeAtPosition::default();
+        prepared.apply(&mut scope, ScopePhase::Immediate);
+        assert_eq!(
+            scope.symbols.contains_key(".packageName"),
+            visible,
+            "{path}"
+        );
+        assert!(!prepared.contains(".packageNames", ScopePhase::Immediate));
+    }
+}
+
 /// Give each contribution source its own name and package so accidental
 /// widening or omission cannot hide behind another source's matching name.
 fn contribution_fixture() -> PackageScopeContribution {

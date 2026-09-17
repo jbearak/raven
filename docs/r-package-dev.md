@@ -45,6 +45,30 @@ Files outside `R/` (e.g., `tests/`, `inst/`, `vignettes/`) are not included in m
 
 Objects stored in `R/sysdata.rda` are namespace-internal and available to your package's own code at runtime, so Raven treats them as in scope for files under `R/` (and everywhere else package symbols are visible, like testthat tests). The names are discovered by scanning `data-raw/` for the generating `usethis::use_data(..., internal = TRUE)` / `save(..., file = "R/sysdata.rda")` call; if no generating script exists (the `.rda` is committed directly), Raven loads the file via R to enumerate its objects. Both the editor and `raven check` apply this. Sysdata objects are *not* exported, so a script outside the package that does `library(yourpkg)` and references one still gets a diagnostic — matching R.
 
+### Namespace runtime bindings
+
+R supplies `.packageName` inside a package namespace. Raven recognizes it in
+package source files and `tests/testthat/`, whose package test environment
+inherits from that namespace. It is not an exported name: ordinary scripts,
+vignettes, and scripts calling `load_all()` do not acquire it implicitly.
+
+Raven also recognizes this load-hook pattern, used by box:
+
+```r
+.onLoad <- function(libname, pkgname) {
+  ns <- base::topenv()
+  ns$system_mod_path <- system.file("mod", package = pkgname)
+}
+```
+
+The assigned name becomes package-internal, so other `R/` files can use
+`system_mod_path`. Both `<-` and `=` work. This qualified form supports direct
+statements in `.onLoad`/`.onAttach`, with no arguments to `base::topenv()`.
+Aliases follow source order; reassignment or unsupported intervening control
+flow stops their propagation. Quoted code and nested function bodies do not
+contribute. This adds to the existing bare namespace-constructor recognition;
+Raven does not execute hooks or evaluate arbitrary environment expressions.
+
 ### Tests directory awareness
 
 Files under `tests/testthat/` get one-way read access to package-internal

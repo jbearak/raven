@@ -292,11 +292,201 @@ fn visit_for_onload(node: Node, content: &str, symbols: &mut BTreeSet<String>) {
             && let Some(body) = rhs.child_by_field_name("body")
         {
             extract_bindings_from_body(body, content, symbols);
+            if is_direct_package_statement(node) && is_unique_package_hook(node, content) {
+                extract_qualified_topenv_bindings(body, content, symbols, &mut BTreeSet::new());
+            }
         }
         return;
     }
     for child in node.children(&mut node.walk()) {
         visit_for_onload(child, content, symbols);
+    }
+}
+
+/// Only direct package statements (including transparent braces) can establish
+/// the hook frame assumed by the qualified `base::topenv()` supplement.
+fn is_direct_package_statement(node: Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "program" => return true,
+            "braced_expression" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// An overwritten/removed hook will not run. This supplemental policy does not
+/// attempt to interpret which conditional declaration eventually wins.
+fn is_unique_package_hook(hook: Node, content: &str) -> bool {
+    fn other_binding(node: Node, hook: Node, name: &str, content: &str) -> bool {
+        if node.id() == hook.id() || node.kind() == "function_definition" {
+            return false;
+        }
+        if matches!(node.kind(), "call" | "for_statement")
+            && (is_alias_removal_call(node, content)
+                || crate::cross_file::binding::subtree_may_bind_name(node, content, name))
+        {
+            return true;
+        }
+        if node.kind() == "binary_operator"
+            && let Some(op) = node.child_by_field_name("operator")
+        {
+            let target = match node_text(op, content) {
+                "<-" | "=" | "<<-" => node.child_by_field_name("lhs"),
+                "->" | "->>" => node.child_by_field_name("rhs"),
+                _ => None,
+            };
+            if target.is_some_and(|target| {
+                crate::cross_file::binding::plain_argument_name(target, content).as_deref()
+                    == Some(name)
+            }) {
+                return true;
+            }
+        }
+        node.named_children(&mut node.walk())
+            .any(|child| other_binding(child, hook, name, content))
+    }
+    let mut root = hook;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let Some(name) = hook
+        .child_by_field_name("lhs")
+        .and_then(|n| crate::cross_file::binding::plain_identifier_name(n, content))
+    else {
+        return false;
+    };
+    !other_binding(root, hook, name, content)
+}
+
+/// Removals invalidate aliases rather than creating bindings, so the shared
+/// possible-binding query alone cannot detect them. Unknown namespaces with a
+/// matching leaf are conservatively barriers too; this grants no new names.
+fn is_alias_removal_call(node: Node, content: &str) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    node.child_by_field_name("function")
+        .is_some_and(|function| {
+            let leaf = if function.kind() == "namespace_operator" {
+                function.child_by_field_name("rhs").unwrap_or(function)
+            } else {
+                function
+            };
+            matches!(
+                crate::cross_file::binding::plain_argument_name(leaf, content).as_deref(),
+                Some("rm" | "remove")
+            )
+        })
+}
+
+fn has_alias_barrier(node: Node, content: &str) -> bool {
+    is_alias_removal_call(node, content)
+        || matches!(
+            node.kind(),
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "repeat_statement"
+                | "function_definition"
+        )
+        || crate::cross_file::binding::capturing_call_kind(node, content, |_| true).is_some()
+        || node
+            .named_children(&mut node.walk())
+            .any(|child| has_alias_barrier(child, content))
+}
+
+/// Recognize the default hook namespace without broadening the legacy namespace
+/// constructor heuristics. Explicit arguments can select unrelated environments.
+fn is_qualified_default_topenv(node: Node, content: &str) -> bool {
+    if node.kind() != "call" || node.has_error() {
+        return false;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    function.kind() == "namespace_operator"
+        && function
+            .child_by_field_name("lhs")
+            .is_some_and(|n| node_text(n, content) == "base")
+        && function
+            .child_by_field_name("rhs")
+            .is_some_and(|n| node_text(n, content) == "topenv")
+        && function
+            .child_by_field_name("operator")
+            .is_some_and(|n| node_text(n, content) == "::")
+        && crate::cross_file::binding::match_call_arguments(
+            arguments,
+            content,
+            &[],
+            crate::cross_file::binding::CallMatchMode::Strict,
+        )
+        .is_some()
+}
+
+/// Supplement legacy extraction with direct `base::topenv()` dollar writes.
+/// Aliases belong only to this ordered walk, never the legacy two-pass collector.
+/// Only straight-line assignments/braces are supported: other statements clear
+/// aliases, so control flow, captures, and deferred functions cannot invent names.
+/// RHS rebinding is checked before a write because R forces it before assigning.
+fn extract_qualified_topenv_bindings(
+    node: Node,
+    content: &str,
+    symbols: &mut BTreeSet<String>,
+    aliases: &mut BTreeSet<String>,
+) {
+    if node.kind() == "braced_expression" {
+        for child in node.named_children(&mut node.walk()) {
+            extract_qualified_topenv_bindings(child, content, symbols, aliases);
+        }
+        return;
+    }
+    if node.kind() == "comment" {
+        return;
+    }
+    if node.kind() != "binary_operator"
+        || !node
+            .child_by_field_name("operator")
+            .is_some_and(|n| matches!(node_text(n, content), "<-" | "="))
+    {
+        aliases.clear();
+        return;
+    }
+    let (Some(lhs), Some(rhs)) = (
+        node.child_by_field_name("lhs"),
+        node.child_by_field_name("rhs"),
+    ) else {
+        aliases.clear();
+        return;
+    };
+    if has_alias_barrier(rhs, content) {
+        aliases.clear();
+    } else {
+        aliases
+            .retain(|name| !crate::cross_file::binding::subtree_may_bind_name(rhs, content, name));
+    }
+    if lhs.kind() == "identifier" {
+        let Some(name) = crate::cross_file::binding::plain_identifier_name(lhs, content) else {
+            aliases.clear();
+            return;
+        };
+        aliases.remove(name);
+        if is_qualified_default_topenv(rhs, content) {
+            aliases.insert(name.to_owned());
+        }
+    } else if let Some((receiver, name)) = dollar_assignment(node, content) {
+        if crate::cross_file::binding::plain_identifier_name(receiver, content)
+            .is_some_and(|name| aliases.contains(name))
+        {
+            symbols.insert(name);
+        }
+    } else {
+        aliases.clear();
     }
 }
 
@@ -697,44 +887,42 @@ fn try_extract_dollar_assignment(
     ns_idents: &BTreeSet<String>,
     local_fns: &BTreeSet<String>,
 ) {
-    // Must be an assignment operator
-    let Some(op) = node.child_by_field_name("operator") else {
-        return;
-    };
-    if !matches!(node_text(op, content), "<-" | "<<-" | "=") {
-        return;
+    if let Some((receiver, name)) = dollar_assignment(node, content)
+        && is_namespace_like(receiver, content, ns_idents, local_fns)
+    {
+        symbols.insert(name);
     }
-    let Some(lhs) = node.child_by_field_name("lhs") else {
-        return;
-    };
+}
+
+/// Extract the receiver and literal name without deciding namespace provenance.
+fn dollar_assignment<'tree>(node: Node<'tree>, content: &str) -> Option<(Node<'tree>, String)> {
+    // Must be an assignment operator
+    let op = node.child_by_field_name("operator")?;
+    if !matches!(node_text(op, content), "<-" | "<<-" | "=") {
+        return None;
+    }
+    let lhs = node.child_by_field_name("lhs")?;
     if lhs.kind() != "extract_operator" {
-        return;
+        return None;
     }
     let mut cursor = lhs.walk();
     let children: Vec<_> = lhs.children(&mut cursor).collect();
     if children.len() < 3 {
-        return;
+        return None;
     }
     if node_text(children[1], content) != "$" {
-        return;
-    }
-    // Check that the receiver (children[0]) is namespace-like
-    if !is_namespace_like(children[0], content, ns_idents, local_fns) {
-        return;
+        return None;
     }
     let field = &children[2];
     let name = if field.kind() == "string" {
         extract_string_literal(*field, content)
     } else if field.kind() == "identifier" {
-        Some(node_text(*field, content).to_string())
+        crate::cross_file::binding::plain_identifier_name(*field, content).map(str::to_owned)
     } else {
         None
     };
-    if let Some(n) = name
-        && !n.is_empty()
-    {
-        symbols.insert(n);
-    }
+    name.filter(|name| !name.is_empty())
+        .map(|name| (children[0], name))
 }
 
 // === Helpers ===
@@ -1056,6 +1244,73 @@ mod tests {
     }
 
     // --- .onLoad / .onAttach bindings ---
+
+    #[test]
+    fn onload_qualified_default_topenv_tracks_ordered_dollar_writes() {
+        for assignment in ["=", "<-"] {
+            let code = format!(
+                r#"
+.onLoad {assignment} function(libname, pkgname) {{
+  ns {assignment} base :: topenv()
+  ns$system_mod_path {assignment} system.file('mod', package = pkgname)
+  {{ ns$another {assignment} 2 }}
+  `ns`$`quoted` {assignment} 3
+}}
+"#
+            );
+            assert_eq!(
+                extract_onload_bindings(&code),
+                BTreeSet::from(["system_mod_path".into(), "another".into(), "quoted".into()])
+            );
+        }
+    }
+
+    #[test]
+    fn onload_qualified_aliases_do_not_leak_across_rebinding_or_deferred_code() {
+        for body in [
+            "ns$x <- 1; ns <- base::topenv()",
+            "ns <- base::topenv(); ns <- new.env(); ns$x <- 1",
+            "ns <- base::topenv(); `ns` <- new.env(); ns$x <- 1",
+            "ns <- base::topenv(); ns$x <- { ns <- new.env(); 1 }",
+            "ns <- base::topenv(); ns$x <- { rm(ns); 1 }",
+            "ns <- base::topenv(); ignored <- base::remove(list = 'ns'); ns$x <- 1",
+            "ns <- base::topenv(); if (cond) ns <- new.env(); ns$x <- 1",
+            "ns <- base::topenv(); quote(ns$x <- 1)",
+            "ns <- base::topenv(); helper <- function() ns$x <- 1",
+            "ns <- another::topenv(); ns$x <- 1",
+            "ns <- base::topenv(globalenv()); ns$x <- 1",
+            "base::topenv(globalenv())$x <- 1",
+            "base::topenv()$x <- 1",
+            "ns <- base::topenv(,); ns$x <- 1",
+            "ns <- base::topenv(,,); ns$x <- 1",
+        ] {
+            let code = format!(".onLoad <- function(libname, pkgname) {{ {body} }}");
+            assert!(extract_onload_bindings(&code).is_empty(), "{body}");
+        }
+        for wrapper in ["quote({ CODE })", "outer <- function() { CODE }"] {
+            let code = wrapper.replace(
+                "CODE",
+                ".onLoad <- function(libname, pkgname) { ns <- base::topenv(); ns$x <- 1 }",
+            );
+            assert!(extract_onload_bindings(&code).is_empty(), "{code}");
+        }
+    }
+
+    #[test]
+    fn onload_qualified_bindings_require_an_unambiguous_hook() {
+        for suffix in [
+            ".onLoad <- function(...) NULL",
+            "rm(.onLoad)",
+            "invisible(rm(.onLoad))",
+            "\".onLoad\" <- function(...) NULL",
+            "for (.onLoad in list(function(...) NULL)) {}",
+            "assign('.onLoad', function(...) NULL)",
+        ] {
+            let code =
+                format!(".onLoad <- function(...) {{ ns <- base::topenv(); ns$x <- 1 }}; {suffix}");
+            assert!(extract_onload_bindings(&code).is_empty(), "{code}");
+        }
+    }
 
     #[test]
     fn onload_assign_with_envir_extracts() {

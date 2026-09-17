@@ -759,6 +759,15 @@ canonical query path once and borrows the applicable groups. Both point and
 streaming resolution use that selection for attachment seeding, name lookup, and
 final scope materialization. Local and sourced bindings take precedence.
 
+The selector also owns `.packageName`, borrowing a shared singleton name set
+only for package source and testthat namespace contexts. This binding stays out
+of the local-dev export overlay: `load_all()` does not export it. Qualified
+zero-argument `base::topenv()` hook assignments are extracted in `sysdata.rs`
+with a bounded static policy for direct statements. Their source-ordered aliases
+remain separate from the legacy namespace-constructor heuristics. Both feed
+the existing per-file hook facts and pure package derivation, so open edits,
+close-to-disk restoration, and manifest changes use the existing invalidation.
+
 Helper/setup contributions stay within the queried directory and exclude the
 queried file itself. Immediate symbol queries use source order; deferred queries
 inside functions use all peers when `hoistGlobalsInFunctions` is enabled.

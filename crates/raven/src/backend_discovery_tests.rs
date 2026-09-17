@@ -71,6 +71,98 @@ async fn ignore_event(backend: &Backend, uri: Url, typ: FileChangeType) {
 }
 
 #[tokio::test]
+async fn package_namespace_bindings_follow_open_edits_close_and_description_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let description = write(
+        root,
+        "DESCRIPTION",
+        "Package: namespaceprobe\nVersion: 0.0.1\n",
+    );
+    let hook_text = ".onLoad = function(libname, pkgname) { ns = base::topenv(); ns$system_mod_path = 'mod' }\n";
+    let hook = write(root, "R/hooks.R", hook_text);
+    let code = "paths <- function() { .packageName; system_mod_path; namespace_typo }\n";
+    let uri = write(root, "R/paths.R", code);
+    let service = service();
+    let backend = service.inner();
+    initialize(backend, root, true).await;
+    run_workspace_scan_transaction_inline(&backend.state)
+        .await
+        .expect_committed();
+    let exclusions = backend.state.read().await.workspace_exclusions.clone();
+    backend
+        .reseed_package_inputs_and_refresh(root.into(), exclusions, true)
+        .await
+        .unwrap();
+    open(backend, &uri, code).await;
+
+    async fn messages(backend: &Backend, uri: &Url) -> Vec<String> {
+        let snapshot = {
+            let state = backend.state.read().await;
+            crate::handlers::DiagnosticsSnapshot::build(&state, uri).unwrap()
+        };
+        crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.code == Some(NumberOrString::String("undefined-variable".into())))
+        .map(|d| d.message)
+        .collect()
+    }
+
+    assert_eq!(
+        messages(backend, &uri).await,
+        vec!["namespace_typo is not defined"]
+    );
+    open(backend, &hook, hook_text).await;
+    backend
+        .did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: hook.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: ".onLoad <- function(libname, pkgname) NULL\n".into(),
+            }],
+        })
+        .await;
+    settle(backend).await;
+    assert_eq!(
+        messages(backend, &uri).await,
+        vec![
+            "system_mod_path is not defined",
+            "namespace_typo is not defined"
+        ]
+    );
+    backend
+        .did_close(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: hook },
+        })
+        .await;
+    settle(backend).await;
+    assert_eq!(
+        messages(backend, &uri).await,
+        vec!["namespace_typo is not defined"]
+    );
+
+    std::fs::remove_file(description.to_file_path().unwrap()).unwrap();
+    ignore_event(backend, description, FileChangeType::DELETED).await;
+    assert_eq!(
+        messages(backend, &uri).await,
+        vec![
+            ".packageName is not defined",
+            "system_mod_path is not defined",
+            "namespace_typo is not defined"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn gitignore_reload_removes_dynamic_cycles_but_preserves_explicit_sources() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
