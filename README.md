@@ -84,7 +84,7 @@ The same `raven` binary provides the language server and command-line checks. Do
 
 **Homebrew (macOS on Apple Silicon):** Install from the [Raven Homebrew tap](https://github.com/jbearak/homebrew-raven) with `brew install jbearak/raven/raven`. Use the fully qualified name because Homebrew/core has a different `raven` package.
 
-**Arch Linux:** Community-maintained PKGBUILDs are available in [Novica's packaging repository](https://github.com/novica/aur-packages).
+**Arch Linux:** Community-maintained AUR packages by Novica: [raven](https://aur.archlinux.org/packages/raven) and [raven-bin](https://aur.archlinux.org/packages/raven-bin).
 
 **Ubuntu:** Install from Raven's signed apt repository. See [Ubuntu installation](docs/cli.md#ubuntu-installation) for setup, then use apt to install and update Raven on your desktop, server, or CI runner.
 
