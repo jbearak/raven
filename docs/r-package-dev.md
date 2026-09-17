@@ -69,6 +69,34 @@ flow stops their propagation. Quoted code and nested function bodies do not
 contribute. This adds to the existing bare namespace-constructor recognition;
 Raven does not execute hooks or evaluate arbitrary environment expressions.
 
+### Non-portable R6 classes
+
+Inside inline methods of `R6::R6Class(portable = FALSE, ...)`, Raven resolves bare
+public, private, and active member names, including inherited members from other
+package `R/` files. Method parameters and local variables take precedence.
+Method defaults and nested closures also see the instance members; field
+initializers and unrelated functions do not.
+
+```r
+Base <- R6::R6Class(portable = FALSE, public = list(value = 1))
+Child <- R6::R6Class(inherit = Base, portable = FALSE, public = list(
+  read = function() value
+))
+```
+
+This also works in scripts with same-file classes or explicit `source()`
+relationships. A superclass can be declared later: R6 captures `inherit` and
+looks it up in the completed creator environment. Raven follows proven class
+bindings and rejects ambiguous package definitions. Bare `R6Class(...)` and
+`list(...)` are recognized when no known local/package definition masks them;
+qualified calls remain recognizable under those masks.
+
+Member bindings feed diagnostics, completion, hover, signature help, and
+go-to-definition through shared scope resolution. Portability must be the literal
+`FALSE`; `F` or a computed expression does not establish non-portable scope.
+Members must come from inline `list(...)`/`base::list(...)` declarations. See
+[R6 limitations](limitations.md#r6-classes) for dynamic forms.
+
 ### Tests directory awareness
 
 Files under `tests/testthat/` get one-way read access to package-internal

@@ -32,6 +32,9 @@ static NAMESPACE_RUNTIME_SYMBOLS: std::sync::LazyLock<BTreeSet<String>> =
 /// Prepared contributions for one canonical query file, independent of cursor position.
 #[derive(Default)]
 pub(super) struct ScopeContributions<'a> {
+    r6: Option<&'a super::r6::PackageClasses>,
+    r6_omitted_parent_context: Option<&'a HashSet<Url>>,
+    r6_graph_context_truncated: bool,
     immediate_groups: Vec<&'a BTreeSet<String>>,
     imported_names: Option<&'a BTreeMap<String, BTreeSet<String>>>,
     deferred_helper_groups: Vec<&'a BTreeSet<String>>,
@@ -49,6 +52,7 @@ impl<'a> ScopeContributions<'a> {
         let Some(contrib) = contribution else {
             return selected;
         };
+        selected.r6_graph_context_truncated = contrib.r6_graph_context_truncated;
         let Ok(path) = uri.to_file_path() else {
             return selected;
         };
@@ -78,6 +82,8 @@ impl<'a> ScopeContributions<'a> {
             selected.immediate_groups.push(&NAMESPACE_RUNTIME_SYMBOLS);
         }
         if kind.is_some() || package_state::is_dev_context_path(&path, root) {
+            selected.r6 = Some(&contrib.r6);
+            selected.r6_omitted_parent_context = Some(&contrib.r6_omitted_parent_context);
             selected.immediate_groups.extend([
                 contrib.r_internal_symbols.as_ref(),
                 contrib.sysdata_symbols.as_ref(),
@@ -105,6 +111,18 @@ impl<'a> ScopeContributions<'a> {
             }
         }
         selected
+    }
+
+    /// Class lookup uses exactly the same package-context gate as internal names.
+    pub(super) fn r6_classes(&self) -> Option<&'a super::r6::PackageClasses> {
+        self.r6
+    }
+
+    pub(super) fn r6_context_incomplete(&self, uri: &Url) -> bool {
+        self.r6_graph_context_truncated
+            || self
+                .r6_omitted_parent_context
+                .is_some_and(|uris| uris.contains(uri))
     }
 
     /// Iterate strict names without allocating the stream's membership index.

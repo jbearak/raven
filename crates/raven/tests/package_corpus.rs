@@ -73,6 +73,7 @@ enum PackageGroup {
     Recommended,
     Tidyverse,
     Dt,
+    ModulesR6,
 }
 
 impl PackageGroup {
@@ -82,6 +83,7 @@ impl PackageGroup {
             Self::Recommended => "recommended",
             Self::Tidyverse => "tidyverse",
             Self::Dt => "dt",
+            Self::ModulesR6 => "modules-r6",
         }
     }
 
@@ -91,6 +93,7 @@ impl PackageGroup {
             "recommended" => Some(Self::Recommended),
             "tidyverse" => Some(Self::Tidyverse),
             "dt" => Some(Self::Dt),
+            "modules-r6" => Some(Self::ModulesR6),
             _ => None,
         }
     }
@@ -120,6 +123,7 @@ struct FetchSpec {
     url: &'static str,
     package_root_subdir: &'static str,
     cran_package: Option<&'static str>,
+    revision: Option<&'static str>,
 }
 
 impl FetchSpec {
@@ -134,6 +138,7 @@ impl FetchSpec {
             url,
             package_root_subdir,
             cran_package: None,
+            revision: None,
         }
     }
 
@@ -148,6 +153,7 @@ impl FetchSpec {
             url,
             package_root_subdir,
             cran_package: None,
+            revision: None,
         }
     }
 
@@ -158,11 +164,18 @@ impl FetchSpec {
             url: CRAN_CONTRIB_URL,
             package_root_subdir: "",
             cran_package: Some(package),
+            revision: None,
         }
     }
 
     fn cache_key(self) -> String {
-        format!("{}:{}:{}", self.kind.as_str(), self.source_id, self.url)
+        format!(
+            "{}:{}:{}:{}",
+            self.kind.as_str(),
+            self.source_id,
+            self.url,
+            self.revision.unwrap_or("HEAD")
+        )
     }
 }
 
@@ -221,6 +234,21 @@ macro_rules! git_pkg {
             ],
         }
     };
+}
+
+fn pinned_module_package(
+    name: &'static str,
+    url: &'static str,
+    revision: &'static str,
+) -> PackageSpec {
+    PackageSpec {
+        name,
+        group: PackageGroup::ModulesR6,
+        fetches: vec![FetchSpec {
+            revision: Some(revision),
+            ..FetchSpec::git(name, url, "")
+        }],
+    }
 }
 
 fn corpus_manifest() -> Vec<PackageSpec> {
@@ -426,6 +454,26 @@ fn corpus_manifest() -> Vec<PackageSpec> {
             "https://github.com/tidyverse/tidyverse"
         ),
         git_pkg!(PackageGroup::Dt, "DT", "https://github.com/rstudio/DT"),
+        pinned_module_package(
+            "rhino",
+            "https://github.com/Appsilon/rhino",
+            "02031ed6bf4ee4073687569c3321b7191c22b709",
+        ),
+        pinned_module_package(
+            "box",
+            "https://github.com/klmr/box",
+            "2eb1430241385747e2f5f75533fedadab4d3c87b",
+        ),
+        pinned_module_package(
+            "box.lsp",
+            "https://github.com/Appsilon/box.lsp",
+            "12445f1be9703968aeab405c568cbad324ee6e93",
+        ),
+        pinned_module_package(
+            "targets",
+            "https://github.com/ropensci/targets",
+            "06cae18bf0306ee98ce2f6f0a647e26410ddca22",
+        ),
     ]
 }
 
@@ -579,6 +627,7 @@ struct CheckReport {
     group: PackageGroup,
     source: ResolvedSource,
     command: String,
+    diagnostic_scope: &'static str,
     exit_code: Option<i32>,
     stderr: String,
     diagnostics: Vec<ObservedDiagnostic>,
@@ -644,6 +693,35 @@ fn manifest_covers_requested_package_sets() {
     assert!(base.contains(&"stats"));
     assert!(recommended.contains(&"survival"));
     assert!(tidyverse.contains(&"dplyr"));
+}
+
+#[test]
+fn corpus_json_normalizes_windows_production_paths() {
+    let rows = parse_raven_json("targets", r#"[{"path":"R\\example.R","diagnostic":{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":2,"code":"undefined-variable","message":"x is not defined"}}]"#).unwrap();
+    assert_eq!(rows[0].path, "R/example.R");
+    assert!(rows[0].path.starts_with("R/"));
+}
+
+#[test]
+fn module_and_r6_corpus_is_pinned_without_fallbacks() {
+    let manifest = corpus_manifest();
+    let selected: Vec<_> = manifest
+        .iter()
+        .filter(|package| package.group == PackageGroup::ModulesR6)
+        .collect();
+    assert_eq!(
+        selected.iter().map(|p| p.name).collect::<Vec<_>>(),
+        ["rhino", "box", "box.lsp", "targets"]
+    );
+    for package in selected {
+        assert_eq!(package.fetches.len(), 1);
+        let fetch = package.fetches[0];
+        assert_eq!(fetch.kind, FetchKind::Git);
+        let revision = fetch.revision.unwrap();
+        assert_eq!(revision.len(), 40);
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(fetch.cache_key().contains(revision));
+    }
 }
 
 #[test]
@@ -1129,13 +1207,35 @@ fn fetch_git_source(fetch: &FetchSpec, fetch_root: &Path) -> Result<FetchedSourc
     ];
     run_checked("git", args)?;
 
+    if let Some(revision) = fetch.revision {
+        run_checked(
+            "git",
+            vec![
+                "-C".into(),
+                root.as_os_str().to_owned(),
+                "fetch".into(),
+                "--depth=1".into(),
+                "origin".into(),
+                revision.into(),
+            ],
+        )?;
+        run_checked(
+            "git",
+            vec![
+                "-C".into(),
+                root.as_os_str().to_owned(),
+                "checkout".into(),
+                "--detach".into(),
+                "FETCH_HEAD".into(),
+            ],
+        )?;
+    }
     let rev_output = run_checked(
         "git",
         vec![
             OsString::from("-C"),
             root.as_os_str().to_os_string(),
             OsString::from("rev-parse"),
-            OsString::from("--short"),
             OsString::from("HEAD"),
         ],
     )?;
@@ -1260,11 +1360,19 @@ fn run_raven_check(
     let command = command_string(binary.as_os_str(), &args);
     let output = Command::new(&binary)
         .args(&args)
+        .env_remove("R_BOX_PATH")
         .output()
         .map_err(|err| format!("failed to run {command}: {err}"))?;
     let stdout = String::from_utf8(output.stdout)
         .map_err(|err| format!("{command} produced non-UTF-8 stdout: {err}"))?;
-    let diagnostics = parse_raven_json(package.name, &stdout)?;
+    let mut diagnostics = parse_raven_json(package.name, &stdout)?;
+    // These pinned repositories include intentionally broken test fixtures and
+    // external harness scripts. This group asserts production R/ is clean;
+    // it does not label every raw repository diagnostic a false positive.
+    let production_only = package.group == PackageGroup::ModulesR6;
+    if production_only {
+        diagnostics.retain(|diagnostic| diagnostic.path.starts_with("R/"));
+    }
     let exit_code = output.status.code();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -1277,6 +1385,7 @@ fn run_raven_check(
         group: package.group,
         source: checkout.source,
         command,
+        diagnostic_scope: if production_only { "R/" } else { "repository" },
         exit_code,
         stderr,
         diagnostics,
@@ -1325,7 +1434,7 @@ fn parse_raven_json(package: &str, stdout: &str) -> Result<Vec<ObservedDiagnosti
         .into_iter()
         .map(|item| ObservedDiagnostic {
             package: package.to_string(),
-            path: item.path,
+            path: item.path.replace('\\', "/"),
             range: DiagnosticRange {
                 start_line: item.diagnostic.range.start.line,
                 start_character: item.diagnostic.range.start.character,
@@ -1512,6 +1621,7 @@ fn run_checked(program: &str, args: Vec<OsString>) -> Result<Output, String> {
     let command = command_string(std::ffi::OsStr::new(program), &args);
     let output = Command::new(program)
         .args(&args)
+        .env_remove("R_BOX_PATH")
         .output()
         .map_err(|err| format!("failed to run {command}: {err}"))?;
     if !output.status.success() {

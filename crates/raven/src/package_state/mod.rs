@@ -1639,6 +1639,8 @@ mod path_tests {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RFileFacts {
+    /// Compact class declarations survive artifact-LRU eviction with the input.
+    pub r6: Arc<crate::cross_file::scope::r6::FileFacts>,
     /// Canonical `Source` vs `Test` classification for this file,
     /// carried through from the corresponding `RFileInput`. Consumers
     /// that need to partition facts by location (e.g. `build_scope_contribution`,
@@ -1663,6 +1665,14 @@ pub struct RFileFacts {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageScopeContribution {
+    /// Source-only class identities; members never enter package-global names.
+    pub r6: Arc<crate::cross_file::scope::r6::PackageClasses>,
+    /// Snapshot-only uncertainty from full-graph parents omitted by neighborhood
+    /// trimming. Persisted package derivation leaves this empty.
+    pub r6_omitted_parent_context: Arc<std::collections::HashSet<tower_lsp::lsp_types::Url>>,
+    /// Snapshot-only graph budget signal. Applies to script R6 creators too,
+    /// even when no package namespace contributions are selected.
+    pub r6_graph_context_truncated: bool,
     /// The workspace root for this package, if known. Carried here so that
     /// scope-injection logic (Phase 5) can check whether the queried file is
     /// under `R/` or `tests/testthat/` without requiring a separate parameter.

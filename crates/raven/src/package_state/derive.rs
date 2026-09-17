@@ -198,6 +198,14 @@ fn build_scope_contribution(
     }
     let test_attached_packages = compute_test_attached_packages(description);
     PackageScopeContribution {
+        r6: Arc::new(crate::cross_file::scope::r6::PackageClasses::build(
+            r_file_facts
+                .values()
+                .filter(|facts| facts.kind == RFileKind::Source)
+                .map(|facts| (facts.top_level_defs.as_ref(), &facts.r6)),
+        )),
+        r6_omitted_parent_context: Default::default(),
+        r6_graph_context_truncated: false,
         workspace_root: Some(ws.root.clone()),
         package_name: Some(ws.name.clone()),
         r_internal_symbols: Arc::new(r_internal_symbols),
@@ -328,24 +336,31 @@ fn derive_r_file_facts(
         });
         let facts = match reuse {
             Some(cached) => cached.clone(),
-            None => RFileFacts {
-                kind: file.kind,
-                roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
-                top_level_defs: Arc::new(crate::roxygen::extract_top_level_defs(&file.text)),
-                onload_bindings: Arc::new(crate::package_state::sysdata::extract_onload_bindings(
-                    &file.text,
-                )),
-                // Only Test-kind files can contribute testthat-preamble attaches;
-                // skip the extra parse for Source files (their `library()` calls
-                // are handled by the standard position-aware scope path).
-                attached_packages: match file.kind {
-                    RFileKind::Test => Arc::new(
-                        crate::cross_file::source_detect::extract_attached_packages(&file.text),
+            None => {
+                let (top_level_defs, r6) = tower_lsp::lsp_types::Url::from_file_path(path)
+                    .ok()
+                    .map(|uri| crate::roxygen::extract_top_level_facts(&uri, &file.text))
+                    .unwrap_or_default();
+                RFileFacts {
+                    r6,
+                    kind: file.kind,
+                    roxygen_namespace: crate::roxygen::extract_roxygen_namespace_tags(&file.text),
+                    top_level_defs: Arc::new(top_level_defs),
+                    onload_bindings: Arc::new(
+                        crate::package_state::sysdata::extract_onload_bindings(&file.text),
                     ),
-                    RFileKind::Source => Arc::new(BTreeSet::new()),
-                },
-                content_digest: file.content_digest,
-            },
+                    // Only Test-kind files can contribute testthat-preamble attaches;
+                    // skip the extra parse for Source files (their `library()` calls
+                    // are handled by the standard position-aware scope path).
+                    attached_packages: match file.kind {
+                        RFileKind::Test => Arc::new(
+                            crate::cross_file::source_detect::extract_attached_packages(&file.text),
+                        ),
+                        RFileKind::Source => Arc::new(BTreeSet::new()),
+                    },
+                    content_digest: file.content_digest,
+                }
+            }
         };
         out.insert(path.clone(), facts);
     }

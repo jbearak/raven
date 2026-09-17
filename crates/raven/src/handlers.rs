@@ -2157,7 +2157,10 @@ impl DiagnosticsSnapshot {
             file_type: doc.file_type,
             rmd_declared_params,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
-            scope_contribution: state.package_state.scope_contribution().clone(),
+            scope_contribution: state.package_scope_contribution_snapshot(
+                &payload.neighborhood,
+                payload.truncation.is_truncated(),
+            ),
             package_query_uri: state
                 .package_inputs
                 .workspace_root
@@ -10039,9 +10042,6 @@ fn collect_undefined_variables_from_snapshot(
         {
             continue;
         }
-        if is_r6_method_special_variable_usage(usage_node, text, &name, &top_level_defs_by_name) {
-            continue;
-        }
 
         // knitr/Quarto-injected `params` (see `is_implicit_rmd_params`): the
         // masked analysis text blanks the frontmatter, so a declared `params`
@@ -10118,7 +10118,8 @@ fn collect_undefined_variables_from_snapshot(
                     .and_then(|unquoted| stream.symbol_for(unquoted))
             });
             if let Some(sym) = stream_symbol
-                && !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16)
+                && (stream.is_deferred_binding(&sym)
+                    || !is_forward_reference_in_same_file(&sym, uri, usage_line, usage_col_utf16))
             {
                 continue;
             }
@@ -10168,7 +10169,10 @@ fn collect_undefined_variables_from_snapshot(
                     .and_then(|name| scope.symbols.get(name))
             });
         if let Some(sym) = replacement_symbol
-            && !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16)
+            && (stream_opt
+                .as_ref()
+                .is_some_and(|stream| stream.is_deferred_binding(sym))
+                || !is_forward_reference_in_same_file(sym, uri, usage_line, usage_col_utf16))
         {
             continue;
         }
@@ -23080,105 +23084,6 @@ pub(crate) fn unquote_backtick_name(name: &str) -> Option<&str> {
 fn is_implicit_search_path_binding(name: &str) -> bool {
     let normalized = unquote_backtick_name(name).unwrap_or(name);
     matches!(normalized, ".Autoloaded")
-}
-
-/// Returns true when `node` is one of R's method-frame special variables that
-/// R6 class method bodies run with `self`, `private`, and `super` injected by
-/// R6 at construction time. Treat them as implicit locals when the use is inside
-/// a function value within the `public`, `private`, or `active` list arguments
-/// of `R6Class(...)` or `R6::R6Class(...)`. A top-level local named `R6Class`
-/// disables the treatment (shadow).
-fn is_r6_method_special_variable_usage(
-    node: Node,
-    text: &str,
-    name: &str,
-    top_level_defs: &HashMap<String, Vec<(u32, u32)>>,
-) -> bool {
-    if !matches!(name, "self" | "private" | "super") {
-        return false;
-    }
-    if top_level_defs.contains_key("R6Class") {
-        return false;
-    }
-
-    let mut current = node;
-    while let Some(function) = containing_function_definition(current) {
-        if function_definition_is_r6_method(function, text) {
-            return true;
-        }
-        current = function;
-    }
-
-    false
-}
-
-/// Returns true when `function` is a value inside a member `list(...)` argument
-/// of an `R6Class(...)` or `R6::R6Class(...)` call. Two argument shapes count:
-///
-/// - the value of a named `public=list(...)`, `private=list(...)`, or
-///   `active=list(...)` argument, or
-/// - an *unnamed* `list(...)` among the call's first four arguments —
-///   R6Class's signature is `R6Class(classname, public, private, active, ...)`,
-///   so the canonical positional form `R6::R6Class("Token", list(...))`
-///   (httr's Token, rvest) supplies member lists in argument positions 2–4.
-fn function_definition_is_r6_method(function: Node, text: &str) -> bool {
-    // function_definition → argument(value) → arguments → call (the list() call)
-    // then: list() call → argument → arguments → call (R6Class), where the
-    // argument is either named public/private/active or unnamed among the
-    // first four.
-    let Some(list_arg) = containing_argument_value(function) else {
-        return false;
-    };
-    let Some(list_args) = list_arg.parent().filter(|p| p.kind() == "arguments") else {
-        return false;
-    };
-    let Some(list_call) = list_args.parent().filter(|p| p.kind() == "call") else {
-        return false;
-    };
-    // The list() call should be named `list`
-    if list_call
-        .child_by_field_name("function")
-        .is_none_or(|f| node_text(f, text) != "list")
-    {
-        return false;
-    }
-    // The list() call must itself be an argument of an R6Class(...) /
-    // R6::R6Class(...) call.
-    let Some(r6_arg) = list_call.parent().filter(|p| p.kind() == "argument") else {
-        return false;
-    };
-    let Some(r6_args) = r6_arg.parent().filter(|p| p.kind() == "arguments") else {
-        return false;
-    };
-    let Some(r6_call) = r6_args.parent().filter(|p| p.kind() == "call") else {
-        return false;
-    };
-    let Some(r6_func) = r6_call.child_by_field_name("function") else {
-        return false;
-    };
-    let func_text = node_text(r6_func, text);
-    if func_text != "R6Class" && func_text != "R6::R6Class" {
-        return false;
-    }
-    match r6_arg.child_by_field_name("name") {
-        // Named argument: must be one of the member-list parameters.
-        Some(arg_name_node) => {
-            matches!(
-                node_text(arg_name_node, text),
-                "public" | "private" | "active"
-            )
-        }
-        // Unnamed argument: positional member list when it sits among the
-        // first four arguments (classname, public, private, active).
-        None => {
-            let mut cursor = r6_args.walk();
-            r6_args
-                .children(&mut cursor)
-                .filter(|c| c.kind() == "argument")
-                .position(|c| c.id() == r6_arg.id())
-                .is_some_and(|idx| idx < 4)
-        }
-    }
 }
 
 /// the dispatcher injects.
@@ -38363,6 +38268,55 @@ y <- totally_undefined_baseline()
                 "group-generic special `{special}` must not be flagged. messages: {messages:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn r6_member_consumers_prefer_instance_provenance_over_globals() {
+        let mut state = crate::state::WorldState::new();
+        let uri = Url::parse("file:///work/r6-consumers.R").unwrap();
+        let code = r#"reader <- function(global_arg) global_arg
+C <- R6::R6Class(portable=FALSE, public=list(
+  run=function() { reader(1); reader },
+  reader=function(member_arg, extra=2) member_arg))
+"#;
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("r"));
+        let at = Position::new(2, 20);
+        let definition = goto_definition(&state, &uri, at).expect("R6 member definition");
+        let locations = match definition {
+            GotoDefinitionResponse::Scalar(location) => vec![location],
+            GotoDefinitionResponse::Array(locations) => locations,
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, uri);
+        assert_eq!(locations[0].range.start, Position::new(3, 2));
+        let hover = hover(&state, &uri, at).await.expect("R6 method hover");
+        let rendered = format!("{:?}", hover.contents);
+        assert!(
+            rendered.contains("member_arg") && !rendered.contains("global_arg"),
+            "{rendered}"
+        );
+        let signature = resolve_signature_help(
+            prepare_signature_help(&state, &uri, Position::new(2, 25)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            signature.signatures[0].label.contains("member_arg"),
+            "{signature:?}"
+        );
+        let items = match completion(&state, &uri, Position::new(2, 34), None).unwrap() {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .iter()
+            .find(|item| item.label == "reader")
+            .expect("R6 member completion");
+        assert!(
+            item.detail.as_ref().unwrap().contains("member_arg"),
+            "{item:?}"
+        );
     }
 
     /// R6 class method bodies run with `self`, `private`, and `super` injected
