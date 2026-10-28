@@ -23,6 +23,7 @@ pub type VoidFn = unsafe extern "C" fn();
 pub type RustReadConsoleFn =
     unsafe extern "C" fn(*const c_char, *mut u8, c_int, c_int, *mut c_int) -> c_int;
 pub type ShowMessageFn = unsafe extern "C" fn(*const c_char);
+pub type BusyFn = unsafe extern "C" fn(c_int);
 
 /// Function table passed to `shim.c` (layout must match `RavenRApi` there).
 #[repr(C)]
@@ -105,6 +106,7 @@ pub struct LibR {
     pub ptr_flush_console: *mut Option<VoidFn>,
     pub ptr_clearerr_console: *mut Option<VoidFn>,
     pub ptr_show_message: *mut Option<ShowMessageFn>,
+    pub ptr_busy: *mut Option<BusyFn>,
 }
 
 // SAFETY: LibR is a table of addresses into a library that is never
@@ -212,6 +214,7 @@ pub fn load(path: &Path) -> Result<&'static LibR, String> {
         ptr_flush_console: sym!("ptr_R_FlushConsole"),
         ptr_clearerr_console: sym!("ptr_R_ClearerrConsole"),
         ptr_show_message: sym!("ptr_R_ShowMessage"),
+        ptr_busy: sym!("ptr_R_Busy"),
     };
 
     // SAFETY: `shim` holds valid addresses for the life of the process; the

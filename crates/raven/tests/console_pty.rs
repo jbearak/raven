@@ -592,6 +592,23 @@ fn r_output_and_child_process_output_stay_in_order() {
         out.rfind("AFTER"),
     );
     assert!(b < ch && ch < a, "order: {out}");
+
+    // Several quick writes before each child: the later ones are buffered as
+    // a burst and must still reach the terminal before the child's output.
+    c.line(
+        "for (i in 1:30) { cat(paste0('A', i, '\\n')); cat(paste0('B', i, '\\n')); \
+         system(paste0('echo C', i)) }; cat('LOOPDONE\\n')",
+    );
+    let out = c.expect("LOOPDONE\r\n");
+    let shown: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.len() > 1 && l[1..].parse::<u32>().is_ok())
+        .collect();
+    let expected: Vec<String> = (1..=30)
+        .flat_map(|i| [format!("A{i}"), format!("B{i}"), format!("C{i}")])
+        .collect();
+    assert_eq!(shown, expected, "order: {out}");
 }
 
 #[test]

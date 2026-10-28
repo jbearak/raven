@@ -8,15 +8,24 @@
 //!   is only ever *added* around text that has no styling of its own.
 //! * Output is batched only during bursts. A write that follows a pause
 //!   longer than [`BURST_GAP`] first flushes anything pending and then goes
-//!   straight to the terminal, so slow streaming output appears at once, and
-//!   so does output printed just before R hands the terminal to something else
-//!   (`system()`, compiled code writing to fd 1). Inside a burst (`print()` of
-//!   a long vector is about a million writes) writes are coalesced and flushed
-//!   by a background thread after [`FLUSH_INTERVAL`], before every prompt, on
+//!   straight to the terminal, so slow streaming output appears at once.
+//!   Inside a burst (`print()` of a long vector is about a million writes)
+//!   writes are coalesced. A background thread writes them out as soon as R
+//!   has been quiet for [`QUIET_FLUSH`], and at the latest after
+//!   [`FLUSH_INTERVAL`]; they are also flushed before every prompt, on
 //!   `flush.console()`, at 64 KB, and at process exit (`q()`). R's own writer
 //!   makes one syscall per write; batching is where the console's output speed
-//!   comes from. The trade-off: during a burst, native output can land up to
-//!   `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses that tail.
+//!   comes from.
+//! * Output stays ordered with child processes. On R's macOS builds,
+//!   `system()`/`system2()` call `R_Busy(1)` before starting the child, and
+//!   the console flushes there. Elsewhere (`posix_spawn` runs no fork hooks)
+//!   ordering rests on timing: R goes quiet the moment it hands over, the
+//!   buffer is out within about `QUIET_FLUSH`, and a child needs well over
+//!   that (spawn plus two `exec`s for `sh -c`) before it can write. On a
+//!   saturated machine the flusher can occasionally lose that race.
+//! * Trade-offs: compiled code that writes to fd 1 *during* a burst can land
+//!   up to `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses the
+//!   buffered tail.
 //!
 //! Styles use the terminal's 16-colour palette roles, so they follow the
 //! user's terminal theme (light or dark) without configuration.
@@ -26,6 +35,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(2);
+/// Buffered output is written once R has written nothing for this long.
+const QUIET_FLUSH: Duration = Duration::from_micros(100);
 /// A write arriving this long after the previous one is not part of a burst.
 const BURST_GAP: Duration = Duration::from_millis(1);
 const MAX_BUFFER: usize = 64 * 1024;
@@ -595,9 +606,23 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
                         g = out.pending.wait(g).unwrap_or_else(|e| e.into_inner());
                     }
                 }
-                // Let a burst of writes accumulate, then write it in one go.
-                std::thread::sleep(FLUSH_INTERVAL);
-                out.flush();
+                // Let the burst accumulate; write it once R goes quiet (it
+                // may be about to start a child process) or once it is
+                // FLUSH_INTERVAL old.
+                let since = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(QUIET_FLUSH);
+                    let g = out.lock();
+                    if g.buf.is_empty() {
+                        break;
+                    }
+                    let quiet = g.last_write.is_none_or(|t| t.elapsed() >= QUIET_FLUSH);
+                    if quiet || since.elapsed() >= FLUSH_INTERVAL {
+                        drop(g);
+                        out.flush();
+                        break;
+                    }
+                }
             }
         })
         .expect("spawn flusher");
