@@ -2348,10 +2348,49 @@ struct LibraryReplacementIntent(u64);
 pub(crate) struct LibraryRoutingReconcileTelemetry {
     pub(crate) package_config_generation: u64,
     pub(crate) package_input_generation: u64,
+    pub(crate) build_inputs: LibraryBuildInputs,
+}
+
+/// The settings that determine what a package-library build produces:
+/// whether packages are enabled, the R binary, extra library paths, and the
+/// workspace folders (the first folder is the build's workspace root).
+///
+/// This is the single definition of "library build input". Every routing
+/// basis, reconcile request, and startup build key captures it through
+/// [`WorldState::library_build_inputs`] and checks currency by comparing the
+/// whole value, so adding an input here extends every staleness check at
+/// once. Watcher-only settings (`packages_watch_*`) are deliberately absent:
+/// changing them restarts the libpath watcher but never rebuilds the library.
+/// Package-input and open-record authority are absent too: a `DESCRIPTION`
+/// edit or the startup package seed changes routing derivation, not the
+/// library, so a build that finishes after such a change is still the right
+/// library and `install_built_package_library` re-captures its routing basis
+/// instead of discarding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryBuildInputs {
     pub(crate) packages_enabled: bool,
     pub(crate) packages_r_path: Option<PathBuf>,
     pub(crate) packages_additional_library_paths: Vec<PathBuf>,
     pub(crate) workspace_folders: Vec<Url>,
+}
+
+impl LibraryBuildInputs {
+    pub(crate) fn from_parts(config: &CrossFileConfig, workspace_folders: &[Url]) -> Self {
+        Self {
+            packages_enabled: config.packages_enabled,
+            packages_r_path: config.packages_r_path.clone(),
+            packages_additional_library_paths: config.packages_additional_library_paths.clone(),
+            workspace_folders: workspace_folders.to_vec(),
+        }
+    }
+
+    /// The workspace root a build resolves project-local libraries against:
+    /// the first workspace folder, when it is a `file:` URL.
+    pub(crate) fn workspace_root(&self) -> Option<PathBuf> {
+        self.workspace_folders
+            .first()
+            .and_then(|url| url.to_file_path().ok())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2401,10 +2440,7 @@ impl LibraryRoutingPreSealDeposit {
             telemetry: LibraryRoutingReconcileTelemetry {
                 package_config_generation: basis.package_config_generation,
                 package_input_generation: basis.package_input_generation,
-                packages_enabled: basis.packages_enabled,
-                packages_r_path: basis.packages_r_path.clone(),
-                packages_additional_library_paths: basis.packages_additional_library_paths.clone(),
-                workspace_folders: basis.workspace_folders.clone(),
+                build_inputs: basis.build_inputs.clone(),
             },
             handles: Vec::new(),
             candidates: Vec::new(),
@@ -2815,12 +2851,9 @@ pub(crate) struct LibraryRoutingBasis {
     package_input_generation: u64,
     package_config_generation: u64,
     package_state_record_generation: u64,
-    packages_enabled: bool,
-    packages_r_path: Option<PathBuf>,
-    packages_additional_library_paths: Vec<PathBuf>,
+    build_inputs: LibraryBuildInputs,
     packages_watch_library_paths: bool,
     packages_watch_debounce_ms: u64,
-    workspace_folders: Vec<Url>,
     watcher_owner: Option<LibpathWatcherOwner>,
     replacement_intent: Option<LibraryReplacementIntent>,
     adopted_reconcile_obligation: bool,
@@ -2850,7 +2883,7 @@ impl LibraryRoutingBasis {
     }
 
     pub(crate) fn should_watch_library_paths(&self, ready: bool, library: &PackageLibrary) -> bool {
-        self.packages_enabled
+        self.build_inputs.packages_enabled
             && self.packages_watch_library_paths
             && ready
             && !library.lib_paths().is_empty()
@@ -5199,15 +5232,9 @@ impl WorldState {
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
             package_state_record_generation: self.package_state_record_generation,
-            packages_enabled: self.cross_file_config.packages_enabled,
-            packages_r_path: self.cross_file_config.packages_r_path.clone(),
-            packages_additional_library_paths: self
-                .cross_file_config
-                .packages_additional_library_paths
-                .clone(),
+            build_inputs: self.library_build_inputs(),
             packages_watch_library_paths: self.cross_file_config.packages_watch_library_paths,
             packages_watch_debounce_ms: self.cross_file_config.packages_watch_debounce_ms,
-            workspace_folders: self.workspace_folders.clone(),
             watcher_owner,
             replacement_intent,
             adopted_reconcile_obligation,
@@ -5237,6 +5264,12 @@ impl WorldState {
             | LibraryRoutingMutation::DegradedReconcile
             | LibraryRoutingMutation::Dropped => basis.replacement_intent.is_none(),
         }
+    }
+
+    /// The current [`LibraryBuildInputs`]: what a package-library build
+    /// started now would be built from.
+    pub(crate) fn library_build_inputs(&self) -> LibraryBuildInputs {
+        LibraryBuildInputs::from_parts(&self.cross_file_config, &self.workspace_folders)
     }
 
     fn library_watch_settings_are_current(&self, basis: &LibraryRoutingBasis) -> bool {
@@ -5280,10 +5313,7 @@ impl WorldState {
             telemetry: LibraryRoutingReconcileTelemetry {
                 package_config_generation: basis.package_config_generation,
                 package_input_generation: basis.package_input_generation,
-                packages_enabled: basis.packages_enabled,
-                packages_r_path: basis.packages_r_path.clone(),
-                packages_additional_library_paths: basis.packages_additional_library_paths.clone(),
-                workspace_folders: basis.workspace_folders.clone(),
+                build_inputs: basis.build_inputs.clone(),
             },
             abort_policy,
             armed: true,
@@ -5326,13 +5356,7 @@ impl WorldState {
         let telemetry = LibraryRoutingReconcileTelemetry {
             package_config_generation: self.package_config_generation,
             package_input_generation: self.package_input_generation(),
-            packages_enabled: self.cross_file_config.packages_enabled,
-            packages_r_path: self.cross_file_config.packages_r_path.clone(),
-            packages_additional_library_paths: self
-                .cross_file_config
-                .packages_additional_library_paths
-                .clone(),
-            workspace_folders: self.workspace_folders.clone(),
+            build_inputs: self.library_build_inputs(),
         };
         let mut lifecycle = self.library_replacement_lifecycle.lock();
         let deposit = lifecycle
@@ -5389,13 +5413,7 @@ impl WorldState {
             telemetry: LibraryRoutingReconcileTelemetry {
                 package_config_generation: self.package_config_generation,
                 package_input_generation: self.package_input_generation(),
-                packages_enabled: self.cross_file_config.packages_enabled,
-                packages_r_path: self.cross_file_config.packages_r_path.clone(),
-                packages_additional_library_paths: self
-                    .cross_file_config
-                    .packages_additional_library_paths
-                    .clone(),
-                workspace_folders: self.workspace_folders.clone(),
+                build_inputs: self.library_build_inputs(),
             },
         }
     }
@@ -5418,13 +5436,7 @@ impl WorldState {
             telemetry: LibraryRoutingReconcileTelemetry {
                 package_config_generation: self.package_config_generation,
                 package_input_generation: self.package_input_generation(),
-                packages_enabled: self.cross_file_config.packages_enabled,
-                packages_r_path: self.cross_file_config.packages_r_path.clone(),
-                packages_additional_library_paths: self
-                    .cross_file_config
-                    .packages_additional_library_paths
-                    .clone(),
-                workspace_folders: self.workspace_folders.clone(),
+                build_inputs: self.library_build_inputs(),
             },
         });
         drop(lifecycle);
@@ -5517,11 +5529,7 @@ impl WorldState {
             || self.package_config_generation != basis.package_config_generation
             || self.package_state_record_generation != basis.package_state_record_generation
             || self.package_library_ready != basis.ready
-            || self.cross_file_config.packages_enabled != basis.packages_enabled
-            || self.cross_file_config.packages_r_path != basis.packages_r_path
-            || self.cross_file_config.packages_additional_library_paths
-                != basis.packages_additional_library_paths
-            || self.workspace_folders != basis.workspace_folders
+            || self.library_build_inputs() != basis.build_inputs
         {
             return None;
         }
@@ -5546,11 +5554,7 @@ impl WorldState {
             && self.package_input_generation() == basis.package_input_generation
             && self.package_config_generation == basis.package_config_generation
             && self.package_state_record_generation == basis.package_state_record_generation
-            && self.cross_file_config.packages_enabled == basis.packages_enabled
-            && self.cross_file_config.packages_r_path == basis.packages_r_path
-            && self.cross_file_config.packages_additional_library_paths
-                == basis.packages_additional_library_paths
-            && self.workspace_folders == basis.workspace_folders
+            && self.library_build_inputs() == basis.build_inputs
             && basis
                 .watcher_owner
                 .is_none_or(|owner| self.libpath_watcher_owner_is_current(owner))
@@ -5569,11 +5573,7 @@ impl WorldState {
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
             || self.package_state_record_generation != basis.package_state_record_generation
-            || self.cross_file_config.packages_enabled != basis.packages_enabled
-            || self.cross_file_config.packages_r_path != basis.packages_r_path
-            || self.cross_file_config.packages_additional_library_paths
-                != basis.packages_additional_library_paths
-            || self.workspace_folders != basis.workspace_folders
+            || self.library_build_inputs() != basis.build_inputs
             || basis
                 .watcher_owner
                 .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
@@ -5597,11 +5597,7 @@ impl WorldState {
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
             || self.package_state_record_generation != basis.package_state_record_generation
-            || self.cross_file_config.packages_enabled != basis.packages_enabled
-            || self.cross_file_config.packages_r_path != basis.packages_r_path
-            || self.cross_file_config.packages_additional_library_paths
-                != basis.packages_additional_library_paths
-            || self.workspace_folders != basis.workspace_folders
+            || self.library_build_inputs() != basis.build_inputs
             || basis
                 .watcher_owner
                 .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
@@ -11377,11 +11373,7 @@ impl WorldState {
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
             || self.package_state_record_generation != basis.package_state_record_generation
-            || self.cross_file_config.packages_enabled != basis.packages_enabled
-            || self.cross_file_config.packages_r_path != basis.packages_r_path
-            || self.cross_file_config.packages_additional_library_paths
-                != basis.packages_additional_library_paths
-            || self.workspace_folders != basis.workspace_folders
+            || self.library_build_inputs() != basis.build_inputs
             || basis
                 .watcher_owner
                 .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
@@ -17160,7 +17152,64 @@ tarchetypes::tar_render(nested, "nested.Rmd")
             request.telemetry.package_config_generation,
             basis.package_config_generation
         );
-        assert_eq!(request.telemetry.workspace_folders, basis.workspace_folders);
+        assert_eq!(request.telemetry.build_inputs, basis.build_inputs);
+    }
+
+    #[tokio::test]
+    async fn every_library_build_input_change_stales_the_routing_basis() {
+        type Mutation = fn(&mut WorldState);
+        let cases: [(&str, Mutation); 5] = [
+            ("nothing", |_| {}),
+            ("packages_enabled", |state| {
+                state.cross_file_config.packages_enabled = !state.cross_file_config.packages_enabled
+            }),
+            ("packages_r_path", |state| {
+                state.cross_file_config.packages_r_path = Some(PathBuf::from("/opt/R/bin/R"))
+            }),
+            ("packages_additional_library_paths", |state| {
+                state
+                    .cross_file_config
+                    .packages_additional_library_paths
+                    .push(PathBuf::from("/opt/R/site-library"))
+            }),
+            ("workspace_folders", |state| {
+                state
+                    .workspace_folders
+                    .push(Url::parse("file:///workspace/other").unwrap())
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut state = WorldState::new();
+            let library = state.package_library.clone();
+            let lease = library.routing_lease().await;
+            let epoch = library.cache_operation_epoch(&lease);
+            let basis = state
+                .capture_library_routing_basis(
+                    &library,
+                    epoch,
+                    LibraryRoutingMutation::Changed,
+                    None,
+                )
+                .unwrap();
+            mutate(&mut state);
+            assert_eq!(
+                state
+                    .refresh_library_routing_cache_epoch(&basis, epoch)
+                    .is_some(),
+                name == "nothing",
+                "changing {name} must stale the basis iff it is a build input"
+            );
+        }
+    }
+
+    #[test]
+    fn library_build_inputs_exclude_watcher_only_settings() {
+        let mut state = WorldState::new();
+        let before = state.library_build_inputs();
+        state.cross_file_config.packages_watch_library_paths =
+            !state.cross_file_config.packages_watch_library_paths;
+        state.cross_file_config.packages_watch_debounce_ms += 1;
+        assert_eq!(state.library_build_inputs(), before);
     }
 
     #[tokio::test]
