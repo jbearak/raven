@@ -62,6 +62,12 @@ For targeting a terminal other than the one REditorSupport manages — for examp
 
 Raven's `raven.sendToR.sendMethod` (default `auto`) pastes short blocks directly and switches to a temp-file `source()` once a block reaches `raven.sendToR.autoTempFileThresholdLines` (default 25). The temp-file path bypasses the typing-simulation pipe entirely: R reads the file from disk, so for those larger blocks there's no inter-line delay. Alongside the main send commands (which target Raven's managed R terminal), Raven also exposes a separate **Terminal** submenu in the editor toolbar (and matching commands in the Command Palette) that targets whatever terminal is currently active — `R` inside `tmux`, a Docker container, or any other shell — using the same statement detection and temp-file fallback. This lets you keep one default destination while still routing a particular send elsewhere without flipping a setting. See [R Console: Editor Toolbar](./r-console.md#editor-toolbar) and [Send method](./r-console.md#send-method) for details.
 
+Raven's default console (`raven.rTerminal.program` = `raven`; see [Raven's console](./r-console.md#ravens-console)) doesn't simulate typing at all. It embeds the user's R and accepts editor sends over a local socket, so a block of any size starts at once, appears in the console as a highlighted transcript, and stops at the first error instead of running the remaining lines. Compared with the third-party consoles it can also launch:
+
+- [radian](https://github.com/randy3k/radian) runs R inside Python, which ties the session to a Python runtime (relevant for reticulate and fork-based parallelism). Raven's console is a native binary that ships with the extension.
+- [arf](https://github.com/eitsupi/arf), also a Rust console that embeds R, decides when input is complete with tree-sitter heuristics. Raven's console asks R's own parser, and colors errors, warnings, and messages distinctly; arf colors all stderr output alike ([arf #490](https://github.com/eitsupi/arf/issues/490)).
+- Both have features Raven's console doesn't yet: arf's fuzzy history search, and radian's and arf's richer prompt customization.
+
 ### Data viewer
 
 REditorSupport's `View()` keeps the data frame [live in R's memory](https://github.com/REditorSupport/vscode-R/blob/master/sess/R/handlers.R) and serves row windows to the webview on demand.

@@ -25,6 +25,8 @@ pub mod builtins;
 pub mod chunks;
 pub mod completion_context;
 pub mod config_file;
+#[cfg(unix)]
+pub mod console;
 pub mod content_provider;
 pub mod diagnostic_code;
 mod discovery;

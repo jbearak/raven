@@ -1,6 +1,6 @@
 # R Console
 
-Raven provides an integrated R console inside VS Code, plus commands to send R code from the editor to that console for execution. It supports the standard R console as well as [arf](https://github.com/eitsupi/arf) and [radian](https://github.com/randy3k/radian) — modern third-party R consoles with syntax highlighting and richer interactive features.
+Raven provides an integrated R console inside VS Code, plus commands to send R code from the editor to that console for execution. By default it uses [Raven's own console](#ravens-console), which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have. You can switch to the standard R console, or to [arf](https://github.com/eitsupi/arf) or [radian](https://github.com/randy3k/radian), third-party R consoles.
 
 The R console is the entry point to Raven's [plot viewer](./plot-viewer.md) and [data viewer](./data-viewer.md): plots produced in this console render in a VS Code panel via httpgd, and `View(df)` opens Raven's data viewer instead of R's default. Raven's [help viewer](./help-viewer.md) works independently of the R console.
 
@@ -17,11 +17,51 @@ The `raven.rTerminal.program` setting controls which program is launched:
 
 | Value | Description |
 |-------|-------------|
-| **R** (default) | Standard R console |
+| **raven** (default) | [Raven's console](#ravens-console), built into Raven. macOS and Linux; on Windows this setting starts plain R. |
+| **R** | Standard R console |
 | **arf** | Rust-based R console with syntax highlighting, fuzzy history search (`Ctrl+R`), interactive help, and rig integration |
 | **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
-The selected program must be available on your PATH.
+arf and radian must be available on your PATH. Raven's console needs only R itself.
+
+## Raven's console
+
+Raven's console runs the same R you get by typing `R` in a terminal: the one on your `PATH`, or `R_HOME` if you set it. It loads that installation's R library into its own process and drives R's own read–eval–print loop. Everything R does at its prompt works as usual: autoprinting, `.Last.value`, `browser()`, `readline()`, `menu()`, error recovery, and your `.Rprofile` and `.Renviron`. If the console can't embed your R (for example, R built without `--enable-R-shlib`), it says why in one line and starts plain R instead, so you always get a working session.
+
+### Editing
+
+- **Syntax highlighting** as you type, using the same R grammar as Raven's language server. The bracket at the cursor and its match are underlined.
+- **Multi-line editing.** Enter runs your input when R's own parser says it is complete, and starts a new, indented line when it isn't — after `function(x) {`, `data.frame(a = 1,` or a trailing `|>`, just as in plain R. A syntax error is reported by R rather than leaving you stuck in continuation lines. **Alt+Enter** always inserts a newline. Arrow keys move between lines.
+- **History** is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux). Up and Down step through earlier entries, and a multi-line entry comes back whole. **Ctrl+R** searches history for text you type, and a dimmed suggestion from history appears as you type; press → to accept it.
+- **Emacs key bindings** by default; set `raven.console.editMode` to `vi` for vi bindings.
+- **Ctrl+C** clears the line you're editing, or interrupts R while it runs. At a `+` continuation line it abandons the unfinished expression, and at a `readline()` or `menu()` prompt it interrupts the code that asked, as in plain R. **Ctrl+D** on an empty line quits.
+- `options(width)` follows the terminal width as you resize it, unless you set `width` yourself.
+
+### Completion
+
+Press **Tab** to complete. A single match is inserted directly; otherwise a menu opens. Keep typing to narrow it, use Tab/Shift+Tab or the arrow keys to move, Enter to accept, and Esc to close. Completion uses R's own completion engine on your live session. It covers objects and functions, `df$` columns, `obj@` slots, function arguments (`name = `), `pkg::` exports, and file paths inside strings. After `library(`, `require(`, `requireNamespace(` or `loadNamespace(`, it completes installed package names. If a completion is slow, Ctrl+C interrupts it, as it would interrupt any R code; compiled code that never checks for interrupts can't be stopped this way.
+
+### Colored output
+
+The console colors output with your terminal theme's own palette, so it suits light and dark themes without configuration. `raven.console.colorOutput` chooses how much:
+
+| Value | Effect |
+|-------|--------|
+| **streams** (default) | Errors in red, warnings in yellow, and other messages in cyan. Ordinary output is unchanged. |
+| **values** | Also colors printed values, like the [colorout](https://github.com/jalvesaq/colorout) package: numbers, quoted strings, `NA`/`NULL`/`TRUE`/`FALSE`/`Inf`, and `[1]`-style indices. Numbers inside words, such as hashes, hostnames, versions and `x86_64`, are left alone. |
+| **off** | No colors added. |
+
+Output that already has colors, such as from the cli package or crayon, always keeps them. R gives the console text, not condition objects, so the colors come from recognising R's own error and warning headers (in your session's language). The rare message that happens to start like an R warning will be colored as one.
+
+Raven's console replaces colorout. If your `.Rprofile` loads colorout, the console turns it off for that session and says so in one dimmed line; colorout writes to the terminal directly, which would bypass the console's handling of output. Use `raven.console.colorOutput` = `values` for colorout-style colors.
+
+### Running code from the editor
+
+Code you send from the editor (Run Line or Selection, Run Chunk, Source File, and so on) goes straight to the console instead of being typed into the terminal, so blocks of any size start immediately. The console shows each line at its prompt with highlighting, as if you'd typed it, with output in between. If a line fails with an error, the rest of that block doesn't run, so you get one error instead of a cascade. Anything you were typing at the console prompt is set aside and comes back afterwards.
+
+### Outside VS Code
+
+The console is the `raven console` command of the `raven` binary (see [CLI](./cli.md#raven-console)), so you can run it in any terminal. R's own options pass through, e.g. `raven console --no-save --vanilla`.
 
 ## Keyboard Shortcuts
 
@@ -111,6 +151,8 @@ By default, the cursor advances to the next line after sending a single statemen
 
 ## Send Method
 
+This section applies to R terminals other than Raven's console, which [receives code directly](#running-code-from-the-editor), and to the Terminal submenu.
+
 By default (`auto`), Raven pastes short blocks directly and switches to a temporary file once a block has at least `raven.sendToR.autoTempFileThresholdLines` lines (≥ N — default 25, so paste up to 24 lines, temp-file 25 or more), running it with `source()`. Override this with `raven.sendToR.sendMethod`:
 
 - **`paste`** — always pastes. For multi-line code, uses bracketed paste mode to deliver the block as a single unit.
@@ -131,7 +173,9 @@ For a comparison with how the [REditorSupport extension](https://marketplace.vis
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `raven.rConsole.activation` | enum | `"auto"` | When Raven's R console activates: `"enabled"`, `"disabled"`, or `"auto"` (off when REditorSupport.r is enabled or running in Positron). |
-| `raven.rTerminal.program` | enum | `"R"` | Program for the R terminal: `"R"`, `"arf"`, or `"radian"` |
+| `raven.rTerminal.program` | enum | `"raven"` | Program for the R terminal: `"raven"`, `"R"`, `"arf"`, or `"radian"` |
+| `raven.console.editMode` | enum | `"emacs"` | Key bindings in Raven's console: `"emacs"` or `"vi"` |
+| `raven.console.colorOutput` | enum | `"streams"` | Output colors in Raven's console: `"streams"`, `"values"`, or `"off"` |
 | `raven.sendToR.advanceCursorOnSend` | boolean | `true` | Advance cursor to next line after sending a single statement |
-| `raven.sendToR.sendMethod` | enum | `"auto"` | How code is sent to R: `"auto"`, `"paste"`, or `"tempfile"` |
+| `raven.sendToR.sendMethod` | enum | `"auto"` | How code is sent to R terminals other than Raven's console: `"auto"`, `"paste"`, or `"tempfile"` |
 | `raven.sendToR.autoTempFileThresholdLines` | integer | `25` | In `auto` mode, blocks with **≥ N lines** use a temp file; smaller blocks are pasted (so `25` means: paste up to 24 lines, temp-file 25 or more) |

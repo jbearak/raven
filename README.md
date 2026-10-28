@@ -40,7 +40,7 @@ Raven also supports **JAGS** (`.jags`, `.bugs`, `.bug`) and **Stan** (`.stan`) f
 
 ### R session integration
 
-- **[R console](docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
+- **[R console](docs/r-console.md)** — Raven's own R console with syntax highlighting, multi-line editing, Tab completion, and colored output, running your installed R; code from the editor goes straight to it. Plain R, arf, and radian are also supported
 - **Quarto & R Markdown** — A consistent, theme-aware authoring and preview workflow for `.Rmd`, `.Rmarkdown`, and `.qmd` documents:
   - **[R code chunks](docs/chunks.md)** — R language intelligence, execution commands, CodeLens buttons, navigation, and highlighting inside chunks
   - **[R Markdown preview + export](docs/knit.md)** — Fast HTML preview with manual refresh, plus export to HTML, PDF, and Word

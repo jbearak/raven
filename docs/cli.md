@@ -5,6 +5,8 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 - `raven check` — index a workspace and report the **full** diagnostic set (the same diagnostics the editor publishes).
 - `raven lint` — run the native **style** linter only.
 
+Raven also ships an interactive R console, [`raven console`](#raven-console).
+
 Run `raven`, `raven --help`, or `raven help` for top-level usage. Commands with options accept `--help`, including package-database commands such as `raven packages fetch --help` and the top-level aliases `raven fetch --help` / `raven freeze --help`.
 
 If your codebase imports R packages, Raven needs to know the symbols those packages export. On a machine with R and the project's packages installed, `raven check` reads that metadata directly from your R installation. In CI, where restoring the full package library can dominate the runtime of a static check, use the package database commands below instead.
@@ -341,6 +343,26 @@ raven lint [OPTIONS] [PATHS...]
 `raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan; use [`raven check`](#raven-check) for those.
 
 `.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.Rmarkdown` / `.qmd`) are linted. Inside `.Rmd` / `.Rmarkdown` / `.qmd` files, lint rules apply to R chunk bodies; prose, YAML front matter, and non-R chunks are ignored. `# nolint` / `# nolint start` / `# nolint end` and `# raven: ignore` markers inside chunk bodies work as in plain R files. Other file types are ignored silently. Passing a directory walks it recursively for `.R` / `.r`, `.Rmd`, `.Rmarkdown`, and `.qmd` files.
+
+## `raven console`
+
+An R console with syntax highlighting, multi-line editing, Tab completion, and colored output. It runs the same R as typing `R` would (the `R` on your `PATH`, or `R_HOME`), embedded in its own process. It is the default R console in Raven's VS Code extension; see [R Console](r-console.md#ravens-console) for how it behaves. macOS and Linux only.
+
+```sh
+raven console                  # like `R`
+raven console --no-save -q     # R's options pass through unchanged
+```
+
+| Option | Description |
+|--------|-------------|
+| `--r-home DIR` | Use the R installation at `DIR` instead of `$R_HOME` or `R RHOME` |
+| `--edit-mode emacs\|vi` | Key bindings (default `emacs`) |
+| `--color-output streams\|values\|off` | Output colors (default `streams`; `NO_COLOR` turns them off) |
+| `--history-file PATH` | Where to keep input history |
+| `--no-history` | Keep history in memory only |
+| `--ipc PATH` | Also accept code from an editor on this Unix socket |
+
+Every other argument goes to R. If stdin or stdout isn't a terminal, or the console can't embed your R (e.g. R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
 
 ## `raven packages`
 

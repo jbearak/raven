@@ -68,6 +68,7 @@ const DOC_LINKS = {
   sendToR: "r-console.md",
   rTerminal: "r-console.md",
   rConsole: "r-console.md",
+  console: "r-console.md",
   editor: "editor-integrations.md",
   plot: "plot-viewer.md",
   help: "help-viewer.md",
