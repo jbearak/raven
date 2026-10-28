@@ -169,6 +169,11 @@ impl StderrClassifier {
     /// Append `text` to `out` with condition styling.
     fn style(&mut self, text: &str, out: &mut Vec<u8>) {
         for piece in text.split_inclusive('\n') {
+            if escapes_only(piece) {
+                self.sgr_active = sgr_active_after(piece, self.sgr_active);
+                out.extend_from_slice(piece.as_bytes());
+                continue;
+            }
             if self.at_line_start {
                 self.current = Some(self.classify_line_start(piece));
             }
@@ -190,6 +195,29 @@ impl StderrClassifier {
             }
         }
     }
+}
+
+/// Whether `text` is nothing but CSI escape sequences, such as the bare
+/// `ESC[?25h` (show cursor) some packages write after every top-level call.
+/// Such a write has no text to style, so it must not mark the line it lands
+/// on as package-coloured; only the SGR state it leaves behind matters.
+fn escapes_only(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != 0x1b || b.get(i + 1) != Some(&b'[') {
+            return false;
+        }
+        i += 2;
+        while i < b.len() && (0x20..0x40).contains(&b[i]) {
+            i += 1;
+        }
+        if i >= b.len() || !(0x40..0x7f).contains(&b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    !b.is_empty()
 }
 
 /// Whether a package's colour/attribute (SGR) style is still in effect after
@@ -321,6 +349,12 @@ impl ValueLexer {
 
     pub fn style(&mut self, text: &str, out: &mut Vec<u8>) {
         for line in text.split_inclusive('\n') {
+            if escapes_only(line) {
+                self.close(out);
+                self.sgr_active = sgr_active_after(line, self.sgr_active);
+                out.extend_from_slice(line.as_bytes());
+                continue;
+            }
             self.line_raw |=
                 self.sgr_active || line.contains('\x1b') || line.len() > MAX_STYLED_LINE;
             if self.line_raw {
@@ -951,6 +985,33 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\x1b[33mline one\nline two\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn bare_cursor_escape_does_not_disable_styling() {
+        // httpgd's session writes `ESC[?25h` to stdout after every top-level
+        // call; the next result must still be styled.
+        let mut lx = ValueLexer::new();
+        let mut out = Vec::new();
+        for w in ["[1]", " 1", "\n", "\x1b[?25h", "[1]", " 2", "\n"] {
+            lx.style(w, &mut out);
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.ends_with(&format!(
+                "\x1b[?25h{V_INDEX}[1]{RESET} {V_NUMBER}2{RESET}\n"
+            )),
+            "{out:?}"
+        );
+
+        let mut c = StderrClassifier::new(Headers::default());
+        let mut out = Vec::new();
+        c.style("\x1b[?25l", &mut out);
+        c.style("note\n", &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[?25l{MESSAGE}note{RESET}\n")
         );
     }
 
