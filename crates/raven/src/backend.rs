@@ -32,17 +32,18 @@ use crate::indentation;
 use crate::state::{
     AnalysisBasis, AnalysisTransferCandidate, AnalysisTransferFinalization, AnalysisTransferHandle,
     AnalysisTransferRejection, DiagnosticsCoherenceGuard, DiagnosticsTrigger, IndentationSettings,
-    OpenCloseCommitOutcome, OpenCloseDiskObservation, OpenCloseIntentToken, OpenCloseResyncTicket,
-    OpenInstallIntentToken, PackageProjectionBasis, PackageRoutingCommitEffects,
-    PackageSeedInstalledIdentity, PostSeedRefreshOwnerRegistration, PreparedAnalysisCommit,
-    PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
-    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
-    PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedPackageProjection,
-    PreparedWatchedBatchAnalysis, PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis,
-    SymbolConfig, SysdataFallbackBasis, SysdataFallbackOwner, SystemFileRoutingOwnerIdentity,
-    SystemFileTransferredEffects, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay,
-    WorkspaceScanDerivationBasis, WorkspaceScanInputBasis, WorkspaceScanIntentToken,
-    WorkspaceScanTransferredEffects, WorldState, derive_workspace_dependency_graph,
+    LibraryBuildInputs, OpenCloseCommitOutcome, OpenCloseDiskObservation, OpenCloseIntentToken,
+    OpenCloseResyncTicket, OpenInstallIntentToken, PackageProjectionBasis,
+    PackageRoutingCommitEffects, PackageSeedInstalledIdentity, PostSeedRefreshOwnerRegistration,
+    PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis,
+    PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan, PreparedOpenEditAnalysis,
+    PreparedOpenGraphProjection, PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch,
+    PreparedPackageProjection, PreparedWatchedBatchAnalysis, PreparedWorkspaceOpenMetadata,
+    PreparedWorkspaceScanAnalysis, SymbolConfig, SysdataFallbackBasis, SysdataFallbackOwner,
+    SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects, WorkspaceGraphDerivationContext,
+    WorkspaceGraphOverlay, WorkspaceScanDerivationBasis, WorkspaceScanInputBasis,
+    WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
+    derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -1856,7 +1857,7 @@ pub struct Backend {
     #[cfg(test)]
     test_home_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     #[cfg(test)]
-    package_library_install_keys_for_test: Arc<std::sync::Mutex<Vec<PackageInitKey>>>,
+    package_library_install_keys_for_test: Arc<std::sync::Mutex<Vec<LibraryBuildInputs>>>,
     #[cfg(test)]
     package_init_attempts_for_test: Arc<AtomicU64>,
     #[cfg(test)]
@@ -2107,50 +2108,21 @@ impl TraversalTruncationState {
     }
 }
 
-/// Construction identity of a package library: the inputs that determine
-/// what `try_build_package_library` produces. Deliberately excludes
-/// package-input and open-record authority — a `DESCRIPTION` edit or the
-/// startup package seed changes routing derivation, not the library, so a
-/// build that finishes after such a change is still the right library and
-/// `install_built_package_library` re-captures its routing basis instead of
-/// discarding it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PackageInitKey {
-    enabled: bool,
-    packages_r_path: Option<std::path::PathBuf>,
-    additional_paths: Vec<std::path::PathBuf>,
-    workspace_root: Option<std::path::PathBuf>,
-    workspace_folders: Vec<Url>,
-}
-
-impl PackageInitKey {
-    fn capture(state: &WorldState) -> Self {
-        Self {
-            enabled: state.cross_file_config.packages_enabled,
-            packages_r_path: state.cross_file_config.packages_r_path.clone(),
-            additional_paths: state
-                .cross_file_config
-                .packages_additional_library_paths
-                .clone(),
-            workspace_root: state
-                .workspace_folders
-                .first()
-                .and_then(|url| url.to_file_path().ok()),
-            workspace_folders: state.workspace_folders.clone(),
-        }
-    }
-}
-
 struct PackageInitBasis {
-    key: PackageInitKey,
+    key: LibraryBuildInputs,
     package_config_generation: u64,
 }
 
 enum PackageInitAttempt {
     Disabled,
     Ready,
-    Committed { key: PackageInitKey, ready: bool },
-    Stale { attempted_key: PackageInitKey },
+    Committed {
+        key: LibraryBuildInputs,
+        ready: bool,
+    },
+    Stale {
+        attempted_key: LibraryBuildInputs,
+    },
 }
 
 impl Backend {
@@ -2283,9 +2255,9 @@ impl Backend {
         let deadline = LibraryRoutingDeadline::foreground();
         let (basis, already_ready, force_not_ready, force_stale, mut reconcile_claim) = {
             let state = self.state.read().await;
-            let key = PackageInitKey::capture(&state);
+            let key = state.library_build_inputs();
             let reconcile_claim = key
-                .enabled
+                .packages_enabled
                 .then(|| state.claim_library_routing_reconcile_request())
                 .flatten();
             (
@@ -2334,7 +2306,7 @@ impl Backend {
         // `build_package_library(..., enabled)` call). When packages are
         // disabled this returns without touching `state.package_library`, so a
         // library the user built before disabling is left intact.
-        if !basis.key.enabled {
+        if !basis.key.packages_enabled {
             return PackageInitAttempt::Disabled;
         }
         if already_ready && reconcile_claim.is_none() {
@@ -2423,8 +2395,8 @@ impl Backend {
             // builder. The exact inputs came from `basis.key`.
             let build = crate::package_library::try_build_package_library(
                 basis.key.packages_r_path.clone(),
-                &basis.key.additional_paths,
-                basis.key.workspace_root.clone(),
+                &basis.key.packages_additional_library_paths,
+                basis.key.workspace_root(),
                 true,
                 // didOpen/on-demand initialization is a passive consumer of
                 // the coordinated same-key generation.
@@ -2503,7 +2475,7 @@ impl Backend {
                 |state| {
                     !state.package_library_ready
                         && state.package_config_generation == basis.package_config_generation
-                        && PackageInitKey::capture(state) == basis.key
+                        && state.library_build_inputs() == basis.key
                 },
             )
             .await;
@@ -17894,13 +17866,13 @@ async fn did_open_transactional(
     // A degraded package build can legitimately remain not-ready. Remember
     // only the exact key whose build won its CAS, and bound fresh-key retries
     // so hostile config churn cannot hold didOpen forever.
-    let mut package_init_attempt: Option<PackageInitKey> = None;
+    let mut package_init_attempt: Option<LibraryBuildInputs> = None;
     let mut package_init_rounds = 0usize;
     loop {
         let (workspace_folders, needs_package_library, force_local_only) = {
             let state = backend.state.read().await;
             let workspace_folders = state.workspace_folders.clone();
-            let package_init_key = PackageInitKey::capture(&state);
+            let package_init_key = state.library_build_inputs();
             (
                 workspace_folders,
                 state.cross_file_config.packages_enabled
@@ -21799,12 +21771,11 @@ impl Backend {
 
             // Settings that require reinitializing `PackageLibrary` via an R
             // subprocess call (~100ms). Keep this narrow.
-            let package_settings_changed = state.cross_file_config.packages_enabled
-                != prev.prev_cross_file.packages_enabled
-                || state.workspace_folders != prev.prev_workspace_folders
-                || state.cross_file_config.packages_r_path != prev.prev_cross_file.packages_r_path
-                || state.cross_file_config.packages_additional_library_paths
-                    != prev.prev_cross_file.packages_additional_library_paths;
+            let package_settings_changed = state.library_build_inputs()
+                != LibraryBuildInputs::from_parts(
+                    &prev.prev_cross_file,
+                    &prev.prev_workspace_folders,
+                );
 
             // Watcher-only settings. Changing just these should restart the
             // filesystem watcher but MUST NOT trigger an R subprocess
@@ -25417,24 +25388,11 @@ async fn try_rebuild_package_library(
         .wait("package rebuild state capture", state_arc.read())
         .await
         .map_err(|LibraryRoutingDeadlineElapsed(phase)| anyhow::anyhow!("{phase}"))?;
-    let (packages_enabled, packages_r_path, additional_paths, workspace_root) = {
-        (
-            state.cross_file_config.packages_enabled,
-            state.cross_file_config.packages_r_path.clone(),
-            state
-                .cross_file_config
-                .packages_additional_library_paths
-                .clone(),
-            state
-                .workspace_folders
-                .first()
-                .and_then(|url| url.to_file_path().ok()),
-        )
-    };
+    let inputs = state.library_build_inputs();
     drop(state);
 
     #[cfg(test)]
-    let synthetic_build = if packages_enabled {
+    let synthetic_build = if inputs.packages_enabled {
         deadline
             .wait("package rebuild synthetic outcome", state_arc.write())
             .await
@@ -25450,10 +25408,10 @@ async fn try_rebuild_package_library(
     }
 
     let build = crate::package_library::try_build_package_library(
-        packages_r_path,
-        &additional_paths,
-        workspace_root,
-        packages_enabled,
+        inputs.packages_r_path.clone(),
+        &inputs.packages_additional_library_paths,
+        inputs.workspace_root(),
+        inputs.packages_enabled,
         // This helper is the explicit replacement authority for refresh,
         // config-change, and libpath-watcher rebuilds.
         crate::package_library::ProviderLoadPolicy::FreshAfterActive,
@@ -26733,7 +26691,7 @@ mod tests {
             let mut state = backend.state.write().await;
             state.cross_file_config.packages_enabled = true;
             state.record_package_input_mutation();
-            let key = super::PackageInitKey::capture(&state);
+            let key = state.library_build_inputs();
             // Eligibility wakes the same resident request; it deliberately
             // does not mint replacement reconcile currency.
             state.notify_library_routing_reconcile();
@@ -59809,7 +59767,7 @@ infixContinuationStyle = "aligned"
             state.cross_file_config.packages_enabled = true;
             state.package_library_ready = false;
             state.force_package_library_not_ready_for_test = true;
-            PackageInitKey::capture(&state)
+            state.library_build_inputs()
         };
 
         tokio::time::timeout(
@@ -59875,7 +59833,7 @@ infixContinuationStyle = "aligned"
                     .package_init_pre_commit_test_pause
                     .arm(pause_uri.clone()),
                 state.package_library.clone(),
-                PackageInitKey::capture(&state),
+                state.library_build_inputs(),
             )
         };
 
@@ -59897,7 +59855,7 @@ infixContinuationStyle = "aligned"
                 state
                     .package_init_pre_commit_test_pause
                     .arm(pause_uri.clone()),
-                PackageInitKey::capture(&state),
+                state.library_build_inputs(),
             )
         };
         assert_ne!(
@@ -59938,7 +59896,7 @@ infixContinuationStyle = "aligned"
             "the exact fresh-key build must replace the retained original library"
         );
         assert_eq!(
-            PackageInitKey::capture(&state),
+            state.library_build_inputs(),
             fresh_key,
             "the committed library must still correspond to the exact fresh key"
         );
@@ -60002,7 +59960,7 @@ infixContinuationStyle = "aligned"
                     .package_init_pre_commit_test_pause
                     .arm(pause_uri.clone()),
                 state.package_library.clone(),
-                PackageInitKey::capture(&state),
+                state.library_build_inputs(),
             )
         };
 
@@ -60021,7 +59979,7 @@ infixContinuationStyle = "aligned"
             let before = state.package_input_generation();
             state.record_package_input_mutation();
             assert_eq!(
-                PackageInitKey::capture(&state),
+                state.library_build_inputs(),
                 original_key,
                 "package-input drift must not change the construction key"
             );

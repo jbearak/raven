@@ -21,6 +21,10 @@ _Avoid_: folding datasets into "exports".
 **Export kind**:
 Whether an ordinary (non-dataset) export is a function or a plain value. Deliberately *not* tracked for package exports, because the ecosystem source (r-universe) supplies export names without kind. Distinct from dataset-vs-non-dataset, which is tracked.
 
+**Library build inputs**:
+The settings that determine what a package-library build produces: `packages.enabled`, `packages.rPath`, `packages.additionalLibraryPaths`, and the workspace folders (the first is the build's workspace root). A change to any of them rebuilds the library and stales in-flight routing work; watcher-only settings (`packages.watchLibraryPaths`, `packages.watchDebounceMs`) are not build inputs. One value in code: `LibraryBuildInputs` in `crates/raven/src/state.rs`.
+_Avoid_: "package settings" (also covers watcher-only and NSE settings).
+
 ## ADRs
 
 ### ADR: `freeze` records explicit base-priority packages
