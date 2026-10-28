@@ -6630,6 +6630,61 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     diagnostics_via_snapshot(state, uri, cancel)
 }
 
+/// The async half of a file's diagnostics: replace the snapshot's cache-based
+/// missing-file findings with real on-disk existence checks.
+///
+/// Every publisher (the debounced LSP worker, the direct LSP publish, and
+/// `raven check`) runs [`diagnostics_from_snapshot`] and then [`Self::apply`],
+/// so they share one rule for which documents get this phase (R, including
+/// R Markdown / Quarto; Stan and JAGS pass through unchanged) and one source
+/// for its severities and workspace root: the snapshot. It carries only what
+/// this phase needs, so `raven check` can drop the heavy snapshot between its
+/// parallel sync pass and this one.
+pub(crate) struct MissingFileChecks {
+    file_type: FileType,
+    directive_meta: crate::cross_file::CrossFileMetadata,
+    workspace_folder: Option<Url>,
+    missing_file_severity: Option<DiagnosticSeverity>,
+    case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
+}
+
+impl DiagnosticsSnapshot {
+    /// The inputs for this file's on-disk missing-file phase.
+    pub(crate) fn missing_file_checks(&self) -> MissingFileChecks {
+        MissingFileChecks {
+            file_type: self.file_type,
+            directive_meta: self.directive_meta.clone(),
+            workspace_folder: self.workspace_folders.first().cloned(),
+            missing_file_severity: self.cross_file_config.missing_file_severity,
+            case_mismatch_severity: self.cross_file_config.case_mismatch_severity,
+        }
+    }
+}
+
+impl MissingFileChecks {
+    /// Finish `sync_diagnostics` (the output of [`diagnostics_from_snapshot`])
+    /// with on-disk missing-file and case-mismatch checks. Non-R documents
+    /// are returned unchanged.
+    pub(crate) async fn apply(
+        &self,
+        uri: &Url,
+        sync_diagnostics: Vec<Diagnostic>,
+    ) -> Vec<Diagnostic> {
+        if self.file_type != FileType::R {
+            return sync_diagnostics;
+        }
+        diagnostics_async_standalone(
+            uri,
+            sync_diagnostics,
+            &self.directive_meta,
+            self.workspace_folder.as_ref(),
+            self.missing_file_severity,
+            self.case_mismatch_severity,
+        )
+        .await
+    }
+}
+
 /// Standalone async version that performs disk existence checks without ContentProvider
 ///
 /// This version is used when we can't hold a reference to ContentProvider across await points.
