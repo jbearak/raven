@@ -18,22 +18,32 @@
  */
 
 #define _GNU_SOURCE
+#include <stdatomic.h>
 #include <stddef.h>
 
-static void (*flush_hook)(void);
+typedef void (*flush_fn)(void);
 
-void raven_set_flush_hook(void (*hook)(void)) { flush_hook = hook; }
+/* Atomic: system() may be called from any thread, at any time. */
+static _Atomic(flush_fn) flush_hook;
+
+void raven_set_flush_hook(flush_fn hook) { atomic_store(&flush_hook, hook); }
 
 #if defined(__linux__)
 #include <dlfcn.h>
 
+typedef int (*system_fn)(const char *);
+
 int system(const char *command) {
-    static int (*real_system)(const char *);
-    if (!real_system) {
-        real_system = (int (*)(const char *))dlsym(RTLD_NEXT, "system");
-        if (!real_system) return -1;
+    /* Racing first calls may both resolve it; they store the same address. */
+    static _Atomic(system_fn) real_system;
+    system_fn real = atomic_load(&real_system);
+    if (!real) {
+        real = (system_fn)dlsym(RTLD_NEXT, "system");
+        if (!real) return -1;
+        atomic_store(&real_system, real);
     }
-    if (flush_hook) flush_hook();
-    return real_system(command);
+    flush_fn hook = atomic_load(&flush_hook);
+    if (hook) hook();
+    return real(command);
 }
 #endif
