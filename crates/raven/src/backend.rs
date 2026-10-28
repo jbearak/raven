@@ -17747,6 +17747,23 @@ fn external_project_config_watch_changed(
         != build_external_project_config_watchers(workspace_folders, new_options)
 }
 
+/// What differs between configuration-reload triggers. See
+/// [`Backend::reload_config`].
+#[derive(Default)]
+struct ConfigReload {
+    /// Snapshot captured by a trigger that mutated reload-relevant state
+    /// (workspace folders) before discovery could run. `None` captures it in
+    /// the reload's own write lock.
+    prev: Option<ConfigChangeSnapshot>,
+    /// New client settings layer, from `workspace/didChangeConfiguration`.
+    raw_client_settings: Option<serde_json::Value>,
+    /// Freshly discovered project layer (`raven.toml` / `.lintr`). Applying
+    /// one also announces it with `raven/projectConfigLoaded`.
+    project_layer: Option<crate::config_file::DiscoveredLoad>,
+    /// A `.gitignore` changed, so the discovery policy must be rebuilt.
+    refresh_discovery: bool,
+}
+
 /// Pre-recompute snapshot of the parsed configs that drive change-detection
 /// inside [`Backend::reconcile_after_config_recompute`].
 ///
@@ -20063,14 +20080,18 @@ impl LanguageServer for Backend {
             .map(|root| crate::config_file::discover_and_load_with_options(&root, &options))
             .unwrap_or(crate::config_file::DiscoveredLoad::None);
         log_project_config_warnings(&layer);
-        {
-            let mut state = self.state.write().await;
-            apply_project_config_layer(&mut state, layer);
-            crate::config_file::recompute_parsed_configs(&mut state);
-        }
         self.register_workspace_config_watchers(&folders, true)
             .await;
-        let to_publish = self.reconcile_after_config_recompute(previous).await;
+        let Some(to_publish) = self
+            .reload_config(ConfigReload {
+                prev: Some(previous),
+                project_layer: Some(layer),
+                ..Default::default()
+            })
+            .await
+        else {
+            return;
+        };
         self.refresh_external_project_config_watch(folders, options)
             .await;
         self.publish_config_reload_diagnostics(
@@ -20094,8 +20115,7 @@ impl LanguageServer for Backend {
             self.client.show_message(MessageType::WARNING, err).await;
         }
         let new_raw_client = params.settings.clone();
-        let (project_root, previous_project_config_path, workspace_folders, old_raw_client): (
-            Option<std::path::PathBuf>,
+        let (project_root, workspace_folders, old_raw_client): (
             Option<std::path::PathBuf>,
             Vec<Url>,
             serde_json::Value,
@@ -20106,7 +20126,6 @@ impl LanguageServer for Backend {
                     .workspace_folders
                     .first()
                     .and_then(|u| u.to_file_path().ok()),
-                state.project_config_path.clone(),
                 state.workspace_folders.clone(),
                 state.raw_client_settings.clone(),
             )
@@ -20130,18 +20149,13 @@ impl LanguageServer for Backend {
             None
         };
 
-        // Lock-only window: snapshot pre-change configs, store the new raw
-        // client settings, recompute parsed configs, recompile lint
-        // overrides. NO I/O — the helper handles every blocking action
-        // outside the lock.
-        //
-        // Deliberately does NOT take `diagnostics_publish_lock`. A recurring
-        // review suggestion is to hold it across the generation advance, on the
-        // theory that a worker could pass its `trigger.is_stale` re-check,
-        // release the state lock, and then send stale findings after this
-        // handler moves `analysis_config_generation`. That window does not
-        // exist: `publish_diagnostics_inner` holds the publish lock from before
-        // its `is_stale` re-check all the way through
+        // `reload_config` deliberately does NOT take `diagnostics_publish_lock`.
+        // A recurring review suggestion is to hold it across the generation
+        // advance, on the theory that a worker could pass its
+        // `trigger.is_stale` re-check, release the state lock, and then send
+        // stale findings after this handler moves `analysis_config_generation`.
+        // That window does not exist: `publish_diagnostics_inner` holds the
+        // publish lock from before its `is_stale` re-check all the way through
         // `client.publish_diagnostics`, so a worker that has passed the check
         // has not yet released the lock and this handler's own state write
         // cannot interleave with its send. Taking the lock here would only add
@@ -20151,69 +20165,26 @@ impl LanguageServer for Backend {
         // marker WHILE an old-config worker holds the publish lock, so the
         // marker is in place by the time that worker's gate commit runs and
         // correctly refuses it.
-        let (snapshot, project_config_path, model_switch_warnings) = {
-            let mut state = self.state.write().await;
-
-            let prev = ConfigChangeSnapshot::capture(&state);
-
-            // Store the new raw client settings and re-merge with the project
-            // file (if any). recompute_parsed_configs() overwrites every
-            // parsed config; absent sections reset to defaults.
-            state.raw_client_settings = new_raw_client;
-            if let Some(layer) = project_layer {
-                apply_project_config_layer(&mut state, layer);
-            }
-            // `recompute_parsed_configs` now also recompiles
-            // `state.lint_overrides` from the merged settings.
-            crate::config_file::recompute_parsed_configs(&mut state);
-            // A disabled resident reconcile request becomes eligible when
-            // packages are re-enabled. This signal is unconditional because
-            // durable state, not the edge notification, decides whether work
-            // exists.
-            state.notify_library_routing_reconcile();
-
-            // Collect from the MERGED layer, after recompute — the layer that
-            // decides the effective value. Reading `params.settings` instead
-            // would both over- and under-report: a client typo superseded by
-            // `raven.toml` would toast "Defaulting to 'off'" while the setting
-            // is actually on, and a typo living only in `raven.toml` would
-            // never toast at all.
-            let warnings =
-                invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
-
-            (prev, state.project_config_path.clone(), warnings)
+        let Some(to_publish) = self
+            .reload_config(ConfigReload {
+                raw_client_settings: Some(new_raw_client),
+                project_layer,
+                ..Default::default()
+            })
+            .await
+        else {
+            return;
         };
 
-        // A model switch that fails closed is otherwise invisible: the log is
-        // filtered out by default, so a typo like "On" looks exactly like the
-        // built-in "off" default — no diagnostics, no explanation. Toast it.
-        for message in model_switch_warnings {
-            self.client
-                .show_message(MessageType::WARNING, message)
-                .await;
-        }
-
-        // Helper drives change detection, package rebuilds, watcher
-        // restart, completion re-registration, and force-republish
-        // marking. Returns the URIs to publish (empty when only the
-        // watcher-lifecycle settings flipped).
-        let to_publish = self.reconcile_after_config_recompute(snapshot).await;
-
-        if rediscover_project_config {
-            if external_project_config_watch_changed(
+        if rediscover_project_config
+            && external_project_config_watch_changed(
                 &workspace_folders,
                 &old_discovery_options,
                 &new_discovery_options,
-            ) {
-                self.refresh_external_project_config_watch(
-                    workspace_folders,
-                    new_discovery_options,
-                )
+            )
+        {
+            self.refresh_external_project_config_watch(workspace_folders, new_discovery_options)
                 .await;
-            }
-            if previous_project_config_path != project_config_path {
-                self.notify_project_config_loaded(project_config_path.as_deref());
-            }
         }
 
         // Reuse the bounded-parallelism helper the watched-file reload path
@@ -20360,61 +20331,19 @@ impl LanguageServer for Backend {
                 notification_receipt = Some(receipt);
             }
 
-            // Step 2 (under write lock, no I/O): apply the reload —
-            // snapshot prev configs for downstream rebuild gating, swap
-            // raw project settings, recompute parsed configs, recompile
-            // overrides. The shared reconciliation helper drives every
-            // downstream action outside the lock.
-            let (snapshot, model_switch_warnings) = {
-                let mut state = self.state.write().await;
-                let prev = ConfigChangeSnapshot::capture(&state);
-
-                // Re-run discovery from the workspace root. Order matters:
-                // raven.toml beats .lintr (DiscoveredConfig embodies that).
-                if project_config_changed {
-                    apply_project_config_layer(&mut state, project_layer);
-                }
-
-                // `recompute_parsed_configs` now also recompiles
-                // `state.lint_overrides` from the merged settings.
-                crate::config_file::recompute_parsed_configs(&mut state);
-
-                // An invalid switch that arrived via `raven.toml` needs the same
-                // user-visible signal as one typed into editor settings. This is
-                // the only path that sees a project-file edit, so without this
-                // the toast would depend on which layer the typo lives in.
-                let warnings =
-                    invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
-
-                (prev, warnings)
-            };
-            if gitignore_changed && !self.refresh_discovery_policy().await {
+            // Step 2: apply the reload. A `.gitignore`-only event re-runs no
+            // project-file layer; `reload_config` still recomputes and
+            // rebuilds the discovery policy.
+            let Some(to_publish) = self
+                .reload_config(ConfigReload {
+                    project_layer: project_config_changed.then_some(project_layer),
+                    refresh_discovery: gitignore_changed,
+                    ..Default::default()
+                })
+                .await
+            else {
                 return;
-            }
-            for message in model_switch_warnings {
-                self.client
-                    .show_message(MessageType::WARNING, message)
-                    .await;
-            }
-            // Helper drives change detection, package rebuilds, watcher
-            // restart, completion re-registration, and force-republish
-            // marking. Returns the URIs to publish (empty when only the
-            // watcher-lifecycle settings flipped — nothing
-            // diagnostic-affecting moved).
-            let to_publish = self.reconcile_after_config_recompute(snapshot).await;
-
-            // Re-emit `raven/projectConfigLoaded` so clients (the VS Code
-            // status bar in particular) see the new state without a
-            // window reload. The notification fires unconditionally for
-            // every reload event — even when the new path matches the
-            // old — so consumers can treat it as the authoritative
-            // "what's in effect now" signal. `path: null` means the
-            // config file was removed.
-            let new_path = {
-                let state = self.state.read().await;
-                state.project_config_path.clone()
             };
-            self.notify_project_config_loaded(new_path.as_deref());
 
             // Config diagnostics share the notification's completion boundary
             // with any source-file events. This prevents a config marker from
@@ -21672,8 +21601,83 @@ impl Backend {
         });
     }
 
+    /// Apply one configuration reload and return the open URIs to republish,
+    /// or `None` when a discovery-policy refresh was superseded.
+    ///
+    /// Every reload trigger (settings change, workspace-folder change,
+    /// watched `raven.toml` / `.lintr` / `.gitignore` event) goes through
+    /// here, so they share one sequence and one set of user-visible signals:
+    ///   1. Under one write lock: capture the [`ConfigChangeSnapshot`] (unless
+    ///      the caller captured it before an earlier mutation of its own),
+    ///      swap in the new raw layers, run
+    ///      [`crate::config_file::recompute_parsed_configs`], wake the
+    ///      library-routing reconcile coordinator, and collect
+    ///      invalid-model-switch warnings from the merged settings.
+    ///   2. Refresh the discovery policy when `refresh_discovery` is set.
+    ///   3. Toast the warnings.
+    ///   4. Run [`Self::reconcile_after_config_recompute`].
+    ///   5. Send `raven/projectConfigLoaded` when a project layer was applied,
+    ///      even if its path is unchanged, so clients treat it as the
+    ///      authoritative "what's in effect now" signal.
+    ///
+    /// Deliberately does NOT take `diagnostics_publish_lock`; see the comment
+    /// in [`Self::did_change_configuration`] for why the reload must be able to
+    /// install its force-republish markers while a worker holds that lock.
+    /// The caller publishes (or defers publishing) the returned URIs.
+    async fn reload_config(&self, reload: ConfigReload) -> Option<Vec<Url>> {
+        let ConfigReload {
+            prev,
+            raw_client_settings,
+            project_layer,
+            refresh_discovery,
+        } = reload;
+        let applied_project_layer = project_layer.is_some();
+        let (snapshot, warnings, project_config_path) = {
+            let mut state = self.state.write().await;
+            let snapshot = prev.unwrap_or_else(|| ConfigChangeSnapshot::capture(&state));
+            if let Some(settings) = raw_client_settings {
+                state.raw_client_settings = settings;
+            }
+            if let Some(layer) = project_layer {
+                apply_project_config_layer(&mut state, layer);
+            }
+            crate::config_file::recompute_parsed_configs(&mut state);
+            // A disabled resident reconcile request becomes eligible when
+            // packages are re-enabled, from any layer. This signal is
+            // unconditional because durable state, not the edge notification,
+            // decides whether work exists.
+            state.notify_library_routing_reconcile();
+            // Collect from the MERGED layer, after recompute — the layer that
+            // decides the effective value. Reading one raw layer instead would
+            // both over- and under-report: a client typo superseded by
+            // `raven.toml` would toast "Defaulting to 'off'" while the setting
+            // is actually on, and a typo living only in `raven.toml` would
+            // never toast at all.
+            let warnings =
+                invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
+            (snapshot, warnings, state.project_config_path.clone())
+        };
+        if refresh_discovery && !self.refresh_discovery_policy().await {
+            return None;
+        }
+        // A model switch that fails closed is otherwise invisible: the log is
+        // filtered out by default, so a typo like "On" looks exactly like the
+        // built-in "off" default — no diagnostics, no explanation. Toast it.
+        for message in warnings {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
+        }
+        let to_publish = self.reconcile_after_config_recompute(snapshot).await;
+        if applied_project_layer {
+            self.notify_project_config_loaded(project_config_path.as_deref());
+        }
+        Some(to_publish)
+    }
+
     /// Drive every downstream action that depends on which parsed-config
-    /// field moved during a configuration reload.
+    /// field moved during a configuration reload. Called only by
+    /// [`Self::reload_config`].
     ///
     /// Caller contract — the helper assumes the caller has already, under a
     /// write lock on `self.state`:
@@ -36519,6 +36523,108 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|message| message.contains("diagnostics.stan") && message.contains("'On'")),
             "startup must toast a raven.toml model-switch typo, got {messages:?}"
+        );
+    }
+
+    /// Adding the first workspace folder loads that folder's `raven.toml`, so
+    /// it must surface the same reload signals as a settings or watched-file
+    /// reload: the invalid-model-switch toast and `raven/projectConfigLoaded`.
+    #[tokio::test]
+    async fn workspace_folder_reload_toasts_and_announces_project_config() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{ShowMessageParams, WorkspaceFoldersChangeEvent};
+
+        let workspace = TempDir::new().unwrap();
+        let config = workspace.path().join("raven.toml");
+        fs::write(&config, "[diagnostics]\nstan = \"On\"\n").unwrap();
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    initialization_options: Some(json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let changed = svc
+            .inner()
+            .did_change_workspace_folders(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![WorkspaceFolder {
+                        uri: Url::from_file_path(workspace.path()).unwrap(),
+                        name: "t".into(),
+                    }],
+                    removed: vec![],
+                },
+            });
+        tokio::pin!(changed);
+        let mut changed_done = false;
+        let mut messages = Vec::new();
+        let mut announced = None;
+
+        loop {
+            let request = if changed_done {
+                match tokio::time::timeout(Duration::from_millis(200), request_stream.next()).await
+                {
+                    Ok(request) => request,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    () = &mut changed => {
+                        changed_done = true;
+                        continue;
+                    }
+                    request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                        request.expect("folder change should drive the client socket")
+                    }
+                }
+            }
+            .expect("client socket should remain open");
+
+            match request.method() {
+                "window/showMessage" => {
+                    let params: ShowMessageParams =
+                        serde_json::from_value(request.params().unwrap().clone()).unwrap();
+                    messages.push(params.message);
+                }
+                "raven/projectConfigLoaded" => {
+                    announced = Some(request.params().unwrap()["path"].clone());
+                }
+                _ => {}
+            }
+            if let Some(id) = request.id().cloned() {
+                response_sink
+                    .send(Response::from_ok(id, serde_json::Value::Null))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("diagnostics.stan") && message.contains("'On'")),
+            "a folder's raven.toml typo must toast, got {messages:?}"
+        );
+        let announced = announced.expect("folder reload must send raven/projectConfigLoaded");
+        assert_eq!(
+            announced.as_str().map(std::path::PathBuf::from),
+            Some(config)
         );
     }
 
