@@ -282,6 +282,7 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
         *lib.ptr_flush_console = Some(flush_console);
         *lib.ptr_clearerr_console = Some(noop);
         *lib.ptr_show_message = Some(show_message);
+        *lib.ptr_busy = Some(busy);
         *lib.r_wait_usec = 10_000;
     }
     output::init(opts.color, output::Headers::default());
@@ -523,6 +524,15 @@ unsafe extern "C" fn flush_console() {
 }
 
 unsafe extern "C" fn noop() {}
+
+/// R's macOS (Aqua) builds call `R_Busy(1)` just before `system()` and
+/// `system2()` start a child, so write out buffered output first: the child
+/// writes straight to the terminal and must not overtake it.
+unsafe extern "C" fn busy(which: c_int) {
+    if which == 1 {
+        let _ = std::panic::catch_unwind(|| output::get().flush());
+    }
+}
 
 unsafe extern "C" fn show_message(msg: *const c_char) {
     let _ = std::panic::catch_unwind(|| {

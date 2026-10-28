@@ -8,15 +8,24 @@
 //!   is only ever *added* around text that has no styling of its own.
 //! * Output is batched only during bursts. A write that follows a pause
 //!   longer than [`BURST_GAP`] first flushes anything pending and then goes
-//!   straight to the terminal, so slow streaming output appears at once, and
-//!   so does output printed just before R hands the terminal to something else
-//!   (`system()`, compiled code writing to fd 1). Inside a burst (`print()` of
-//!   a long vector is about a million writes) writes are coalesced and flushed
-//!   by a background thread after [`FLUSH_INTERVAL`], before every prompt, on
+//!   straight to the terminal, so slow streaming output appears at once.
+//!   Inside a burst (`print()` of a long vector is about a million writes)
+//!   writes are coalesced. A background thread writes them out as soon as R
+//!   has been quiet for [`QUIET_FLUSH`], and at the latest after
+//!   [`FLUSH_INTERVAL`]; they are also flushed before every prompt, on
 //!   `flush.console()`, at 64 KB, and at process exit (`q()`). R's own writer
 //!   makes one syscall per write; batching is where the console's output speed
-//!   comes from. The trade-off: during a burst, native output can land up to
-//!   `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses that tail.
+//!   comes from.
+//! * Output stays ordered with `system()`/`system2()` children: the buffer is
+//!   flushed synchronously before the child starts, from `R_Busy(1)` on R's
+//!   macOS builds and from the `system()` wrapper in `system_hook.c` on
+//!   Linux. Other child output (e.g. a `posix_spawn` from package code) is
+//!   ordered by timing only: R goes quiet the moment it hands over, the
+//!   buffer is out within about `QUIET_FLUSH`, and a child needs well over
+//!   that before it can write.
+//! * Trade-offs: compiled code that writes to fd 1 *during* a burst can land
+//!   up to `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses the
+//!   buffered tail.
 //!
 //! Styles use the terminal's 16-colour palette roles, so they follow the
 //! user's terminal theme (light or dark) without configuration.
@@ -26,6 +35,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(2);
+/// Buffered output is written once R has written nothing for this long.
+const QUIET_FLUSH: Duration = Duration::from_micros(100);
 /// A write arriving this long after the previous one is not part of a burst.
 const BURST_GAP: Duration = Duration::from_millis(1);
 const MAX_BUFFER: usize = 64 * 1024;
@@ -169,6 +180,11 @@ impl StderrClassifier {
     /// Append `text` to `out` with condition styling.
     fn style(&mut self, text: &str, out: &mut Vec<u8>) {
         for piece in text.split_inclusive('\n') {
+            if escapes_only(piece) {
+                self.sgr_active = sgr_active_after(piece, self.sgr_active);
+                out.extend_from_slice(piece.as_bytes());
+                continue;
+            }
             if self.at_line_start {
                 self.current = Some(self.classify_line_start(piece));
             }
@@ -190,6 +206,29 @@ impl StderrClassifier {
             }
         }
     }
+}
+
+/// Whether `text` is nothing but CSI escape sequences, such as the bare
+/// `ESC[?25h` (show cursor) some packages write after every top-level call.
+/// Such a write has no text to style, so it must not mark the line it lands
+/// on as package-coloured; only the SGR state it leaves behind matters.
+fn escapes_only(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != 0x1b || b.get(i + 1) != Some(&b'[') {
+            return false;
+        }
+        i += 2;
+        while i < b.len() && (0x20..0x40).contains(&b[i]) {
+            i += 1;
+        }
+        if i >= b.len() || !(0x40..0x7f).contains(&b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    !b.is_empty()
 }
 
 /// Whether a package's colour/attribute (SGR) style is still in effect after
@@ -321,6 +360,12 @@ impl ValueLexer {
 
     pub fn style(&mut self, text: &str, out: &mut Vec<u8>) {
         for line in text.split_inclusive('\n') {
+            if escapes_only(line) {
+                self.close(out);
+                self.sgr_active = sgr_active_after(line, self.sgr_active);
+                out.extend_from_slice(line.as_bytes());
+                continue;
+            }
             self.line_raw |=
                 self.sgr_active || line.contains('\x1b') || line.len() > MAX_STYLED_LINE;
             if self.line_raw {
@@ -553,6 +598,16 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
     std::thread::Builder::new()
         .name("raven-console-flush".into())
         .spawn(|| {
+            // Tests set this to make the flusher too slow to matter, so that
+            // only the synchronous flushes keep output ordered.
+            let (quiet_flush, flush_interval) =
+                match std::env::var("RAVEN_CONSOLE_TEST_FLUSH_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    Some(ms) => (Duration::from_millis(ms), Duration::from_millis(ms)),
+                    None => (QUIET_FLUSH, FLUSH_INTERVAL),
+                };
             let out = get();
             loop {
                 {
@@ -561,16 +616,37 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
                         g = out.pending.wait(g).unwrap_or_else(|e| e.into_inner());
                     }
                 }
-                // Let a burst of writes accumulate, then write it in one go.
-                std::thread::sleep(FLUSH_INTERVAL);
-                out.flush();
+                // Let the burst accumulate; write it once R goes quiet (it
+                // may be about to start a child process) or once it is
+                // FLUSH_INTERVAL old.
+                let since = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(quiet_flush);
+                    let g = out.lock();
+                    if g.buf.is_empty() {
+                        break;
+                    }
+                    let quiet = g.last_write.is_none_or(|t| t.elapsed() >= quiet_flush);
+                    if quiet || since.elapsed() >= flush_interval {
+                        drop(g);
+                        out.flush();
+                        break;
+                    }
+                }
             }
         })
         .expect("spawn flusher");
+    // SAFETY: registers a plain extern "C" fn; see system_hook.c.
+    unsafe { crate::console::libr::raven_set_flush_hook(flush_before_child) };
     // R ends the process with exit() (`q()`); drain what is buffered then.
     // SAFETY: registering a plain extern "C" fn with atexit.
     unsafe { libc::atexit(flush_at_exit) };
     out
+}
+
+/// Called by the `system()` wrapper (Linux) just before a child starts.
+extern "C" fn flush_before_child() {
+    let _ = std::panic::catch_unwind(|| get().flush());
 }
 
 extern "C" fn flush_at_exit() {
@@ -951,6 +1027,33 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\x1b[33mline one\nline two\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn bare_cursor_escape_does_not_disable_styling() {
+        // httpgd's session writes `ESC[?25h` to stdout after every top-level
+        // call; the next result must still be styled.
+        let mut lx = ValueLexer::new();
+        let mut out = Vec::new();
+        for w in ["[1]", " 1", "\n", "\x1b[?25h", "[1]", " 2", "\n"] {
+            lx.style(w, &mut out);
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.ends_with(&format!(
+                "\x1b[?25h{V_INDEX}[1]{RESET} {V_NUMBER}2{RESET}\n"
+            )),
+            "{out:?}"
+        );
+
+        let mut c = StderrClassifier::new(Headers::default());
+        let mut out = Vec::new();
+        c.style("\x1b[?25l", &mut out);
+        c.style("note\n", &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[?25l{MESSAGE}note{RESET}\n")
         );
     }
 
