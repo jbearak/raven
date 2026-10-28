@@ -326,7 +326,8 @@ pub fn continuation(line: &str, parse: impl Fn(&str) -> i32) -> Option<String> {
 }
 
 pub fn continuation_indent(scan: &Scan) -> String {
-    if scan.in_string_or_comment() {
+    // Never add spaces inside a multi-line string; a trailing comment is fine.
+    if scan.in_string() {
         return String::new();
     }
     let levels = scan.open_depth() + usize::from(scan.ends_with_operator());
@@ -468,6 +469,10 @@ mod tests {
         assert_eq!(
             continuation_indent(&lexer::scan("lapply(x, function(i) {")),
             "    "
+        );
+        assert_eq!(
+            continuation_indent(&lexer::scan("f <- function(x) {  # setup")),
+            "  "
         );
         assert_eq!(continuation_indent(&lexer::scan("x <- \"abc")), "");
     }

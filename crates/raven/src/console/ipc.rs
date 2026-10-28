@@ -57,8 +57,27 @@ impl Server {
         break_flag: Arc<AtomicBool>,
         main_thread: libc::pthread_t,
     ) -> std::io::Result<Self> {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+        // Replace only a stale socket: `--ipc` is a public option, and a
+        // mistyped path must never delete an ordinary file.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            use std::os::unix::fs::FileTypeExt;
+            if !meta.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "path exists and is not a socket",
+                ));
+            }
+            let _ = std::fs::remove_file(path);
+        }
+        // Create the socket owner-only from the start (no window where the
+        // umask's mode applies). Runs at startup, before any thread that
+        // creates files.
+        // SAFETY: umask only swaps the process file-creation mask.
+        let old = unsafe { libc::umask(0o077) };
+        let bound = UnixListener::bind(path);
+        // SAFETY: as above.
+        unsafe { libc::umask(old) };
+        let listener = bound?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let server = Server {
             queue: Arc::new(Mutex::new(VecDeque::new())),

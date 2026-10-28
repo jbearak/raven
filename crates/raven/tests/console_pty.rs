@@ -514,12 +514,21 @@ fn rapid_dependent_sends_run_in_order() {
         } else {
             format!("acc <- paste0(acc, {})", i % 10)
         };
-        let st = request_with_timeout(
-            &sock,
-            serde_json::json!({"v": 1, "id": i, "op": "execute", "code": code}),
-            Duration::from_millis(1),
-        );
-        assert_eq!(st.first().map(String::as_str), Some("queued"));
+        // Wait for `queued` (as the extension does), then hang up without
+        // waiting for `done`.
+        let stream = UnixStream::connect(&sock).expect("connect");
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut w = stream.try_clone().unwrap();
+        writeln!(
+            w,
+            "{}",
+            serde_json::json!({"v": 1, "id": i, "op": "execute", "code": code})
+        )
+        .unwrap();
+        let mut first = String::new();
+        BufReader::new(stream).read_line(&mut first).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["status"], "queued");
     }
     c.line("cat(acc, '\\n')");
     c.expect("1234567890123456789");

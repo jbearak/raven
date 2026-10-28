@@ -14,7 +14,7 @@ enum State {
 pub struct Scan {
     /// Bracket tokens outside strings/comments: (byte offset, byte, length).
     brackets: Vec<(usize, u8, usize)>,
-    end_state_code: bool,
+    end_in_string: bool,
     open_depth: usize,
     /// Last significant (non-space, non-comment) code token text.
     last_token: String,
@@ -113,7 +113,7 @@ pub fn scan(s: &str) -> Scan {
             },
         }
     }
-    out.end_state_code = st == State::Code;
+    out.end_in_string = matches!(st, State::Str(_));
     out.open_depth = stack.len();
     if let Some((a, z)) = last_start {
         out.last_token = s[a..z.min(s.len())].to_string();
@@ -122,8 +122,10 @@ pub fn scan(s: &str) -> Scan {
 }
 
 impl Scan {
-    pub fn in_string_or_comment(&self) -> bool {
-        !self.end_state_code
+    /// The input ends inside an unterminated string (a trailing comment
+    /// doesn't count).
+    pub fn in_string(&self) -> bool {
+        self.end_in_string
     }
 
     pub fn open_depth(&self) -> usize {
@@ -223,7 +225,7 @@ mod tests {
         let s = scan("f(\"(\", x) # )");
         assert_eq!(s.open_depth(), 0);
         assert_eq!(s.matching_bracket(1), Some((1, 8)));
-        assert!(s.in_string_or_comment()); // ends inside the comment
+        assert!(!s.in_string()); // ends inside the comment, not a string
     }
 
     #[test]
