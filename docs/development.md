@@ -1528,6 +1528,18 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
+### Native R console (`raven console`)
+
+`crates/raven/src/console/` is a terminal front end for R, and the default R terminal in the VS Code extension. Behavior and invariants are documented on the code: the module doc in `console/mod.rs` covers the thread model and input state machine, and the header of `console/shim.c` covers the longjmp boundary. In brief:
+
+- **Embedding.** `discovery.rs` finds R (`--r-home`, then `R_HOME`, then `R RHOME`). It replays the launcher's environment (`bin/R` resource-dir assignments plus `etc/ldpaths`) in `sh` and re-execs once, so the dynamic loader sees R's library path from process start. `libr.rs` then `dlopen`s `libR` with `RTLD_GLOBAL` and resolves every symbol up front. Any failure before R starts falls back to `exec`ing that installation's `bin/R` with the R arguments.
+- **Main thread.** R owns the main thread. `main.rs` dispatches `console` before building the tokio runtime used by every other subcommand.
+- **The C shim.** All R work the console starts itself (helper calls, `R_ParseVector` probes, event pumping) runs in C under `R_ToplevelExec` (`shim.c`, built by `crates/raven/build.rs`), so R errors and interrupts never `longjmp` over Rust frames. The R-side helpers live in `console/helpers.R`, evaluated into an environment that is attached nowhere.
+- **Output** (`output.rs`) never calls R. It keeps stdout and stderr in order through one buffer, flushed by a background thread every 8 ms and before each prompt, and styles stderr by recognizing R's localized condition headers.
+- **Editor sends** arrive over `--ipc` (`ipc.rs`, NDJSON). The socket thread only enqueues; the R thread feeds requests through `ReadConsole`. The client half is `editors/vscode/src/send-to-r/console-ipc.ts`.
+
+**Testing.** Unit tests sit next to each module. `crates/raven/tests/console_pty.rs` drives the real binary through a pseudo-terminal: editing, interrupts, nested prompts, sockets, events, and fallback. Each test skips itself when no R with a shared `libR` is installed; the `Cargo Tests` CI job installs `r-base-core`, so they run there. To see what a user sees, run the console inside tmux and use `tmux capture-pane -p` (add `-e` to keep escapes). reedline paints to stderr, so don't redirect stderr while watching the screen.
+
 ### Stan parsing and generated builtin catalog
 
 Stan documents have their own tree-sitter parse path, pinned by git revision in

@@ -1021,12 +1021,43 @@
         "raven.rTerminal.program": {
           "type": "string",
           "enum": [
+            "raven",
             "R",
             "arf",
             "radian"
           ],
-          "default": "R",
-          "description": "Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately). If the configured program is not found in your shell PATH, Raven prompts you to switch to 'R' on this machine, leaving your User-level default unchanged."
+          "enumDescriptions": [
+            "Raven's built-in R console: syntax highlighting, multi-line editing, Tab completion, and colored output. Runs the same R you get by typing R, and falls back to plain R if it can't. macOS and Linux; on Windows this starts plain R.",
+            "The standard R console.",
+            "arf, a third-party Rust R console (install separately).",
+            "radian, a third-party Python R console (install separately)."
+          ],
+          "default": "raven",
+          "description": "Program to use for the R terminal. 'raven' (the default) is Raven's built-in console; 'R' is the standard R console; 'arf' and 'radian' are third-party R consoles (must be installed separately). If arf or radian is not found in your shell PATH, Raven prompts you to switch to 'R' on this machine, leaving your User-level default unchanged."
+        },
+        "raven.console.editMode": {
+          "type": "string",
+          "enum": [
+            "emacs",
+            "vi"
+          ],
+          "default": "emacs",
+          "description": "Key bindings for Raven's R console (raven.rTerminal.program = 'raven'). Applies to newly opened consoles."
+        },
+        "raven.console.colorOutput": {
+          "type": "string",
+          "enum": [
+            "streams",
+            "values",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Color errors, warnings, and messages differently.",
+            "Also color printed values: numbers, strings, NA/TRUE/FALSE, and [1]-style indices (like the colorout package).",
+            "No colors added (output that is already colored, e.g. by the cli package, keeps its colors)."
+          ],
+          "default": "streams",
+          "description": "How Raven's R console colors output (raven.rTerminal.program = 'raven'). Uses your terminal theme's colors. Applies to newly opened consoles."
         },
         "raven.sendToR.advanceCursorOnSend": {
           "type": "boolean",
@@ -1046,7 +1077,7 @@
             "Write code to a temporary file and run source() for both single-line and multi-line sends."
           ],
           "default": "auto",
-          "description": "Controls how Raven sends code to R. Auto mode pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N); 'paste' always pastes, using bracketed paste mode for multi-line code; 'tempfile' always writes to a temp file and runs source()."
+          "description": "Controls how Raven sends code to R terminals other than Raven's built-in console, which receives code directly. Auto mode pastes short blocks directly and switches to a temp file once a block has at least raven.sendToR.autoTempFileThresholdLines lines (≥ N); 'paste' always pastes, using bracketed paste mode for multi-line code; 'tempfile' always writes to a temp file and runs source()."
         },
         "raven.sendToR.autoTempFileThresholdLines": {
           "type": "integer",

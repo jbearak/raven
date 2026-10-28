@@ -15,6 +15,11 @@ import {
     PendingProfileSession,
     _sweep_and_dequeue_session,
 } from './pending-fifo';
+import {
+    forget_console_terminal,
+    make_console_socket_path,
+    register_console_terminal,
+} from './console-ipc';
 
 export type { PendingProfileSession };
 export { _sweep_and_dequeue_session };
@@ -24,6 +29,7 @@ const TERMINAL_NAME = 'R (Raven)';
 const PENDING_TTL_MS = 30_000;
 
 let plot_services: PlotServices | null = null;
+let server_path_getter: (() => string) | null = null;
 let extension_context: vscode.ExtensionContext | null = null;
 // Cache the in-flight (or completed) write promise rather than a "done" flag,
 // so concurrent first calls in one activation share a single write instead of
@@ -37,10 +43,49 @@ let creation_in_flight: Promise<vscode.Terminal> | null = null;
 let pending_profile_creation_count = 0;
 const pending_profile_session_ids: PendingProfileSession[] = [];
 const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
+// Console sockets for terminals opened from the profile picker, matched to the
+// terminal in `onDidOpenTerminal` in creation order (like the session ids).
+const pending_profile_sockets: { socket: string; generatedAtMs: number }[] = [];
+
+/** `raven.rTerminal.program` value for Raven's built-in console. */
+export const RAVEN_CONSOLE_PROGRAM = 'raven';
 
 function get_program(): string {
     const config = vscode.workspace.getConfiguration('raven.rTerminal');
-    return config.get<string>('program', 'R');
+    return config.get<string>('program', RAVEN_CONSOLE_PROGRAM);
+}
+
+/** How to launch an R terminal for a resolved program. */
+export type RTerminalLaunch = {
+    shellPath: string;
+    shellArgs: string[];
+    /** Set when the terminal runs Raven's console: where it listens for code. */
+    consoleSocket?: string;
+};
+
+/**
+ * Launch spec for `program` (a `resolve_program()` result). Raven's console is
+ * the bundled server binary's `console` subcommand; it finds R itself and
+ * falls back to plain R if it can't embed it, so it needs no PATH check.
+ */
+export function build_r_terminal_launch(program: string): RTerminalLaunch {
+    const r_args = ['--no-save', '--no-restore'];
+    if (program !== RAVEN_CONSOLE_PROGRAM || !server_path_getter) {
+        return { shellPath: program, shellArgs: r_args };
+    }
+    const config = vscode.workspace.getConfiguration('raven.console');
+    const socket = make_console_socket_path();
+    return {
+        shellPath: server_path_getter(),
+        shellArgs: [
+            'console',
+            '--ipc', socket,
+            '--edit-mode', config.get<string>('editMode', 'emacs'),
+            '--color-output', config.get<string>('colorOutput', 'streams'),
+            ...r_args,
+        ],
+        consoleSocket: socket,
+    };
 }
 
 const exec_async = promisify(exec);
@@ -147,6 +192,11 @@ export function _set_validator_for_test(
 export async function resolve_program(): Promise<string> {
     const configured = get_program();
     if (configured === 'R') return 'R';
+    // Raven's console is bundled (no PATH check). It isn't available on
+    // Windows yet, where the same setting means plain R.
+    if (configured === RAVEN_CONSOLE_PROGRAM) {
+        return process.platform === 'win32' ? 'R' : RAVEN_CONSOLE_PROGRAM;
+    }
     if (is_program_validated_on_this_machine(configured)) return configured;
 
     if (await _validator(configured)) {
@@ -219,11 +269,18 @@ function handle_terminal_opened(terminal: vscode.Terminal): void {
         last_active_terminal = terminal;
         const next_id = _sweep_and_dequeue_session(pending_profile_session_ids, Date.now(), PENDING_TTL_MS);
         if (next_id) terminal_to_session_id.set(terminal, next_id);
+        const now = Date.now();
+        while (pending_profile_sockets.length > 0 && now - pending_profile_sockets[0].generatedAtMs > PENDING_TTL_MS) {
+            pending_profile_sockets.shift();
+        }
+        const pending_socket = pending_profile_sockets.shift();
+        if (pending_socket) register_console_terminal(terminal, pending_socket.socket);
     }
 }
 
 function handle_terminal_closed(terminal: vscode.Terminal): void {
     profile_terminals.delete(terminal);
+    forget_console_terminal(terminal);
     const sid = terminal_to_session_id.get(terminal);
     if (sid && plot_services) {
         plot_services.server.markSessionEnded(sid);
@@ -248,9 +305,11 @@ function handle_active_terminal_changed(
 export function register_r_terminal(
     context: vscode.ExtensionContext,
     services: PlotServices,
+    get_server_path: () => string,
 ): void {
     extension_context = context;
     plot_services = services;
+    server_path_getter = get_server_path;
     const provider: vscode.TerminalProfileProvider = {
         async provideTerminalProfile(
             token: vscode.CancellationToken
@@ -266,13 +325,17 @@ export function register_r_terminal(
             if (token.isCancellationRequested) {
                 throw new vscode.CancellationError();
             }
+            const launch = build_r_terminal_launch(program);
             const profile = new vscode.TerminalProfile({
                 name: TERMINAL_NAME,
-                shellPath: program,
-                shellArgs: ['--no-save', '--no-restore'],
+                shellPath: launch.shellPath,
+                shellArgs: launch.shellArgs,
                 env: plot_env?.env,
                 isTransient: true,
             });
+            if (launch.consoleSocket) {
+                pending_profile_sockets.push({ socket: launch.consoleSocket, generatedAtMs: Date.now() });
+            }
             if (plot_env) {
                 pending_profile_session_ids.push({
                     sessionId: plot_env.sessionId,
@@ -321,13 +384,15 @@ async function create_r_terminal(): Promise<vscode.Terminal> {
     // is fresh (no objects/history) and the baked-in port/token env vars point
     // at a session server from the previous activation that no longer exists,
     // so plot/data-viewer integration silently posts to a dead server.
+    const launch = build_r_terminal_launch(program);
     const terminal = vscode.window.createTerminal({
         name: TERMINAL_NAME,
-        shellPath: program,
-        shellArgs: ['--no-save', '--no-restore'],
+        shellPath: launch.shellPath,
+        shellArgs: launch.shellArgs,
         env: plot_env?.env,
         isTransient: true,
     });
+    if (launch.consoleSocket) register_console_terminal(terminal, launch.consoleSocket);
     profile_terminals.add(terminal);
     last_active_terminal = terminal;
     if (plot_env) terminal_to_session_id.set(terminal, plot_env.sessionId);

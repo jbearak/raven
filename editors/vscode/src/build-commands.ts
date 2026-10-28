@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import {
+    build_r_terminal_launch,
+    forget_console_terminal,
     get_or_create_r_terminal,
+    register_console_terminal,
     resolve_program,
     send_code,
     get_send_options,
@@ -108,19 +111,21 @@ let tasks_terminal: vscode.Terminal | null = null;
 let tasks_creation_in_flight: Promise<vscode.Terminal> | null = null;
 
 function handle_tasks_terminal_closed(terminal: vscode.Terminal): void {
+    forget_console_terminal(terminal);
     if (terminal === tasks_terminal) {
         tasks_terminal = null;
     }
 }
 
 async function create_tasks_terminal(): Promise<vscode.Terminal> {
-    const program = await resolve_program();
+    const launch = build_r_terminal_launch(await resolve_program());
     const terminal = vscode.window.createTerminal({
         name: TASKS_TERMINAL_NAME,
-        shellPath: program,
-        shellArgs: ['--no-save', '--no-restore'],
+        shellPath: launch.shellPath,
+        shellArgs: launch.shellArgs,
         isTransient: true,
     });
+    if (launch.consoleSocket) register_console_terminal(terminal, launch.consoleSocket);
     // `resolve_program()` can yield for seconds (shell `which` validation,
     // or a "Switch to R / Keep" dialog). If `raven.rTerminal.program`
     // changed during that window, the config handler cleared

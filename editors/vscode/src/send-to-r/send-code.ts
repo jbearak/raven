@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { console_route, send_via_console, send_when_listening, type_in_order } from './console-ipc';
 import { choose_send_transport, SendMethod } from './send-method';
 import { create_temp_file, schedule_temp_file_cleanup } from './temp-file';
 
@@ -19,6 +20,25 @@ export function get_send_options(): SendOptions {
 }
 
 export function send_code(
+    terminal: vscode.Terminal,
+    code: string,
+    options: SendOptions,
+): void {
+    // Raven's console takes code over its socket — any size, no keystroke
+    // injection or temp files — and falls back to typing only when no
+    // console is listening.
+    const route = console_route(terminal);
+    const type_it = () => send_by_typing(terminal, code, options);
+    if (route.kind === 'socket') {
+        send_via_console(route.socket, code, type_it);
+    } else if (route.kind === 'starting') {
+        send_when_listening(terminal, route.socket, code, type_it);
+    } else {
+        type_in_order(terminal, type_it);
+    }
+}
+
+function send_by_typing(
     terminal: vscode.Terminal,
     code: string,
     options: SendOptions,

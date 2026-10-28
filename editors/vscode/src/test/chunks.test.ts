@@ -269,11 +269,23 @@ async function poll_for_lenses(
 }
 
 suite('chunk commands: registration and behavior', () => {
-    suiteTeardown(() => {
+    // These tests capture what is typed into a stubbed terminal, so they run
+    // against plain R: Raven's console takes code over a socket instead, and a
+    // stub never opens one (sends would wait for it to start listening).
+    suiteSetup(async () => {
+        await vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .update('program', 'R', vscode.ConfigurationTarget.Global);
+    });
+
+    suiteTeardown(async () => {
         for (const file of TEMP_FIXTURE_FILES) {
             try { fs.unlinkSync(file); } catch { /* best-effort */ }
         }
         TEMP_FIXTURE_FILES.length = 0;
+        await vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .update('program', undefined, vscode.ConfigurationTarget.Global);
     });
 
     test('every chunk command is registered in VS Code', async () => {

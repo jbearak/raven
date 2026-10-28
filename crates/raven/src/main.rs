@@ -23,6 +23,7 @@ fn print_usage() {
     print!(
         r#"
 Usage: raven [OPTIONS]
+       raven console [OPTIONS] [R OPTIONS...]
        raven check [PATHS...] [--workspace DIR]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
@@ -61,8 +62,26 @@ freeze, fetch                Top-level aliases for raven packages freeze/fetch
     println!("Docs: {}", env!("CARGO_PKG_REPOSITORY"));
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // `raven console` embeds R, which must own the process's main thread, so
+    // it is dispatched before any tokio runtime (and its threads) exists.
+    let mut raw = env::args_os().skip(1);
+    if raw.next().is_some_and(|a| a == "console") {
+        #[cfg(unix)]
+        std::process::exit(raven::console::main(raw.collect()));
+        #[cfg(not(unix))]
+        {
+            eprintln!("raven console is not available on this platform yet; use R instead.");
+            std::process::exit(2);
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let mut argv = env::args();
     argv.next(); // skip executable name
 

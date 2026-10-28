@@ -446,7 +446,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         );
 
         // Register R terminal and send-to-R commands
-        register_r_terminal(context, plot_services);
+        register_r_terminal(context, plot_services, () => getServerPath(context));
         register_send_to_r_commands(context);
         register_inspection_commands(context);
         register_build_commands(context);
