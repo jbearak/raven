@@ -71,6 +71,7 @@ unsafe extern "C" {
     pub fn raven_pump_events() -> c_int;
     pub fn raven_option_string(name: *const c_char, buf: *mut c_char, buflen: c_int) -> c_int;
     pub fn raven_set_read_console(f: RustReadConsoleFn);
+    pub fn raven_set_flush_hook(hook: unsafe extern "C" fn());
     pub fn raven_read_console(
         prompt: *const c_char,
         buf: *mut u8,

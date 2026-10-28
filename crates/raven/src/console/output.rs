@@ -16,13 +16,13 @@
 //!   `flush.console()`, at 64 KB, and at process exit (`q()`). R's own writer
 //!   makes one syscall per write; batching is where the console's output speed
 //!   comes from.
-//! * Output stays ordered with child processes. On R's macOS builds,
-//!   `system()`/`system2()` call `R_Busy(1)` before starting the child, and
-//!   the console flushes there. Elsewhere (`posix_spawn` runs no fork hooks)
-//!   ordering rests on timing: R goes quiet the moment it hands over, the
+//! * Output stays ordered with `system()`/`system2()` children: the buffer is
+//!   flushed synchronously before the child starts, from `R_Busy(1)` on R's
+//!   macOS builds and from the `system()` wrapper in `system_hook.c` on
+//!   Linux. Other child output (e.g. a `posix_spawn` from package code) is
+//!   ordered by timing only: R goes quiet the moment it hands over, the
 //!   buffer is out within about `QUIET_FLUSH`, and a child needs well over
-//!   that (spawn plus two `exec`s for `sh -c`) before it can write. On a
-//!   saturated machine the flusher can occasionally lose that race.
+//!   that before it can write.
 //! * Trade-offs: compiled code that writes to fd 1 *during* a burst can land
 //!   up to `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses the
 //!   buffered tail.
@@ -598,6 +598,16 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
     std::thread::Builder::new()
         .name("raven-console-flush".into())
         .spawn(|| {
+            // Tests set this to make the flusher too slow to matter, so that
+            // only the synchronous flushes keep output ordered.
+            let (quiet_flush, flush_interval) =
+                match std::env::var("RAVEN_CONSOLE_TEST_FLUSH_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    Some(ms) => (Duration::from_millis(ms), Duration::from_millis(ms)),
+                    None => (QUIET_FLUSH, FLUSH_INTERVAL),
+                };
             let out = get();
             loop {
                 {
@@ -611,13 +621,13 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
                 // FLUSH_INTERVAL old.
                 let since = std::time::Instant::now();
                 loop {
-                    std::thread::sleep(QUIET_FLUSH);
+                    std::thread::sleep(quiet_flush);
                     let g = out.lock();
                     if g.buf.is_empty() {
                         break;
                     }
-                    let quiet = g.last_write.is_none_or(|t| t.elapsed() >= QUIET_FLUSH);
-                    if quiet || since.elapsed() >= FLUSH_INTERVAL {
+                    let quiet = g.last_write.is_none_or(|t| t.elapsed() >= quiet_flush);
+                    if quiet || since.elapsed() >= flush_interval {
                         drop(g);
                         out.flush();
                         break;
@@ -626,10 +636,17 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
             }
         })
         .expect("spawn flusher");
+    // SAFETY: registers a plain extern "C" fn; see system_hook.c.
+    unsafe { crate::console::libr::raven_set_flush_hook(flush_before_child) };
     // R ends the process with exit() (`q()`); drain what is buffered then.
     // SAFETY: registering a plain extern "C" fn with atexit.
     unsafe { libc::atexit(flush_at_exit) };
     out
+}
+
+/// Called by the `system()` wrapper (Linux) just before a child starts.
+extern "C" fn flush_before_child() {
+    let _ = std::panic::catch_unwind(|| get().flush());
 }
 
 extern "C" fn flush_at_exit() {

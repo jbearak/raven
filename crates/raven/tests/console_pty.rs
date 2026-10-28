@@ -47,6 +47,10 @@ impl Console {
     }
 
     fn spawn_with(extra: &[&str], no_history: bool) -> Console {
+        Self::spawn_env(extra, no_history, &[])
+    }
+
+    fn spawn_env(extra: &[&str], no_history: bool, env: &[(&str, &str)]) -> Console {
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
         let ws = libc::winsize {
@@ -86,6 +90,7 @@ impl Console {
             .args(extra)
             .env("TERM", "xterm-256color")
             .env_remove("RAVEN_CONSOLE_BOOTSTRAPPED")
+            .envs(env.iter().copied())
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -582,7 +587,10 @@ fn r_output_and_child_process_output_stay_in_order() {
     if !r_available() {
         return;
     }
-    let mut c = Console::spawn(&[]);
+    // The background flusher is slowed down so that only the synchronous
+    // flush before a child starts (R_Busy on macOS, the system() wrapper on
+    // Linux) can keep the order; a timing-based pass would prove nothing.
+    let mut c = Console::spawn_env(&[], true, &[("RAVEN_CONSOLE_TEST_FLUSH_DELAY_MS", "500")]);
     c.expect("> ");
     c.line("cat('BEFORE\\n'); system(\"printf 'CHILD\\\\n'\"); cat('AFTER\\n')");
     let out = c.expect("AFTER");
@@ -597,7 +605,7 @@ fn r_output_and_child_process_output_stay_in_order() {
     // a burst and must still reach the terminal before the child's output.
     c.line(
         "for (i in 1:30) { cat(paste0('A', i, '\\n')); cat(paste0('B', i, '\\n')); \
-         system(paste0('echo C', i)) }; cat('LOOPDONE\\n')",
+         system(paste0('echo C', i)); system2('echo', paste0('D', i)) }; cat('LOOPDONE\\n')",
     );
     let out = c.expect("LOOPDONE\r\n");
     let shown: Vec<&str> = out
@@ -606,7 +614,14 @@ fn r_output_and_child_process_output_stay_in_order() {
         .filter(|l| l.len() > 1 && l[1..].parse::<u32>().is_ok())
         .collect();
     let expected: Vec<String> = (1..=30)
-        .flat_map(|i| [format!("A{i}"), format!("B{i}"), format!("C{i}")])
+        .flat_map(|i| {
+            [
+                format!("A{i}"),
+                format!("B{i}"),
+                format!("C{i}"),
+                format!("D{i}"),
+            ]
+        })
         .collect();
     assert_eq!(shown, expected, "order: {out}");
 }
