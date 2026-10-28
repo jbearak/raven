@@ -359,6 +359,7 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     let mut pump = event_pump();
     ed = ed.with_idle_callback(Box::new(move || {
         pump();
+        output::get().pump_editor();
         if ACCEPTING.load(Ordering::Relaxed)
             && ipc_for_idle.as_ref().is_some_and(ipc::Server::has_pending)
         {

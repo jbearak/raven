@@ -6,9 +6,17 @@
 //!   terminal, every chunk goes through one buffer to fd 1.
 //! * Passes ANSI escapes, `\r`, and partial lines through untouched; styling
 //!   is only ever *added* around text that has no styling of its own.
-//! * Output is buffered for throughput and flushed by a background thread
-//!   every [`FLUSH_INTERVAL`], before every prompt, and on `flush.console()`,
-//!   so a slow loop printing one line at a time still appears promptly.
+//! * Output is batched only during bursts. A write that follows a pause
+//!   longer than [`BURST_GAP`] first flushes anything pending and then goes
+//!   straight to the terminal, so slow streaming output appears at once, and
+//!   so does output printed just before R hands the terminal to something else
+//!   (`system()`, compiled code writing to fd 1). Inside a burst (`print()` of
+//!   a long vector is about a million writes) writes are coalesced and flushed
+//!   by a background thread after [`FLUSH_INTERVAL`], before every prompt, on
+//!   `flush.console()`, at 64 KB, and at process exit (`q()`). R's own writer
+//!   makes one syscall per write; batching is where the console's output speed
+//!   comes from. The trade-off: during a burst, native output can land up to
+//!   `FLUSH_INTERVAL` early, and an abnormal exit (`abort`) loses that tail.
 //!
 //! Styles use the terminal's 16-colour palette roles, so they follow the
 //! user's terminal theme (light or dark) without configuration.
@@ -17,7 +25,9 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const FLUSH_INTERVAL: Duration = Duration::from_millis(8);
+const FLUSH_INTERVAL: Duration = Duration::from_millis(2);
+/// A write arriving this long after the previous one is not part of a burst.
+const BURST_GAP: Duration = Duration::from_millis(1);
 const MAX_BUFFER: usize = 64 * 1024;
 /// Lines longer than this are passed through without value styling.
 const MAX_STYLED_LINE: usize = 4096;
@@ -509,6 +519,11 @@ struct Inner {
     /// Trailing bytes of an incomplete UTF-8 character, per stream (R may
     /// split a character across writes).
     carry: [Vec<u8>; 2],
+    /// When the last write arrived (burst detection).
+    last_write: Option<std::time::Instant>,
+    /// Complete lines for the editor's printer not yet accepted by its
+    /// (bounded) channel, in order.
+    editor_queue: std::collections::VecDeque<String>,
 }
 
 static OUTPUT: std::sync::OnceLock<Output> = std::sync::OnceLock::new();
@@ -530,6 +545,8 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
             editor_sink: None,
             pending_editor_line: String::new(),
             carry: [Vec::new(), Vec::new()],
+            last_write: None,
+            editor_queue: std::collections::VecDeque::new(),
         }),
         pending: std::sync::Condvar::new(),
     });
@@ -550,7 +567,55 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
             }
         })
         .expect("spawn flusher");
+    // R ends the process with exit() (`q()`); drain what is buffered then.
+    // SAFETY: registering a plain extern "C" fn with atexit.
+    unsafe { libc::atexit(flush_at_exit) };
     out
+}
+
+extern "C" fn flush_at_exit() {
+    if let Some(out) = OUTPUT.get() {
+        // try_lock: never deadlock if exit() interrupted a write.
+        if let Ok(mut g) = out.inner.try_lock() {
+            let inner = &mut *g;
+            inner.values.close(&mut inner.buf);
+            drain_editor_to_buf(inner);
+            flush_inner(inner);
+        }
+    }
+}
+
+/// Hand queued editor lines to the printer channel, in order, as far as it
+/// has room.
+fn drain_editor_queue(inner: &mut Inner) {
+    let Some(sink) = inner.editor_sink.as_ref() else {
+        return;
+    };
+    while let Some(line) = inner.editor_queue.pop_front() {
+        match sink.try_send(line) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(line)) => {
+                inner.editor_queue.push_front(line);
+                return;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(line)) => {
+                inner.editor_queue.push_front(line);
+                inner.editor_sink = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Move editor-bound output (queued lines, then a partial line) to the
+/// ordinary buffer, in order.
+fn drain_editor_to_buf(inner: &mut Inner) {
+    for line in std::mem::take(&mut inner.editor_queue) {
+        inner.buf.extend_from_slice(line.as_bytes());
+        inner.buf.push(b'\n');
+    }
+    let rest = std::mem::take(&mut inner.pending_editor_line);
+    inner.buf.extend_from_slice(rest.as_bytes());
 }
 
 impl Output {
@@ -595,36 +660,51 @@ impl Output {
                 .push_str(&String::from_utf8_lossy(&styled));
             while let Some(nl) = inner.pending_editor_line.find('\n') {
                 let line: String = inner.pending_editor_line.drain(..=nl).collect();
-                let line = line.trim_end_matches('\n').to_string();
-                if let Some(Err(
-                    std::sync::mpsc::TrySendError::Full(line)
-                    | std::sync::mpsc::TrySendError::Disconnected(line),
-                )) = inner.editor_sink.as_ref().map(|s| s.try_send(line))
-                {
-                    // The editor drains this channel on the same thread, so
-                    // never block on it: write through (raw mode needs CR).
-                    let mut out = std::io::stdout().lock();
-                    let _ = write!(out, "\r\n{line}");
-                    let _ = out.flush();
-                }
+                inner
+                    .editor_queue
+                    .push_back(line.trim_end_matches('\n').to_string());
             }
+            // The editor drains its channel on this same thread, so never
+            // block on it: whatever doesn't fit waits in `editor_queue`.
+            drain_editor_queue(inner);
             return;
         }
         if !inner.merged && is_err {
             let _ = std::io::stderr().write_all(&styled);
             return;
         }
+        let now = std::time::Instant::now();
+        let after_pause = inner
+            .last_write
+            .is_none_or(|t| now.duration_since(t) > BURST_GAP);
+        inner.last_write = Some(now);
         let was_empty = inner.buf.is_empty();
         inner.buf.extend_from_slice(&styled);
-        if inner.buf.len() >= MAX_BUFFER {
+        if after_pause || inner.buf.len() >= MAX_BUFFER {
             flush_inner(inner);
         } else if was_empty && !inner.buf.is_empty() {
             self.pending.notify_one();
         }
     }
 
+    /// `flush.console()`: write everything out now, including a partial line
+    /// printed while the editor is showing (e.g. a progress bar in a
+    /// `later()` callback).
     pub fn flush(&self) {
-        flush_inner(&mut self.lock());
+        let mut g = self.lock();
+        let inner = &mut *g;
+        if inner.editor_sink.is_some() && !inner.pending_editor_line.is_empty() {
+            let partial = std::mem::take(&mut inner.pending_editor_line);
+            inner.editor_queue.push_back(partial);
+            drain_editor_queue(inner);
+        }
+        flush_inner(inner);
+    }
+
+    /// Give queued editor lines another chance at the printer's channel
+    /// (called from the editor's idle loop, after reedline has drained it).
+    pub fn pump_editor(&self) {
+        drain_editor_queue(&mut self.lock());
     }
 
     /// A prompt is about to be shown: flush and reset condition state.
@@ -640,11 +720,10 @@ impl Output {
     /// Route output to the editor (Some) or back to the terminal (None).
     pub fn set_editor_sink(&self, sink: Option<std::sync::mpsc::SyncSender<String>>) {
         let mut g = self.lock();
-        if sink.is_none() && !g.pending_editor_line.is_empty() {
-            // A partial line printed while editing: it belongs before the
-            // next output, so put it in the ordinary buffer.
-            let rest = std::mem::take(&mut g.pending_editor_line);
-            g.buf.extend_from_slice(rest.as_bytes());
+        if sink.is_none() {
+            // Output that arrived while editing but hasn't been printed yet
+            // belongs before what comes next.
+            drain_editor_to_buf(&mut g);
         }
         g.editor_sink = sink;
     }

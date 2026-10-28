@@ -387,20 +387,26 @@ fn socket_runs_code_and_stops_at_the_first_error() {
     assert_eq!(long.join().unwrap(), ["queued", "error"]);
 }
 
-#[test]
-fn event_loop_runs_while_idle() {
-    if !r_available() {
-        return;
-    }
-    let has_later = Command::new("Rscript")
+fn later_available() -> bool {
+    let ok = Command::new("Rscript")
         .args([
             "-e",
             "quit(status = !requireNamespace('later', quietly = TRUE))",
         ])
         .status()
         .is_ok_and(|s| s.success());
-    if !has_later {
+    if !ok {
         eprintln!("skipping: R package 'later' not installed");
+    }
+    ok
+}
+
+#[test]
+fn event_loop_runs_while_idle() {
+    if !r_available() {
+        return;
+    }
+    if !later_available() {
         return;
     }
     let mut c = Console::spawn(&[]);
@@ -558,6 +564,67 @@ fn socket_interrupt_works_after_a_readline_answer() {
     c.line("cat('alive\\n')");
     let out = c.expect("alive");
     assert!(!out.contains("slept"), "{out}");
+}
+
+#[test]
+fn output_right_before_quit_is_not_lost() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    c.line("cat('LAST', 'LINE\\n', sep = ''); q('no')");
+    c.expect("LASTLINE");
+}
+
+#[test]
+fn r_output_and_child_process_output_stay_in_order() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    c.line("cat('BEFORE\\n'); system(\"printf 'CHILD\\\\n'\"); cat('AFTER\\n')");
+    let out = c.expect("AFTER");
+    let (b, ch, a) = (
+        out.find("BEFORE\r\n").or(out.rfind("BEFORE")),
+        out.rfind("CHILD"),
+        out.rfind("AFTER"),
+    );
+    assert!(b < ch && ch < a, "order: {out}");
+}
+
+#[test]
+fn idle_output_is_visible_and_ordered_while_editing() {
+    if !r_available() || !later_available() {
+        return;
+    }
+    let mut c = Console::spawn(&[]);
+    c.expect("> ");
+    // A partial line made visible with flush.console(), then a flood.
+    c.line("later::later(function() { cat('PROGRESS 50%'); flush.console() }, 1)");
+    c.send("abc");
+    c.expect("PROGRESS 50%");
+    c.send("\x15");
+    c.line("later::later(function() for (i in 1:5000) cat('L', i, '\\n'), 0.5)");
+    c.send("x");
+    c.expect("L 5000");
+    c.settle();
+    let out = c.since_mark();
+    let nums: Vec<u32> = out
+        .lines()
+        // What the terminal shows on each line: the text after the last
+        // carriage return (reedline redraws the prompt between messages).
+        .map(|l| l.trim_end().rsplit('\r').next().unwrap_or(""))
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("L ")
+                .and_then(|n| n.trim().parse().ok())
+        })
+        .collect();
+    let missing: Vec<u32> = (1..=5000).filter(|n| !nums.contains(n)).collect();
+    assert!(missing.is_empty(), "missing lines {missing:?}");
+    assert!(nums.windows(2).all(|w| w[0] < w[1]), "in order");
 }
 
 #[test]
