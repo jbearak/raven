@@ -401,9 +401,12 @@ jobs:
     env:
       # The workflow-level mold flag is Linux-only.
       RUSTFLAGS: ""
-      SCCACHE_DIR: ${{ runner.temp }}/sccache
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # The runner context isn't available in job-level env.
+      - name: Point sccache at the runner's temp directory
+        run: echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> $env:GITHUB_ENV
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
