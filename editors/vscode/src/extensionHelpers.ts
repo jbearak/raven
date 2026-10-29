@@ -1,12 +1,31 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-// Set of language IDs and file extensions that Raven's language server
-// processes. `.Rmd` / `.qmd` are intentionally absent: those files use the
-// dedicated `rmd` / `quarto` language IDs and the LSP's document selector
-// is `r` only, so sending activity or watching their file events would be
-// noise. The chunk feature (which spans `.Rmd` / `.qmd`) has its own
-// language-aware wiring in `chunks/`.
+/**
+ * Language IDs the Raven language server handles. This is the single source
+ * for the client's LSP document selector (`serverDocumentSelector`) and for
+ * which editors count as active/visible in `raven/activeDocumentsChanged`
+ * (`isServerDocument`), so the server never analyzes a document whose editor
+ * activity the client fails to report.
+ */
+const SERVER_LANGUAGE_IDS = ['r', 'rmd', 'quarto', 'jags', 'stan'] as const;
+
+/** The LSP document selector: every server language, saved or untitled. */
+export function serverDocumentSelector(): { scheme: string; language: string }[] {
+    return SERVER_LANGUAGE_IDS.flatMap((language) => [
+        { scheme: 'file', language },
+        { scheme: 'untitled', language },
+    ]);
+}
+
+/** Whether the language server receives this document (see `SERVER_LANGUAGE_IDS`). */
+export function isServerDocument(document: Pick<vscode.TextDocument, 'languageId'>): boolean {
+    return (SERVER_LANGUAGE_IDS as readonly string[]).includes(document.languageId);
+}
+
+// Plain R-like documents (R, JAGS, Stan), used to gate the path-completion
+// suggest trigger. R Markdown / Quarto are absent; their chunk features have
+// their own language-aware wiring in `chunks/`.
 const R_DOCUMENT_LANGUAGE_IDS = new Set(['r', 'jags', 'stan']);
 const R_DOCUMENT_EXTENSIONS = new Set([
     '.r',
@@ -49,7 +68,7 @@ export function isRDocument(
  * server. Rmd/Quarto are included because Enter inside an R chunk resolves
  * the judge's indent unit from this per-document map (see
  * `backend.rs::on_type_formatting`'s `judge_indent_unit`). They remain
- * excluded from `isRDocument`, whose activity/diagnostics role is narrower.
+ * excluded from `isRDocument`, whose path-suggest role is narrower.
  */
 export function isIndentUnitDocument(
     document: Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'>,
