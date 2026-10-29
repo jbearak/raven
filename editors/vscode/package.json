@@ -350,6 +350,11 @@
         "command": "raven.debugger.viewData",
         "title": "Open in Data Viewer",
         "category": "Raven"
+      },
+      {
+        "command": "raven.debugger.inspectLastError",
+        "title": "Inspect Last Error",
+        "category": "Raven"
       }
     ],
     "keybindings": [
@@ -446,6 +451,10 @@
       "commandPalette": [
         {
           "command": "raven.debugger.start",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
+          "command": "raven.debugger.inspectLastError",
           "when": "raven.rConsoleEnabled"
         },
         {

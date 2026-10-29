@@ -29,6 +29,8 @@
 //! → {"v":1,"id":11,"op":"breakpoints","files":{"/w/a.R":[{"line":3}]},
 //!    "functions":["f"],"exceptionFilters":["error"]}   // mirror while no
 //! ← {"id":11,"status":"ok"}                            // session exists
+//! → {"v":1,"id":13,"op":"inspect"}                    // Inspect Last Error
+//! ← {"id":13,"status":"ok"}        // or "none", "busy", "stopped"
 //! ```
 //!
 //! Access control: the socket is owner-only, inside a directory the editor
@@ -205,6 +207,14 @@ fn serve(
             Some("breakpoints") => {
                 let ok = apply_breakpoint_mirror(&msg);
                 let status = if ok { "ok" } else { "not-ready" };
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::json!({"id": id, "status": status})
+                );
+            }
+            Some("inspect") => {
+                let status = super::dap::request_inspect();
                 let _ = writeln!(
                     writer,
                     "{}",

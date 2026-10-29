@@ -256,6 +256,8 @@ struct RState {
     pending_exception: Option<(String, String)>,
     /// R recorded a warning's location that isn't printed yet.
     warnings_pending: bool,
+    /// Inspect Last Error is open: the frames are dead, so steps continue.
+    inspecting: bool,
     step_next_segment: bool,
     /// One-shot step probe armed for the segment being fed.
     step_probe_armed: bool,
@@ -390,6 +392,7 @@ pub fn init(
             pending_step: false,
             pending_exception: None,
             warnings_pending: false,
+            inspecting: false,
             step_next_segment: false,
             step_probe_armed: false,
             plans: HashMap::new(),
@@ -1112,6 +1115,14 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 String::new()
             }
         }
+        "last_error" => {
+            HAS_LAST_ERROR.store(a == "1", Ordering::SeqCst);
+            String::new()
+        }
+        "inspecting" => {
+            with_r(|r| r.inspecting = a == "1");
+            String::new()
+        }
         "warnings_pending" => {
             with_r(|r| r.warnings_pending = true);
             String::new()
@@ -1588,20 +1599,70 @@ fn print_warning_locations(top: bool) {
 /// Most traceback lines printed; the rest are counted.
 const TRACEBACK_LINES: usize = 8;
 
-/// Print the traceback `at_prompt` returned (a JSON array of lines, each
-/// `call at /abs/file.R:12`, innermost first), dim, after R's error message.
-/// VS Code's terminal links the `path:line` itself.
+/// The last printed error kept its frames: Inspect Last Error has
+/// something to open. Read by the socket thread.
+static HAS_LAST_ERROR: AtomicBool = AtomicBool::new(false);
+/// The editor asked to inspect the last error; taken at the next idle
+/// top-level prompt.
+static INSPECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The socket thread's answer to an `inspect` request: `ok` (R opens the
+/// last error at its prompt), or why not (`none`, `busy`, `stopped`).
+pub fn request_inspect() -> &'static str {
+    let Some(h) = handle() else { return "none" };
+    if !HAS_LAST_ERROR.load(Ordering::SeqCst) {
+        return "none";
+    }
+    if super::ipc::R_BUSY.load(Ordering::Relaxed) {
+        return "busy";
+    }
+    if lock(h).stop.is_some() {
+        return "stopped";
+    }
+    INSPECT_REQUESTED.store(true, Ordering::SeqCst);
+    h.break_flag.store(true, Ordering::Relaxed);
+    "ok"
+}
+
+/// Hidden input that opens the last error, if one was requested.
+pub fn take_inspect() -> Option<String> {
+    INSPECT_REQUESTED
+        .swap(false, Ordering::SeqCst)
+        .then(|| ".raven_dbg_inspect()\n".to_string())
+}
+
+/// Print the traceback `at_prompt` returned (`{"lines": [...], "inspect":
+/// bool}`, each line `call at /abs/file.R:12`, innermost first), dim, after
+/// R's error message. VS Code's terminal links the `path:line` itself. The
+/// Inspect hint is shown only when an editor is connected to run it.
 fn print_traceback(json: &str) {
-    let lines: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+    let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
+    let lines: Vec<String> = v["lines"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     if lines.is_empty() {
         return;
     }
+    let editor = handle().is_some_and(|h| {
+        !h.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    });
     let mut text = String::from("Traceback:\n");
     for l in lines.iter().take(TRACEBACK_LINES) {
         text.push_str(&format!("  {l}\n"));
     }
     if lines.len() > TRACEBACK_LINES {
         text.push_str(&format!("  … {} more\n", lines.len() - TRACEBACK_LINES));
+    }
+    if editor && v["inspect"] == true {
+        text.push_str("Inspect it: run Raven: Inspect Last Error\n");
     }
     super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
 }
@@ -1623,7 +1684,7 @@ fn on_top_level(more: bool) -> Option<String> {
     let mut fields = reply.splitn(3, '\x1e');
     let masked = fields.next().unwrap_or("").to_string();
     let bound = fields.next().unwrap_or("").to_string();
-    print_traceback(fields.next().unwrap_or("[]"));
+    print_traceback(fields.next().unwrap_or("{}"));
     report_function_breakpoints(&bound);
     let changed = with_r(|r| {
         r.jit_off = false;
@@ -1864,7 +1925,11 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
 /// asked for one (checked when the break flag interrupts the editor).
 pub fn take_resume() -> Option<String> {
     let h = handle()?;
-    let cmd = lock(h).resume.take()?;
+    let mut cmd = lock(h).resume.take()?;
+    // Inspecting the last error, there is nothing to step through.
+    if with_r(|r| r.inspecting).unwrap_or(false) {
+        cmd = "c".into();
+    }
     // Step Out is R's `c` once the caller is flagged to stop (`on_resume`
     // for "f"): R's own `f` would mark a loop as finishing, where R takes
     // no steps, so a breakpoint later in the loop couldn't stop.
@@ -1899,11 +1964,16 @@ fn note_resume(cmd: &str) {
 
 /// The user typed `text` at a browser prompt in the terminal: browser
 /// commands count as resumes, exactly as if clicked in the UI (§2.1).
-pub fn on_user_line(text: &str) {
+/// While inspecting the last error a step is a Continue, so a typed `n`,
+/// `s` or `f` comes back as `c` for R to read.
+pub fn on_user_line(text: &str) -> Option<String> {
     if !active() {
-        return;
+        return None;
     }
     let t = text.trim();
+    let inspecting = with_r(|r| r.inspecting).unwrap_or(false);
+    let replaced = (inspecting && matches!(t, "n" | "s" | "f")).then(|| "c".to_string());
+    let t = replaced.as_deref().unwrap_or(t);
     if matches!(t, "n" | "s" | "f" | "c" | "cont" | "Q") {
         let cmd = if t == "cont" { "c" } else { t };
         if let Some(h) = handle() {
@@ -1911,6 +1981,7 @@ pub fn on_user_line(text: &str) {
         }
         note_resume(cmd);
     }
+    replaced
 }
 
 /// Run queued R work (scopes, variables, evaluate, …). Called on the R

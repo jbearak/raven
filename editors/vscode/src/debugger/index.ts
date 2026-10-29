@@ -309,6 +309,65 @@ async function choose_console(): Promise<string | undefined> {
     return console_socket_of(terminal);
 }
 
+/** One request on a console's socket; resolves with its `status`. */
+function console_request(ipc: string, op: string): Promise<string> {
+    return new Promise((resolve) => {
+        const sock = net.createConnection(socket_endpoint(ipc));
+        sock.setEncoding('utf8');
+        let reply = '';
+        const done = (status: string) => {
+            sock.destroy();
+            resolve(status);
+        };
+        sock.on('connect', () => sock.write(JSON.stringify({ v: 1, id: 0, op }) + '\n'));
+        sock.on('data', (d: string) => {
+            reply += d;
+            const nl = reply.indexOf('\n');
+            if (nl < 0) return;
+            try {
+                done(String((JSON.parse(reply.slice(0, nl)) as { status?: unknown }).status ?? ''));
+            } catch {
+                done('');
+            }
+        });
+        sock.on('error', () => done(''));
+        sock.setTimeout(5_000, () => done(''));
+    });
+}
+
+/**
+ * Inspect Last Error: the console opens a browser in the saved frames of the
+ * last error that printed a traceback, and the debugger attaches to it as to
+ * any stop (with `attach: never`, this starts the session itself).
+ */
+async function inspect_last_error(): Promise<void> {
+    const active = vscode.window.activeTerminal;
+    const ipc = (active && console_socket_of(active)) ?? live_console_sockets().pop()?.[1];
+    if (!ipc) {
+        void vscode.window.showInformationMessage("Raven: no R console is open.");
+        return;
+    }
+    const status = await console_request(ipc, 'inspect');
+    const why: Record<string, string> = {
+        none: 'Raven: there is no error to inspect. Inspect Last Error opens an error that printed a traceback.',
+        busy: 'Raven: R is busy. Inspect the last error once it is back at the prompt.',
+        stopped: 'Raven: R is already stopped in the debugger.',
+        '': "Raven: this R console can't inspect errors. Open a new R console with the debugger enabled.",
+    };
+    if (status !== 'ok') {
+        void vscode.window.showInformationMessage(why[status] ?? why['']);
+        return;
+    }
+    if (attach_policy() === 'never') {
+        await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+            type: DEBUG_TYPE,
+            request: 'launch',
+            name: 'R console',
+            consoleSocket: ipc,
+        });
+    }
+}
+
 const configuration_provider: vscode.DebugConfigurationProvider = {
     async resolveDebugConfiguration(_folder, config) {
         if (!debugger_enabled()) {
@@ -432,6 +491,7 @@ export function register_debugger(context: vscode.ExtensionContext): void {
                 name: 'R console',
             });
         }),
+        vscode.commands.registerCommand('raven.debugger.inspectLastError', inspect_last_error),
         vscode.commands.registerCommand(
             'raven.debugger.viewData',
             async (arg?: { variable?: { evaluateName?: string; name?: string } }) => {

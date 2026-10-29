@@ -208,6 +208,20 @@ impl Console {
     }
 }
 
+impl Console {
+    /// Send a one-line IPC request and return its `status`.
+    fn ipc_status(&self, op: &str) -> String {
+        let s = UnixStream::connect(self.dir.join("i")).expect("ipc connect");
+        s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"v": 1, "id": 1, "op": op})).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        v["status"].as_str().unwrap_or("").to_string()
+    }
+}
+
 impl Drop for Console {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -1870,4 +1884,87 @@ fn warnings_from_file_code_name_their_lines() {
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
     d.session_ended();
+}
+
+#[test]
+fn inspect_last_error_opens_its_frames_after_the_fact() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let a = c.write_file(
+        "a.R",
+        "inner <- function(x) {\n  y <- paste0(x, \"!\")\n  log(y)\n}\nouter <- function(z) {\n  w <- toupper(z)\n  inner(w)\n}\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": []}));
+    d.req("configurationDone", json!({}));
+    c.send(&std::fs::read_to_string(&a).unwrap(), Some(&a));
+    c.expect("> ");
+    assert_eq!(c.ipc_status("inspect"), "none");
+
+    // An editor is connected: the traceback offers Inspect.
+    let sub = UnixStream::connect(c.dir.join("i")).unwrap();
+    writeln!(&sub, "{}", json!({"v": 1, "id": 2, "op": "subscribe"})).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    c.type_line("outer('a')");
+    c.expect("Inspect it: run Raven: Inspect Last Error");
+
+    // Inspect: the saved stack, its variables, and evaluation in a frame.
+    for round in 0..2 {
+        let m = d.mark();
+        assert_eq!(c.ipc_status("inspect"), "ok");
+        let stop = d.event("stopped", m);
+        assert_eq!(stop["body"]["reason"], "exception", "round {round}");
+        let st = d.stack();
+        assert_eq!(st[0], ("inner".to_string(), 3));
+        assert_eq!(st[1], ("outer".to_string(), 7));
+        assert_eq!(d.locals().get("y").map(String::as_str), Some("\"A!\""));
+        let frames = d.req("stackTrace", json!({"threadId": 1}));
+        let outer_id = frames["body"]["stackFrames"][1]["id"].clone();
+        let ev = d.req(
+            "evaluate",
+            json!({"expression": "w", "frameId": outer_id, "context": "repl"}),
+        );
+        assert_eq!(ev["body"]["result"], "[1] \"A\"");
+        assert_eq!(c.ipc_status("inspect"), "stopped");
+        // A step has nothing to run: it ends the inspection.
+        let m = d.mark();
+        d.req(
+            if round == 0 { "next" } else { "stepIn" },
+            json!({"threadId": 1}),
+        );
+        d.event("terminated", m);
+        d.session_ended();
+    }
+
+    // A typed `n` at Browse> ends it too; R is back at the prompt.
+    let m = d.mark();
+    assert_eq!(c.ipc_status("inspect"), "ok");
+    d.event("stopped", m);
+    let m = d.mark();
+    c.type_line("n");
+    d.event("terminated", m);
+    d.session_ended();
+    c.type_line("cat('back', '\\n')");
+    c.expect("back ");
+
+    // Busy while R runs.
+    c.type_line("Sys.sleep(1.5)");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(c.ipc_status("inspect"), "busy");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // The next printed error replaces it.
+    c.type_line("inner(1:2 > 0)");
+    c.expect("inner(1:2 > 0) at");
+    let m = d.mark();
+    assert_eq!(c.ipc_status("inspect"), "ok");
+    d.event("stopped", m);
+    assert_eq!(d.stack().len(), 2);
+    let m = d.mark();
+    d.req("terminate", json!({}));
+    d.event("terminated", m);
+    d.session_ended();
+    drop(sub);
 }
