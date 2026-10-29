@@ -3,7 +3,7 @@
 Date: 2026-10-29. This file records the persona findability review from §6 of `2026-10-29-docs-redesign-design.md`, following Phase 7 of the plan.
 
 - **Baseline docs SHA:** `6c7871aac52a75305cb9996412e905e7524618a0` (the docs before the redesign).
-- **Tested docs SHA:** `a8d788802673bfdb86edd6b8389485b62cd45cc6`. The runs were made at `55d86e47` and `c1317332`, and carry forward as described under Carry-forward.
+- **Tested docs SHA:** `2018668d387eaf28c7f56fdc35f89c02d1e9f702`. The runs were made at `55d86e47`, `c1317332`, and `76d99864`, and carry forward as described under Carry-forward.
 - **Evidence commits:** the commits that add and update this file. It touches only `docs/superpowers/`.
 
 ## Protocol
@@ -57,6 +57,7 @@ Baseline: 18/20 found; tasks 6 and 17 were not found. Final: 20/20 found, and ev
 2. **final2** at `4732b0d4`. Tasks 1–3 were found at 0 clicks. Task 14 took 2 clicks against 1 for Ruff and uv. Fix: the README says where `raven.toml` lives and how it's found (`55d86e47`).
 3. **final3** at `55d86e47`. A full re-run, because the README changed. Task 14 was found at 0 clicks. Tasks 9 and 16 took 2 clicks: the tester opened a second page to confirm an answer that `diagnostics.md` already gave. That page answered task 9 at 1 click in rounds 1 and 2. The `raven.toml` form for task 9 was a link away, though, so `diagnostics.md` now shows it inline (`c1317332`).
 4. **final4** at `c1317332`. Tasks 9, 10, and 16 visit `diagnostics.md`, so two independent testers re-ran them. Both found all three at 1 click with high confidence. Tester A answered 16 from `diagnostics.md` and tester B from `troubleshooting.md`.
+5. **final5** at `76d99864`. Merging `main`, which added Raven's console on Windows, changed one feature-table row in `editor-integrations.md`. Tasks 4, 5, and 6 visit that page, so they were re-run, and all three were found at 1 click with high confidence.
 
 ## Carry-forward
 
@@ -72,7 +73,9 @@ Between `55d86e47` and `c1317332`, only `docs/diagnostics.md` changed (`git diff
 - `non-standard-evaluation.md`
 - `troubleshooting.md`
 
-After acceptance, a reader found the R console page's opening confusing because it treated "the R terminal" and "the console" as two separate things. Commits `50fd5ab2` through `a8d78880` restructured the top of `docs/r-console.md` around one console with a choice of program, and updated one link label in `docs/configuration.md` (`git diff --stat c1317332 a8d78880`). The final4 runs and the carried-forward runs never visited either page, so every result in the table carries forward to `a8d78880`.
+After acceptance, a reader found the R console page's opening confusing because it treated "the R terminal" and "the console" as two separate things. Commits `50fd5ab2` through `a8d78880`, and `2018668d`, restructured the top of `docs/r-console.md` around one console with a choice of program, and updated one link label in `docs/configuration.md`.
+
+The merge from `main` at `76d99864` changed `cli.md`, `debugger.md`, `limitations.md`, `r-console.md`, and `editor-integrations.md`. Of these, only `editor-integrations.md` was visited by an acceptance run (tasks 4, 5, and 6), and those tasks were re-run as final5. `git diff --stat 76d99864 2018668d` shows only `docs/r-console.md`. Every result in the table is therefore valid at `2018668d`.
 
 ## Spot checks
 
