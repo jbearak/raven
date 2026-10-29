@@ -1,15 +1,39 @@
 # Linting
 
-Raven ships an opt-in, native style linter that re-implements 18 of [`lintr`](https://lintr.r-lib.org/)'s rules — most of `lintr`'s default rule set — in Rust against the tree-sitter AST. No R session or `lintr` install is needed — rules run on the parse tree Raven already builds for completions and diagnostics.
+[Docs](README.md) › Analysis
 
-This page is the landing point for users coming from `lintr` or `REditorSupport`. For these rules alongside Raven's other diagnostic categories, see [Diagnostics § Style Lints](diagnostics.md#style-lints); the per-key configuration reference lives in [Configuration § Linting Settings](configuration.md#linting-settings).
+Raven's optional style linter checks line length, naming, spacing, and 15 more of [`lintr`](https://lintr.r-lib.org/)'s default rules as you type and in CI, with no R session or `lintr` install.
+
+| You write | Rule | Why it's flagged |
+|---|---|---|
+| `x = 1` | `assignment_operator` | The default style is `<-` for assignment. |
+| `if (x == NA)` | `equals_na` | Comparing with `NA` always returns `NA`; use `is.na(x)`. |
+| `f( x )` | `spaces_inside` | No spaces just inside parentheses. |
+| `plot(T)` | `t_and_f_symbol` | `T` and `F` can be reassigned; write `TRUE` and `FALSE`. |
+
+Raven implements 18 of `lintr`'s rules, most of its default set, in Rust on the same parse tree it already builds for completion and diagnostics.
 
 > [!NOTE]
-> In Raven, "linting" means subjective style rules — line length, naming, infix spacing, and similar — and the whole group is governed by the tri-state master switch `raven.linting.enabled` (default `"auto"`, see below). Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are on by default under `raven.diagnostics.enabled`; most categories have a per-category severity that can silence them (`"off"`), while a few (parse errors, assignment-target errors) respond only to the master switch. None of these are controlled by `raven.linting.*`. If you're looking for things like the orphan-`else` parse error, see [Diagnostics](diagnostics.md), not this page.
+> In Raven, "linting" means subjective style rules, and the whole group is off until you turn it on. Correctness diagnostics (parse errors, semantic warnings, cross-file issues, assignment-target errors) are on by default and are not controlled by `raven.linting.*`; see [Diagnostics](diagnostics.md). For example, the orphan-`else` parse error is a diagnostic, not a lint.
 
 ## Quick start
 
-By default (`"auto"`), Raven turns linting on when it discovers a workspace or non-home ancestor `.lintr` **that contains linting configuration**, or a `raven.toml` opt-in, and stays off otherwise. A blank or empty `.lintr` (one with no `linters:` or `exclusions:` directive) carries no opt-in and does **not** turn linting on — unlike `lintr` itself, Raven's native linting is off by default and a `.lintr` enables it only when the file actually configures linting (a `linters:` directive, including a bare `linters_with_defaults()`). The literal home-directory `~/.lintr` is ignored unless `raven.linting.readHomeLintr` is true in the editor, or the CLI is pointed at it explicitly with `--config ~/.lintr`. A discovered `.lintr` is also *ignored* when [REditorSupport's own `lintr` diagnostics are live or you're running in Positron](#auto-and-reditorsupport--positron) — there the `.lintr` belongs to `lintr` itself, so Raven doesn't pile its native lints on top. To force linting on regardless of project state, set:
+Turn linting on in any of three ways.
+
+In a `raven.toml` at the project root, which the editor and the CLI both read:
+
+```toml
+[linting]
+enabled = true
+```
+
+In a `.lintr` file at the project root, if you already use `lintr` (Raven reads a [subset](#migrating-from-lintr)):
+
+```r
+linters: linters_with_defaults(line_length_linter(120))
+```
+
+In VS Code settings, for yourself only:
 
 ```json
 {
@@ -17,7 +41,9 @@ By default (`"auto"`), Raven turns linting on when it discovers a workspace or n
 }
 ```
 
-All style lint rules default to severity `information`, matching REditorSupport `languageserver`'s mapping for `lintr` style findings. To raise a rule (e.g. line length) to `warning`, lower it to `hint`, or disable an individual rule, set its severity:
+From a terminal, `raven lint .` always lints, whether or not the project turns linting on. See [`raven lint`](cli.md#raven-lint).
+
+All rules default to severity `information`, matching how REditorSupport's `languageserver` maps `lintr` style findings. To raise a rule to `warning`, lower it to `hint`, or turn it off, set its severity:
 
 ```json
 {
@@ -27,7 +53,7 @@ All style lint rules default to severity `information`, matching REditorSupport 
 }
 ```
 
-To change the line-length threshold or pick a different naming scheme:
+To change the line-length limit or allow other naming styles:
 
 ```json
 {
@@ -40,191 +66,166 @@ To change the line-length threshold or pick a different naming scheme:
 }
 ```
 
-Each `objectNameStyle*` accepts either a single style string or an array of styles. A name passes when it matches any named style for that kind or any regex in the matching `objectNameRegexes*` setting. Setting an `objectNameStyle*` to `"any"` (or including `"any"` in the array) disables the check for that symbol kind and ignores regexes for that kind while leaving the other two active. An explicit empty style array with regexes is regex-only mode; empty styles and empty regexes together disable that kind. Setting `raven.linting.objectNameSeverity` to `"off"` disables the rule entirely.
+The same keys work in `raven.toml` under `[linting]`, without the `raven.linting.` prefix. Lint diagnostics carry the source `raven (lint)`, so you can filter them from Raven's other diagnostics in the Problems pane. Style findings never fail `raven check` at its default threshold; see [Gate on style](ci.md#gate-on-style) to make them fail CI.
 
-Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to filter from Raven's other diagnostics in the Problems pane.
+<a id="settings-reference-by-rule"></a>
 
-## Master switch (`raven.linting.enabled`)
+## Rules
 
-`raven.linting.enabled` is tri-state: `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for backward compatibility with existing settings.
+Each rule mirrors one `lintr` linter. The code is what appears in output; suppression comments accept it in this `snake_case` form or in kebab-case (`line-length`). Severity settings accept `"error"`, `"warning"`, `"information"` (or its `"info"` alias), `"hint"`, or `"off"`.
 
-The explicit `raven lint` CLI command is the exception to this master switch: choosing that command opts into native linting, so it runs with built-in defaults even when no config is discovered or `--no-config` is passed, and it ignores a base `enabled = false`. Per-file `enabled = false` overrides and `.lintr` exclusions still skip matching files, individual rule severities set to `off` remain disabled, and all other configured rule values still apply. This CLI-only behavior does not change editor/LSP diagnostics or `raven check`.
+| Rule | Code | `lintr` linter (`.lintr` form) | Raven settings |
+|---|---|---|---|
+| [Line length](#line-length) | `line_length` | `line_length_linter(length = N)` | `lineLength = N`, `lineLengthSeverity` |
+| [Trailing whitespace](#trailing-whitespace) | `trailing_whitespace` | `trailing_whitespace_linter()` | `trailingWhitespaceSeverity` |
+| [Tab characters](#tab-characters) | `no_tab` | `whitespace_linter()` (no-tab portion) | `noTabSeverity` |
+| [Trailing blank lines](#trailing-blank-lines) | `trailing_blank_lines` | `trailing_blank_lines_linter()` | `trailingBlankLinesSeverity` |
+| [Assignment operator](#assignment-operator) | `assignment_operator` | `assignment_linter()` | `assignmentOperator`, `assignmentOperatorSeverity` |
+| [Object names](#object-names) | `object_name` | `object_name_linter(styles = c("snake_case"), regexes = c("^x$"))` | `objectNameStyleFunction`, `objectNameStyleVariable`, `objectNameStyleArgument`, `objectNameRegexesFunction`, `objectNameRegexesVariable`, `objectNameRegexesArgument`, `objectNameSeverity` |
+| [Infix spaces](#infix-spaces) | `infix_spaces` | `infix_spaces_linter()` | `infixSpacesSeverity` |
+| [Commented code](#commented-code) | `commented_code` | `commented_code_linter()` | `commentedCodeSeverity` |
+| [Quotes](#quotes) | `quotes` | `quotes_linter()` / `single_quotes_linter()` | `stringDelimiter`, `quotesSeverity` |
+| [Commas](#commas) | `commas` | `commas_linter()` | `commasSeverity` |
+| [T / F symbol](#t--f-symbol) | `t_and_f_symbol` | `T_and_F_symbol_linter()` | `tAndFSymbolSeverity` |
+| [Semicolon](#semicolon) | `semicolon` | `semicolon_linter()` | `semicolonSeverity` |
+| [Equals NA](#equals-na) | `equals_na` | `equals_na_linter()` | `equalsNaSeverity` |
+| [Object length](#object-length) | `object_length` | `object_length_linter(length = N)` | `objectLength = N`, `objectLengthSeverity` |
+| [Vector logic](#vector-logic) | `vector_logic` | `vector_logic_linter()` | `vectorLogicSeverity` |
+| [Function left parentheses](#function-left-parentheses) | `function_left_parentheses` | `function_left_parentheses_linter()` | `functionLeftParenthesesSeverity` |
+| [Spaces inside](#spaces-inside) | `spaces_inside` | `spaces_inside_linter()` | `spacesInsideSeverity` |
+| [Indentation](#indentation) | `indentation` | `indentation_linter(indent = N)` | `indentationUnit = N`, `infixContinuationStyle`, `indentationSeverity` |
 
-- `"auto"` — lint when a project config opts in. Specifically: when a `.lintr` **that contains linting configuration** (a `linters:` or `exclusions:` directive — a bare `linters_with_defaults()` counts; a blank/empty file does not) is discovered on the upward walk from the active project root, or when a `raven.toml` sets `[linting] enabled = true`. The active project root is the first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory. The literal home-directory `~/.lintr` is ignored by default; in VS Code and other LSP clients, set `raven.linting.readHomeLintr = true` to include it, while the CLI uses it only when passed explicitly with `--config ~/.lintr`. Otherwise off. The `.lintr` half of this is suppressed when REditorSupport / Positron already owns the `lintr` path — see [`"auto"` and REditorSupport / Positron](#auto-and-reditorsupport--positron) below.
-- `true` / `"on"` — force linting on. Discovered rule severities still apply.
-- `false` / `"off"` — disable linting unless a discovered `raven.toml` explicitly sets `enabled = true` (raven.toml always wins at the leaf — the project-policy contract). A discovered `.lintr` alone never re-enables linting.
+Settings are shown without their `raven.linting.` prefix. Every severity defaults to `"information"`.
 
-### Behavior matrix
-
-Resolution by client setting × project state:
-
-<!-- markdownlint-disable MD013 -->
-
-| Client (`raven.linting.enabled`) | Project state | Result |
-|---|---|---|
-| `"auto"` (default) | no `.lintr`, no `raven.toml` | off |
-| `"auto"` | blank/empty `.lintr` (no `linters:` / `exclusions:` directive) | off — an empty `.lintr` carries no opt-in |
-| `"auto"` | configured `.lintr` discovered (workspace or non-home ancestor) | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
-| `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = false` (default) | off |
-| `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = true` | on — **unless** REditorSupport's `lintr` path is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
-| `"auto"` | `raven.toml` with `enabled = true` (or `"on"`) | on |
-| `"auto"` | `raven.toml` with `enabled = false` (or `"off"`) | off — `.lintr` not consulted (raven.toml wins discovery) |
-| `"auto"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | off (no `.lintr` discovered; raven.toml was discovered instead) |
-| `false` / `"off"` | no project config | off |
-| `false` / `"off"` | `.lintr` discovered | off |
-| `false` / `"off"` | `raven.toml` with `enabled = true` | on (raven.toml project layer wins at the leaf — project-policy contract) |
-| `false` / `"off"` | `raven.toml` with `enabled = false` / `"auto"` / no `[linting]` | off |
-| `true` / `"on"` | no project config | on with built-in defaults |
-| `true` / `"on"` | `.lintr` discovered | on with `.lintr`'s rule severities |
-| `true` / `"on"` | `raven.toml` with `enabled = true` | on |
-| `true` / `"on"` | `raven.toml` with `enabled = false` | off (raven.toml project layer wins at the leaf — project-policy contract) |
-| `true` / `"on"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | on (project layer is silent on `enabled`; client value passes through) |
-
-<!-- markdownlint-enable MD013 -->
-
-`raven.toml` and `.lintr` are mutually exclusive at discovery: `raven.toml` wins on the same walk and `.lintr` is not consulted.
-
-### `"auto"` and REditorSupport / Positron
-
-Under `"auto"`, a discovered `.lintr` is treated as an opt-in *only* when nothing else is already running `lintr` against it. A `.lintr` is REditorSupport's / `lintr`'s own config file, so when that tool is already linting your project, letting the same file also flip Raven's native lints on would double-report style issues. Raven therefore ignores a discovered `.lintr` (under `"auto"`) when **either**:
-
-- the **REditorSupport (R) extension** is installed and enabled **and** both `r.lsp.enabled` and `r.lsp.diagnostics` are on (its default) — i.e. its language server is actively emitting `lintr` diagnostics; **or**
-- you are running inside **Positron**, which ships its own R-session linting.
-
-In those environments, `"auto"` + a discovered `.lintr` resolves to **off**. This affects the `.lintr` path only:
-
-- A `raven.toml` opt-in (`[linting] enabled = true`) is **unaffected** — it always turns Raven's linting on regardless of REditorSupport / Positron.
-- An explicit client `true` / `"on"` (or `false` / `"off"`) is **unaffected** — only `"auto"` consults this heuristic.
-- Turning REditorSupport's `r.lsp.diagnostics` (or `r.lsp.enabled`) **off**, or uninstalling/disabling the extension, re-enables the `.lintr` auto opt-in live — no window reload needed.
-
-To run Raven's native lints *alongside* REditorSupport's `lintr` on purpose, set `raven.linting.enabled` to `true` (or migrate the project to `raven.toml`). See [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both).
-
-> This is a VS Code **environment** signal: it is computed by the extension (from REditorSupport's state and `r.lsp.*`) and is not something a project `raven.toml` can override. Editors other than VS Code, and the bare CLI, don't send it, so they keep the historical "discovered workspace/non-home *configured* `.lintr` ⇒ on" behavior (a blank/empty `.lintr` still never opts in). The literal home-directory `~/.lintr` remains default-off unless the editor setting is enabled or the CLI receives it explicitly with `--config ~/.lintr`.
-
-## Settings reference by rule
-
-Each rule lists the Raven settings that control it and the `lintr` linter it mirrors. Severities accept `"error"`, `"warning"`, `"information"` (or its `"info"` alias), `"hint"`, or `"off"`. See [Diagnostics § Style Lints](diagnostics.md#style-lints) to see these rules in context with Raven's other diagnostic categories.
+`mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints. They are always-on semantic warnings, configured with `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Semantic warnings](diagnostics.md#semantic-warnings).
 
 ### Line length
 
-- **Raven:** `raven.linting.lineLength` (default `80`), `raven.linting.lineLengthSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::line_length_linter(length = 80L)`.
-- Line length is measured in characters, matching `lintr`'s `nchar()` (an emoji counts as 1).
+Default `80`. Mirrors `lintr::line_length_linter(length = 80L)`. Length is measured in characters, matching `lintr`'s `nchar()`, so an emoji counts as 1.
 
 ### Trailing whitespace
 
-- **Raven:** `raven.linting.trailingWhitespaceSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::trailing_whitespace_linter()` with its defaults (`allow_empty_lines = FALSE`, `allow_in_strings = TRUE`).
-- Whitespace-only lines are flagged; trailing whitespace inside a multi-line string literal is part of the string's value and is not.
+Mirrors `lintr::trailing_whitespace_linter()` with its defaults (`allow_empty_lines = FALSE`, `allow_in_strings = TRUE`). Whitespace-only lines are flagged. Trailing whitespace inside a multi-line string literal is part of the string's value and is not.
 
 ### Tab characters
 
-- **Raven:** `raven.linting.noTabSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::whitespace_linter()`.
-- Flags tabs used for *indentation* only (matching `lintr`): tabs in comments, strings, or between tokens are left alone, and a line starting inside a multi-line string is part of the string's value. One diagnostic per offending line, anchored at the tab run.
+Mirrors `lintr::whitespace_linter()`. Flags tabs used for *indentation* only, matching `lintr`: tabs in comments, strings, or between tokens are left alone, and a line starting inside a multi-line string is part of the string's value. One diagnostic per offending line, at the tab run.
 
 ### Trailing blank lines
 
-- **Raven:** `raven.linting.trailingBlankLinesSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::trailing_blank_lines_linter()`.
-- Also fires when the file is missing a final newline; a file can get both diagnostics (trailing blanks *and* the missing newline), as in `lintr`.
-- Does not apply to `.Rmd` / `.qmd` documents: the rule describes the file's shape, and a chunk document's shape is Markdown, not R. (Deliberate deviation: `lintr` checks chunk contents in knitr documents.)
+Mirrors `lintr::trailing_blank_lines_linter()`. Also fires when the file is missing a final newline; a file can get both diagnostics, as in `lintr`. It does not apply to `.Rmd` or `.qmd` documents, because the rule describes the file's shape and a chunk document's shape is Markdown, not R. This is a deliberate difference: `lintr` checks chunk contents in knitr documents.
 
 ### Assignment operator
 
-- **Raven:** `raven.linting.assignmentOperator` (default `"<-"`, alternative `"="`), `raven.linting.assignmentOperatorSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::assignment_linter()`.
-- Under the default `<-` style, the flagged operators are `=`, `->`, `->>`, and the magrittr assignment pipe `%<>%` (`<<-` is allowed, matching `lintr` 3.3's default `operator = c("<-", "<<-")`; `:=` is never linted). Under the `=` style, `<-`, `<<-`, `->`, `->>`, and `%<>%` are flagged. Named-argument `=` (`f(name = value)`) is never flagged, and `lintr`'s implicit-assignment exclusion is mirrored: an assignment nested inside a call argument, an `if`/`while` condition, or a `for` sequence is skipped (`lapply(xs, function(x) { y = x; y })` and `if ({a = TRUE}) 1` are clean) unless the enclosing expression is explicitly parenthesized (`fun((blah = fun(1)))` is still flagged).
+`raven.linting.assignmentOperator` defaults to `"<-"` (alternative `"="`). Mirrors `lintr::assignment_linter()`.
+
+Under the default `<-` style, the flagged operators are `=`, `->`, `->>`, and the magrittr assignment pipe `%<>%`. `<<-` is allowed, matching `lintr` 3.3's default `operator = c("<-", "<<-")`, and `:=` is never linted. Under the `=` style, `<-`, `<<-`, `->`, `->>`, and `%<>%` are flagged.
+
+Named-argument `=` (`f(name = value)`) is never flagged. `lintr`'s implicit-assignment exclusion is mirrored: an assignment nested inside a call argument, an `if`/`while` condition, or a `for` sequence is skipped (`lapply(xs, function(x) { y = x; y })` and `if ({a = TRUE}) 1` are clean) unless the enclosing expression is explicitly parenthesized (`fun((blah = fun(1)))` is still flagged).
 
 ### Object names
 
-- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `["snake_case", "symbols"]`, matching `lintr`'s default `styles`), `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument` (each defaults to `[]`), `raven.linting.objectNameSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::object_name_linter(styles = ..., regexes = ...)`.
-- Each style key accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, `"symbols"` (names made up entirely of non-alphanumeric characters, e.g. an operator overload like `` `%+%` ``), `"any"` (disable that kind and ignore its regexes), or an array of those styles. Multiple styles are ORed. A name also passes if it matches any regex for that kind.
-- Regexes are Rust regexes applied as partial matches against the full identifier, including any leading `.`. Use anchors such as `^...$` when you need the whole name to match. Rust's regex engine does not support PCRE lookaround such as `(?=...)`; unsupported patterns are warned about and skipped (for the settings/`raven.toml` path the warning goes to the server log; a `.lintr` file surfaces a visible warning notification). Empty regex strings are rejected because they would match every identifier. If regex-only mode supplies regexes but none are valid, Raven retains the default named style instead of silently disabling the check (in `.lintr` the invalid call still clears editor-level regexes, since it stated the project's regex policy).
-- An explicit empty style array with regexes is regex-only mode. If both the style array and regex array are empty, that kind's object-name check is disabled. A style value with no recognized style names is warned about and treated as empty: with valid regexes configured the kind becomes regex-only, with no regex setting at all it is disabled, and if the regex setting is present but contains no valid patterns the default style is restored rather than silently disabling the check.
-- Backtick-quoted and string names are normalized the way `lintr` does it (`strip_names`): surrounding backticks/quotes and `%` are removed, as is a trailing `<-` (so a replacement function `` `height<-` `` checks as `height`), and the remaining name goes through the normal matching — `` `myBadName` <- 1 `` is flagged exactly like `myBadName <- 1`, while `` `%+%` `` strips to `+` and passes via the default `symbols` style. A name that strips to nothing (e.g. `` `%%` ``) is skipped.
-- Carve-outs: named styles always allow an optional leading `.`, but the rest of the name must still match the configured style (so `.helper` is fine under `snake_case`, but `.onLoad` is exempt as one of `lintr`'s special functions — `.onLoad`, `.onAttach`, `.onUnload`, `.onDetach`, `.Last.lib`, `.First`, `.Last`, and `...` are never flagged); S3-method names of the form `<generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`, `` `+.foo` ``) are exempt when the generic is a base R S3 generic (the list is ported from `lintr`, including operator generics) or a generic declared in the same file via `UseMethod` (`lintr`'s `declared_s3_generics`). Hidden methods (`.print.MyClass`) are also exempt — a deliberate leniency over `lintr`, which flags them. Non-ASCII identifiers are skipped when no regexes are configured for that kind; when regexes are configured (regex-only or combined with styles), non-ASCII names are checked against the regexes — the named ASCII styles never match them (a deliberate leniency over `lintr`, whose ASCII style regexes flag non-ASCII names). A compound target checks its base object through `$`/`@` chains, subscripts, and replacement calls (`a$b$c <- 1`, `a[[1]] <- 1`, and `names(a) <- 1` all check `a`, matching `lintr`); symbols used as subscript indices (`x[i] <- 1`) are not targets. Literal binding names in `assign("name", …)` / `setGeneric("name", …)` are checked.
+Mirrors `lintr::object_name_linter(styles = ..., regexes = ...)`. Each of `objectNameStyleFunction`, `objectNameStyleVariable`, and `objectNameStyleArgument` defaults to `["snake_case", "symbols"]`, `lintr`'s default `styles`. Each `objectNameRegexes*` defaults to `[]`.
+
+Each style setting accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, `"symbols"` (names made only of non-alphanumeric characters, such as an operator overload like `` `%+%` ``), `"any"`, or an array of those. A name passes when it matches any listed style or any regex for that kind. `"any"` turns off the check for that kind and ignores its regexes, leaving the other two kinds active. An explicit empty style array with regexes checks regexes only; empty styles and empty regexes together turn that kind off. Setting `raven.linting.objectNameSeverity` to `"off"` turns off the rule entirely.
+
+<details markdown="1">
+<summary>Regex rules, name normalization, and exemptions</summary>
+
+**Regexes.** Regexes are Rust regexes applied as partial matches against the full identifier, including any leading `.`. Use anchors such as `^...$` when the whole name must match. Rust's regex engine does not support PCRE lookaround such as `(?=...)`. Unsupported patterns are warned about and skipped: from settings or `raven.toml` the warning goes to the server log, and from a `.lintr` file it appears as a notification. Empty regex strings are rejected because they would match every identifier.
+
+If regex-only mode supplies regexes but none are valid, Raven keeps the default named style instead of silently turning the check off. In `.lintr`, the invalid call still clears editor-level regexes, since it stated the project's regex policy.
+
+A style value with no recognized style names is warned about and treated as empty. With valid regexes configured the kind becomes regex-only; with no regex setting at all it is turned off; and if the regex setting is present but has no valid patterns, the default style is restored rather than silently turning the check off.
+
+**Name normalization.** Backtick-quoted and string names are normalized the way `lintr` does it (`strip_names`): surrounding backticks or quotes and `%` are removed, as is a trailing `<-`, so a replacement function `` `height<-` `` is checked as `height`. The result goes through normal matching: `` `myBadName` <- 1 `` is flagged exactly like `myBadName <- 1`, and `` `%+%` `` strips to `+` and passes through the default `symbols` style. A name that strips to nothing (such as `` `%%` ``) is skipped.
+
+**Leading dots and special functions.** Named styles always allow an optional leading `.`, but the rest of the name must still match, so `.helper` is fine under `snake_case` and `.myHelper` is not. `lintr`'s special functions are never flagged: `.onLoad`, `.onAttach`, `.onUnload`, `.onDetach`, `.Last.lib`, `.First`, `.Last`, and `...`.
+
+**S3 methods.** Names of the form `<generic>.<class>` (`print.MyClass`, `as.Date.character`, `` `+.foo` ``) are exempt when the generic is a base R S3 generic (the list is ported from `lintr`, including operator generics) or a generic declared in the same file with `UseMethod` (`lintr`'s `declared_s3_generics`). Hidden methods (`.print.MyClass`) are also exempt, a deliberate leniency over `lintr`, which flags them. For methods of other generics, use `# nolint` or `# raven: ignore`.
+
+**Non-ASCII names** are skipped when no regexes are configured for that kind. When regexes are configured, non-ASCII names are checked against the regexes, and the named ASCII styles never match them. This is more lenient than `lintr`, whose ASCII style regexes flag non-ASCII names.
+
+**Assignment targets.** A compound target checks its base object through `$`/`@` chains, subscripts, and replacement calls: `a$b$c <- 1`, `a[[1]] <- 1`, and `names(a) <- 1` all check `a`, matching `lintr`. Symbols used as subscript indices (`x[i] <- 1`) are not targets. Literal binding names in `assign("name", …)` and `setGeneric("name", …)` are checked.
+
+</details>
 
 ### Infix spaces
 
-- **Raven:** `raven.linting.infixSpacesSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::infix_spaces_linter()`.
-- Lints exactly `lintr`'s default operator set (the style guide's low-precedence operators): arithmetic (`+`, `-`, `*`, `/`), comparison, logical, assignment (`<-`, `<<-`, `:=`, `->`, `->>`, `=` — including named-argument `=` in calls and formal defaults, `lintr`'s `EQ_SUB`/`EQ_FORMALS`), pipe (`|>`, `%>%`, and any `%...%` user-defined operator), and binary `~`. Each requires at least one space on both sides. High-precedence operators (`^`/`**`, `:`, `::`, `:::`, `$`, `@`, `?`) and unary `-`/`+`/`!`/`~` are never linted, matching `lintr` — `x^2`, `x ^ 2`, and `1:10` are all fine. Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped; `/` inside `box::use(...)` module paths is exempt. A named argument with a missing value still needs a space after `=` (`alist(a = )` is fine, `alist(a =)` is flagged) — pinned by `lintr`'s own test suite.
+Mirrors `lintr::infix_spaces_linter()`. It lints exactly `lintr`'s default operator set, the style guide's low-precedence operators, and each needs at least one space on both sides:
+
+- arithmetic (`+`, `-`, `*`, `/`), comparison, and logical operators
+- assignment (`<-`, `<<-`, `:=`, `->`, `->>`, `=`), including named-argument `=` in calls and formal defaults (`lintr`'s `EQ_SUB`/`EQ_FORMALS`)
+- pipes (`|>`, `%>%`, and any `%...%` user-defined operator) and binary `~`
+
+High-precedence operators (`^`/`**`, `:`, `::`, `:::`, `$`, `@`, `?`) and unary `-`, `+`, `!`, `~` are never linted, matching `lintr`, so `x^2`, `x ^ 2`, and `1:10` are all fine. Alignment whitespace (`x   <- 1`) is allowed, line continuations with the operator at the end of a line are skipped, and `/` inside `box::use(...)` module paths is exempt. A named argument with a missing value still needs a space after `=`: `alist(a = )` is fine and `alist(a =)` is flagged, as pinned by `lintr`'s own tests.
 
 ### Commented code
 
-- **Raven:** `raven.linting.commentedCodeSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::commented_code_linter()`.
-- Flags a standalone comment block (consecutive `#` lines) whose body parses as R and contains a call, assignment, operator, or function definition. Prose that merely contains code shapes is rejected: juxtaposed expressions (`# use foo(x) instead`) are not valid R, and binary `-` / unary `-`, `+`, `?` alone are not evidence (`# 1-a`, `# ?data.frame` are prose, matching `lintr`). A dangling trailing `,` / `%>%` / `|>` or leading `,` is stripped before the parse test, so commented-out argument-list lines and pipe fragments are still caught. Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped. End-of-line comments next to real code are checked too, like `lintr`: `x <- 1 # other_call()` is flagged, `x <- 1 # explain` is not.
+Mirrors `lintr::commented_code_linter()`. Flags a standalone comment block (consecutive `#` lines) whose body parses as R and contains a call, assignment, operator, or function definition.
+
+Prose that merely contains code shapes is not flagged. Juxtaposed expressions (`# use foo(x) instead`) are not valid R, and binary `-` or unary `-`, `+`, `?` alone are not evidence (`# 1-a` and `# ?data.frame` are prose, matching `lintr`). A dangling trailing `,`, `%>%`, or `|>`, or a leading `,`, is stripped before the parse test, so commented-out argument-list lines and pipe fragments are still caught.
+
+Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint`, `# raven:`, and `# @lsp-…` comments are skipped. End-of-line comments next to real code are checked too, like `lintr`: `x <- 1 # other_call()` is flagged and `x <- 1 # explain` is not.
 
 ### Quotes
 
-- **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::quotes_linter()` / `lintr::single_quotes_linter()` (the two map to the two settings above).
-- Raw strings are checked like ordinary literals (`R'(plain)'` is flagged under the double-quote default). Any literal whose source contains the preferred quote character is exempt — switching delimiters would force escaping (`'he said "hi"'`, `r'(")'`).
+`raven.linting.stringDelimiter` defaults to `"\""` (alternative `"'"`). Mirrors `lintr::quotes_linter()` and `lintr::single_quotes_linter()`, which map to the two settings. Raw strings are checked like ordinary literals (`R'(plain)'` is flagged under the double-quote default). A literal whose source contains the preferred quote character is exempt, because switching delimiters would force escaping (`'he said "hi"'`, `r'(")'`).
 
 ### Commas
 
-- **Raven:** `raven.linting.commasSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::commas_linter()`.
-- Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. Matches `lintr`'s exemptions: a comma that starts its own line (leading-comma continuation style), a comma preceded by another comma (`a[1, , 2]` missing-argument style), and a comma preceded by a value-less named argument's `=` (`switch(op, x = , y = bar)`) are all clean. Matches `lintr`'s default `allow_trailing = FALSE` — a comma directly against a closing bracket (`a[1,]`) is still flagged.
+Mirrors `lintr::commas_linter()`. Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. It matches `lintr`'s exemptions: a comma that starts its own line (leading-comma style), a comma right after another comma (`a[1, , 2]`), and a comma after a value-less named argument's `=` (`switch(op, x = , y = bar)`) are clean. It matches `lintr`'s default `allow_trailing = FALSE`, so a comma directly against a closing bracket (`a[1,]`) is flagged.
 
 ### T / F symbol
 
-- **Raven:** `raven.linting.tAndFSymbolSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::T_and_F_symbol_linter()`.
-- Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets (`T <- 0`) get `lintr`'s dedicated "don't use `T` as a variable name" message. Named arguments (`foo(T = TRUE)`), formal parameters (`function(T) ...`), `$` / `@` field names (`obj$T`), formula terms (`y ~ T + F` — though a named-argument value inside a formula call is still a real read), subscripted uses (`T[1]`), and callees (`T(1)`) are exempt — those positions don't read the boolean.
+Mirrors `lintr::T_and_F_symbol_linter()`. Flags bare `T` and `F` used as `TRUE` and `FALSE`. Assignment targets (`T <- 0`) get `lintr`'s dedicated "don't use `T` as a variable name" message. These positions don't read the boolean and are exempt: named arguments (`foo(T = TRUE)`), formal parameters (`function(T) ...`), `$` and `@` field names (`obj$T`), formula terms (`y ~ T + F`, though a named-argument value inside a formula call is still a real read), subscripted uses (`T[1]`), and callees (`T(1)`).
 
 ### Semicolon
 
-- **Raven:** `raven.linting.semicolonSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::semicolon_linter()`.
-- Flags `;` separators in source. A `;` inside any token — string literals, comments, backtick-quoted identifiers (`` `a;b` ``), user infix operators (`%;%`) — is left alone. One diagnostic per `;`.
+Mirrors `lintr::semicolon_linter()`. Flags `;` separators in source, one diagnostic per `;`. A `;` inside any token, such as a string literal, comment, backtick-quoted identifier (`` `a;b` ``), or user infix operator (`%;%`), is left alone.
 
 ### Equals NA
 
-- **Raven:** `raven.linting.equalsNaSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::equals_na_linter()`.
-- Flags `x == NA`, `x != NA`, and the typed variants (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`) on either side, plus `x %in% NA` (right-hand side only — `NA %in% x` is a legitimate membership test). The comparison always returns `NA`; use `is.na(x)` instead.
+Mirrors `lintr::equals_na_linter()`. Flags `x == NA`, `x != NA`, and the typed variants (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`) on either side, plus `x %in% NA` (right-hand side only; `NA %in% x` is a legitimate membership test). The comparison always returns `NA`; use `is.na(x)` instead.
 
 ### Object length
 
-- **Raven:** `raven.linting.objectLength` (default `30`), `raven.linting.objectLengthSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::object_length_linter(length = 30)`.
-- Flags assignment targets and formal parameters whose names exceed the configured length. Names are normalized like `object_name` (backticks/quotes stripped), and a leading `<generic>.` prefix is removed for S3 methods so only an overlong class part is flagged, matching `lintr`. All characters of the remaining name count, including a leading `.`.
+`raven.linting.objectLength` defaults to `30`. Mirrors `lintr::object_length_linter(length = 30)`. Flags assignment targets and formal parameters whose names are longer than the limit. Names are normalized like object names (backticks and quotes stripped), and a leading `<generic>.` prefix is removed for S3 methods so only an overlong class part is flagged, matching `lintr`. Every character of the remaining name counts, including a leading `.`.
 
 ### Vector logic
 
-- **Raven:** `raven.linting.vectorLogicSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::vector_logic_linter()`.
-- Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar short-circuit form) and in `expect_true()` / `expect_false()`. The scan recurses through nested logical operators but stops at call boundaries — `if (any(x & y))` is left alone because the `&` is evaluated on a vector inside `any()`. Bitwise arithmetic is exempt: an operand that is a string literal or an `as.raw()` / `as.octmode()` / `as.hexmode()` call (`if (info & as.raw(12))`) marks the operator as bitwise, matching `lintr`. The mirror check flags scalar `&&` / `||` inside `subset()` / `filter()` arguments (bare, `pkg::`-qualified except `stats::filter`, or as a pipe target) — subsetting is a vector context; nested function definitions inside those arguments are skipped.
+Mirrors `lintr::vector_logic_linter()`. Flags `&` or `|` in `if` and `while` conditions, where `&&` and `||` are the scalar short-circuit forms, and in `expect_true()` and `expect_false()`. The scan follows nested logical operators but stops at calls, so `if (any(x & y))` is left alone because the `&` runs on a vector inside `any()`.
+
+Bitwise arithmetic is exempt: an operand that is a string literal or an `as.raw()`, `as.octmode()`, or `as.hexmode()` call (`if (info & as.raw(12))`) marks the operator as bitwise, matching `lintr`. The mirror check flags scalar `&&` and `||` inside `subset()` and `filter()` arguments (bare, `pkg::`-qualified except `stats::filter`, or as a pipe target), since subsetting is a vector context. Nested function definitions inside those arguments are skipped.
 
 ### Function left parentheses
 
-- **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::function_left_parentheses_linter()`.
-- Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`, and between a call's function name and its argument `(` — `blah (1)`, `base::print (x)`, `` `+` (1, 1) ``, `x$foo (1)`. A `(` on a later line than the function name gets a dedicated message; `@` slot calls get only that cross-line check (same-line whitespace after `@` access is not flagged). String "callees" (`"print"(x)`, `base::"mean"(x)`) and computed callees (IIFEs, `f(x)(y)`) are left alone, matching `lintr`.
+Mirrors `lintr::function_left_parentheses_linter()`. Flags whitespace between `function` (or the `\` lambda shorthand) and its parameter `(`, and between a called function's name and its `(`: `blah (1)`, `base::print (x)`, `` `+` (1, 1) ``, `x$foo (1)`. A `(` on a later line than the function name gets its own message. `@` slot calls get only that cross-line check; same-line whitespace after `@` access is not flagged. String callees (`"print"(x)`, `base::"mean"(x)`) and computed callees (`f(x)(y)`, immediately invoked functions) are left alone, matching `lintr`.
 
 ### Spaces inside
 
-- **Raven:** `raven.linting.spacesInsideSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
-- Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`), including the parens of `if`/`while`/`for` and function/lambda parameter lists. Whitespace-only groupings (`f( )`, `x[ ]`) are flagged on both sides, as in `lintr`; multi-line wrapping is never flagged. Exemptions, matching `lintr`: a comma before the closer (`x[i, ]`, `f(a, )`), a value-less named argument's `=` before `)` only (`alist(a = )` is clean, `x[j = ]` is flagged), and an opener followed by a same-line comment.
+Mirrors `lintr::spaces_inside_linter()`. Flags whitespace just inside `(`, `[`, `[[` and their closing counterparts (`f( x )`, `df[ 1 ]`, `mat[[ i ]]`), including the parentheses of `if`, `while`, `for`, and function or lambda parameter lists. Whitespace-only groupings (`f( )`, `x[ ]`) are flagged on both sides, as in `lintr`; wrapping across lines is never flagged. Exemptions, matching `lintr`: a comma before the closer (`x[i, ]`, `f(a, )`), a value-less named argument's `=` before `)` only (`alist(a = )` is clean, `x[j = ]` is flagged), and an opener followed by a same-line comment.
 
 ### Indentation
 
-- **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.infixContinuationStyle` (default `"either"`), `raven.linting.indentationSeverity` (default `"information"`). With `indentationUnit = "auto"`, each file uses its resolved `editor.tabSize`; a matching `[[linting.overrides]]` entry still wins for that file.
-- **`lintr` equivalent:** `lintr::indentation_linter()` with its tidy-default hanging style.
-- Uses `lintr`'s accumulated indent-change model, verified against a 112-case differential corpus. Bracket openers, end-of-line operators, and unbraced bodies contribute indentation; standalone closers align with their owning context. A run of consecutive lines wrong by the same amount produces one diagnostic.
-- Raven retains two argument-layout leniencies that are independent of the infix setting: it accepts same-line arguments aligned after the opener, and accepts a block form where tidy `lintr` demands a hanging/double indent. There is deliberately no lint-side `argumentStyle` setting.
-- A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is exempt. Directive/suppression markers are never alignment anchors.
+Mirrors `lintr::indentation_linter()` with its tidy-default hanging style. Settings:
 
-`raven.linting.infixContinuationStyle` is Raven-specific; `.lintr` has no equivalent and cannot override it. It checks non-assignment end-of-line operators (`|`, `&`, `+`, comparisons, pipes, `%…%`, `$`/`@` chains):
+- `raven.linting.indentationUnit` defaults to `"auto"`, which uses each file's `editor.tabSize`; a fixed integer is clamped to 1 to 8. A matching `[[linting.overrides]]` entry still wins for that file.
+- `raven.linting.infixContinuationStyle` defaults to `"either"`.
+- `raven.linting.indentationSeverity` defaults to `"information"`.
 
-- `"indented"` — strict `lintr` parity. The continuation receives exactly one additional block level; the former deeper-only chain-start tolerance is not part of this mode.
-- `"aligned"` — strict floored alignment. Subsequent operands use `max(first_operand_column, statement_indent + unit)`; the indented alternative is flagged.
-- `"either"` (default) — the union of the two complete passes. It accepts both editor traditions and both outputs from Raven's [producer setting](indentation.md#configuration), while still flagging anything matching neither form.
+It uses `lintr`'s model of accumulated indent changes, checked against a 112-case comparison corpus. Bracket openers, end-of-line operators, and unbraced bodies add indentation; standalone closers align with their owning context. A run of consecutive lines wrong by the same amount produces one diagnostic.
+
+Raven keeps two argument-layout leniencies, independent of the infix setting: it accepts same-line arguments aligned after the opener, and it accepts a block form where tidy `lintr` demands a hanging or double indent. There is deliberately no lint-side `argumentStyle` setting. A standalone comment-only line aligned with the trailing-comment column of a neighboring line that expects the same indent is exempt. Suppression comments are never alignment anchors.
+
+<details markdown="1">
+<summary>Infix continuation styles, with examples</summary>
+
+`raven.linting.infixContinuationStyle` is Raven-specific; `.lintr` has no equivalent and cannot override it. It checks non-assignment end-of-line operators (`|`, `&`, `+`, comparisons, pipes, `%…%`, and `$`/`@` chains):
+
+- `"indented"`: strict `lintr` parity. The continuation gets exactly one more block level; the older deeper-only chain-start tolerance is not part of this mode.
+- `"aligned"`: strict floored alignment. Later operands use `max(first_operand_column, statement_indent + unit)`; the indented alternative is flagged.
+- `"either"` (default): the union of the two. It accepts both editor traditions and both outputs of Raven's [indentation setting](indentation.md#configuration), and still flags anything matching neither.
 
 With a 4-space unit, strict `indented` requires the second operand at column 8:
 
@@ -235,7 +236,7 @@ changed <- !(
 )
 ```
 
-Strict `aligned` requires column 4, matching the first operand; `either` accepts both snippets:
+Strict `aligned` requires column 4, matching the first operand; `either` accepts both:
 
 ```r
 changed <- !(
@@ -251,11 +252,13 @@ x |>
   y
 ```
 
-For `x <- y |>` the first operand begins at column 5, so aligned mode requires the continuation under `y`; indented mode requires column 2. The producer follows its own `raven.indentation.infixContinuationStyle` faithfully. Matching producer/lint values never conflict, and lint `either` is compatible with either producer value. Mismatched strict values are a user configuration state. If a flagged non-assignment continuation is at exactly the column the enabled auto-indenter produces, Raven appends advice naming both settings: match the lint style to the producer, use lint `either`, or change the producer to the lint style. No advice is added for assignments, genuinely mis-indented or syntactically malformed code, disabled/off producer policy, lint `either`, CLI runs without an `[indentation]` policy, or documents where `editor.insertSpaces` or `editor.formatOnType` disables the auto-indenter (synced per document from VS Code).
+For `x <- y |>` the first operand begins at column 5, so aligned mode requires the continuation under `y`; indented mode requires column 2.
 
-RStudio's vertical-alignment preference and ESS's `ess-align-continuations-in-calls` produce aligned operator continuations inside parentheses/calls, while both use a fixed continuation offset at statement level. Real `lintr` 3.3.0.1, styler, and Air require the indented tradition. Projects that run those tools in CI should set both infix settings to `indented`; strict-alignment projects should set both to `aligned`.
+The auto-indenter follows its own `raven.indentation.infixContinuationStyle`. Matching indenter and lint values never conflict, and lint `either` is compatible with either indenter value. If a flagged non-assignment continuation sits at exactly the column the enabled auto-indenter produces, Raven adds advice naming both settings: match the lint style to the indenter, use lint `either`, or change the indenter to the lint style. No advice is added for assignments, genuinely mis-indented or malformed code, an indenter set to off, lint `either`, CLI runs without an `[indentation]` policy, or documents where `editor.insertSpaces` or `editor.formatOnType` turns off the auto-indenter (synced per document from VS Code).
 
-Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) and named-argument `=` continuations are exempt from the infix axis in every mode. An RHS begun on the next line receives one level, never alignment under the LHS. Assignment flattening also keeps a continued RHS chain at that paid-for level:
+RStudio's vertical-alignment preference and ESS's `ess-align-continuations-in-calls` produce aligned operator continuations inside parentheses and calls, and both use a fixed continuation offset at statement level. Real `lintr` 3.3.0.1, styler, and Air require the indented tradition. Projects that run those tools in CI should set both infix settings to `indented`; strict-alignment projects should set both to `aligned`.
+
+Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) and named-argument `=` continuations are exempt from the infix setting in every mode. A right-hand side begun on the next line gets one level, never alignment under the left-hand side. A continued right-hand-side chain stays at that level:
 
 ```r
 x <-
@@ -263,80 +266,110 @@ x <-
   b
 ```
 
+</details>
+
+<a id="master-switch-ravenlintingenabled"></a>
+
+## When linting is on
+
+`raven.linting.enabled` takes `"auto"` (the default), `true` (or `"on"`), or `false` (or `"off"`). Booleans are accepted for compatibility with older settings.
+
+- `"auto"`: lint when a project config opts in. That means a discovered `.lintr` **that contains linting configuration** (a `linters:` or `exclusions:` field; a bare `linters_with_defaults()` counts, a blank file does not), or a `raven.toml` with `[linting] enabled = true`. Otherwise off. The `.lintr` half is ignored when REditorSupport or Positron already runs `lintr`; see [below](#auto-and-reditorsupport--positron).
+- `true` / `"on"`: always lint. Discovered rule severities still apply.
+- `false` / `"off"`: don't lint, unless a discovered `raven.toml` explicitly sets `enabled = true`. A `raven.toml` value always wins over the editor value. A discovered `.lintr` alone never turns linting back on.
+
+Raven looks for `.lintr` by walking upward from the active project root: the first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory. The literal home-directory `~/.lintr` is ignored by default. In VS Code and other editors, set `raven.linting.readHomeLintr = true` to include it; the CLI uses it only when passed explicitly with `--config ~/.lintr`.
+
+`raven lint` ignores this switch: choosing that command opts into linting, so it runs with built-in defaults even when no config is discovered or `--no-config` is passed, and it ignores a base `enabled = false`. Per-file `enabled = false` overrides and `.lintr` exclusions still skip matching files, rule severities set to `off` stay off, and all other rule values still apply. This doesn't change editor diagnostics or `raven check`.
+
+### `"auto"` and REditorSupport / Positron
+
+Under `"auto"`, a discovered `.lintr` counts as an opt-in only when nothing else already runs `lintr` on it. A `.lintr` is `lintr`'s own config file, so when REditorSupport is already linting your project, also turning on Raven's lints from the same file would report style issues twice. Raven ignores a discovered `.lintr` under `"auto"` when **either**:
+
+- the **REditorSupport (R) extension** is installed and enabled **and** both `r.lsp.enabled` and `r.lsp.diagnostics` are on (the default), so its language server is reporting `lintr` diagnostics; **or**
+- you are running in **Positron**, which has its own R-session linting.
+
+This affects only the `.lintr` path:
+
+- A `raven.toml` opt-in (`[linting] enabled = true`) is **unaffected** and always turns Raven's linting on.
+- An explicit editor `true`/`"on"` or `false`/`"off"` is **unaffected**; only `"auto"` checks for REditorSupport or Positron.
+- Turning off REditorSupport's `r.lsp.diagnostics` or `r.lsp.enabled`, or disabling or uninstalling the extension, restores the `.lintr` opt-in live, with no window reload.
+
+To run Raven's lints *alongside* REditorSupport's `lintr` on purpose, set `raven.linting.enabled` to `true`, or move the project to `raven.toml`. See [Coexistence](coexistence.md#language-servers-raven-alone-vs-both).
+
+The VS Code extension computes this signal from REditorSupport's state and `r.lsp.*`, and a project `raven.toml` can't override it. Other editors and the CLI don't send it, so for them a discovered workspace or non-home *configured* `.lintr` always turns linting on. A blank `.lintr` still never does, and the literal `~/.lintr` stays off unless the editor setting is on or the CLI receives it with `--config ~/.lintr`.
+
 ## Migrating from `.lintr`
 
-The recommended path is to configure Raven via `raven.toml` at the project root (see [Configuration § Project config](configuration.md#project-config-raventoml)). The table below maps the `lintr` linters covered by Raven to their Raven equivalents. For each `lintr` linter you currently enable, set the corresponding `raven.linting.*` keys; for ones not listed, see [Gaps vs `lintr`](#gaps-vs-lintr).
+The recommended path is to configure Raven with `raven.toml` at the project root (see [Project config](configuration.md#project-config-raventoml)). For each `lintr` linter you use, set the matching Raven keys from the [Rules](#settings-reference-by-rule) table. For linters Raven doesn't have, see [Gaps vs `lintr`](#gaps-vs-lintr).
 
-> **Runtime support:** When no `raven.toml` is discovered on the upward walk from the active project root (first editor workspace folder, `raven check --workspace`, or the `raven lint` working directory), Raven reads a documented subset of the discovered `.lintr`. In the LSP/editor, that discovered `.lintr` is watched and live-reloaded; the CLI reads it once per command invocation. Workspace and non-home ancestor `.lintr` files are read by default. The literal home-directory `~/.lintr` is read only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled, or when the CLI receives it explicitly with `--config ~/.lintr`. The mapping table below is the supported surface. Forms outside the supported subset log a single batch warning and are otherwise ignored.
->
-> Multi-line `linters:` / `exclusions:` values are folded by **bracket balance**, so a closing `)` works whether it sits at column 0 or is indented, and `#` comments inside the value are handled. (Real `lintr` reads `.lintr` as strict DCF and *rejects* a column-0 continuation — `read.dcf`: "Regular lines must have a tag" — so Raven logs a one-line note suggesting you indent the closing line if you also run `lintr`; a column-0 `#` comment line is valid DCF and is not counted in that note.) A field whose brackets don't balance — a missing `)`, a stray extra one, or a mismatched type — is reported specifically (`field 'linters' has unbalanced brackets …`) and parsed best-effort rather than silently swallowing the next field. A recognized field still opts the project into linting even when it has a typo, so a single missing `)` never silently turns all linting off. Most linter arguments accept either lintr's named form or a leading positional value (`line_length_linter(120)`, `assignment_linter("=")`, `object_name_linter("snake_case")`). Numeric arguments accept R integer literals — decimal or hexadecimal, each with an optional `L` suffix (`line_length_linter(120L)`, `line_length_linter(0x50)`) — and whitespace before `(` is tolerated (`linters_with_defaults (...)`). The pre-3.0 `with_defaults(...)` spelling is accepted as an alias for `linters_with_defaults(...)`.
+When no `raven.toml` is discovered, Raven reads a documented subset of the discovered `.lintr`: the linter calls in the Rules table and the `exclusions:` field. In the editor that `.lintr` is watched and reloaded live; the CLI reads it once per command. Forms outside the subset produce a single combined warning and are otherwise ignored.
 
-| `.lintr` linter | Raven settings |
-|---|---|
-| `line_length_linter(length = N)` | `raven.linting.lineLength = N`, `raven.linting.lineLengthSeverity` |
-| `trailing_whitespace_linter()` | `raven.linting.trailingWhitespaceSeverity` |
-| `whitespace_linter()` (no-tab portion) | `raven.linting.noTabSeverity` |
-| `trailing_blank_lines_linter()` | `raven.linting.trailingBlankLinesSeverity` |
-| `assignment_linter()` | `raven.linting.assignmentOperator`, `raven.linting.assignmentOperatorSeverity` |
-| `object_name_linter(styles = c("snake_case"), regexes = c("^x$"))` | `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument`, `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument`, `raven.linting.objectNameSeverity` |
-| `infix_spaces_linter()` | `raven.linting.infixSpacesSeverity` |
-| `commented_code_linter()` | `raven.linting.commentedCodeSeverity` |
-| `quotes_linter()` / `single_quotes_linter()` | `raven.linting.stringDelimiter`, `raven.linting.quotesSeverity` |
-| `commas_linter()` | `raven.linting.commasSeverity` |
-| `T_and_F_symbol_linter()` | `raven.linting.tAndFSymbolSeverity` |
-| `semicolon_linter()` | `raven.linting.semicolonSeverity` |
-| `equals_na_linter()` | `raven.linting.equalsNaSeverity` |
-| `object_length_linter(length = N)` | `raven.linting.objectLength = N`, `raven.linting.objectLengthSeverity` |
-| `vector_logic_linter()` | `raven.linting.vectorLogicSeverity` |
-| `function_left_parentheses_linter()` | `raven.linting.functionLeftParenthesesSeverity` |
-| `spaces_inside_linter()` | `raven.linting.spacesInsideSeverity` |
-| `indentation_linter(indent = N)` | `raven.linting.indentationUnit = N`, `raven.linting.indentationSeverity` |
+To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To match a rule that `lintr` reports as a `warning`, raise its severity from `"information"` to `"warning"`.
 
-Numeric-argument linters accept both the named and the first-positional form: `line_length_linter(80)` and `line_length_linter(length = 80)` are equivalent, as are `object_length_linter(40)` / `object_length_linter(length = 40)` and `indentation_linter(4)` / `indentation_linter(indent = 4)`.
+**Raven: Create linting settings** in the Command Palette writes every project-scoped `raven.linting.*` key into `.vscode/settings.json`, each with a `//` comment naming its `lintr` equivalent (see [Scaffold commands](configuration.md#scaffold-commands)). Raven doesn't generate a `.lintr`; if you also want to run `lintr` itself, see [Filling the gaps](#filling-the-gaps-with-lintr-itself).
 
-`object_name_linter` accepts styles positionally or via `styles =`, as a scalar or a `c(...)` vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case", "camelCase"))`) and applies them to functions, variables, and arguments. Known style names (`snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `symbols`, `any`) map to the three style arrays and are ORed. Regexes may be named (`regexes =`) or passed as the second positional argument, as a scalar or vector; names on vector entries (such as `c(public = "^[a-z]")`) are diagnostic labels and do not change the patterns. Matching `lintr`, explicitly supplying `regexes` **replaces** the default styles (regex-only mode) unless `styles` is also explicitly supplied — specify both to combine them. R string escapes are processed, so `"^\\.on[A-Z]"` means the regex `^\.on[A-Z]`; R raw strings (`r"(^\.on[A-Z])"`) are also supported and taken verbatim. R's numeric escapes (octal `"\056"`, hex `"\x2e"`, unicode `"\u{2e}"`) also decode with R semantics before the pattern reaches the regex engine; escape sequences R itself rejects (such as a bare `"\d"` — write `"\\d"`) are warned about as unrecognized. `lintr` styles Raven has no equivalent for (`CamelCase`, `UPPERCASE`, `SNAKE_CASE`) are warned about and skipped, as are case/punctuation typos of Raven's style names (with a did-you-mean hint); any other unknown non-empty `styles` element is treated leniently as a regex, a Raven extension over `lintr`. Empty style elements are still unrecognized because an empty regex would match every identifier. An explicit empty vector (`styles = c()`, `styles = character()`, or `character(0)`) maps to empty style arrays — regex-only mode when regexes are also given, otherwise "check disabled". Whenever a call states a pattern policy it states the regex policy too: a styles-only call (including the empty-vector forms) or any call with a `regexes` argument — even one whose patterns were all rejected — emits regex arrays (the accepted patterns, or `[]`), so editor-level `objectNameRegexes*` values are cleared rather than silently ORed in.
+<details markdown="1">
+<summary>How Raven parses <code>.lintr</code> fields</summary>
 
-To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
+Multi-line `linters:` and `exclusions:` values are joined by **bracket balance**, so a closing `)` works whether it sits at column 0 or is indented, and `#` comments inside the value are handled. Real `lintr` reads `.lintr` as strict DCF and *rejects* a column-0 continuation (`read.dcf`: "Regular lines must have a tag"), so Raven logs a one-line note suggesting you indent the closing line if you also run `lintr`. A column-0 `#` comment line is valid DCF and doesn't count toward that note.
+
+A field whose brackets don't balance (a missing `)`, a stray extra one, or a mismatched type) is reported specifically (`field 'linters' has unbalanced brackets …`) and parsed best-effort, rather than swallowing the next field. A recognized field still opts the project into linting even with a typo, so a single missing `)` never silently turns all linting off.
+
+Most linter arguments accept either `lintr`'s named form or a leading positional value (`line_length_linter(120)`, `assignment_linter("=")`, `object_name_linter("snake_case")`). Numeric arguments accept R integer literals, decimal or hexadecimal, each with an optional `L` suffix (`line_length_linter(120L)`, `line_length_linter(0x50)`), and whitespace before `(` is allowed (`linters_with_defaults (...)`). The pre-3.0 `with_defaults(...)` spelling is accepted as an alias for `linters_with_defaults(...)`.
+
+`line_length_linter(80)` and `line_length_linter(length = 80)` are equivalent, as are `object_length_linter(40)` / `object_length_linter(length = 40)` and `indentation_linter(4)` / `indentation_linter(indent = 4)`.
+
+</details>
+
+<details markdown="1">
+<summary>How Raven reads <code>object_name_linter()</code> arguments</summary>
+
+`object_name_linter` accepts styles positionally or as `styles =`, as a scalar or a `c(...)` vector (`object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case", "camelCase"))`), and applies them to functions, variables, and arguments. Known style names (`snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `symbols`, `any`) map to the three style arrays and are ORed.
+
+Regexes may be named (`regexes =`) or passed as the second positional argument, as a scalar or vector. Names on vector entries (such as `c(public = "^[a-z]")`) are labels and don't change the patterns. Matching `lintr`, supplying `regexes` **replaces** the default styles (regex-only mode) unless `styles` is also supplied; give both to combine them.
+
+R string escapes are processed, so `"^\\.on[A-Z]"` means the regex `^\.on[A-Z]`. R raw strings (`r"(^\.on[A-Z])"`) are taken verbatim. R's numeric escapes (octal `"\056"`, hex `"\x2e"`, Unicode `"\u{2e}"`) decode with R semantics before the pattern reaches the regex engine. Escapes R itself rejects (such as a bare `"\d"`; write `"\\d"`) are warned about as unrecognized.
+
+`lintr` styles Raven has no equivalent for (`CamelCase`, `UPPERCASE`, `SNAKE_CASE`) are warned about and skipped, as are case or punctuation typos of Raven's style names, with a did-you-mean hint. Any other unknown non-empty `styles` element is treated as a regex, a Raven extension over `lintr`. Empty style elements are still unrecognized, because an empty regex would match every identifier.
+
+An explicit empty vector (`styles = c()`, `styles = character()`, or `character(0)`) maps to empty style arrays: regex-only mode when regexes are also given, otherwise the check is off. Whenever a call states a style policy it also states the regex policy. A styles-only call (including the empty forms) or any call with a `regexes` argument, even one whose patterns were all rejected, sets the regex arrays (to the accepted patterns, or `[]`), so editor-level `objectNameRegexes*` values are cleared rather than silently ORed in.
+
+</details>
 
 ### Exclusions
 
-A `.lintr` `exclusions:` field that lists files and directories — e.g. `exclusions: list("R/legacy.R", "tests", "NAMESPACE")` — maps to a single `[[linting.overrides]]` entry with `enabled = false`, anchored at the project root. Each entry becomes one or more globs matched against the project-relative path:
+A `.lintr` `exclusions:` field that lists files and directories, such as `exclusions: list("R/legacy.R", "tests", "NAMESPACE")`, becomes a single `[[linting.overrides]]` entry with `enabled = false`, anchored at the project root. Each entry becomes one or more globs matched against the project-relative path:
 
-| `exclusions:` entry | Globs emitted | Matches |
+| `exclusions:` entry | Globs | Matches |
 |---|---|---|
-| `"R/"` (trailing slash → directory) | `R/**` | every file under `R/` |
+| `"R/"` (trailing slash means directory) | `R/**` | every file under `R/` |
 | any other entry (`"R/foo.R"`, `"NAMESPACE"`, `"pkg.Rcheck"`, …) | `<entry>` **and** `<entry>/**` | the path itself if it's a file, or its contents if it's a directory |
 
-Raven resolves exclusions without touching the filesystem, so it can't tell whether a bare entry like `NAMESPACE` (a file) or `pkg.Rcheck` (a directory) is which — and a dot is no help (`foo.R` is a file, `pkg.Rcheck` is a directory). It therefore emits both an exact glob and a recursive glob for every entry that doesn't already end in `/`. The extra glob only ever disables linting on a path that doesn't exist, so it is harmless. Add a trailing slash to force directory-only matching.
+Raven resolves exclusions without touching the filesystem, so it can't tell whether a bare entry like `NAMESPACE` (a file) or `pkg.Rcheck` (a directory) is which, and a dot is no help. It emits both an exact and a recursive glob for every entry that doesn't end in `/`. The extra glob only affects a path that doesn't exist, so it is harmless. Add a trailing slash to match directories only.
 
-Not supported: the named line-range form `list("file.R" = 1:10)` (exclude specific lines of a file) has no Raven equivalent and is ignored with the batch warning. A `=` *inside* a quoted name (e.g. `"a=b.R"`) is treated as an ordinary filename, not this form.
-
-> **Note:** `mixed_logical` and `condition_assignment` are not in this table because they have no `lintr` equivalent and are not style lints — they are always-on semantic warnings configured under `raven.diagnostics.mixedLogicalSeverity` and `raven.diagnostics.conditionAssignmentSeverity`. See [Diagnostics § Semantic Warnings](diagnostics.md#semantic-warnings).
-
-If you'd like a starter project-scoped `raven.linting.*` block scaffolded into `.vscode/settings.json` — every linting key Raven maps to `raven.toml`, each prefaced with a `//` comment naming its `lintr` equivalent — run the **Raven: Create linting settings** command from the Command Palette ([Configuration § Scaffold Commands](configuration.md#scaffold-commands)). It merges into an existing `settings.json` without disturbing unrelated keys or comments, preserves client-only linting settings such as `raven.linting.readHomeLintr`, and prompts before overwriting any pre-existing project-scoped `raven.linting.*` values.
-
-If you also want to run `lintr` itself alongside Raven, see [below](#filling-the-gaps-with-lintr-itself) — that path needs a `.lintr` file, which Raven doesn't generate.
+Not supported: the named line-range form `list("file.R" = 1:10)`, which excludes specific lines, has no Raven equivalent and is ignored with the combined warning. A `=` *inside* a quoted name (such as `"a=b.R"`) is an ordinary filename, not this form.
 
 ## Gaps vs `lintr`
 
-`lintr` ships more than 140 linters in total, of which about two dozen are enabled by default. Raven implements 18 of those defaults — the ones in the table above. Common `lintr` linters that have **no Raven equivalent** include (non-exhaustive):
+`lintr` ships more than 140 linters, about two dozen of them on by default. Raven implements 18 of those defaults, the ones in the [Rules](#settings-reference-by-rule) table. Common `lintr` linters with **no Raven equivalent** include:
 
-- `object_usage_linter` — flags undefined globals inside function bodies via `codetools::checkUsage()`. Raven's [Undefined variable diagnostic](diagnostics.md#undefined-variables) covers similar ground at the file and `source()`-chain level (via static cross-file scope), but with different semantics: Raven's check is scope- and position-aware across `source()` chains, while `object_usage_linter` runs inside individual function bodies via R's own analyzer.
-- `cyclocomp_linter` — cyclomatic complexity.
+- `object_usage_linter`, which flags undefined globals inside function bodies with `codetools::checkUsage()`. Raven's [undefined-variable diagnostic](diagnostics.md#undefined-variables) covers similar ground with different semantics: it is scope- and position-aware across `source()` chains, while `object_usage_linter` runs R's own analyzer inside individual function bodies.
+- `cyclocomp_linter` (cyclomatic complexity).
 - `seq_linter`.
 - `brace_linter`, `paren_body_linter`, `spaces_left_parentheses_linter`.
 - `pipe_continuation_linter`, `pipe_call_linter`.
 - `absolute_path_linter`.
 
-If you rely on any of these, the recommended setup is to run `lintr` via the REditorSupport extension alongside Raven — Raven's language server is designed to coexist with REditorSupport. See [below](#filling-the-gaps-with-lintr-itself).
+If you rely on any of these, run `lintr` through the REditorSupport extension alongside Raven, as described next.
 
 ### Filling the gaps with `lintr` itself
 
-The [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) runs `lintr` from inside its own R-based language server, so it covers every linter `lintr` ships. To run both at once:
+The [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) runs `lintr` from its own R-based language server, so it covers every linter `lintr` ships. To run both:
 
 1. Keep Raven installed and enabled.
-2. Install the REditorSupport extension. Leave `r.lsp.enabled` at its default (`true`).
-3. Place a `.lintr` file at your project root. Raven does not scaffold this file — its format is `lintr`'s own DSL. (Raven reads a [documented subset](#migrating-from-lintr) of `.lintr` at runtime when no `raven.toml` is present, but the file primarily exists so `lintr` itself can consume it from REditorSupport's R session.) A minimal starter that mirrors the `lintr` default rule set with a 120-character line limit is one line:
+2. Install the REditorSupport extension and leave `r.lsp.enabled` at its default (`true`).
+3. Put a `.lintr` file at your project root. Raven doesn't create this file, because its format is `lintr`'s own. (Raven reads a [subset](#migrating-from-lintr) of it when no `raven.toml` is present, but the file exists mainly for `lintr`.) A one-line starter that mirrors `lintr`'s default rules with a 120-character line limit:
 
    ```r
    linters: linters_with_defaults(line_length_linter(120))
@@ -344,45 +377,75 @@ The [REditorSupport extension](https://marketplace.visualstudio.com/items?itemNa
 
 4. Install `lintr` in the R session REditorSupport uses (`install.packages("lintr")`).
 
-REditorSupport's LSP will surface `lintr` diagnostics; Raven will continue to surface its own. Both sets will appear in the Problems pane and you can tell them apart by the `source` field (`raven (lint)` for Raven, `lintr` for REditorSupport). See [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both) for the broader cross-extension model.
+REditorSupport reports `lintr` diagnostics and Raven reports its own. Both appear in the Problems pane, and the source field tells them apart: `raven (lint)` for Raven, `lintr` for REditorSupport. Note that a `.lintr` with REditorSupport active doesn't turn on Raven's lints under `"auto"` (see [above](#auto-and-reditorsupport--positron)). See [Coexistence](coexistence.md#language-servers-raven-alone-vs-both) for the broader picture.
 
-## Suppression matrix
+<a id="suppression-matrix"></a>
 
-Raven recognizes its own `# raven:` primary namespace, the legacy `@lsp-ignore` aliases, and `lintr`'s `# nolint`. All apply to lint diagnostics. The `# raven:` forms — `ignore`, `ignore-next`, `ignore-start`/`ignore-end`, and `ignore-file` (and their `@lsp-ignore` / `@lsp-ignore-next` aliases) — additionally apply to several of Raven's other diagnostics: undefined-variable, invalid-assignment-target, missing-package, and out-of-scope-symbol errors. They do **not** suppress structural syntax parse errors (unbalanced brackets, orphan `else`, etc.), which can only be turned off with `raven.diagnostics.enabled`, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth exceeded, redundant directive), which are governed only by their own [severity settings](diagnostics.md#cross-file-diagnostics). `# nolint` and `# nolint start/end` apply to lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks only; they do not suppress any parse-error diagnostics.
+## Suppressing lints
 
-A `[code]` selector is **enforced per rule/code** in both tracks: `# raven: ignore[line-length]` silences only the line-length lint, and `# nolint: line_length` is likewise honored per rule (both kebab-case and lintr `snake_case` spellings are accepted). Every form also has an asserting **`expect`** flavor (`# raven: expect…`, `@lsp-expect…`) that reports an [`unused-suppression`](diagnostics.md#suppressing-diagnostics) hint when it matches nothing. See [Directives → Ignore Directives](directives.md#ignore-directives) for the complete syntax and the `expect` semantics.
+Every suppression comment works on lints: `# raven: ignore`, `# raven: expect`, their `@lsp-` aliases, and `lintr`'s `# nolint`, `# nolint: rule_a, rule_b`, and `# nolint start` / `# nolint end`. The syntax and exactly which comment silences which diagnostics are in [Suppressing diagnostics](diagnostics.md#suppressing-diagnostics).
 
-| Marker | Scope | Origin | Applies to |
-|---|---|---|---|
-| `# raven: ignore` (trailing) | The line it appears on | Raven (primary) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus `undefined-variable`, `assign-to-string-literal`, and `package-not-installed` diagnostics (and out-of-scope usages, which carry the `undefined-variable` code). **Not** parse errors, nor the dependency-graph diagnostics |
-| `# raven: ignore-next` | The *following* source line | Raven (primary) | Same as `# raven: ignore` |
-| `# raven: ignore-start` … `# raven: ignore-end` | Inclusive range between the two markers | Raven (primary) | Same as `# raven: ignore` (lint **and** analyzer diagnostics) |
-| `# raven: ignore-file` | Every line in the file | Raven (primary) | Same as `# raven: ignore` (lint **and** analyzer diagnostics) |
-| `# raven: ignore[code]` | As above, narrowed to the listed code(s) | Raven (primary) | The selector is enforced per code/rule in every form; comma-separate to list several |
-| `# raven: expect…` | Same scope as the matching `ignore…` form | Raven (primary) | Suppresses identically, **and** reports `unused-suppression` (a hint) if it matched nothing |
-| `# nolint` (trailing) | The line it appears on | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
-| `# nolint: rule_a, rule_b` | The line it appears on | `lintr` convention | Lint diagnostics and the semantic checks, narrowed to the named rules (honored per rule) |
-| `# nolint start` … `# nolint end` | Inclusive range between the two markers | `lintr` convention | Lint diagnostics and the `mixed_logical` / `condition_assignment` semantic checks |
-| `# @lsp-ignore` | The line it appears on | Raven (alias of `# raven: ignore`) | Lint diagnostics, the `mixed_logical` / `condition_assignment` checks, plus `undefined-variable`, `assign-to-string-literal`, and `package-not-installed` diagnostics (and out-of-scope usages, which carry the `undefined-variable` code). **Not** parse errors, nor the dependency-graph diagnostics (missing file, circular dependency, max chain depth, redundant directive) |
-| `# @lsp-ignore-next` | The *following* source line | Raven (alias of `# raven: ignore-next`) | Same as `# @lsp-ignore` |
+For lints specifically, a rule list is honored per rule: `# nolint: line_length` silences only the line-length lint, just as `# raven: ignore[line-length]` does, and both spellings work in both forms. `# nolint` silences only lints and the `mixed_logical` and `condition_assignment` checks. Markers work inside R chunks of `.Rmd` and `.qmd` files as in plain `.R` files; to silence a whole chunk, see [Suppressing diagnostics in a chunk](chunks.md#suppressing-diagnostics-in-a-chunk).
 
-Notes:
+## Settings
 
-- A `# nolint` marker inside a string literal (`x <- "# nolint"`) is not parsed as a marker.
-- A typo like `# nolinter` or `# @lsp-ignored` is intentionally not recognized — better to surface the lint than to silently swallow it.
-- An unterminated `# nolint start` (or `# raven: ignore-start`) suppresses through end of file (matching `lintr`).
-- A same-line marker nested inside a commented-code line — `# x <- 1 # nolint` — also works. The fallback only fires when the prefix between the outer `#` and the inner `# nolint` parses as real R code, so the same marker buried in prose (`# this is just talking about nolint # nolint`) is left alone.
+Every rule setting is listed in the [Rules](#settings-reference-by-rule) table. Defaults and types for every `raven.linting.*` key are in the [Settings reference](settings-reference.md).
 
-## Performance and scope notes
+| Setting | Default | What it does |
+|---|---|---|
+| `raven.linting.enabled` | `"auto"` | Turns linting on or off; see [When linting is on](#master-switch-ravenlintingenabled) |
+| `raven.linting.readHomeLintr` | `false` | Editor-only. Also read the literal `~/.lintr` |
+| `raven.linting.*Severity` | `"information"` | Severity of one rule, or `"off"` |
 
-- **R Markdown / Quarto.** Lint rules apply inside R chunk bodies of `.Rmd` / `.qmd` documents — both in the editor and via `raven lint`. Prose, YAML front matter, and non-R chunks are never linted. `# nolint`, `# nolint start` / `# nolint end`, and `# raven: ignore` markers work inside chunk bodies exactly as in plain `.R` files. You can also suppress a whole chunk with the `raven.ignore` chunk option or an in-chunk `# raven: ignore-chunk` directive — see [Code chunks → Suppressing diagnostics in a chunk](chunks.md#suppressing-diagnostics-in-a-chunk). The one exception is [trailing blank lines](#trailing-blank-lines), which describes the file's shape — Markdown, not R — and is disabled for chunk documents.
-- **Static, no R subprocess.** Raven's lint rules run against the tree-sitter parse it already maintains for completions and diagnostics. There's no `lintr` install, no `R` process, no startup cost. The `commented_code` rule re-parses each candidate comment body via a thread-local parser pool; every other rule walks only the already-parsed tree.
-- **`commented_code` differs subtly from `lintr`.** Both decide whether a comment body "looks like code" by parsing it, but Raven parses with tree-sitter and `lintr` parses with R itself. Edge cases that exercise R-specific syntax (very old `_` assignment, non-ASCII operator overloads, etc.) may be classified differently.
-- **Position-aware, but not call-flow-aware.** Raven walks the AST top-down for most rules and does not run R-level data-flow analysis. Rules that would need that (`object_usage_linter`, `cyclocomp_linter`, `seq_linter`) are intentionally out of scope for the native linter — run `lintr` for those (see [above](#filling-the-gaps-with-lintr-itself)).
+In `raven.toml`, set the same keys under `[linting]`, and use `[[linting.overrides]]` to change them for some files (see [Per-file overrides](configuration.md#per-file-overrides)).
+
+<a id="performance-and-scope-notes"></a>
+
+## Limitations
+
+- **`commented_code` can disagree with `lintr` on edge cases.** Both decide whether a comment looks like code by parsing it, but Raven uses its own R parser and `lintr` uses R. Comments that exercise unusual R syntax (very old `_` assignment, non-ASCII operator overloads, and the like) may be classified differently.
+- **Not data-flow-aware.** Most rules walk the syntax tree and don't run data-flow analysis. Rules that need it (`object_usage_linter`, `cyclocomp_linter`, `seq_linter`) are out of scope; run `lintr` for those (see [Filling the gaps](#filling-the-gaps-with-lintr-itself)).
+- **Trailing blank lines** is not checked in R Markdown or Quarto documents (see [Trailing blank lines](#trailing-blank-lines)).
+
+## Details
+
+<a id="r-markdown-and-quarto"></a>
+
+**R Markdown and Quarto.** Lint rules apply inside R chunk bodies of `.Rmd` and `.qmd` documents, in the editor and with `raven lint`. Prose, YAML front matter, and non-R chunks are never linted.
+
+**No R process.** Lint rules run on the parse tree Raven already keeps for completion and diagnostics: no `lintr` install, no R process, no startup cost. `commented_code` re-parses each candidate comment; every other rule only walks the existing tree.
+
+### Behavior matrix
+
+How `raven.linting.enabled` combines with the project's config files. `raven.toml` and `.lintr` are never both used: when the upward walk finds a `raven.toml`, `.lintr` is not consulted.
+
+<!-- markdownlint-disable MD013 -->
+
+| Editor (`raven.linting.enabled`) | Project state | Result |
+|---|---|---|
+| `"auto"` (default) | no `.lintr`, no `raven.toml` | off |
+| `"auto"` | blank `.lintr` (no `linters:` / `exclusions:` field) | off; a blank `.lintr` doesn't opt in |
+| `"auto"` | configured `.lintr` discovered (workspace or non-home ancestor) | on, **unless** REditorSupport's `lintr` is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
+| `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = false` (default) | off |
+| `"auto"` | literal `~/.lintr` exists, `raven.linting.readHomeLintr = true` | on, **unless** REditorSupport's `lintr` is live or you're in Positron, then off ([details](#auto-and-reditorsupport--positron)) |
+| `"auto"` | `raven.toml` with `enabled = true` (or `"on"`) | on |
+| `"auto"` | `raven.toml` with `enabled = false` (or `"off"`) | off; `.lintr` not consulted |
+| `"auto"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | off (`raven.toml` was found, so no `.lintr` is read) |
+| `false` / `"off"` | no project config | off |
+| `false` / `"off"` | `.lintr` discovered | off |
+| `false` / `"off"` | `raven.toml` with `enabled = true` | on (`raven.toml` wins) |
+| `false` / `"off"` | `raven.toml` with `enabled = false` / `"auto"` / no `[linting]` | off |
+| `true` / `"on"` | no project config | on with built-in defaults |
+| `true` / `"on"` | `.lintr` discovered | on with `.lintr`'s rule severities |
+| `true` / `"on"` | `raven.toml` with `enabled = true` | on |
+| `true` / `"on"` | `raven.toml` with `enabled = false` | off (`raven.toml` wins) |
+| `true` / `"on"` | `raven.toml` with `enabled = "auto"` or no `[linting]` | on (`raven.toml` doesn't set `enabled`, so the editor value applies) |
+
+<!-- markdownlint-enable MD013 -->
 
 ## See also
 
-- [Diagnostics § Style Lints](diagnostics.md#style-lints) — these rules alongside Raven's other diagnostic categories.
-- [Configuration § Linting Settings](configuration.md#linting-settings) — every `raven.linting.*` key.
-- [Coexistence § Language servers](coexistence.md#language-servers-raven-alone-vs-both) — running Raven and REditorSupport together.
-- [Comparison](comparison.md) — how Raven differs from REditorSupport, Positron/Ark, and RStudio.
+- [Diagnostics](diagnostics.md#style-lints): these rules alongside Raven's other diagnostics.
+- [Configuration](configuration.md): how `raven.toml`, `.lintr`, and editor settings combine.
+- [Coexistence](coexistence.md#language-servers-raven-alone-vs-both): running Raven and REditorSupport together.
+- [Comparison](comparison.md): how Raven differs from REditorSupport, Positron, and RStudio.

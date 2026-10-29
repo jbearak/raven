@@ -1,24 +1,42 @@
 # Configuration
 
-Most settings are exposed as VS Code settings — search for "raven" in Settings (Cmd/Ctrl-,). A handful of advanced server-side knobs are only available via LSP initialization options; those are noted in the tables below.
+[Docs](README.md) › Reference
 
-> Looking for a specific key? See [Settings reference](settings-reference.md) for an alphabetical index of every `raven.*` setting with default, type, `raven.toml` path, and a one-line description. The sections below add context: when each setting matters, how the project file interacts with VS Code settings, and which knobs hang together.
+Raven reads settings from your editor, from a project `raven.toml`, and from a `.lintr` file, and combines them key by key so one committed file can govern both your editor and CI.
+
+| Source | Who reads it | Use it for |
+|---|---|---|
+| Editor settings (`raven.*` in VS Code) | The VS Code extension; other editors through the language server's client settings | Personal preferences and editor-only features such as the console and viewers |
+| `raven.toml` at the project root | Every editor and the `raven check` / `raven lint` CLIs | Project policy shared by everyone and by CI |
+| `.lintr` | Linting settings only (a subset), when no `raven.toml` is found | Projects that already configure `lintr` |
+
+For every individual key, with its default, type, and `raven.toml` path, see the [Settings reference](settings-reference.md). This page explains how the sources fit together.
 
 ## Project config: `raven.toml`
 
-The recommended way to configure Raven is a `raven.toml` file at the project root. Every editor and the `raven check` / `raven lint` CLIs read this file, so a single committed config governs both interactive editing and CI.
+A `raven.toml` file at the project root is the recommended way to configure Raven. Every editor and the `raven check` / `raven lint` CLIs read it, so a single committed file governs both interactive editing and CI.
+
+In VS Code, **Raven: Create raven.toml** writes a starter file (see [Scaffold commands](#scaffold-commands)).
 
 ### Discovery
 
-Raven walks upward from the active project root looking for `raven.toml`: the first workspace folder in editors, `--workspace` for `raven check`, and the invocation working directory for `raven lint`. If none is found, `.lintr` is read for linting settings only (subset; see [Linting](linting.md#migrating-from-lintr)), except the literal home-directory `~/.lintr` is ignored by default so user-level `lintr` preferences do not silently affect every project. In VS Code, set `raven.linting.readHomeLintr = true` to include it; in the CLI, pass it explicitly with `--config ~/.lintr`. In multi-root workspaces, open a project folder directly when you need a different folder-specific project config.
+Raven walks upward from the active project root looking for `raven.toml`. The active project root is the first workspace folder in editors, `--workspace` for `raven check`, and the working directory for `raven lint`.
+
+If no `raven.toml` is found, Raven reads `.lintr` for linting settings only (a subset; see [Linting](linting.md#migrating-from-lintr)). The literal home-directory `~/.lintr` is ignored by default, so user-level `lintr` preferences don't silently affect every project. In VS Code, set `raven.linting.readHomeLintr = true` to include it; in the CLI, pass it explicitly with `--config ~/.lintr`.
+
+In multi-root workspaces, open a project folder directly when you need a different folder-specific project config.
 
 ### Precedence
 
-Per-key. For each setting, project values win over the LSP client's `initializationOptions` / `did_change_configuration` payload. Keys not pinned by the project file continue to come from client settings (or Raven's defaults if neither layer specifies them).
+Precedence is per key. For each setting, a value in `raven.toml` wins over the value from the editor (the language server's `initializationOptions` and `workspace/didChangeConfiguration` payload). Keys the project file doesn't set keep coming from the editor, or from Raven's defaults if neither sets them.
+
+For example, if `raven.toml` sets `[linting] lineLength = 100` and your VS Code settings set `raven.linting.lineLength = 120` and `raven.linting.lineLengthSeverity = "warning"`, Raven uses a line length of 100 and severity `warning`.
+
+`raven.toml` and `.lintr` don't merge: when a `raven.toml` is found, `.lintr` is not read.
 
 ### Schema
 
-Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `workspace`, `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`, `box`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
+Most `raven.toml` keys mirror the editor settings: drop the `raven.` prefix and use the remaining path as the TOML section and key. The top-level sections are `workspace`, `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`, and `box`. A few keys live at a different path, and the [Settings reference](settings-reference.md) lists the exact `raven.toml` path for every setting (`—` means the setting isn't read from `raven.toml`).
 
 ```toml
 [workspace]
@@ -53,191 +71,189 @@ stan = "on"
 undefinedVariable = "warning"
 ```
 
+Editor-only settings, such as `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, and `raven.pandoc.*`, apply only inside VS Code and aren't read from `raven.toml`. They are documented on their feature pages ([R console](r-console.md), [Data viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard VS Code language-client trace setting (`off`, `messages`, `verbose`), useful when filing bug reports.
+
+Canonical paths shared with Sight, and their permanent compatibility aliases, are specified in [Shared project configuration schema](shared-config-schema.md).
+
 ### Per-file overrides
 
-`[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
-
-Canonical paths shared with Sight and their permanent compatibility aliases
-are specified in [Shared project configuration schema](shared-config-schema.md).
+`[[linting.overrides]]` is an array of entries, each a list of globs plus the linting settings to change for matching files. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
 
 ### Project exclusions
 
-Automatic discovery respects `.gitignore` by default: workspace indexing, CLI
-directory scans, package R definitions, testthat helpers, `.Rprofile`, and data
-harvesting omit ignored files. Explicit CLI file arguments, open editor buffers,
-and directly resolved dependencies (including files sourced by a prelude) still
-work. Closing an ignored buffer removes its buffer-only contribution unless an
-eligible file still needs it as a dependency.
+Raven skips three kinds of files when it discovers files on its own:
 
-To disable this policy, set `raven.workspace.respectGitignore = false` in the
-editor or use the project override:
+- Files ignored by `.gitignore`, by default.
+- Files matching `[workspace].exclude` in `raven.toml`.
+- Hidden directories and the vendored or build directories `renv`, `packrat`, `node_modules`, and `target`, always.
+
+Discovery here means workspace indexing, CLI directory scans, package R definitions, testthat helpers, `.Rprofile`, and data harvesting. Files you name or open still work: explicit CLI file arguments, open editor buffers, and directly resolved dependencies, including files sourced by a prelude. Closing an ignored buffer removes its buffer-only contribution unless an eligible file still needs it as a dependency.
+
+To stop respecting `.gitignore`, set `raven.workspace.respectGitignore = false` in the editor, or in the project:
 
 ```toml
 [workspace]
 respectGitignore = false
 ```
 
-Raven reads root and nested `.gitignore` files, plus ancestors up to the nearest
-`.git` file or directory. Without a repository marker, inheritance starts at the
-workspace root. Matching is case-sensitive; the deepest workspace folder owns
-overlapping paths. Git-style negation cannot re-include a child of an ignored
-directory, override `workspace.exclude`, or restore directories pruned by the
-workspace walker. Symlinked `.gitignore` files are not followed. Git need not be
-installed: tracked-file status, global Git excludes, and `.git/info/exclude` are
-not consulted. Ignore-file edits and setting changes refresh discovery live.
+`[workspace].exclude` is a `raven.toml`-only list of project-root-relative globs; there is no editor setting for it. The default is `[]`. Use directory globs such as `generated/**`, `archive/**`, or `**/cache/**` to ignore whole trees. A leading `!` re-includes matching paths, so `["generated/**", "!generated/keep.R"]` excludes the generated tree except `generated/keep.R`.
 
-`[workspace].exclude` is a `raven.toml`-only list of project-root-relative globs. It is not exposed as a VS Code/LSP client setting. The default is `[]`.
+<details markdown="1">
+<summary>How <code>.gitignore</code> files are read</summary>
 
-These exclusions are broader than lint overrides: Raven ignores matching files for background workspace indexing, dependency discovery, file-watcher/on-demand indexing, package-mode disk seeding, and default `raven check` discovery. Existing index entries that become excluded after a live `raven.toml` reload are removed from Raven's indexes and dependency graph.
+Raven reads root and nested `.gitignore` files, plus ancestors up to the nearest `.git` file or directory. Without a repository marker, inheritance starts at the workspace root. Matching is case-sensitive; the deepest workspace folder owns overlapping paths. Git-style negation cannot re-include a child of an ignored directory, override `workspace.exclude`, or restore directories pruned by the workspace walker. Symlinked `.gitignore` files are not followed.
 
-Some directories are skipped before `[workspace].exclude` is consulted and cannot be re-included: every hidden directory (name starting with `.`, such as `.git`, `.Rproj.user`, `.vscode`, and AI coding agents' embedded worktrees under `.claude/` or `.codex/`) plus the vendored/build directories `renv`, `packrat`, `node_modules`, and `target`. This is what keeps a repository holding dozens of hidden worktree copies of itself from indexing every copy. The rule governs discovery, both the startup scan and files the editor's file watcher reports later: an open buffer, an explicit `raven check` file argument, and on-demand indexing of a `source()` target that lives under a hidden directory all still work.
+Git need not be installed: tracked-file status, global Git excludes, and `.git/info/exclude` are not consulted. Edits to ignore files and setting changes refresh discovery live.
 
-Use directory globs such as `generated/**`, `archive/**`, or `**/cache/**` to ignore whole trees. Raven compiles the glob list once when config is recomputed and matches paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. Patterns are evaluated in order; a leading `!` re-includes matching paths, so `["generated/**", "!generated/keep.R"]` excludes the generated tree except `generated/keep.R`.
+</details>
 
-Raven prunes directories during the serial workspace walk only when a positive directory glob proves every descendant is excluded, such as `generated/**`. If any negated pattern is present, directory pruning is disabled for the list so re-included files are never dropped before they can match. Files are still filtered by the full ordered matcher.
+<details markdown="1">
+<summary>Exactly what <code>[workspace].exclude</code> affects and how patterns match</summary>
 
-Explicit CLI file arguments bypass `[workspace].exclude`: `raven check generated/one.R` reports that file even if it matches an exclusion. Directory arguments are discovery walks, so exclusions still apply inside them. Likewise, a matching file opened in the editor is diagnosed live; exclusion controls bulk discovery and symbol indexing, not an explicit open buffer's diagnostics.
+These exclusions are broader than lint overrides. Raven ignores matching files for background workspace indexing, dependency discovery, file-watcher and on-demand indexing, package-mode disk seeding, and default `raven check` discovery. Index entries that become excluded after a live `raven.toml` reload are removed from Raven's indexes and dependency graph.
+
+Raven compiles the glob list once whenever configuration is recomputed and matches paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. Patterns are evaluated in order.
+
+Raven skips whole directories during the workspace walk only when a positive directory glob such as `generated/**` proves every descendant is excluded. If any negated pattern is present, this directory skipping is turned off for the list, so re-included files are never dropped before they can match. Files are still filtered by the full ordered pattern list.
+
+Explicit CLI file arguments bypass `[workspace].exclude`: `raven check generated/one.R` reports that file even if it matches an exclusion. Directory arguments are discovery walks, so exclusions still apply inside them. Likewise, a matching file opened in the editor is diagnosed live; exclusion controls bulk discovery and symbol indexing, not an open buffer's diagnostics.
+
+</details>
+
+<details markdown="1">
+<summary>Directories that are always skipped</summary>
+
+Some directories are skipped before `[workspace].exclude` is consulted and cannot be re-included: every hidden directory (a name starting with `.`, such as `.git`, `.Rproj.user`, `.vscode`, and AI coding agents' embedded worktrees under `.claude/` or `.codex/`), plus `renv`, `packrat`, `node_modules`, and `target`. This keeps a repository holding many hidden worktree copies of itself from indexing every copy.
+
+The rule governs discovery: both the startup scan and files the editor's file watcher reports later. An open buffer, an explicit `raven check` file argument, and on-demand indexing of a `source()` target under a hidden directory all still work.
+
+</details>
 
 ### Live reload
 
-In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[workspace]` (`exclude`), `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`, `[box]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
+In the editor, edits to `raven.toml` take effect live for every section: `[workspace]` (`exclude`), `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`, and `[box]`. Open documents re-publish diagnostics automatically, with no restart.
 
-Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
+The discovered `.lintr` is also watched and reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal `~/.lintr` only when `raven.linting.readHomeLintr = true`.
 
-## Diagnostics
+Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher settings) are handled the same way as an editor settings change: Raven rebuilds the package library through R if needed, restarts the library-path watcher, and re-registers completion triggers if they changed. This all happens in the background without blocking editing.
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics. When false, the model-language switches below cannot enable findings. |
-| `raven.diagnostics.jags` | `"off"` | Set to `"on"` to enable native syntax diagnostics for standalone JAGS/BUGS files. Portable as `[diagnostics] jags = "on"` in `raven.toml`. Parsing and language intelligence remain active when off. |
-| `raven.diagnostics.stan` | `"off"` | Set to `"on"` to enable native syntax and conservative undeclared-variable diagnostics for standalone Stan files. Portable as `[diagnostics] stan = "on"` in `raven.toml`. `undefinedVariableSeverity = "off"` disables only the semantic findings. Parsing and language intelligence remain active when off. |
-| `raven.diagnostics.maxSyntaxDiagnosticsPerFile` | `500` | Maximum native Tree-sitter syntax findings retained per Stan or JAGS/BUGS file after exact deduplication and stable source ordering. `0` means unlimited. Does not cap R diagnostics. Portable as `[diagnostics] maxSyntaxDiagnosticsPerFile = 500` in `raven.toml`; the editor and `raven check` use the same value. |
+The CLI reads configuration once per command. Pass `--config ~/.lintr` to use a literal home `.lintr` for that run.
 
-The two model-language switches layer per key like every other project setting:
-a value in `raven.toml` overrides the corresponding editor/LSP-client value,
-while an unpinned key continues to use the client value or its built-in `"off"`
-default.
+## Settings in other editors
 
-## Cross-File Settings
+Editors other than VS Code send settings to the language server as LSP client settings (`initializationOptions` at startup and `workspace/didChangeConfiguration` afterwards). Most keys have the same shape as in `raven.toml`, and a `raven.toml` value wins over them per key. A few advanced server-side settings, such as `raven.crossFile.hoistGlobalsInFunctions`, have no VS Code Settings UI entry and can be set only this way or in `raven.toml`. The simplest portable choice is a `raven.toml`, which every editor reads. See [Editor setup](editor-integrations.md) for each editor.
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.crossFile.indexWorkspace` | `true` | Enable background workspace indexing |
-| `raven.crossFile.backwardDependencies` | `"auto"` | How backward dependencies are resolved. `"auto"`: infer from workspace scan. `"explicit"`: require backward directives (e.g. `# raven: sourced-by`) to declare backward dependencies. See [Backward Dependency Modes](cross-file.md#backward-dependency-modes) |
-| `raven.crossFile.hoistGlobalsInFunctions` | `true` | Hoist global definitions inside function bodies (late-binding semantics). See [Global Symbol Hoisting](cross-file.md#global-symbol-hoisting). *LSP init-only — not exposed in the VS Code Settings UI.* |
-| `raven.crossFile.assumeCallSite` | `"end"` | Default call site when not specified by directive (`"end"` or `"start"`) |
-| `raven.crossFile.maxBackwardDepth` | `10` | Maximum depth for backward directive traversal |
-| `raven.crossFile.maxForwardDepth` | `10` | Maximum depth for forward source() traversal |
-| `raven.crossFile.maxChainDepth` | `64` | Maximum total chain depth (emits diagnostic when exceeded). Also bounds the bidirectional neighborhood-walk depth. |
-| `raven.crossFile.maxTransitiveDependentsVisited` | `50000` | Maximum files visited while traversing the cross-file dependency graph. When this budget truncates analysis, dropped `source()` edges can surface as false-positive `undefined-variable` warnings; the editor shows a throttled warning and `raven check` prints a one-line note (on stdout with the diagnostics for `text`, on stderr for `json`/`sarif`). Raise this for very large workspaces. |
-| `raven.crossFile.maxRevalidationsPerTrigger` | `10` | Max open documents to revalidate per change |
-| `raven.crossFile.revalidationDebounceMs` | `200` | Debounce delay for dependent file diagnostics (ms) |
-| `raven.crossFile.editedFileDebounceMs` | `50` | Debounce delay for the actively-edited file (ms) |
+## Settings by area
 
-### On-demand indexing
+The [Settings reference](settings-reference.md) lists every key. This table points from each area to the page that explains it.
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.crossFile.onDemandIndexing.enabled` | `true` | Index files referenced by `source()` / directives that aren't currently open, so cross-file features work without opening every dependency. Depth is bounded by `maxForwardDepth` / `maxBackwardDepth` |
+| Area | Editor prefix | `raven.toml` section | Explained in |
+|---|---|---|---|
+| <a id="diagnostics"></a><a id="diagnostic-severity-settings"></a>Diagnostics and severities | `raven.diagnostics.*` | `[diagnostics]` | [Diagnostics](diagnostics.md) |
+| <a id="cross-file-settings"></a><a id="on-demand-indexing"></a><a id="cache-sizes"></a>Cross-file analysis | `raven.crossFile.*` | `[crossFile]` | [Cross-file analysis](cross-file.md) |
+| <a id="package-settings"></a>Packages | `raven.packages.*` | `[packages]` | [Package development](r-package-dev.md), [.Rprofile startup files](rprofile.md) |
+| <a id="linting-settings"></a>Linting | `raven.linting.*` | `[linting]` | [Linting](linting.md) |
+| <a id="indentation-settings"></a>Indentation | `raven.indentation.*` | `[indentation]` | [Indentation](indentation.md) |
+| <a id="symbol-settings"></a>Workspace symbols | `raven.symbols.*` | `[symbols]` | [Document outline](document-outline.md) |
+| <a id="completion-settings"></a>Completion | `raven.completion.*` | `[completion]` | [Completion](completion.md) |
+| Workspace discovery | `raven.workspace.*` | `[workspace]` | [Project exclusions](#project-exclusions) |
+| `box` modules | — | `[box]` | [Box module search paths](#box-module-search-paths) |
+| <a id="r-console-activation"></a>R console activation | `raven.rConsole.activation` | — | [Coexistence](coexistence.md) |
+| <a id="plot-settings"></a>Plot viewer | `raven.plot.*` | — | [Plot viewer](plot-viewer.md) |
+| <a id="help-viewer-settings"></a>Help viewer | `raven.help.*` | — | [Help viewer](help-viewer.md) |
+| <a id="editor-integration-settings-vs-code-only"></a>Editor integration | `raven.editor.*` | — | [Editor setup](editor-integrations.md) |
+| <a id="server-settings"></a>Server binary | `raven.server.path` | — | [Server binary](#server-binary) |
 
-### Cache sizes
+Severity settings accept `"error"`, `"warning"`, `"information"` (or its `"info"` alias), `"hint"`, or `"off"`. To turn off one lint rule and keep the rest, set its severity to `"off"`.
 
-LRU-evicted; raise these if you have a very large workspace and see repeated re-indexing, lower them to reduce memory. The minimums quoted below are the lower bounds enforced by the VS Code Settings UI; the server itself only clamps each cache to a minimum of `1`, so `raven.toml` and other LSP clients can go lower if they really want to.
+## Commands
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.crossFile.cache.metadataMaxEntries` | `1000` | Parsed file metadata (directives, source calls). VS Code UI minimum `100`. |
-| `raven.crossFile.cache.fileContentMaxEntries` | `500` | Full file text used during resolution. VS Code UI minimum `50`. |
-| `raven.crossFile.cache.existenceMaxEntries` | `2000` | Cached `Path::exists` results for resolved references. VS Code UI minimum `100`. |
-| `raven.crossFile.cache.workspaceIndexMaxEntries` | `5000` | Closed-file entries in the cross-file workspace index (parsed metadata + scope artifacts). VS Code UI minimum `100`. |
+### Refresh command
 
-## Diagnostic Severity Settings
+**Raven: Refresh package cache** (`raven.refreshPackages`) re-runs `.libPaths()`, rebuilds the package library, restarts the file watcher, clears the cache, and republishes diagnostics. Use it after `renv::activate()`, after `.libPaths()` changes, or if the watcher misses an event. See [When Raven calls R](cross-file.md#when-raven-calls-r) for what these R queries do.
 
-Each accepts: `"error"`, `"warning"`, `"information"` (or its `"info"`
-alias), `"hint"`, or `"off"`.
+### Scaffold commands
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.diagnostics.undefinedVariableSeverity` | `"warning"` | Variable used but not defined in scope, sourced files, or loaded packages |
-| `raven.crossFile.missingFileSeverity` | `"warning"` | Missing file referenced by source() or directive |
-| `raven.crossFile.caseMismatchSeverity` | `"auto"` | A `source()`/forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename. Also accepts `"auto"` (in addition to the levels above): **information** on a case-insensitive filesystem, **warning** on a case-sensitive one. Independent of `missingFileSeverity`. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch). |
-| `raven.crossFile.circularDependencySeverity` | `"error"` | Circular dependency detected |
-| `raven.crossFile.maxChainDepthSeverity` | `"warning"` | Source chain exceeds max depth |
-| `raven.crossFile.outOfScopeSeverity` | `"warning"` | Symbol used before it's in scope |
-| `raven.crossFile.redundantDirectiveSeverity` | `"hint"` | Redundant `# raven: source` directive |
-| `raven.diagnostics.mixedLogicalSeverity` | `"warning"` | `\|` / `\|\|` whose immediate operand is a bare `&` / `&&` (not wrapped in parentheses). Since `&` binds tighter than `\|` in R, the grouping is silent — the rule asks for explicit parentheses. Applies everywhere, not just inside `if` / `while` conditions. |
-| `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | Binary `=` used directly inside an `if` / `while` condition (likely `==` intended). |
-| `raven.diagnostics.reportUnusedSuppressions` | `false` | Report **every** suppression directive that suppressed nothing as an `unused-suppression` hint, not just `# raven: expect[...]` directives. With the default `false`, only `expect` directives are checked; a plain `# raven: ignore` / `# @lsp-ignore` / `# nolint` stays silent even when it matched no diagnostic. Pyright-style; the hint is HINT severity, so it never gates `raven check --max-severity error` by default. Available in `raven.toml` (`[diagnostics] reportUnusedSuppressions = true`) and honored by `raven check`. See [Directives → Ignore Directives](directives.md#ignore-directives). |
-
-## Package Settings
-
-| Setting | Default | Description |
-|---|---|---|
-| `raven.packages.enabled` | `true` | Enable package function awareness |
-| `raven.packages.rPath` | `""` | Path to R executable for subprocess calls. Empty by default, in which case Raven searches `PATH`. Must point to vanilla `R` — not `radian` or `arf`, which are interactive REPL wrappers and cannot run the non-interactive scripts Raven uses for package introspection. For the interactive terminal program, see [`raven.rTerminal.program`](r-console.md#choosing-the-r-program). |
-| `raven.packages.additionalLibraryPaths` | `[]` | Additional R library paths for package discovery |
-| `raven.packages.missingPackageSeverity` | `"warning"` | Severity for missing package diagnostics (`"off"` to disable) |
-| `raven.packages.watchLibraryPaths` | `true` | Watch `.libPaths()` directories and invalidate caches on install/remove |
-| `raven.packages.watchDebounceMs` | `500` | Coalesce rapid filesystem events into a single invalidation pass (ms) |
-| `raven.packages.packageMode` | `"auto"` | R package workspace mode: `"auto"` (detect DESCRIPTION), `"enabled"` (always), `"disabled"` (never). See [R Package Development](r-package-dev.md). |
-| `raven.packages.rprofilePrelude` | `true` | Use the workspace-root `.Rprofile` startup prelude for ordinary script scope. See [`.Rprofile` Startup Prelude](rprofile.md). |
-
-### Refresh Command
-
-**Raven: Refresh package cache** (`raven.refreshPackages`) — re-runs `.libPaths()`, rebuilds the package library, restarts the filesystem watcher, clears the cache, and republishes diagnostics. Use after `renv::activate()`, `.libPaths()` changes, or if the watcher misses an event. See [When Raven calls R](cross-file.md#when-raven-calls-r) for what these R queries do.
-
-## Scaffold Commands
-
-These Command Palette entries write starter R config files to the first workspace folder. If the target file already exists, Raven prompts before overwriting.
+These Command Palette entries write starter config files to the first workspace folder. If the target file already exists, Raven asks before overwriting.
 
 | Command | File | Contents |
 |---|---|---|
-| `Raven: Create raven.toml` | `raven.toml` | A starter linting-focused project config at the workspace root, with the `[linting]` keys Raven maps from VS Code settings. Add other sections from this reference as needed (`crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`, `box`) |
-| `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch dirs, and AI-tool user-local overrides |
-| `Raven: Create linting settings` | `.vscode/settings.json` | Every project-scoped `raven.linting.*` key Raven maps to `raven.toml`, each prefaced with a `//` comment naming its `lintr` equivalent. Merges into an existing `settings.json` without disturbing unrelated keys or comments, preserves client-only linting settings such as `raven.linting.readHomeLintr`, and prompts before overwriting an existing project-scoped `raven.linting.*` block |
+| `Raven: Create raven.toml` | `raven.toml` | A starter linting-focused project config at the workspace root, with the `[linting]` keys Raven maps from VS Code settings. Add other sections as needed. |
+| `Raven: Create .gitignore` | `.gitignore` | Standard R ignores (`.Rhistory`, `.RData`, `.Rproj.user/`), OS files (`.DS_Store`, `Thumbs.db`), R Markdown/Quarto/`R CMD check` artifacts, local scratch directories, and AI-tool user-local overrides |
+| `Raven: Create linting settings` | `.vscode/settings.json` | Every project-scoped `raven.linting.*` key Raven maps to `raven.toml`, each with a `//` comment naming its `lintr` equivalent. See below. |
 
-## R Console Activation
+**Raven: Create linting settings** merges into an existing `settings.json` without disturbing unrelated keys or comments, keeps client-only linting settings such as `raven.linting.readHomeLintr`, and asks before overwriting an existing project-scoped `raven.linting.*` block.
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console — and the surfaces gated alongside it (plot viewer, data viewer, chunk navigation / highlighting / active-cell indicator, `.R` cell mode, and the `r.json` snippets contributed to `.Rmd` / `.Rmarkdown` / `.qmd`) — activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
+## Box module search paths
 
-## Plot Settings
+```toml
+[box]
+searchPaths = ["modules", "../shared-r"]
+```
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.plot.viewerColumn` | `"beside"` | Initial editor column for an R session's plot viewer panel when its first plot arrives. Once you move the panel, Raven leaves it in its new location. Values: `active`, `beside`. See [Plot Viewer](plot-viewer.md). |
+This project-only setting overrides startup `R_BOX_PATH`, inferred project `.Rprofile` paths, and Rhino's default root. Entries are relative to the config file's directory. An empty list searches only the importing file's directory. The setting changes Raven's static analysis, not R's configuration. Reloading or removing it refreshes module imports. See [box and import modules](modules.md) for precedence, automatic inputs, and external-directory watching.
 
-## Help Viewer Settings
+## Server binary
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.help.viewerColumn` | `"beside"` | Initial editor column when the R help viewer first opens. Once you move the panel, Raven leaves it where you put it. Values: `active`, `beside`. See [Help Viewer](help-viewer.md). |
+`raven.server.path` is the path to the `raven` binary the VS Code extension runs. It is empty by default, which uses the binary bundled with the extension.
 
-## Symbol Settings
+## Notes on individual settings
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.symbols.workspaceMaxResults` | `1000` | Maximum symbols returned by workspace symbol search (Cmd/Ctrl+T). Range: 100–10000. |
+The [Settings reference](settings-reference.md) gives a one-line description per key. These notes add what doesn't fit there.
 
-## Completion Settings
+<details markdown="1">
+<summary>Diagnostics settings</summary>
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.completion.triggerOnOpenParen` | `true` | Register `(` as a completion trigger character for parameter suggestions |
+- `raven.diagnostics.enabled` is the master switch for all diagnostics. When it is false, the JAGS and Stan switches cannot turn findings on.
+- `raven.diagnostics.jags` and `raven.diagnostics.stan` default to `"off"`. Parsing and language features stay active when they are off. `undefinedVariableSeverity = "off"` turns off only Stan's undeclared-variable findings. Like every project setting, a value in `raven.toml` overrides the editor value, and an unset key falls back to the editor value or the built-in `"off"`.
+- `raven.diagnostics.maxSyntaxDiagnosticsPerFile` (default `500`, `0` for unlimited) caps Stan and JAGS/BUGS syntax findings per file and does not cap R diagnostics. The editor and `raven check` use the same value.
+- `raven.diagnostics.mixedLogicalSeverity` covers `|` or `||` whose immediate operand is a bare `&` or `&&` without parentheses. Since `&` binds tighter than `|` in R, the grouping is silent, so the rule asks for explicit parentheses. It applies everywhere, not just inside `if` and `while` conditions.
+- `raven.diagnostics.conditionAssignmentSeverity` covers a binary `=` used directly inside an `if` or `while` condition, where `==` was likely intended.
+- `raven.diagnostics.reportUnusedSuppressions` (default `false`) reports **every** suppression comment that suppressed nothing as an `unused-suppression` hint. With the default, only `# raven: expect` comments are checked, and a plain `# raven: ignore`, `# @lsp-ignore`, or `# nolint` stays silent even when it matched nothing. The finding is a hint, so it never fails `raven check` at the default threshold. `raven check` honors it. See [Directives](directives.md#ignore-directives).
 
-## Indentation Settings
+</details>
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.indentation.enabled` | `true` | Syntax-aware indentation master switch |
-| `raven.indentation.argumentStyle` | `"aligned"` | Parenthesized arguments: `"aligned"`, `"indented"`, or `"off"` |
-| `raven.indentation.infixContinuationStyle` | `"aligned"` | Infix continuations: `"aligned"`, `"indented"`, or `"off"` |
-| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → syntax-aware indentation disabled |
+<details markdown="1">
+<summary>Cross-file settings</summary>
 
-Explicit new settings win per field over the alias. The alias never changes the infix setting. See [Smart Indentation](indentation.md#permanent-compatibility-alias) for the full precedence table and examples.
+- `raven.crossFile.backwardDependencies`: `"auto"` infers backward dependencies from a workspace scan; `"explicit"` requires backward directives such as `# raven: sourced-by`. See [Backward dependency modes](cross-file.md#backward-dependency-modes).
+- `raven.crossFile.hoistGlobalsInFunctions` is set through client settings or `raven.toml` only; it isn't in the VS Code Settings UI. See [Global symbol hoisting](cross-file.md#global-symbol-hoisting).
+- `raven.crossFile.maxChainDepth` (default `64`) also bounds how far Raven walks the dependency graph in both directions, and produces a diagnostic when a chain exceeds it.
+- `raven.crossFile.maxTransitiveDependentsVisited` (default `50000`): when this budget cuts analysis short, dropped `source()` edges can show up as false `undefined-variable` warnings. The editor shows a throttled warning and `raven check` prints a one-line note (on stdout with the diagnostics for `text`, on stderr for `json`/`sarif`). Raise it for very large workspaces.
+- `raven.crossFile.onDemandIndexing.enabled` indexes files referenced by `source()` or directives that aren't open, so cross-file features work without opening every dependency. Its depth is bounded by `maxForwardDepth` and `maxBackwardDepth`.
+- `raven.crossFile.caseMismatchSeverity` also accepts `"auto"` (the default): information on a case-insensitive filesystem, warning on a case-sensitive one. It is independent of `missingFileSeverity`. See [Source path case mismatch](diagnostics.md#source-path-case-mismatch).
+- The `raven.crossFile.cache.*` settings size least-recently-used caches. Raise them if a very large workspace re-indexes repeatedly; lower them to save memory. The minimums shown in the Settings reference are enforced by the VS Code Settings UI; the server itself only requires at least `1`, so `raven.toml` and other editors can go lower.
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). Syntax-aware indentation applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
+</details>
+
+<details markdown="1">
+<summary>Package settings</summary>
+
+- `raven.packages.rPath` is empty by default, in which case Raven searches `PATH`. It must point to plain `R`, not `radian` or `arf`: those are interactive wrappers and can't run the non-interactive scripts Raven uses to read package information. For the interactive console program, see [Choosing the R program](r-console.md#choosing-the-r-program).
+- `raven.packages.missingPackageSeverity` set to `"off"` turns off missing-package diagnostics.
+- `raven.packages.watchLibraryPaths` watches the `.libPaths()` directories and refreshes package information when packages are installed or removed; `raven.packages.watchDebounceMs` (default `500`) groups rapid file events into one refresh.
+- `raven.packages.packageMode`: `"auto"` detects a `DESCRIPTION` file, `"enabled"` always treats the workspace as a package, `"disabled"` never does. See [Package development](r-package-dev.md).
+- `raven.packages.rprofilePrelude` uses the workspace-root `.Rprofile` as a startup prelude for ordinary scripts. See [.Rprofile startup files](rprofile.md).
+
+</details>
+
+<details markdown="1">
+<summary>Linting settings</summary>
+
+`raven.linting.enabled` is tri-state (default `"auto"`). See the [behavior matrix](linting.md#behavior-matrix) for how it combines with `raven.toml` and `.lintr`. All rules default to severity `information`, matching how REditorSupport's `languageserver` maps `lintr` style findings.
+
+- `raven.linting.readHomeLintr` is a client-only setting: it includes the literal `~/.lintr` in discovery. Workspace and non-home parent `.lintr` files are still discovered when it is `false`; the CLI uses the literal `~/.lintr` only with `--config ~/.lintr`.
+- `raven.linting.indentationUnit`: in VS Code, `"auto"` follows each file's `editor.tabSize`; an integer from 1 to 8 sets a fixed unit.
+- `raven.linting.objectNameStyle*` settings accept one style or an array, ORed with that kind's `objectNameRegexes*`. Include `"any"` to turn off checking for just that kind. An empty style array with regexes checks regexes only; empty styles and empty regexes together turn that kind off. The regexes are partial matches against the full identifier, including any leading `.`; use `^...$` for whole-name matches. Empty strings are rejected. See [Object names](linting.md#object-names).
+
+</details>
+
+<details markdown="1">
+<summary>Indentation settings and format-on-type</summary>
+
+`raven.indentation.style` is a deprecated permanent alias: `rstudio` means argument style `aligned`, `rstudio-minus` means argument style `indented`, and `off` turns syntax-aware indentation off. Explicit new settings win per field over the alias, and the alias never changes the infix setting. See [Indentation](indentation.md#permanent-compatibility-alias).
+
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default, as the lowest-priority VS Code default. Syntax-aware indentation applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks are left alone. To turn it off per language:
 
 ```json
 "[r]": {
@@ -251,71 +267,23 @@ Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by defa
 }
 ```
 
-Out of the box Raven emits aligned infix continuations and its lint accepts both forms. Projects using real `lintr`, styler, or Air in CI should set both infix settings to `"indented"`; strict-alignment projects should set both to `"aligned"`.
+Out of the box Raven produces aligned infix continuations, and its lint accepts both forms. Projects that run real `lintr`, styler, or Air in CI should set both infix settings to `"indented"`; strict-alignment projects should set both to `"aligned"`.
 
-## Linting Settings
+</details>
 
-Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (default `"auto"`); auto turns on when a `.lintr` that contains linting configuration (a blank/empty `.lintr` does not count) or a `raven.toml` opts in — except the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled (or the CLI receives `--config ~/.lintr`), and any `.lintr` is ignored when REditorSupport's own `lintr` diagnostics are live or you're in Positron ([details](linting.md#auto-and-reditorsupport--positron)) — set `true`/`false` for explicit overrides. Implemented in Rust against the tree-sitter AST — no `lintr` install required. All rules default to severity `information`, matching REditorSupport `languageserver`'s mapping for `lintr` style findings. See [Style Lints](diagnostics.md#style-lints) for the full rule list and suppression conventions, and [Linting](linting.md) for the master-switch behavior matrix, quick-start configuration, mapping from a `.lintr` file, and the suppression matrix.
+<details markdown="1">
+<summary>Viewer, symbol, completion, and editor settings</summary>
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
-| `raven.linting.readHomeLintr` | `false` | VS Code/LSP-client-only. Include the literal home-directory `~/.lintr` in discovery. Workspace and non-home parent `.lintr` files are still discovered when this is `false`; the CLI uses literal `~/.lintr` only when passed explicitly with `--config ~/.lintr`. |
-| `raven.linting.lineLength` | `80` | Maximum line length (characters) |
-| `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
-| `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
-| `raven.linting.infixContinuationStyle` | `"either"` | Infix checking policy: strict `"indented"` (`lintr` parity), strict floored `"aligned"`, or their `"either"` union. Raven-only; see [Indentation](linting.md#indentation). |
-| `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
-| `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
-| `raven.linting.lineLengthSeverity` | `"information"` | Severity for over-long lines (or `"off"`) |
-| `raven.linting.trailingWhitespaceSeverity` | `"information"` | Severity for trailing whitespace |
-| `raven.linting.noTabSeverity` | `"information"` | Severity for tab characters |
-| `raven.linting.trailingBlankLinesSeverity` | `"information"` | Severity for blank lines or missing newline at end of file |
-| `raven.linting.assignmentOperatorSeverity` | `"information"` | Severity for mismatched assignment operator |
-| `raven.linting.objectNameStyleFunction` | `["snake_case", "symbols"]` | Naming schemes for functions. Accepts one style string or an array of styles (`"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"symbols"` \| `"any"`); styles are ORed with function regexes. |
-| `raven.linting.objectNameStyleVariable` | `["snake_case", "symbols"]` | Naming schemes for variables (same string-or-array enum as above); styles are ORed with variable regexes. |
-| `raven.linting.objectNameStyleArgument` | `["snake_case", "symbols"]` | Naming schemes for function formal arguments (same string-or-array enum as above); styles are ORed with argument regexes. |
-| `raven.linting.objectNameRegexesFunction` | `[]` | Additional Rust regexes accepted for function names. Partial match against the full identifier, including any leading `.`; use `^...$` for whole-name matches. Empty strings are rejected. |
-| `raven.linting.objectNameRegexesVariable` | `[]` | Additional Rust regexes accepted for variable names (same matching rules as above). |
-| `raven.linting.objectNameRegexesArgument` | `[]` | Additional Rust regexes accepted for function formal argument names (same matching rules as above). |
-| `raven.linting.objectNameSeverity` | `"information"` | Severity for the object-name lint (set to `"off"` to disable entirely; include `"any"` in a kind's style setting to disable just that kind) |
-| `raven.linting.infixSpacesSeverity` | `"information"` | Severity for the infix-spaces lint (whitespace around operators) |
-| `raven.linting.commentedCodeSeverity` | `"information"` | Severity for the commented-code lint (standalone comments whose body parses as R code) |
-| `raven.linting.quotesSeverity` | `"information"` | Severity for the quotes lint (string-literal delimiter style) |
-| `raven.linting.commasSeverity` | `"information"` | Severity for the commas lint (spacing around `,`) |
-| `raven.linting.tAndFSymbolSeverity` | `"information"` | Severity for the T/F-symbol lint (bare `T` / `F` used as `TRUE` / `FALSE`) |
-| `raven.linting.semicolonSeverity` | `"information"` | Severity for the semicolon lint (`;` separators in source) |
-| `raven.linting.equalsNaSeverity` | `"information"` | Severity for the equals-NA lint (`x == NA`, `x != NA`, typed-`NA` variants) |
-| `raven.linting.objectLengthSeverity` | `"information"` | Severity for the object-length lint |
-| `raven.linting.vectorLogicSeverity` | `"information"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
-| `raven.linting.functionLeftParenthesesSeverity` | `"information"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
-| `raven.linting.spacesInsideSeverity` | `"information"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
-| `raven.linting.indentationSeverity` | `"information"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the surrounding syntax) |
+- `raven.plot.viewerColumn` and `raven.help.viewerColumn` (`active` or `beside`, default `beside`) set where the plot viewer or help viewer first opens. Once you move the panel, Raven leaves it there.
+- `raven.symbols.workspaceMaxResults` (default `1000`, range 100 to 10000) caps workspace symbol search (Cmd/Ctrl+T).
+- `raven.completion.triggerOnOpenParen` registers `(` as a completion trigger for parameter suggestions.
+- `raven.editor.dotInWord` was renamed from `raven.editor.dotInWordSeparators`, and the old setting is migrated automatically. Change it at any time by editing the setting.
 
-To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also include `"any"` in any of the three style settings to disable just that symbol kind while keeping the others active. An explicit empty style array with regexes is regex-only mode; empty styles and empty regexes together disable that kind.
+</details>
 
-## Editor Integration Settings (VS Code only)
+## See also
 
-| Setting | Default | Description |
-|---|---|---|
-| `raven.editor.dotInWord` | `"yes"` | Whether to treat `.` as part of a word in R and JAGS files. `"yes"` (the default) treats dots as word characters by overriding `editor.wordSeparators` for `[r]` / `[jags]` — matching RStudio and Positron — `"no"` leaves dots as separators, and `"ask"` prompts on first use. Change it any time by editing the setting. (Renamed from `raven.editor.dotInWordSeparators`, which is migrated automatically.) |
-
-## Server Settings
-
-| Setting | Default | Description |
-|---|---|---|
-| `raven.server.path` | `""` | Path to the `raven` binary. Empty by default, in which case the bundled binary is used. |
-
-## Box module search paths
-
-```toml
-[box]
-searchPaths = ["modules", "../shared-r"]
-```
-
-This project-only setting overrides startup `R_BOX_PATH`, inferred project
-`.Rprofile` paths, and Rhino's default root. Entries are relative to the config
-file's directory. An empty list searches only the importing file's directory.
-The setting changes Raven's static analysis, not R's configuration. Reloading or
-removing it refreshes module imports. See [modules](modules.md) for precedence,
-automatic inputs, and external-directory watching.
+- [Settings reference](settings-reference.md)
+- [Linting](linting.md)
+- [Editor setup](editor-integrations.md)
+- [CLI](cli.md)
