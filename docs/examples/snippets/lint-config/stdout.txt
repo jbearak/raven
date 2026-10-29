@@ -1,0 +1,4 @@
+tidy.R:1:7 info: Use `<-` for assignment instead of `=`. [assignment_operator]
+tidy.R:2:24 info: Use `TRUE` instead of the symbol `T`. [t_and_f_symbol]
+tidy.R:2:11 info: Use `is.na(x)` instead of `x == NA`; comparison with `NA` returns `NA`. [equals_na]
+3 issues (0 errors, 0 warnings, 3 infos, 0 hints, 0 notes)

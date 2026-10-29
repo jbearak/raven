@@ -70,6 +70,7 @@ Other LSP editors that don't tell Raven which files are shown use the standard r
 | Stop false positives from an NSE helper Raven doesn't know | Use [`# raven: nse`](non-standard-evaluation.md#when-raven-needs-a-hint) to name the captured arguments. Raven keeps checking the other arguments, which a blanket ignore would not. |
 | See a parent file's symbols | Usually nothing: auto mode finds the relationship. Add `# raven: sourced-by` only when it can't. See [Cross-file analysis](cross-file.md). |
 | Account for project startup helpers | Raven reads a workspace-root `.Rprofile` for ordinary scripts. See [.Rprofile startup files](rprofile.md). |
+| Silence a whole R Markdown or Quarto chunk | Add `raven.ignore=TRUE` to the chunk header, or `# raven: ignore-chunk` inside it. See [Chunks](chunks.md#suppressing-diagnostics-in-a-chunk). |
 | Turn a category off | Set its severity setting to `"off"`. See [Turn a category off](#per-category-configuration). |
 | Check JAGS or Stan files | Set `raven.diagnostics.jags` or `raven.diagnostics.stan` to `"on"`. |
 | Turn off all diagnostics | Set `raven.diagnostics.enabled` to `false`. |
@@ -237,7 +238,7 @@ A model file whose language is switched off is skipped without being opened, so 
 <a id="diagnostic-categories"></a>
 ## Diagnostic codes
 
-Every diagnostic carries a stable kebab-case code. Only codes marked suppressible can be silenced with `# raven: ignore`; the others follow only their severity setting. Settings are listed by their VS Code name; see the [settings reference](settings-reference.md) for defaults and `raven.toml` paths.
+Most diagnostics carry a stable code, shown in brackets at the end of each `raven check` line. This page writes codes in kebab-case. Style lints and the `mixed-logical` and `condition-assignment` checks print in lintr's snake_case (`mixed_logical`), and suppression selectors accept either spelling. Only codes marked suppressible can be silenced with `# raven: ignore`; the others follow only their severity setting. Settings are listed by their VS Code name; see the [settings reference](settings-reference.md) for defaults and `raven.toml` paths.
 
 | Code | Default severity | Suppressible | Setting |
 |---|---|---|---|
@@ -262,7 +263,7 @@ Every diagnostic carries a stable kebab-case code. Only codes marked suppressibl
 | [Circular dependency](#circular-dependency-chain-depth-and-redundant-directives) (no code) | error | No | `raven.crossFile.circularDependencySeverity` |
 | [Max chain depth exceeded](#circular-dependency-chain-depth-and-redundant-directives) (no code) | warning | No | `raven.crossFile.maxChainDepthSeverity` |
 | [Redundant directive](#circular-dependency-chain-depth-and-redundant-directives) (no code) | hint | No | `raven.crossFile.redundantDirectiveSeverity` |
-| [Style lints](#style-lints) (`line-length`, `object-name`, …) | information | Yes, also `# nolint` | `raven.linting.*` |
+| [Style lints](#style-lints) (`line_length`, `object_name`, …) | information | Yes, also `# nolint` | `raven.linting.*` |
 
 <a id="undefined-variables"></a>
 ### `undefined-variable`

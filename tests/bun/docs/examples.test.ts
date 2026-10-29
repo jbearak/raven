@@ -46,7 +46,7 @@ describe("doc examples", () => {
 test("every corpus example has cmd, stdout.txt, stderr.txt, and exit", () => {
   if (!existsSync(corpusDir)) return;
   const violations: string[] = [];
-  for (const name of readdirSync(corpusDir)) {
+  for (const name of readdirSync(corpusDir).filter((n) => !n.startsWith("."))) {
     for (const f of ["cmd", "stdout.txt", "stderr.txt", "exit"])
       if (!existsSync(path.join(corpusDir, name, f))) violations.push(`${name}: missing ${f}`);
   }

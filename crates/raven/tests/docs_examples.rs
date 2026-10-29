@@ -152,6 +152,8 @@ fn docs_examples_match_raven_output() {
         .expect("docs/examples/snippets exists")
         .map(|e| e.unwrap().path())
         .filter(|p| p.is_dir())
+        // Skip hidden directories (editor and tool state), which are never examples.
+        .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with('.'))
         .collect();
     examples.sort();
     assert!(!examples.is_empty(), "no docs examples found");
