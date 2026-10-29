@@ -1,126 +1,105 @@
 # Raven
 
-Raven is a static analyzer for R that resolves what's in scope at each line — catching undefined and used-before-defined variables even in a single script, and across files by following `source()` chains — without running your code. The same scope model drives the rest of its code intelligence — completions, go-to-definition, find-references, hover — so each reflects what's reachable at your cursor, not just what exists somewhere in the project. It also diagnoses syntax errors, and can optionally check code style and formatting.
+Raven finds undefined variables and broken `source()` chains in R code, across files and as you type, without running your code. It is a language server for R, so the same analysis drives completion, go to definition, find references, and hover in VS Code, Neovim, Zed, or any editor that speaks the Language Server Protocol. A command-line `raven check` runs it in CI.
 
-Raven is fast and runs all of this in realtime in your editor, with diagnostics updating instantly as you type. It also fills a gap at the other end of the workflow: automated checks in pull requests — running `raven check` flags undefined variables and other errors before code merges, the kind of automated review that's table stakes for other languages but has long been missing for R analysis projects.
+Here, `analysis.R` sources `helpers.R`, which defines `clean_names()`:
 
-Doing this well in R is hard — part of why so little static tooling exists for the language. R leans heavily on [non-standard evaluation](docs/non-standard-evaluation.md) (NSE): a function can take its arguments as unevaluated code and decide what the symbols mean at runtime, so `col` in `dplyr::filter(df, col > 0)` is a data-frame column, not an undefined variable. A checker that didn't account for this would flag idiomatic R as errors; Raven recognizes these NSE contexts and leaves them unflagged — though code that pulls names into scope at runtime, such as `attach()`, can still draw a false positive, which you resolve by declaring those symbols with a [directive](docs/directives.md). The same analysis isn't only defensive: wherever it can determine an object's structure statically, Raven completes its fields — start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session.
+<!-- example: readme-demo file=analysis.R -->
+```r
+source("helpers.R")
 
-Beyond code intelligence, Raven's VS Code extension can bring the rest of an R workflow into the editor — an [R console](docs/r-console.md) with [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers — but it's built to add to your setup rather than change it: those R-session features defer by default to REditorSupport or Positron, and the language server runs alongside or instead of [r-language-server](https://github.com/REditorSupport/languageserver) ([details below](#how-raven-differs)).
+survey <- clean_names(read.csv("survey.csv"))
+summary(servey$age)
 
-Raven is fully open source ([GPL-3.0](LICENSE)) and editor-agnostic: it speaks the Language Server Protocol, so it runs in VS Code, Neovim, Zed, or any LSP client — including over VS Code Remote-SSH, so you can develop on a remote server with more compute than your laptop.
+plot(fit)
+fit <- lm(age ~ income, data = survey)
+```
 
-> **Status:** Raven is under active development. It works well for day-to-day use but hasn't been widely announced yet. Bug reports and feedback are welcome!
+<!-- example: readme-demo -->
+```console
+$ raven check .
+analysis.R:4:9 warning: servey is not defined [undefined-variable]
+analysis.R:6:6 warning: fit is used before it is defined (defined on line 7) [undefined-variable]
+2 issues (0 errors, 2 warnings, 0 infos, 0 hints, 0 notes)
+```
 
-> **Quick Start:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r) or [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r), or download from the [releases page](https://github.com/jbearak/raven/releases). See [Installation](#installation) for details.
-
-Raven's sibling project [Sight](https://github.com/jbearak/sight) implements a language server for Stata. Together they bring cross-file navigation, error detection, and code intelligence to two languages widely used in social science research.
-
-## Features
-
-### Code intelligence
-
-- **[Completions](docs/completion.md)** — Symbols, packages, and function parameters — across files
-- **[Go-to-definition](docs/go-to-definition.md)** — Jump to definitions across file boundaries
-- **[Find references](docs/find-references.md)** — Locate all usages of a symbol across your project
-- **[Hover](docs/hover.md)** — Symbol info including source file and package origin
-- **[Diagnostics](docs/diagnostics.md)** — Undefined variable detection that understands sourced files and loaded packages
-- **[Non-standard evaluation](docs/non-standard-evaluation.md)** — NSE-aware diagnostics for data-masking, tidyselect, ggplot mappings, Shiny, foreach, and custom helpers
-- **[Linting](docs/linting.md)** — Opt-in style/lint rules (line length, trailing whitespace, trailing blank lines, tabs, assignment operator, object names, infix spaces, commented code, indentation)
-- **[Document outline](docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
-- **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
-- **File path intellisense** — Completions and cmd-click inside `source()` paths
-- **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with configurable argument and chain styles
-- **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains and static `targets::tar_source()` batches, and connects supported `{tarchetypes}` target factories and report documents
-- **[Module & import systems](docs/modules.md)** — Models static `{box}` and `{import}` selective imports, binding only the names an import requests, with module privacy
-- **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
-- **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
-
-Raven also supports **JAGS** (`.jags`, `.bugs`, `.bug`) and **Stan** (`.stan`) files with [syntax highlighting](docs/syntax-highlighting.md#jags-and-stan), [completions](docs/completion.md#jags-and-stan), [hover](docs/hover.md), [syntax diagnostics](docs/diagnostics.md#jags-and-stan-parse-errors), [go-to-definition](docs/go-to-definition.md#jags-and-stan), [find references](docs/find-references.md#jags-and-stan), and [model-structure outlines](docs/document-outline.md#jags-and-stan-model-structure). JAGS additionally provides static signature help for built-ins, while Stan provides conservative [undeclared-variable diagnostics](docs/diagnostics.md#stan-undeclared-variables).
-
-### R session integration
-
-- **[R console](docs/r-console.md)** — Raven's own R console with syntax highlighting, multi-line editing, Tab completion, and colored output, running your installed R; code from the editor goes straight to it. Plain R, arf, and radian are also supported
-- **[Debugger](docs/debugger.md)** — Breakpoints (conditional, hit-count, logpoints, function), stepping, call stack, variables, watch and the Debug Console in VS Code for `.R`, `.Rmd` and `.qmd` files, built on R's own `browser()`; stops on errors, warnings and interrupts, and instruments code run from the editor, `source()`, and `devtools::load_all()`
-- **Quarto & R Markdown** — A consistent, theme-aware authoring and preview workflow for `.Rmd`, `.Rmarkdown`, and `.qmd` documents:
-  - **[R code chunks](docs/chunks.md)** — R language intelligence, execution commands, CodeLens buttons, navigation, and highlighting inside chunks
-  - **[R Markdown preview + export](docs/knit.md)** — Fast HTML preview with manual refresh, plus export to HTML, PDF, and Word
-  - **[Quarto preview + render](docs/quarto.md)** — Preview and render `.qmd` documents with Quarto, including automatic refresh after saves
-- **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
-- **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
-- **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred
-
-## How Raven Differs
-
-Raven takes a static-analysis approach rather than attaching to a live R session, so it can start answering questions the moment a file is opened, without running user code. That has four practical consequences:
-
-- **Available immediately, even for code you haven't run** — answers the moment you open a file, including code that errors halfway, is missing a dependency, or that you're only reading (onboarding to a repo, reviewing a pull request). A session-based tool can offer little until the code runs cleanly.
-- **Reflects what your code says, not what your session remembers** — a tool tied to a live session sees whatever is in `globalenv()` right now, possibly stale. Comment out `library(dplyr)` while it's still attached in your session and a session-based tool keeps completing `dplyr` functions; Raven reads the file and knows it isn't loaded there.
-- **Read-only and side-effect-free** — computing scope never runs your code, so nothing it does (writing files, hitting a database, a long job) can be triggered. This is also what makes Raven safe to run behind an agentic/AI tool.
-- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in CI (automated checks on pushes and pull requests) or any headless context. Use [`raven check`](docs/cli.md#raven-check) for the full diagnostic set (cross-file, undefined-variable, package) and [`raven lint`](docs/cli.md#raven-lint) for style-only gating. See [Automated checks in CI](docs/ci.md) for a beginner-friendly guide and GitHub Actions / Bitbucket Pipelines examples.
-
-See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
-
-**Built to coexist, not replace.** Raven layers onto your existing R setup two different ways, and neither one takes anything over.
-
-*The language server is additive.* Its reason for being is static, cross-file analysis, and it runs happily next to [r-language-server](https://github.com/REditorSupport/languageserver): install Raven and you get its diagnostics, completions, and navigation on top of whatever you already run. If you'd rather not have two providers offering completions, set `r.lsp.enabled` to `false` to turn REditorSupport's language server off and let Raven handle code intelligence alone. If you want to keep REditorSupport's language server but not its [`lintr`](https://lintr.r-lib.org/) style diagnostics, set `r.lsp.diagnostics` to `false` — you'll keep Raven's syntax and scope diagnostics without style linting. And if you want some of that style linting back, Raven ships its own opt-in lints (`raven.linting.enabled`), configurable through a `.lintr` file for backward compatibility, a `raven.toml`, or VS Code's settings UI — a point-and-click alternative to writing `.lintr` syntax by hand. Raven also folds in [configurable syntax-aware indentation](docs/indentation.md) as you type; it never reformats whole files, so there's nothing for a dedicated formatter like [Air](https://github.com/posit-dev/air) (Posit) to collide with. The community has dedicated tools for these jobs — Air for formatting, [lintr](https://lintr.r-lib.org/) or [Jarl](https://github.com/etiennebacher/jarl) for linting — and Raven is built to run alongside them.
-
-*The R console and viewers defer to whatever you already run.* Raven's [R console](docs/r-console.md), its [plot](docs/plot-viewer.md) and [data](docs/data-viewer.md) viewers, and its [Knit Preview](docs/knit.md) overlap with what REditorSupport, RStudio, and Positron already give you — and if you like their live-session, workspace-watcher style of working, Raven isn't trying to replace it. By default these features defer: under `raven.rConsole.activation`'s `auto` setting they step aside whenever REditorSupport is enabled or you're running in Positron, so installing Raven never displaces the R integration you already have. They exist for two reasons. First, having built a language server that deliberately needs no live R session, I didn't want to then be forced to pair it with a tool that injects itself into one — so Raven gives you a complete R workflow you *can* run on its own. Second, I had particular preferences these viewers are built around: a data viewer that stays responsive on millions of rows, reopens after a VS Code restart, remembers sorts and filters across repeated `View()` calls, and shows value labels from imported Stata / SPSS data, all without waiting on a live R session (the frame streams out to Arrow on disk); help that lists only the function actually in scope (hover `print()` and you get `base::print`, not a list of every package that happens to define a `print`); and a fast `.Rmd` / `.Rmarkdown` preview that themes prose, syntax highlighting, and plots to match your editor. Turn them on everywhere with `raven.rConsole.activation: "enabled"`. (Raven's scope-aware [help viewer](docs/help-viewer.md) remains available regardless -- it only opens when you click the link in one of Raven's hovers, so it doesn't get in the way of anything else.)
-
-For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — covering both language intelligence and R session integration — see [docs/comparison.md](docs/comparison.md).
+Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags the typo and the plot that runs before the model exists. In your editor, the same warnings appear as you type. No R session is involved, and the output above was produced with R turned off.
 
 ## Installation
 
-### Editors
+- **VS Code:** install [Raven from the Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r). The extension includes the language server.
+- **Cursor, Positron, VSCodium:** install from [Open VSX](https://open-vsx.org/extension/jbearak/raven-r).
+- **Other editors:** install the `raven` binary (below), then follow [Editor setup](docs/editor-integrations.md) for Neovim, Zed, Helix, Emacs, and others.
 
-**VS Code:** Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.raven-r).
-
-**Cursor, Positron, and other VS Code-based editors:** Install from [OpenVSX](https://open-vsx.org/extension/jbearak/raven-r) or download the .vsix file from the [releases page](https://github.com/jbearak/raven/releases) and install manually.
-
-**Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), or install with the macOS, Ubuntu, or Arch Linux packages [below](#command-line). Configure your editor's LSP client to run `raven --stdio`. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
+Then follow [Getting started](docs/getting-started.md). It takes two minutes.
 
 ### Command line
 
-The same `raven` binary provides the language server and command-line checks. Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), use a package below, or build from source.
+The `raven` binary is the language server and the CLI.
 
-**Homebrew (macOS on Apple Silicon):** Install from the [Raven Homebrew tap](https://github.com/jbearak/homebrew-raven) with `brew install jbearak/raven/raven`. Use the fully qualified name because Homebrew/core has a different `raven` package.
+- **macOS (Apple Silicon):** `brew install jbearak/raven/raven`. Use the full name, since Homebrew core has an unrelated `raven`.
+- **Ubuntu:** use the signed apt repository. See [Ubuntu installation](docs/cli.md#ubuntu-installation).
+- **Arch Linux:** the community AUR packages [raven](https://aur.archlinux.org/packages/raven) and [raven-bin](https://aur.archlinux.org/packages/raven-bin), maintained by Novica.
+- **Anything else:** download a binary from the [releases page](https://github.com/jbearak/raven/releases), or build from source with `cargo install --git https://github.com/jbearak/raven raven`.
 
-**Arch Linux:** Community-maintained AUR packages by Novica: [raven](https://aur.archlinux.org/packages/raven) and [raven-bin](https://aur.archlinux.org/packages/raven-bin).
+<a id="ci"></a>
+To run Raven on every pull request, see [Raven in CI](docs/ci.md). GitHub Actions users can install it with `jbearak/setup-raven@v1`.
 
-**Ubuntu:** Install from Raven's signed apt repository. See [Ubuntu installation](docs/cli.md#ubuntu-installation) for setup, then use apt to install and update Raven on your desktop, server, or CI runner.
+<a id="features"></a>
+## What you get
 
-**Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
+<a id="code-intelligence"></a>
+**Analysis**
 
-Run `raven check` for full diagnostics or `raven lint` for style checks. See [CLI](docs/cli.md) for usage and options.
+- [Diagnostics](docs/diagnostics.md): undefined and used-before-defined variables, syntax errors, missing files and packages.
+- [Cross-file analysis](docs/cross-file.md): follows `source()` chains, including computed paths and `{targets}` pipelines.
+- [Non-standard evaluation](docs/non-standard-evaluation.md): dplyr columns, ggplot aesthetics, and other NSE are not flagged.
+- [Package development](docs/r-package-dev.md), [box and import modules](docs/modules.md), and [`.Rprofile`](docs/rprofile.md) are modeled too.
+- [Linting](docs/linting.md): opt-in style rules, configured with `raven.toml`, `.lintr`, or VS Code settings.
+- [Directives](docs/directives.md): `# raven:` comments for what static analysis can't see.
 
-### CI
+**Navigation and editing**
 
-Use `raven check` in GitHub Actions, Bitbucket Pipelines, or another CI system to catch analyzer diagnostics before code merges. See [Automated checks in CI](docs/ci.md).
+- [Completion](docs/completion.md), [hover](docs/hover.md), [go to definition](docs/go-to-definition.md), and [find references](docs/find-references.md), across files.
+- [Document outline](docs/document-outline.md), [indentation](docs/indentation.md) as you type, [syntax highlighting](docs/syntax-highlighting.md), and [snippets](docs/snippets.md).
+- JAGS and Stan files get [highlighting](docs/syntax-highlighting.md#jags-and-stan), [completion](docs/completion.md#jags-and-stan), [definitions](docs/go-to-definition.md#jags-and-stan), [references](docs/find-references.md#jags-and-stan), [outlines](docs/document-outline.md#jags-and-stan-model-structure), [parse errors](docs/diagnostics.md#jags-and-stan-parse-errors), and Stan [undeclared-variable checks](docs/diagnostics.md#stan-undeclared-variables).
 
-**GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
+<a id="r-session-integration"></a>
+**R session (VS Code)**
 
-**Bitbucket Pipelines and Ubuntu CI:** Install Raven from the signed apt repository in an Ubuntu image, then run `raven check`. See [CLI](docs/cli.md#bitbucket-pipelines-example).
+- An [R console](docs/r-console.md) that runs your installed R, with code sent straight from the editor.
+- A [debugger](docs/debugger.md) with breakpoints, stepping, variables, and the Debug Console.
+- [Plot](docs/plot-viewer.md), [data](docs/data-viewer.md), and [help](docs/help-viewer.md) viewers. The data viewer stays fast on millions of rows.
+
+**R Markdown, Quarto, and CI**
+
+- [Chunks](docs/chunks.md) with run buttons and full code intelligence, [R Markdown preview and export](docs/knit.md), and [Quarto preview and render](docs/quarto.md).
+- [`raven check` and `raven lint`](docs/cli.md) for the command line and [CI](docs/ci.md).
+
+<a id="how-raven-differs"></a>
+## Why static analysis
+
+Raven reads your files instead of asking a running R session what exists. That has four consequences:
+
+- It answers the moment you open a file, even code that errors halfway or that you're only reading.
+- It reflects what the file says, not what your session remembers from an hour ago.
+- It never runs your code, so it is safe on any project and behind an AI agent.
+- It runs anywhere, including CI, with no R installed.
+
+[How Raven compares](docs/comparison.md) covers RStudio, Positron, vscode-R, lintr, Jarl, and Air.
+
+## Works with your setup
+
+Raven adds to the R tools you already use. Its language server runs alongside vscode-R's, and its R console and viewers step aside when vscode-R or Positron is present. [Using Raven with other R tools](docs/coexistence.md) explains each combination.
 
 ## Documentation
 
-Each feature above links to its own page. Beyond those:
+All pages are listed in the [documentation hub](docs/README.md). Start with [Getting started](docs/getting-started.md), and see [Troubleshooting](docs/troubleshooting.md) or the [FAQ](docs/faq.md) when something is unclear. Raven is under active development; bug reports and feedback are welcome in [issues](https://github.com/jbearak/raven/issues).
 
-- [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
-- [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
-- [Automated checks in CI](docs/ci.md) — What CI is, why `raven check` belongs there, and GitHub Actions / Bitbucket Pipelines templates
-- [CLI](docs/cli.md) — `raven check` (full diagnostics) and `raven lint` (style) for CI and command-line usage
-- [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
-- [`.Rprofile` Startup Prelude](docs/rprofile.md) — How Raven models project startup files for script scope
-- [Non-Standard Evaluation](docs/non-standard-evaluation.md) — How Raven handles NSE, when to add `# raven: nse`, and when to use other escape hatches
-- [Speeding Up Cross-File Analysis](docs/cross-file-analysis-performance.md) — When `# raven: self-contained` improves analysis of high-fan-out source graphs
-- [Coexistence](docs/coexistence.md) — Running alongside REditorSupport (vscode-R) and Positron
-- [Comparison](docs/comparison.md) — How Raven compares to other R tools
-- [Chunk Keybinding Comparison](docs/keybinding-comparison.md) — Chunk shortcuts across Raven, Quarto, RStudio, and REditorSupport
-- [Limitations](docs/limitations.md) — Features not yet implemented
+Raven's sibling project [Sight](https://github.com/jbearak/sight) is a language server for Stata with the same cross-file model.
 
-## Development
-
-See [Development Notes](docs/development.md) for build/test, profiling, and internal architecture.
+<a id="editors"></a><a id="development"></a>
+Contributors: [development notes](docs/development.md) cover building, testing, and internals.
 
 ## Provenance
 
