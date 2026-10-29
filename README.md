@@ -27,7 +27,7 @@ analysis.R:6:6 warning: fit is used before it is defined (defined on line 7) [un
 
 *The same check in VS Code, from the [Getting started](docs/getting-started.md) tutorial (Raven 0.21.1).*
 
-Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags the typo and the plot that runs before the model exists. In your editor, the same warnings appear as you type. No R session is involved, and the output above was produced with R turned off.
+Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags the typo and the plot that runs before the model exists. Style linters such as lintr and Jarl check how each line is written; Raven checks whether every name your code uses exists at that point, following `source()` across files, and it runs alongside them. In your editor, the same warnings appear as you type. No R session is involved, and the output above was produced with R turned off.
 
 ## Installation
 

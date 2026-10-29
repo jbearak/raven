@@ -30,7 +30,10 @@ function jsoncToJson(src: string): string {
       while (i < src.length && src[i] !== "\n") i++;
       out += "\n";
     } else if (c === "/" && src[i + 1] === "*") {
-      i = src.indexOf("*/", i + 2) + 1;
+      const end = src.indexOf("*/", i + 2);
+      // Leave an unterminated comment in place so JSON.parse reports it.
+      if (end === -1) return src;
+      i = end + 1;
     } else out += c;
   }
   return out.replace(/,(\s*[}\]])/g, "$1");
