@@ -1091,6 +1091,12 @@ fn read_new_input_from(prompt: &str, kind: PromptKind, cap: usize, depth: u32) -
             // SAFETY: R thread; R's own handler only ever stores 1 here.
             unsafe { *p = 0 };
         }
+        // Windows R's flag: R clears it only when it polls.
+        #[cfg(windows)]
+        // SAFETY: R's exported global; R thread, R idle.
+        unsafe {
+            std::ptr::write_volatile(libr::get().user_break, 0)
+        };
     }
     result
 }

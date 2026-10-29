@@ -139,8 +139,18 @@ mod imp {
         }
     }
 
+    /// Real console handles: `is_terminal` also accepts MSYS/Cygwin pty
+    /// pipes (mintty), where the console API the editor needs fails.
     pub fn stdin_and_stdout_are_terminals() -> bool {
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+        let is_console = |which| {
+            let mut mode = 0u32;
+            // SAFETY: a plain query on the process's own handle.
+            unsafe { GetConsoleMode(GetStdHandle(which), &mut mode) != 0 }
+        };
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && is_console(STD_INPUT_HANDLE)
+            && is_console(STD_OUTPUT_HANDLE)
     }
 
     /// Make the console carry UTF-8 (R's native encoding under raven.exe's
@@ -225,8 +235,8 @@ mod imp {
         Line::Text(format!("{text}\n"))
     }
 
-    /// Whether the console's input holds a key press; other events (focus,
-    /// mouse, key releases) are discarded, so a wait on the handle doesn't
+    /// Whether the console's input holds a key press that types something;
+    /// other events (focus, mouse, key releases, bare modifiers) are discarded, so a wait on the handle doesn't
     /// spin on them.
     fn key_pending(h: windows_sys::Win32::Foundation::HANDLE) -> bool {
         // SAFETY: an all-zero INPUT_RECORD is valid; the API writes at most
@@ -237,9 +247,13 @@ mod imp {
             if PeekConsoleInputW(h, recs.as_mut_ptr(), recs.len() as u32, &mut n) == 0 {
                 return true; // let the read decide
             }
-            let key = recs[..n as usize]
-                .iter()
-                .any(|r| u32::from(r.EventType) == KEY_EVENT && r.Event.KeyEvent.bKeyDown != 0);
+            // A cooked read ignores keys without a character (Shift, Alt);
+            // they must not end the idle loop that serves the debugger.
+            let key = recs[..n as usize].iter().any(|r| {
+                u32::from(r.EventType) == KEY_EVENT
+                    && r.Event.KeyEvent.bKeyDown != 0
+                    && r.Event.KeyEvent.uChar.UnicodeChar != 0
+            });
             if !key && n > 0 {
                 ReadConsoleInputW(h, recs.as_mut_ptr(), n, &mut n);
             }
