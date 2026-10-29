@@ -2,7 +2,8 @@
 //! Adapter Protocol's `Content-Length` framing (design §2).
 //!
 //! One client at a time (a newer connection replaces an older one: VS Code
-//! reconnects for each debug session). The reader thread hands every parsed
+//! reconnects for each debug session, and the older one's messages are
+//! dropped from then on). The reader thread hands every parsed
 //! message to the handler; replies and events go through [`Outbox`], whose
 //! writer thread owns the socket, so the R thread never blocks on I/O. None
 //! of these threads ever touches R.
@@ -154,6 +155,19 @@ pub fn start(
                     .spawn(move || {
                         let mut r = BufReader::new(reader);
                         while let Some(msg) = read_frame(&mut r) {
+                            // A client replaced by a newer one is gone as far
+                            // as the debugger is concerned: its late requests
+                            // (typically a `disconnect`) must not act on the
+                            // new session's stop, and replies would reach the
+                            // new client anyway.
+                            let live = current
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_ref()
+                                .is_some_and(|(cid, _)| *cid == id);
+                            if !live {
+                                break;
+                            }
                             on_message(msg);
                         }
                         let mut g = current.lock().unwrap_or_else(|e| e.into_inner());

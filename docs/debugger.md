@@ -10,16 +10,16 @@ It needs Raven's console (`raven.rTerminal.program` = `raven`, the default). It 
 2. Run the code that defines it with **Run Line or Selection**, **Run Chunk**, or **Source File** (`Cmd+Enter`, `Shift+Cmd+Enter`).
 3. Call the code. When R reaches the breakpoint, VS Code switches to the debugger, showing the stopped line, the call stack and the variables.
 
-You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error (if you turned that on), and detaches when R gets back to the `>` prompt.
+You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error (if you turned that on), and detaches when R gets back to the `>` prompt. When you run several expressions at once (a selection, Run All Chunks, a sourced file), the session lasts until all of them have run, so stopping again in a later one doesn't restart the debugger.
 
-To attach before anything stops, run **Raven: Start R Debugging**. You need this to turn on an exception filter for the first time, because the filters live in the **Breakpoints** view of a running session (Raven remembers them per workspace after that). **F5** with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script.
+To attach before anything stops, run **Raven: Start R Debugging**. You need this to turn on an exception filter for the first time, because the filters live in the **Breakpoints** view of a running session (Raven remembers them per workspace after that). **F5** with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger; the session ends when the file has run. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script.
 
 ## What you can do while stopped
 
 | Action | How |
 |---|---|
 | Continue, Step Over, Step Into, Step Out | Toolbar or F5/F10/F11/Shift+F11. These send R's own `c`, `n`, `s`, `f` |
-| Stop | Toolbar **Stop** quits the browser (`Q`) and returns R to the prompt. **Disconnect** lets R continue (`c`); the next stop attaches again |
+| Stop | Toolbar **Stop** quits the browser (`Q`) and returns R to the prompt. With an `attach` configuration of your own the button is **Disconnect**, which lets R continue (`c`); Alt-click it to Stop |
 | Look at variables | **Variables** view: locals of the selected frame, the enclosing environment, and the global environment. Long vectors and lists are paged |
 | Watch an expression | **Watch** view, evaluated in the selected frame |
 | Run R code | **Debug Console**, evaluated in the frame selected in **Call Stack**, with completions that include the frame's own variables. What the code prints, its messages and its warnings appear in the Debug Console. Typing in the terminal at `Browse[1]>` evaluates in R's browsed frame, as R defines |

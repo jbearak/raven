@@ -169,6 +169,63 @@ const DYNAMIC_SCOPE: &[&str] = &[
     "sys.function",
 ];
 
+/// The R code of a file, line for line: for R Markdown and Quarto
+/// documents every line outside an R chunk (prose, fences, other engines)
+/// is blanked, so breakpoints plan against the code the chunks will send
+/// and keep their line numbers. Other files are returned as they are.
+pub fn r_code_of<'a>(path: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    let lower = path.to_ascii_lowercase();
+    if ![".rmd", ".qmd", ".rmarkdown"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    // The open chunk's fence (its backticks), when inside an R chunk.
+    let mut fence: Option<String> = None;
+    let mut other: Option<String> = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let t = body.trim_start();
+        let ticks: String = t.chars().take_while(|c| *c == '`').collect();
+        let keep = if let Some(f) = &fence {
+            if ticks.len() >= f.len() && t[ticks.len()..].trim().is_empty() {
+                fence = None;
+                false
+            } else {
+                true
+            }
+        } else if let Some(f) = &other {
+            if ticks.len() >= f.len() && t[ticks.len()..].trim().is_empty() {
+                other = None;
+            }
+            false
+        } else if ticks.len() >= 3 {
+            let info = t[ticks.len()..].trim_start();
+            let is_r = info
+                .strip_prefix('{')
+                .map(|i| i.trim_start())
+                .and_then(|i| i.strip_prefix(['r', 'R']))
+                .is_some_and(|rest| rest.starts_with([' ', ',', '}']));
+            if is_r {
+                fence = Some(ticks);
+            } else {
+                other = Some(ticks);
+            }
+            false
+        } else {
+            false
+        };
+        if keep {
+            out.push_str(line);
+        } else {
+            out.push_str(&line[body.len()..]);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 pub fn parse(text: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
@@ -812,6 +869,23 @@ mod tests {
         // Plain top-level statements are not functions' bodies.
         let p = plan("x <- y + 1\n", 1, &[bp("c", 1)]);
         assert!(p.injections()[0].brace_end.is_none());
+    }
+
+    #[test]
+    fn markdown_documents_plan_their_r_chunks_only() {
+        let doc = "---\ntitle: x\n---\n\nSome *prose* (with { braces.\n\n```{r setup, echo=FALSE}\na <- 1\n```\n\n```{python}\nb = 2\n```\n\n```{r}\nf <- function() {\n  a + 1\n}\n```\n";
+        let code = r_code_of("/w/report.Rmd", doc);
+        assert_eq!(code.lines().count(), doc.lines().count());
+        let p = plan(
+            &code,
+            1,
+            &[bp("a", 8), bp("b", 12), bp("c", 17), bp("d", 5)],
+        );
+        assert_eq!(injected(&p), vec![("a".into(), 8), ("c".into(), 17)]);
+        assert!(matches!(
+            r_code_of("/w/a.R", "x"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

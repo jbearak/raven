@@ -174,9 +174,18 @@ impl Console {
 
     /// Send code over IPC, optionally with its location in `path`.
     fn send(&self, code: &str, path: Option<&str>) {
+        self.send_tagged(code, path.map(|p| (p, 1)));
+    }
+
+    /// Send `code` as having come from `path` starting at `line`.
+    fn send_at(&self, code: &str, path: &str, line: u32) {
+        self.send_tagged(code, Some((path, line)));
+    }
+
+    fn send_tagged(&self, code: &str, at: Option<(&str, u32)>) {
         let mut msg = json!({"v": 1, "id": 1, "op": "execute", "code": code});
-        if let Some(p) = path {
-            msg["location"] = json!({"path": p, "line": 1, "col": 0});
+        if let Some((p, line)) = at {
+            msg["location"] = json!({"path": p, "line": line, "col": 0});
         }
         let s = UnixStream::connect(self.dir.join("i")).expect("ipc connect");
         s.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -222,11 +231,18 @@ struct Dap {
     w: UnixStream,
     msgs: Arc<Mutex<Vec<Value>>>,
     seq: i64,
+    dir: PathBuf,
 }
 
 impl Dap {
+    /// Connect and attach; the caller sets breakpoints, then sends
+    /// `configurationDone`.
     fn connect(c: &Console) -> Dap {
-        let s = UnixStream::connect(c.dir.join("d")).expect("dap connect");
+        Dap::open(&c.dir, false)
+    }
+
+    fn open(dir: &Path, configure: bool) -> Dap {
+        let s = UnixStream::connect(dir.join("d")).expect("dap connect");
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let sink = msgs.clone();
         let r = s.try_clone().unwrap();
@@ -256,17 +272,33 @@ impl Dap {
                     .push(serde_json::from_slice(&buf).unwrap());
             }
         });
-        let mut d = Dap { w: s, msgs, seq: 1 };
+        let mut d = Dap {
+            w: s,
+            msgs,
+            seq: 1,
+            dir: dir.to_path_buf(),
+        };
         d.req("initialize", json!({"adapterID": "raven-r"}));
         d.req("attach", json!({}));
+        if configure {
+            d.req("configurationDone", json!({}));
+        }
         d
+    }
+
+    /// What VS Code does after `terminated`: disconnect, and start a new
+    /// session (on the next stop; here, right away).
+    fn session_ended(&mut self) {
+        let _ = self.send("disconnect", json!({}));
+        let next = Dap::open(&self.dir.clone(), true);
+        *self = next;
     }
 
     fn mark(&self) -> usize {
         self.msgs.lock().unwrap().len()
     }
 
-    fn req(&mut self, command: &str, args: Value) -> Value {
+    fn send(&mut self, command: &str, args: Value) -> i64 {
         let seq = self.seq;
         self.seq += 1;
         let body = serde_json::to_vec(
@@ -275,6 +307,11 @@ impl Dap {
         .unwrap();
         write!(self.w, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
         self.w.write_all(&body).unwrap();
+        seq
+    }
+
+    fn req(&mut self, command: &str, args: Value) -> Value {
+        let seq = self.send(command, args);
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if let Some(r) = self
@@ -406,6 +443,7 @@ fn breakpoint_in_sent_code_stops_with_stack_locals_and_evaluate() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("[1] 4");
     // The debugger's own steps never show in the terminal.
     assert!(!c.text().contains("raven-probe"), "{}", c.text());
@@ -457,6 +495,7 @@ fn conditions_logpoints_top_level_stops_and_stepping_across_expressions() {
     let m = d.mark();
     d.req("next", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("done 6");
     // Stepping off the end left no step flag behind for the next input.
     let m = d.mark();
@@ -493,6 +532,7 @@ fn stepping_onto_a_breakpoint_line_stops_once() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("[1] 4");
 }
 
@@ -557,6 +597,7 @@ fn exceptions_function_breakpoints_and_source() {
     let m = d.mark();
     d.req("next", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("boom: 10");
     d.req("setExceptionBreakpoints", json!({"filters": []}));
 
@@ -576,6 +617,7 @@ fn exceptions_function_breakpoints_and_source() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     d.req("setFunctionBreakpoints", json!({"breakpoints": []}));
 
     d.req(
@@ -596,6 +638,7 @@ fn exceptions_function_breakpoints_and_source() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("[1] 10");
 }
 
@@ -651,6 +694,7 @@ fn step_in_skips_code_without_srcref_and_frames_get_virtual_sources() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
 
     d.req(
         "setFunctionBreakpoints",
@@ -672,6 +716,7 @@ fn step_in_skips_code_without_srcref_and_frames_get_virtual_sources() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
 }
 
 #[test]
@@ -702,6 +747,7 @@ fn steps_never_leak_into_a_later_send_and_function_breakpoints_bind_late() {
     let m = d.mark();
     d.req("next", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     // A second tagged send runs without a stop.
     let q = c.write_file("t.R", "w <- 7\nw * 6\n");
     let m = d.mark();
@@ -735,6 +781,7 @@ fn steps_never_leak_into_a_later_send_and_function_breakpoints_bind_late() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("[1] 42");
     assert!(!c.text().contains("careful"), "{}", c.text());
     d.req("setFunctionBreakpoints", json!({"breakpoints": []}));
@@ -803,6 +850,7 @@ fn unbraced_bodies_handlers_completions_and_nested_browsers() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("[1] 10");
     // A breakpoint in a tryCatch() handler binds and stops.
     let m = d.mark();
@@ -812,5 +860,126 @@ fn unbraced_bodies_handlers_completions_and_nested_browsers() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("\"no\"");
+}
+
+#[test]
+fn session_lifecycle_survives_teardown_races_and_disconnect_semantics() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "p1 <- 1\np2 <- 2\np3 <- 3\n";
+    let p = c.write_file("l.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 1}, {"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    // Two stops in one send: one session, no `terminated` in between.
+    let m = d.mark();
+    c.send(src, Some(&p));
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("stopped", m);
+    assert_eq!(d.count("terminated", m), 0, "session ended between stops");
+    assert_eq!(d.stack()[0].1, 3);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.send("rm(p1, p2, p3)", None);
+
+    // VS Code's teardown `disconnect` can arrive after the next stop: it
+    // must not resume it, and the next session sees that stop.
+    let m = d.mark();
+    c.send(src, Some(&p));
+    d.event("stopped", m);
+    d.session_ended();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(d.stack()[0].1, 1, "the new session sees the stop");
+
+    // A user Disconnect lets R continue (to the next breakpoint)...
+    d.req("disconnect", json!({"terminateDebuggee": false}));
+    let mut d = Dap::open(&c.dir, true);
+    d.event("stopped", 0);
+    assert_eq!(d.stack()[0].1, 3);
+    // ...and Stop (terminateDebuggee) quits the browser.
+    d.req("disconnect", json!({"terminateDebuggee": true}));
+    std::thread::sleep(Duration::from_millis(500));
+    c.send("cat('after', exists('p3'), '\\n')", None);
+    c.expect("after FALSE");
+}
+
+#[test]
+fn sourcing_with_echo_shows_only_the_users_lines() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "# a comment\nv1 <- 10\nfn <- function(x) {\n  x + v1\n}\nprint(fn(1))\n";
+    let p = c.write_file("e.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 2}, {"line": 4}]}),
+    );
+    d.req("configurationDone", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    let m = d.mark();
+    c.send(&format!("source('{p}', echo = TRUE)"), None);
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("fn".to_string(), 4));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("[1] 11");
+    let text = c.text();
+    assert_eq!(text.matches("> # a comment").count(), 1, "{text}");
+    assert_eq!(text.matches("> v1 <- 10").count(), 1, "{text}");
+    assert!(!text.contains("Called from"), "{text}");
+    assert!(text.contains("+   x + v1"), "{text}");
+    assert!(!text.contains("#line"), "{text}");
+    assert!(!text.contains("raven"), "{text}");
+}
+
+#[test]
+fn r_markdown_breakpoints_bind_per_chunk() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let doc = "---\ntitle: t\n---\n\nProse (with an { open brace.\n\n```{r}\nrk <- function(x) {\n  x * 3\n}\n```\n";
+    let p = c.write_file("r.Rmd", doc);
+    let mut d = Dap::connect(&c);
+    let r = d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 9}]}),
+    );
+    let msg = r["body"]["breakpoints"][0]["message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(msg.contains("not run"), "{r}");
+    d.req("configurationDone", json!({}));
+    // Run Chunk sends the chunk's code tagged with its first line.
+    let chunk = "rk <- function(x) {\n  x * 3\n}";
+    let m = d.mark();
+    c.send_at(chunk, &p, 8);
+    assert_eq!(
+        d.event("breakpoint", m)["body"]["breakpoint"]["verified"],
+        true
+    );
+    let m = d.mark();
+    c.send("rk(2)", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("rk".to_string(), 9));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("[1] 6");
 }

@@ -805,7 +805,8 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
         route_submission(level);
         // The debugger's hidden input (stack capture, stepping through
         // probes, installing handlers) comes before anything queued.
-        if let Some(hidden) = dap::on_repl_prompt(level) {
+        let more = with_state(|s| !s.pending.is_empty() || !s.segments.is_empty()).unwrap_or(false);
+        if let Some(hidden) = dap::on_repl_prompt(level, more) {
             return Some(hidden);
         }
         if kind == PromptKind::TopLevel {

@@ -753,6 +753,31 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     source_args <- c("local", "echo", "print.eval", "verbose", "prompt.echo", "max.deparse.length",
                      "width.cutoff", "deparseCtrl", "spaced", "keep.source", "chdir", "encoding", "skip.echo")
+    # `source(echo = TRUE)` echoes the lines each top-level srcref spans in its
+    # srcfile, which for annotated text would show `#line` directives and
+    # probes. Point the srcrefs at the user's own lines (the `#line`-mapped
+    # numbers), and give each top-level probe the span of the statement it
+    # guards: the statement echoes before its probe stops, and not again.
+    # Only the echo reads these;
+    # stops use the srcrefs inside the expressions, which are untouched.
+    echo_original <- function(exprs, path, lines) {
+        sr <- attr(exprs, "srcref")
+        if (is.null(sr) || !length(sr)) return(exprs)
+        of <- srcfilecopy(path, lines)
+        out <- vector("list", length(sr))
+        nxt <- NULL
+        for (i in rev(seq_along(sr))) {
+            if (identical(utils::getSrcFilename(sr[[i]]), "<raven-probe>")) {
+                out[[i]] <- nxt
+            } else {
+                out[[i]] <- nxt <- srcref(of, as.integer(sr[[i]])[1:6])
+            }
+        }
+        attr(exprs, "srcref") <- out
+        attr(exprs, "srcfile") <- of
+        attr(exprs, "wholeSrcref") <- srcref(of, c(1L, 1L, length(lines), 1L, 1L, 1L))
+        exprs
+    }
     env$source_hook <- function(file, local = FALSE, ...) {
         orig <- state$orig_source
         if (is.null(orig)) orig <- base::source
@@ -778,6 +803,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is.null(ann)) return(plain())
         alines <- strsplit(ann, "\n", fixed = TRUE)[[1L]]
         exprs <- parse(text = alines, keep.source = TRUE, srcfile = srcfilecopy(path, alines), encoding = "UTF-8")
+        if (isTRUE(args$echo)) exprs <- tryCatch(echo_original(exprs, path, lines), error = function(e) exprs)
         if (isTRUE(args$chdir)) {
             owd <- setwd(dirname(path))
             on.exit(setwd(owd), add = TRUE)

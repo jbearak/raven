@@ -24,8 +24,13 @@ import { get_send_options, send_code } from '../send-to-r/send-code';
  * - Breakpoints are mirrored to every console while no session exists, so
  *   code run before the first stop is already instrumented. VS Code's own
  *   `setBreakpoints` takes over inside a session; both carry the same set.
- * - Disconnecting while R is stopped lets R continue (the console feeds
- *   `c`); Stop quits the browser (`Q`). The next stop attaches again.
+ * - Sessions the extension starts are `launch` sessions, so the toolbar shows
+ *   Stop, which quits the browser (`Q`), as stopping a Python or Node
+ *   program does. A user-configured `attach` shows Disconnect, which lets R
+ *   continue (`c`). The console ignores the `disconnect` VS Code sends after
+ *   a `terminated` it sent itself.
+ * - A stop pushed while this console's previous session is still tearing
+ *   down attaches as soon as that session is gone.
  * - F5 with an R file open and no launch.json sources that file in the
  *   console (a `launch` with `program`); the session itself is the same
  *   attach to the console.
@@ -55,6 +60,10 @@ function just_my_code(): boolean {
 
 let context_ref: vscode.ExtensionContext | null = null;
 const sessions = new Map<string, vscode.DebugSession>();
+/** Consoles that stopped while their previous session was ending. */
+const attach_after_end = new Set<string>();
+/** Sessions the console has ended (`terminated`) that VS Code is tearing down. */
+const ending = new Set<string>();
 const links = new Map<string, ConsoleLink>();
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
@@ -203,10 +212,16 @@ class ConsoleLink {
 
 async function auto_attach(ipc: string): Promise<void> {
     if (!debugger_enabled() || attach_policy() === 'never') return;
-    if (sessions.has(ipc)) return;
+    const current = sessions.get(ipc);
+    if (current) {
+        // A live session receives the stop itself; one that is ending
+        // won't, so attach again once it has gone.
+        if (ending.has(current.id)) attach_after_end.add(ipc);
+        return;
+    }
     await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
         type: DEBUG_TYPE,
-        request: 'attach',
+        request: 'launch',
         name: 'R console',
         consoleSocket: ipc,
     });
@@ -237,14 +252,15 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
             const doc = vscode.window.activeTextEditor?.document;
             config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
                 ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
-                : { type: DEBUG_TYPE, request: 'attach', name: 'R console' };
+                : { type: DEBUG_TYPE, request: 'launch', name: 'R console' };
         }
-        if (config.request === 'launch') {
-            const doc = vscode.window.activeTextEditor?.document;
-            if (!config.program || config.program === '${file}') config.program = doc?.uri.fsPath;
-            if (!config.program) {
-                void vscode.window.showErrorMessage('Raven: no R file to run (set "program").');
-                return undefined;
+        if (config.request === 'launch' && config.program) {
+            if (config.program === '${file}') {
+                config.program = vscode.window.activeTextEditor?.document.uri.fsPath;
+                if (!config.program) {
+                    void vscode.window.showErrorMessage('Raven: no R file is open to run.');
+                    return undefined;
+                }
             }
             const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
             if (open?.isDirty && !(await open.save())) return undefined;
@@ -283,7 +299,8 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
         const ipc: string = session.configuration.consoleSocket;
         const program: string | undefined = session.configuration.program;
         return {
-            onDidSendMessage(m: { type?: string; command?: string; success?: boolean }) {
+            onDidSendMessage(m: { type?: string; command?: string; event?: string }) {
+                if (m.type === 'event' && m.event === 'terminated') ending.add(session.id);
                 // Run the program once the session's breakpoints are in.
                 if (program && m.type === 'response' && m.command === 'configurationDone') {
                     const terminal = live_console_sockets().find(([, sock]) => sock === ipc)?.[0];
@@ -325,15 +342,19 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         }),
         vscode.debug.onDidTerminateDebugSession((s) => {
             if (s.type !== DEBUG_TYPE) return;
-            if (sessions.get(s.configuration.consoleSocket) === s) sessions.delete(s.configuration.consoleSocket);
+            const ipc: string = s.configuration.consoleSocket;
+            if (sessions.get(ipc) === s) sessions.delete(ipc);
+            ending.delete(s.id);
             update_status();
+            // The console replays a live stop to the next session.
+            if (attach_after_end.delete(ipc)) void auto_attach(ipc);
             // Filters may have changed in the session; keep consoles in step.
             mirror_all();
         }),
         vscode.commands.registerCommand('raven.debugger.start', async () => {
             await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
                 type: DEBUG_TYPE,
-                request: 'attach',
+                request: 'launch',
                 name: 'R console',
             });
         }),

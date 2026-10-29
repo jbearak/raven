@@ -2550,7 +2550,7 @@
               "program": {
                 "type": "string",
                 "default": "${file}",
-                "description": "R script to source() in the R console once the debugger is attached."
+                "description": "R script to source() in the R console once the debugger is attached. Leave unset to debug whatever you run in the console; the session then starts and ends like an automatic one."
               },
               "consoleSocket": {
                 "type": "string",

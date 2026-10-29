@@ -188,6 +188,17 @@ struct Shared {
     /// The session asked to step into code without source too
     /// (`justMyCode: false`).
     all_code: bool,
+    /// Level-0 prompts so far (R thread), and, for a session launched to
+    /// run a `program`, the count when it was configured: a later prompt
+    /// means the program has finished.
+    prompts: u64,
+    session_from: Option<u64>,
+    runs_program: bool,
+    /// The current session has seen a stop and not yet been ended.
+    session_open: bool,
+    /// `terminated` was sent to the current client: its `disconnect` is
+    /// VS Code's teardown, not a user detach, and must not resume R.
+    ended: bool,
 }
 
 impl Shared {
@@ -485,6 +496,7 @@ fn capabilities() -> Value {
         "supportsExceptionInfoRequest": true,
         "supportsBreakpointLocationsRequest": true,
         "supportsTerminateRequest": true,
+        "supportTerminateDebuggee": true,
         "supportsDelayedStackTraceLoading": true,
         "supportsClipboardContext": true,
         "exceptionBreakpointFilters": [
@@ -507,18 +519,28 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
     let args = msg.get("arguments").cloned().unwrap_or(Value::Null);
     match cmd {
         "initialize" => {
-            lock_shared(shared).connected = true;
+            {
+                let mut s = lock_shared(shared);
+                s.connected = true;
+                s.ended = false;
+                s.session_from = None;
+                s.runs_program = false;
+            }
             out.respond(&msg, capabilities());
             out.event("initialized", json!({}));
         }
         "attach" | "launch" => {
-            lock_shared(shared).all_code = args["justMyCode"] == json!(false);
+            let mut s = lock_shared(shared);
+            s.all_code = args["justMyCode"] == json!(false);
+            s.runs_program = cmd == "launch" && args["program"].is_string();
+            drop(s);
             out.respond(&msg, json!({}));
         }
         "configurationDone" => {
             let stop = {
                 let mut s = lock_shared(shared);
                 s.configured = true;
+                s.session_from = s.runs_program.then_some(s.prompts);
                 s.stop.clone()
             };
             out.respond(&msg, json!({}));
@@ -633,13 +655,18 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             out.respond(&msg, json!({}));
         }
         "disconnect" => {
-            // Detaching lets R go on (as other debuggers' attach sessions
-            // do); terminating quits the browser.
+            // After our own `terminated` this is VS Code's teardown. Else a
+            // user detach: R goes on (as other debuggers' attach sessions
+            // do), or quits the browser when asked to end the debuggee.
+            let ended = std::mem::replace(&mut lock_shared(shared).ended, true);
             let terminate = args["terminateDebuggee"].as_bool().unwrap_or(false);
             out.respond(&msg, json!({}));
-            request_resume(if terminate { "Q" } else { "c" });
+            if !ended {
+                request_resume(if terminate { "Q" } else { "c" });
+            }
         }
         "terminate" => {
+            lock_shared(shared).ended = true;
             out.respond(&msg, json!({}));
             out.event("terminated", json!({}));
             request_resume("Q");
@@ -762,6 +789,7 @@ fn statement_lines(path: &str, from: u32, to: u32) -> Vec<u32> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    let text = annotate::r_code_of(path, &text);
     let reqs: Vec<BpRequest> = (from..=to)
         .map(|l| BpRequest {
             id: l.to_string(),
@@ -789,7 +817,9 @@ fn statement_lines(path: &str, from: u32, to: u32) -> Vec<u32> {
 pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String)>) -> Vec<Value> {
     let Some(h) = handle() else { return Vec::new() };
     let key = canonical(path);
-    let text = std::fs::read_to_string(&key).ok();
+    let text = std::fs::read_to_string(&key)
+        .ok()
+        .map(|t| annotate::r_code_of(&key, &t).into_owned());
     let plan = text.as_deref().map(|t| {
         let reqs: Vec<BpRequest> = wanted
             .iter()
@@ -1312,7 +1342,7 @@ fn read_current_srcref(use_na: bool) -> Option<(String, [u32; 4])> {
 
 /// Called for every REPL prompt (top level or browser) before the console
 /// feeds anything. Returns hidden input to give R instead of reading.
-pub fn on_repl_prompt(level: u32) -> Option<String> {
+pub fn on_repl_prompt(level: u32, more: bool) -> Option<String> {
     if !active() {
         return None;
     }
@@ -1335,7 +1365,7 @@ pub fn on_repl_prompt(level: u32) -> Option<String> {
         let _ = call_helper("at_prompt", &["FALSE"]);
     }
     if level == 0 {
-        return on_top_level();
+        return on_top_level(more);
     }
     let awaiting = with_r(|r| std::mem::take(&mut r.awaiting_capture))?;
     if awaiting {
@@ -1394,8 +1424,50 @@ fn report_function_breakpoints(bound: &str) {
     }
 }
 
-fn on_top_level() -> Option<String> {
+/// The session ends (`terminated`, so VS Code leaves debug mode) when R is
+/// back at the top-level prompt with nothing more of the submission to run,
+/// if it stopped, or it was launched to run a program that has now run. While
+/// more of the same submission is pending the session stays: the next
+/// expression may stop again (stepping across expressions, several
+/// breakpoints in one Run All Chunks), and ending in between would race the
+/// next stop against VS Code's teardown.
+fn end_session_at_prompt(more: bool) {
+    let Some(h) = handle() else { return };
+    let end = {
+        let mut s = lock(h);
+        s.prompts += 1;
+        let ran = s.session_from.is_some_and(|n| s.prompts > n);
+        if more || !(s.session_open || ran) {
+            return;
+        }
+        s.session_open = false;
+        s.session_from = None;
+        for bps in s.files.values_mut() {
+            for bp in bps.iter_mut() {
+                bp.hits = 0;
+            }
+        }
+        let live = s.connected && !s.ended;
+        s.ended = true;
+        live
+    };
+    if end && let Some(out) = outbox() {
+        out.event(
+            "continued",
+            json!({"threadId": 1, "allThreadsContinued": true}),
+        );
+        out.event("terminated", json!({}));
+    }
+    push_control(json!({"event": "running"}));
+}
+
+fn on_top_level(more: bool) -> Option<String> {
     release_held(true);
+    // A pause that arrived as R finished on its own must not turn a later
+    // Ctrl-C into a pause.
+    if let Some(h) = handle() {
+        h.pause.store(false, Ordering::SeqCst);
+    }
     let reply = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
     let (masked, bound) = reply.split_once('\x1e').unwrap_or((reply.as_str(), ""));
     let (masked, bound) = (masked.to_string(), bound.to_string());
@@ -1425,40 +1497,26 @@ fn on_top_level() -> Option<String> {
     if had_stop {
         // SAFETY: R thread at a prompt.
         unsafe { raven_dbg_clear_global_rdebug() };
-        let stepping = with_r(|r| {
+        with_r(|r| {
             // A step that finished a top-level expression stops at the
             // start of the next expression of the same submission (§4).
-            let s = matches!(r.last_user_resume.as_deref(), Some("n" | "s" | "f")) && r.resumed;
+            r.step_next_segment =
+                matches!(r.last_user_resume.as_deref(), Some("n" | "s" | "f")) && r.resumed;
             r.stopped = false;
             r.resumed = false;
             r.last_user_resume = None;
             r.pending_hit = None;
             r.pending_exception = None;
-            r.step_next_segment = s;
-            s
-        })
-        .unwrap_or(false);
-        let _ = stepping;
+        });
         if let Some(h) = handle() {
             let mut s = lock(h);
             s.stop = None;
             s.resume = None;
             s.rewrite_next = false;
-            for bps in s.files.values_mut() {
-                for bp in bps.iter_mut() {
-                    bp.hits = 0;
-                }
-            }
+            s.session_open = true;
         }
-        if let Some(out) = outbox() {
-            out.event(
-                "continued",
-                json!({"threadId": 1, "allThreadsContinued": true}),
-            );
-            out.event("terminated", json!({}));
-        }
-        push_control(json!({"event": "running"}));
     }
+    end_session_at_prompt(more);
     if !installed {
         with_r(|r| r.installed = true);
         return Some(INSTALL.into());
@@ -1562,6 +1620,10 @@ fn on_captured() -> Option<String> {
         )
     })
     .unwrap_or((None, None, None, false));
+    // A `Called from:` R printed for the debugger's own browser() (a probe,
+    // or the frame browser of an exception or pause stop) is noise; one for
+    // the user's browser() is kept, as R shows it.
+    let own_browser = hit.is_some() || step_probe || exception.is_some();
     let (reason, description, exc) = if let Some((kind, detail)) = exception {
         let mut parts = detail.split(US);
         let class = parts.next().unwrap_or("condition").to_string();
@@ -1613,7 +1675,7 @@ fn on_captured() -> Option<String> {
         r.resumed = false;
         r.had_stop = true;
     });
-    release_held(true);
+    release_held(!own_browser);
     let _ = call_helper("on_stop", &[]);
     if configured && let Some(out) = outbox() {
         send_stopped(out, &stop);
