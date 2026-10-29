@@ -1834,9 +1834,9 @@
             "none"
           ],
           "enumDescriptions": [
-            "Color the cell text for NA / NaN.",
-            "Tint the cell background for NA / NaN.",
-            "Render missing values like any other cell."
+            "Show NA / NaN in muted italic text.",
+            "Show NA / NaN in italics on a tinted cell background.",
+            "Show NA / NaN in italics, without color."
           ],
           "default": "foreground",
           "description": "How the data viewer highlights NA / NaN cells."

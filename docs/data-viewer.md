@@ -35,8 +35,8 @@ The panel title is the second argument when you give one, otherwise the expressi
 
 ## What it shows
 
-- `data.frame`, including `tibble` and `data.table` subclasses.
-- `matrix`. Non-default rownames appear as a leading `rowname` column; automatic `1..N` rownames are dropped in favor of the viewer's row-number gutter.
+- `data.frame`, including `tibble` and `data.table` subclasses. A frame with explicit row names (`View(mtcars)` shows the car names) gets a leading `rowname` column. Automatic row names (`1..N`) are never turned into a column; the row-number gutter shows them instead. If the frame already has a column called `rowname`, the new one is called `.rowname` (then `..rowname`, and so on).
+- `matrix`. Non-default rownames appear as a leading `rowname` column, named the same way; automatic `1..N` rownames are dropped in favor of the row-number gutter.
 - Atomic vectors and scalars (`numeric`, `integer`, `character`, `logical`, `complex`, `Date`, `POSIXct`), plus standalone `factor` and `haven_labelled` vectors. A vector renders as a `values` column (a `value` column when it has length 1). If the vector has `names()`, they appear in a leading `name` column, the same role the `rowname` column plays for a matrix. A standalone `factor` or `haven_labelled` vector keeps its labels, so the [Labels](#labels) toggle works on it. A 1-D array (`array(1:3)`) renders the same way as a vector, with its `dimnames` as the `name` column.
 - Flat lists, where every element is a scalar or vector. Each element becomes a column, padded with empty (`NA`) cells to the length of the longest element, and each column keeps its own type. Unnamed elements get `V1`, `V2`, … headers. So `c(a = 1, b = 2)` is a two-row `name`/`values` table, while `list(a = 1, b = 2)` is a one-row, two-column table, matching `as.data.frame(list(a = 1, b = 2))`.
 
@@ -51,11 +51,39 @@ Error: Can't `View()` an object of class `function`
 - An array with more than two dimensions (a 3-D or higher array, or a 3-way or higher `table`) reports its dimension count: `` Can't `View()` an array with 3 dimensions; the data viewer shows 2-dimensional tables only. ``
 - `raw` vectors, environments, functions, and other unsupported classes get the class-based message shown above.
 
+## Reading the header
+
+Each column header has up to three lines and a thin bar along its bottom edge:
+
+```text
+┌──────────────────────┐
+│ mpg                ▲2│  column name; sort direction and priority at the right
+│ <dbl>                │  type
+│ Miles per gallon     │  variable label
+└──────────────────────┘
+  ▔▔▔▔                    share of NA values
+```
+
+- The **type** line uses the same short tags as tibble: `<int>`, `<dbl>`, `<chr>`, `<lgl>`, `<fct>`, `<ord>`, `<date>`, `<dttm>`, `<drtn>`, `<cpl>`, and `<list>`. Columns with value labels add `+lbl` (`<dbl+lbl>`). A date-time column names the time zone its values are shown in (`<dttm America/New_York>`), and a duration names its unit (`<drtn secs>`).
+- The **label** line shows the variable label (`attr(col, "label")`). It appears only when at least one column has a label, and the Labels toggle doesn't hide it.
+- The **missing bar** fills in proportion to the column's share of NA values. Raven counts them in the background after the grid first appears; until the count is done, the bar is dashed.
+- Long names and labels end in `…`. Hover over a header for the full name and label, the R class, the source display format, the exact NA count and share, and the first few value labels.
+
+## Missing values and row numbers
+
+- A missing value shows the literal `NA` in italics, so it never looks like an empty string. `NaN` shows as `NaN`, also in italics, and stays distinct from `NA`. An empty string shows nothing. The `raven.dataViewer.missingValueStyle` setting picks muted text, a tinted background, or plain italics.
+- The gutter on the left shows each row's R row number, the number you'd use in `df[i, ]`. It keeps that number after you sort or filter, so row 18 stays 18 wherever it lands. While a filter is active, the gutter's header shows how many rows pass, such as `12 / 32`.
+- The gutter and any `rowname` column stay in place when you scroll right. Together they take at most half the panel's width; past that, the `rowname` column is shortened with `…`.
+
 ## Toolbar
 
 ```text
-rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | Filter: cyl ∈ {6,8} ✕ | [Labels] [Format] [3 digits ▾] | [Columns ▾ <7>]
+32 × 11   Sort: mpg ▲ cyl ▼ ✕   Filter: cyl ∈ {6,8} ✕        [Labels] [Format] [3 ▾] [Columns 2]
+…grid…
+rows 1–20 of 12 (filtered from 32) · 11 cols
 ```
+
+The left end of the toolbar shows the frame's shape, rows × columns, or `12 of 32 rows × 11` while a filter is active. The status line under the grid shows the exact range of rows on screen and the filter context.
 
 The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
 
@@ -69,28 +97,40 @@ On by default in new panels. When on, columns with labels show their labels inst
 - `haven_labelled` columns (from `haven::read_dta`) and other columns with `attr(col, "labels")` (haven) or `attr(col, "value.labels")` (`foreign::read.dta`, `readstata13::read.dta13`) show the matching label, or the raw value when no label is mapped.
 - Columns without label metadata are unchanged.
 
-The variable label (`attr(col, "label")`) always appears in the column-header tooltip, whatever the toggle says.
+Labels shown as text are left-aligned; with Labels off, labelled numbers are right-aligned like other numbers. The variable label (`attr(col, "label")`) always appears in the header's label line and tooltip, whatever the toggle says.
 
 ### Format
 
 On by default in new panels. When on, non-integer numeric columns are rounded to the digits chosen in the dropdown (0–6, default 3). Integer columns, dates, timestamps, factors, and string columns are unaffected. `NaN` and ±Inf show as `NaN`, `Inf`, and `-Inf`; they aren't formatted away.
 
-A floating-point column that the source file marked for integer display (Stata `%w.0f`, SAS/SPSS `F8.0`, `COMMA10.0`, `Z3.`, and so on) is treated like an integer column: Format does nothing to it, and the toggle is hidden when no other column would be affected. Separately, a single whole-number cell in an otherwise-decimal column (for example `5` in a column whose other rows are `1.5` and `2.25`) shows as `5`, not `5.000`. This avoids the misleading trailing zeros common in SPSS and SAS files that store whole numbers as doubles.
+- A nonzero value never shows as zero. A value that would round to zero, or one of 1e15 or more in size, switches to scientific notation (`1.23e-10`).
+- A whole number in a decimal column (for example `5` among `1.5` and `2.25`) shows as `5`, not `5.000`, which avoids the misleading trailing zeros common in SPSS and SAS files. It's padded so the decimal points still line up.
+- A number too wide for its column shows `###` rather than its leading digits. Hover over it for the full value, or widen the column.
+- With Format off, numbers show at full precision, with R-style exponents (`1e-07`).
+
+When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps it), Format uses it instead of the dropdown. Raven honors Stata `%w.df`, `%w.dfc` (with thousands separators), and `%w.dg` (significant digits), and SPSS and SAS `Fw.d`, `COMMAw.d`, `DOLLARw.d` (with a `$`), `PCTw.d` and `PERCENTw.d` (with a `%`, value unchanged), and `Zw.` (zero-padded). Other formats fall back to the dropdown. A column formatted for whole numbers (`%9.0f`, `F8.0`) is treated like an integer column, and the toggle is hidden when no other column would be affected.
+
+### Dates and times
+
+Dates print as `2024-03-01`, and date-times as `2024-03-01 09:00:00` in the column's own time zone (its `tzone` attribute), or the R session's zone when it has none. Hover over a date-time for the UTC offset in effect at that moment, so the two 01:30s on the night clocks fall back are told apart. Fractional seconds show 0, 3, or 6 digits, chosen once per column so the width doesn't change as you scroll. Years before 1 and after 9999 print as R prints them (`-044`, `10000`). A value too far from 1970 for the viewer to show reads `<out of range>`; hover for its raw seconds. If a time zone name isn't recognized, values show in UTC and the type line says so.
 
 ### Columns popover
 
 The Columns ▾ button opens a popover with one checkbox per column. Hidden and shown columns are remembered for the panel name and the data's column layout, so the same `View(mtcars)` opened tomorrow keeps the layout.
 
+Columns start wide enough for their name, type, label, and first loaded values, up to 400 px. Drag a header border to resize (40 to 3,200 px), or double-click it to fit the loaded values; dragged widths are remembered with the layout. Frames whose row names became a `rowname` column count as a new column layout, so their saved widths, hidden columns, sort, and filters reset once after updating Raven.
+
 ### Selection and copy
 
 - Click a cell, then Shift-click another to select the rectangle between them. Click-drag also extends the selection.
 - Click a column header to select that column; drag across headers to select several adjacent columns.
-- Click a row-number cell to select that row; drag across row numbers to select several adjacent rows.
-- Click the `#` corner cell (top-left) to select every row across all visible columns, as a row selection.
-- `Cmd/Ctrl+A` also selects every row across all visible columns, but as a column selection. The two look the same but copy differently, as described below.
-- `Cmd/Ctrl+C` copies the selection as tab-separated text. Copying follows the current Labels, Format, and digits settings, so you copy what you see.
-- Column-header selections and `Cmd/Ctrl+A` selections include the column-name row when copied. Cell, row-number, and `#`-corner selections copy data only, as in spreadsheets.
-- Right-click a cell, column header, or row number for a Copy menu that copies the current selection. Right-clicking a column header always selects just that column first. Right-clicking a cell outside the selection selects it first; right-clicking a cell inside the selection keeps the selection.
+- Click a row number in the gutter to select that row. Shift-click another row number to extend the selection, and Cmd/Ctrl-click to add or remove one row.
+- `Cmd/Ctrl+A` selects every row across all visible columns.
+- `Cmd/Ctrl+C` copies the selection as tab-separated text. Copying follows the current Labels, Format, and digits settings, so you copy what you see. Missing values copy as empty fields.
+- Column-header selections and `Cmd/Ctrl+A` selections include the column-name row when copied. Cell and row selections copy data only, as in spreadsheets.
+- Row numbers and the `rowname` column aren't copied. Choose Copy with row names from the right-click menu to include the `rowname` column, or, for a frame without one, the R row numbers.
+- Double-click a cell, or press `Enter`, to see a long or cut-off value in full (up to 64 KiB) with a Copy button.
+- Right-click a cell or column header for a Copy menu that copies the current selection. Right-clicking a column header always selects just that column first. Right-clicking a cell outside the selection selects it first; right-clicking a cell inside the selection keeps the selection.
 - The column-header menu also offers Hide column, plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
 - Copying is capped at 5,000,000 cells. Over the cap, the panel shows a message and doesn't copy.
 
@@ -108,6 +148,7 @@ The Columns ▾ button opens a popover with one checkbox per column. Hidden and 
 | `PageDown` | Scroll one screen down. |
 | `Cmd/Ctrl+A` | Select all rows across visible columns. |
 | `Cmd/Ctrl+C` | Copy the current selection as tab-separated text. |
+| `Enter` | Show the focused cell's full value when it's long or cut off. |
 | `Shift+Alt+A` | Sort the focused column ascending. |
 | `Shift+Alt+D` | Sort the focused column descending. |
 | `Shift+Alt+0` | Clear all sorts. |
@@ -211,7 +252,7 @@ Filters on different columns combine with AND: a row must pass all active filter
 
 ### Filter indicator
 
-The row count at the top left shows the filtered total as `Showing X-Y of N`, where `N` is the number of rows that pass all filters. While Raven recomputes the filter, a `Filtering…` pill appears beside the chips.
+The shape at the top left shows the filtered total as `N of M rows × C`, where `N` is the number of rows that pass all filters, and the gutter's header shows `N / M`. If no row passes, the grid says "No rows match these filters" and offers Clear filters. While Raven recomputes the filter, a `Filtering…` pill appears beside the chips.
 
 <a id="persistence-1"></a>
 
@@ -236,6 +277,7 @@ Active filters are remembered for the panel name and the data's column layout, a
 - Nothing happens when you call `View(df)`. Check that Raven started the terminal (the "R" entry in the terminal profile dropdown, or a send-to-R command), and that `requireNamespace("arrow")` returns `TRUE`. Also check that Raven's R console is active; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 - You see "Raven data viewer requires the 'arrow' package". Run `install.packages("arrow")` in the same R installation.
 - The Labels toggle doesn't change a column. The column has no label metadata. For `haven_labelled` columns, this means `attr(col, "labels")` is empty.
+- A frame with zero rows shows "No rows" under its column headers.
 - Copying fails with "Selection exceeds copy limit". The 5,000,000-cell cap is intentional; select less, or export the slice from R.
 
 ## Settings
