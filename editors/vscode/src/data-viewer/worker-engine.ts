@@ -60,13 +60,19 @@ function abortError(message: string): Error {
 /** One worker thread with request/reply correlation and restart. */
 class ThreadClient {
     private worker: Worker | undefined;
+    /** Resolves once the current thread opened its file. */
+    private started: Promise<void> = Promise.resolve();
+    /** Resolves once the current thread is also seeded; callers wait on
+     *  this, so nothing reaches a restarted thread before its seed. */
     private ready: Promise<void> = Promise.resolve();
     private readonly pending = new Map<number, Pending>();
     private nextId = 1;
-    private stopping = false;
+    /** Workers terminated on purpose; their `exit` is not a crash. */
+    private readonly retired = new WeakSet<Worker>();
     private disposed = false;
-    /** Seeds a fresh thread before re-issued requests run. */
-    onRestart: (() => Promise<void>) | undefined;
+    /** Seeds a fresh thread before re-issued requests run. `call` here
+     *  bypasses the seeded gate. */
+    onRestart: ((call: (msg: Record<string, unknown>) => Promise<unknown>) => Promise<void>) | undefined;
     /** Requests that should be re-issued after an *unexpected* exit. */
     reissueAllOnCrash = false;
     restarts = 0;
@@ -83,14 +89,15 @@ class ThreadClient {
     private start(): void {
         const w = new Worker(this.script, { workerData: this.init });
         this.worker = w;
-        this.ready = new Promise<void>((resolve, reject) => {
+        this.started = new Promise<void>((resolve, reject) => {
             const onMsg = (m: ThreadReply) => {
                 if (m.type === 'ready') { w.off('message', onMsg); resolve(); }
                 else if (m.type === 'openFailed') { w.off('message', onMsg); reject(new Error(m.error)); }
             };
             w.on('message', onMsg);
         });
-        this.ready.catch(() => undefined);
+        this.started.catch(() => undefined);
+        this.ready = this.started;
         w.on('message', (m: ThreadReply) => this.onMessage(m));
         w.on('error', err => this.log(`${this.name} thread error: ${String(err)}`));
         w.on('exit', code => { void this.onExit(w, code); });
@@ -112,7 +119,7 @@ class ThreadClient {
     }
 
     private async onExit(w: Worker, code: number): Promise<void> {
-        if (this.worker !== w || this.disposed || this.stopping) return;
+        if (this.worker !== w || this.disposed || this.retired.has(w)) return;
         this.log(`${this.name} thread exited (${code}); restarting`);
         await this.restartAndReissue(this.reissueAllOnCrash);
     }
@@ -129,9 +136,13 @@ class ThreadClient {
             if (reissueAll || p.reissue) toReissue.push(p);
             else p.reject(abortError(`${this.name} thread restarted`));
         }
+        const seeded = (async () => {
+            await this.started;
+            await this.onRestart?.(msg => this.send0(msg));
+        })();
+        this.ready = seeded;
         try {
-            await this.ready;
-            await this.onRestart?.();
+            await seeded;
         } catch (err) {
             for (const p of toReissue) p.reject(err);
             return;
@@ -149,7 +160,15 @@ class ThreadClient {
         opts: { onProgress?: (v: unknown) => void; reissue?: boolean; onId?: (id: number) => void } = {},
     ): Promise<T> {
         await this.ready;
-        if (this.disposed) throw abortError(`${this.name} thread disposed`);
+        return this.send0<T>(msg, opts);
+    }
+
+    /** Post a request on the current thread without waiting for its seed. */
+    private send0<T>(
+        msg: Record<string, unknown>,
+        opts: { onProgress?: (v: unknown) => void; reissue?: boolean; onId?: (id: number) => void } = {},
+    ): Promise<T> {
+        if (this.disposed) return Promise.reject(abortError(`${this.name} thread disposed`));
         const id = this.nextId++;
         opts.onId?.(id);
         const full = { ...msg, id };
@@ -179,14 +198,14 @@ class ThreadClient {
             this.pending.delete(victimId);
             p?.reject(reason);
         }
-        this.stopping = true;
-        try {
+        if (w) this.retired.add(w);
+        // Requests issued while the old thread dies wait for the new one.
+        const done = (async () => {
             await w?.terminate();
-        } finally {
-            this.stopping = false;
-        }
-        if (this.disposed) return;
-        await this.restartAndReissue(false);
+            if (!this.disposed) await this.restartAndReissue(false);
+        })();
+        this.ready = done.then(() => undefined, () => undefined);
+        await done;
     }
 
     /** Test hook: kill the thread as if it crashed. */
@@ -196,6 +215,7 @@ class ThreadClient {
 
     async dispose(): Promise<void> {
         this.disposed = true;
+        if (this.worker) this.retired.add(this.worker);
         for (const p of this.pending.values()) p.reject(abortError(`${this.name} thread disposed`));
         this.pending.clear();
         await this.worker?.terminate();
@@ -234,18 +254,18 @@ export class WorkerEngine implements DataEngine {
         // A restarted reader serves exactly what it served before: the
         // committed generation, the retained N−1, and the candidate.
         this.reader.reissueAllOnCrash = true;
-        this.reader.onRestart = async () => {
+        this.reader.onRestart = async (call) => {
             const seed = this.coordinator.readerSeed();
-            await this.reader.call({
+            await call({
                 op: 'seed',
                 seed: { committed: seed.committed, live: seed.live },
                 candidate: seed.candidate,
             });
         };
-        this.scan.onRestart = async () => {
+        this.scan.onRestart = async (call) => {
             this.scanRestarted = true;
             const c = this.coordinator.committed;
-            await this.scan.call({ op: 'seed', gen: c.gen, spec: c.spec });
+            await call({ op: 'seed', gen: c.gen, spec: c.spec });
         };
     }
 
