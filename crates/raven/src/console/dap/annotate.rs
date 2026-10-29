@@ -735,6 +735,9 @@ pub fn render(
         let line = first_line + text[..at].matches('\n').count() as u32;
         (line, col)
     };
+    // `#line`'s path is an R string literal: Windows backslashes must be
+    // escaped (`C:\Users` would be a `\U` escape).
+    let path = path.replace('\\', "\\\\");
     let mut out = String::with_capacity(text.len() + 128 * (edits.len() + 1));
     if wrap == Wrap::Braced {
         out.push_str("{\n");
@@ -773,6 +776,12 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_paths_are_escaped_in_line_directives() {
+        let out = render("x <- 1", r"C:\Users\Ana\a.R", 7, 0, &[], 1, Wrap::Braced);
+        assert!(out.contains(r#"#line 7 "C:\\Users\\Ana\\a.R""#), "{out}");
+    }
 
     fn bp(id: &str, line: u32) -> BpRequest {
         BpRequest {
