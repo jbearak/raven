@@ -44,6 +44,10 @@ In `main.R`, `summarize_score` gets a yellow squiggle. Hover it to read the mess
 summarize_score is not defined
 ```
 
+![VS Code showing a yellow squiggle under summarize_score and the hover message "summarize_score is not defined (undefined-variable)"](images/undefined-variable.png)
+
+*Step 3 in VS Code (Raven 0.21.1).*
+
 Raven followed `source("helpers.R")`, found `summarize_scores` (plural) there, and saw that `summarize_score` exists nowhere. R would only tell you this when you ran line 4.
 
 ## 4. Fix it
@@ -64,6 +68,10 @@ The squiggle disappears as you type. The name now matches a function that `helpe
 ## 5. Jump across files
 
 Hold Cmd (macOS) or Ctrl (Windows, Linux) and click `summarize_scores`. Or put the cursor on it and press F12. VS Code opens `helpers.R` at the definition.
+
+![Peek Definition on summarize_scores in main.R, showing its definition in helpers.R](images/go-to-definition.png)
+
+*Peek Definition (Alt+F12, or Option+F12 on macOS) shows the definition without leaving `main.R` (Raven 0.21.1).*
 
 Hover `summarize_scores` in `main.R`, and Raven shows the definition and the file it comes from. Completion works the same way: type `summ` in `main.R`, and `summarize_scores` is offered because it is in scope there.
 

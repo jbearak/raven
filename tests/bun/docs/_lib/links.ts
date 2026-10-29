@@ -52,5 +52,7 @@ export function checkTarget(fromFile: string, target: string): string | null {
 export function repoUrlsIn(source: string): string[] {
   return [...source.matchAll(/https:\/\/(?:github\.com\/jbearak\/raven\/(?:blob|tree)|raw\.githubusercontent\.com\/jbearak\/raven)\/main\/[^\s"'`)<>\]]+/g)].map(
     (m) => m[0].replace(/[.,;:]+$/, ""),
-  );
+  )
+    // Template strings in scripts (`${path}`) are not literal URLs.
+    .filter((u) => !u.includes("${"));
 }

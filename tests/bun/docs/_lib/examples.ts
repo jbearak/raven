@@ -55,6 +55,9 @@ export function expectedBlock(m: Extract<Marker, { kind: "example" }>): { text: 
     if (!existsSync(path.join(dir, m.file))) return { error: `example "${m.name}" has no file ${m.file}` };
     return { text: read(m.name, m.file).replace(/\n$/, "") };
   }
+  for (const f of ["cmd", "stdout.txt", "stderr.txt"])
+    if (!existsSync(path.join(dir, f)))
+      return { error: `example "${m.name}" has no ${f}; run UPDATE_DOCS_EXAMPLES=1 cargo test -p raven --test docs_examples` };
   const cmd = read(m.name, "cmd").trim();
   const stdout = sub(read(m.name, "stdout.txt"));
   const stderr = sub(read(m.name, "stderr.txt"));

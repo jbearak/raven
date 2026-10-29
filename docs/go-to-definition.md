@@ -10,6 +10,10 @@ source("utils.R")
 result <- helper_function(42)  # Cmd-click helper_function: opens utils.R at its definition
 ```
 
+![Peek Definition on summarize_scores in main.R, showing its definition in helpers.R](images/go-to-definition.png)
+
+*Peek Definition (Alt+F12) on a function defined in a sourced file (Raven 0.21.1).*
+
 ```r
 # utils.R
 helper_function <- function(x) { x * 2 }  # jump target

@@ -6,6 +6,10 @@ Set breakpoints, step through code, and inspect variables in R scripts, R Markdo
 
 The debugger is built into Raven's [R console](r-console.md) and driven by R's own `browser()`, so everything you know from the console still works: typing `n` in the terminal and clicking Step Over do the same thing. You get breakpoints in `.R`, `.Rmd` and `.qmd` files, stepping, the call stack, a Variables view, watch expressions and the Debug Console.
 
+![The VS Code debugger stopped at a breakpoint in an R function, with local variables avg and scores in the Variables view and the R console below](images/debugger.png)
+
+*Stopped at a breakpoint in `summarize_scores()`: locals in the Variables view, the call stack, and R's `Browse[1]>` prompt in the console (Raven 0.21.1).*
+
 ## Getting started
 
 You need Raven's console (`raven.rTerminal.program` = `raven`, the default) on macOS or Linux. See [Limitations](#limitations) for Windows.

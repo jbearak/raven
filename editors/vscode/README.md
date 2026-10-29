@@ -23,7 +23,11 @@ analysis.R:6:6 warning: fit is used before it is defined (defined on line 7) [un
 2 issues (0 errors, 2 warnings, 0 infos, 0 hints, 0 notes)
 ```
 
+![VS Code showing a yellow squiggle under summarize_score and the hover message "summarize_score is not defined (undefined-variable)"](https://raw.githubusercontent.com/jbearak/raven/main/docs/images/undefined-variable.png)
+
 Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags the typo and the plot that runs before the model exists. In VS Code, the same warnings appear in the editor and the Problems panel as you type. No R session is involved, and the output above was produced with R turned off.
+
+![The VS Code debugger stopped at a breakpoint in an R function, with local variables avg and scores in the Variables view and the R console below](https://raw.githubusercontent.com/jbearak/raven/main/docs/images/debugger.png)
 
 ## Get started
 
