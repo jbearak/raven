@@ -809,7 +809,7 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
             return Some(hidden);
         }
         if kind == PromptKind::TopLevel {
-            start_next_segment(prompt);
+            start_next_segment(prompt, true);
         }
     }
 
@@ -832,18 +832,22 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
 
 /// At a top-level prompt with no lines pending, render the next tagged
 /// expression of the submission (if any) and queue its lines; its original
-/// lines are echoed now, the rendered ones are fed silently.
-fn start_next_segment(prompt: &str) {
+/// lines are echoed now, the rendered ones are fed silently. `continuing` is
+/// true when the segment follows an earlier one of the same submission (a
+/// step may carry over into it), false for the first segment of a new one.
+fn start_next_segment(prompt: &str, continuing: bool) {
     let next = with_state(|s| {
         if s.pending.is_empty() {
-            s.segments.pop_front().map(|seg| (seg, s.echo))
+            Some(s.segments.pop_front().map(|seg| (seg, s.echo)))
         } else {
             None
         }
     })
     .flatten();
+    let Some(next) = next else { return };
+    // Nothing left to step into: drop any carried-over step.
+    dap::on_next_segment(continuing && next.is_some());
     let Some((seg, echo)) = next else { return };
-    dap::on_next_segment();
     let text = dap::render_segment(&seg);
     if echo {
         for (i, line) in seg.echo.iter().enumerate() {
@@ -1076,7 +1080,7 @@ fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
             s.start_level = 0;
             s.request_level = 0;
         });
-        start_next_segment(prompt);
+        start_next_segment(prompt, false);
         let (chunk, echo) = next_pending(cap)?;
         if echo {
             echo_line(prompt, kind, &chunk);

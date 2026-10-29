@@ -43,12 +43,15 @@ pub struct Callee {
 #[derive(Debug, Clone)]
 pub enum Placement {
     /// Inject a probe before the statement starting at `byte` (offset into
-    /// the expression text), whose first line is file line `line`.
+    /// the expression text), whose first line is file line `line`. When
+    /// `brace_end` is set the statement is an unbraced function body ending
+    /// at that byte, which gets braced so the probe runs inside the function.
     Inject {
         id: String,
         byte: usize,
         line: u32,
         callees: Vec<Callee>,
+        brace_end: Option<usize>,
     },
     /// Not injectable; `reason` is shown to the user.
     Invalid { id: String, reason: String },
@@ -61,6 +64,27 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Every injection, ignoring callee confirmation.
+    #[cfg(test)]
+    pub fn injections(&self) -> Vec<Injection> {
+        self.placements
+            .iter()
+            .filter_map(|p| match p {
+                Placement::Inject {
+                    id,
+                    byte,
+                    brace_end,
+                    ..
+                } => Some(Injection {
+                    byte: *byte,
+                    id: id.clone(),
+                    brace_end: *brace_end,
+                }),
+                Placement::Invalid { .. } => None,
+            })
+            .collect()
+    }
+
     /// Every callee any injection depends on (for one batched R check).
     pub fn callees(&self) -> BTreeSet<Callee> {
         let mut out = BTreeSet::new();
@@ -99,9 +123,8 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
         | "withVisible"
         | "force"
         | "identity" => ("base", Code(first)),
-        "try" => ("base", Code(first)),
-        "tryCatch" => ("base", Code(&[(0, "expr"), (usize::MAX, "finally")])),
-        "withCallingHandlers" => ("base", Code(first)),
+        // Handlers are evaluated (to functions) too.
+        "try" | "tryCatch" | "withCallingHandlers" => ("base", All),
         "with" => ("base", Code(&[(1, "expr")])),
         "within" => ("base", Code(&[(1, "expr")])),
         "lapply" | "sapply" | "vapply" | "mapply" | "Map" | "Filter" | "Reduce" | "Find"
@@ -117,6 +140,9 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
             ("shiny", Code(&[(0, "x"), (0, "expr")]))
         }
         "shinyApp" | "moduleServer" | "shinyServer" => ("shiny", All),
+        "R6Class" => ("R6", All),
+        // Not setGeneric: a probe in `def` would make it non-standard.
+        "setRefClass" | "setMethod" | "setClass" | "setValidity" => ("methods", All),
         "map" | "map_dbl" | "map_chr" | "map_int" | "map_lgl" | "map_dfr" | "map_dfc" | "walk"
         | "imap" | "map2" | "pmap" | "walk2" | "iwalk" | "map_vec" | "modify" | "keep"
         | "discard" | "reduce" => ("purrr", All),
@@ -128,7 +154,7 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
 /// the probe or the path to it is evaluated (core syntax and the probe's own
 /// lookups; §5.2, §5.3).
 const CORE_NAMES: &[&str] = &[
-    "{", "(", "if", "for", "while", "repeat", "<-", "=", "<<-", "function", "::", "browser",
+    "{", "(", "if", "for", "while", "repeat", "<-", "=", "<<-", "function", "::",
 ];
 
 /// Calls that change scope dynamically; with any of these in the expression,
@@ -173,8 +199,18 @@ fn is_statement_parent(n: Node) -> bool {
     matches!(n.kind(), "braced_expression" | "program")
 }
 
+/// An unbraced function body (`function(x) x + 1`): a statement position
+/// once [`render`] braces it.
+fn unbraced_body(n: Node) -> bool {
+    n.kind() != "braced_expression"
+        && n.parent().is_some_and(|p| {
+            p.kind() == "function_definition"
+                && p.child_by_field_name("body").map(|b| b.id()) == Some(n.id())
+        })
+}
+
 /// Statement nodes: direct named children of `{}` bodies and of the
-/// program, excluding comments.
+/// program, and unbraced function bodies, excluding comments.
 fn collect_statements<'t>(root: Node<'t>, out: &mut Vec<Node<'t>>) {
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
@@ -183,12 +219,35 @@ fn collect_statements<'t>(root: Node<'t>, out: &mut Vec<Node<'t>>) {
             if child.kind() == "comment" {
                 continue;
             }
-            if is_statement_parent(n) {
+            if is_statement_parent(n) || unbraced_body(child) {
                 out.push(child);
             }
             stack.push(child);
         }
     }
+}
+
+/// The unbraced body on `row` of a statement that only defines a function
+/// (`f <- function(x) x + 1`, or a bare `function(x) x`): stopping where the
+/// definition runs shows nothing, so the breakpoint goes inside.
+fn defined_body_on_row<'t>(stmt: Node<'t>, text: &str, row: usize) -> Option<Node<'t>> {
+    let def = match stmt.kind() {
+        "function_definition" => stmt,
+        "binary_operator" => {
+            let op = stmt
+                .child_by_field_name("operator")
+                .map(|o| node_text(o, text))?;
+            let value = match op {
+                "<-" | "=" | "<<-" => stmt.child_by_field_name("rhs")?,
+                "->" | "->>" => stmt.child_by_field_name("lhs")?,
+                _ => return None,
+            };
+            (value.kind() == "function_definition").then_some(value)?
+        }
+        _ => return None,
+    };
+    let body = def.child_by_field_name("body")?;
+    (unbraced_body(body) && body.start_position().row == row).then_some(body)
 }
 
 /// What a line holds, for anchoring.
@@ -199,13 +258,18 @@ fn line_is_blank_or_closing(line: &str) -> bool {
 
 /// Choose the statement a breakpoint on row `row` (0-based, relative to the
 /// text) anchors to.
-fn anchor<'t>(stmts: &[Node<'t>], lines: &[&str], row: usize) -> Result<Node<'t>, String> {
+fn anchor<'t>(
+    stmts: &[Node<'t>],
+    text: &str,
+    lines: &[&str],
+    row: usize,
+) -> Result<Node<'t>, String> {
     let starting: Vec<&Node> = stmts
         .iter()
         .filter(|s| s.start_position().row == row)
         .collect();
     if let Some(s) = starting.iter().min_by_key(|s| s.start_byte()) {
-        return Ok(**s);
+        return Ok(defined_body_on_row(**s, text, row).unwrap_or(**s));
     }
     let line = lines.get(row).copied().unwrap_or("");
     if line_is_blank_or_closing(line) {
@@ -492,7 +556,7 @@ pub fn plan(text: &str, first_line: u32, bps: &[BpRequest]) -> Plan {
         .collect();
     for b in relevant {
         let row = (b.line - first_line) as usize;
-        let placement = match anchor(&stmts, &lines, row) {
+        let placement = match anchor(&stmts, text, &lines, row) {
             Err(reason) => Placement::Invalid {
                 id: b.id.clone(),
                 reason,
@@ -524,6 +588,7 @@ pub fn plan(text: &str, first_line: u32, bps: &[BpRequest]) -> Plan {
                             byte: stmt.start_byte(),
                             line: first_line + stmt.start_position().row as u32,
                             callees,
+                            brace_end: unbraced_body(stmt).then(|| stmt.end_byte()),
                         }
                     }
                 }
@@ -561,43 +626,75 @@ pub enum Wrap {
     File,
 }
 
+/// One probe for [`render`]: before the statement at `byte`, bracing it up
+/// to `brace_end` when set (see [`Placement`]).
+#[derive(Debug, Clone)]
+pub struct Injection {
+    pub byte: usize,
+    pub id: String,
+    pub brace_end: Option<usize>,
+}
+
 /// Write `text` with a probe before each accepted injection; `#line`
 /// directives map every user line back to `path` (§3). `first_col` is the
-/// column (in characters) where `text` starts. `injections` are
-/// `(byte offset, file line, id)`.
+/// column (in characters) where `text` starts.
 pub fn render(
     text: &str,
     path: &str,
     first_line: u32,
     first_col: usize,
-    injections: &[(usize, u32, String)],
+    injections: &[Injection],
     pid: u32,
     wrap: Wrap,
 ) -> String {
-    let mut sorted: Vec<&(usize, u32, String)> = injections.iter().collect();
-    sorted.sort_by_key(|(b, _, _)| *b);
-    let mut out = String::with_capacity(text.len() + 128 * (sorted.len() + 1));
+    // Edits in text order. At one byte, closing braces come before probes,
+    // and an inner (later-opened) brace closes before an outer one.
+    enum Edit<'a> {
+        Close,
+        Open(&'a Injection),
+    }
+    let mut edits: Vec<(usize, u8, std::cmp::Reverse<usize>, Edit)> = Vec::new();
+    for inj in injections {
+        edits.push((inj.byte, 1, std::cmp::Reverse(0), Edit::Open(inj)));
+        if let Some(end) = inj.brace_end {
+            edits.push((end, 0, std::cmp::Reverse(inj.byte), Edit::Close));
+        }
+    }
+    edits.sort_by_key(|e| (e.0, e.1, e.2));
+    // File line and column of byte `at`.
+    let position = |at: usize| {
+        let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let mut col = text[line_start..at].chars().count();
+        if line_start == 0 {
+            col += first_col;
+        }
+        let line = first_line + text[..at].matches('\n').count() as u32;
+        (line, col)
+    };
+    let mut out = String::with_capacity(text.len() + 128 * (edits.len() + 1));
     if wrap == Wrap::Braced {
         out.push_str("{\n");
     }
     out.push_str(&format!("#line {first_line} \"{path}\"\n"));
     out.push_str(&" ".repeat(first_col));
     let mut last = 0usize;
-    for (byte, line, id) in sorted {
-        let byte = *byte;
+    for (byte, _, _, edit) in edits {
         out.push_str(&text[last..byte]);
-        let line_start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let mut col = text[line_start..byte].chars().count();
-        if line_start == 0 {
-            col += first_col;
+        last = byte;
+        let (line, col) = position(byte);
+        if matches!(edit, Edit::Open(inj) if inj.brace_end.is_some()) {
+            out.push('{');
         }
-        out.push('\n');
-        out.push_str(&format!("#line 1 \"{PROBE_FILE}\"\n"));
-        out.push_str(&probe(id, pid));
-        out.push('\n');
+        out.push_str(&format!("\n#line 1 \"{PROBE_FILE}\"\n"));
+        match edit {
+            Edit::Close => out.push_str("}\n"),
+            Edit::Open(inj) => {
+                out.push_str(&probe(&inj.id, pid));
+                out.push('\n');
+            }
+        }
         out.push_str(&format!("#line {line} \"{path}\"\n"));
         out.push_str(&" ".repeat(col));
-        last = byte;
     }
     out.push_str(&text[last..]);
     if !out.ends_with('\n') {
@@ -693,11 +790,46 @@ mod tests {
     }
 
     #[test]
+    fn unbraced_function_bodies_are_braced() {
+        // A body on its own line, and a one-line definition: both stop when
+        // the function runs, not when it is defined.
+        let src = "f <- function(x)\n  x + 1\ng <- function(y) y * 2; h()\n";
+        let p = plan(src, 1, &[bp("a", 2), bp("b", 3)]);
+        assert_eq!(injected(&p), vec![("a".into(), 2), ("b".into(), 3)]);
+        let out = render(src, "/a.R", 1, 0, &p.injections(), 1, Wrap::File);
+        assert!(out.contains("f <- function(x)\n  {\n#line 1"), "{out}");
+        assert!(
+            out.contains(
+                "#line 2 \"/a.R\"\n  x + 1\n#line 1 \"<raven-probe>\"\n}\n#line 2 \"/a.R\"\n"
+            ),
+            "{out}"
+        );
+        // `h()` keeps its column after the closing brace.
+        assert!(
+            out.contains("#line 3 \"/a.R\"\n                      ; h()"),
+            "{out}"
+        );
+        // Plain top-level statements are not functions' bodies.
+        let p = plan("x <- y + 1\n", 1, &[bp("c", 1)]);
+        assert!(p.injections()[0].brace_end.is_none());
+    }
+
+    #[test]
     fn only_code_arguments_qualify() {
-        let src = "tryCatch({\n  a()\n}, error = function(e) {\n  b()\n})\n";
+        let src = "with({\n  a()\n}, {\n  b()\n})\n";
         let p = plan(src, 1, &[bp("a", 2), bp("b", 4)]);
-        assert_eq!(injected(&p), vec![("a".into(), 2)]);
+        assert_eq!(injected(&p), vec![("b".into(), 4)]);
         assert!(invalid(&p)[0].1.contains("isn't run as code"));
+    }
+
+    #[test]
+    fn condition_handlers_and_class_methods_qualify() {
+        let src = "tryCatch(a(), error = function(e) {\n  b()\n})\nR6Class(\"C\", public = list(m = function() {\n  c()\n}))\nsetMethod(\"show\", \"C\", function(object) {\n  d()\n})\n";
+        let p = plan(src, 1, &[bp("b", 2), bp("c", 5), bp("d", 8)]);
+        assert_eq!(
+            injected(&p),
+            vec![("b".into(), 2), ("c".into(), 5), ("d".into(), 8)]
+        );
     }
 
     #[test]
@@ -734,15 +866,7 @@ mod tests {
     fn render_keeps_user_lines_and_marks_probes() {
         let src = "f <- function() {\n  y <- 1\n}";
         let p = plan(src, 7, &[bp("a", 8)]);
-        let inj: Vec<(usize, u32, String)> = p
-            .placements
-            .iter()
-            .filter_map(|pl| match pl {
-                Placement::Inject { id, byte, line, .. } => Some((*byte, *line, id.clone())),
-                _ => None,
-            })
-            .collect();
-        let out = render(src, "/w/a.R", 7, 0, &inj, 42, Wrap::Braced);
+        let out = render(src, "/w/a.R", 7, 0, &p.injections(), 42, Wrap::Braced);
         assert!(out.starts_with("{\n#line 7 \"/w/a.R\"\n"));
         assert!(out.contains("#line 1 \"<raven-probe>\"\n"));
         assert!(out.contains("Sys.getpid(), 42L"));
@@ -763,7 +887,11 @@ mod tests {
             "/a.R",
             1,
             0,
-            &[(7, 2, "x".into())],
+            &[Injection {
+                byte: 7,
+                id: "x".into(),
+                brace_end: None,
+            }],
             1,
             Wrap::File,
         );

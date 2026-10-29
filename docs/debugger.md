@@ -10,17 +10,19 @@ It needs Raven's console (`raven.rTerminal.program` = `raven`, the default). It 
 2. Run the code that defines it with **Run Line or Selection**, **Run Chunk**, or **Source File** (`Cmd+Enter`, `Shift+Cmd+Enter`).
 3. Call the code. When R reaches the breakpoint, VS Code switches to the debugger, showing the stopped line, the call stack and the variables.
 
-You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error (if you turned that on), and detaches when R gets back to the `>` prompt. To attach before anything stops (for example to set exception filters), run **Raven: Start R Debugging** or press F5.
+You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error (if you turned that on), and detaches when R gets back to the `>` prompt.
+
+To attach before anything stops, run **Raven: Start R Debugging**. You need this to turn on an exception filter for the first time, because the filters live in the **Breakpoints** view of a running session (Raven remembers them per workspace after that). **F5** with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script.
 
 ## What you can do while stopped
 
 | Action | How |
 |---|---|
 | Continue, Step Over, Step Into, Step Out | Toolbar or F5/F10/F11/Shift+F11. These send R's own `c`, `n`, `s`, `f` |
-| Stop | Toolbar Stop. Quits the browser (`Q`) and returns R to the prompt |
+| Stop | Toolbar **Stop** quits the browser (`Q`) and returns R to the prompt. **Disconnect** lets R continue (`c`); the next stop attaches again |
 | Look at variables | **Variables** view: locals of the selected frame, the enclosing environment, and the global environment. Long vectors and lists are paged |
 | Watch an expression | **Watch** view, evaluated in the selected frame |
-| Run R code | **Debug Console**, evaluated in the frame selected in **Call Stack**. Typing in the terminal at `Browse[1]>` evaluates in R's browsed frame, as R defines |
+| Run R code | **Debug Console**, evaluated in the frame selected in **Call Stack**, with completions that include the frame's own variables. What the code prints, its messages and its warnings appear in the Debug Console. Typing in the terminal at `Browse[1]>` evaluates in R's browsed frame, as R defines |
 | Hover over a name | Shows its value without running any R code (see below) |
 | Change a variable | **Set Value** in the Variables view |
 | Open a data frame | Right-click it in the Variables view → **Open in Data Viewer** |
@@ -34,7 +36,7 @@ You don't need a `launch.json`. VS Code attaches when R stops, whether at a brea
 | Conditional | Stop only when an R expression is `TRUE` in the breakpoint's frame. A condition that errors stops and prints the error |
 | Hit count | `5`, `>= 5`, `== 5`, `> 5`, `< 5`, `% 3` |
 | Logpoints | Print a message instead of stopping; `{expr}` is evaluated in the frame. Output goes to the Debug Console |
-| Function breakpoints | **Breakpoints** view → **+** with a function name (`f`, or `pkg::f`). Uses `debug()` |
+| Function breakpoints | **Breakpoints** view → **+** with a function name (`f`, or `pkg::f`). Uses `debug()`. A name that doesn't exist yet (or a package that isn't loaded) binds at the next prompt after it does, and redefining the function re-binds it |
 | Errors, warnings, interrupts | Exception filters in the **Breakpoints** view (below) |
 
 ### When a breakpoint takes effect
@@ -56,14 +58,16 @@ A breakpoint shows as verified (solid red) once the code containing it has run. 
 | `local` is masked or not loaded | The code calls a function Raven checks before instrumenting, and the name now points somewhere else |
 | sourced via an unsupported `source()` form | `source()` was called with a connection, a URL or unusual arguments |
 
-Raven's own code-running functions are instrumented through, including `local()`, `tryCatch()`, `with()`, `lapply()` and friends, `test_that()`, `observeEvent()`, `reactive()` and `render*()`. Before adding a probe inside one of them, Raven checks that the name really is that function and isn't redefined in the code being run.
+Raven's own code-running functions are instrumented through, including `local()`, `tryCatch()` and its handlers, `with()`, `lapply()` and friends, `test_that()`, `observeEvent()`, `reactive()`, `render*()`, `R6Class()` methods and `setMethod()`/`setRefClass()` definitions. Before adding a probe inside one of them, Raven checks that the name really is that function and isn't redefined in the code being run.
+
+A breakpoint on a line that only defines a function, like `sq <- function(x) x^2`, stops when the function runs, not when it is defined. Raven wraps the body in braces to hold the probe.
 
 ### Stepping
 
 Steps behave as R defines them, with three conveniences:
 
 - **Across top-level lines.** When you step past the end of one top-level expression of code you sent, the debugger stops at the start of the next one, as if the whole selection were one function.
-- **Just my code.** **Step Into** a function that has no source (base R or an installed package) steps back out instead of showing R's internals.
+- **Just my code.** **Step Into** a function that has no source (base R or an installed package) steps back out instead of showing R's internals. Turn this off with `raven.debugger.justMyCode`.
 - **No double stops.** Stepping onto a line that has a breakpoint stops once.
 
 ## Errors, warnings and interrupts
@@ -84,7 +88,7 @@ Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handle
 
 Showing variables never forces a lazy value (a promise), never calls an active binding, and never calls a `print()` or `format()` method. Values are shown from their underlying data: factors with their labels, `Date` and `POSIXct` as dates and times, data frames, tibbles and data.tables as their dimensions with paged columns. Hovering over `x`, `x$name`, `x[["name"]]` or `x@slot` reads the value directly; anything else needs the Debug Console.
 
-The Debug Console and Watch run R code, as you'd expect. Watch expressions stop after two seconds of runtime (R checks this cooperatively, so compiled code may overrun).
+The Debug Console and Watch run R code, as you'd expect. Watch expressions stop after two seconds of runtime (R checks this cooperatively, so compiled code may overrun). If an expression reaches a `browser()` or a `debug()`ged function, R continues past it and the Debug Console says so: the debugger is already stopped and can't stop again inside its own request.
 
 ## Settings
 
@@ -92,6 +96,13 @@ The Debug Console and Watch run R code, as you'd expect. Watch expressions stop 
 |---|---|---|
 | `raven.debugger.enabled` | `true` | Run the debugger in new R consoles |
 | `raven.debugger.attach` | `onStop` | `onStop`: start a debug session when R stops. `never`: only when you start one |
+| `raven.debugger.justMyCode` | `true` | **Step Into** skips functions without source |
+
+## What the debugger changes in your R session
+
+- While any line breakpoint exists, `source()` is replaced by a wrapper that instruments the file being sourced and otherwise calls the original. `source(exprs = )`, connections and URLs go straight to the original. The original is put back when the last line breakpoint is removed.
+- The base environment gets a few bindings: `.ark_annotate_source` (the hook pkgload and shiny call; Positron's Ark defines the same name) and `.raven_dbg_*` helpers the console calls at its own prompts.
+- The option `raven.debug_hook` is set; probes call it.
 
 ## Limitations
 
@@ -99,4 +110,4 @@ The Debug Console and Watch run R code, as you'd expect. Watch expressions stop 
 - **Instrumented functions run slower.** A function that holds a breakpoint isn't byte-compiled, so loops in it run several times slower until you remove the breakpoint and run it again. `print(f)` shows the probe lines.
 - **Rebinding base functions.** If code redefines `local`, `if`, `with` or a similar function after it was instrumented, the probe can show up in data that code captures. Raven prints a notice when it sees such a rebinding in the global environment.
 - **Compiled code.** A pause or error stop inside a function R has already byte-compiled steps like **Continue** on the first **Step Over**, as in plain R.
-- **Not supported:** data breakpoints, Restart Frame, step back, and debugging Knit/Quarto renders (they run in separate R processes). The debugger works only with Raven's console, not with plain R, radian or arf.
+- **Not supported:** data breakpoints, Restart Frame, step back, editing a running function in place (live patching), and debugging Knit/Quarto renders (they run in separate R processes). The debugger works only with Raven's console, not with plain R, radian or arf.

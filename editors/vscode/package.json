@@ -1100,6 +1100,11 @@
           "default": "onStop",
           "description": "When VS Code attaches its debugger to Raven's R console."
         },
+        "raven.debugger.justMyCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step Into skips functions that have no source (base R and installed packages) and steps back out instead."
+        },
         "raven.sendToR.advanceCursorOnSend": {
           "type": "boolean",
           "default": true,
@@ -2533,6 +2538,27 @@
               "consoleSocket": {
                 "type": "string",
                 "description": "IPC socket of the Raven R console to debug. Leave unset to use the active R console (one is opened if needed)."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "description": "Step Into skips functions without source (base R, installed packages). Defaults to raven.debugger.justMyCode."
+              }
+            }
+          },
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "default": "${file}",
+                "description": "R script to source() in the R console once the debugger is attached."
+              },
+              "consoleSocket": {
+                "type": "string",
+                "description": "IPC socket of the Raven R console to use. Leave unset to use the active R console (one is opened if needed)."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "description": "Step Into skips functions without source (base R, installed packages). Defaults to raven.debugger.justMyCode."
               }
             }
           }
@@ -2540,11 +2566,27 @@
         "initialConfigurations": [
           {
             "type": "raven-r",
+            "request": "launch",
+            "name": "Source R file",
+            "program": "${file}"
+          },
+          {
+            "type": "raven-r",
             "request": "attach",
             "name": "Debug R console"
           }
         ],
         "configurationSnippets": [
+          {
+            "label": "Raven: Source R file",
+            "description": "Source an R script in Raven's R console with the debugger attached",
+            "body": {
+              "type": "raven-r",
+              "request": "launch",
+              "name": "Source R file",
+              "program": "^\"\\${file}\""
+            }
+          },
           {
             "label": "Raven: Debug R console",
             "description": "Attach the debugger to Raven's R console",

@@ -8,6 +8,7 @@ import {
     on_console_registered,
 } from '../send-to-r/console-ipc';
 import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
+import { get_send_options, send_code } from '../send-to-r/send-code';
 
 /**
  * VS Code side of Raven's R debugger. The debug adapter itself runs inside
@@ -23,13 +24,16 @@ import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
  * - Breakpoints are mirrored to every console while no session exists, so
  *   code run before the first stop is already instrumented. VS Code's own
  *   `setBreakpoints` takes over inside a session; both carry the same set.
- * - A user disconnect suppresses auto-attach for that console for 30 s.
+ * - Disconnecting while R is stopped lets R continue (the console feeds
+ *   `c`); Stop quits the browser (`Q`). The next stop attaches again.
+ * - F5 with an R file open and no launch.json sources that file in the
+ *   console (a `launch` with `program`); the session itself is the same
+ *   attach to the console.
  */
 
 export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
-const DETACH_COOLDOWN_MS = 30_000;
 const SOCKET_WAIT_MS = 10_000;
 
 /** The console's DAP socket lives next to its IPC socket. */
@@ -45,10 +49,12 @@ function attach_policy(): 'onStop' | 'never' {
     return vscode.workspace.getConfiguration('raven.debugger').get<'onStop' | 'never'>('attach', 'onStop');
 }
 
+function just_my_code(): boolean {
+    return vscode.workspace.getConfiguration('raven.debugger').get<boolean>('justMyCode', true);
+}
+
 let context_ref: vscode.ExtensionContext | null = null;
 const sessions = new Map<string, vscode.DebugSession>();
-const ended_by_console = new Set<string>();
-const detached_until = new Map<string, number>();
 const links = new Map<string, ConsoleLink>();
 
 function wait_for_file(file: string, ms: number): Promise<boolean> {
@@ -91,8 +97,44 @@ function mirror_payload(previous: Set<string>): { msg: object; files: Set<string
     };
 }
 
+interface BreakpointState {
+    verified: boolean;
+    line: number;
+    message?: string;
+    source: { path: string };
+}
+
+let status_item: vscode.StatusBarItem | null = null;
+
+/**
+ * While no session exists, the status bar summarizes the active console's
+ * line breakpoints: how many are bound, and why the others aren't (design
+ * §5.5). Inside a session the gutter and Breakpoints view show this.
+ */
+function update_status(): void {
+    if (!status_item) return;
+    const active = vscode.window.activeTerminal;
+    const ipc = (active && console_socket_of(active)) ?? [...links.keys()].pop();
+    const states = (ipc && links.get(ipc)?.states) || [];
+    if (states.length === 0 || (ipc && sessions.has(ipc))) {
+        status_item.hide();
+        return;
+    }
+    const bound = states.filter((b) => b.verified).length;
+    status_item.text = `$(debug-breakpoint) R ${bound}/${states.length}`;
+    const md = new vscode.MarkdownString(`**R breakpoints:** ${bound} of ${states.length} bound\n\n`);
+    for (const b of states.filter((s) => !s.verified)) {
+        const where = `${path.basename(b.source.path)}:${b.line}`;
+        md.appendMarkdown(`- \`${where}\`: ${b.message ?? 'not bound'}\n`);
+    }
+    status_item.tooltip = md;
+    status_item.show();
+}
+
 /** The control connection to one console: stop events in, breakpoint mirror out. */
 class ConsoleLink {
+    /** The console's line breakpoint states, as last pushed. */
+    states: BreakpointState[] = [];
     private control: net.Socket | null = null;
     private mirrored = new Set<string>();
     private closed = false;
@@ -117,9 +159,13 @@ class ConsoleLink {
             while ((nl = buf.indexOf('\n')) >= 0) {
                 const line = buf.slice(0, nl);
                 buf = buf.slice(nl + 1);
-                let msg: { event?: string };
+                let msg: { event?: string; breakpoints?: BreakpointState[] };
                 try { msg = JSON.parse(line); } catch { continue; }
                 if (msg.event === 'stopped') void auto_attach(this.ipc);
+                if (msg.event === 'breakpoints') {
+                    this.states = msg.breakpoints ?? [];
+                    update_status();
+                }
             }
         });
         sock.on('error', () => undefined);
@@ -150,13 +196,14 @@ class ConsoleLink {
     dispose(): void {
         this.closed = true;
         this.control?.destroy();
+        this.states = [];
+        update_status();
     }
 }
 
 async function auto_attach(ipc: string): Promise<void> {
     if (!debugger_enabled() || attach_policy() === 'never') return;
     if (sessions.has(ipc)) return;
-    if ((detached_until.get(ipc) ?? 0) > Date.now()) return;
     await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
         type: DEBUG_TYPE,
         request: 'attach',
@@ -186,8 +233,23 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
             return undefined;
         }
         if (!config.type && !config.request) {
-            config = { type: DEBUG_TYPE, request: 'attach', name: 'R console' };
+            // F5 with no launch.json: source the open R script, if any.
+            const doc = vscode.window.activeTextEditor?.document;
+            config = doc && doc.uri.scheme === 'file' && /\.r$/i.test(doc.uri.fsPath)
+                ? { type: DEBUG_TYPE, request: 'launch', name: 'Source R file', program: doc.uri.fsPath }
+                : { type: DEBUG_TYPE, request: 'attach', name: 'R console' };
         }
+        if (config.request === 'launch') {
+            const doc = vscode.window.activeTextEditor?.document;
+            if (!config.program || config.program === '${file}') config.program = doc?.uri.fsPath;
+            if (!config.program) {
+                void vscode.window.showErrorMessage('Raven: no R file to run (set "program").');
+                return undefined;
+            }
+            const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === config.program);
+            if (open?.isDirty && !(await open.save())) return undefined;
+        }
+        config.justMyCode ??= just_my_code();
         if (!config.consoleSocket) {
             const ipc = await choose_console();
             if (!ipc) {
@@ -219,14 +281,18 @@ const descriptor_factory: vscode.DebugAdapterDescriptorFactory = {
 const tracker_factory: vscode.DebugAdapterTrackerFactory = {
     createDebugAdapterTracker(session) {
         const ipc: string = session.configuration.consoleSocket;
+        const program: string | undefined = session.configuration.program;
         return {
-            onDidSendMessage(m: { type?: string; event?: string }) {
-                if (m.type === 'event' && m.event === 'terminated') ended_by_console.add(session.id);
+            onDidSendMessage(m: { type?: string; command?: string; success?: boolean }) {
+                // Run the program once the session's breakpoints are in.
+                if (program && m.type === 'response' && m.command === 'configurationDone') {
+                    const terminal = live_console_sockets().find(([, sock]) => sock === ipc)?.[0];
+                    if (!terminal) return;
+                    terminal.show(true);
+                    send_code(terminal, `source(${JSON.stringify(program)}, echo = TRUE)`, get_send_options());
+                }
             },
             onWillReceiveMessage(m: { command?: string; arguments?: { filters?: string[] } }) {
-                if (m.command === 'disconnect' && !ended_by_console.has(session.id)) {
-                    detached_until.set(ipc, Date.now() + DETACH_COOLDOWN_MS);
-                }
                 if (m.command === 'setExceptionBreakpoints') {
                     void context_ref?.workspaceState.update(FILTERS_KEY, m.arguments?.filters ?? []);
                 }
@@ -241,7 +307,12 @@ function mirror_all(): void {
 
 export function register_debugger(context: vscode.ExtensionContext): void {
     context_ref = context;
+    status_item = vscode.window.createStatusBarItem('raven.debugger.breakpoints', vscode.StatusBarAlignment.Left, 50);
+    status_item.name = 'R breakpoints';
+    status_item.command = 'workbench.debug.action.focusBreakpointsView';
     context.subscriptions.push(
+        status_item,
+        vscode.window.onDidChangeActiveTerminal(update_status),
         vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, configuration_provider),
         vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, descriptor_factory),
         vscode.debug.registerDebugAdapterTrackerFactory(DEBUG_TYPE, tracker_factory),
@@ -249,12 +320,13 @@ export function register_debugger(context: vscode.ExtensionContext): void {
         vscode.debug.onDidStartDebugSession((s) => {
             if (s.type === DEBUG_TYPE && s.configuration.consoleSocket) {
                 sessions.set(s.configuration.consoleSocket, s);
+                update_status();
             }
         }),
         vscode.debug.onDidTerminateDebugSession((s) => {
             if (s.type !== DEBUG_TYPE) return;
             if (sessions.get(s.configuration.consoleSocket) === s) sessions.delete(s.configuration.consoleSocket);
-            ended_by_console.delete(s.id);
+            update_status();
             // Filters may have changed in the session; keep consoles in step.
             mirror_all();
         }),

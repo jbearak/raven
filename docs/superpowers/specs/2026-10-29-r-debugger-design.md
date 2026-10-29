@@ -98,9 +98,8 @@ VS Code ──DAP (Unix socket / named pipe)──▶ raven console: DAP thread 
 
 - **Attach only when R stops (owner's decision).** No session exists while R runs. The always-attached "Quiet" session and its session swaps are **not built**; they could be reconsidered later if breakpoint states before the first stop turn out to matter.
 - **Session end vs detach.** The session ending because R returned to the prompt **keeps** all instrumentation and starts no cooldown. Only a *user* disconnect counts as a detach.
-  - **Detach** removes live patches for the session and leaves R paused if it was paused.
-  - After a detach, auto-attach on a stop is suppressed for 30 s, or until the user starts debugging again.
-  - **Terminate** sends `Q`.
+  - **Detach** (Disconnect) lets R continue with `c`, as attach sessions in other debuggers do; the next stop attaches again. (An earlier draft left R paused and suppressed auto-attach for 30 s; with no session, a paused R had nothing to show it, so 1.0 resumes instead.)
+  - **Terminate** (Stop) sends `Q`.
 - **Handshake.** `initialize` → `attach` → `initialized` → `setBreakpoints` / `setExceptionBreakpoints` → `configurationDone` → replay of `stopped` for the current generation, if R is still stopped. Each new session receives `breakpoint` events with the current state of every breakpoint.
 - **P0 checks** (pass/fail):
   - starting a session on a stop and ending it at the prompt, with no visible flicker in typical use;

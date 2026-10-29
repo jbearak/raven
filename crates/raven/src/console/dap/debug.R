@@ -340,8 +340,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$capture <- function() {
         lv <- get0(".Last.value", envir = baseenv())
         internal(tryCatch({
-            here <- sys.nframe()
-            n <- here - 1L
+            depth <- sys.nframe()
+            n <- depth - 1L
             if (!is.null(state$cut)) n <- min(n, state$cut)
             calls <- if (n > 0) sys.calls()[seq_len(n)] else list()
             frames <- if (n > 0) sys.frames()[seq_len(n)] else list()
@@ -388,6 +388,21 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (frame <= length(state$frames)) return(state$frames[[frame]])
         globalenv()
     }
+    # Debug Console completions: R's own completer (as at the console
+    # prompt) plus the selected frame's names, which it can't see.
+    env$completions <- function(head, frame) internal(tryCatch({
+        e <- frame_env(frame)
+        utils:::.assignLinebuffer(head)
+        utils:::.assignEnd(nchar(head, type = "chars"))
+        token <- utils:::.guessTokenFromLine()
+        utils:::.completeToken()
+        items <- utils:::.retrieveCompletions()
+        if (grepl("^[.A-Za-z][.A-Za-z0-9_]*$", token) && !identical(e, globalenv())) {
+            local <- ls(e, all.names = startsWith(token, "."))
+            items <- c(local[startsWith(local, token)], items)
+        }
+        jobj(token = jstr(token), items = jarr(jstr(unique(items))))
+    }, error = function(e) "{}"))
     env$scopes <- function(frame) internal(tryCatch({
         e <- frame_env(frame)
         out <- jobj(name = jstr(if (identical(e, globalenv())) "Global" else "Locals"),
@@ -414,12 +429,32 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             setTimeLimit(elapsed = lim, transient = TRUE)
             on.exit(setTimeLimit(elapsed = Inf), add = TRUE)
         }
-        res <- tryCatch(withVisible(eval(parse(text = expr, keep.source = FALSE), e)),
-                        error = function(err) err)
-        if (inherits(res, "error")) return(jobj(error = jstr(conditionMessage(res))))
+        # Everything the expression prints, messages and warnings included,
+        # goes to the Debug Console rather than the terminal.
+        notes <- character()
+        res <- NULL
+        printed <- utils::capture.output(
+            res <- tryCatch(
+                withCallingHandlers(
+                    withVisible(eval(parse(text = expr, keep.source = FALSE), e)),
+                    message = function(m) {
+                        notes <<- c(notes, sub("\n$", "", conditionMessage(m)))
+                        invokeRestart("muffleMessage")
+                    },
+                    warning = function(w) {
+                        notes <<- c(notes, paste("Warning:", conditionMessage(w)))
+                        invokeRestart("muffleWarning")
+                    }),
+                error = function(err) err),
+            type = "output")
+        if (inherits(res, "error")) {
+            msg <- paste(c(printed, notes, paste("Error:", conditionMessage(res))), collapse = "\n")
+            return(jobj(error = jstr(msg)))
+        }
         v <- res$value
-        text <- if (identical(context, "repl")) {
-            if (isTRUE(res$visible)) paste(utils::capture.output(print(v)), collapse = "\n") else ""
+        text <- if (context %in% c("repl", "clipboard")) {
+            shown <- if (isTRUE(res$visible)) utils::capture.output(print(v)) else character()
+            paste(c(printed, notes, shown), collapse = "\n")
         } else preview(v)
         counts <- tryCatch(child_counts(v), error = function(e) c(0, 0))
         ref <- if (sum(counts) > 0) register(v, paste0("(", expr, ")")) else 0L
@@ -555,9 +590,29 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (grepl("::", name, fixed = TRUE)) {
             p <- strsplit(name, ":::?")[[1L]]
             if (length(p) != 2L) return(NULL)
+            # Never load a package as a side effect; it binds once loaded.
+            if (!isNamespaceLoaded(p[[1L]])) return(NULL)
             return(tryCatch(get(p[[2L]], envir = asNamespace(p[[1L]]), mode = "function"), error = function(e) NULL))
         }
         get0(name, envir = globalenv(), mode = "function")
+    }
+    # `state$fbp_names` are the requested names; `state$fbp` the closures
+    # currently debug()ged for them. Names are re-resolved at every top-level
+    # prompt, so a function defined (or redefined) later binds then.
+    state$fbp_names <- character()
+    bind_fbp <- function(nm) {
+        f <- find_fun(nm)
+        if (is.null(f) || !is.function(f)) return("function not found")
+        if (is.primitive(f)) return("can't debug a primitive")
+        old <- state$fbp[[nm]]
+        if (!is.null(old) && identical(old, f) && isdebugged(f)) return("")
+        ok <- tryCatch({ debug(f); TRUE }, error = function(e) FALSE)
+        if (!ok) return("debug() failed")
+        state$fbp[[nm]] <- f
+        ""
+    }
+    fbp_status <- function() {
+        vapply(state$fbp_names, bind_fbp, "")
     }
     env$function_breakpoints <- function(spec) internal(tryCatch({
         names <- if (nzchar(spec)) strsplit(spec, US, fixed = TRUE)[[1L]] else character()
@@ -568,18 +623,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 state$fbp[[old]] <- NULL
             }
         }
-        out <- character()
-        for (nm in names) {
-            f <- find_fun(nm)
-            if (is.null(f) || !is.function(f) || is.primitive(f)) {
-                out <- c(out, jobj(verified = "false", message = jstr(if (is.null(f)) "function not found" else "can't debug a primitive")))
-                next
-            }
-            ok <- tryCatch({ debug(f); TRUE }, error = function(e) FALSE)
-            if (ok) state$fbp[[nm]] <- f
-            out <- c(out, jobj(verified = jbool(ok), message = if (ok) NULL else jstr("debug() failed")))
-        }
-        jarr(out)
+        state$fbp_names <- names
+        st <- fbp_status()
+        jarr(vapply(st, function(m) jobj(verified = jbool(!nzchar(m)), message = if (nzchar(m)) jstr(m) else NULL), ""))
     }, error = function(e) jarr(character())))
 
     # ---- per-stop state (design sec. 4, sec. 5.4.6) -----------------------------------
@@ -607,7 +653,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (isTRUE(getOption("browserNLdisabled"))) options(browserNLdisabled = state$nl_saved[[1L]])
                 state$nl_saved <- NULL
             }
-            return(masked_names())
+            st <- fbp_status()
+            return(paste0(masked_names(), "\x1e", paste(ifelse(nzchar(st), "0", "1"), collapse = "")))
         }
         ""
     }, error = function(e) ""))
@@ -712,6 +759,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         args <- list(...)
         # `local = TRUE` means the caller's frame, which delegation would lose.
         if (isTRUE(local)) local <- parent.frame()
+        if (missing(file)) return(do.call(orig, c(list(local = local), args)))
         plain <- function() do.call(orig, c(list(file, local = local), args))
         unnamed <- length(args) && (is.null(names(args)) || any(!nzchar(names(args))))
         if (isTRUE(state$internal) || unnamed || !is.character(file) || length(file) != 1L ||

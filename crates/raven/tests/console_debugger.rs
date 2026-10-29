@@ -673,3 +673,144 @@ fn step_in_skips_code_without_srcref_and_frames_get_virtual_sources() {
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
 }
+
+#[test]
+fn steps_never_leak_into_a_later_send_and_function_breakpoints_bind_late() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "u <- 1\nv <- u + 1\n";
+    let p = c.write_file("s.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 2}]}),
+    );
+    // Set before `late` exists: unverified until it is defined.
+    let fb = d.req(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": [{"name": "late"}]}),
+    );
+    assert_eq!(fb["body"]["breakpoints"][0]["verified"], false, "{fb}");
+    let fb_id = fb["body"]["breakpoints"][0]["id"].clone();
+    d.req("configurationDone", json!({}));
+    let m = d.mark();
+    c.send(src, Some(&p));
+    d.event("stopped", m);
+    // Step off the end of the send.
+    let m = d.mark();
+    d.req("next", json!({"threadId": 1}));
+    d.event("terminated", m);
+    // A second tagged send runs without a stop.
+    let q = c.write_file("t.R", "w <- 7\nw * 6\n");
+    let m = d.mark();
+    c.send("w <- 7\nw * 6\n", Some(&q));
+    c.expect("[1] 42");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(d.count("stopped", m), 0, "step leaked into a new send");
+
+    // Defining `late` binds its breakpoint at the next prompt.
+    let m = d.mark();
+    c.send("late <- function() {\n  41 + 1\n}", None);
+    let ev = d.event("breakpoint", m);
+    assert_eq!(ev["body"]["breakpoint"]["id"], fb_id, "{ev}");
+    assert_eq!(ev["body"]["breakpoint"]["verified"], true, "{ev}");
+    let m = d.mark();
+    c.send("late()", None);
+    assert_eq!(
+        d.event("stopped", m)["body"]["reason"],
+        "function breakpoint"
+    );
+    // The Debug Console shows printed output, messages and warnings, and
+    // none of them reach the terminal.
+    let ev = d.req(
+        "evaluate",
+        json!({"expression": "{cat('said\\n'); message('noted'); warning('careful'); 5}", "context": "repl"}),
+    );
+    let out = ev["body"]["result"].as_str().unwrap();
+    for want in ["said", "noted", "Warning: careful", "[1] 5"] {
+        assert!(out.contains(want), "{want} missing from {out:?}");
+    }
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("[1] 42");
+    assert!(!c.text().contains("careful"), "{}", c.text());
+    d.req("setFunctionBreakpoints", json!({"breakpoints": []}));
+
+    // The source() hook (installed while line breakpoints exist) keeps
+    // source(exprs=) working.
+    c.send("source(exprs = quote(cat('from exprs\\n')))", None);
+    c.expect("from exprs");
+    assert!(!c.text().contains("Error"), "{}", c.text());
+}
+
+#[test]
+fn unbraced_bodies_handlers_completions_and_nested_browsers() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "sq1 <- function(x) x^2 + 1\nsafe <- function() tryCatch(stop(\"no\"), error = function(e) {\n  conditionMessage(e)\n})\n";
+    let p = c.write_file("u.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 1}, {"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send(src, Some(&p));
+    std::thread::sleep(Duration::from_millis(300));
+    // A breakpoint on a one-line definition stops when the function runs.
+    let m = d.mark();
+    c.send("sq1(3)", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("sq1".to_string(), 1));
+    // Not forced yet: shown as the promise it is.
+    assert_eq!(
+        d.locals().get("x").map(String::as_str),
+        Some("<promise: 3>")
+    );
+    // Completions see the frame's own names.
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let comp = d.req(
+        "completions",
+        json!({"text": "x", "column": 2, "frameId": frame}),
+    );
+    let labels: Vec<&str> = comp["body"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels.first(), Some(&"x"), "{comp}");
+    // An expression that reaches browser() continues instead of stopping.
+    let m = d.mark();
+    let ev = d.req(
+        "evaluate",
+        json!({"expression": "(function() { browser(); 7 })()", "frameId": frame, "context": "repl"}),
+    );
+    assert!(
+        ev["body"]["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("[1] 7"),
+        "{ev}"
+    );
+    assert_eq!(d.count("stopped", m), 0);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("[1] 10");
+    // A breakpoint in a tryCatch() handler binds and stops.
+    let m = d.mark();
+    c.send("safe()", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0].1, 3);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("\"no\"");
+}

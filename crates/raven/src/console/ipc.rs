@@ -21,6 +21,8 @@
 //! → {"v":1,"id":10,"op":"subscribe"}                  // keeps the connection:
 //! ← {"id":10,"status":"ok"}                            // the console pushes
 //! ← {"event":"stopped","reason":"breakpoint"}          // stop/run events
+//! ← {"event":"breakpoints","breakpoints":[…]}          // and line breakpoint
+//!                                                      // states (DAP shape)
 //! → {"v":1,"id":11,"op":"breakpoints","files":{"/w/a.R":[{"line":3}]},
 //!    "functions":["f"],"exceptionFilters":["error"]}   // mirror while no
 //! ← {"id":11,"status":"ok"}                            // session exists

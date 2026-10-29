@@ -163,6 +163,7 @@ enum Job {
     Variables(Value),
     Evaluate(Value),
     SetVariable(Value),
+    Completions(Value),
     FunctionBreakpoints(Option<Value>, Vec<String>),
 }
 
@@ -184,6 +185,9 @@ struct Shared {
     hooks_dirty: bool,
     /// Virtual sources (deparsed functions) of the current stop.
     sources: HashMap<i64, String>,
+    /// The session asked to step into code without source too
+    /// (`justMyCode: false`).
+    all_code: bool,
 }
 
 impl Shared {
@@ -255,6 +259,11 @@ struct RState {
     jmc_steps: u8,
     /// Names the rebinding detector last reported.
     masked: String,
+    /// Function breakpoints' bound state (`1`/`0` per name) last reported.
+    fn_bound: String,
+    /// Some code has been instrumented in this session (the rebinding
+    /// notice matters only then).
+    instrumented: bool,
 }
 
 thread_local! {
@@ -313,6 +322,7 @@ pub fn init(
         "function_breakpoints",
         "verify_callees",
         "split_exprs",
+        "completions",
         "set_source_hook",
         "install_hook_only",
         "on_stop",
@@ -377,6 +387,8 @@ pub fn init(
             jit_off: false,
             jmc_steps: 0,
             masked: String::new(),
+            fn_bound: String::new(),
+            instrumented: false,
         })
     });
     // The probe hook and Ark's annotate hook can be bound now; the global
@@ -410,9 +422,21 @@ fn r_version_at_least(major: u32, minor: u32) -> bool {
     (ma, mi) >= (major, minor)
 }
 
+thread_local! {
+    /// Helper calls in progress on the R thread (see [`on_repl_prompt`]).
+    static HELPER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Call an R helper with string arguments; its result as one string.
 fn call_helper(name: &str, args: &[&str]) -> Option<String> {
     let fun = with_r(|r| r.helpers.get(name).copied()).flatten()?;
+    HELPER_DEPTH.with(|d| d.set(d.get() + 1));
+    let out = call_helper_inner(fun, args);
+    HELPER_DEPTH.with(|d| d.set(d.get() - 1));
+    out
+}
+
+fn call_helper_inner(fun: Sexp, args: &[&str]) -> Option<String> {
     let owned: Vec<CString> = args
         .iter()
         .map(|a| CString::new(a.replace('\0', "")).unwrap_or_default())
@@ -457,6 +481,7 @@ fn capabilities() -> Value {
         "supportsLogPoints": true,
         "supportsEvaluateForHovers": true,
         "supportsSetVariable": true,
+        "supportsCompletionsRequest": true,
         "supportsExceptionInfoRequest": true,
         "supportsBreakpointLocationsRequest": true,
         "supportsTerminateRequest": true,
@@ -486,7 +511,10 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             out.respond(&msg, capabilities());
             out.event("initialized", json!({}));
         }
-        "attach" | "launch" => out.respond(&msg, json!({})),
+        "attach" | "launch" => {
+            lock_shared(shared).all_code = args["justMyCode"] == json!(false);
+            out.respond(&msg, json!({}));
+        }
         "configurationDone" => {
             let stop = {
                 let mut s = lock_shared(shared);
@@ -568,6 +596,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
         "variables" => queue_job(Job::Variables(msg)),
         "evaluate" => queue_job(Job::Evaluate(msg)),
         "setVariable" => queue_job(Job::SetVariable(msg)),
+        "completions" => queue_job(Job::Completions(msg)),
         "exceptionInfo" => {
             let stop = lock_shared(shared).stop.clone();
             match stop.and_then(|s| s.exception) {
@@ -590,30 +619,30 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 "stepIn" => "s",
                 _ => "f",
             };
-            request_resume(cmd_letter);
+            // Respond first: the resume's `continued` (and any next
+            // `stopped`) must follow the response.
             if cmd == "continue" {
                 out.respond(&msg, json!({"allThreadsContinued": true}));
             } else {
                 out.respond(&msg, json!({}));
             }
+            request_resume(cmd_letter);
         }
         "pause" => {
             request_pause();
             out.respond(&msg, json!({}));
         }
         "disconnect" => {
+            // Detaching lets R go on (as other debuggers' attach sessions
+            // do); terminating quits the browser.
             let terminate = args["terminateDebuggee"].as_bool().unwrap_or(false);
-            if terminate && lock_shared(shared).stop.is_some() {
-                request_resume("Q");
-            }
             out.respond(&msg, json!({}));
+            request_resume(if terminate { "Q" } else { "c" });
         }
         "terminate" => {
-            if lock_shared(shared).stop.is_some() {
-                request_resume("Q");
-            }
             out.respond(&msg, json!({}));
             out.event("terminated", json!({}));
+            request_resume("Q");
         }
         "breakpointLocations" => {
             let path = args["source"]["path"].as_str().unwrap_or("");
@@ -835,6 +864,8 @@ pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String
     } else {
         s.files.insert(key, new);
     }
+    drop(s);
+    push_breakpoint_summary();
     result
 }
 
@@ -851,7 +882,24 @@ pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>
     }
 }
 
+/// Every line breakpoint's state, pushed to the extension's control
+/// connection so it can summarize them while no session exists (§5.5).
+fn push_breakpoint_summary() {
+    let Some(h) = handle() else { return };
+    let items: Vec<Value> = {
+        let s = lock(h);
+        s.files
+            .iter()
+            .flat_map(|(path, bps)| bps.iter().map(move |b| b.to_dap(path)))
+            .collect()
+    };
+    push_control(json!({"event": "breakpoints", "breakpoints": items}));
+}
+
 fn notify_breakpoints(changed: Vec<(String, LineBp)>) {
+    if !changed.is_empty() {
+        push_breakpoint_summary();
+    }
     let Some(out) = outbox() else { return };
     for (path, bp) in changed {
         out.event(
@@ -1049,7 +1097,7 @@ fn apply_plan(
     first_line: u32,
     plan: &annotate::Plan,
     verified_callees: &[&str],
-) -> (Vec<(usize, u32, String)>, bool) {
+) -> (Vec<annotate::Injection>, bool) {
     let Some(h) = handle() else {
         return (Vec::new(), false);
     };
@@ -1065,13 +1113,18 @@ fn apply_plan(
                     byte,
                     line,
                     callees,
+                    brace_end,
                 } => {
                     let unconfirmed = callees.iter().find(|c| {
                         !verified_callees.contains(&format!("{}::{}", c.pkg, c.name).as_str())
                     });
                     let Ok(num) = id.parse::<u64>() else {
                         if id == STEP_PROBE {
-                            inj.push((*byte, *line, id.clone()));
+                            inj.push(annotate::Injection {
+                                byte: *byte,
+                                id: id.clone(),
+                                brace_end: *brace_end,
+                            });
                         }
                         continue;
                     };
@@ -1091,7 +1144,11 @@ fn apply_plan(
                         bp.bound_text = lines
                             .get((line - first_line) as usize)
                             .map(|l| l.to_string());
-                        inj.push((*byte, *line, id.clone()));
+                        inj.push(annotate::Injection {
+                            byte: *byte,
+                            id: id.clone(),
+                            brace_end: *brace_end,
+                        });
                     }
                     changed.push((path.to_string(), bp.clone()));
                 }
@@ -1109,6 +1166,9 @@ fn apply_plan(
     }
     notify_breakpoints(changed);
     let any = !inj.is_empty();
+    if any {
+        with_r(|r| r.instrumented = true);
+    }
     (inj, any)
 }
 
@@ -1213,12 +1273,14 @@ pub fn render_segment(seg: &Segment) -> String {
     )
 }
 
-/// Called when the console starts feeding the next segment of a
-/// submission at a top-level prompt: arms the one-shot step probe if the
-/// user was stepping when the previous expression finished (§4).
-pub fn on_next_segment() {
+/// Called at a top-level prompt with no lines pending: arms the one-shot
+/// step probe if the user was stepping when the previous expression
+/// finished and `continuing` (another segment of the same submission is
+/// about to run, §4). Otherwise the carried-over step is dropped, so it
+/// never reaches a later, unrelated send.
+pub fn on_next_segment(continuing: bool) {
     with_r(|r| {
-        if std::mem::take(&mut r.step_next_segment) {
+        if std::mem::take(&mut r.step_next_segment) && continuing {
             r.step_probe_armed = true;
         }
     });
@@ -1252,6 +1314,21 @@ fn read_current_srcref(use_na: bool) -> Option<(String, [u32; 4])> {
 /// feeds anything. Returns hidden input to give R instead of reading.
 pub fn on_repl_prompt(level: u32) -> Option<String> {
     if !active() {
+        return None;
+    }
+    // A Debug Console or Watch expression reached a `browser()` (or a
+    // debug()ged function): the debugger is already stopped, so it can't
+    // stop again inside its own request. Continue, and say so.
+    if HELPER_DEPTH.with(|d| d.get()) > 0 {
+        if level > 0 {
+            if let Some(out) = outbox() {
+                out.event(
+                    "output",
+                    json!({"category": "important", "output": "raven debugger: skipped a browser() reached while evaluating an expression\n"}),
+                );
+            }
+            return Some("c\n".into());
+        }
         return None;
     }
     if with_r(|r| std::mem::take(&mut r.jit_off)).unwrap_or(false) && level > 0 {
@@ -1289,14 +1366,45 @@ pub fn on_repl_prompt(level: u32) -> Option<String> {
     Some(CAPTURE.into())
 }
 
+/// DAP id of the `i`th function breakpoint (the list is replaced as a whole
+/// by every `setFunctionBreakpoints`, so position is a stable identity).
+fn fn_bp_id(i: usize) -> u64 {
+    FN_BP_ID_BASE + i as u64
+}
+
+const FN_BP_ID_BASE: u64 = 1 << 40;
+
+/// A function breakpoint whose name came to (or stopped) resolving since the
+/// last prompt, for example because the function was defined after the
+/// breakpoint was set, is re-reported to the client.
+fn report_function_breakpoints(bound: &str) {
+    let prev =
+        with_r(|r| std::mem::replace(&mut r.fn_bound, bound.to_string())).unwrap_or_default();
+    if prev == bound || prev.len() != bound.len() {
+        return;
+    }
+    let Some(out) = outbox() else { return };
+    for (i, (a, b)) in prev.bytes().zip(bound.bytes()).enumerate() {
+        if a != b {
+            out.event(
+                "breakpoint",
+                json!({"reason": "changed", "breakpoint": {"id": fn_bp_id(i), "verified": b == b'1'}}),
+            );
+        }
+    }
+}
+
 fn on_top_level() -> Option<String> {
     release_held(true);
-    let masked = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
+    let reply = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
+    let (masked, bound) = reply.split_once('\x1e').unwrap_or((reply.as_str(), ""));
+    let (masked, bound) = (masked.to_string(), bound.to_string());
+    report_function_breakpoints(&bound);
     let changed = with_r(|r| {
         r.jit_off = false;
         if r.masked != masked {
             r.masked = masked.clone();
-            true
+            r.instrumented
         } else {
             false
         }
@@ -1369,8 +1477,9 @@ fn on_captured() -> Option<String> {
     let top_nosrc = flags.split(',').any(|f| f == "nosrc");
     // "Just my code" (§4): a step-in that lands in a function with no
     // srcref (base R, an installed package) steps back out, unseen.
+    let all_code = lock(h).all_code;
     let jmc = with_r(|r| {
-        let step_in = r.resumed && r.last_user_resume.as_deref() == Some("s");
+        let step_in = !all_code && r.resumed && r.last_user_resume.as_deref() == Some("s");
         if step_in && top_nosrc && r.jmc_steps < MAX_JMC_STEPS {
             r.jmc_steps += 1;
             true
@@ -1538,6 +1647,10 @@ fn note_resume(cmd: &str) {
         r.last_user_resume = Some(cmd.to_string());
         r.pending_hit = None;
     });
+    // Running again: nothing to show until the next stop.
+    if let Some(h) = handle() {
+        lock(h).stop = None;
+    }
     if let Some(out) = outbox() {
         out.event(
             "continued",
@@ -1636,6 +1749,36 @@ fn run_job(h: &Handle, job: Job) {
                 out.respond(&req, v);
             }
         }
+        Job::Completions(req) => {
+            let a = &req["arguments"];
+            let (head, column) = completion_head(
+                a["text"].as_str().unwrap_or(""),
+                a["line"].as_u64(),
+                a["column"].as_u64().unwrap_or(1),
+            );
+            let frame = if a["frameId"].is_null() {
+                "0".to_string()
+            } else {
+                r_frame(&a["frameId"])
+            };
+            let json = call_helper("completions", &[&head, &frame]).unwrap_or_default();
+            let v: Value = serde_json::from_str(&json).unwrap_or(json!({}));
+            let token = v["token"].as_str().unwrap_or("");
+            let len = token.encode_utf16().count() as u64;
+            let cands: Vec<String> = v["items"]
+                .as_array()
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let targets: Vec<Value> = super::editor::rank(token, &cands)
+                .into_iter()
+                .map(|c| json!({"label": c, "start": column.saturating_sub(len), "length": len}))
+                .collect();
+            out.respond(&req, json!({"targets": targets}));
+        }
         Job::SetVariable(req) => {
             let a = &req["arguments"];
             let r = a["variablesReference"].as_u64().unwrap_or(0).to_string();
@@ -1654,12 +1797,42 @@ fn run_job(h: &Handle, job: Job) {
             lock(h).fn_names = names.clone();
             let json = call_helper("function_breakpoints", &[&names.join(US)])
                 .unwrap_or_else(|| "[]".into());
-            let bps: Value = serde_json::from_str(&json).unwrap_or(json!([]));
+            let mut bps: Value = serde_json::from_str(&json).unwrap_or(json!([]));
+            let mut bound = String::new();
+            if let Some(list) = bps.as_array_mut() {
+                for (i, bp) in list.iter_mut().enumerate() {
+                    bp["id"] = json!(fn_bp_id(i));
+                    bound.push(if bp["verified"] == json!(true) {
+                        '1'
+                    } else {
+                        '0'
+                    });
+                }
+            }
+            with_r(|r| r.fn_bound = bound);
             if let Some(req) = req {
                 out.respond(&req, json!({"breakpoints": bps}));
             }
         }
     }
+}
+
+/// The line a `completions` request completes, up to the cursor, and the
+/// cursor's 1-based column (DAP columns count UTF-16 units; VS Code sends
+/// 1-based lines and columns).
+fn completion_head(text: &str, line: Option<u64>, column: u64) -> (String, u64) {
+    let row = line.unwrap_or(1).max(1) as usize - 1;
+    let l = text.split('\n').nth(row).unwrap_or("");
+    let mut units = 0u64;
+    let mut head = String::new();
+    for ch in l.chars() {
+        if units + ch.len_utf16() as u64 > column.saturating_sub(1) {
+            break;
+        }
+        units += ch.len_utf16() as u64;
+        head.push(ch);
+    }
+    (head, units + 1)
 }
 
 /// Keep the `source()` hook installed exactly while line breakpoints exist.
