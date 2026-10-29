@@ -11,13 +11,20 @@
  *     own evaluation; the only one that calls Rust is the RPC routine, and
  *     Rust's side of it never touches R.
  *
- * libR is loaded with RTLD_GLOBAL, so symbols are resolved here with dlsym
- * rather than threaded through shim.c's table. Required symbols missing at
+ * libR is loaded with RTLD_GLOBAL (on Windows, R.dll is already loaded by
+ * name), so symbols are resolved here directly rather than threaded through
+ * shim.c's table. Required symbols missing at
  * init disable the debugger (the console itself still runs); optional ones
  * (R 4.6's binding API) fall back to older accessors.
  */
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <math.h>
 #include <limits.h>
 #include <stdio.h>
@@ -103,15 +110,26 @@ static RustRpc rust_rpc = NULL;
 
 void raven_dbg_set_rpc(RustRpc f) { rust_rpc = f; }
 
+/* R's exports: global symbols of the RTLD_GLOBAL libR (Unix), or R.dll's
+ * export table (Windows, where there is no global namespace). */
+static void *r_symbol(const char *name) {
+#ifdef _WIN32
+    HMODULE dll = GetModuleHandleA("R.dll");
+    return dll ? (void *)GetProcAddress(dll, name) : NULL;
+#else
+    return dlsym(RTLD_DEFAULT, name);
+#endif
+}
+
 #define REQ(field, name)                                         \
     do {                                                          \
-        r.field = dlsym(RTLD_DEFAULT, name);                      \
+        *(void **)&r.field = r_symbol(name);                      \
         if (!r.field) {                                           \
             missing = name;                                       \
             goto fail;                                            \
         }                                                         \
     } while (0)
-#define OPT(field, name) r.field = dlsym(RTLD_DEFAULT, name)
+#define OPT(field, name) *(void **)&r.field = r_symbol(name)
 
 /* ---- .Call routines (run inside R's evaluation) -------------------------- */
 
@@ -381,6 +399,18 @@ static void copy_str(char *dst, int len, const char *src) {
     dst[i] = 0;
 }
 
+/* `/x`, and on Windows also `\\x` and `C:/x` / `C:\\x`. */
+static int is_absolute(const char *f) {
+    if (f[0] == '/') return 1;
+#ifdef _WIN32
+    if (f[0] == '\\') return 1;
+    if (((f[0] >= 'A' && f[0] <= 'Z') || (f[0] >= 'a' && f[0] <= 'z')) && f[1] == ':' &&
+        (f[2] == '/' || f[2] == '\\'))
+        return 1;
+#endif
+    return 0;
+}
+
 static void toplevel_srcref(void *data) {
     SrcrefPayload *p = (SrcrefPayload *)data;
     SEXP sr = r.R_GetCurrentSrcref(p->skip);
@@ -400,7 +430,7 @@ static void toplevel_srcref(void *data) {
             /* Relative names are resolved against the srcfile's wd. */
             SEXP wd = r.Rf_findVarInFrame(srcfile, r.Rf_install("wd"));
             if (r.TYPEOF(wd) == PROMSXP) wd = r.PRVALUE(wd);
-            if (f[0] != '/' && f[0] != '<' && r.TYPEOF(wd) == STRSXP && r.Rf_length(wd) > 0) {
+            if (!is_absolute(f) && f[0] != '<' && r.TYPEOF(wd) == STRSXP && r.Rf_length(wd) > 0) {
                 const char *w = r.R_CHAR(r.STRING_ELT(wd, 0));
                 int n = 0;
                 for (; w[n] && n < p->filelen - 2; n++) p->file[n] = w[n];

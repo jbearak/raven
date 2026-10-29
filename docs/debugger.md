@@ -2,7 +2,7 @@
 
 Raven's R console has a built-in debugger for VS Code. You get breakpoints in `.R`, `.Rmd` and `.qmd` files, stepping, the call stack, a Variables view, watch expressions and the Debug Console. It is driven by R's own `browser()`, so everything you know from the console still works: typing `n` in the terminal and clicking **Step Over** do the same thing.
 
-It needs Raven's console (`raven.rTerminal.program` = `raven`, the default). It works on macOS and Linux. On Windows, Raven's console starts plain R, so there is no debugger there yet.
+It needs Raven's console (`raven.rTerminal.program` = `raven`, the default), on macOS, Linux, or Windows.
 
 ## Getting started
 

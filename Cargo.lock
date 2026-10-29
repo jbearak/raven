@@ -1836,6 +1836,7 @@ dependencies = [
  "url",
  "walkdir",
  "winapi-util",
+ "windows-sys 0.61.2",
  "xdg",
  "yaml-rust2",
 ]

@@ -346,7 +346,7 @@ raven lint [OPTIONS] [PATHS...]
 
 ## `raven console`
 
-An R console with syntax highlighting, multi-line editing, Tab completion, and colored output. It runs the same R as typing `R` would (the `R` on your `PATH`, or `R_HOME`), embedded in its own process. It is the default R console in Raven's VS Code extension; see [R Console](r-console.md#ravens-console) for how it behaves. macOS and Linux only.
+An R console with syntax highlighting, multi-line editing, Tab completion, and colored output. It runs the same R as typing `R` would (the `R` on your `PATH`, or `R_HOME`), embedded in its own process. It is the default R console in Raven's VS Code extension; see [R Console](r-console.md#ravens-console) for how it behaves. On Windows it needs R 4.2 or later, and also finds R through the registry.
 
 ```sh
 raven console                  # like `R`
@@ -360,8 +360,10 @@ raven console --no-save -q     # R's options pass through unchanged
 | `--color-output streams\|values\|off` | Output colors (default `streams`; `NO_COLOR` turns them off) |
 | `--history-file PATH` | Where to keep input history |
 | `--no-history` | Keep history in memory only |
-| `--ipc PATH` | Also accept code from an editor on this Unix socket |
-| `--dap PATH` | Serve the R [debugger](debugger.md) (Debug Adapter Protocol) on this Unix socket |
+| `--ipc PATH` | Also accept code from an editor on this local socket |
+| `--dap PATH` | Serve the R [debugger](debugger.md) (Debug Adapter Protocol) on this local socket |
+
+On Unix, `--ipc` and `--dap` sockets are Unix sockets at `PATH`. On Windows they are named pipes named after `PATH` (`\\.\pipe\raven-` followed by `PATH` with every character other than letters, digits, `.`, `_` and `-` replaced by `-`), and the console creates an empty file at `PATH` once the pipe is listening. A `PATH` that already starts with `\\.\pipe\` is used as the pipe name.
 
 Every other argument goes to R. If stdin or stdout isn't a terminal, or the console can't embed your R (e.g. R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
 
