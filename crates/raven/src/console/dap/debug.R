@@ -10,7 +10,7 @@
 # Rules:
 #   - Nothing on a default path calls a generic on a user object: previews
 #     and hover use typeof(), oldClass(), attr(), .subset()/.subset2() and
-#     the native helpers, which never dispatch (design §6).
+#     the native helpers, which never dispatch (design sec. 6).
 #   - Every entry point catches its own errors and sets `state$internal`, so
 #     Raven's own work never triggers the user's handlers or breakpoints.
 base::local(envir = base::new.env(parent = base::baseenv()), {
@@ -74,15 +74,29 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
 
     # ---- references ----------------------------------------------------------
-    register <- function(x) {
+    # `expr` is the R expression that reaches `x` from the selected frame
+    # (DAP evaluateName: Watch, Copy as Expression, Open in Data Viewer);
+    # "" for a frame environment itself.
+    register <- function(x, expr = NULL) {
         id <- state$next_ref
         state$next_ref <- id + 1L
         assign(as.character(id), x, envir = state$refs)
+        if (!is.null(expr)) assign(as.character(id), expr, envir = state$exprs)
         id
     }
+    lookup_expr <- function(id) get0(as.character(id), envir = state$exprs, inherits = FALSE)
+    bt <- function(n) if (identical(make.names(n), n)) n else paste0("`", gsub("`", "\\`", n), "`")
+    child_expr <- function(parent, name = NULL, index = NULL, atomic = FALSE) {
+        if (is.null(parent)) return(NULL)
+        if (!is.null(name)) return(if (nzchar(parent)) paste0(parent, "$", bt(name)) else bt(name))
+        if (!nzchar(parent)) return(NULL)
+        if (atomic) paste0(parent, "[", index, "]") else paste0(parent, "[[", index, "]]")
+    }
     lookup_ref <- function(id) get0(as.character(id), envir = state$refs, inherits = FALSE)
+    state$exprs <- new.env(parent = emptyenv())
     env$reset_refs <- function() {
         state$refs <- new.env(parent = emptyenv())
+        state$exprs <- new.env(parent = emptyenv())
         invisible(NULL)
     }
 
@@ -91,7 +105,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     trunc_str <- function(s, n = 200L) {
         s <- s[1L]
         if (is.na(s)) return("NA")
-        if (nchar(s, type = "chars", allowNA = TRUE, keepNA = FALSE) > n) paste0(substr(s, 1L, n), "…") else s
+        if (nchar(s, type = "chars", allowNA = TRUE, keepNA = FALSE) > n) paste0(substr(s, 1L, n), "...") else s
     }
     short_type <- function(t) {
         switch(t, double = "num", integer = "int", character = "chr", logical = "lgl",
@@ -191,7 +205,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is_df(cls)) {
             nr <- .row_names_info(x, 2L)
             label <- if ("tbl_df" %in% cls) "tibble" else if ("data.table" %in% cls) "data.table" else "data.frame"
-            return(sprintf("%s [%s × %s]", label, format(nr), format(n)))
+            return(sprintf("%s [%s x %s]", label, format(nr), format(n)))
         }
         if (t %in% c("list", "pairlist")) {
             return(sprintf("%s [%s]", if (is.null(cls)) "list" else cls[[1L]], format(n)))
@@ -203,7 +217,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         k <- min(n, 10)
         shown <- elems(x, seq_len(k))
         s <- paste(shown, collapse = " ")
-        if (n > k) s <- paste(s, "…")
+        if (n > k) s <- paste(s, "...")
         if (n != 1) s <- sprintf("%s [%s] %s", type_label(x), format(n), s)
         trunc_str(s)
     }
@@ -226,7 +240,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         c(0, 0)
     }
-    var_json <- function(name, value, kind = "value") {
+    var_json <- function(name, value, kind = "value", expr = NULL) {
         if (kind == "promise") {
             return(jobj(name = jstr(name), value = jstr(paste0("<promise: ", trunc_str(deparse(value, nlines = 1L, width.cutoff = 200L)[1L]), ">")),
                         type = jstr("promise"), variablesReference = "0",
@@ -237,9 +251,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                         variablesReference = "0", presentationHint = jobj(kind = jstr("data"), lazy = "true")))
         }
         counts <- tryCatch(child_counts(value), error = function(e) c(0, 0))
-        ref <- if (sum(counts) > 0) register(value) else 0L
+        ref <- if (sum(counts) > 0) register(value, expr) else 0L
         jobj(name = jstr(name), value = jstr(preview(value)), type = jstr(tryCatch(type_label(value), error = function(e) "?")),
              variablesReference = jnum(ref),
+             evaluateName = if (!is.null(expr)) jstr(expr) else NULL,
              indexedVariables = if (counts[1] > 0) jnum(counts[1]) else NULL,
              namedVariables = if (counts[2] > 0) jnum(counts[2]) else NULL)
     }
@@ -249,14 +264,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (start >= n) return(integer())
         seq.int(start + 1, min(n, start + count))
     }
-    children <- function(x, start, count, filter) {
+    children <- function(x, start, count, filter, pexpr = NULL) {
         t <- typeof(x)
         out <- character()
         if (t == "environment") {
             nms <- ls(x, all.names = TRUE, sorted = TRUE)
             for (i in page(length(nms), start, count)) {
                 b <- .Call(N$binding, x, nms[[i]])
-                out <- c(out, var_json(nms[[i]], b[[2L]], b[[1L]]))
+                out <- c(out, var_json(nms[[i]], b[[2L]], b[[1L]], child_expr(pexpr, name = nms[[i]])))
             }
             return(out)
         }
@@ -270,8 +285,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             n <- xlen(x)
             nms <- attr(x, "names", exact = TRUE)
             for (i in page(n, start, count)) {
-                nm <- if (!is.null(nms) && nzchar(nms[[i]])) nms[[i]] else sprintf("[[%d]]", i)
-                out <- c(out, var_json(nm, .subset2(x, i)))
+                named <- !is.null(nms) && nzchar(nms[[i]])
+                nm <- if (named) nms[[i]] else sprintf("[[%d]]", i)
+                ex <- if (named) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
+                out <- c(out, var_json(nm, .subset2(x, i), "value", ex))
             }
             return(out)
         }
@@ -281,8 +298,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             if (length(idx)) {
                 vals <- elems(x, idx)
                 for (j in seq_along(idx)) {
+                    ex <- child_expr(pexpr, index = idx[[j]], atomic = TRUE)
                     out <- c(out, jobj(name = jstr(sprintf("[%d]", idx[[j]])), value = jstr(vals[[j]]),
-                                       type = jstr(type_label(x)), variablesReference = "0"))
+                                       type = jstr(type_label(x)), variablesReference = "0",
+                                       evaluateName = if (!is.null(ex)) jstr(ex) else NULL))
                 }
             }
             return(out)
@@ -294,7 +313,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is.null(x) && !exists(as.character(ref), envir = state$refs, inherits = FALSE)) {
             return(jarr(character()))
         }
-        jarr(children(x, as.numeric(start), as.numeric(count), filter))
+        jarr(children(x, as.numeric(start), as.numeric(count), filter, lookup_expr(as.integer(ref))))
     }, error = function(e) jarr(character())))
 
     # ---- stops ---------------------------------------------------------------
@@ -317,7 +336,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     # Called as hidden console input at a Browse> prompt: R evaluates it in
     # the browsed environment, so parent.frame() is that environment even
-    # while a promise is being forced (RStudio's capture trick, design §4).
+    # while a promise is being forced (RStudio's capture trick, design sec. 4).
     env$capture <- function() {
         lv <- get0(".Last.value", envir = baseenv())
         internal(tryCatch({
@@ -335,16 +354,31 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             fbp <- n > 0 && any(vapply(state$fbp, function(g) identical(g, funs[[n]]), TRUE))
             env$reset_refs()
             items <- character()
+            top_nosrc <- FALSE
+            first <- TRUE
             for (i in rev(seq_len(n))) {
                 if (hidden[[i]]) next
                 loc <- if (i < n) srcref_loc(attr(calls[[i + 1L]], "srcref")) else NULL
+                f <- funs[[i]]
+                # A function with no srcref (base R, an installed package)
+                # gets its deparsed text as a virtual source (design sec. 6).
+                nosrc <- is.function(f) && !is.primitive(f) && is.null(attr(f, "srcref"))
+                if (first) {
+                    top_nosrc <- nosrc
+                    first <- FALSE
+                }
+                fsrc <- if (nosrc) {
+                    tryCatch(paste(deparse(f, width.cutoff = 80L, nlines = 2000L), collapse = "\n"),
+                             error = function(e) NULL)
+                } else NULL
                 items <- c(items, jobj(id = jnum(i), name = jstr(call_name(calls[[i]])),
-                                       loc = if (is.null(loc)) "null" else jarr(c(jstr(loc[[1L]]), loc[-1L]))))
+                                       loc = if (is.null(loc)) "null" else jarr(c(jstr(loc[[1L]]), loc[-1L])),
+                                       fsrc = if (!is.null(fsrc)) jstr(paste0(call_name(calls[[i]]), " <- ", fsrc)) else NULL))
             }
             gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else NULL
             items <- c(items, jobj(id = "0", name = jstr("<top level>"),
                                    loc = if (is.null(gloc)) "null" else jarr(c(jstr(gloc[[1L]]), gloc[-1L]))))
-            rpc("captured", jarr(items), if (fbp) "fbp" else "")
+            rpc("captured", jarr(items), paste(c(if (fbp) "fbp", if (top_nosrc) "nosrc"), collapse = ","))
         }, error = function(e) rpc("captured", "[]")))
         invisible(lv)
     }
@@ -357,15 +391,15 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$scopes <- function(frame) internal(tryCatch({
         e <- frame_env(frame)
         out <- jobj(name = jstr(if (identical(e, globalenv())) "Global" else "Locals"),
-                    presentationHint = jstr("locals"), variablesReference = jnum(register(e)),
+                    presentationHint = jstr("locals"), variablesReference = jnum(register(e, "")),
                     namedVariables = jnum(length(ls(e, all.names = TRUE, sorted = FALSE))),
                     expensive = jbool(identical(e, globalenv())))
         if (!identical(e, globalenv())) {
             p <- parent.env(e)
             if (!identical(p, globalenv()) && !identical(p, emptyenv())) {
-                out <- c(out, jobj(name = jstr("Enclosing"), variablesReference = jnum(register(p)), expensive = "true"))
+                out <- c(out, jobj(name = jstr("Enclosing"), variablesReference = jnum(register(p, "")), expensive = "true"))
             }
-            out <- c(out, jobj(name = jstr("Global"), variablesReference = jnum(register(globalenv())), expensive = "true"))
+            out <- c(out, jobj(name = jstr("Global"), variablesReference = jnum(register(globalenv(), "")), expensive = "true"))
         }
         jarr(out)
     }, error = function(e) jarr(character())))
@@ -388,14 +422,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             if (isTRUE(res$visible)) paste(utils::capture.output(print(v)), collapse = "\n") else ""
         } else preview(v)
         counts <- tryCatch(child_counts(v), error = function(e) c(0, 0))
-        ref <- if (sum(counts) > 0) register(v) else 0L
+        ref <- if (sum(counts) > 0) register(v, paste0("(", expr, ")")) else 0L
         jobj(result = jstr(text), type = jstr(tryCatch(type_label(v), error = function(e) "?")),
              variablesReference = jnum(ref),
              indexedVariables = if (counts[1] > 0) jnum(counts[1]) else NULL,
              namedVariables = if (counts[2] > 0) jnum(counts[2]) else NULL)
     }, error = function(e) jobj(error = jstr(conditionMessage(e)))))
 
-    # Hover resolves only forms that run no R code (design §6).
+    # Hover resolves only forms that run no R code (design sec. 6).
     resolve <- function(e, scope) {
         if (is.symbol(e)) {
             name <- as.character(e)
@@ -488,7 +522,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     # The probe's hook (installed as option `raven.debug_hook`). It must force
     # `b` as its very last action so the single hidden `n` that follows a hit
-    # lands on the anchored statement (design §5.2).
+    # lands on the anchored statement (design sec. 5.2).
     hook <- function(id, env, b) {
         if (isTRUE(state$internal)) return(invisible(NULL))
         info <- rpc("bp", id)
@@ -548,7 +582,37 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         jarr(out)
     }, error = function(e) jarr(character())))
 
-    # ---- callee identity (design §5.3) ---------------------------------------
+    # ---- per-stop state (design sec. 4, sec. 5.4.6) -----------------------------------
+    # While stopped, an empty line must not repeat `n`; R's JIT is off for
+    # the duration of a step-in (Ark's fix for positron#11890). Each change
+    # is undone only if the value is still the one Raven set (sec. 8.3).
+    env$on_stop <- function() internal(tryCatch({
+        if (is.null(state$nl_saved)) {
+            state$nl_saved <- list(getOption("browserNLdisabled"))
+            options(browserNLdisabled = TRUE)
+        }
+        "ok"
+    }, error = function(e) "err"))
+    env$on_resume <- function(cmd) internal(tryCatch({
+        if (identical(cmd, "s") && is.null(state$jit_saved)) state$jit_saved <- compiler::enableJIT(0L)
+        "ok"
+    }, error = function(e) "err"))
+    env$at_prompt <- function(top) internal(tryCatch({
+        if (!is.null(state$jit_saved)) {
+            if (identical(compiler::enableJIT(-1L), 0L)) compiler::enableJIT(state$jit_saved)
+            state$jit_saved <- NULL
+        }
+        if (isTRUE(as.logical(top))) {
+            if (!is.null(state$nl_saved)) {
+                if (isTRUE(getOption("browserNLdisabled"))) options(browserNLdisabled = state$nl_saved[[1L]])
+                state$nl_saved <- NULL
+            }
+            return(masked_names())
+        }
+        ""
+    }, error = function(e) ""))
+
+    # ---- callee identity (design sec. 5.3) ---------------------------------------
     lazy_promise <- function(expr) is.call(expr) && identical(expr[[1L]], quote(lazyLoadDBfetch))
     lookup_fun <- function(name, from) {
         s <- from
@@ -579,6 +643,23 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         FALSE
     }
+    # Core syntax and base functions in the known-callee table that a
+    # function binding in the global or an attached environment now masks
+    # (the advisory rebinding detector, design sec. 5.3 rule 2).
+    watched <- c("{", "(", "if", "for", "while", "repeat", "<-", "=", "<<-", "function", "::", "browser",
+                 "local", "tryCatch", "withCallingHandlers", "try", "suppressWarnings", "suppressMessages",
+                 "with", "within", "system.time", "invisible", "lapply", "sapply", "vapply", "Map", "Filter",
+                 "Reduce", "do.call")
+    masked_names <- function() {
+        out <- character()
+        for (nm in watched) {
+            expected <- get(nm, envir = baseenv())
+            found <- lookup_fun(nm, globalenv())
+            if (!isTRUE(found$ok) || !same_fun(found$value, expected)) out <- c(out, nm)
+        }
+        paste(out, collapse = US)
+    }
+
     # `spec` is "pkg::name" entries joined by US; returns the confirmed ones.
     env$verify_callees <- function(spec, from = globalenv()) internal(tryCatch({
         items <- if (nzchar(spec)) strsplit(spec, US, fixed = TRUE)[[1L]] else character()
@@ -612,7 +693,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         out <- rpc("render_file", path, verified)
         if (nzchar(out)) out else NULL
     }
-    # Ark's de facto hook (design §5.3, owner decision 1): pkgload >= 1.5 and
+    # Ark's de facto hook (design sec. 5.3, owner decision 1): pkgload >= 1.5 and
     # shiny >= 1.13 call it with the file's text and a file:/// URI and parse
     # whatever text it returns.
     env$ark_annotate_source <- function(source, uri, with_visible = FALSE) {
@@ -676,7 +757,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         "ok"
     }, error = function(e) conditionMessage(e)))
 
-    # ---- exceptions and pause (design §7) ------------------------------------
+    # ---- exceptions and pause (design sec. 7) ------------------------------------
     user_frame <- function() {
         n <- sys.nframe()
         for (i in rev(seq_len(n))) {

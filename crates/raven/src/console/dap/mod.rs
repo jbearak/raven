@@ -56,6 +56,9 @@ const CAPTURE: &str = "base::.raven_dbg_capture()\n";
 const INSTALL: &str = "base::.raven_dbg_install()\n";
 /// Most hidden `n` steps through probe scaffolding before giving up (§4).
 const MAX_HIDDEN_STEPS: u8 = 4;
+/// Most hidden `f` steps out of code with no srcref before giving up
+/// ("just my code", §4).
+const MAX_JMC_STEPS: u8 = 64;
 /// Id of the one-shot probe that continues stepping into the next top-level
 /// expression of a submission (§4).
 const STEP_PROBE: &str = "step";
@@ -134,6 +137,9 @@ struct Frame {
     col: u32,
     end_line: u32,
     end_col: u32,
+    /// `sourceReference` of the deparsed function, for frames whose
+    /// function has no srcref (design §6).
+    source_ref: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +175,8 @@ struct Shared {
     rewrite_next: bool,
     /// Line breakpoints changed: the R thread re-syncs the `source()` hook.
     hooks_dirty: bool,
+    /// Virtual sources (deparsed functions) of the current stop.
+    sources: HashMap<i64, String>,
 }
 
 impl Shared {
@@ -213,7 +221,8 @@ struct RState {
     awaiting_capture: bool,
     hidden_steps: u8,
     current: Option<(String, [u32; 4])>,
-    captured: Option<(String, bool)>,
+    /// The capture call's frames (JSON) and flags (`fbp`, `nosrc`).
+    captured: Option<(String, String)>,
     /// A stop is active (reported and not resumed into running code).
     stopped: bool,
     /// A step/continue command was fed since the last stop.
@@ -234,6 +243,11 @@ struct RState {
     line_buf: String,
     filter_mode: FilterMode,
     hook_installed: bool,
+    /// The JIT was turned off for a step-in; restore it at the next prompt.
+    jit_off: bool,
+    jmc_steps: u8,
+    /// Names the rebinding detector last reported.
+    masked: String,
 }
 
 thread_local! {
@@ -294,6 +308,9 @@ pub fn init(
         "split_exprs",
         "set_source_hook",
         "install_hook_only",
+        "on_stop",
+        "on_resume",
+        "at_prompt",
     ] {
         let c = CString::new(format!("get(\"{name}\", envir = environment())")).expect("name");
         let mut out: Sexp = std::ptr::null_mut();
@@ -350,6 +367,9 @@ pub fn init(
             line_buf: String::new(),
             filter_mode: FilterMode::Pass,
             hook_installed: false,
+            jit_off: false,
+            jmc_steps: 0,
+            masked: String::new(),
         })
     });
     // The probe hook and Ark's annotate hook can be bound now; the global
@@ -584,7 +604,16 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             let locs: Vec<Value> = lines.into_iter().map(|l| json!({"line": l})).collect();
             out.respond(&msg, json!({"breakpoints": locs}));
         }
-        "source" => out.fail(&msg, "source not available"),
+        "source" => {
+            let r = args["sourceReference"]
+                .as_i64()
+                .or_else(|| args["source"]["sourceReference"].as_i64())
+                .unwrap_or(0);
+            match lock_shared(shared).sources.get(&r).cloned() {
+                Some(text) => out.respond(&msg, json!({"content": text, "mimeType": "text/x-r"})),
+                None => out.fail(&msg, "source not available"),
+            }
+        }
         _ => out.fail(&msg, &format!("unsupported request: {cmd}")),
     }
 }
@@ -632,7 +661,16 @@ fn frame_to_dap(f: &Frame) -> Value {
         "line": f.line.max(1),
         "column": f.col.max(1),
     });
-    if !f.path.is_empty() && !f.path.starts_with('<') {
+    if let Some(r) = f.source_ref {
+        v["source"] = json!({
+            "name": format!("{} (deparsed)", f.name),
+            "sourceReference": r,
+            "presentationHint": "deemphasize",
+        });
+        v["line"] = json!(1);
+        v["column"] = json!(1);
+        v["presentationHint"] = json!("subtle");
+    } else if !f.path.is_empty() && !f.path.starts_with('<') {
         let name = Path::new(&f.path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -887,7 +925,7 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
             String::new()
         }
         "captured" => {
-            with_r(|r| r.captured = Some((a.to_string(), b == "fbp")));
+            with_r(|r| r.captured = Some((a.to_string(), b.to_string())));
             String::new()
         }
         "exception" => {
@@ -1179,13 +1217,15 @@ pub fn on_repl_prompt(level: u32) -> Option<String> {
     if !active() {
         return None;
     }
+    if with_r(|r| std::mem::take(&mut r.jit_off)).unwrap_or(false) && level > 0 {
+        let _ = call_helper("at_prompt", &["FALSE"]);
+    }
     if level == 0 {
         return on_top_level();
     }
     let awaiting = with_r(|r| std::mem::take(&mut r.awaiting_capture))?;
     if awaiting {
-        on_captured();
-        return None;
+        return on_captured();
     }
     let use_na = with_r(|r| r.use_na)?;
     let cur = read_current_srcref(use_na);
@@ -1216,6 +1256,28 @@ pub fn on_repl_prompt(level: u32) -> Option<String> {
 
 fn on_top_level() -> Option<String> {
     release_held(true);
+    let masked = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
+    let changed = with_r(|r| {
+        r.jit_off = false;
+        if r.masked != masked {
+            r.masked = masked.clone();
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false);
+    if changed && !masked.is_empty() {
+        let names: Vec<String> = masked.split(US).map(|n| format!("`{n}`")).collect();
+        let note = format!(
+            "raven debugger: {} rebound; code instrumented for breakpoints earlier may expose its probes until re-run\n",
+            names.join(", ")
+        );
+        super::output::get().write(format!("\x1b[2m{}\x1b[0m", note).as_bytes(), 1);
+        if let Some(out) = outbox() {
+            out.event("output", json!({"category": "important", "output": note}));
+        }
+    }
     let (had_stop, installed) = with_r(|r| (std::mem::take(&mut r.had_stop), r.installed))?;
     if had_stop {
         // SAFETY: R thread at a prompt.
@@ -1258,8 +1320,10 @@ fn on_top_level() -> Option<String> {
     None
 }
 
-fn on_captured() {
-    let Some(h) = handle() else { return };
+/// The capture call has run: classify the stop. Returns hidden input when
+/// the stop isn't shown (stepping back out of code with no srcref).
+fn on_captured() -> Option<String> {
+    let h = handle()?;
     let (captured, cur, stopped, resumed) = match with_r(|r| {
         (
             r.captured.take(),
@@ -1269,16 +1333,42 @@ fn on_captured() {
         )
     }) {
         Some(v) => v,
-        None => return,
+        None => return None,
     };
-    let (frames_json, fbp) = captured.unwrap_or_else(|| ("[]".into(), false));
+    let (frames_json, flags) = captured.unwrap_or_else(|| ("[]".into(), String::new()));
+    let fbp = flags.split(',').any(|f| f == "fbp");
+    let top_nosrc = flags.split(',').any(|f| f == "nosrc");
+    // "Just my code" (§4): a step-in that lands in a function with no
+    // srcref (base R, an installed package) steps back out, unseen.
+    let jmc = with_r(|r| {
+        let step_in = r.resumed && r.last_user_resume.as_deref() == Some("s");
+        if step_in && top_nosrc && r.jmc_steps < MAX_JMC_STEPS {
+            r.jmc_steps += 1;
+            true
+        } else {
+            r.jmc_steps = 0;
+            false
+        }
+    })
+    .unwrap_or(false);
+    if jmc {
+        release_held(false);
+        return Some("f\n".into());
+    }
+    let mut sources: Vec<(i64, String)> = Vec::new();
     let mut frames: Vec<Frame> = serde_json::from_str::<Vec<Value>>(&frames_json)
         .unwrap_or_default()
         .iter()
         .map(|f| {
             let loc = f["loc"].as_array().cloned().unwrap_or_default();
             let num = |i: usize| loc.get(i).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let source_ref = f["fsrc"].as_str().map(|text| {
+                let id = 1000 + sources.len() as i64;
+                sources.push((id, text.to_string()));
+                id
+            });
             Frame {
+                source_ref,
                 r_index: f["id"].as_i64().unwrap_or(0),
                 name: f["name"].as_str().unwrap_or("?").to_string(),
                 path: loc
@@ -1293,7 +1383,9 @@ fn on_captured() {
             }
         })
         .collect();
-    if let (Some(top), Some((file, l))) = (frames.first_mut(), cur.as_ref()) {
+    if let (Some(top), Some((file, l))) = (frames.first_mut(), cur.as_ref())
+        && top.source_ref.is_none()
+    {
         top.path = if file.is_empty() || file.starts_with('<') {
             file.clone()
         } else {
@@ -1317,7 +1409,7 @@ fn on_captured() {
             if let Some(out) = outbox() {
                 out.event("invalidated", json!({"areas": ["variables"], "threadId": 1}));
             }
-            return;
+            return None;
         }
     }
     let (hit, exception, last, step_probe) = with_r(|r| {
@@ -1369,6 +1461,7 @@ fn on_captured() {
     };
     let configured = {
         let mut s = lock(h);
+        s.sources = sources.into_iter().collect();
         s.stop = Some(stop.clone());
         s.rewrite_next = rewrite;
         s.resume = None;
@@ -1380,10 +1473,12 @@ fn on_captured() {
         r.had_stop = true;
     });
     release_held(true);
+    let _ = call_helper("on_stop", &[]);
     if configured && let Some(out) = outbox() {
         send_stopped(out, &stop);
     }
     push_control(json!({"event": "stopped", "reason": stop.reason}));
+    None
 }
 
 fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
@@ -1403,6 +1498,9 @@ pub fn take_resume() -> Option<String> {
 }
 
 fn note_resume(cmd: &str) {
+    if cmd == "s" && call_helper("on_resume", &["s"]).as_deref() == Some("ok") {
+        with_r(|r| r.jit_off = true);
+    }
     with_r(|r| {
         r.resumed = true;
         r.last_user_resume = Some(cmd.to_string());
