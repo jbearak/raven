@@ -435,8 +435,10 @@ jobs:
         with:
           r-version: release
 
+      # Lib, binary, and the Windows suite. The lib's own test target has
+      # Windows-only lint debt in unrelated tests, never linted on Windows.
       - name: Clippy (Windows)
-        run: cargo clippy -p raven --all-targets --features test-support -- -D warnings
+        run: cargo clippy -p raven --features test-support --lib --bins --test console_windows -- -D warnings
 
       - name: Console unit tests
         run: cargo test -p raven --features test-support --lib 'console::'
