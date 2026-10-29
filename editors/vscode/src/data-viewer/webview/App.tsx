@@ -34,11 +34,13 @@ import {
     type Settings,
     type SortKey,
     type SortState,
+    type StringOrder,
     type WebviewToExtension,
 } from '../messages';
 import type { ToolbarState } from '../toolbar-state';
 import type { Cell } from '../wire-format';
-import { RowCache } from './row-cache';
+import { TileCache, tileGeometry } from './tile-cache';
+import { StatusLine, createRangeStore } from './status-line';
 import { formatCell, type FormattedCell } from './cell-render';
 import { displayTypeTag, isRightAligned } from '../display-format';
 import {
@@ -115,11 +117,13 @@ type VscodeApi = {
     setState?(state: PersistedState): void;
 };
 
+/** What `vscode.setState` keeps across a hidden-and-restored webview.
+ *  Dictionaries and histograms are excluded: the host resends them. */
 type PersistedState = {
     panelGeneration: number;
     nrow: number;
     columns: ColumnSchema[];
-    dictionaries: Record<number, string[]>;
+    dictionaries?: Record<number, string[]>;
     layout: Layout;
     settings: Settings;
     toolbar: ToolbarState;
@@ -275,10 +279,15 @@ function sameColumns(a: readonly ColumnSchema[], b: readonly ColumnSchema[]): bo
 export function App({
     vscode,
     initialState,
+    onRender,
 }: {
     vscode: VscodeApi;
     initialState?: unknown;
+    /** Called on every render of App (tests assert scrolling and hover
+     *  never render it). */
+    onRender?: () => void;
 }) {
+    onRender?.();
     const restored = initialState as PersistedState | undefined;
     const theme = useGridTheme();
     const vscodeTheme = theme.grid;
@@ -286,9 +295,26 @@ export function App({
     const gridRef = useRef<DataEditorRef>(null);
     const gridShellRef = useRef<HTMLDivElement>(null);
     const headerTooltipRef = useRef<HTMLDivElement>(null);
-    const rowCacheRef = useRef(new RowCache(200_000));
-    const inflightRef = useRef(new Map<number, string>());
-    const pendingKeysRef = useRef(new Set<string>());
+    /** Cells by (row page, column page); see tile-cache.ts. Recreated
+     *  (with the geometry for the view) whenever the rows are cleared. */
+    const tileCacheRef = useRef(new TileCache(tileGeometry(false, 0)));
+    /** In-flight viewport requests: their tile keys, and the transform
+     *  generation they named. */
+    const inflightRef = useRef(new Map<number, { tiles: number[]; transformGeneration?: number }>());
+    const inflightTilesRef = useRef(new Set<number>());
+    /** The transform generation the webview is showing (from the last
+     *  announcement it processed); every reader request names it. */
+    const shownTransformGenRef = useRef<number | undefined>(undefined);
+    /** The visible row range lives here, not in React state, so scrolling
+     *  never re-renders App; the status line subscribes to it. */
+    const visibleRangeRef = useRef<VisibleRange>(restored?.visibleRange ?? { start: 0, end: 0 });
+    const rangeStore = useMemo(() => createRangeStore(visibleRangeRef), []);
+    /** Visible data-column positions (in `visibleCols`), from the grid. */
+    const visibleColRangeRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+    /** Row under the pointer; drawn by getRowThemeOverride, kept out of
+     *  React state so hovering never re-renders App. */
+    const hoverRowRef = useRef<number | null>(null);
+    const persistTimerRef = useRef<number | null>(null);
     const nextRequestIdRef = useRef(0);
     const intentRequestStateRef = useRef(createIntentRequestState());
     const panelGenerationRef = useRef(restored?.panelGeneration ?? 0);
@@ -324,13 +350,14 @@ export function App({
     const [panelGeneration, setPanelGeneration] = useState(restored?.panelGeneration ?? 0);
     const [nrow, setNrow] = useState(restored?.nrow ?? 0);
     const [columns, setColumns] = useState<ColumnSchema[]>(restored?.columns ?? []);
-    const [dictionaries, setDictionaries] = useState<Record<number, string[]>>(restored?.dictionaries ?? {});
+    const [dictionaries, setDictionaries] = useState<Record<number, string[]>>({});
     const [layout, setLayout] = useState<Layout>(restored?.layout ?? EMPTY_LAYOUT);
     const [settings, setSettings] = useState<Settings>(restored?.settings ?? DEFAULT_SETTINGS);
     const [toolbar, setToolbar] = useState<ToolbarState>(restored?.toolbar ?? EMPTY_TOOLBAR);
     const [schemaHash, setSchemaHash] = useState(restored?.schemaHash ?? '');
-    const [visibleRange, setVisibleRange] = useState<VisibleRange>(restored?.visibleRange ?? { start: 0, end: 0 });
-    const [cacheRevision, setCacheRevision] = useState(0);
+    /** Bumped when the cached rows are dropped (a new transform, dataset
+     *  or column set), never on scroll; re-runs the viewport request. */
+    const [viewEpoch, setViewEpoch] = useState(0);
     const [gridSelection, setGridSelection] = useState<GridSelection>(createEmptySelection);
     const [resolvedLabels, setResolvedLabels] = useState<Record<number, Record<number, string>>>({});
     const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
@@ -344,7 +371,6 @@ export function App({
      *  hasn't sized. Not persisted: recomputed per dataset. */
     const [autoWidths, setAutoWidths] = useState<Record<number, number>>({});
     const autoWidthsMeasuredRef = useRef<'none' | 'header' | 'values'>('none');
-    const [hoverRow, setHoverRow] = useState<number | null>(null);
     const [shellWidth, setShellWidth] = useState(0);
     const gutterAnchorRef = useRef<number | null>(null);
     const measureCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -360,7 +386,11 @@ export function App({
     const [pendingFilterIntent, setPendingFilterIntent] = useState<FilterState | null>(null);
     const [filterPending, setFilterPending] = useState(false);
     const [nrowFiltered, setNrowFiltered] = useState<number | undefined>(restored?.nrowFiltered);
-    const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>(restored?.histograms ?? {});
+    const [histograms, setHistograms] = useState<Record<number, HistogramBin[]>>({});
+    /** A Natural or Locale sort running past 3 s (offer C order), and a
+     *  sort rebuilding keys after the scan worker restarted. */
+    const [sortSlow, setSortSlow] = useState(false);
+    const [sortRebuilding, setSortRebuilding] = useState(false);
     /** True until the first init/replace lands. Until then nrow is 0 and the
      *  row-count readout would say "Showing 0-0 of 0", which reads as an
      *  empty/broken table; show "Loading…" instead. Starts false when we
@@ -408,6 +438,9 @@ export function App({
         [columns, layout.hiddenColumns],
     );
     const visibleCols = display.dataCols;
+    /** Frozen data columns (rownames), always fetched with the viewport. */
+    const frozenDataColsRef = useRef(0);
+    frozenDataColsRef.current = display.freezeColumns - 1;
     /** Map of source column index → { direction, priority (1-based) } for
      *  the active sort. Empty when no sort is active. Used by drawHeader
      *  and by the context menu's "check active direction" rendering. */
@@ -455,6 +488,8 @@ export function App({
      *  All grid-coordinate math must use this count so row indices never
      *  exceed the permutation length; display/identity contexts still use nrow. */
     const effectiveNrow = nrowFiltered ?? nrow;
+    const sortActiveRef = useRef(false);
+    sortActiveRef.current = sort.keys.length > 0;
     const displayedFilter = pendingFilterIntent ?? filter;
     // On open, explain the background wait while saved sort/filter
     // preferences are reapplied (#519). The grid already shows natural-order
@@ -466,7 +501,7 @@ export function App({
             : describeRestoreMessage(restorePending.sort, restorePending.filter))
         : null;
     const rowCountText = describeShape(nrow, columns.length, nrowFiltered, loading);
-    const statusText = loading ? '' : describeStatusLine(nrow, columns.length, nrowFiltered, visibleRange);
+
     const emptyState = emptyStateMessage(nrow, nrowFiltered, loading);
     const missingInfo = useCallback((source: number): MissingInfo => {
         if (!nullCounts) return undefined;
@@ -498,42 +533,67 @@ export function App({
      *  rebuilds a permutation/filter index on a large frame. */
     const pendingLabels = pendingOperationLabels(sortPending, filterPending);
 
-    const persistWebviewState = useCallback(() => {
-        vscode.setState?.({
-            panelGeneration,
-            nrow,
-            columns,
-            dictionaries,
-            layout,
-            settings,
-            toolbar,
-            schemaHash,
-            visibleRange,
-            sort,
-            filter,
-            nrowFiltered,
-            histograms,
-        });
-    }, [
-        vscode,
+    // Latest values for callbacks that must stay stable across scrolling
+    // (getCellContent, requestRows, the message listener).
+    const live = useRef({
+        effectiveNrow: 0, visibleCols: [] as readonly number[], panelGeneration: 0, schemaHash: '',
+        permuted: false,
+    });
+    live.current = {
+        effectiveNrow: nrowFiltered ?? nrow,
+        visibleCols,
+        panelGeneration,
+        schemaHash,
+        permuted: sort.keys.length > 0 || nrowFiltered !== undefined,
+    };
+    const persistedRef = useRef<() => PersistedState>(() => ({} as PersistedState));
+    persistedRef.current = () => ({
         panelGeneration,
         nrow,
         columns,
-        dictionaries,
         layout,
         settings,
         toolbar,
         schemaHash,
-        visibleRange,
+        visibleRange: visibleRangeRef.current,
         sort,
         filter,
         nrowFiltered,
-        histograms,
-    ]);
+    });
+
+    /** Debounced (250 ms) `vscode.setState`. The write carries the schema
+     *  hash and panel generation current when it was scheduled and is
+     *  dropped if either changed before it runs; the change schedules its
+     *  own write. */
+    const schedulePersist = useCallback(() => {
+        if (!vscode.setState) return;
+        const generation = panelGenerationRef.current;
+        const hash = live.current.schemaHash;
+        if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = window.setTimeout(() => {
+            persistTimerRef.current = null;
+            if (panelGenerationRef.current !== generation || live.current.schemaHash !== hash) return;
+            vscode.setState?.(persistedRef.current());
+        }, 250);
+    }, [vscode]);
 
     useEffect(() => {
-        persistWebviewState();
-    }, [persistWebviewState]);
+        schedulePersist();
+    }, [schedulePersist, panelGeneration, nrow, columns, layout, settings, toolbar, schemaHash, sort, filter, nrowFiltered]);
+
+    useEffect(() => () => {
+        if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+    }, []);
+
+    /** Move the viewport: the ref, the status line, and the persisted
+     *  state, without rendering App. */
+    const setVisibleRange = useCallback((range: VisibleRange) => {
+        const prev = visibleRangeRef.current;
+        if (prev.start === range.start && prev.end === range.end) return;
+        visibleRangeRef.current = range;
+        rangeStore.emit();
+        schedulePersist();
+    }, [rangeStore, schedulePersist]);
 
     const focusCell = useCallback((selection: GridSelection = gridSelection): { row: number; col: number } | null => {
         const current = selection.current;
@@ -543,12 +603,14 @@ export function App({
             if (col !== undefined) return { row: current.cell[1], col };
         }
         if (effectiveNrow <= 0 || visibleCols.length === 0) return null;
-        return { row: Math.min(effectiveNrow - 1, visibleRange.start), col: visibleCols[0] };
-    }, [display, effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
+        return { row: Math.min(effectiveNrow - 1, visibleRangeRef.current.start), col: visibleCols[0] };
+    }, [display, effectiveNrow, gridSelection, visibleCols]);
 
+    const postLifecycleRef = useRef<(event: string, range?: VisibleRange) => void>(() => {});
+    const onRowsArrivedRef = useRef<() => void>(() => {});
     const postLifecycle = useCallback((
         event: string,
-        range: VisibleRange = visibleRange,
+        range: VisibleRange = visibleRangeRef.current,
         selection = gridSelection,
         generation = panelGeneration,
     ) => {
@@ -566,7 +628,8 @@ export function App({
             focusCell: focusCell(selection),
             timestamp: Date.now(),
         });
-    }, [columns.length, focusCell, gridSelection, nrow, panelGeneration, visibleRange, vscode]);
+    }, [columns.length, focusCell, gridSelection, nrow, panelGeneration, vscode]);
+    postLifecycleRef.current = postLifecycle;
 
     const persistLayout = useCallback((nextLayout: Layout) => {
         if (!schemaHash) return;
@@ -581,44 +644,83 @@ export function App({
         });
     }, [panelGeneration, schemaHash, vscode]);
 
-    const clearRows = useCallback(() => {
-        rowCacheRef.current.clear();
+    /** Drop every cached tile (a new transform, dataset or column set)
+     *  and start a cache with the geometry for the view. `permuted`
+     *  overrides the view's current sort/filter state when the caller
+     *  knows it is about to change. */
+    const clearRows = useCallback((permuted: boolean = live.current.permuted) => {
+        tileCacheRef.current = new TileCache(tileGeometry(permuted, live.current.visibleCols.length));
         inflightRef.current.clear();
-        pendingKeysRef.current.clear();
+        inflightTilesRef.current.clear();
         if (missingRowRequestTimerRef.current !== null) {
             window.clearTimeout(missingRowRequestTimerRef.current);
             missingRowRequestTimerRef.current = null;
         }
         missingRowRequestRef.current = null;
-        setCacheRevision(r => r + 1);
+        setViewEpoch(e => e + 1);
     }, []);
 
+    /**
+     * Request the tiles of `range` × the visible columns that aren't
+     * cached or already in flight: one request per contiguous run of
+     * column pages (the frozen rowname columns, and the viewport), each
+     * the bounding box of its missing tiles. Pins the viewport's tiles.
+     * Reads only refs, so it is stable across scrolling.
+     */
     const requestRows = useCallback((range: VisibleRange) => {
         if (bootstrappingRef.current) return;
-        if (range.end <= range.start || visibleCols.length === 0) return;
-        if (rowCacheRef.current.hasRange(range.start, range.end)) return;
-        const columnsKey = visibleCols.join(',');
-        const key = `${range.start}:${range.end}:${columnsKey}`;
-        if (pendingKeysRef.current.has(key)) return;
-
-        viewportGenerationRef.current += 1;
-        const requestId = nextRequestId();
-        pendingKeysRef.current.add(key);
-        inflightRef.current.set(requestId, key);
-        vscode.postMessage({
-            type: 'getRows',
-            panelGeneration,
-            requestId,
-            viewportGeneration: viewportGenerationRef.current,
-            start: range.start,
-            end: range.end,
-            columns: [...visibleCols],
-        });
-    }, [nextRequestId, panelGeneration, visibleCols, vscode]);
+        const { visibleCols: cols, effectiveNrow: total } = live.current;
+        if (range.end <= range.start || cols.length === 0) return;
+        const cache = tileCacheRef.current;
+        const { rowsPerTile: R, colsPerTile: C } = cache.geometry;
+        const view = visibleColRangeRef.current;
+        let c0 = Math.max(0, Math.min(view.start, cols.length - 1));
+        let c1 = Math.max(c0 + 1, Math.min(view.end, cols.length));
+        if (view.end <= view.start) { c0 = 0; c1 = Math.min(cols.length, C); }
+        const runs: [number, number][] = [];
+        const frozen = Math.max(0, frozenDataColsRef.current);
+        if (frozen > 0 && c0 > 0) runs.push([0, Math.min(frozen, cols.length)]);
+        runs.push([c0, c1]);
+        const pinRows = cache.pagesFor(range.start, range.end, 0, 1).rowPages;
+        const pinnedCols: [number, number] = [Math.floor(runs[0][0] / C), Math.floor((c1 - 1) / C)];
+        cache.pin(pinRows, pinnedCols);
+        for (const [a, b] of runs) {
+            const pages = cache.pagesFor(range.start, range.end, a, b);
+            let r0 = Infinity; let r1 = -1; let p0 = Infinity; let p1 = -1;
+            const tiles: number[] = [];
+            for (let r = pages.rowPages[0]; r <= pages.rowPages[1]; r++) {
+                for (let c = pages.colPages[0]; c <= pages.colPages[1]; c++) {
+                    const k = r * 65536 + c;
+                    if (cache.has(r, c) || inflightTilesRef.current.has(k)) continue;
+                    tiles.push(k);
+                    r0 = Math.min(r0, r); r1 = Math.max(r1, r);
+                    p0 = Math.min(p0, c); p1 = Math.max(p1, c);
+                }
+            }
+            if (tiles.length === 0) continue;
+            for (const k of tiles) inflightTilesRef.current.add(k);
+            viewportGenerationRef.current += 1;
+            const requestId = nextRequestId();
+            const transformGeneration = shownTransformGenRef.current;
+            inflightRef.current.set(requestId, { tiles, transformGeneration });
+            vscode.postMessage({
+                type: 'getRows',
+                panelGeneration: panelGenerationRef.current,
+                requestId,
+                viewportGeneration: viewportGenerationRef.current,
+                start: r0 * R,
+                end: Math.min((r1 + 1) * R, total),
+                columns: [...cols],
+                columnRange: { start: p0 * C, end: Math.min((p1 + 1) * C, cols.length) },
+                ...(transformGeneration !== undefined ? { transformGeneration } : {}),
+            });
+        }
+    }, [nextRequestId, vscode]);
 
     const scheduleMissingRowRequest = useCallback((row: number) => {
-        if (effectiveNrow <= 0 || visibleCols.length === 0) return;
-        const clamped = Math.max(0, Math.min(effectiveNrow - 1, row));
+        const { effectiveNrow: total, visibleCols: cols } = live.current;
+        if (total <= 0 || cols.length === 0) return;
+        const clamped = Math.max(0, Math.min(total - 1, row));
         const current = missingRowRequestRef.current;
         missingRowRequestRef.current = current
             ? {
@@ -632,9 +734,26 @@ export function App({
             missingRowRequestRef.current = null;
             missingRowRequestTimerRef.current = null;
             if (!range) return;
-            requestRows(paddedRange(range.start, range.end - range.start, effectiveNrow, OVERSCAN_ROWS));
+            requestRows(paddedRange(range.start, range.end - range.start, live.current.effectiveNrow, OVERSCAN_ROWS));
         }, 0);
-    }, [effectiveNrow, requestRows, visibleCols.length]);
+    }, [requestRows]);
+
+    /** Adopt transform generation `gen` from an announcement: drop tiles
+     *  of older generations, name `gen` in every request from now on,
+     *  and ack `adopted` (on processing, not on the next draw, so a
+     *  hidden panel acks too). */
+    const adoptTransform = useCallback((gen: number | undefined, permuted: boolean) => {
+        if (gen === undefined) return;
+        if (gen !== shownTransformGenRef.current) {
+            shownTransformGenRef.current = gen;
+            clearRows(permuted);
+        }
+        vscode.postMessage({
+            type: 'adopted',
+            panelGeneration: panelGenerationRef.current,
+            transformGeneration: gen,
+        });
+    }, [clearRows, vscode]);
 
     useEffect(() => () => {
         if (missingRowRequestTimerRef.current !== null) {
@@ -684,7 +803,9 @@ export function App({
         setNrow(m.nrow);
         setColumns(m.columns);
         setLayout(m.layout);
-        setDictionaries(m.dictionaries);
+        // The host sends dictionaries once per webview and dataset; a
+        // repaint of the same data omits them.
+        if (m.dictionaries) setDictionaries(m.dictionaries);
         setSchemaHash(m.schemaHash);
         if (m.type === 'init') setSettings(m.settings);
         setToolbar(m.toolbar);
@@ -727,7 +848,10 @@ export function App({
             autoWidthsMeasuredRef.current = 'none';
         }
         toolbarBootstrappedRef.current = true;
-        clearRows();
+        const permuted = m.sort.keys.length > 0 || m.filter.entries.some(e => e.enabled);
+        clearRows(permuted);
+        shownTransformGenRef.current = undefined;
+        adoptTransform(m.transformGeneration, permuted);
         setResolvedLabels({});
         setGridSelection(createEmptySelection());
         // Clear only an orphaned in-flight copy: a "copying" toast whose
@@ -744,38 +868,48 @@ export function App({
         if (!sameDataset) setVisibleRange({ start: 0, end: 0 });
         postLifecycle(
             m.type,
-            sameDataset ? visibleRange : { start: 0, end: 0 },
+            sameDataset ? visibleRangeRef.current : { start: 0, end: 0 },
             createEmptySelection(),
             m.panelGeneration,
         );
         window.setTimeout(() => gridRef.current?.scrollTo(0, 0, 'both'), 0);
-    }, [clearCopyToast, clearRows, columns, nrow, panelGeneration, postLifecycle, visibleRange]);
+    }, [adoptTransform, clearCopyToast, clearRows, columns, nrow, postLifecycle, setVisibleRange]);
 
     const applyRows = useCallback((m: Extract<ExtensionToWebview, { type: 'rows' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
-        const key = inflightRef.current.get(m.requestId);
-        if (!key) {
-            return;
-        }
-        pendingKeysRef.current.delete(key);
+        const req = inflightRef.current.get(m.requestId);
+        if (!req) return;
         inflightRef.current.delete(m.requestId);
+        for (const k of req.tiles) inflightTilesRef.current.delete(k);
         if (m.stale) return;
-        rowCacheRef.current.put(m.start, m.end, m.rows, m.originalRowIndices);
-        setCacheRevision(r => r + 1);
+        // Rows of an older transform generation (the tiles were dropped).
+        if (req.transformGeneration !== shownTransformGenRef.current) return;
+        const cache = tileCacheRef.current;
+        const range = visibleRangeRef.current;
+        const rowPages = cache.pagesFor(range.start, range.end, 0, 1).rowPages;
+        // A newer viewport supersedes a request whose tiles it no longer
+        // shows: drop the reply (regular-table's contract).
+        if (range.end > range.start && !req.tiles.some(k => {
+            const r = Math.floor(k / 65536);
+            return r >= rowPages[0] - 1 && r <= rowPages[1] + 1;
+        })) return;
+        const { visibleCols: cols, effectiveNrow: total } = live.current;
+        const colStart = m.columnRange?.start ?? 0;
+        cache.putBlock(m.start, colStart, m.rows, m.originalRowIndices, total, cols.length);
         const rowEnd = Math.min(m.end, m.start + m.rows.length);
-        const width = Math.min(visibleCols.length, m.rows[0]?.length ?? visibleCols.length);
+        const width = m.rows[0]?.length ?? 0;
         const damageList: { cell: Item }[] = [];
         for (let row = m.start; row < rowEnd; row++) {
             // Display 0 is the gutter; data position p is display p + 1.
-            for (let displayCol = 0; displayCol <= width; displayCol++) {
-                damageList.push({ cell: [displayCol, row] });
+            damageList.push({ cell: [0, row] });
+            for (let pos = colStart; pos < colStart + width; pos++) {
+                damageList.push({ cell: [pos + 1, row] });
             }
         }
-        if (damageList.length > 0) {
-            gridRef.current?.updateCells(damageList);
-        }
+        if (damageList.length > 0) gridRef.current?.updateCells(damageList);
+        onRowsArrivedRef.current();
         postLifecycle('rows');
-    }, [postLifecycle, visibleCols.length]);
+    }, [postLifecycle]);
 
     const applyLabels = useCallback((m: Extract<ExtensionToWebview, { type: 'labels' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -788,6 +922,7 @@ export function App({
         }));
         const displayCol = displayIndexOf(display, m.columnIndex);
         if (displayCol < 0) return;
+        const visibleRange = visibleRangeRef.current;
         const damageList: { cell: Item }[] = [];
         for (let row = visibleRange.start; row < visibleRange.end; row++) {
             damageList.push({ cell: [displayCol, row] });
@@ -795,7 +930,7 @@ export function App({
         if (damageList.length > 0) {
             gridRef.current?.updateCells(damageList);
         }
-    }, [display, visibleRange.end, visibleRange.start]);
+    }, [display]);
 
     const applyHistogram = useCallback((m: Extract<ExtensionToWebview, { type: 'histogram' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -806,6 +941,9 @@ export function App({
 
     const applySortApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'sortApplied' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
+        // The host committed this generation and serves it from now on, so
+        // adopt it even when a newer sort request makes us ignore the ack.
+        adoptTransform(m.transformGeneration, m.sort.keys.length > 0 || live.current.effectiveNrow !== nrow);
         if (!shouldAcceptSortResponse(
             latestSortRequestIdRef.current,
             m.requestId,
@@ -816,9 +954,13 @@ export function App({
         acceptedSortRequestIdRef.current = m.requestId;
         setSort(m.sort);
         setSortPending(false);
-        // Permutation just changed — every cached row window is now in
-        // the wrong order. Clear and refetch the current viewport.
-        clearRows();
+        setSortSlow(false);
+        setSortRebuilding(false);
+        // Permutation just changed — every cached tile is now in the wrong
+        // order (adoptTransform cleared them; a host without generations
+        // still needs the clear). Refetch the current viewport.
+        if (m.transformGeneration === undefined) clearRows();
+        const visibleRange = visibleRangeRef.current;
         // (Pulse animation on apply, suppressed when fromPersistence,
         // is deferred — spec §3.1 describes it but no callers depend on
         // it for v1.)
@@ -848,13 +990,14 @@ export function App({
             });
         }
     }, [
+        adoptTransform,
         clearRows,
         effectiveNrow,
+        nrow,
         showCopyToast,
         requestRows,
         schemaHash,
         visibleCols.length,
-        visibleRange,
         vscode,
     ]);
 
@@ -862,10 +1005,18 @@ export function App({
         if (m.panelGeneration !== panelGenerationRef.current) return;
         if (!shouldAcceptSortResponse(latestSortRequestIdRef.current, m.requestId, false)) return;
         setSortPending(m.state === 'pending');
+        if (m.state === 'idle') {
+            setSortSlow(false);
+            setSortRebuilding(false);
+            return;
+        }
+        if (m.slow) setSortSlow(true);
+        if (m.rebuildingKeys) setSortRebuilding(true);
     }, []);
 
     const applyFilterApplied = useCallback((m: Extract<ExtensionToWebview, { type: 'filterApplied' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
+        adoptTransform(m.transformGeneration, m.filter.entries.some(e => e.enabled) || sortActiveRef.current);
         if (!shouldAcceptAppliedResponse(
             latestFilterRequestIdRef.current,
             m.requestId,
@@ -905,10 +1056,12 @@ export function App({
         const activeNrowFiltered = m.filter.entries.some(e => e.enabled) ? m.nrowFiltered : undefined;
         setNrowFiltered(activeNrowFiltered);
         setFilterPending(false);
-        // Permutation just changed — every cached row window is stale.
-        // Clear and refetch the current viewport, exactly as applySortApplied does.
-        // clearRows() is idempotent (safe on the fromPersistence path too).
-        clearRows();
+        // Permutation just changed — every cached tile is stale (cleared by
+        // adoptTransform, or here for a host without generations). Refetch
+        // the current viewport, exactly as applySortApplied does.
+        if (m.transformGeneration === undefined) clearRows();
+        live.current.effectiveNrow = activeNrowFiltered ?? nrow;
+        const visibleRange = visibleRangeRef.current;
         const count = activeNrowFiltered ?? nrow;
         if (count > 0 && visibleCols.length > 0) {
             requestRows(paddedRange(
@@ -919,13 +1072,13 @@ export function App({
             ));
         }
     }, [
+        adoptTransform,
         clearRows,
         nrow,
         showCopyToast,
         requestRows,
         schemaHash,
         visibleCols.length,
-        visibleRange,
         vscode,
     ]);
 
@@ -1000,7 +1153,7 @@ export function App({
 
     /** Send a setSort request. Empty `keys` clears the sort. The host
      *  replies with `sortApplied` which drives state updates. */
-    const applySort = useCallback((keys: SortKey[]) => {
+    const applySort = useCallback((keys: SortKey[], orderOverride?: StringOrder) => {
         if (bootstrappingRef.current || restoreInteractionBlockRef.current !== null) return;
         const request = requestSortIntent(
             intentRequestStateRef.current,
@@ -1008,10 +1161,15 @@ export function App({
             toolbar.labelsOn,
         );
         nextRequestIdRef.current = intentRequestStateRef.current.nextRequestId;
-        const next = request.sort;
+        const order = orderOverride ?? toolbar.sortOrder ?? 'natural';
+        const next: SortState = keys.length === 0 || order === 'natural'
+            ? request.sort
+            : { ...request.sort, stringOrder: order };
         latestSortIntentRef.current = next;
         setSort(next);
         setSortPending(keys.length > 0);
+        setSortSlow(false);
+        setSortRebuilding(false);
         latestSortRequestIdRef.current = request.requestId;
         vscode.postMessage({
             type: 'setSort',
@@ -1022,12 +1180,22 @@ export function App({
             labelsOn: toolbar.labelsOn,
             formatOn: toolbar.formatOn,
             digits: toolbar.digits,
+            ...(order !== 'natural' ? { stringOrder: order } : {}),
         });
     }, [panelGeneration, toolbar, vscode]);
+
 
     const sortKeysForRequest = useCallback(() => {
         return sortKeysForNextRequest(sort.keys, latestSortIntentRef.current);
     }, [sort.keys]);
+
+    /** Choose the string order for sorts (remembered per panel through the
+     *  toolbar state) and re-sort with it when a sort is active. */
+    const setSortOrder = useCallback((order: StringOrder) => {
+        setToolbar(t => (t.sortOrder ?? 'natural') === order ? t : { ...t, sortOrder: order });
+        const keys = sortKeysForRequest();
+        if (keys.length > 0) applySort(keys, order);
+    }, [applySort, sortKeysForRequest]);
 
     /** Pick a direction for `sourceIndex`. When `append` is true, merge
      *  into the existing sort (flipping the column's direction in place
@@ -1067,12 +1235,13 @@ export function App({
     }, [showCopyToast]);
 
     const estimatedViewportRowCount = useCallback((): number => {
+        const visibleRange = visibleRangeRef.current;
         const current = visibleRange.end - visibleRange.start;
         if (current > 0) return current;
         const shell = document.querySelector('.grid-shell');
         const height = shell instanceof HTMLElement ? shell.clientHeight : 0;
         return Math.max(1, Math.floor((height - hMetrics.height) / rowHeight) || 20);
-    }, [hMetrics.height, rowHeight, visibleRange.end, visibleRange.start]);
+    }, [hMetrics.height, rowHeight]);
 
     const viewportForStart = useCallback((start: number): VisibleRange => {
         const height = estimatedViewportRowCount();
@@ -1091,10 +1260,14 @@ export function App({
         setVisibleRange(viewport);
         requestRows(paddedRange(viewport.start, viewport.end - viewport.start, effectiveNrow, OVERSCAN_ROWS));
         postLifecycle(event, viewport, selection);
-    }, [effectiveNrow, gridSelection, postLifecycle, requestRows]);
+    }, [effectiveNrow, gridSelection, postLifecycle, requestRows, setVisibleRange]);
 
+    // (Re)request the viewport after the rows were dropped (a new
+    // transform, dataset or column set) or the frame changed shape —
+    // never on scroll, which requests from onVisibleRegionChanged.
     useEffect(() => {
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
+        const visibleRange = visibleRangeRef.current;
         const hasViewport = visibleRange.end > visibleRange.start;
         const viewport = hasViewport
             ? visibleRange
@@ -1120,8 +1293,9 @@ export function App({
         estimatedViewportRowCount,
         postLifecycle,
         requestRows,
+        setVisibleRange,
+        viewEpoch,
         visibleCols.length,
-        visibleRange,
     ]);
 
     const scrollToFraction = useCallback((fraction: number) => {
@@ -1153,6 +1327,7 @@ export function App({
             return;
         }
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
+        const visibleRange = visibleRangeRef.current;
         const current = gridSelection.current?.cell ?? [1, Math.max(0, visibleRange.start)];
         let col = current[0];
         let row = current[1];
@@ -1182,14 +1357,14 @@ export function App({
         postLifecycle,
         requestRows,
         scrollToFraction,
+        setVisibleRange,
         viewportForStart,
         visibleCols.length,
-        visibleRange,
     ]);
 
     useEffect(() => {
         bootstrappingRef.current = true;
-        vscode.postMessage({ type: 'webviewReady' });
+        vscode.postMessage({ type: 'webviewReady', adoptsTransforms: true });
     }, [vscode]);
 
     /** Skip the in-flight saved-sort/filter restore (#519). Posts the
@@ -1207,8 +1382,25 @@ export function App({
         });
     }, [vscode, panelGeneration]);
 
+    // The message listener registers once and dispatches through this ref
+    // to the latest handlers, so re-renders never re-subscribe it.
+    const handlersRef = useRef({
+        applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
+        applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
+        handleTestKey, scrollToFraction, showCopyToast,
+    });
+    handlersRef.current = {
+        applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
+        applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
+        handleTestKey, scrollToFraction, showCopyToast,
+    };
     useEffect(() => {
         const onMessage = (event: MessageEvent<ExtensionToWebview>) => {
+            const {
+                applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
+                applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
+                handleTestKey, scrollToFraction, showCopyToast,
+            } = handlersRef.current;
             const m = event.data;
             if (!m || typeof m !== 'object') return;
             const currentGeneration = panelGenerationRef.current;
@@ -1317,29 +1509,10 @@ export function App({
         };
         window.addEventListener('message', onMessage);
         return () => window.removeEventListener('message', onMessage);
-    }, [
-        applyCopyDone,
-        applyFilterApplied,
-        applyFilterStatus,
-        applyHistogram,
-        applyInitOrReplace,
-        applyLabels,
-        applyRows,
-        applySortApplied,
-        applySortStatus,
-        handleTestKey,
-        panelGeneration,
-        scrollToFraction,
-        showCopyToast,
-        vscode,
-    ]);
+    }, []);
 
-    // Clear the restore-banner debounce timer on UNMOUNT only. This must not
-    // live in the message-handler effect's cleanup: that effect re-runs on
-    // every dep change (e.g. a scroll updates visibleRange → applyInitOrReplace
-    // identity changes), which would clear a pending timer and prevent the
-    // banner from ever appearing during a slow restore while the old grid is
-    // still interactive.
+    // Clear the restore-banner debounce timer on UNMOUNT only, kept apart
+    // from the message listener so its lifetime never depends on it.
     useEffect(() => () => {
         if (restoreTimerRef.current !== null) {
             clearTimeout(restoreTimerRef.current);
@@ -1448,17 +1621,22 @@ export function App({
         applyFilters(filterEntriesForRequest());
     }, [applyFilters, columns, displayedFilter, filterEntriesForRequest, toolbar.labelsOn]);
 
-    useEffect(() => {
+    /** Ask for labels of unshipped-dictionary codes on screen. Runs when
+     *  rows arrive and when Labels or the resolved set change — not per
+     *  scroll frame (rows for a new viewport arrive anyway). */
+    const requestMissingLabels = useCallback(() => {
         if (!toolbar.labelsOn) return;
+        const cache = tileCacheRef.current;
+        const range = visibleRangeRef.current;
         const wantByColumn: Record<number, Set<number>> = {};
-        for (let displayCol = 0; displayCol < visibleCols.length; displayCol++) {
-            const colIdx = visibleCols[displayCol];
+        for (let pos = 0; pos < visibleCols.length; pos++) {
+            const colIdx = visibleCols[pos];
             const col = columns[colIdx];
             if (!col || col.dictionaryShipped || !col.arrowType.startsWith('Dictionary')) continue;
-            const cache = resolvedLabels[colIdx] ?? {};
-            for (let row = visibleRange.start; row < visibleRange.end; row++) {
-                const cell = rowCacheRef.current.getRow(row)?.[displayCol];
-                if (typeof cell === 'number' && cache[cell] === undefined) {
+            const known = resolvedLabels[colIdx] ?? {};
+            for (let row = range.start; row < range.end; row++) {
+                const cell = cache.cell(row, pos);
+                if (typeof cell === 'number' && known[cell] === undefined) {
                     (wantByColumn[colIdx] ??= new Set()).add(cell);
                 }
             }
@@ -1474,16 +1652,9 @@ export function App({
                 indices: [...indices],
             });
         }
-    }, [
-        cacheRevision,
-        columns,
-        panelGeneration,
-        resolvedLabels,
-        toolbar.labelsOn,
-        visibleCols,
-        visibleRange,
-        vscode,
-    ]);
+    }, [columns, nextRequestId, panelGeneration, resolvedLabels, toolbar.labelsOn, visibleCols, vscode]);
+
+    useEffect(() => { requestMissingLabels(); }, [requestMissingLabels]);
 
     /** Copy the selection as TSV. The gutter is never copied, and rowname
      *  columns only with `withRowNames` ("Copy with row names"), which on a
@@ -1530,6 +1701,8 @@ export function App({
             digits: toolbar.digits,
             includeHeader,
             rowNumbers: withRowNames && display.allRownameCols.length === 0,
+            ...(shownTransformGenRef.current !== undefined
+                ? { transformGeneration: shownTransformGenRef.current } : {}),
         });
     }, [display, effectiveNrow, gridSelection, nextRequestId, panelGeneration, showCopyToast, toolbar, visibleCols.length, vscode]);
 
@@ -1595,7 +1768,7 @@ export function App({
                 event.preventDefault();
                 const next = createAllColumnsSelection(display.count, display.freezeColumns);
                 setGridSelection(next);
-                postLifecycle('select-all', visibleRange, next);
+                postLifecycle('select-all', visibleRangeRef.current, next);
             } else if (event.key === 'c' || event.key === 'C') {
                 event.preventDefault();
                 copySelection();
@@ -1617,7 +1790,6 @@ export function App({
         openFilterEditor,
         postLifecycle,
         sortColumn,
-        visibleRange,
     ]);
 
     const toGridShellPoint = useCallback((clientX: number, clientY: number): { leftPx: number; topPx: number } => {
@@ -1668,7 +1840,7 @@ export function App({
         const sourceIndex = sourceAt(display, displayCol);
         const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
         if (!col || sourceIndex === undefined) return undefined;
-        const cell = rowCacheRef.current.getRow(row)?.[rowPosition(displayCol)];
+        const cell = tileCacheRef.current.cell(row, rowPosition(displayCol));
         if (cell === undefined) return undefined;
         return formatCell(cell, col, dictionaries[sourceIndex], {
             labelsOn: toolbar.labelsOn,
@@ -1724,17 +1896,34 @@ export function App({
     }, [columns, display, formattedAt, isNumericColumn, numericOverflows]);
 
     const getRowThemeOverride = useCallback((row: number): Partial<Theme> | undefined => {
-        if (row === hoverRow) return { bgCell: theme.hoverBg };
+        if (row === hoverRowRef.current) return { bgCell: theme.hoverBg };
         if (theme.bandBg && row % 2 === 1) return { bgCell: theme.bandBg };
         return undefined;
-    }, [hoverRow, theme.bandBg, theme.hoverBg]);
+    }, [theme.bandBg, theme.hoverBg]);
+
+    /** Repaint the rows whose hover state changed (no React render). */
+    const setHoverRow = useCallback((row: number | null) => {
+        const prev = hoverRowRef.current;
+        if (prev === row) return;
+        hoverRowRef.current = row;
+        const view = visibleColRangeRef.current;
+        const damage: { cell: Item }[] = [];
+        for (const r of [prev, row]) {
+            if (r === null) continue;
+            damage.push({ cell: [0, r] });
+            for (let p = view.start; p < view.end; p++) damage.push({ cell: [p + 1, r] });
+            for (let p = 0; p < frozenDataColsRef.current; p++) damage.push({ cell: [p + 1, r] });
+        }
+        if (damage.length > 0) gridRef.current?.updateCells(damage);
+    }, []);
 
     const getCellContent = useCallback(([displayCol, row]: Item): GridCell => {
         if (isGutter(displayCol)) {
-            if (!rowCacheRef.current.hasRow(row)) {
+            const cache = tileCacheRef.current;
+            if (!cache.hasRow(row)) {
                 return { kind: GridCellKind.Loading, allowOverlay: false };
             }
-            const text = String(rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row)));
+            const text = String(rRowNumber(row, cache.originalRowIndex(row)));
             return {
                 kind: GridCellKind.Text,
                 data: text,
@@ -1782,7 +1971,7 @@ export function App({
     /** Auto-fit `sources` to their header text and up to `sampleLimit`
      *  loaded rows (60–400 px). */
     const measureWidths = useCallback((sources: readonly number[], sampleLimit: number): Record<number, number> => {
-        const sample = rowCacheRef.current.sampleRows(sampleLimit);
+        const cache = tileCacheRef.current;
         const out: Record<number, number> = {};
         for (const src of sources) {
             const col = columns[src];
@@ -1790,9 +1979,7 @@ export function App({
             const pos = visibleCols.indexOf(src);
             const values: string[] = [];
             if (pos >= 0) {
-                for (const row of sample) {
-                    const cell = row[pos];
-                    if (cell === undefined) continue;
+                for (const cell of cache.sampleColumn(pos, sampleLimit)) {
                     values.push(formatCell(cell, col, dictionaries[src], {
                         labelsOn: toolbar.labelsOn,
                         formatOn: toolbar.formatOn,
@@ -1811,14 +1998,22 @@ export function App({
     // Measured default widths (≤ 200 columns): from the header text at
     // once, then once more when the first rows arrive. Wider frames keep
     // type-based defaults.
-    useEffect(() => {
+    const measureDefaultWidths = useCallback(() => {
         if (columns.length === 0 || columns.length > MEASURE_COLUMN_LIMIT) return;
         const stage = autoWidthsMeasuredRef.current;
-        const haveRows = rowCacheRef.current.sampleRows(1).length > 0;
+        const haveRows = tileCacheRef.current.hasAny;
         if (stage === 'values' || (stage === 'header' && !haveRows)) return;
         autoWidthsMeasuredRef.current = haveRows ? 'values' : 'header';
         setAutoWidths(measureWidths(columns.map((_, i) => i), MEASURE_SAMPLE_ROWS));
-    }, [cacheRevision, columns, measureWidths]);
+    }, [columns, measureWidths]);
+    useEffect(() => { measureDefaultWidths(); }, [measureDefaultWidths]);
+
+    /** After rows arrive: labels for what's now on screen, and the
+     *  one-time width measurement from values. */
+    onRowsArrivedRef.current = () => {
+        requestMissingLabels();
+        measureDefaultWidths();
+    };
 
     /** Double-click on a column border (via the Glide patch's
      *  `onColumnAutoSize`): fit to the loaded rows and persist like a
@@ -1864,8 +2059,8 @@ export function App({
         }
         const next = createRowsSelection(rows);
         setGridSelection(next);
-        postLifecycle('selection', visibleRange, next);
-    }, [gridSelection.rows, postLifecycle, visibleRange]);
+        postLifecycle('selection', visibleRangeRef.current, next);
+    }, [gridSelection.rows, postLifecycle]);
 
     /** Enter or double-click on a truncated, long, or list cell opens the
      *  cell-detail popover; the host sends the untruncated value. */
@@ -1873,7 +2068,7 @@ export function App({
         const [displayCol, row] = cell;
         const sourceIndex = sourceAt(display, displayCol);
         const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
-        const raw = rowCacheRef.current.getRow(row)?.[rowPosition(displayCol)];
+        const raw = tileCacheRef.current.cell(row, rowPosition(displayCol));
         const formatted = formattedAt(displayCol, row);
         if (!col || sourceIndex === undefined || !formatted || raw === undefined) return;
         const width = gridColumns[displayCol]?.width ?? 0;
@@ -1888,7 +2083,7 @@ export function App({
         const needsHost = typeof raw === 'string' || isTrunc;
         setCellDetail({
             requestId,
-            title: `${col.name}, row ${rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row))}`,
+            title: `${col.name}, row ${rRowNumber(row, tileCacheRef.current.originalRowIndex(row))}`,
             text: needsHost ? undefined : formatted.copyText,
             truncated: false,
             leftPx: point.leftPx,
@@ -1901,6 +2096,8 @@ export function App({
                 requestId,
                 row,
                 columnIndex: sourceIndex,
+                ...(shownTransformGenRef.current !== undefined
+                    ? { transformGeneration: shownTransformGenRef.current } : {}),
             });
         }
     }, [columns, display, formattedAt, gridColumns, nextRequestId, panelGeneration, textMeasure, toGridShellPoint, vscode, vscodeTheme.cellHorizontalPadding]);
@@ -1963,7 +2160,7 @@ export function App({
             }
         }
         setHeaderTooltip(null);
-    }, [columns, display, formattedAt, gridColumns, isNumericColumn, missingInfo, numericOverflows, toGridShellPoint]);
+    }, [columns, display, formattedAt, gridColumns, isNumericColumn, missingInfo, numericOverflows, setHoverRow, toGridShellPoint]);
 
     /** Hooks read by the Glide accessibility patch: header names carry
      *  name, type, label, NA share and sort state; rows carry the R row
@@ -1977,10 +2174,29 @@ export function App({
                 if (!c || sourceIndex === undefined) return undefined;
                 return headerAccessibleName(c, sortByColumn.get(sourceIndex), showPriorityBadge, missingInfo(sourceIndex));
             },
-            rowLabel: row => `row ${rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row)).toLocaleString('en-US')}`,
+            rowLabel: row => `row ${rRowNumber(row, tileCacheRef.current.originalRowIndex(row)).toLocaleString('en-US')}`,
         },
         onColumnAutoSize: autoSizeColumn,
     }), [autoSizeColumn, columns, display, missingInfo, showPriorityBadge, sortByColumn]);
+
+    /** Scrolling: update the viewport ref (and the status line), request
+     *  missing tiles, report the range. No React state changes here. */
+    const onVisibleRegionChanged = useCallback((range: Rectangle) => {
+        const total = live.current.effectiveNrow;
+        const viewport = {
+            start: Math.max(0, Math.floor(range.y)),
+            end: Math.min(total, Math.ceil(range.y + range.height)),
+        };
+        // Display columns → positions in visibleCols (display 0 is the
+        // gutter); frozen columns are fetched separately by requestRows.
+        visibleColRangeRef.current = {
+            start: Math.max(0, range.x - 1),
+            end: Math.max(0, range.x - 1 + range.width),
+        };
+        setVisibleRange(viewport);
+        requestRows(paddedRange(range.y, range.height, total, OVERSCAN_ROWS));
+        postLifecycleRef.current('visible', viewport);
+    }, [requestRows, setVisibleRange]);
 
     const updateHiddenColumns = useCallback((hiddenColumns: number[]) => {
         const nextLayout = { ...layout, hiddenColumns };
@@ -2020,7 +2236,19 @@ export function App({
                             role="status"
                             aria-live="polite"
                         >
-                            {label}
+                            {sortRebuilding && label.startsWith('Sorting')
+                                ? 'Sorting (rebuilding keys)…'
+                                : label}
+                            {sortSlow && label.startsWith('Sorting') && (
+                                <button
+                                    type="button"
+                                    className="toolbar-progress-action"
+                                    onClick={() => setSortOrder('c')}
+                                    title="Code point order, as dplyr::arrange() uses"
+                                >
+                                    Switch to C order (fast, as dplyr)
+                                </button>
+                            )}
                         </span>
                     ))}
                 </div>
@@ -2140,13 +2368,13 @@ export function App({
                             ? { ...selection, columns: selection.columns.remove(frozen) }
                             : selection;
                         setGridSelection(next);
-                        postLifecycle('selection', visibleRange, next);
+                        postLifecycle('selection', visibleRangeRef.current, next);
                     }}
                     onHeaderClicked={colIndex => {
                         if (colIndex < display.freezeColumns) return;
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
-                        postLifecycle('header-click', visibleRange, next);
+                        postLifecycle('header-click', visibleRangeRef.current, next);
                     }}
                     onHeaderContextMenu={(colIndex, event) => {
                         event.preventDefault();
@@ -2206,15 +2434,7 @@ export function App({
                             return next;
                         });
                     }}
-                    onVisibleRegionChanged={(range: Rectangle) => {
-                        const viewport = {
-                            start: Math.max(0, Math.floor(range.y)),
-                            end: Math.min(effectiveNrow, Math.ceil(range.y + range.height)),
-                        };
-                        setVisibleRange(viewport);
-                        requestRows(paddedRange(range.y, range.height, effectiveNrow, OVERSCAN_ROWS));
-                        postLifecycle('visible', viewport);
-                    }}
+                    onVisibleRegionChanged={onVisibleRegionChanged}
                     getCellContent={getCellContent}
                 />
                 {emptyState && (
@@ -2269,6 +2489,11 @@ export function App({
                                 },
                                 onClearAll: () => {
                                     clearAllSorts();
+                                    setContextMenu(null);
+                                },
+                                stringOrder: toolbar.sortOrder ?? 'natural',
+                                onStringOrder: order => {
+                                    setSortOrder(order);
                                     setContextMenu(null);
                                 },
                             }
@@ -2373,7 +2598,13 @@ export function App({
                     </div>
                 )}
             </div>
-            <div className="status-line" aria-live="off">{statusText}</div>
+            <StatusLine
+                store={rangeStore}
+                nrow={nrow}
+                ncol={columns.length}
+                nrowFiltered={nrowFiltered}
+                loading={loading}
+            />
             {copyStatus && <div className={`toast toast-${copyStatus}`}>{copyStatusMsg}</div>}
         </div>
     );

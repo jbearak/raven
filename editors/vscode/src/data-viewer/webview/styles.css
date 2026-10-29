@@ -337,6 +337,18 @@ body,
     animation: toolbar-progress-pulse 1.2s ease-in-out infinite;
 }
 
+/* "Switch to C order" inside a slow Natural/Locale sort's pill. */
+.toolbar-progress-action {
+    margin-left: 6px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
 /* Saved sort/filter is being reapplied on open (#519): explains the wait and
    offers a "Skip and show data now" link that abandons it and shows the data
    in natural order. */
@@ -478,6 +490,13 @@ body,
     background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
 }
 
+/* "Text order" group label in the column menu. */
+.context-menu-heading {
+    padding: 2px 10px 2px 28px;
+    color: var(--vscode-descriptionForeground, inherit);
+    font-size: var(--dv-font-size-xs);
+}
+
 .sort-strip {
     display: flex;
     align-items: center;
@@ -604,6 +623,16 @@ body,
 
 .sort-strip-clear:hover {
     opacity: 1;
+}
+
+/* "C" / "Locale" when text keys don't sort in the default Natural order. */
+.sort-order-chip {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    border: 1px solid var(--vscode-badge-background, rgba(128, 128, 128, 0.45));
+    border-radius: 8px;
+    font-size: var(--dv-font-size-xs);
+    line-height: 1.5;
 }
 
 /* ── Filter chip strip ──────────────────────────────────────────────── */

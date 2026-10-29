@@ -281,6 +281,10 @@ export class DataViewerPanel {
     private stagedTransform: ComputedTransform | undefined;
     /** The committed descriptor the host's mirrors were last set from. */
     private mirroredDesc: Descriptor | undefined;
+    /** The reader whose dictionaries the current webview already has.
+     *  Dictionaries go out once per webview and dataset; a repaint of the
+     *  same data omits them. Reset when the webview reloads. */
+    private dictionariesSentFor: ArrowSliceReader | undefined;
 
     private constructor(
         panelName: string,
@@ -815,7 +819,7 @@ export class DataViewerPanel {
             columns: this.columns,
             layout: this.layout,
             toolbar: activeToolbar,
-            dictionaries: this.dictionaries,
+            ...(this.dictionariesSentFor !== this.reader ? { dictionaries: this.dictionaries } : {}),
             schemaHash: layoutHash,
             sort: this.sort,
             filter: this.filter,
@@ -833,6 +837,7 @@ export class DataViewerPanel {
             loadedToolbar: activeToolbar,
         });
         await this.webviewPanel.webview.postMessage(msg);
+        this.dictionariesSentFor = this.reader;
         this.recordSortSnapshot(0);
         this.recordFilterSnapshot(0);
         this.startNullCountScan(generation);
@@ -1431,6 +1436,7 @@ export class DataViewerPanel {
             // A reloaded webview can't ack what the old one was adopting:
             // release every pending adoption before this reload's install.
             this.adoptsTransforms = m.adoptsTransforms === true;
+            this.dictionariesSentFor = undefined;
             this.coordinator.adoptionRequired = this.adoptsTransforms;
             this.coordinator.releaseAdoptions();
             // A webview reload mid-restore is a lifecycle interruption, not

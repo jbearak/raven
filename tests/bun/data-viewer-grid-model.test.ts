@@ -26,7 +26,6 @@ import {
     showAllColumns,
     toggleColumnHidden,
 } from '../../editors/vscode/src/data-viewer/webview/column-visibility-model';
-import { RowCache } from '../../editors/vscode/src/data-viewer/webview/row-cache';
 import { Selection } from '../../editors/vscode/src/data-viewer/webview/selection-model';
 import { formatCell } from '../../editors/vscode/src/data-viewer/webview/cell-render';
 import {
@@ -129,46 +128,6 @@ describe('React data-viewer grid model', () => {
             text: '123...',
             truncated: true,
         });
-    });
-});
-
-describe('RowCache', () => {
-    test('put/get roundtrip', () => {
-        const c = new RowCache(100);
-        c.put(0, 2, [[1, 2, 3], [4, 5, 6]]);
-        expect(c.get(0, 2)).toEqual([[1, 2, 3], [4, 5, 6]]);
-    });
-
-    test('getRow finds a row inside a cached window', () => {
-        const c = new RowCache(100);
-        c.put(10, 12, [[1, 2], [3, 4]]);
-        expect(c.getRow(11)).toEqual([3, 4]);
-        expect(c.getRow(12)).toBeUndefined();
-    });
-
-    test('hasRange treats a cached superset as present', () => {
-        const c = new RowCache(100);
-        c.put(10, 20, Array.from({ length: 10 }, (_, i) => [i]));
-        expect(c.hasRange(12, 18)).toBe(true);
-        expect(c.hasRange(8, 18)).toBe(false);
-        expect(c.hasRange(12, 22)).toBe(false);
-    });
-
-    test('LRU evicts by aggregate cell count', () => {
-        const c = new RowCache(10);
-        c.put(0, 1, [[1, 2, 3, 4, 5]]);
-        c.put(1, 2, [[1, 2, 3, 4, 5]]);
-        c.put(2, 3, [[1, 2, 3, 4, 5]]);
-        expect(c.get(0, 1)).toBeUndefined();
-        expect(c.get(1, 2)).toBeDefined();
-        expect(c.get(2, 3)).toBeDefined();
-    });
-
-    test('clear empties the cache', () => {
-        const c = new RowCache(100);
-        c.put(0, 1, [[1, 2, 3]]);
-        c.clear();
-        expect(c.get(0, 1)).toBeUndefined();
     });
 });
 

@@ -1,5 +1,13 @@
 import { useEffect, useRef, type MouseEvent } from 'react';
+import type { StringOrder } from '../messages';
 import { useDismiss } from './use-dismiss';
+
+/** Menu labels for the string orders, in menu order. */
+export const STRING_ORDER_LABELS: [StringOrder, string, string][] = [
+    ['natural', 'Natural', 'Locale order, with digit runs as numbers (file_2 before file_10)'],
+    ['locale', 'Locale', "Your UI language's collation"],
+    ['c', 'C', 'Code point order, as dplyr::arrange() and sort(method = "radix")'],
+];
 
 /** Sort-related slice of context-menu props. Always supplied when the
  *  menu opens for a column header; omitted for cell context menus,
@@ -28,6 +36,9 @@ export type SortMenuProps = {
     onClearColumn: () => void;
     /** Clear the entire sort. Called only when `anySorted` is true. */
     onClearAll: () => void;
+    /** String order for text and label keys, remembered per panel. */
+    stringOrder: StringOrder;
+    onStringOrder: (order: StringOrder) => void;
 };
 
 /** Filter-related slice of context-menu props. Always supplied when the
@@ -197,6 +208,22 @@ export function ColumnContextMenu({
                             <span className="context-menu-shortcut">⇧⌥0</span>
                         </button>
                     )}
+                    <div className="context-menu-divider" role="separator" />
+                    <div className="context-menu-heading" role="presentation">Text order</div>
+                    {STRING_ORDER_LABELS.map(([order, label, title]) => (
+                        <button
+                            key={order}
+                            type="button"
+                            className={sort.stringOrder === order ? 'context-menu-item active' : 'context-menu-item'}
+                            onClick={() => sort.onStringOrder(order)}
+                            role="menuitemradio"
+                            aria-checked={sort.stringOrder === order}
+                            title={title}
+                        >
+                            <span className="context-menu-check">{sort.stringOrder === order ? '✓' : ''}</span>
+                            {label}
+                        </button>
+                    ))}
                 </>
             )}
             {filter && (

@@ -139,7 +139,9 @@ export type ExtensionToWebview =
         layout: Layout;
         toolbar: ToolbarState;
         settings: Settings;
-        dictionaries: Record<number, string[]>;
+        /** Shipped dictionaries by column. Sent once per webview and
+         *  dataset; omitted when the webview already has them. */
+        dictionaries?: Record<number, string[]>;
         /** schemaHash for the active dataset. Echoed back by saveLayout
          *  / saveToolbar / saveSort so the host stores under the hash
          *  that was current when the user toggled, even if a later
@@ -188,7 +190,8 @@ export type ExtensionToWebview =
         columns: ColumnSchema[];
         layout: Layout;
         toolbar: ToolbarState;
-        dictionaries: Record<number, string[]>;
+        /** See `init`. */
+        dictionaries?: Record<number, string[]>;
         schemaHash: string;
         sort: SortState;
         /** Filter state restored from persistence, or EMPTY_FILTER if
