@@ -3,7 +3,7 @@
 Date: 2026-10-29. This file records the persona findability review from §6 of `2026-10-29-docs-redesign-design.md`, following Phase 7 of the plan.
 
 - **Baseline docs SHA:** `6c7871aac52a75305cb9996412e905e7524618a0` (the docs before the redesign).
-- **Tested docs SHA:** `50fd5ab2bb4437c5c956101a6a17bb41a3b0aa59`. The runs were made at `55d86e47` and `c1317332`, and carry forward as described under Carry-forward.
+- **Tested docs SHA:** `7f6027c3a6d5259ec81668f7f729c551732d05a3`. The runs were made at `55d86e47` and `c1317332`, and carry forward as described under Carry-forward.
 - **Evidence commits:** the commits that add and update this file. It touches only `docs/superpowers/`.
 
 ## Protocol
@@ -72,7 +72,7 @@ Between `55d86e47` and `c1317332`, only `docs/diagnostics.md` changed (`git diff
 - `non-standard-evaluation.md`
 - `troubleshooting.md`
 
-After acceptance, a reader pointed out that two paragraphs in `docs/r-console.md` seemed to contradict each other about what the console does by default. They were merged into one at `50fd5ab2`, which changed only `docs/r-console.md` (`git diff --stat c1317332 50fd5ab2`). No acceptance run visited that page, so every result carries forward to `50fd5ab2`.
+After acceptance, a reader pointed out that two paragraphs in `docs/r-console.md` seemed to contradict each other about what the console does by default. They were merged into one at `50fd5ab2` and reworded at `7f6027c3`; both commits changed only `docs/r-console.md` (`git diff --stat c1317332 7f6027c3`). No acceptance run visited that page, so every result carries forward to `7f6027c3`.
 
 ## Spot checks
 
