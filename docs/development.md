@@ -2450,6 +2450,7 @@ Run the benchmark (not part of `bun test`; fixtures are generated once into `$TM
 bun tests/bun/bench/data-viewer/bench.ts                      # A, C, D, G at full size
 bun tests/bun/bench/data-viewer/bench.ts --fixtures A --out /tmp/a.json
 bun tests/bun/bench/data-viewer/bench.ts --baseline /tmp/a.json --threshold 0.15
+bun tests/bun/bench/data-viewer/bench.ts --fixtures R,D        # also time the real R View() writer (needs R + arrow)
 ```
 
 Each measure reports the median and p95 of `--samples` runs (default 10; `--sort-samples`, default 3, for full sorts) after one discarded warm-up, plus the longest event-loop block from `perf_hooks.monitorEventLoopDelay`. With `--baseline`, a median more than `--threshold` slower is re-measured once and reported only if it repeats; `--fail-on-regression` turns that into exit code 1. To measure an older revision, copy its `editors/vscode/src/data-viewer/*.ts` into a directory inside `editors/vscode/` (so `apache-arrow` resolves) and pass it as `--src`.

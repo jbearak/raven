@@ -4,7 +4,11 @@
 //   bun tests/bun/bench/data-viewer/bench.ts [options]
 //
 // Options:
-//   --fixtures A,C,D,G     which fixtures (default all four)
+//   --fixtures A,C,D,G     which fixtures (default all four). Add `R` to
+//                          time the real R View() writer end to end (R
+//                          side plus open → first rows) on D- and
+//                          A-shaped frames; needs R with arrow, else it's
+//                          reported as skipped.
 //   --scale 1              row multiplier for A and C (CI uses less)
 //   --samples 10           samples per fast measure (median and p95)
 //   --sort-samples 3       samples per full sort
@@ -22,7 +26,7 @@
 // (perf_hooks.monitorEventLoopDelay), which is what the "host never
 // blocked > 50 ms" budget is about.
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ensureFixture } from './fixtures';
@@ -172,10 +176,79 @@ async function measuresFor(fx: FixtureInfo): Promise<{ measures: Measures; teard
     return { measures, teardown: () => reader.close() };
 }
 
+/** Time the real R `View()` writer (design F0's end-to-end budget, minus
+ *  the webview paint): R-side `View()` elapsed time measured inside R, and
+ *  the reader's open → first rows on the file it wrote. */
+async function rWriterMeasures(): Promise<Record<string, Stat>> {
+    const R = process.env.RAVEN_TEST_R_BIN ?? 'R';
+    const profileMod = await import(join(import.meta.dir, '../../../../editors/vscode/src/plot/r-bootstrap-profile.ts'));
+    const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-bench-r-'));
+    const dv = join(tmp, 'dv');
+    mkdirSync(dv);
+    const out: Record<string, Stat> = {};
+    try {
+        const profile = await profileMod.write_profile_file(tmp, profileMod.generate_profile_source());
+        const shapes: Array<[string, number, number]> = [
+            ['view_D_50k_x_30', 50_000, 30],
+            ['view_A_10M_x_10', Math.round(10_000_000 * SCALE), 10],
+        ];
+        for (const [metric, rows, cols] of shapes) {
+            const reps = Math.max(1, Math.min(SORT_SAMPLES, 5));
+            const code = `
+                if (!requireNamespace("arrow", quietly = TRUE)) { cat("NOARROW\n"); quit(save = "no") }
+                set.seed(1)
+                df <- as.data.frame(lapply(seq_len(${cols}), function(j)
+                    if (j %% 3 == 0) sample(c("a","b","c",NA), ${rows}, TRUE) else rnorm(${rows})))
+                invisible(View(df))   # warm-up
+                t <- vapply(seq_len(${reps}), function(i) system.time(View(df))[["elapsed"]], 0)
+                cat("TIMES", t * 1000, "\n")`;
+            const p = Bun.spawn({
+                cmd: [R, '--quiet', '--no-echo', '--no-save', '--no-restore', '-e', code],
+                cwd: tmp,
+                env: {
+                    ...process.env, R_PROFILE_USER: profile, RAVEN_ORIGINAL_R_PROFILE_USER: '',
+                    RAVEN_DATA_VIEWER_DIR: dv, RAVEN_R_SESSION_ID: 'bench',
+                    RAVEN_SESSION_PORT: '', RAVEN_SESSION_TOKEN: '',
+                },
+                stdout: 'pipe', stderr: 'pipe',
+            });
+            const stdout = await new Response(p.stdout).text();
+            await p.exited;
+            if (stdout.includes('NOARROW')) { console.error('[bench] R: arrow not installed; skipped'); return out; }
+            const line = stdout.split('\n').find(l => l.startsWith('TIMES'));
+            if (!line) { console.error(`[bench] R: ${metric} produced no timings; skipped`); continue; }
+            const times = line.split(/\s+/).slice(1).filter(Boolean).map(Number).sort((a, b) => a - b);
+            out[`${metric}_r_side`] = {
+                median_ms: round(quantile(times, 0.5)), p95_ms: round(quantile(times, 0.95)),
+                n: times.length, max_block_ms: 0,
+            };
+            const files = readdirSync(dv).filter(f => f.endsWith('.arrow')).map(f => join(dv, f));
+            const file = files[files.length - 1];
+            const firstCols = Array.from({ length: cols }, (_, c) => c);
+            out[`${metric}_open_first_rows`] = await measure(SAMPLES, async () => {
+                const r = await ArrowSliceReader.open(file);
+                await r.getRows({ start: 0, end: 64, columns: firstCols, viewportGeneration: 1 });
+                await r.close();
+            });
+            for (const f of files) rmSync(f, { force: true });
+        }
+    } catch (e) {
+        console.error(`[bench] R: unavailable (${(e as Error).message}); skipped`);
+    } finally {
+        rmSync(tmp, { recursive: true, force: true });
+    }
+    return out;
+}
+
 async function run(only?: Record<string, string[]>): Promise<Report> {
     const results: Report['results'] = {};
     for (const name of FIXTURES) {
         if (only && !only[name]) continue;
+        if ((name as string) === 'R') {
+            results.R = await rWriterMeasures();
+            for (const [m, st] of Object.entries(results.R)) console.error(`[bench] R.${m}: ${JSON.stringify(st)}`);
+            continue;
+        }
         const fx = ensureFixture(DIR, name, SCALE);
         const { measures, teardown } = await measuresFor(fx);
         results[name] = {};

@@ -212,9 +212,10 @@ export class ArrowSliceReader {
     private readonly cols: ColumnInfo[];
     private readonly headerCache: ByteLru<number, ParsedHeader>;
     private readonly chunkCache: ByteLru<string, any>;
-    /** Whole decoded batches, used only when `projectable` is false. */
-    private readonly wholeBatchCache = new Map<number, any>();
-    private static readonly WHOLE_BATCH_CACHE_MAX = 16;
+    /** Whole decoded batches, used only when `projectable` is false.
+     *  Byte-bounded like the chunk cache (same budget): a decoded batch's
+     *  size varies with frame width and string content. */
+    private readonly wholeBatchCache: ByteLru<number, any>;
     private readonly utf8 = new TextDecoder('utf-8');
     private latestViewportGen = 0;
     private closed = false;
@@ -243,6 +244,7 @@ export class ArrowSliceReader {
         this.cols = init.cols;
         this.headerCache = init.headerCache;
         this.chunkCache = new ByteLru(init.chunkCacheBytes);
+        this.wholeBatchCache = new ByteLru(init.chunkCacheBytes);
     }
 
     /**
@@ -428,6 +430,7 @@ export class ArrowSliceReader {
 
     /** Bytes currently held by the viewport chunk cache (tests, bench). */
     get chunkCacheBytes(): number { return this.chunkCache.bytes; }
+    get wholeBatchCacheBytes(): number { return this.wholeBatchCache.bytes; }
 
     /** The loaded dictionary (an arrow Vector) for a dictionary-encoded
      *  column, or undefined. */
@@ -812,18 +815,10 @@ export class ArrowSliceReader {
     /** Whole-batch decode, for files the projected path can't serve. */
     private async wholeBatch(bi: number): Promise<any> {
         const cached = this.wholeBatchCache.get(bi);
-        if (cached) {
-            this.wholeBatchCache.delete(bi);
-            this.wholeBatchCache.set(bi, cached);
-            return cached;
-        }
+        if (cached) return cached;
         const b = await this.reader.readRecordBatch(bi);
         this.onBatchLoad?.(bi);
-        this.wholeBatchCache.set(bi, b);
-        while (this.wholeBatchCache.size > ArrowSliceReader.WHOLE_BATCH_CACHE_MAX) {
-            const oldest = this.wholeBatchCache.keys().next().value as number;
-            this.wholeBatchCache.delete(oldest);
-        }
+        this.wholeBatchCache.set(bi, b, b.data.byteLength);
         return b;
     }
 

@@ -4,10 +4,12 @@
 // own reader and `encodeArrowCell`, which is what the reader did before
 // projection.
 import { afterAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { RecordBatchFileReader } from 'apache-arrow';
+import {
+    Field, Int32, List, RecordBatchFileReader, Table, tableToIPC, vectorFromArray,
+} from 'apache-arrow';
 import {
     ArrowSliceReader,
     encodeArrowCell,
@@ -276,6 +278,29 @@ describe('caches', () => {
         loaded.length = 0;
         await r.getRows({ start: 0, end: 1, columns: [0], viewportGeneration: 1 });
         expect(loaded).toEqual([0]);
+        await r.close();
+    });
+
+    test('the whole-batch fallback cache is byte-bounded', async () => {
+        // A list column isn't flat, so the reader can't project and decodes
+        // whole batches (the path for files the R writer never produces).
+        const n = 1_024;
+        const listType = new List(new Field('item', new Int32()));
+        const parts = Array.from({ length: 8 }, (_, b) => new Table({
+            x: vectorFromArray(Array.from({ length: n }, (_, i) => b * n + i + 0.5)),
+            l: vectorFromArray(Array.from({ length: n }, (_, i) => [i]), listType),
+        }));
+        const p = join(DIR, 'nested.arrow');
+        writeFileSync(p, tableToIPC(new Table(parts.flatMap(t => t.batches)), 'file'));
+        // One decoded batch is ~16 KiB; a 40 KiB budget holds two.
+        const r = await ArrowSliceReader.open(p, { chunkCacheBytes: 40 * 1024 });
+        expect(r.projectable).toBe(false);
+        for (let b = 0; b < 8; b++) {
+            const out = await r.getRows({ start: b * n, end: b * n + 1, columns: [0], viewportGeneration: 1 });
+            expect(out.rows).toEqual([[b * n + 0.5]]);
+            expect(r.wholeBatchCacheBytes).toBeGreaterThan(0);
+            expect(r.wholeBatchCacheBytes).toBeLessThanOrEqual(40 * 1024);
+        }
         await r.close();
     });
 
