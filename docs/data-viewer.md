@@ -161,6 +161,7 @@ Right-click a column header to sort. The menu offers:
 - Add ascending to sort and Add descending to sort, when another column is already sorted. These add this column as the next key. Holding Shift while choosing Sort ascending or Sort descending does the same.
 - Clear sort on this column, when this column is sorted.
 - Clear all sorts, when any sort is active.
+- Text order: Natural, Locale, or C, for how text and labels sort (see [Text order](#text-order)).
 
 A sorted column shows a thin triangle at the right edge of its header: ▲ for ascending, ▼ for descending. When more than one column is sorted, each sorted header also shows a small priority badge (1, 2, 3 …) so you can see which key comes first.
 
@@ -168,13 +169,27 @@ The toolbar's Sort strip lists the active keys in priority order. Click a chip f
 
 <a id="sort-indicator"></a>
 
-While Raven sorts a large frame, a `Sorting…` pill appears beside the chips. It is the only progress cue; the data viewer has no status bar.
+While Raven sorts a large frame, a `Sorting…` pill appears beside the chips. It is the only progress cue; the data viewer has no status bar. Sorting and filtering run on a background thread, so the editor and the grid stay responsive, and you can keep scrolling the current rows until the new order arrives.
+
+<a id="text-order"></a>
+
+### Text order
+
+Text columns, and labelled columns sorted by label, sort in one of three orders. Pick one under Text order in the column header menu. The panel remembers your choice for the panel name and the data's column layout, and the next sort uses it.
+
+| Order | Sorts like | Example |
+|---|---|---|
+| Natural (default) | Your VS Code display language's collation, with runs of digits compared as numbers | `a`, `A`, `file_2`, `file_10` |
+| Locale | Your VS Code display language's collation, character by character | `a`, `A`, `file_10`, `file_2` |
+| C | Unicode code points, as `dplyr::arrange()` (dplyr 1.1.0 and later) and `sort(method = "radix")` | `A`, `a`, `file_10`, `file_2` |
+
+When the order isn't Natural, the Sort strip shows a `C` or `Locale` chip. Natural and Locale compare every distinct value with a collator, which can take tens of seconds on a column with a million distinct values. When such a sort runs past 3 seconds, the `Sorting…` pill offers Switch to C order (fast, as dplyr), which re-sorts in C order instead. Text that the collator treats as equal, such as an accented letter typed as one character or as a letter plus a combining accent, ties and keeps its original row order.
 
 <a id="na--nan"></a>
 
 ### Missing values in sorts
 
-Missing values (R's `NA`, floating-point `NaN`, and `NULL`) always sort to the bottom, ascending or descending, matching `order(..., na.last = TRUE)`. `Inf` and `-Inf` sort as numbers.
+Missing values always sort to the bottom, ascending or descending, matching `order(..., na.last = TRUE)`: `NaN` rows come just below every value, and `NA` rows below them. `Inf` and `-Inf` sort as numbers, and `-0` ties with `0`. Rows that tie keep their original order.
 
 <a id="labels-and-format"></a>
 
@@ -298,7 +313,7 @@ Changes apply to newly opened panels. There is no separate on/off setting for th
 
 1. When Raven starts an R terminal, its startup profile (loaded through `R_PROFILE_USER`) installs Raven's `View()` in the global environment before it sets up the plot viewer. If plot-viewer setup fails, `View()` still works.
 2. `View(df)` writes the data frame to an Apache Arrow (Feather v2) file in the extension's storage folder, including variable labels and value labels.
-3. The panel reads rows from that file on demand as you scroll, without going back to R. Raven only accepts files from its own data-viewer folder.
+3. The panel reads rows from that file on demand as you scroll, without going back to R. Reads for the visible rows and full-column work (sorting, filtering, counting missing values) each run on their own background thread, so neither blocks the editor or the other. Raven only accepts files from its own data-viewer folder.
 
 The same file backs the panel for as long as it's open, and closing the panel deletes it. When the extension starts, it removes leftover data-viewer files older than 24 hours.
 

@@ -2432,7 +2432,11 @@ The design and its budgets are in `docs/superpowers/specs/2026-10-29-data-viewer
 
 - **Writer** (`.raven_write_arrow` in `editors/vscode/src/plot/r-bootstrap-profile.ts`): batches of `max(1024, min(65536, 2^21 %/% w))` rows, where `w` is the estimated bytes per row ÷ 8, so a batch decodes to roughly 16 MB at any width. Schema metadata carries `raven.nrow`, `raven.chunk_rows`, `raven.session_tz`, and per-column `raven.type_tag` and `raven.subsecond_digits` inside `raven.fields`. `View()` never touches `.Random.seed`.
 - **Reader** (`arrow-reader.ts`, `arrow-ipc.ts`): open reads the footer, dictionaries, and at most one batch header. Unsorted windows and scans read only the requested columns; sorted or filtered windows gather single elements with coalesced `readSync` calls. Viewport chunks live in a 128 MB byte-bounded LRU, parsed headers in a 32 MB one; scans bypass both. `reader.nullCounts()` sums `FieldNode.null_count` from the batch headers and is never on the open path. `tests/bun/data-viewer-arrow-projected-spike.test.ts` pins the apache-arrow 21.1.0 API this relies on.
-- **Panel**: the composed sort + filter permutation is cached per change (`effective-permutation.ts`), not rebuilt per `getRows`.
+- **Threads (F4)** (`engine.ts`, `worker-engine.ts`, `threads/`): each panel reader gets a **reader thread** (viewport reads: chunk reads and the sorted/filtered element gather, `reader-core.ts`) and a **scan worker** (sort keys and permutations, filters, histograms, the header null-count scan, `scan-core.ts`). Both are `worker_threads` that open their own reader on the file; `scripts/build.js` bundles them to `dist/data-viewer-reader.js` and `dist/data-viewer-worker.js`, and the panel resolves them from `extensionUri` (falling back to the in-process `LocalEngine`, which drives the same cores, when they're missing, as in headless tests). The extension host only forwards requests.
+- **Commit protocol** (`transform-coordinator.ts`, whose module doc is the reference): permutations are immutable `SharedArrayBuffer`s with host-side reference counts and a shared byte counter. The host is the commit authority: `prepare N` → wait for the webview's `adopted N−1` → `commit N` (the point of no return) or `abort N`. Every paint and every `sortApplied`/`filterApplied` is posted only after `committed`, so the reader's committed transform always matches what the webview was told to paint; restore is one composed transform; clears, reverts and rollbacks are installs too. Cancellation is a 4-byte shared flag per request, checked between batches and every 65,536 radix elements or collator comparisons; a regex filter or a task past its deadline is cancelled by terminating the scan worker, which is restarted and re-seeded from the host's committed record. A crashed reader thread is restarted, re-seeded with the committed generation, the N−1 it keeps during the adoption interval, and any candidate, and its in-flight requests are re-issued.
+- **Sort** (`sort.ts`, `radix.ts`): stable LSD radix over order-preserving key bits; NA and NaN are bucketed before encoding; strings sort by rank (distinct values ranked once with the Natural, Locale or C comparator, using the explicit `vscode.env.language`). Keys are cached per column over all rows, so a sort under a filter sorts only the survivors (#328) and flipping a direction or clearing the filter doesn't re-read the file.
+- **Webview (F5)** (`webview/App.tsx`, `webview/tile-cache.ts`, `webview/status-line.tsx`): the visible range, row replies and hover live in refs, so scrolling never renders `App` (the status line subscribes to the range on its own); the message listener registers once; `vscode.setState` is debounced (250 ms) and dropped if the panel generation or schema changed. Cells live in a (row page, column page) tile cache: 256 × 32 unsorted, 64 × 32 under a sort or filter, row pages halved at 512+ visible columns and quartered at 2,048+, bounded by cells and bytes with the viewport pinned. Requests carry `columnRange` and the shown transform generation; replies for older generations, or for tiles no longer near the viewport, are dropped. Dictionaries go out once per webview and dataset.
+- **Wire format (F6)**: tile replies stay JSON `Cell[][]`. `tests/bun/bench/data-viewer/f6-wire.ts` compares them with per-column typed arrays on fixture G (stringify/parse versus a structured-clone copy, each including the tile-cache insert). Typed arrays cut that slice by 64% for a 128 × 32 unsorted tile (0.18 → 0.07 ms) and 31% for a 32 × 32 sorted one (0.06 → 0.04 ms), but the gather that precedes it takes 1–1.7 ms, so the whole scroll path improves by about 10% and 1%: below the 20% bar. VS Code's own IPC can't be measured outside VS Code; re-run this if a profile there shows serialization dominating.
 
 Budgets the benchmark tracks (reference: Apple M-series, 32 GB, warm page cache):
 
@@ -2440,9 +2444,25 @@ Budgets the benchmark tracks (reference: Apple M-series, 32 GB, warm page cache)
 |---|---|---|
 | Open → first rows, viewer side | A | < 300 ms |
 | `getRows` host time, sort + filter active | A | < 5 ms |
-| Numeric sort | A | < 2 s, event loop never blocked > 50 ms (needs the F4 worker) |
+| Numeric sort | A | < 2 s, event loop never blocked > 50 ms |
 | Header null-count scan, all columns | A | < 300 ms |
 | Sorted 64 × 32 gather | A | < 15 ms |
+
+Before and after F4/F5 (M-series, bun, `--sort-samples 2`; "block" is the host event loop's longest stall). The `worker_*` and `reader_thread_*` rows are what the extension runs; the plain `numeric_sort` row is the engine in process:
+
+| Measure | Before | After |
+|---|---|---|
+| A numeric sort, 10M rows | 4,837 ms, host blocked 5,132 ms | 420 ms in the scan worker, host blocked 0.9 ms |
+| A string sort (100k distinct), Natural | 34,465 ms, host blocked 34,263 ms | 2,517 ms in the worker (C order 2,140 ms), host blocked 21 ms |
+| A filter (`numBetween`) | on the host | 239 ms in the worker, host blocked 14 ms |
+| A re-sort of filter survivors, keys cached (#328) | full re-read | 325 ms |
+| A sorted 64 × 32 gather via the reader thread | 0.72 ms on the host | 0.93 ms (p95 2.3) |
+| C numeric sort, 1M rows | 376 ms, host blocked 495 ms | 48 ms in the worker, host blocked 1.7 ms |
+| C string sort (1M distinct), Natural / C | 2,042 ms on the host | 2,288 / 1,114 ms in the worker, host blocked 3–6 ms |
+| G (20k × 2,000) numeric sort | 5.9 ms | 10.9 ms in the worker (thread round trip), host blocked 0.3 ms |
+| Commit protocol round trip (prepare + commit) | n/a | 0.09–0.14 ms |
+
+The 1M-distinct string sort on C sets the F4 spike's budget: Natural < 3 s, C < 1.5 s on the reference machine.
 
 Run the benchmark (not part of `bun test`; fixtures are generated once into `$TMPDIR/raven-dv-bench`, outside the timed sections):
 

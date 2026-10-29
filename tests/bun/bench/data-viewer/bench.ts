@@ -25,6 +25,13 @@
 // timings it records the longest event-loop block seen during the samples
 // (perf_hooks.monitorEventLoopDelay), which is what the "host never
 // blocked > 50 ms" budget is about.
+//
+// When the measured sources have the worker engine (F4), the `worker_*`
+// measures drive it as the extension does: sort and filter in the scan
+// worker (cold = a fresh worker with no cached keys, warm = keys cached),
+// the 64 × 32 sorted gather through the reader thread, and the commit
+// protocol's prepare/commit round trip. Their `max_block_ms` is the
+// extension host's event loop while the worker computes.
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -60,6 +67,9 @@ const effMod = existsSync(join(SRC, 'effective-permutation.ts'))
     ? await import(join(SRC, 'effective-permutation.ts'))
     : undefined;
 const { ArrowSliceReader } = readerMod;
+const workerMod = existsSync(join(SRC, 'worker-engine.ts'))
+    ? await import(join(SRC, 'worker-engine.ts'))
+    : undefined;
 const CTX = { labelsOn: true, formatOn: true, digits: 3 };
 
 /** The panel's composition before F3 (recomputed on every getRows). */
@@ -100,6 +110,39 @@ async function measure(
         p95_ms: round(quantile(times, 0.95)),
         n: samples,
         max_block_ms: round(h.max / 1e6),
+    };
+}
+
+/** Like {@link measure}, but `setup`/`teardown` run outside the timing
+ *  and the event-loop monitor (e.g. a fresh worker per cold sample). */
+async function measureEach<T>(
+    samples: number,
+    setup: () => Promise<T>,
+    fn: (ctx: T, i: number) => Promise<void>,
+    teardown: (ctx: T) => Promise<void>,
+): Promise<Stat> {
+    const times: number[] = [];
+    let maxBlock = 0;
+    for (let i = -1; i < samples; i++) {
+        const ctx = await setup();
+        const h = monitorEventLoopDelay({ resolution: 1 });
+        h.enable();
+        const t0 = performance.now();
+        await fn(ctx, i);
+        const dt = performance.now() - t0;
+        await new Promise(r => setTimeout(r, 2));
+        h.disable();
+        await teardown(ctx);
+        if (i < 0) continue; // warm-up
+        times.push(dt);
+        maxBlock = Math.max(maxBlock, h.max / 1e6);
+    }
+    times.sort((a, b) => a - b);
+    return {
+        median_ms: round(quantile(times, 0.5)),
+        p95_ms: round(quantile(times, 0.95)),
+        n: samples,
+        max_block_ms: round(maxBlock),
     };
 }
 
@@ -166,6 +209,7 @@ async function measuresFor(fx: FixtureInfo): Promise<{ measures: Measures; teard
                 reader, [{ columnIndex: fx.stringColumn!, direction: 'asc' }], CTX);
         });
     }
+    if (workerMod) Object.assign(measures, workerMeasures(fx, firstCols, gatherCols));
     if (typeof reader.nullCounts === 'function') {
         measures.null_count_scan = () => measure(SAMPLES, async () => {
             const r = await ArrowSliceReader.open(fx.path);   // cold header cache
@@ -174,6 +218,101 @@ async function measuresFor(fx: FixtureInfo): Promise<{ measures: Measures; teard
         });
     }
     return { measures, teardown: () => reader.close() };
+}
+
+/** Measures through the worker engine (F4); see the header comment. */
+function workerMeasures(fx: FixtureInfo, firstCols: number[], gatherCols: number[]): Measures {
+    const startEngine = () => workerMod.WorkerEngine.start({
+        filePath: fx.path,
+        nrow: fx.nrow,
+        readerScript: join(SRC, 'threads', 'reader-thread.ts'),
+        scanScript: join(SRC, 'threads', 'scan-worker.ts'),
+    });
+    const numericSort = (dir: 'asc' | 'desc') => ({
+        sort: { keys: [{ columnIndex: fx.numericColumn, direction: dir }], labelsOnWhenSorted: true },
+        sortCtx: CTX,
+    });
+    const filter = {
+        filter: {
+            entries: [{
+                id: 'bench', columnIndex: fx.filterColumn, enabled: true, includeMissing: false,
+                predicate: { kind: 'numBetween', lo: fx.filterRange[0], hi: fx.filterRange[1], inclusive: true },
+            }],
+            labelsOnWhenFiltered: true,
+        },
+        filterCtx: CTX,
+    };
+    const stopEngine = (e: any) => e.dispose();
+    const out: Measures = {
+        worker_numeric_sort_cold: () => measureEach(SORT_SAMPLES, startEngine, async e => {
+            e.discard(await e.compute(numericSort('desc')));
+        }, stopEngine),
+        worker_filter_cold: () => measureEach(SORT_SAMPLES, startEngine, async e => {
+            e.discard(await e.compute(filter));
+        }, stopEngine),
+        // #328: with keys cached, re-sorting only a filter's survivors.
+        worker_sort_survivors_warm: () => measureEach(SORT_SAMPLES, async () => {
+            const e = await startEngine();
+            await e.coordinator.install(await e.compute(filter));
+            e.discard(await e.compute(numericSort('asc')));
+            return e;
+        }, async e => {
+            e.discard(await e.compute(numericSort('desc')));
+        }, stopEngine),
+    };
+    if (fx.stringColumn !== undefined) {
+        for (const order of ['natural', 'c'] as const) {
+            out[`worker_string_sort_${order}_cold`] = () => measureEach(SORT_SAMPLES, startEngine, async e => {
+                e.discard(await e.compute({
+                    sort: {
+                        keys: [{ columnIndex: fx.stringColumn!, direction: 'asc' }],
+                        labelsOnWhenSorted: true, stringOrder: order,
+                    },
+                    sortCtx: { ...CTX, locale: 'en-US' },
+                }));
+            }, stopEngine);
+        }
+    }
+    // Reader-thread gather and the commit round trip share one engine with
+    // a committed numeric sort.
+    let shared: any;
+    const sharedEngine = async () => {
+        if (!shared) {
+            shared = await startEngine();
+            await shared.coordinator.install(await shared.compute(numericSort('asc')));
+        }
+        return shared;
+    };
+    out.reader_thread_sorted_gather_64x32 = async () => {
+        const e = await sharedEngine();
+        const gen = e.coordinator.committed.gen;
+        return measure(SAMPLES, async i => {
+            const start = startFor(i, fx.nrow, 64);
+            await e.getRows({ start, end: start + 64, columns: gatherCols, viewportGeneration: i + 2 }, gen);
+        });
+    };
+    out.reader_thread_unsorted_256x32 = async () => {
+        const e = await startEngine();
+        try {
+            return await measure(SAMPLES, async i => {
+                const start = startFor(i, fx.nrow, 256);
+                await e.getRows({ start, end: start + 256, columns: firstCols, viewportGeneration: i + 2 }, 0);
+            });
+        } finally {
+            await e.dispose();
+        }
+    };
+    out.commit_protocol_round_trip = async () => {
+        const e = await sharedEngine();
+        const m = await measure(SAMPLES, async () => {
+            // Re-install the committed buffer: prepare, commit, both acks.
+            await e.coordinator.install(e.coordinator.reuse({ ...e.coordinator.committed }));
+        });
+        await e.dispose();
+        shared = undefined;
+        return m;
+    };
+    return out;
 }
 
 /** Time the real R `View()` writer (design F0's end-to-end budget, minus
