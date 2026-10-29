@@ -13,6 +13,7 @@ User-facing docs:
 - `docs/diagnostic-corpora.md`
 - `docs/indentation.md`
 - `docs/r-console.md`
+- `docs/debugger.md`
 - `docs/plot-viewer.md`
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
@@ -1551,6 +1552,17 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 - **Editor sends** arrive over `--ipc` (`ipc.rs`, NDJSON). The socket thread only enqueues; the R thread feeds requests through `ReadConsole`. The client half is `editors/vscode/src/send-to-r/console-ipc.ts`.
 
 **Testing.** Unit tests sit next to each module. `crates/raven/tests/console_pty.rs` drives the real binary through a pseudo-terminal: editing, interrupts, nested prompts, sockets, events, and fallback. Each test skips itself when no R with a shared `libR` is installed; the `Cargo Tests` CI job installs `r-base-core`, so they run there. To see what a user sees, run the console inside tmux and use `tmux capture-pane -p` (add `-e` to keep escapes). reedline paints to stderr, so don't redirect stderr while watching the screen.
+
+### R debugger (`raven console --dap`)
+
+The debugger runs inside the console (design and review history: `docs/superpowers/specs/2026-10-29-r-debugger-design.md`; prior art: `2026-10-29-debugger-prior-art.md`). The module doc of `console/dap/mod.rs` covers threads, stops and breakpoints; `console/debug.c` covers the native routines; `console/dap/debug.R` covers the R side. In brief:
+
+- **Transport.** `--dap PATH` is a Unix socket speaking DAP (`dap/server.rs`). The extension connects with `DebugAdapterNamedPipeServer` (`editors/vscode/src/debugger/index.ts`). The IPC socket gains `subscribe` (the console pushes `stopped`/`running`) and `breakpoints` (the extension mirrors VS Code's breakpoints while no session exists).
+- **Threads.** The DAP reader thread answers what needs no R; R work is queued and run at the console's service points (the editor's idle callback, and the poll loop in nested reads). Resume commands go through the editor's break flag. No lock is held across an R call.
+- **Breakpoints are injected, not traced.** Code sent with a `location` is split into top-level expressions with R's parser and each is fed as `{ #line … }` with probe statements before breakpoint lines (`dap/annotate.rs`, which also decides where injection is safe). `source()` is hooked while breakpoints exist, and pkgload/shiny call Ark's `.ark_annotate_source`, bound into base by writing the symbol's value cell. Probes carry the marker srcfile `<raven-probe>`; the console steps through marker stops with hidden `n` input and captures the stack at real stops with hidden input evaluated in the browsed frame.
+- **Never run user code by default.** Variable previews and hover use `typeof`/`oldClass`/`attr`/`.subset2` and the natives in `debug.c`; nothing on the default path dispatches.
+
+**Testing.** `crates/raven/tests/console_debugger.rs` drives the real binary through a PTY and speaks DAP to it (breakpoints, stepping, conditions, logpoints, exceptions, pause, function breakpoints, `source()`, virtual sources). Like `console_pty.rs`, it skips when R isn't installed. `annotate.rs` has unit tests for anchoring and the injection-safety rules.
 
 ### Stan parsing and generated builtin catalog
 

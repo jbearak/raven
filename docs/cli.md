@@ -361,6 +361,7 @@ raven console --no-save -q     # R's options pass through unchanged
 | `--history-file PATH` | Where to keep input history |
 | `--no-history` | Keep history in memory only |
 | `--ipc PATH` | Also accept code from an editor on this Unix socket |
+| `--dap PATH` | Serve the R [debugger](debugger.md) (Debug Adapter Protocol) on this Unix socket |
 
 Every other argument goes to R. If stdin or stdout isn't a terminal, or the console can't embed your R (e.g. R built without `--enable-R-shlib`), it runs plain R with the same arguments instead.
 

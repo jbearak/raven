@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { console_route, send_via_console, send_when_listening, type_in_order } from './console-ipc';
+import { console_route, send_via_console, send_when_listening, type_in_order, type SendLocation } from './console-ipc';
 import { choose_send_transport, SendMethod } from './send-method';
 import { create_temp_file, schedule_temp_file_cleanup } from './temp-file';
 
@@ -19,10 +19,23 @@ export function get_send_options(): SendOptions {
     };
 }
 
+/**
+ * Where `code` sits in `document`, for the console (only files on disk: the
+ * console maps srcrefs to a path). `start` is the code's first character.
+ */
+export function location_in(
+    document: vscode.TextDocument,
+    start: vscode.Position,
+): SendLocation | undefined {
+    if (document.uri.scheme !== 'file') return undefined;
+    return { path: document.uri.fsPath, line: start.line + 1, col: start.character };
+}
+
 export function send_code(
     terminal: vscode.Terminal,
     code: string,
     options: SendOptions,
+    location?: SendLocation,
 ): void {
     // Raven's console takes code over its socket — any size, no keystroke
     // injection or temp files — and falls back to typing only when no
@@ -30,9 +43,9 @@ export function send_code(
     const route = console_route(terminal);
     const type_it = () => send_by_typing(terminal, code, options);
     if (route.kind === 'socket') {
-        send_via_console(route.socket, code, type_it);
+        send_via_console(route.socket, code, type_it, location);
     } else if (route.kind === 'starting') {
-        send_when_listening(terminal, route.socket, code, type_it);
+        send_when_listening(terminal, route.socket, code, type_it, location);
     } else {
         type_in_order(terminal, type_it);
     }

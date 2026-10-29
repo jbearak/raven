@@ -75,11 +75,17 @@ export function build_r_terminal_launch(program: string): RTerminalLaunch {
     }
     const config = vscode.workspace.getConfiguration('raven.console');
     const socket = make_console_socket_path();
+    // The debugger's DAP socket sits next to the IPC socket (see
+    // debugger/index.ts `dap_socket_for`).
+    const dap = vscode.workspace.getConfiguration('raven.debugger').get<boolean>('enabled', true)
+        ? ['--dap', path.join(path.dirname(socket), 'd')]
+        : [];
     return {
         shellPath: server_path_getter(),
         shellArgs: [
             'console',
             '--ipc', socket,
+            ...dap,
             '--edit-mode', config.get<string>('editMode', 'emacs'),
             '--color-output', config.get<string>('colorOutput', 'streams'),
             ...r_args,

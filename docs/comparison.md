@@ -68,6 +68,22 @@ Raven's default console (`raven.rTerminal.program` = `raven`; see [Raven's conso
 - [arf](https://github.com/eitsupi/arf), also a Rust console that embeds R, decides when input is complete with tree-sitter heuristics. Raven's console asks R's own parser, and colors errors, warnings, and messages distinctly; arf colors all stderr output alike ([arf #490](https://github.com/eitsupi/arf/issues/490)).
 - Both have features Raven's console doesn't yet: arf's fuzzy history search, and radian's and arf's richer prompt customization.
 
+### Debugger
+
+| | Raven | Positron (Ark) | RStudio | REditorSupport + [R Debugger](https://github.com/ManuelHentschel/VSCode-R-Debugger) |
+|---|---|---|---|---|
+| Editor | VS Code | Positron | RStudio | VS Code |
+| Breakpoints in code run from the editor | Lines, chunks and files, including top-level lines | Lines and files; top-level lines in sent code stay unverified | `source()` and functions | Its own launch modes |
+| Conditional / hit count / logpoints | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | — | — |
+| Function breakpoints | ✓ | — | — | — |
+| `load_all()` | ✓ (pkgload's hook) | ✓ | ✓ | packages you name |
+| Stop on errors / warnings / interrupts | ✓ / ✓ / ✓ | ✓ / ✓ / ✓ | errors | errors |
+| Reason a breakpoint isn't active | Shown per breakpoint | Partly | Partly | — |
+| Variables view | Paged; never runs your code | Not paged | Environment pane | Paged |
+| Breakpoints in already-loaded code | Re-run to activate | Re-run to activate | ✓ for named functions | ✓ for named functions |
+
+Raven's debugger runs inside its console, so typing `n` at `Browse[1]>` and clicking **Step Over** are the same thing. See [Debugger](./debugger.md).
+
 ### Data viewer
 
 REditorSupport's `View()` keeps the data frame [live in R's memory](https://github.com/REditorSupport/vscode-R/blob/master/sess/R/handlers.R) and serves row windows to the webview on demand.

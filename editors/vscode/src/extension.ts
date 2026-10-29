@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { register_debugger } from './debugger';
 import {
     ExecuteCommandRequest,
     LanguageClient,
@@ -434,6 +435,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // Register R terminal and send-to-R commands
         register_r_terminal(context, plot_services, () => getServerPath(context));
         register_send_to_r_commands(context);
+        register_debugger(context);
         register_inspection_commands(context);
         register_build_commands(context);
         register_chunks_with_terminal(context);

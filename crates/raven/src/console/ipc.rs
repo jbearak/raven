@@ -13,6 +13,24 @@
 //! ← {"id":8,"status":"ok"}
 //! ```
 //!
+//! For the debugger (see `dap`):
+//!
+//! ```text
+//! → {"v":1,"id":9,"op":"execute","code":"f(1)",
+//!    "location":{"path":"/w/a.R","line":12,"col":0}}   // tagged send (§3)
+//! → {"v":1,"id":12,"op":"execute","code":"source(…)",
+//!    "debugProgram":true}                              // F5's program: its
+//!                                                      // session ends with it
+//! → {"v":1,"id":10,"op":"subscribe"}                  // keeps the connection:
+//! ← {"id":10,"status":"ok"}                            // the console pushes
+//! ← {"event":"stopped","reason":"breakpoint"}          // stop/run events
+//! ← {"event":"breakpoints","breakpoints":[…]}          // and line breakpoint
+//!                                                      // states (DAP shape)
+//! → {"v":1,"id":11,"op":"breakpoints","files":{"/w/a.R":[{"line":3}]},
+//!    "functions":["f"],"exceptionFilters":["error"]}   // mirror while no
+//! ← {"id":11,"status":"ok"}                            // session exists
+//! ```
+//!
 //! Access control is the filesystem: the socket is created mode 0600 inside a
 //! directory the editor created 0700.
 
@@ -27,6 +45,11 @@ use std::sync::{Arc, Mutex};
 pub struct Request {
     pub id: u64,
     pub code: String,
+    /// Where the code came from in the editor, when the sender knows.
+    pub location: Option<super::dap::Location>,
+    /// The `program` of a debug session (`"debugProgram": true`): the
+    /// session ends when this request finishes.
+    pub debug_program: bool,
     reply: Option<UnixStream>,
 }
 
@@ -56,6 +79,7 @@ impl Server {
         path: &Path,
         break_flag: Arc<AtomicBool>,
         main_thread: libc::pthread_t,
+        subscribers: Arc<Mutex<Vec<UnixStream>>>,
     ) -> std::io::Result<Self> {
         // Replace only a stale socket: `--ipc` is a public option, and a
         // mistyped path must never delete an ordinary file.
@@ -90,10 +114,11 @@ impl Server {
                 for stream in listener.incoming().flatten() {
                     let queue = queue.clone();
                     let break_flag = break_flag.clone();
+                    let subscribers = subscribers.clone();
                     let _ = std::thread::Builder::new()
                         .name("raven-console-client".into())
                         .spawn(move || {
-                            serve(stream, &queue, &break_flag, main);
+                            serve(stream, &queue, &break_flag, main, &subscribers);
                         });
                 }
             })?;
@@ -121,6 +146,7 @@ fn serve(
     queue: &Mutex<VecDeque<Request>>,
     break_flag: &AtomicBool,
     main: libc::pthread_t,
+    subscribers: &Mutex<Vec<UnixStream>>,
 ) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
@@ -158,9 +184,24 @@ fn serve(
                         "{}",
                         serde_json::json!({"id": id, "status": "queued"})
                     );
+                    let location = msg.get("location").and_then(|l| {
+                        Some(super::dap::Location {
+                            path: l.get("path")?.as_str()?.to_string(),
+                            line: l.get("line")?.as_u64()? as u32,
+                            col: l.get("col").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                            lines: l.get("lines").and_then(|m| m.as_array()).map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect()
+                            }),
+                        })
+                    });
                     q.push_back(Request {
                         id,
                         code: code.to_string(),
+                        location,
+                        debug_program: msg.get("debugProgram").and_then(|v| v.as_bool())
+                            == Some(true),
                         reply,
                     });
                 }
@@ -173,6 +214,27 @@ fn serve(
                     unsafe { libc::pthread_kill(main, libc::SIGINT) };
                 }
                 let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));
+            }
+            Some("subscribe") => {
+                let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));
+                if let Ok(push) = writer.try_clone() {
+                    // A subscriber that stops reading is dropped rather
+                    // than stalling every later push.
+                    let _ = push.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                    subscribers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(push);
+                }
+            }
+            Some("breakpoints") => {
+                let ok = apply_breakpoint_mirror(&msg);
+                let status = if ok { "ok" } else { "not-ready" };
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::json!({"id": id, "status": status})
+                );
             }
             Some("ping") => {
                 let _ = writeln!(
@@ -190,4 +252,45 @@ fn serve(
             }
         }
     }
+}
+
+/// The extension's copy of VS Code's R breakpoints, sent while no debug
+/// session exists (design §2.1), so code run before the first stop is
+/// already instrumented. `false` until the debugger has started.
+fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
+    if !super::dap::ready() {
+        return false;
+    }
+    if let Some(files) = msg.get("files").and_then(|f| f.as_object()) {
+        for (path, bps) in files {
+            let wanted = bps
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|b| {
+                            let s = |k: &str| {
+                                b.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                            };
+                            (
+                                b.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                s("condition"),
+                                s("hitCondition"),
+                                s("logMessage"),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            super::dap::set_file_breakpoints(path, wanted);
+        }
+    }
+    let strings = |k: &str| {
+        msg.get(k).and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+    };
+    super::dap::set_mirrored(strings("functions"), strings("exceptionFilters"));
+    true
 }

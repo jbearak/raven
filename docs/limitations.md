@@ -103,6 +103,7 @@ R chunk bodies in `.Rmd` / `.Rmarkdown` / `.qmd` documents are fully analyzed as
 
 ## R-session features
 
+- **Debugger** — see [Debugger: Limitations](./debugger.md#limitations). Breakpoints in code that's already loaded activate when it runs again; there are no data breakpoints, Restart Frame or step back; and Windows has no debugger until Raven's console runs there.
 - **Workspace viewer** — REditorSupport has a sidebar panel that introspects the live R session, showing objects in `globalenv()` with their types and dimensions, plus attached and loaded namespaces; objects can be viewed or removed from the panel. Raven has no equivalent. See [Comparison: What REditorSupport's VS Code extension offers that Raven doesn't](./comparison.md#what-reditorsupports-vs-code-extension-offers-that-raven-doesnt).
 - **htmlwidget / Shiny viewer** — Interactive HTML output (plotly, DT, profvis, etc.) and Shiny apps render in REditorSupport's webview panels. Raven has no equivalent.
 - **Auto-refresh R Markdown knit preview** — Raven's [`Raven: Knit Preview`](./knit.md) for `.Rmd` / `.Rmarkdown` files is a static HTML viewer with a manual **Knit again** button (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter` saves and re-knits in one keystroke). REditorSupport's `.Rmd` preview adds an opt-in auto-refresh mode. Raven's separate [Quarto Preview](./quarto.md) does refresh `.qmd` output on save through Quarto's built-in watcher; it does not change the deliberately manual Knit Preview pipeline.

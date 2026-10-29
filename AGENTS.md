@@ -30,6 +30,7 @@ User-facing:
 - `docs/syntax-highlighting.md`
 - `docs/snippets.md`
 - `docs/r-console.md`
+- `docs/debugger.md`
 - `docs/chunks.md`
 - `docs/knit.md`
 - `docs/quarto.md`
@@ -53,6 +54,7 @@ Code (authoritative for behavior):
 - Cross-file: `crates/raven/src/cross_file/` — module docs in `scope.rs`, `revalidation.rs`, `dependency.rs`, `path_resolve.rs`.
 - Indentation: `crates/raven/src/indentation/`
 - R console (`raven console`): `crates/raven/src/console/` — module doc in `mod.rs` (thread model, input state machine); `shim.c` header (the longjmp boundary: every console-initiated R call goes through it).
+- R debugger (`raven console --dap`): `crates/raven/src/console/dap/` — module doc in `mod.rs` (threads, stops, breakpoints), `annotate.rs` (where probes may be injected), `debug.R` (R side), `../debug.c` (natives); VS Code side in `editors/vscode/src/debugger/index.ts`. Design and review history: `docs/superpowers/specs/2026-10-29-r-debugger-design.md`.
 - Linting: `crates/raven/src/linting/` — opt-in lintr-equivalent rules in Rust, gated by `state.lint_config`. Honors `# nolint` / `# nolint start/end` and `# raven: ignore` / `# raven: ignore-next` (and their `@lsp-` aliases).
 - Packages / R subprocess: `crates/raven/src/package_library.rs`, `crates/raven/src/r_subprocess.rs` — the `r_subprocess` module doc spells out the safety invariants every R-subprocess caller must follow.
 - Diagnostic collectors: `crates/raven/src/handlers.rs` — `is_structural_non_reference` is the single source of truth for "structural identifier; not a reference".

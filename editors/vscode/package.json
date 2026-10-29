@@ -32,7 +32,8 @@
     "onLanguage:markdown",
     "onTerminalProfile:raven.rTerminal",
     "onWebviewPanel:raven.knitOutput",
-    "onWebviewPanel:raven.quartoPreview"
+    "onWebviewPanel:raven.quartoPreview",
+    "onDebugResolve:raven-r"
   ],
   "main": "./dist/extension.js",
   "capabilities": {
@@ -338,6 +339,17 @@
         "command": "raven.help.forward",
         "title": "Help Forward",
         "category": "Raven"
+      },
+      {
+        "command": "raven.debugger.start",
+        "title": "Start R Debugging",
+        "category": "Raven",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "raven.debugger.viewData",
+        "title": "Open in Data Viewer",
+        "category": "Raven"
       }
     ],
     "keybindings": [
@@ -433,6 +445,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "raven.debugger.start",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
           "command": "raven.goToNextChunk",
           "when": "raven.rConsoleEnabled"
         },
@@ -515,6 +531,10 @@
         },
         {
           "command": "raven.help.forward",
+          "when": "false"
+        },
+        {
+          "command": "raven.debugger.viewData",
           "when": "false"
         }
       ],
@@ -695,6 +715,13 @@
           "command": "raven.terminal.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@1"
+        }
+      ],
+      "debug/variables/context": [
+        {
+          "command": "raven.debugger.viewData",
+          "when": "debugType == 'raven-r'",
+          "group": "navigation"
         }
       ]
     },
@@ -1058,6 +1085,29 @@
           ],
           "default": "streams",
           "description": "How Raven's R console colors output (raven.rTerminal.program = 'raven'). Uses your terminal theme's colors. Applies to newly opened consoles."
+        },
+        "raven.debugger.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the R debugger in Raven's R console (raven.rTerminal.program = 'raven'): breakpoints, stepping, variables and the Debug Console for R, R Markdown and Quarto files. Applies to newly opened consoles."
+        },
+        "raven.debugger.attach": {
+          "type": "string",
+          "enum": [
+            "onStop",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Start a debug session when R stops (a breakpoint, browser(), debug(), or an exception filter).",
+            "Never start a session automatically; use Run and Debug or 'Raven: Start R Debugging'."
+          ],
+          "default": "onStop",
+          "description": "When VS Code attaches its debugger to Raven's R console."
+        },
+        "raven.debugger.justMyCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Step Into skips functions that have no source (base R and installed packages) and steps back out instead."
         },
         "raven.sendToR.advanceCursorOnSend": {
           "type": "boolean",
@@ -2476,7 +2526,94 @@
           "description": "Severity for the indentation lint. Flags lines whose leading whitespace doesn't match the surrounding syntax (braced blocks, multi-line argument lists, continuation lines)."
         }
       }
-    }
+    },
+    "debuggers": [
+      {
+        "type": "raven-r",
+        "label": "R (Raven console)",
+        "languages": [
+          "r",
+          "rmd",
+          "quarto"
+        ],
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "consoleSocket": {
+                "type": "string",
+                "description": "IPC socket of the Raven R console to debug. Leave unset to use the active R console (one is opened if needed)."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "description": "Step Into skips functions without source (base R, installed packages). Defaults to raven.debugger.justMyCode."
+              }
+            }
+          },
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "default": "${file}",
+                "description": "R script to source() in the R console once the debugger is attached. Leave unset to debug whatever you run in the console; the session then starts and ends like an automatic one."
+              },
+              "consoleSocket": {
+                "type": "string",
+                "description": "IPC socket of the Raven R console to use. Leave unset to use the active R console (one is opened if needed)."
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "description": "Step Into skips functions without source (base R, installed packages). Defaults to raven.debugger.justMyCode."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "raven-r",
+            "request": "launch",
+            "name": "Source R file",
+            "program": "${file}"
+          },
+          {
+            "type": "raven-r",
+            "request": "attach",
+            "name": "Debug R console"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Raven: Source R file",
+            "description": "Source an R script in Raven's R console with the debugger attached",
+            "body": {
+              "type": "raven-r",
+              "request": "launch",
+              "name": "Source R file",
+              "program": "^\"\\${file}\""
+            }
+          },
+          {
+            "label": "Raven: Debug R console",
+            "description": "Attach the debugger to Raven's R console",
+            "body": {
+              "type": "raven-r",
+              "request": "attach",
+              "name": "Debug R console"
+            }
+          }
+        ]
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "r"
+      },
+      {
+        "language": "rmd"
+      },
+      {
+        "language": "quarto"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "bun run bundle && bun run copy-binary",

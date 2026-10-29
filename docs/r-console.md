@@ -59,6 +59,10 @@ Raven's console replaces colorout. If your `.Rprofile` loads colorout, the conso
 
 Code you send from the editor (Run Line or Selection, Run Chunk, Source File, and so on) goes straight to the console instead of being typed into the terminal, so blocks of any size start immediately. The console shows each line at its prompt with highlighting, as if you'd typed it, with output in between. If a line fails with an error, the rest of that block doesn't run, so you get one error instead of a cascade. Anything you were typing at the console prompt is set aside and comes back afterwards.
 
+### Debugging
+
+Raven's console includes a debugger for VS Code: breakpoints, stepping, the call stack, variables and the Debug Console, attached automatically when R stops. See [Debugger](./debugger.md).
+
 ### Outside VS Code
 
 The console is the `raven console` command of the `raven` binary (see [CLI](./cli.md#raven-console)), so you can run it in any terminal. R's own options pass through, e.g. `raven console --no-save --vanilla`.

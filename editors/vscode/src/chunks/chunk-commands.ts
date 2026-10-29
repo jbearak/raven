@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { SendLocation } from '../send-to-r/console-ipc';
 import {
     classify_chunk_document_for_document,
     detect_chunks,
@@ -45,13 +46,47 @@ function chunks_for_document(document: vscode.TextDocument): Chunk[] {
 }
 
 function combined_code(lines: string[], chunks: Chunk[]): string {
+    return combined_code_with_lines(lines, chunks).code;
+}
+
+/**
+ * The runnable chunks' code joined, plus the 1-based document line of every
+ * code line, so the console can map each expression back to its chunk.
+ */
+function combined_code_with_lines(lines: string[], chunks: Chunk[]): { code: string; map: number[] | null } {
     const parts: string[] = [];
+    let map: number[] | null = [];
     for (const c of chunks) {
         if (!is_runnable_chunk(c)) continue;
         const code = extract_chunk_code(lines, c);
-        if (code.trim().length > 0) parts.push(code);
+        if (code.trim().length === 0) continue;
+        parts.push(code);
+        if (c.kind === 'markdown' && c.executable_code !== undefined) {
+            map = null;
+        } else if (map) {
+            const n = code.split('\n').length;
+            for (let i = 0; i < n; i++) map.push(c.header_line + 2 + i);
+        }
     }
-    return parts.join('\n');
+    return { code: parts.join('\n'), map };
+}
+
+/** Location of a chunk's code in `document`, for breakpoints (single chunk). */
+function chunk_location(document: vscode.TextDocument, chunk: Chunk): SendLocation | undefined {
+    if (document.uri.scheme !== 'file') return undefined;
+    if (chunk.kind === 'markdown' && chunk.executable_code !== undefined) return undefined;
+    return { path: document.uri.fsPath, line: chunk.header_line + 2, col: 0 };
+}
+
+function combined_location(
+    document: vscode.TextDocument,
+    lines: string[],
+    chunks: Chunk[],
+): SendLocation | undefined {
+    if (document.uri.scheme !== 'file') return undefined;
+    const { map } = combined_code_with_lines(lines, chunks);
+    if (!map || map.length === 0) return undefined;
+    return { path: document.uri.fsPath, line: map[0], col: 0, lines: map };
 }
 
 /**
@@ -78,13 +113,13 @@ async function resolve_target_terminal(
     return active;
 }
 
-async function send_to_r(code: string, target: TerminalTarget): Promise<void> {
+async function send_to_r(code: string, target: TerminalTarget, location?: SendLocation): Promise<void> {
     if (code.trim().length === 0) return;
     try {
         const terminal = await resolve_target_terminal(target);
         if (!terminal) return;
         terminal.show(true);
-        send_code(terminal, code, get_send_options());
+        send_code(terminal, code, get_send_options(), location);
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         vscode.window.showErrorMessage(`Raven: failed to send chunk to R — ${message}`);
@@ -166,7 +201,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable R chunks to execute.');
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, combined_location(document, lines, chunks));
         return;
     }
 
@@ -177,7 +212,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable chunks above the cursor.');
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, combined_location(document, lines, above));
         return;
     }
 
@@ -188,7 +223,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: no runnable chunks below the cursor.');
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, combined_location(document, lines, below));
         return;
     }
 
@@ -204,7 +239,7 @@ async function run_chunk_at(
             if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, chunk_location(document, previous));
         if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
         return;
     }
@@ -221,7 +256,7 @@ async function run_chunk_at(
             if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, chunk_location(document, next));
         if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
         return;
     }
@@ -247,7 +282,7 @@ async function run_chunk_at(
             vscode.window.showInformationMessage('Raven: current chunk and chunks below are empty.');
             return;
         }
-        await send_to_r(code, target);
+        await send_to_r(code, target, combined_location(document, lines, [current, ...below]));
         return;
     }
 
@@ -257,7 +292,7 @@ async function run_chunk_at(
         if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
         return;
     }
-    await send_to_r(code, target);
+    await send_to_r(code, target, chunk_location(document, current));
     if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
 }
 

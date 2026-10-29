@@ -32,6 +32,7 @@
 //! and socket requests are only ever fed to R's own REPL prompts, never to
 //! `readline()`/`menu()`/`scan()` input (R marks those with `hist = 0`).
 
+mod dap;
 mod discovery;
 mod editor;
 mod ipc;
@@ -62,6 +63,7 @@ const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(33);
 struct Options {
     r_home: Option<PathBuf>,
     ipc: Option<PathBuf>,
+    dap: Option<PathBuf>,
     edit_mode: EditMode,
     color: ColorMode,
     history_file: Option<PathBuf>,
@@ -81,6 +83,7 @@ Options:
   --history-file PATH   Where to keep input history
   --no-history          Keep history in memory only
   --ipc PATH            Listen for code from an editor on this Unix socket
+  --dap PATH            Serve the R debugger (Debug Adapter Protocol) on this Unix socket
   --help                Show this help
 
 Every other option is passed to R unchanged (e.g. --no-save, --vanilla, -q)."
@@ -91,6 +94,7 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
     let mut o = Options {
         r_home: None,
         ipc: None,
+        dap: None,
         edit_mode: EditMode::Emacs,
         color: if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
             ColorMode::Off
@@ -109,6 +113,7 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
             Some("--help") => return Ok(None),
             Some("--r-home") => o.r_home = Some(PathBuf::from(value("--r-home")?)),
             Some("--ipc") => o.ipc = Some(PathBuf::from(value("--ipc")?)),
+            Some("--dap") => o.dap = Some(PathBuf::from(value("--dap")?)),
             Some("--history-file") => {
                 o.history_file = Some(PathBuf::from(value("--history-file")?))
             }
@@ -207,6 +212,12 @@ struct State {
     plain_editor: Option<Reedline>,
     /// Lines of the submission being fed to R.
     pending: VecDeque<String>,
+    /// Location-tagged top-level expressions not yet rendered and fed (the
+    /// debugger renders each one just before it runs; see `dap`).
+    segments: VecDeque<dap::Segment>,
+    /// Lines of the current rendered segment still to feed without echo
+    /// (its original lines were echoed instead).
+    quiet_lines: usize,
     /// Echo each pending line as it is fed (socket submissions).
     echo: bool,
     /// The socket request that owns `pending`, if any.
@@ -234,6 +245,8 @@ struct State {
 /// A partly fed submission, parked while a nested `browser()` it started runs.
 struct Submission {
     pending: VecDeque<String>,
+    segments: VecDeque<dap::Segment>,
+    quiet_lines: usize,
     echo: bool,
     request: Option<ipc::Request>,
     request_failed: bool,
@@ -291,8 +304,9 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     let indent = Arc::new(IndentRequest::default());
     // SAFETY: pthread_self has no preconditions.
     let main_thread = unsafe { libc::pthread_self() };
+    let subscribers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ipc = opts.ipc.as_ref().and_then(|p| {
-        match ipc::Server::start(p, break_flag.clone(), main_thread) {
+        match ipc::Server::start(p, break_flag.clone(), main_thread, subscribers.clone()) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("raven console: cannot listen on {}: {e}", p.display());
@@ -306,6 +320,8 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
             editor: None,
             plain_editor: None,
             pending: VecDeque::new(),
+            segments: VecDeque::new(),
+            quiet_lines: 0,
             echo: false,
             request: None,
             request_failed: false,
@@ -345,6 +361,16 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     if let Some(h) = helpers {
         output::get().set_headers(h.headers);
     }
+    if opts.dap.is_some()
+        && let Err(e) = dap::init(
+            opts.dap.as_deref(),
+            break_flag.clone(),
+            main_thread,
+            subscribers,
+        )
+    {
+        eprintln!("\x1b[2mraven console: {e}\x1b[0m");
+    }
     let printer = reedline::ExternalPrinter::new(4096);
     let printer_tx = printer.sender();
     let mut ed = editor::build(editor::EditorConfig {
@@ -361,6 +387,9 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     ed = ed.with_idle_callback(Box::new(move || {
         pump();
         output::get().pump_editor();
+        if dap::has_work() {
+            dap::service();
+        }
         if ACCEPTING.load(Ordering::Relaxed)
             && ipc_for_idle.as_ref().is_some_and(ipc::Server::has_pending)
         {
@@ -515,6 +544,13 @@ unsafe extern "C" fn write_console_ex(buf: *const c_char, len: c_int, otype: c_i
         }
         // SAFETY: R passes a buffer of `len` bytes.
         let bytes = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len as usize) };
+        if otype == 0 && dap::active() {
+            let text = dap::filter_output(&String::from_utf8_lossy(bytes));
+            if !text.is_empty() {
+                output::get().write(text.as_bytes(), otype);
+            }
+            return;
+        }
         output::get().write(bytes, otype);
     });
 }
@@ -554,6 +590,8 @@ unsafe extern "C" fn reset_console() {
     let _ = std::panic::catch_unwind(|| {
         let parked = with_state(|s| {
             s.pending.clear();
+            s.segments.clear();
+            s.quiet_lines = 0;
             if s.request.is_some() {
                 s.request_failed = true;
             }
@@ -702,7 +740,14 @@ fn next_pending(cap: usize) -> Option<(String, bool)> {
         if !line.is_empty() {
             s.pending.push_front(line);
         }
-        Some((chunk, s.echo))
+        let mut echo = s.echo;
+        if s.quiet_lines > 0 {
+            echo = false;
+            if chunk.ends_with('\n') {
+                s.quiet_lines -= 1;
+            }
+        }
+        Some((chunk, echo))
     })
     .flatten()
 }
@@ -752,10 +797,29 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
         // a `browser()` its last line opened. Record that before deciding
         // what to feed next.
         let level = browse_level(prompt).unwrap_or(0);
-        if with_state(|s| s.pending.is_empty() && level <= s.request_level).unwrap_or(false) {
+        if with_state(|s| s.pending.is_empty() && s.segments.is_empty() && level <= s.request_level)
+            .unwrap_or(false)
+        {
             finish_request();
         }
         route_submission(level);
+        // The debugger's hidden input (stack capture, stepping through
+        // probes, installing handlers) comes before anything queued.
+        // More to run: the rest of this submission, an unfinished
+        // expression, or sends already queued behind it.
+        let more = kind != PromptKind::TopLevel
+            || with_state(|s| {
+                !s.pending.is_empty()
+                    || !s.segments.is_empty()
+                    || s.ipc.as_ref().is_some_and(ipc::Server::has_pending)
+            })
+            .unwrap_or(false);
+        if let Some(hidden) = dap::on_repl_prompt(level, more) {
+            return Some(hidden);
+        }
+        if kind == PromptKind::TopLevel {
+            start_next_segment(prompt, true);
+        }
     }
 
     // Continue feeding the current submission at R's own REPL prompts.
@@ -775,15 +839,53 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
     result
 }
 
+/// At a top-level prompt with no lines pending, render the next tagged
+/// expression of the submission (if any) and queue its lines; its original
+/// lines are echoed now, the rendered ones are fed silently. `continuing` is
+/// true when the segment follows an earlier one of the same submission (a
+/// step may carry over into it), false for the first segment of a new one.
+fn start_next_segment(prompt: &str, continuing: bool) {
+    let next = with_state(|s| {
+        if s.pending.is_empty() {
+            Some(s.segments.pop_front().map(|seg| (seg, s.echo)))
+        } else {
+            None
+        }
+    })
+    .flatten();
+    let Some(next) = next else { return };
+    // Nothing left to step into: drop any carried-over step.
+    dap::on_next_segment(continuing && next.is_some());
+    let Some((seg, echo)) = next else { return };
+    let text = dap::render_segment(&seg);
+    if echo {
+        for (i, line) in seg.echo.iter().enumerate() {
+            let p = if i == 0 { prompt } else { "+ " };
+            let kind = if i == 0 {
+                PromptKind::TopLevel
+            } else {
+                PromptKind::Continuation
+            };
+            echo_line(p, kind, line);
+        }
+    }
+    with_state(|s| {
+        s.pending = split_submission(&text);
+        s.quiet_lines = s.pending.len();
+    });
+}
+
 /// Keep a submission's lines out of a deeper `browser()` that one of its own
 /// lines started (they would become debugger commands — `n`, `c`, `Q`): set
 /// it aside there, and pick it up again once R is back at the level it
 /// started from.
 fn route_submission(level: u32) {
     with_state(|s| {
-        if !s.pending.is_empty() && level > s.start_level {
+        if (!s.pending.is_empty() || !s.segments.is_empty()) && level > s.start_level {
             let parked = Submission {
                 pending: std::mem::take(&mut s.pending),
+                segments: std::mem::take(&mut s.segments),
+                quiet_lines: std::mem::take(&mut s.quiet_lines),
                 echo: s.echo,
                 request: s.request.take(),
                 request_failed: std::mem::take(&mut s.request_failed),
@@ -793,11 +895,14 @@ fn route_submission(level: u32) {
             s.suspended.push(parked);
             s.start_level = level;
         } else if s.pending.is_empty()
+            && s.segments.is_empty()
             && s.request.is_none()
             && s.suspended.last().is_some_and(|p| level <= p.start_level)
         {
             let p = s.suspended.pop().expect("checked");
             s.pending = p.pending;
+            s.segments = p.segments;
+            s.quiet_lines = p.quiet_lines;
             s.echo = p.echo;
             s.request = p.request;
             s.request_failed = p.request_failed;
@@ -814,7 +919,11 @@ fn finish_request() {
     })
     .flatten();
     if let Some((r, failed)) = finished {
+        let program = r.debug_program;
         r.finish(if failed { "error" } else { "done" });
+        if program {
+            dap::on_program_finished();
+        }
     }
 }
 
@@ -903,6 +1012,9 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
                 // `q()` exits the process without dropping the editor, so
                 // history is written after every submission.
                 let _ = ed.sync_history();
+                if kind == PromptKind::Browser {
+                    dap::on_user_line(&text);
+                }
                 with_state(|s| {
                     s.pending = split_submission(&text);
                     s.echo = false;
@@ -919,6 +1031,19 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
             Ok(Signal::CtrlC) => continue,
             Ok(Signal::CtrlD) => return None,
             Ok(Signal::ExternalBreak(buf)) => {
+                // The debugger resumes R (Continue, Step…): feed its browser
+                // command, keeping whatever the user had typed for later.
+                if kind == PromptKind::Browser
+                    && let Some(cmd) = dap::take_resume()
+                {
+                    if !buf.is_empty() {
+                        let pos = ed.current_insertion_point();
+                        with_state(|s| s.stash = Some((buf, pos)));
+                    }
+                    ed.run_edit_commands(&[EditCommand::Clear]);
+                    echo_line(prompt, kind, &cmd);
+                    return Some(format!("{cmd}\n"));
+                }
                 let indent = with_state(|s| s.indent.take()).flatten();
                 if let Some(indent) = indent {
                     ed.run_edit_commands(&[EditCommand::InsertString(indent)]);
@@ -947,7 +1072,39 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
 
 /// Pop a socket request (if any) and return its first line for R.
 fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
-    let req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
+    let mut req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
+    // A CRLF file's lines arrive with their `\r`, which R rejects as an
+    // invalid token.
+    if req.code.contains("\r\n") {
+        req.code = req.code.replace("\r\n", "\n");
+    }
+    // Code sent from an editor with its location, at a top-level prompt,
+    // runs expression by expression wrapped in `{ #line … }` so its srcrefs
+    // point at the file (and breakpoints can be injected; design §3).
+    let segments = if kind == PromptKind::TopLevel && browse_level(prompt).is_none() {
+        req.location
+            .as_ref()
+            .and_then(|loc| dap::split_submission(&req.code, loc))
+    } else {
+        None
+    };
+    if let Some(segments) = segments {
+        with_state(|s| {
+            s.pending.clear();
+            s.segments = segments;
+            s.echo = true;
+            s.request_failed = false;
+            s.request = Some(req);
+            s.start_level = 0;
+            s.request_level = 0;
+        });
+        start_next_segment(prompt, false);
+        let (chunk, echo) = next_pending(cap)?;
+        if echo {
+            echo_line(prompt, kind, &chunk);
+        }
+        return Some(chunk);
+    }
     with_state(|s| {
         s.pending = split_submission(&req.code);
         s.echo = true;
@@ -1011,9 +1168,36 @@ fn plain_read(prompt: &str) -> Option<String> {
         let _ = out.flush();
     }
     // Read with libc so that Ctrl-C (EINTR) interrupts instead of retrying.
+    // Poll first, so the debugger is served while this nested read waits (a
+    // breakpoint hit inside a `later`/httpuv callback stops here; design §2).
+    let browser = is_browser_prompt(prompt);
     let mut line = Vec::new();
     let mut byte = 0u8;
     let result = loop {
+        if line.is_empty() && dap::active() {
+            if dap::has_work() {
+                dap::service();
+            }
+            if browser && let Some(cmd) = dap::take_resume() {
+                break Some(format!("{cmd}\n"));
+            }
+            let mut pfd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd.
+            let ready = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                request_interrupt();
+                break Some("\n".into());
+            }
+        }
         // SAFETY: reading one byte into a valid buffer.
         let n = unsafe { libc::read(0, (&raw mut byte).cast(), 1) };
         if n == 1 {
