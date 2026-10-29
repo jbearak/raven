@@ -1057,3 +1057,65 @@ fn breakpoints_keep_source_semantics_set_value_scope_and_fbp_cleanup() {
     c.send("cat('old debugged:', isdebugged(old), '\\n')", None);
     c.expect("old debugged: FALSE");
 }
+
+#[test]
+fn stop_interrupts_running_code_and_values_show_faithfully() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": ["interrupt"]}));
+    d.req("configurationDone", json!({}));
+    // Stop while R runs: interrupted back to the prompt, even with the
+    // Interrupts filter on, and no stop.
+    let m = d.mark();
+    c.send("spin <- 0; repeat { spin <- spin + 1 }", None);
+    std::thread::sleep(Duration::from_millis(800));
+    d.req("terminate", json!({}));
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(d.count("stopped", m), 0, "Stop opened a browser");
+    d.session_ended();
+    d.req("setExceptionBreakpoints", json!({"filters": []}));
+    c.send("cat('alive', spin > 0, '\\n')", None);
+    c.expect("alive TRUE");
+
+    // Non-ASCII text, NaN, matrices and named vectors.
+    c.send(
+        "vals <- function() {\n  s <- \"a\u{2019}b\u{2014}c \u{4e2d}\u{6587}\"\n  m <- matrix(1:6, 2)\n  nv <- c(a = 1, b = NaN)\n  browser()\n  s\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("vals()", None);
+    d.event("stopped", m);
+    let locals = d.locals();
+    assert_eq!(
+        locals.get("s").map(String::as_str),
+        Some("\"a\u{2019}b\u{2014}c \u{4e2d}\u{6587}\"")
+    );
+    assert!(locals["m"].starts_with("int [2 x 3] 1 2 3"), "{locals:?}");
+    assert!(locals["nv"].contains("NaN"), "{locals:?}");
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let sc = d.req("scopes", json!({"frameId": frame}));
+    let r = sc["body"]["scopes"][0]["variablesReference"].clone();
+    let vs = d.req("variables", json!({"variablesReference": r}));
+    let nv = vs["body"]["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "nv")
+        .unwrap()["variablesReference"]
+        .clone();
+    let kids = d.req("variables", json!({"variablesReference": nv}));
+    let names: Vec<&str> = kids["body"]["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}

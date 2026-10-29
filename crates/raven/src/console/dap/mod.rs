@@ -188,10 +188,10 @@ struct Shared {
     /// The session asked to step into code without source too
     /// (`justMyCode: false`).
     all_code: bool,
-    /// Level-0 prompts so far (R thread), and, for a session launched to
-    /// run a `program`, the count when it was configured: a later prompt
-    /// means the program has finished.
-    prompts: u64,
+    /// Console requests (sends) finished so far, and, for a session
+    /// launched to run a `program`, the count when it was configured: a
+    /// later finish is the program's.
+    finished: u64,
     session_from: Option<u64>,
     runs_program: bool,
     /// The current session has seen a stop and not yet been ended.
@@ -215,6 +215,9 @@ pub struct Handle {
     out: Option<server::Outbox>,
     break_flag: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    /// Stop asked to end what R is running: the interrupt it sends must
+    /// return R to the prompt, not open a browser.
+    abort: AtomicBool,
     main_thread: libc::pthread_t,
     /// IPC subscribers (the extension's control connections).
     subscribers: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
@@ -369,6 +372,7 @@ pub fn init(
         out,
         break_flag,
         pause: Arc::new(AtomicBool::new(false)),
+        abort: AtomicBool::new(false),
         main_thread,
         subscribers,
     });
@@ -523,6 +527,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 let mut s = lock_shared(shared);
                 s.connected = true;
                 s.ended = false;
+                s.configured = false;
                 s.session_from = None;
                 s.runs_program = false;
             }
@@ -540,7 +545,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             let stop = {
                 let mut s = lock_shared(shared);
                 s.configured = true;
-                s.session_from = s.runs_program.then_some(s.prompts);
+                s.session_from = s.runs_program.then_some(s.finished);
                 s.stop.clone()
             };
             out.respond(&msg, json!({}));
@@ -662,14 +667,29 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             let terminate = args["terminateDebuggee"].as_bool().unwrap_or(false);
             out.respond(&msg, json!({}));
             if !ended {
-                request_resume(if terminate { "Q" } else { "c" });
+                let stopped = lock_shared(shared).stop.is_some();
+                match (terminate, stopped) {
+                    (true, true) => request_resume("Q"),
+                    (true, false) => request_abort(),
+                    (false, _) => request_resume("c"),
+                }
             }
         }
         "terminate" => {
-            lock_shared(shared).ended = true;
+            let stopped = {
+                let mut s = lock_shared(shared);
+                s.ended = true;
+                s.stop.is_some()
+            };
             out.respond(&msg, json!({}));
             out.event("terminated", json!({}));
-            request_resume("Q");
+            // Stopped: quit the browser. Running: interrupt, as Stop ends a
+            // running Python or Node program.
+            if stopped {
+                request_resume("Q");
+            } else {
+                request_abort();
+            }
         }
         "breakpointLocations" => {
             let path = args["source"]["path"].as_str().unwrap_or("");
@@ -720,6 +740,15 @@ fn request_resume(cmd: &str) {
         s.resume = Some(cmd.to_string());
     }
     h.break_flag.store(true, Ordering::Relaxed);
+}
+
+fn request_abort() {
+    let Some(h) = handle() else { return };
+    if super::ipc::R_BUSY.load(Ordering::Relaxed) {
+        h.abort.store(true, Ordering::SeqCst);
+        // SAFETY: as in `request_pause`.
+        unsafe { libc::pthread_kill(h.main_thread, libc::SIGINT) };
+    }
 }
 
 fn request_pause() {
@@ -1056,7 +1085,10 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
             String::new()
         }
         "take_pause" => {
-            if h.pause.swap(false, Ordering::SeqCst) {
+            if h.abort.swap(false, Ordering::SeqCst) {
+                h.pause.store(false, Ordering::SeqCst);
+                "abort".into()
+            } else if h.pause.swap(false, Ordering::SeqCst) {
                 "1".into()
             } else {
                 String::new()
@@ -1460,8 +1492,7 @@ fn end_session_at_prompt(more: bool) {
     let Some(h) = handle() else { return };
     let end = {
         let mut s = lock(h);
-        s.prompts += 1;
-        let ran = s.session_from.is_some_and(|n| s.prompts > n);
+        let ran = s.session_from.is_some_and(|n| s.finished > n);
         if more || !(s.session_open || ran) {
             return;
         }
@@ -1486,12 +1517,20 @@ fn end_session_at_prompt(more: bool) {
     push_control(json!({"event": "running"}));
 }
 
+/// A console request (a send from the editor) has finished.
+pub fn on_request_finished() {
+    if let Some(h) = handle() {
+        lock(h).finished += 1;
+    }
+}
+
 fn on_top_level(more: bool) -> Option<String> {
     release_held(true);
-    // A pause that arrived as R finished on its own must not turn a later
-    // Ctrl-C into a pause.
+    // A pause or Stop that arrived as R finished on its own must not change
+    // what a later Ctrl-C does.
     if let Some(h) = handle() {
         h.pause.store(false, Ordering::SeqCst);
+        h.abort.store(false, Ordering::SeqCst);
     }
     let reply = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
     let (masked, bound) = reply.split_once('\x1e').unwrap_or((reply.as_str(), ""));

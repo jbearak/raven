@@ -805,7 +805,15 @@ fn read_console_impl(prompt: &str, hist: c_int, cap: usize) -> Option<String> {
         route_submission(level);
         // The debugger's hidden input (stack capture, stepping through
         // probes, installing handlers) comes before anything queued.
-        let more = with_state(|s| !s.pending.is_empty() || !s.segments.is_empty()).unwrap_or(false);
+        // More to run: the rest of this submission, an unfinished
+        // expression, or sends already queued behind it.
+        let more = kind != PromptKind::TopLevel
+            || with_state(|s| {
+                !s.pending.is_empty()
+                    || !s.segments.is_empty()
+                    || s.ipc.as_ref().is_some_and(ipc::Server::has_pending)
+            })
+            .unwrap_or(false);
         if let Some(hidden) = dap::on_repl_prompt(level, more) {
             return Some(hidden);
         }
@@ -912,6 +920,7 @@ fn finish_request() {
     .flatten();
     if let Some((r, failed)) = finished {
         r.finish(if failed { "error" } else { "done" });
+        dap::on_request_finished();
     }
 }
 

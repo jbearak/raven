@@ -45,13 +45,18 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     jstr <- function(s) {
         s <- tryCatch(enc2utf8(as.character(s)), error = function(e) "<unprintable>")
         s[is.na(s)] <- "NA"
+        # Invalid UTF-8 shows its bytes rather than failing the whole value.
+        s <- iconv(s, "UTF-8", "UTF-8", sub = "byte")
+        s[is.na(s)] <- "<unprintable>"
         s <- tryCatch({
             s <- gsub("\\", "\\\\", s, fixed = TRUE)
             s <- gsub("\"", "\\\"", s, fixed = TRUE)
             s <- gsub("\n", "\\n", s, fixed = TRUE)
             s <- gsub("\r", "\\r", s, fixed = TRUE)
             s <- gsub("\t", "\\t", s, fixed = TRUE)
-            gsub("[[:cntrl:]]", " ", s, useBytes = TRUE)
+            # ASCII control characters only: matched as bytes, `[[:cntrl:]]`
+            # also hits UTF-8 continuation bytes and mangles non-ASCII text.
+            gsub("[\001-\037\177]", " ", s, perl = TRUE)
         }, error = function(e) rep("<unprintable>", length(s)))
         paste0("\"", s, "\"")
     }
@@ -120,6 +125,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         out <- formatC(v, digits = 7L, format = "g")
         out <- trimws(out)
         out[is.na(v)] <- "NA"
+        out[is.nan(v)] <- "NaN"
         out
     }
     civil <- function(z) {
@@ -185,6 +191,11 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         nm <- environmentName(x)
         if (nzchar(nm)) sprintf("<environment: %s>", nm) else "<environment>"
     }
+    # "[3 x 4]" for a matrix or array, "[12]" otherwise.
+    dims_label <- function(x, n) {
+        d <- attr(x, "dim", exact = TRUE)
+        if (is.null(d)) format(n) else paste(format(d), collapse = " x ")
+    }
     fn_label <- function(x) {
         args <- tryCatch(names(formals(x)), error = function(e) NULL)
         sprintf("function(%s)", paste(args, collapse = ", "))
@@ -218,7 +229,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         shown <- elems(x, seq_len(k))
         s <- paste(shown, collapse = " ")
         if (n > k) s <- paste(s, "...")
-        if (n != 1) s <- sprintf("%s [%s] %s", type_label(x), format(n), s)
+        if (n != 1 || !is.null(attr(x, "dim", exact = TRUE))) {
+            s <- sprintf("%s [%s] %s", type_label(x), dims_label(x, n), s)
+        }
         trunc_str(s)
     }
     preview <- function(x) tryCatch(preview_(x), error = function(e) "<preview unavailable>")
@@ -297,9 +310,20 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             idx <- page(n, start, count)
             if (length(idx)) {
                 vals <- elems(x, idx)
+                nms <- attr(x, "names", exact = TRUE)
+                d <- attr(x, "dim", exact = TRUE)
                 for (j in seq_along(idx)) {
-                    ex <- child_expr(pexpr, index = idx[[j]], atomic = TRUE)
-                    out <- c(out, jobj(name = jstr(sprintf("[%d]", idx[[j]])), value = jstr(vals[[j]]),
+                    i <- idx[[j]]
+                    ex <- child_expr(pexpr, index = i, atomic = TRUE)
+                    label <- if (!is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])) {
+                        nms[[i]]
+                    } else if (length(d) == 2L) {
+                        # Column-major position as [row,col].
+                        sprintf("[%d,%d]", (i - 1L) %% d[[1L]] + 1L, (i - 1L) %/% d[[1L]] + 1L)
+                    } else {
+                        sprintf("[%d]", i)
+                    }
+                    out <- c(out, jobj(name = jstr(label), value = jstr(vals[[j]]),
                                        type = jstr(type_label(x)), variablesReference = "0",
                                        evaluateName = if (!is.null(ex)) jstr(ex) else NULL))
                 }
@@ -893,7 +917,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (isTRUE(state$internal)) return(invisible(NULL))
         kind <- if (inherits(cnd, "interrupt")) "interrupt" else if (inherits(cnd, "error")) "error"
                 else if (inherits(cnd, "warning")) "warning" else return(invisible(NULL))
-        pause <- kind == "interrupt" && identical(rpc("take_pause"), "1")
+        taken <- if (kind == "interrupt") rpc("take_pause") else ""
+        # Stop while running: let the interrupt return R to the prompt.
+        if (identical(taken, "abort")) return(invisible(NULL))
+        pause <- identical(taken, "1")
         filters <- strsplit(rpc("filters"), ",", fixed = TRUE)[[1L]]
         if (!pause && !(kind %in% filters)) return(invisible(NULL))
         k <- user_frame()
