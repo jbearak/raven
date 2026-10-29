@@ -286,6 +286,8 @@ When you are developing an R package, a script anywhere in its source tree (`ins
 
 Windows-only base functions (`shell.exec`, `Sys.junction`, `readRegistry`, the `win*`/clipboard helpers, …) are recognized as builtins even though Raven's builtin list is generated on non-Windows hosts, so platform-guarded code does not draw a false positive.
 
+Exported dot-prefixed base functions (`.Call`, `.External`, `.Internal`, `.subset2`, `.row_names_info`, `.libPaths`, `...length`, …) are recognized as builtins as well, with or without R available.
+
 **Never checked:** Symbols on the RHS of `$` or `@` (member access), function parameters, named-argument labels, and formula variables (`y ~ x`).
 
 #### targets and tarchetypes target names

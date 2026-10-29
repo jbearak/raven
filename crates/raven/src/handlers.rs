@@ -30668,6 +30668,28 @@ mod tests {
     }
 
     #[test]
+    fn test_leading_dot_base_builtins() {
+        // `ls()` hides dot-prefixed names unless `all.names = TRUE`; the
+        // builtin generator must still capture these exported functions.
+        for name in [
+            ".Call",
+            ".C",
+            ".External",
+            ".Internal",
+            ".subset",
+            ".subset2",
+            ".row_names_info",
+            ".libPaths",
+            "...length",
+            ".lm.fit",
+            ".hasSlot",
+        ] {
+            assert!(is_builtin(name), "{name}");
+        }
+        assert!(!is_builtin(".not_a_base_fn"));
+    }
+
+    #[test]
     fn test_not_builtin() {
         assert!(!is_builtin("my_custom_function"));
         assert!(!is_builtin("undefined_var"));
@@ -39074,6 +39096,23 @@ y <- totally_undefined_baseline()
         );
 
         diagnostics.into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn exported_leading_dot_base_functions_are_not_undefined() {
+        // The builtin table is the floor before (or without) a package
+        // library; exported dot-prefixed functions must be in it.
+        let code = "df <- data.frame(a = 1:3)\nx <- list(1, 2)\n\
+                    a <- .subset2(x, 1)\nb <- .subset(x, 1)\n\
+                    n <- .row_names_info(df, 2L)\nr <- .Call(\"f\")\n\
+                    e <- .External(\"g\")\np <- .libPaths()\n\
+                    z <- .not_a_base_fn(x)\n";
+        let messages = undefined_messages_for_code(code);
+        assert_eq!(
+            messages,
+            vec![".not_a_base_fn is not defined".to_string()],
+            "{messages:?}"
+        );
     }
 
     #[test]
