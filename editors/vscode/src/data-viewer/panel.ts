@@ -13,6 +13,7 @@ import * as fs from 'node:fs/promises';
 
 import { ArrowSliceReader, ColumnSchema } from './arrow-reader';
 import {
+    CELL_DETAIL_LIMIT_BYTES,
     COPY_CELL_LIMIT,
     EMPTY_FILTER,
     EMPTY_SORT,
@@ -35,7 +36,7 @@ import { ToolbarState, ToolbarStateStore } from './toolbar-state';
 import { SortStateStore } from './sort-state';
 import { FilterStateStore } from './filter-state';
 import { build_csp } from './csp';
-import { render_tsv, ResolvedLabels } from './tsv';
+import { prependRowNumbers, render_tsv, ResolvedLabels } from './tsv';
 import { applyViewerTabIcon } from '../viewer-tab-icon';
 
 let dataViewerTraceOutput: vscode.OutputChannel | undefined;
@@ -89,6 +90,8 @@ export class DataViewerPanel {
     private webviewReady = false;
     private webviewInitialized = false;
     private disposed = false;
+    private nullCountAbort: AbortController | null = null;
+    private nullCountCache: { reader: ArrowSliceReader; counts: Float64Array } | null = null;
     private dictionaries: Record<number, string[]> = {};
     private columns: ColumnSchema[] = [];
     private layout: Layout = { columnWidths: {}, hiddenColumns: [] };
@@ -731,6 +734,57 @@ export class DataViewerPanel {
         await this.webviewPanel.webview.postMessage(msg);
         this.recordSortSnapshot(0);
         this.recordFilterSnapshot(0);
+        this.startNullCountScan(generation);
+    }
+
+    /**
+     * Header missing bars: sum each record batch's `FieldNode.null_count`
+     * (`reader.nullCounts`, headers only) after first paint, posting
+     * progress at most every 100 ms and the exact counts when done. The
+     * webview treats `done: false` counts as lower bounds. Results are
+     * cached per reader, so a repaint of the same data posts at once; a
+     * new paint or a disposed panel aborts the scan.
+     */
+    private startNullCountScan(generation: number): void {
+        this.nullCountAbort?.abort();
+        const reader = this.reader;
+        const post = (counts: ArrayLike<number>, done: boolean): void => {
+            if (generation !== this.generation || reader !== this.reader || this.disposed) return;
+            const msg: ExtensionToWebview = {
+                type: 'nullCounts',
+                panelGeneration: generation,
+                counts: Array.from(counts),
+                done,
+            };
+            void this.webviewPanel.webview.postMessage(msg);
+        };
+        if (this.nullCountCache?.reader === reader) {
+            post(this.nullCountCache.counts, true);
+            return;
+        }
+        const abort = new AbortController();
+        this.nullCountAbort = abort;
+        let lastPost = Date.now();
+        // A macrotask first, so the paint's own getRows is served before
+        // the scan starts reading headers.
+        setTimeout(() => {
+            if (abort.signal.aborted) return;
+            Promise.resolve().then(() => reader.nullCounts({
+                signal: abort.signal,
+                onProgress: (_done, _total, counts) => {
+                    const now = Date.now();
+                    if (now - lastPost < 100) return;
+                    lastPost = now;
+                    post(counts, false);
+                },
+            })).then(counts => {
+                if (abort.signal.aborted) return;
+                this.nullCountCache = { reader, counts };
+                post(counts, true);
+            }).catch(err => {
+                if (!isAbortError(err)) this.trace('null-count-scan-failed', { error: String(err) });
+            });
+        }, 0);
     }
 
     // -------------------------------------------------------
@@ -1469,6 +1523,26 @@ export class DataViewerPanel {
                 await this.handleCopy(m, gen);
                 return;
             }
+            case 'getCellDetail': {
+                const reader = this.reader;
+                const got = await reader.getCellText(
+                    m.row, m.columnIndex, CELL_DETAIL_LIMIT_BYTES, this.effectivePermutation(),
+                );
+                if (gen !== this.generation || reader !== this.reader) return;
+                const reply: ExtensionToWebview = {
+                    type: 'cellDetail',
+                    panelGeneration: gen,
+                    requestId: m.requestId,
+                    text: got.text,
+                    truncated: got.truncated,
+                };
+                await this.webviewPanel.webview.postMessage(reply);
+                return;
+            }
+            case 'copyText': {
+                await vscode.env.clipboard.writeText(m.text);
+                return;
+            }
             case 'setSort': {
                 await this.handleSetSort(m, gen);
                 return;
@@ -1864,10 +1938,13 @@ export class DataViewerPanel {
             }
         }
 
-        const tsv = render_tsv(
+        let tsv = render_tsv(
             got.rows, m.range.colIndices, this.columns, this.dictionaries,
             m.labelsOn, m.formatOn, m.digits, resolved, m.includeHeader,
         );
+        if (m.rowNumbers) {
+            tsv = prependRowNumbers(tsv, m.range.rowStart, got.originalRowIndices, m.includeHeader);
+        }
         try {
             await vscode.env.clipboard.writeText(tsv);
             await this.postCopyDone(m, gen, true);
@@ -1946,6 +2023,7 @@ export class DataViewerPanel {
     private async dispose(): Promise<void> {
         if (this.disposed) return;
         this.disposed = true;
+        this.nullCountAbort?.abort();
         this.abortInteractiveTransforms();
         this.abortAndClearRestore();
         this.trace('dispose', {});

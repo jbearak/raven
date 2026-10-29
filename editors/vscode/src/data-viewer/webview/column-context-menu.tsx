@@ -50,6 +50,9 @@ type Props = {
     topPx: number;
     copyLabel?: string;
     onCopy: () => void;
+    /** "Copy with row names": the same copy with the rowname column (or,
+     *  without one, the R row numbers) prepended. */
+    onCopyWithRowNames?: () => void;
     onHideColumn?: () => void;
     onClose: () => void;
     /** Only present for column context menus. */
@@ -65,6 +68,7 @@ export function ColumnContextMenu({
     topPx,
     copyLabel = 'Copy',
     onCopy,
+    onCopyWithRowNames,
     onHideColumn,
     onClose,
     sort,
@@ -100,6 +104,11 @@ export function ColumnContextMenu({
             <button type="button" className="context-menu-item" onClick={onCopy} role="menuitem">
                 {copyLabel}
             </button>
+            {onCopyWithRowNames && (
+                <button type="button" className="context-menu-item" onClick={onCopyWithRowNames} role="menuitem">
+                    Copy with row names
+                </button>
+            )}
             {onHideColumn && (
                 <button type="button" className="context-menu-item" onClick={onHideColumn} role="menuitem">
                     Hide column

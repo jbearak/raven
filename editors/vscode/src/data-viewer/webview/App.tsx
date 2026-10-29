@@ -9,12 +9,13 @@ import {
     CompactSelection,
     DataEditorCore as DataEditor,
     GridCellKind,
-    markerCellRenderer,
+    loadingCellRenderer,
     textCellRenderer,
     type DataEditorRef,
     type DataEditorCoreProps,
     type DrawCellCallback,
     type DrawHeaderCallback,
+    type GridCell,
     type GridMouseEventArgs,
     type GridSelection,
     type Item,
@@ -38,22 +39,52 @@ import {
 import type { ToolbarState } from '../toolbar-state';
 import type { Cell } from '../wire-format';
 import { RowCache } from './row-cache';
-import { formatCell } from './cell-render';
+import { formatCell, type FormattedCell } from './cell-render';
+import { displayTypeTag, isRightAligned } from '../display-format';
+import {
+    allCopyColumns,
+    buildDisplayColumns,
+    clampToData,
+    copyColumns,
+    displayIndexOf,
+    isGutter,
+    rowPosition,
+    rRowNumber,
+    sourceAt,
+} from './display-columns';
+import { rowHeightFor, useGridTheme, type GridTheme } from './grid-theme';
+import {
+    drawDataHeader,
+    headerAccessibleName,
+    headerMetrics,
+    headerTooltipLines,
+    SORT_SLOT_PX,
+    type MissingInfo,
+} from './header-layout';
+import { CellDetailPopover } from './cell-detail-popover';
 import { hasFormatEffect, hasLabelsEffect } from './toolbar-effects';
 import {
     buildGridColumns,
-    buildVisibleGridColumns,
+    capFrozenWidths,
+    clampAutoWidth,
+    clampColumnWidth,
     describeRestoreMessage,
-    describeToolbarRowCount,
-    fitLeadingText,
-    HEADER_HEIGHT_PX,
+    describeShape,
+    describeStatusLine,
+    emptyStateMessage,
+    gutterHeaderText,
+    gutterWidth,
+    MAX_COLUMN_WIDTH_PX,
+    MEASURE_COLUMN_LIMIT,
+    MEASURE_SAMPLE_ROWS,
+    measuredColumnWidth,
+    MIN_COLUMN_WIDTH_PX,
     OVERSCAN_ROWS,
     paddedRange,
     pendingOperationLabels,
-    rowMarkerWidth,
-    ROW_HEIGHT_PX,
+    type DataViewerGridColumn,
+    type TextMeasure,
     type VisibleRange,
-    visibleColumnIndices,
 } from './grid-model';
 import {
     hideAllColumns,
@@ -113,6 +144,30 @@ type HeaderTooltipState = {
     topPx: number;
 };
 
+type CellDetailState = {
+    requestId: number;
+    title: string;
+    text: string | null | undefined;
+    truncated: boolean;
+    leftPx: number;
+    topPx: number;
+};
+
+/** Accessibility hooks read by Raven's Glide patch
+ *  (`editors/vscode/patches/@glideapps+glide-data-grid+6.0.3.patch`). */
+type GlideExperimental = NonNullable<DataEditorCoreProps['experimental']> & {
+    accessibility?: {
+        isColumnHidden?: (col: number) => boolean;
+        columnLabel?: (col: number) => string | undefined;
+        rowLabel?: (row: number) => string | undefined;
+    };
+    onColumnAutoSize?: (col: number) => void;
+};
+
+/** Values longer than this open the cell-detail popover even when they
+ *  fit the column. */
+const LONG_VALUE_CHARS = 80;
+
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
 const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
@@ -123,7 +178,7 @@ const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDig
 const RESTORE_DEBOUNCE_MS = 200;
 // Glide's renderer type is invariant, but dispatch is by each renderer's `kind`.
 const DATA_VIEWER_RENDERERS = [
-    markerCellRenderer,
+    loadingCellRenderer,
     textCellRenderer,
 ] as unknown as NonNullable<DataEditorCoreProps['renderers']>;
 const DATA_VIEWER_IMAGE_LOADER: DataEditorCoreProps['imageWindowLoader'] = {
@@ -146,13 +201,19 @@ function createColumnSelection(colIndex: number): GridSelection {
     };
 }
 
-function createAllColumnsSelection(columnCount: number): GridSelection {
+/** Every data column (display `firstData`..count−1); the gutter and
+ *  rowname columns are never part of a column selection. */
+function createAllColumnsSelection(displayCount: number, firstData: number): GridSelection {
     return {
-        columns: columnCount > 0
-            ? CompactSelection.fromSingleSelection([0, columnCount])
+        columns: displayCount > firstData
+            ? CompactSelection.fromSingleSelection([firstData, displayCount])
             : CompactSelection.empty(),
         rows: CompactSelection.empty(),
     };
+}
+
+function createRowsSelection(rows: CompactSelection): GridSelection {
+    return { columns: CompactSelection.empty(), rows };
 }
 
 function createCellSelection(col: number, row: number): GridSelection {
@@ -165,73 +226,6 @@ function createCellSelection(col: number, row: number): GridSelection {
         columns: CompactSelection.empty(),
         rows: CompactSelection.empty(),
     };
-}
-
-function readCssVar(style: CSSStyleDeclaration, name: string, fallback: string): string {
-    return style.getPropertyValue(name).trim() || fallback;
-}
-
-function buildGridTheme(style: CSSStyleDeclaration): Partial<Theme> {
-    const fg = readCssVar(style, '--vscode-foreground', '#cccccc');
-    const editorFg = readCssVar(style, '--vscode-editor-foreground', fg);
-    const editorBg = readCssVar(style, '--vscode-editor-background', '#1e1e1e');
-    const headerBg = readCssVar(style, '--vscode-editorGroupHeader-tabsBackground', editorBg);
-    const border = readCssVar(style, '--vscode-panel-border', 'rgba(128,128,128,0.35)');
-    const selectionBg = readCssVar(style, '--vscode-list-activeSelectionBackground', '#094771');
-    const selectionFg = readCssVar(style, '--vscode-list-activeSelectionForeground', '#ffffff');
-    const hoverBg = readCssVar(style, '--vscode-list-hoverBackground', 'rgba(128,128,128,0.1)');
-    const focusBorder = readCssVar(style, '--vscode-focusBorder', '#007fd4');
-    const fontFamily = readCssVar(style, '--vscode-editor-font-family', 'monospace');
-    return {
-        bgCell: editorBg,
-        bgCellMedium: editorBg,
-        bgHeader: headerBg,
-        bgHeaderHasFocus: selectionBg,
-        bgHeaderHovered: hoverBg,
-        textDark: editorFg,
-        textMedium: fg,
-        textLight: fg,
-        textHeader: fg,
-        textHeaderSelected: selectionFg,
-        borderColor: border,
-        horizontalBorderColor: border,
-        headerBottomBorderColor: border,
-        accentColor: focusBorder,
-        accentFg: selectionFg,
-        accentLight: selectionBg,
-        linkColor: readCssVar(style, '--vscode-textLink-foreground', focusBorder),
-        fontFamily,
-    };
-}
-
-function buildMissingThemes(style: CSSStyleDeclaration): { fg: Partial<Theme>; bg: Partial<Theme> } {
-    return {
-        fg: { textDark: readCssVar(style, '--vscode-editorError-foreground', '#f14c4c') },
-        bg: { bgCell: readCssVar(style, '--vscode-diffEditor-removedTextBackground', 'rgba(255,0,0,0.06)') },
-    };
-}
-
-function useVscodeTheme(): { grid: Partial<Theme>; missingFg: Partial<Theme>; missingBg: Partial<Theme> } {
-    const [revision, setRevision] = useState(0);
-    useEffect(() => {
-        const observer = new MutationObserver(() => setRevision(r => r + 1));
-        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
-        observer.observe(document.body, {
-            attributes: true,
-            attributeFilter: ['style', 'class', 'data-vscode-theme-kind', 'data-vscode-theme-name'],
-        });
-        return () => observer.disconnect();
-    }, []);
-
-    return useMemo(() => {
-        const style = getComputedStyle(document.documentElement);
-        const missing = buildMissingThemes(style);
-        return {
-            grid: buildGridTheme(style),
-            missingFg: missing.fg,
-            missingBg: missing.bg,
-        };
-    }, [revision]);
 }
 
 /** True when an event would type into the given element (or its
@@ -253,56 +247,21 @@ function isEditableTarget(el: Element | null): boolean {
     return false;
 }
 
-/** Paint the sort arrow + (when there's more than one key) a priority
- *  badge in the right-edge cluster of a column header. The arrow alpha
- *  encodes the primary/secondary cue at a glance; the badge is the
- *  precise readout. */
-function drawSortGlyphs(
-    ctx: CanvasRenderingContext2D,
-    rect: { x: number; y: number; width: number; height: number },
-    theme: Theme,
-    entry: { direction: 'asc' | 'desc'; priority: number },
-    showBadge: boolean,
-): void {
-    const isPrimary = entry.priority === 1;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(rect.x, rect.y, rect.width, rect.height);
-    ctx.clip();
-    const arrowRightEdge = rect.x + rect.width - 8;
-    const arrowCenterY = rect.y + rect.height / 2;
-    const arrowSize = 5;
-    ctx.fillStyle = theme.textHeader;
-    ctx.globalAlpha = isPrimary ? 0.85 : 0.55;
-    ctx.beginPath();
-    if (entry.direction === 'asc') {
-        ctx.moveTo(arrowRightEdge - arrowSize, arrowCenterY + arrowSize / 2);
-        ctx.lineTo(arrowRightEdge, arrowCenterY + arrowSize / 2);
-        ctx.lineTo(arrowRightEdge - arrowSize / 2, arrowCenterY - arrowSize / 2);
-    } else {
-        ctx.moveTo(arrowRightEdge - arrowSize, arrowCenterY - arrowSize / 2);
-        ctx.lineTo(arrowRightEdge, arrowCenterY - arrowSize / 2);
-        ctx.lineTo(arrowRightEdge - arrowSize / 2, arrowCenterY + arrowSize / 2);
-    }
-    ctx.closePath();
-    ctx.fill();
-    if (showBadge) {
-        const badgeCenterX = arrowRightEdge - arrowSize - 10;
-        const badgeRadius = 7;
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = theme.bgHeader === theme.bgCell
-            ? 'rgba(128, 128, 128, 0.35)'
-            : theme.bgCell;
-        ctx.beginPath();
-        ctx.arc(badgeCenterX, arrowCenterY, badgeRadius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = theme.textHeader;
-        ctx.font = `600 9px ${theme.fontFamily}`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(String(entry.priority), badgeCenterX, arrowCenterY + 0.5);
-    }
-    ctx.restore();
+/** A canvas text measurer in the grid's fonts, for widths. */
+function makeTextMeasure(ctx: CanvasRenderingContext2D | null, theme: GridTheme): TextMeasure {
+    const fs = theme.fontSizePx;
+    const family = theme.fontFamily;
+    const at = (font: string) => (text: string) => {
+        if (!ctx) return text.length * fs * 0.6;
+        ctx.font = font;
+        return ctx.measureText(text).width;
+    };
+    return {
+        name: at(`600 ${fs}px ${family}`),
+        tag: at(`${Math.round(fs * 0.85)}px ${family}`),
+        label: at(`italic ${Math.round(fs * 0.92)}px ${family}`),
+        cell: at(`${fs}px ${family}`),
+    };
 }
 
 function sameColumns(a: readonly ColumnSchema[], b: readonly ColumnSchema[]): boolean {
@@ -321,7 +280,9 @@ export function App({
     initialState?: unknown;
 }) {
     const restored = initialState as PersistedState | undefined;
-    const { grid: vscodeTheme, missingFg, missingBg } = useVscodeTheme();
+    const theme = useGridTheme();
+    const vscodeTheme = theme.grid;
+    const rowHeight = rowHeightFor(theme.fontSizePx);
     const gridRef = useRef<DataEditorRef>(null);
     const gridShellRef = useRef<HTMLDivElement>(null);
     const headerTooltipRef = useRef<HTMLDivElement>(null);
@@ -375,6 +336,18 @@ export function App({
     const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
     const [headerTooltip, setHeaderTooltip] = useState<HeaderTooltipState | null>(null);
+    const [cellDetail, setCellDetail] = useState<CellDetailState | null>(null);
+    /** Header null-count scan results by source column (see the host's
+     *  `startNullCountScan`); null until the first report. */
+    const [nullCounts, setNullCounts] = useState<{ counts: number[]; done: boolean } | null>(null);
+    /** Measured default widths by source column, for columns the user
+     *  hasn't sized. Not persisted: recomputed per dataset. */
+    const [autoWidths, setAutoWidths] = useState<Record<number, number>>({});
+    const autoWidthsMeasuredRef = useRef<'none' | 'header' | 'values'>('none');
+    const [hoverRow, setHoverRow] = useState<number | null>(null);
+    const [shellWidth, setShellWidth] = useState(0);
+    const gutterAnchorRef = useRef<number | null>(null);
+    const measureCanvasRef = useRef<HTMLCanvasElement | null>(null);
     const [copyStatus, setCopyStatus] = useState<'' | 'copying' | 'copied' | 'error'>('');
     const [copyStatusMsg, setCopyStatusMsg] = useState('');
     // Mirrors copyStatus for synchronous reads inside callbacks (e.g.
@@ -427,10 +400,14 @@ export function App({
         return requestId;
     }, []);
 
-    const visibleCols = useMemo(
-        () => visibleColumnIndices(columns, layout.hiddenColumns),
+    /** Display ↔ source column mapping (display 0 is the R-row-number
+     *  gutter). `visibleCols` is the data columns in display order, which
+     *  is also the order of cells in fetched rows. */
+    const display = useMemo(
+        () => buildDisplayColumns(columns, layout.hiddenColumns),
         [columns, layout.hiddenColumns],
     );
+    const visibleCols = display.dataCols;
     /** Map of source column index → { direction, priority (1-based) } for
      *  the active sort. Empty when no sort is active. Used by drawHeader
      *  and by the context menu's "check active direction" rendering. */
@@ -441,11 +418,37 @@ export function App({
         return m;
     }, [sort]);
     const showPriorityBadge = sort.keys.length > 1;
-    const allGridColumns = useMemo(() => buildGridColumns(columns, layout), [columns, layout]);
-    const gridColumns = useMemo(
-        () => buildVisibleGridColumns(allGridColumns, visibleCols),
-        [allGridColumns, visibleCols],
+    const allGridColumns = useMemo(
+        () => buildGridColumns(columns, layout, autoWidths),
+        [autoWidths, columns, layout],
     );
+    const textMeasure = useMemo(() => {
+        if (!measureCanvasRef.current && typeof document !== 'undefined') {
+            measureCanvasRef.current = document.createElement('canvas');
+        }
+        return makeTextMeasure(measureCanvasRef.current?.getContext('2d') ?? null, theme);
+    }, [theme]);
+    const anyVariableLabel = useMemo(() => columns.some(c => !!c.variableLabel), [columns]);
+    const hMetrics = useMemo(
+        () => headerMetrics(theme.fontSizePx, anyVariableLabel),
+        [anyVariableLabel, theme.fontSizePx],
+    );
+    const gutterTitle = gutterHeaderText(nrow, nrowFiltered);
+    const gutterPx = gutterWidth(nrow, t => textMeasure.cell(t), gutterTitle);
+    /** Gutter, then the data columns. Frozen rowname columns shrink so
+     *  the frozen region stays within half the viewport. */
+    const gridColumns = useMemo((): DataViewerGridColumn[] => {
+        const data = visibleCols.map(index => allGridColumns[index]).filter(Boolean);
+        const frozen = display.freezeColumns - 1;
+        if (frozen > 0 && shellWidth > 0) {
+            const capped = capFrozenWidths(gutterPx, data.slice(0, frozen).map(c => c.width), shellWidth);
+            for (let i = 0; i < frozen; i++) data[i] = { ...data[i], width: capped[i] };
+        }
+        return [
+            { id: '__gutter', title: gutterTitle, width: gutterPx, sourceIndex: -1, hasMenu: false },
+            ...data,
+        ];
+    }, [allGridColumns, display.freezeColumns, gutterPx, gutterTitle, shellWidth, visibleCols]);
     const labelsHaveEffect = hasLabelsEffect(columns);
     const formatHasEffect = hasFormatEffect(columns);
     /** When a filter is active, the host's permutation has length `nrowFiltered`.
@@ -462,9 +465,15 @@ export function App({
             ? 'Loading…'
             : describeRestoreMessage(restorePending.sort, restorePending.filter))
         : null;
-    const rowCountText = describeToolbarRowCount(
-        effectiveNrow, visibleRange, loading, false,
-    );
+    const rowCountText = describeShape(nrow, columns.length, nrowFiltered, loading);
+    const statusText = loading ? '' : describeStatusLine(nrow, columns.length, nrowFiltered, visibleRange);
+    const emptyState = emptyStateMessage(nrow, nrowFiltered, loading);
+    const missingInfo = useCallback((source: number): MissingInfo => {
+        if (!nullCounts) return undefined;
+        const count = nullCounts.counts[source];
+        if (count === undefined) return undefined;
+        return { count, total: nrow, partial: !nullCounts.done };
+    }, [nrow, nullCounts]);
     /** Whether the chip group must wrap onto its own second row. `layout.hiddenColumns.length`
      *  is in the deps because the Columns count badge widens the action buttons without
      *  changing the toolbar width — without that the wrap state can be stale.
@@ -529,12 +538,13 @@ export function App({
     const focusCell = useCallback((selection: GridSelection = gridSelection): { row: number; col: number } | null => {
         const current = selection.current;
         if (current) {
-            const col = visibleCols[current.cell[0]];
+            // A focused gutter cell reports the first data column.
+            const col = sourceAt(display, current.cell[0]) ?? visibleCols[0];
             if (col !== undefined) return { row: current.cell[1], col };
         }
         if (effectiveNrow <= 0 || visibleCols.length === 0) return null;
         return { row: Math.min(effectiveNrow - 1, visibleRange.start), col: visibleCols[0] };
-    }, [effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
+    }, [display, effectiveNrow, gridSelection, visibleCols, visibleRange.start]);
 
     const postLifecycle = useCallback((
         event: string,
@@ -602,7 +612,7 @@ export function App({
             viewportGeneration: viewportGenerationRef.current,
             start: range.start,
             end: range.end,
-            columns: visibleCols,
+            columns: [...visibleCols],
         });
     }, [nextRequestId, panelGeneration, visibleCols, vscode]);
 
@@ -708,6 +718,14 @@ export function App({
         setFilterPending(false);
         setNrowFiltered(undefined);
         setLoading(false);
+        setCellDetail(null);
+        // The host re-posts null counts after every paint (from its cache
+        // for the same reader).
+        setNullCounts(null);
+        if (!sameDataset) {
+            setAutoWidths({});
+            autoWidthsMeasuredRef.current = 'none';
+        }
         toolbarBootstrappedRef.current = true;
         clearRows();
         setResolvedLabels({});
@@ -742,13 +760,14 @@ export function App({
         pendingKeysRef.current.delete(key);
         inflightRef.current.delete(m.requestId);
         if (m.stale) return;
-        rowCacheRef.current.put(m.start, m.end, m.rows);
+        rowCacheRef.current.put(m.start, m.end, m.rows, m.originalRowIndices);
         setCacheRevision(r => r + 1);
         const rowEnd = Math.min(m.end, m.start + m.rows.length);
         const width = Math.min(visibleCols.length, m.rows[0]?.length ?? visibleCols.length);
         const damageList: { cell: Item }[] = [];
         for (let row = m.start; row < rowEnd; row++) {
-            for (let displayCol = 0; displayCol < width; displayCol++) {
+            // Display 0 is the gutter; data position p is display p + 1.
+            for (let displayCol = 0; displayCol <= width; displayCol++) {
                 damageList.push({ cell: [displayCol, row] });
             }
         }
@@ -767,7 +786,7 @@ export function App({
                 ...m.labels,
             },
         }));
-        const displayCol = visibleCols.indexOf(m.columnIndex);
+        const displayCol = displayIndexOf(display, m.columnIndex);
         if (displayCol < 0) return;
         const damageList: { cell: Item }[] = [];
         for (let row = visibleRange.start; row < visibleRange.end; row++) {
@@ -776,7 +795,7 @@ export function App({
         if (damageList.length > 0) {
             gridRef.current?.updateCells(damageList);
         }
-    }, [visibleCols, visibleRange.end, visibleRange.start]);
+    }, [display, visibleRange.end, visibleRange.start]);
 
     const applyHistogram = useCallback((m: Extract<ExtensionToWebview, { type: 'histogram' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -1052,8 +1071,8 @@ export function App({
         if (current > 0) return current;
         const shell = document.querySelector('.grid-shell');
         const height = shell instanceof HTMLElement ? shell.clientHeight : 0;
-        return Math.max(1, Math.floor((height - HEADER_HEIGHT_PX) / ROW_HEIGHT_PX) || 20);
-    }, [visibleRange.end, visibleRange.start]);
+        return Math.max(1, Math.floor((height - hMetrics.height) / rowHeight) || 20);
+    }, [hMetrics.height, rowHeight, visibleRange.end, visibleRange.start]);
 
     const viewportForStart = useCallback((start: number): VisibleRange => {
         const height = estimatedViewportRowCount();
@@ -1118,10 +1137,7 @@ export function App({
 
     const handleTestKey = useCallback((key: string) => {
         if (key === 'End') {
-            const displayCol = Math.max(0, Math.min(
-                visibleCols.length - 1,
-                gridSelection.current?.cell[0] ?? 0,
-            ));
+            const displayCol = clampToData(display, gridSelection.current?.cell[0] ?? 1);
             const row = Math.max(0, effectiveNrow - 1);
             const next = createCellSelection(displayCol, row);
             setGridSelection(next);
@@ -1130,14 +1146,14 @@ export function App({
             return;
         }
         if (key === 'Home') {
-            const next = createCellSelection(0, 0);
+            const next = createCellSelection(clampToData(display, 1), 0);
             setGridSelection(next);
             scrollToFraction(0);
             postLifecycle('test-key', viewportForStart(0), next);
             return;
         }
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
-        const current = gridSelection.current?.cell ?? [0, Math.max(0, visibleRange.start)];
+        const current = gridSelection.current?.cell ?? [1, Math.max(0, visibleRange.start)];
         let col = current[0];
         let row = current[1];
         if (key === 'ArrowDown') row += 1;
@@ -1145,7 +1161,7 @@ export function App({
         else if (key === 'ArrowRight') col += 1;
         else if (key === 'ArrowLeft') col -= 1;
         else return;
-        col = Math.max(0, Math.min(visibleCols.length - 1, col));
+        col = clampToData(display, col);
         row = Math.max(0, Math.min(effectiveNrow - 1, row));
         const next = createCellSelection(col, row);
         setGridSelection(next);
@@ -1159,6 +1175,7 @@ export function App({
         }
         postLifecycle('test-key', viewport, next);
     }, [
+        display,
         effectiveNrow,
         estimatedViewportRowCount,
         gridSelection,
@@ -1264,6 +1281,16 @@ export function App({
                     return;
                 case 'copyDone':
                     applyCopyDone(m);
+                    return;
+                case 'nullCounts':
+                    if (m.panelGeneration !== panelGenerationRef.current) return;
+                    setNullCounts({ counts: m.counts, done: m.done });
+                    return;
+                case 'cellDetail':
+                    if (m.panelGeneration !== panelGenerationRef.current) return;
+                    setCellDetail(prev => (prev && prev.requestId === m.requestId
+                        ? { ...prev, text: m.text, truncated: m.truncated }
+                        : prev));
                     return;
                 case 'sortApplied':
                     applySortApplied(m);
@@ -1458,7 +1485,13 @@ export function App({
         vscode,
     ]);
 
-    const copySelection = useCallback((selection: GridSelection = gridSelection) => {
+    /** Copy the selection as TSV. The gutter is never copied, and rowname
+     *  columns only with `withRowNames` ("Copy with row names"), which on a
+     *  frame without one prepends the R row numbers instead. */
+    const copySelection = useCallback((
+        selection: GridSelection = gridSelection,
+        withRowNames = false,
+    ) => {
         if (effectiveNrow <= 0 || visibleCols.length === 0) return;
         let rowStart = 0;
         let rowEnd = 0;
@@ -1468,23 +1501,20 @@ export function App({
         if (selection.columns.length > 0) {
             rowStart = 0;
             rowEnd = effectiveNrow;
-            colIndices = selection.columns.toArray()
-                .map(displayCol => visibleCols[displayCol])
-                .filter((col): col is number => col !== undefined);
+            colIndices = copyColumns(display, selection.columns.toArray(), withRowNames);
             includeHeader = true;
         } else if (selection.rows.length > 0) {
             const rows = selection.rows.toArray();
             rowStart = Math.max(0, Math.min(...rows));
             rowEnd = Math.min(effectiveNrow, Math.max(...rows) + 1);
-            colIndices = [...visibleCols];
+            colIndices = allCopyColumns(display, withRowNames);
         } else if (selection.current) {
             const range = selection.current.range;
             rowStart = Math.max(0, range.y);
             rowEnd = Math.min(effectiveNrow, range.y + range.height);
-            for (let displayCol = range.x; displayCol < range.x + range.width; displayCol++) {
-                const col = visibleCols[displayCol];
-                if (col !== undefined) colIndices.push(col);
-            }
+            const displayed: number[] = [];
+            for (let d = range.x; d < range.x + range.width; d++) displayed.push(d);
+            colIndices = copyColumns(display, displayed, withRowNames);
         }
 
         if (rowEnd <= rowStart || colIndices.length === 0) return;
@@ -1499,8 +1529,9 @@ export function App({
             formatOn: toolbar.formatOn,
             digits: toolbar.digits,
             includeHeader,
+            rowNumbers: withRowNames && display.allRownameCols.length === 0,
         });
-    }, [effectiveNrow, gridSelection, nextRequestId, panelGeneration, showCopyToast, toolbar, visibleCols, vscode]);
+    }, [display, effectiveNrow, gridSelection, nextRequestId, panelGeneration, showCopyToast, toolbar, visibleCols.length, vscode]);
 
     useEffect(() => {
         const onCopy = (event: ClipboardEvent) => {
@@ -1520,14 +1551,14 @@ export function App({
                 if (event.key === 'A' || event.code === 'KeyA') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];
-                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    const sourceIndex = focused !== undefined ? sourceAt(display, focused) : undefined;
                     if (sourceIndex !== undefined) sortColumn(sourceIndex, 'asc', false);
                     return;
                 }
                 if (event.key === 'D' || event.code === 'KeyD') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];
-                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    const sourceIndex = focused !== undefined ? sourceAt(display, focused) : undefined;
                     if (sourceIndex !== undefined) sortColumn(sourceIndex, 'desc', false);
                     return;
                 }
@@ -1544,7 +1575,7 @@ export function App({
                 if (event.key === 'F' || event.code === 'KeyF') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];
-                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    const sourceIndex = focused !== undefined ? sourceAt(display, focused) : undefined;
                     if (sourceIndex !== undefined) {
                         openFilterEditor(sourceIndex, 100, 100);
                     }
@@ -1553,7 +1584,7 @@ export function App({
                 if (event.key === 'X' || event.code === 'KeyX') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];
-                    const sourceIndex = focused !== undefined ? visibleCols[focused] : undefined;
+                    const sourceIndex = focused !== undefined ? sourceAt(display, focused) : undefined;
                     if (sourceIndex !== undefined) clearFilterOnColumn(sourceIndex);
                     return;
                 }
@@ -1562,7 +1593,7 @@ export function App({
             if (!meta) return;
             if (event.key === 'a' || event.key === 'A') {
                 event.preventDefault();
-                const next = createAllColumnsSelection(visibleCols.length);
+                const next = createAllColumnsSelection(display.count, display.freezeColumns);
                 setGridSelection(next);
                 postLifecycle('select-all', visibleRange, next);
             } else if (event.key === 'c' || event.key === 'C') {
@@ -1580,81 +1611,14 @@ export function App({
         clearAllSorts,
         clearFilterOnColumn,
         copySelection,
+        display,
         gridSelection,
         onClearAllFilters,
         openFilterEditor,
         postLifecycle,
         sortColumn,
-        visibleCols,
         visibleRange,
     ]);
-
-    const drawHeader: DrawHeaderCallback = useCallback(({ ctx, column, columnIndex, theme, rect, isSelected, hasSelectedCell }, drawContent) => {
-        const col = column as typeof gridColumns[number];
-        const sourceIndex = visibleCols[columnIndex];
-        const sortEntry = sourceIndex !== undefined ? sortByColumn.get(sourceIndex) : undefined;
-
-        // Default text rendering when no variable label — but we still
-        // need to paint sort glyphs on top when the column is sorted.
-        if (!col.variableLabel) {
-            drawContent();
-            if (sortEntry) drawSortGlyphs(ctx, rect, theme, sortEntry, showPriorityBadge);
-            return;
-        }
-        const textColor = isSelected || hasSelectedCell ? theme.textHeaderSelected : theme.textHeader;
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(rect.x, rect.y, rect.width, rect.height);
-        ctx.clip();
-        ctx.fillStyle = textColor;
-        ctx.font = `${theme.headerFontStyle} ${theme.fontFamily}`;
-        ctx.textBaseline = 'middle';
-        ctx.fillText(col.title, rect.x + 12, rect.y + 14);
-        ctx.globalAlpha = 0.68;
-        ctx.font = `400 11px ${theme.fontFamily}`;
-        ctx.fillText(col.variableLabel, rect.x + 12, rect.y + rect.height - 9);
-        ctx.restore();
-        if (sortEntry) drawSortGlyphs(ctx, rect, theme, sortEntry, showPriorityBadge);
-    }, [gridColumns, showPriorityBadge, sortByColumn, visibleCols]);
-
-    const drawCell: DrawCellCallback = useCallback((args, drawContent) => {
-        const sourceIndex = visibleCols[args.col];
-        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
-        if (!col || args.cell.kind !== GridCellKind.Text
-            || (!col.isInteger && !col.arrowType.startsWith('Float'))) {
-            drawContent();
-            return;
-        }
-
-        const text = args.cell.displayData;
-        if (!text) {
-            drawContent();
-            return;
-        }
-
-        const availableWidth = args.rect.width - (args.theme.cellHorizontalPadding * 2) - 1;
-        args.ctx.font = `${args.theme.baseFontStyle} ${args.theme.fontFamily}`;
-        const fitted = fitLeadingText(text, availableWidth, value => args.ctx.measureText(value).width);
-        if (!fitted.truncated) {
-            drawContent();
-            return;
-        }
-
-        args.ctx.save();
-        args.ctx.beginPath();
-        args.ctx.rect(args.rect.x, args.rect.y, args.rect.width, args.rect.height);
-        args.ctx.clip();
-        args.ctx.font = `${args.theme.baseFontStyle} ${args.theme.fontFamily}`;
-        args.ctx.fillStyle = args.theme.textDark;
-        args.ctx.textAlign = 'left';
-        args.ctx.textBaseline = 'middle';
-        args.ctx.fillText(
-            fitted.text,
-            args.rect.x + args.theme.cellHorizontalPadding + 0.5,
-            args.rect.y + args.rect.height / 2,
-        );
-        args.ctx.restore();
-    }, [columns, visibleCols]);
 
     const toGridShellPoint = useCallback((clientX: number, clientY: number): { leftPx: number; topPx: number } => {
         const shellRect = gridShellRef.current?.getBoundingClientRect();
@@ -1664,6 +1628,282 @@ export function App({
             topPx: clientY - shellRect.top,
         };
     }, []);
+
+    const drawHeader: DrawHeaderCallback = useCallback(({ ctx, columnIndex, theme: t, rect, isSelected, hasSelectedCell }) => {
+        const padding = t.cellHorizontalPadding;
+        if (isGutter(columnIndex)) {
+            if (!gutterTitle) return;
+            ctx.save();
+            ctx.fillStyle = theme.descriptionFg;
+            ctx.font = `${Math.round(theme.fontSizePx * 0.85)}px ${t.fontFamily}`;
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(gutterTitle, rect.x + rect.width - padding, rect.y + hMetrics.nameY);
+            ctx.restore();
+            return;
+        }
+        const sourceIndex = sourceAt(display, columnIndex);
+        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+        if (!col || sourceIndex === undefined) return;
+        drawDataHeader(
+            ctx,
+            rect,
+            hMetrics,
+            {
+                text: isSelected || hasSelectedCell ? t.textHeaderSelected : t.textHeader,
+                description: theme.descriptionFg,
+                missing: theme.missingColor,
+                fontFamily: t.fontFamily,
+            },
+            col,
+            sortByColumn.get(sourceIndex),
+            showPriorityBadge,
+            missingInfo(sourceIndex),
+            padding,
+        );
+    }, [columns, display, gutterTitle, hMetrics, missingInfo, showPriorityBadge, sortByColumn, theme]);
+
+    /** Format the cell at a display location; undefined when not loaded. */
+    const formattedAt = useCallback((displayCol: number, row: number): FormattedCell | undefined => {
+        const sourceIndex = sourceAt(display, displayCol);
+        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+        if (!col || sourceIndex === undefined) return undefined;
+        const cell = rowCacheRef.current.getRow(row)?.[rowPosition(displayCol)];
+        if (cell === undefined) return undefined;
+        return formatCell(cell, col, dictionaries[sourceIndex], {
+            labelsOn: toolbar.labelsOn,
+            formatOn: toolbar.formatOn,
+            digits: toolbar.digits,
+            alignPad: true,
+            resolvedLabel: typeof cell === 'number' ? resolvedLabels[sourceIndex]?.[cell] : undefined,
+        });
+    }, [columns, dictionaries, display, resolvedLabels, toolbar.digits, toolbar.formatOn, toolbar.labelsOn]);
+
+    /** Numeric columns never show leading digits of a value that doesn't
+     *  fit: they draw `###`, and the hover tooltip has the full value. */
+    const isNumericColumn = useCallback((col: ColumnSchema): boolean =>
+        col.isInteger || col.arrowType.startsWith('Float'), []);
+
+    const numericOverflows = useCallback((text: string, widthPx: number): boolean => {
+        const available = widthPx - (vscodeTheme.cellHorizontalPadding ?? 8) * 2 - 1;
+        return textMeasure.cell(text.trimEnd()) > available;
+    }, [textMeasure, vscodeTheme.cellHorizontalPadding]);
+
+    const drawCell: DrawCellCallback = useCallback((args, drawContent) => {
+        const sourceIndex = sourceAt(display, args.col);
+        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+        if (!col || args.cell.kind !== GridCellKind.Text || !isNumericColumn(col)) {
+            drawContent();
+            return;
+        }
+        const text = args.cell.displayData;
+        // A value label shown in place of the number is text: it clips
+        // like text, never as `###`, even when it looks numeric.
+        if (formattedAt(args.col, args.row)?.isLabel) {
+            drawContent();
+            return;
+        }
+        if (!text || !numericOverflows(text, args.rect.width)) {
+            drawContent();
+            return;
+        }
+        args.ctx.save();
+        args.ctx.beginPath();
+        args.ctx.rect(args.rect.x, args.rect.y, args.rect.width, args.rect.height);
+        args.ctx.clip();
+        args.ctx.font = `${args.theme.baseFontStyle} ${args.theme.fontFamily}`;
+        args.ctx.fillStyle = args.theme.textDark;
+        args.ctx.textAlign = 'right';
+        args.ctx.textBaseline = 'middle';
+        args.ctx.fillText(
+            '###',
+            args.rect.x + args.rect.width - args.theme.cellHorizontalPadding - 0.5,
+            args.rect.y + args.rect.height / 2,
+        );
+        args.ctx.restore();
+    }, [columns, display, formattedAt, isNumericColumn, numericOverflows]);
+
+    const getRowThemeOverride = useCallback((row: number): Partial<Theme> | undefined => {
+        if (row === hoverRow) return { bgCell: theme.hoverBg };
+        if (theme.bandBg && row % 2 === 1) return { bgCell: theme.bandBg };
+        return undefined;
+    }, [hoverRow, theme.bandBg, theme.hoverBg]);
+
+    const getCellContent = useCallback(([displayCol, row]: Item): GridCell => {
+        if (isGutter(displayCol)) {
+            if (!rowCacheRef.current.hasRow(row)) {
+                return { kind: GridCellKind.Loading, allowOverlay: false };
+            }
+            const text = String(rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row)));
+            return {
+                kind: GridCellKind.Text,
+                data: text,
+                displayData: text,
+                readonly: true,
+                allowOverlay: false,
+                contentAlign: 'right',
+                themeOverride: theme.gutter,
+            };
+        }
+        const sourceIndex = sourceAt(display, displayCol);
+        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+        const formatted = formattedAt(displayCol, row);
+        if (!col || !formatted) {
+            if (col) scheduleMissingRowRequest(row);
+            return { kind: GridCellKind.Loading, allowOverlay: false };
+        }
+        const missingTheme = formatted.missing
+            ? settings.missingValueStyle === 'background'
+                ? theme.missingBg
+                : settings.missingValueStyle === 'none' ? theme.missingPlain : theme.missingFg
+            : undefined;
+        return {
+            kind: GridCellKind.Text,
+            // `data` is what Glide's accessibility table reads, so it gets
+            // the display text ("NA", not the empty clipboard form).
+            data: formatted.text,
+            displayData: formatted.text,
+            readonly: true,
+            allowOverlay: false,
+            contentAlign: isRightAligned(col, toolbar.labelsOn) ? 'right' : 'left',
+            copyData: formatted.copyText,
+            ...(missingTheme ? { themeOverride: missingTheme } : {}),
+        };
+    }, [columns, display, formattedAt, scheduleMissingRowRequest, settings.missingValueStyle, theme, toolbar.labelsOn]);
+
+    // Glide caches the drawn header; repaint it when the missing-bar
+    // counts or sort glyphs change (row -1 addresses header cells).
+    useEffect(() => {
+        const damage: { cell: Item }[] = [];
+        for (let d = 0; d < display.count; d++) damage.push({ cell: [d, -1] });
+        gridRef.current?.updateCells(damage);
+    }, [display.count, nullCounts, sortByColumn]);
+
+    /** Auto-fit `sources` to their header text and up to `sampleLimit`
+     *  loaded rows (60–400 px). */
+    const measureWidths = useCallback((sources: readonly number[], sampleLimit: number): Record<number, number> => {
+        const sample = rowCacheRef.current.sampleRows(sampleLimit);
+        const out: Record<number, number> = {};
+        for (const src of sources) {
+            const col = columns[src];
+            if (!col) continue;
+            const pos = visibleCols.indexOf(src);
+            const values: string[] = [];
+            if (pos >= 0) {
+                for (const row of sample) {
+                    const cell = row[pos];
+                    if (cell === undefined) continue;
+                    values.push(formatCell(cell, col, dictionaries[src], {
+                        labelsOn: toolbar.labelsOn,
+                        formatOn: toolbar.formatOn,
+                        digits: toolbar.digits,
+                        alignPad: true,
+                    }).text);
+                }
+            }
+            out[src] = measuredColumnWidth(
+                col.name, displayTypeTag(col), col.variableLabel, values, textMeasure, SORT_SLOT_PX,
+            );
+        }
+        return out;
+    }, [columns, dictionaries, textMeasure, toolbar.digits, toolbar.formatOn, toolbar.labelsOn, visibleCols]);
+
+    // Measured default widths (≤ 200 columns): from the header text at
+    // once, then once more when the first rows arrive. Wider frames keep
+    // type-based defaults.
+    useEffect(() => {
+        if (columns.length === 0 || columns.length > MEASURE_COLUMN_LIMIT) return;
+        const stage = autoWidthsMeasuredRef.current;
+        const haveRows = rowCacheRef.current.sampleRows(1).length > 0;
+        if (stage === 'values' || (stage === 'header' && !haveRows)) return;
+        autoWidthsMeasuredRef.current = haveRows ? 'values' : 'header';
+        setAutoWidths(measureWidths(columns.map((_, i) => i), MEASURE_SAMPLE_ROWS));
+    }, [cacheRevision, columns, measureWidths]);
+
+    /** Double-click on a column border (via the Glide patch's
+     *  `onColumnAutoSize`): fit to the loaded rows and persist like a
+     *  drag. */
+    const autoSizeColumn = useCallback((displayCol: number) => {
+        const src = sourceAt(display, displayCol);
+        if (src === undefined) return;
+        const width = clampAutoWidth(measureWidths([src], Number.MAX_SAFE_INTEGER)[src]);
+        setLayout(current => {
+            const next = { ...current, columnWidths: { ...current.columnWidths, [src]: width } };
+            persistLayout(next);
+            return next;
+        });
+    }, [display, measureWidths, persistLayout]);
+
+    useEffect(() => {
+        const el = gridShellRef.current;
+        if (!el || typeof ResizeObserver === 'undefined') return;
+        const ro = new ResizeObserver(entries => {
+            const w = entries[0]?.contentRect.width ?? el.clientWidth;
+            setShellWidth(Math.round(w));
+        });
+        ro.observe(el);
+        return () => ro.disconnect();
+    }, []);
+
+    /** Row selection lives on the gutter: click selects a row, Shift
+     *  extends from the anchor, Cmd/Ctrl toggles. */
+    const onCellClicked = useCallback((cell: Item, event: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
+        const [displayCol, row] = cell;
+        if (!isGutter(displayCol)) return;
+        let rows: CompactSelection;
+        const anchor = gutterAnchorRef.current;
+        if (event.shiftKey && anchor !== null) {
+            rows = CompactSelection.fromSingleSelection([Math.min(anchor, row), Math.max(anchor, row) + 1]);
+        } else if (event.metaKey || event.ctrlKey) {
+            const current = gridSelection.rows;
+            rows = current.hasIndex(row) ? current.remove(row) : current.add(row);
+            gutterAnchorRef.current = row;
+        } else {
+            rows = CompactSelection.fromSingleSelection(row);
+            gutterAnchorRef.current = row;
+        }
+        const next = createRowsSelection(rows);
+        setGridSelection(next);
+        postLifecycle('selection', visibleRange, next);
+    }, [gridSelection.rows, postLifecycle, visibleRange]);
+
+    /** Enter or double-click on a truncated, long, or list cell opens the
+     *  cell-detail popover; the host sends the untruncated value. */
+    const onCellActivated = useCallback((cell: Item) => {
+        const [displayCol, row] = cell;
+        const sourceIndex = sourceAt(display, displayCol);
+        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+        const raw = rowCacheRef.current.getRow(row)?.[rowPosition(displayCol)];
+        const formatted = formattedAt(displayCol, row);
+        if (!col || sourceIndex === undefined || !formatted || raw === undefined) return;
+        const width = gridColumns[displayCol]?.width ?? 0;
+        const isTrunc = typeof raw === 'object' && raw !== null && raw._ === 'trunc';
+        const isList = (col.typeTag ?? '') === '<list>';
+        const long = formatted.text.length > LONG_VALUE_CHARS;
+        const overflows = textMeasure.cell(formatted.text) > width - (vscodeTheme.cellHorizontalPadding ?? 8) * 2;
+        if (!isTrunc && !isList && !long && !overflows) return;
+        const requestId = nextRequestId();
+        const bounds = gridRef.current?.getBounds(displayCol, row);
+        const point = bounds ? toGridShellPoint(bounds.x, bounds.y + bounds.height) : { leftPx: 40, topPx: 40 };
+        const needsHost = typeof raw === 'string' || isTrunc;
+        setCellDetail({
+            requestId,
+            title: `${col.name}, row ${rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row))}`,
+            text: needsHost ? undefined : formatted.copyText,
+            truncated: false,
+            leftPx: point.leftPx,
+            topPx: point.topPx,
+        });
+        if (needsHost) {
+            vscode.postMessage({
+                type: 'getCellDetail',
+                panelGeneration,
+                requestId,
+                row,
+                columnIndex: sourceIndex,
+            });
+        }
+    }, [columns, display, formattedAt, gridColumns, nextRequestId, panelGeneration, textMeasure, toGridShellPoint, vscode, vscodeTheme.cellHorizontalPadding]);
 
     useEffect(() => {
         const el = headerTooltipRef.current;
@@ -1683,24 +1923,64 @@ export function App({
     }, [headerTooltip]);
 
     const onItemHovered = useCallback((args: GridMouseEventArgs) => {
-        if (args.kind !== 'header') {
-            setHeaderTooltip(null);
+        setHoverRow(args.kind === 'cell' ? args.location[1] : null);
+        const [displayCol, row] = args.location;
+        if (args.kind === 'header') {
+            const sourceIndex = sourceAt(display, displayCol);
+            const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+            if (!col || sourceIndex === undefined) {
+                setHeaderTooltip(null);
+                return;
+            }
+            const point = toGridShellPoint(args.bounds.x, args.bounds.y + args.bounds.height);
+            setHeaderTooltip({
+                text: headerTooltipLines(col, missingInfo(sourceIndex)).join('\n'),
+                leftPx: point.leftPx,
+                topPx: point.topPx,
+            });
             return;
         }
-        const sourceIndex = visibleCols[args.location[0]];
-        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
-        const label = col?.variableLabel?.trim();
-        if (!col || !label) {
-            setHeaderTooltip(null);
-            return;
+        if (args.kind === 'cell') {
+            // Cell detail on hover: the full value of a `###` number, a
+            // timestamp's UTC offset, or the raw seconds of an
+            // out-of-range timestamp.
+            const sourceIndex = sourceAt(display, displayCol);
+            const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
+            const formatted = formattedAt(displayCol, row);
+            let text: string | undefined;
+            if (col && formatted) {
+                const width = gridColumns[displayCol]?.width ?? 0;
+                if (isNumericColumn(col) && !formatted.missing && numericOverflows(formatted.text, width)) {
+                    text = formatted.copyText;
+                } else if (formatted.tooltip) {
+                    text = formatted.tooltip;
+                }
+            }
+            if (text) {
+                const point = toGridShellPoint(args.bounds.x, args.bounds.y + args.bounds.height);
+                setHeaderTooltip({ text, leftPx: point.leftPx, topPx: point.topPx });
+                return;
+            }
         }
-        const point = toGridShellPoint(args.bounds.x, args.bounds.y + args.bounds.height);
-        setHeaderTooltip({
-            text: label,
-            leftPx: point.leftPx,
-            topPx: point.topPx,
-        });
-    }, [columns, toGridShellPoint, visibleCols]);
+        setHeaderTooltip(null);
+    }, [columns, display, formattedAt, gridColumns, isNumericColumn, missingInfo, numericOverflows, toGridShellPoint]);
+
+    /** Hooks read by the Glide accessibility patch: header names carry
+     *  name, type, label, NA share and sort state; rows carry the R row
+     *  number; the gutter is out of the accessibility tree. */
+    const glideExperimental = useMemo((): GlideExperimental => ({
+        accessibility: {
+            isColumnHidden: col => isGutter(col),
+            columnLabel: col => {
+                const sourceIndex = sourceAt(display, col);
+                const c = sourceIndex === undefined ? undefined : columns[sourceIndex];
+                if (!c || sourceIndex === undefined) return undefined;
+                return headerAccessibleName(c, sortByColumn.get(sourceIndex), showPriorityBadge, missingInfo(sourceIndex));
+            },
+            rowLabel: row => `row ${rRowNumber(row, rowCacheRef.current.getOriginalRowIndex(row)).toLocaleString('en-US')}`,
+        },
+        onColumnAutoSize: autoSizeColumn,
+    }), [autoSizeColumn, columns, display, missingInfo, showPriorityBadge, sortByColumn]);
 
     const updateHiddenColumns = useCallback((hiddenColumns: number[]) => {
         const nextLayout = { ...layout, hiddenColumns };
@@ -1717,7 +1997,7 @@ export function App({
                 className={toolbarChipsWrapped ? 'toolbar is-wrapped' : 'toolbar'}
                 ref={toolbarRef}
             >
-                <span className="row-count" ref={rowCountRef}>{rowCountText}</span>
+                <span className="row-count" ref={rowCountRef} title="rows × columns">{rowCountText}</span>
                 <div className="toolbar-chips" ref={toolbarChipsRef}>
                     <ToolbarSortStrip
                         sort={sort}
@@ -1832,9 +2112,11 @@ export function App({
                     height="100%"
                     columns={gridColumns}
                     rows={effectiveNrow}
-                    rowHeight={ROW_HEIGHT_PX}
-                    headerHeight={HEADER_HEIGHT_PX}
-                    rowMarkers={{ kind: 'number', width: rowMarkerWidth(effectiveNrow) }}
+                    rowHeight={rowHeight}
+                    headerHeight={hMetrics.height}
+                    freezeColumns={display.freezeColumns}
+                    minColumnWidth={MIN_COLUMN_WIDTH_PX}
+                    maxColumnWidth={MAX_COLUMN_WIDTH_PX}
                     rowSelect="multi"
                     columnSelect="multi"
                     rangeSelect="rect"
@@ -1842,21 +2124,34 @@ export function App({
                     smoothScrollY={true}
                     drawHeader={drawHeader}
                     drawCell={drawCell}
+                    getRowThemeOverride={getRowThemeOverride}
                     onItemHovered={onItemHovered}
+                    onCellClicked={onCellClicked}
+                    onCellActivated={onCellActivated}
+                    cellActivationBehavior="double-click"
+                    experimental={glideExperimental}
                     gridSelection={gridSelection}
                     onGridSelectionChange={selection => {
-                        setGridSelection(selection);
-                        postLifecycle('selection', visibleRange, selection);
+                        // The gutter and rowname columns (the frozen
+                        // display indices) are never part of a column
+                        // selection.
+                        const frozen: [number, number] = [0, display.freezeColumns];
+                        const next = selection.columns.hasIndex(0) || display.freezeColumns > 1
+                            ? { ...selection, columns: selection.columns.remove(frozen) }
+                            : selection;
+                        setGridSelection(next);
+                        postLifecycle('selection', visibleRange, next);
                     }}
                     onHeaderClicked={colIndex => {
-                        if (colIndex < 0) return;
+                        if (colIndex < display.freezeColumns) return;
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
                         postLifecycle('header-click', visibleRange, next);
                     }}
                     onHeaderContextMenu={(colIndex, event) => {
                         event.preventDefault();
-                        if (colIndex < 0) {
+                        const sourceIndex = sourceAt(display, colIndex);
+                        if (sourceIndex === undefined) {
                             setContextMenu(null);
                             return;
                         }
@@ -1869,7 +2164,7 @@ export function App({
                         setContextMenu({
                             leftPx: point.leftPx,
                             topPx: point.topPx,
-                            columnIndex: visibleCols[colIndex],
+                            columnIndex: sourceIndex,
                             kind: 'column',
                         });
                     }}
@@ -1886,25 +2181,25 @@ export function App({
                         });
                     }}
                     onColumnResize={(_column, _newSize, colIndex, newSizeWithGrow) => {
-                        const sourceIndex = visibleCols[colIndex];
+                        const sourceIndex = sourceAt(display, colIndex);
                         if (sourceIndex === undefined) return;
                         setLayout(current => ({
                             ...current,
                             columnWidths: {
                                 ...current.columnWidths,
-                                [sourceIndex]: newSizeWithGrow,
+                                [sourceIndex]: clampColumnWidth(newSizeWithGrow),
                             },
                         }));
                     }}
                     onColumnResizeEnd={(_column, _newSize, colIndex, newSizeWithGrow) => {
-                        const sourceIndex = visibleCols[colIndex];
+                        const sourceIndex = sourceAt(display, colIndex);
                         if (sourceIndex === undefined) return;
                         setLayout(current => {
                             const next = {
                                 ...current,
                                 columnWidths: {
                                     ...current.columnWidths,
-                                    [sourceIndex]: newSizeWithGrow,
+                                    [sourceIndex]: clampColumnWidth(newSizeWithGrow),
                                 },
                             };
                             persistLayout(next);
@@ -1920,51 +2215,18 @@ export function App({
                         requestRows(paddedRange(range.y, range.height, effectiveNrow, OVERSCAN_ROWS));
                         postLifecycle('visible', viewport);
                     }}
-                    getCellContent={([displayCol, row]: Item) => {
-                        const sourceIndex = visibleCols[displayCol];
-                        const col = sourceIndex === undefined ? undefined : columns[sourceIndex];
-                        const cell = rowCacheRef.current.getRow(row)?.[displayCol];
-                        if (cell === undefined || !col) {
-                            if (col) scheduleMissingRowRequest(row);
-                            return {
-                                kind: GridCellKind.Text,
-                                data: '',
-                                displayData: '',
-                                readonly: true,
-                                allowOverlay: false,
-                            };
-                        }
-                        const dictionary = dictionaries[sourceIndex];
-                        const decoded = formatCell(
-                            cell,
-                            col,
-                            dictionary,
-                            toolbar.labelsOn,
-                            toolbar.formatOn,
-                            toolbar.digits,
-                        );
-                        const labelOverride = toolbar.labelsOn
-                            && col.arrowType.startsWith('Dictionary')
-                            && !col.dictionaryShipped
-                            && typeof cell === 'number'
-                            ? resolvedLabels[sourceIndex]?.[cell]
-                            : undefined;
-                        const text = labelOverride ?? decoded.text;
-                        const missingTheme = decoded.missing && settings.missingValueStyle !== 'none'
-                            ? settings.missingValueStyle === 'background' ? missingBg : missingFg
-                            : undefined;
-                        return {
-                            kind: GridCellKind.Text,
-                            data: text,
-                            displayData: text,
-                            readonly: true,
-                            allowOverlay: true,
-                            contentAlign: col.isInteger || col.arrowType.startsWith('Float') ? 'right' : 'left',
-                            copyData: text,
-                            ...(missingTheme ? { themeOverride: missingTheme } : {}),
-                        };
-                    }}
+                    getCellContent={getCellContent}
                 />
+                {emptyState && (
+                    <div className="grid-empty" role="status" style={{ top: `${hMetrics.height}px` }}>
+                        <span>{emptyState.text}</span>
+                        {emptyState.clearFilters && (
+                            <button type="button" className="grid-empty-clear" onClick={onClearAllFilters}>
+                                Clear filters
+                            </button>
+                        )}
+                    </div>
+                )}
                 {contextMenu && (
                     <ColumnContextMenu
                         leftPx={contextMenu.leftPx}
@@ -1972,6 +2234,10 @@ export function App({
                         copyLabel={contextMenu.kind === 'column' ? 'Copy Column' : 'Copy'}
                         onCopy={() => {
                             copySelection();
+                            setContextMenu(null);
+                        }}
+                        onCopyWithRowNames={() => {
+                            copySelection(gridSelection, true);
                             setContextMenu(null);
                         }}
                         onHideColumn={contextMenu.columnIndex === undefined
@@ -2077,6 +2343,23 @@ export function App({
                         />
                     );
                 })()}
+                {cellDetail && (
+                    <CellDetailPopover
+                        title={cellDetail.title}
+                        text={cellDetail.text}
+                        truncated={cellDetail.truncated}
+                        leftPx={cellDetail.leftPx}
+                        topPx={cellDetail.topPx}
+                        onCopy={text => {
+                            vscode.postMessage({ type: 'copyText', panelGeneration, text });
+                            setCellDetail(null);
+                        }}
+                        onClose={() => {
+                            setCellDetail(null);
+                            gridRef.current?.focus();
+                        }}
+                    />
+                )}
                 {headerTooltip && (
                     <div
                         ref={headerTooltipRef}
@@ -2090,6 +2373,7 @@ export function App({
                     </div>
                 )}
             </div>
+            <div className="status-line" aria-live="off">{statusText}</div>
             {copyStatus && <div className={`toast toast-${copyStatus}`}>{copyStatusMsg}</div>}
         </div>
     );

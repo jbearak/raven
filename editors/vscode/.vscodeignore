@@ -23,3 +23,4 @@ bun.lock
 # install, so Tier 1 already resolves their installed packages — the broad
 # CRAN/Bioconductor floor isn't needed and would only bloat the VSIX.
 bin/names.db
+patches/**

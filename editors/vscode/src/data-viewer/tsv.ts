@@ -7,6 +7,7 @@
 
 import type { Cell } from './wire-format';
 import type { ColumnSchema } from './arrow-reader';
+import { formatCell } from './display-format';
 
 /** Map of column index → (dictionary index → label string), for columns
  *  whose dictionaries weren't shipped up front (cardinality above the
@@ -58,40 +59,27 @@ function format_cell_for_tsv(
     formatOn: boolean,
     digits: number,
 ): string {
-    if (cell === null) return '';
-    if (typeof cell === 'object' && cell && '_' in cell) {
-        switch (cell._) {
-            case 'nan': return 'NaN';
-            case 'inf': return 'Inf';
-            case '-inf': return '-Inf';
-            case 'date':  return sanitize(cell.v);
-            case 'ts':    return sanitize(cell.v);
-            case 'trunc': return sanitize(cell.v);
-        }
-    }
-    // Dictionary cell with shipped dictionary.
-    if (typeof cell === 'number' && col?.dictionaryShipped && dict) {
-        return labelsOn && dict[cell] !== undefined
-            ? sanitize(dict[cell])
-            : String(cell + 1);
-    }
-    // Dictionary cell without a shipped dictionary (high cardinality).
-    if (typeof cell === 'number' && col?.arrowType.startsWith('Dictionary')) {
-        if (labelsOn && resolved && resolved[cell] !== undefined) {
-            return sanitize(resolved[cell]);
-        }
-        return String(cell + 1);
-    }
-    if (labelsOn && col?.valueLabels
-        && (typeof cell === 'number' || typeof cell === 'string')) {
-        const lbl = col.valueLabels[String(cell)];
-        if (lbl !== undefined) return sanitize(lbl);
-    }
-    if (typeof cell === 'number' && col && !col.isInteger && formatOn) {
-        // Match cell-render: don't add trailing zeros for integer-valued
-        // cells (common in SPSS/SAS files that store ints as Float64).
-        if (Number.isInteger(cell)) return String(cell);
-        return cell.toFixed(digits);
-    }
-    return sanitize(String(cell));
+    const resolvedLabel = typeof cell === 'number' ? resolved?.[cell] : undefined;
+    return sanitize(formatCell(cell, col, dict, { labelsOn, formatOn, digits, resolvedLabel }).copyText);
+}
+
+/**
+ * "Copy with row names" on a frame without a rowname column: prefix each
+ * data line with its 1-based R row number (from the host's permutation
+ * when one is active, else `rowStart + i + 1`), and the header line with
+ * an empty field.
+ */
+export function prependRowNumbers(
+    tsv: string,
+    rowStart: number,
+    originalRowIndices: readonly number[] | undefined,
+    includeHeader: boolean,
+): string {
+    const lines = tsv.split('\n');
+    return lines.map((line, i) => {
+        if (includeHeader && i === 0) return `\t${line}`;
+        const r = i - (includeHeader ? 1 : 0);
+        const original = originalRowIndices?.[r] ?? rowStart + r;
+        return `${original + 1}\t${line}`;
+    }).join('\n');
 }
