@@ -1,0 +1,70 @@
+# Raven
+
+> Raven is a static analyzer and language server for R. It finds undefined variables and broken `source()` chains across files without running code, and provides completion, navigation, and hover in any LSP editor. Its VS Code extension adds an R console, debugger, plot/data/help viewers, and R Markdown/Quarto preview. The `raven check` CLI runs the same analysis in CI.
+
+## Start here
+
+- [Getting started](https://github.com/jbearak/raven/blob/main/docs/getting-started.md): Install Raven and catch your first bug in two minutes.
+- [Coming from RStudio, vscode-R, Positron, or lintr](https://github.com/jbearak/raven/blob/main/docs/coming-from.md): What stays the same, what changes, and which settings to flip.
+- [Editor setup](https://github.com/jbearak/raven/blob/main/docs/editor-integrations.md): Set up Raven in VS Code, Neovim, Zed, Helix, Emacs, or any LSP client, and check that it works.
+- [Raven in CI](https://github.com/jbearak/raven/blob/main/docs/ci.md): Run `raven check` on every pull request with GitHub Actions or Bitbucket Pipelines.
+
+## Analysis
+
+- [Diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md): What Raven reports, how to silence or tune it, and a reference for every diagnostic code.
+- [Cross-file analysis](https://github.com/jbearak/raven/blob/main/docs/cross-file.md): How Raven follows `source()` chains and resolves paths across files.
+- [Non-standard evaluation](https://github.com/jbearak/raven/blob/main/docs/non-standard-evaluation.md): How Raven handles dplyr-style column names, and what to do when it can't.
+- [Package development](https://github.com/jbearak/raven/blob/main/docs/r-package-dev.md): How Raven analyzes R packages: visibility between R/ and tests/, NAMESPACE, and build commands.
+- [box and import modules](https://github.com/jbearak/raven/blob/main/docs/modules.md): How Raven models `box::use()` and `import::from()` imports.
+- [.Rprofile startup files](https://github.com/jbearak/raven/blob/main/docs/rprofile.md): How Raven accounts for definitions in a project `.Rprofile`.
+- [Linting](https://github.com/jbearak/raven/blob/main/docs/linting.md): Opt-in style rules, configured with `raven.toml`, `.lintr`, or VS Code settings.
+- [Indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md): How Raven indents R code as you type, and the styles you can choose.
+
+## Navigation and editing
+
+- [Completion](https://github.com/jbearak/raven/blob/main/docs/completion.md): Completions for symbols, packages, arguments, `$` fields, and file paths.
+- [Hover](https://github.com/jbearak/raven/blob/main/docs/hover.md): What hover shows for functions, variables, and package symbols.
+- [Go to definition](https://github.com/jbearak/raven/blob/main/docs/go-to-definition.md): Jump to where a symbol is defined, across files and into packages.
+- [Find references](https://github.com/jbearak/raven/blob/main/docs/find-references.md): Find every use of a symbol across your project.
+- [Document outline](https://github.com/jbearak/raven/blob/main/docs/document-outline.md): The outline and breadcrumbs: sections, functions, and classes.
+- [Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md): Semantic highlighting for R, plus JAGS and Stan grammars.
+- [Snippets](https://github.com/jbearak/raven/blob/main/docs/snippets.md): The R code snippets Raven provides.
+
+## R session (VS Code)
+
+- [R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md): Run R in VS Code and send code from the editor.
+- [Debugger](https://github.com/jbearak/raven/blob/main/docs/debugger.md): Breakpoints, stepping, and variables for R scripts and documents.
+- [Plot viewer](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md): View, browse, and save plots in a VS Code panel.
+- [Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md): Browse, sort, and filter data frames of any size with `View()`.
+- [Help viewer](https://github.com/jbearak/raven/blob/main/docs/help-viewer.md): Read R help for the function actually in scope.
+
+## R Markdown and Quarto
+
+- [Code chunks](https://github.com/jbearak/raven/blob/main/docs/chunks.md): Run, navigate, and get code intelligence in R chunks.
+- [R Markdown preview and export](https://github.com/jbearak/raven/blob/main/docs/knit.md): Preview `.Rmd` files and export them to HTML, PDF, or Word.
+- [Quarto](https://github.com/jbearak/raven/blob/main/docs/quarto.md): Preview and render `.qmd` documents with Quarto.
+
+## Reference
+
+- [Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md): `# raven:` comments that declare symbols, relationships, and suppressions.
+- [Configuration](https://github.com/jbearak/raven/blob/main/docs/configuration.md): How settings, `raven.toml`, and `.lintr` combine, and where Raven looks for them.
+- [Settings reference](https://github.com/jbearak/raven/blob/main/docs/settings-reference.md): Every setting, alphabetically, with its default and `raven.toml` key.
+- [Command line](https://github.com/jbearak/raven/blob/main/docs/cli.md): `raven check`, `raven lint`, `raven packages`, and the language server command.
+- [Keybindings](https://github.com/jbearak/raven/blob/main/docs/keybinding-comparison.md): Chunk and console shortcuts compared with RStudio, Quarto, and vscode-R.
+
+## Understanding Raven
+
+- [How Raven compares](https://github.com/jbearak/raven/blob/main/docs/comparison.md): Raven next to RStudio, Positron, vscode-R, languageserver, lintr, and Jarl.
+- [Using Raven with other R tools](https://github.com/jbearak/raven/blob/main/docs/coexistence.md): Run Raven alongside vscode-R or Positron, and choose which tool owns the console.
+- [Limitations](https://github.com/jbearak/raven/blob/main/docs/limitations.md): What Raven doesn't do yet.
+- [Package database](https://github.com/jbearak/raven/blob/main/docs/package-database.md): How Raven knows package exports without R, and how to keep that data current.
+- [Performance on large projects](https://github.com/jbearak/raven/blob/main/docs/cross-file-analysis-performance.md): Speed up analysis when many files source the same scripts.
+
+## Help
+
+- [Troubleshooting](https://github.com/jbearak/raven/blob/main/docs/troubleshooting.md): A step-by-step procedure for when Raven misbehaves, and what to include in a bug report.
+- [FAQ](https://github.com/jbearak/raven/blob/main/docs/faq.md): Short answers to common questions.
+
+## Optional
+
+- [README](https://github.com/jbearak/raven/blob/main/README.md): overview, installation, and license

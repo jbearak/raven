@@ -1,0 +1,3 @@
+analysis.R:4:9 warning: servey is not defined [undefined-variable]
+analysis.R:6:6 warning: fit is used before it is defined (defined on line 7) [undefined-variable]
+2 issues (0 errors, 2 warnings, 0 infos, 0 hints, 0 notes)
