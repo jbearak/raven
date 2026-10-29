@@ -98,13 +98,31 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     lookup_expr <- function(id) get0(as.character(id), envir = state$exprs, inherits = FALSE)
     lookup_path <- function(id) get0(as.character(id), envir = state$paths, inherits = FALSE)
     # The position of each child row of a list or vector, by its label.
-    # A label naming two positions (a real name that equals a generated
-    # `a [[1]]`) is ambiguous: Set Value refuses it rather than guess.
-    note_child <- function(pid, label, i) {
-        if (is.null(pid)) return(invisible(NULL))
-        key <- paste(pid, label, sep = US)
-        old <- get0(key, envir = state$childidx, inherits = FALSE)
-        assign(key, if (!is.null(old) && !identical(old, i)) NA_integer_ else i, envir = state$childidx)
+    # Row labels of a list's or vector's elements `idx`: the name when it is
+    # unique, else the name with the position (`a [[2]]`, `a [2]`), else the
+    # position (`[[3]]`, `[3]`, `[2,1]` in a matrix). Computed from the whole
+    # names vector, so a label means the same whichever rows were fetched.
+    child_labels <- function(x, idx) {
+        listy <- typeof(x) %in% c("list", "pairlist")
+        d <- sattr(x, "dim")
+        out <- if (listy) sprintf("[[%d]]", idx)
+               else if (length(d) == 2L) sprintf("[%d,%d]", (idx - 1) %% d[[1L]] + 1, (idx - 1) %/% d[[1L]] + 1)
+               else sprintf("[%d]", idx)
+        nms <- sattr(x, "names")
+        if (!is.null(nms)) {
+            nm <- nms[idx]
+            named <- !is.na(nm) & nzchar(nm)
+            dup <- nm %in% nms[duplicated(nms)]
+            out[named & !dup] <- nm[named & !dup]
+            out[named & dup] <- sprintf(if (listy) "%s [[%d]]" else "%s [%d]", nm[named & dup], idx[named & dup])
+        }
+        out
+    }
+    # The one element a row label names; a label that names two (a real name
+    # equal to a generated `a [[1]]`) gives NA, and Set Value refuses it.
+    find_child <- function(x, label) {
+        w <- which(child_labels(x, seq_len(xlen(x))) == label)
+        if (length(w) == 1L) w else if (length(w)) NA_integer_ else NULL
     }
     bt <- function(n) if (identical(make.names(n), n)) n else paste0("`", gsub("`", "\\`", n), "`")
     child_expr <- function(parent, name = NULL, index = NULL, atomic = FALSE) {
@@ -116,12 +134,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     lookup_ref <- function(id) get0(as.character(id), envir = state$refs, inherits = FALSE)
     state$exprs <- new.env(parent = emptyenv())
     state$paths <- new.env(parent = emptyenv())
-    state$childidx <- new.env(parent = emptyenv())
     env$reset_refs <- function() {
         state$refs <- new.env(parent = emptyenv())
         state$exprs <- new.env(parent = emptyenv())
         state$paths <- new.env(parent = emptyenv())
-        state$childidx <- new.env(parent = emptyenv())
         invisible(NULL)
     }
 
@@ -315,7 +331,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (start >= n) return(integer())
         seq.int(start + 1, min(n, start + count))
     }
-    children <- function(x, start, count, filter, pexpr = NULL, ppath = NULL, pid = NULL) {
+    children <- function(x, start, count, filter, pexpr = NULL, ppath = NULL) {
         t <- typeof(x)
         out <- character()
         if (t != "environment" && t != "S4" && foreign(x)) return(out)
@@ -337,15 +353,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (t %in% c("list", "pairlist")) {
             n <- xlen(x)
             nms <- sattr(x, "names")
-            for (i in page(n, start, count)) {
-                named <- !is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])
-                # `x$a` finds the first `a`: a repeated name needs its index,
-                # in the expression and in the row's name (which Set Value
-                # uses to find the element).
-                unique_name <- named && sum(nms == nms[[i]], na.rm = TRUE) == 1L
-                nm <- if (unique_name) nms[[i]] else if (named) sprintf("%s [[%d]]", nms[[i]], i) else sprintf("[[%d]]", i)
+            idx <- page(n, start, count)
+            labels <- child_labels(x, idx)
+            for (j in seq_along(idx)) {
+                i <- idx[[j]]
+                nm <- labels[[j]]
+                # `x$a` finds the first `a`: a repeated name needs its index.
+                unique_name <- !is.null(nms) && identical(nm, nms[[i]])
                 ex <- if (unique_name) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
-                note_child(pid, nm, i)
                 cpath <- if (!is.null(ppath)) list(env = ppath$env, steps = c(ppath$steps, list(as.integer(i))))
                 out <- c(out, var_json(nm, .subset2(x, i), "value", ex, cpath))
             }
@@ -356,20 +371,11 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             idx <- page(n, start, count)
             if (length(idx)) {
                 vals <- elems(x, idx)
-                nms <- sattr(x, "names")
-                d <- sattr(x, "dim")
+                labels <- child_labels(x, idx)
                 for (j in seq_along(idx)) {
                     i <- idx[[j]]
                     ex <- child_expr(pexpr, index = i, atomic = TRUE)
-                    label <- if (!is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])) {
-                        if (sum(nms == nms[[i]], na.rm = TRUE) == 1L) nms[[i]] else sprintf("%s [%d]", nms[[i]], i)
-                    } else if (length(d) == 2L) {
-                        # Column-major position as [row,col].
-                        sprintf("[%d,%d]", (i - 1L) %% d[[1L]] + 1L, (i - 1L) %/% d[[1L]] + 1L)
-                    } else {
-                        sprintf("[%d]", i)
-                    }
-                    note_child(pid, label, i)
+                    label <- labels[[j]]
                     out <- c(out, jobj(name = jstr(label), value = jstr(vals[[j]]),
                                        type = jstr(type_label(x)), variablesReference = "0",
                                        evaluateName = if (!is.null(ex)) jstr(ex) else NULL))
@@ -385,7 +391,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             return(jarr(character()))
         }
         jarr(children(x, as.numeric(start), as.numeric(count), filter, lookup_expr(as.integer(ref)),
-                      lookup_path(as.integer(ref)), as.character(ref)))
+                      lookup_path(as.integer(ref))))
     }, error = function(e) jarr(character())))
 
     # ---- stops ---------------------------------------------------------------
@@ -571,7 +577,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (!isTRUE(target$ok) || isTRUE(target$promise)) return(list(ok = FALSE))
                 x <- target$value
                 key <- e[[3L]]
-                if (is.symbol(key)) key <- as.character(key)
+                # `x$a` names `a`; in `x[[i]]` the symbol is a variable,
+                # which hover doesn't evaluate.
+                if (is.symbol(key)) {
+                    if (op != "$") return(list(ok = FALSE))
+                    key <- as.character(key)
+                }
                 if (!(is.character(key) || is.numeric(key)) || length(key) != 1L) return(list(ok = FALSE))
                 if (op == "@") {
                     if (!isS4(x) || !is.character(key)) return(list(ok = FALSE))
@@ -624,7 +635,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             # An element of a list or vector: assign through the path from
             # the environment that holds it, `x[["a"]][[2]] <- v`, as R would.
             p <- lookup_path(as.integer(ref))
-            i <- get0(paste(ref, name, sep = US), envir = state$childidx, inherits = FALSE)
+            i <- find_child(container, name)
             if (is.null(p) || !length(p$steps) || is.null(i)) {
                 return(jobj(error = jstr("this value can't be changed from here")))
             }

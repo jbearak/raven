@@ -1462,7 +1462,19 @@ fn set_value_edits_list_elements_and_vector_entries() {
         .map(|v| v["name"].as_str().unwrap())
         .collect();
     assert_eq!(dup_names, vec!["a [[1]]", "a [[2]]", "a [[1]]"]);
-    // A label that names two elements is refused, not guessed.
+    // A label that names two elements is refused, not guessed, even when
+    // only the first rows were fetched.
+    let first_two = d.req(
+        "variables",
+        json!({"variablesReference": dup["variablesReference"], "start": 0, "count": 2}),
+    );
+    assert_eq!(first_two["body"]["variables"].as_array().unwrap().len(), 2);
+    // Hover doesn't read `l[[k]]` as `l[["k"]]`.
+    let hv = d.req(
+        "evaluate",
+        json!({"expression": "l[[k]]", "frameId": frame, "context": "hover"}),
+    );
+    assert_eq!(hv["success"], false, "{hv}");
     let amb = d.req(
         "setVariable",
         json!({"variablesReference": dup["variablesReference"], "name": "a [[1]]", "value": "0"}),
