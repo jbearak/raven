@@ -75,7 +75,7 @@ Between `55d86e47` and `c1317332`, only `docs/diagnostics.md` changed (`git diff
 
 After acceptance, a reader found the R console page's opening confusing because it treated "the R terminal" and "the console" as two separate things. Commits `50fd5ab2` through `a8d78880`, `2018668d`, and `572f6612` restructured the top of `docs/r-console.md` around one console with a choice of program, and updated one link label in `docs/configuration.md`.
 
-The merge from `main` at `76d99864` changed `cli.md`, `debugger.md`, `limitations.md`, `r-console.md`, and `editor-integrations.md`. Of these, only `editor-integrations.md` was visited by an acceptance run (tasks 4, 5, and 6), and those tasks were re-run as final5. `git diff --stat 76d99864 572f6612` shows only `docs/r-console.md`. Every result in the table is therefore valid at `572f6612`.
+The merge from `main` at `76d99864` changed `cli.md`, `debugger.md`, `limitations.md`, `r-console.md`, and `editor-integrations.md`. Of these, only `editor-integrations.md` was visited by an acceptance run (tasks 4, 5, and 6), and those tasks were re-run as final5. `git diff --stat 76d99864 572f6612 -- README.md editors/vscode/README.md docs ':!docs/superpowers'` shows only `docs/r-console.md`. Every result in the table is therefore valid at `572f6612`.
 
 ## Spot checks
 
