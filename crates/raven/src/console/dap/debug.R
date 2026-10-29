@@ -470,7 +470,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                                        loc = if (is.null(loc)) "null" else jarr(c(jstr(loc[[1L]]), loc[-1L])),
                                        fsrc = if (!is.null(fsrc)) jstr(paste0(call_name(calls[[i]]), " <- ", fsrc)) else NULL))
             }
-            gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else NULL
+            gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else state$top_loc
             items <- c(items, jobj(id = "0", name = jstr("<top level>"),
                                    loc = if (is.null(gloc)) "null" else jarr(c(jstr(gloc[[1L]]), gloc[-1L]))))
             rpc("captured", jarr(items), paste(c(if (fbp) "fbp", if (top_nosrc) "nosrc",
@@ -1138,6 +1138,17 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         FALSE
     }
+    # Where a top-level line from a file signalled: the innermost call with
+    # a file srcref. R 4.3 reports no current srcref for a browser opened in
+    # globalenv(), so the `<top level>` frame takes its line from here.
+    top_file_loc <- function() {
+        for (i in rev(seq_len(sys.nframe()))) {
+            if (identical(environment(sys.function(i)), here)) next
+            sr <- attr(sys.call(i), "srcref")
+            if (file_srcref(sr)) return(srcref_loc(sr))
+        }
+        NULL
+    }
     on_condition <- function(cnd) {
         if (isTRUE(state$internal)) return(invisible(NULL))
         kind <- if (inherits(cnd, "interrupt")) "interrupt" else if (inherits(cnd, "error")) "error"
@@ -1154,7 +1165,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         call <- tryCatch(paste(deparse(conditionCall(cnd), nlines = 1L), collapse = ""), error = function(e) "")
         rpc("exception", if (pause) "pause" else kind, paste(class(cnd)[[1L]], msg, call, sep = US))
         state$cut <- if (k > 0) k else 0L
-        on.exit(state$cut <- NULL, add = TRUE)
+        state$top_loc <- if (k == 0 && !pause && kind != "interrupt") top_file_loc()
+        on.exit({ state$cut <- NULL; state$top_loc <- NULL }, add = TRUE)
         if (k > 0) base::eval(quote(base::browser()), sys.frame(k)) else base::eval(quote(base::browser()), globalenv())
         if (kind == "interrupt") tryInvokeRestart("resume")
         invisible(NULL)
