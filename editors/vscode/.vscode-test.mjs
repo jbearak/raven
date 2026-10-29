@@ -1,7 +1,8 @@
 import { defineConfig } from '@vscode/test-cli';
-import { mkdirSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // macOS Unix domain sockets cap path length at 103 chars. When this repo is
 // checked out in a deeply nested worktree (e.g. `.claude/worktrees/<branch>/`)
@@ -13,16 +14,47 @@ import { join } from 'node:path';
 const userDataDir = join(tmpdir(), `raven-vscode-test-ud-${process.pid}`);
 mkdirSync(userDataDir, { recursive: true });
 
-export default defineConfig({
-    files: 'out/test/**/*.test.js',
-    workspaceFolder: './src/test/fixtures',
-    mocha: {
-        timeout: 60000
-    },
-    launchArgs: [
-        '--disable-gpu',
-        '--no-sandbox',
-        '--disable-extensions',
-        `--user-data-dir=${userDataDir}`
-    ]
+// The getting-started suite opens a temp copy of the tutorial's files, outside
+// the repo, so no raven.toml or .lintr above it (such as the shared fixtures'
+// raven.toml) can change what the tutorial promises. See
+// src/test-getting-started/getting-started.test.ts.
+const here = dirname(fileURLToPath(import.meta.url));
+const gettingStartedWs = join(tmpdir(), `raven-getting-started-${process.pid}`);
+rmSync(gettingStartedWs, { recursive: true, force: true });
+cpSync(join(here, '..', '..', 'docs', 'examples', 'snippets', 'getting-started-before'), gettingStartedWs, {
+    recursive: true,
+    filter: (src) => !/(^|\/)(cmd|stdout\.txt|stderr\.txt|exit)$/.test(src),
 });
+const gettingStartedUserData = join(tmpdir(), `raven-vscode-test-gs-${process.pid}`);
+mkdirSync(gettingStartedUserData, { recursive: true });
+
+export default defineConfig([
+    {
+        label: 'main',
+        files: 'out/test/**/*.test.js',
+        workspaceFolder: './src/test/fixtures',
+        mocha: {
+            timeout: 60000
+        },
+        launchArgs: [
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-extensions',
+            `--user-data-dir=${userDataDir}`
+        ]
+    },
+    {
+        label: 'getting-started',
+        files: 'out/test-getting-started/**/*.test.js',
+        workspaceFolder: gettingStartedWs,
+        mocha: {
+            timeout: 60000
+        },
+        launchArgs: [
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-extensions',
+            `--user-data-dir=${gettingStartedUserData}`
+        ]
+    }
+]);

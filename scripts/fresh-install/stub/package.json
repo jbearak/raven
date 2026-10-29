@@ -1,0 +1,7 @@
+{
+  "name": "raven-fresh-install-stub",
+  "description": "Empty extension that only hosts the test runner, so the installed Raven VSIX is the only Raven loaded. See scripts/fresh-install-check.sh.",
+  "version": "0.0.0",
+  "publisher": "raven-tests",
+  "engines": { "vscode": "^1.80.0" }
+}
