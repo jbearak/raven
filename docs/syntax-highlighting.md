@@ -1,116 +1,147 @@
-# Syntax Highlighting
+# Syntax highlighting
 
-Raven contributes syntax highlighting in three ways: LSP semantic tokens for R function names (including inside R chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents), TextMate grammars for R, R Markdown, JAGS, Stan, and R package development files, and a GitHub-themed highlighter for the rendered HTML output of `Raven: Knit Preview`. The R and R Markdown grammars are vendored from [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT) so `.R`, `.Rmd`, and `.Rmarkdown` files highlight out of the box, including in remote workspaces; siblings that ship the same grammar are preferred when installed (see below). For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
+[Docs](README.md) › Navigation and editing
+
+Raven colors function names by what they are, and its VS Code extension adds grammars so R, R Markdown, JAGS, Stan, and R package files highlight without other extensions.
+
+| File | Highlighted by |
+|---|---|
+| `.R` | An R grammar, plus Raven's semantic highlighting of function names |
+| `.Rmd`, `.Rmarkdown` | An R Markdown grammar, plus semantic highlighting in R chunks |
+| `.qmd` | Raven's R Markdown grammar, plus semantic highlighting in R chunks. The [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) adds full Quarto highlighting. |
+| `.jags`, `.bugs`, `.bug`, `.stan` | Raven's JAGS and Stan grammars |
+| `DESCRIPTION`, `NAMESPACE`, `.Rd`, `.Rbuildignore`, `.Rproj`, `.lintr` | Raven's R package file grammars |
+| Code in the Knit Preview panel | A GitHub light or dark palette, using the editor's grammars |
 
 ## R
 
-Raven emits LSP semantic tokens for R function names. The token legend contains one entry — the standard LSP `function` token type — and Raven emits it for:
+Raven highlights two kinds of names as functions, using the standard LSP `function` semantic token:
 
-- Function-definition names (identifiers assigned a `function(...)` value, with `<-`, `=`, `<<-`, `->`, or `->>`).
-- Function-call heads, including namespace-qualified calls like `pkg::fn()`.
+- names assigned a `function(...)` value with `<-`, `=`, `<<-`, `->`, or `->>`
+- the function in a call, including qualified calls like `pkg::fn()`
 
-This is intentionally narrow. The goal is to catch call and definition sites reliably via the tree-sitter AST, then let the TextMate grammar handle everything else (comments, strings, numbers, operators, roxygen tags, constants, storage types, brackets). Semantic tokens augment the grammar; they don't replace it.
+That is deliberately all. Raven finds call and definition sites reliably from the parsed code and leaves everything else to the grammar: comments, strings, numbers, operators, roxygen tags, constants, storage types, and brackets. Semantic highlighting adds to the grammar; it doesn't replace it. Any LSP editor that supports semantic tokens shows these colors.
 
-Semantic tokens fire inside `R` chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents too. Raven walks the document chunk-by-chunk (via the same chunk detector used for the document outline), parses each R chunk body in isolation with tree-sitter, and rebases the tokens onto the full document so VS Code paints them in the editor. Non-R chunks (Python, SQL, Bash, etc.) are intentionally skipped — Raven is an R language server.
+Semantic highlighting also works inside R chunks of `.Rmd`, `.Rmarkdown`, and `.qmd` documents. Raven reads each R chunk separately and places the colors at the right lines in the document. Python, SQL, Bash, and other non-R chunks get no semantic highlighting from Raven.
 
-Raven isn't the only R language server that emits semantic tokens — the one bundled with the full `REditorSupport.r` extension (distinct from the grammar-only `REditorSupport.r-syntax` discussed below) also does, with broader coverage. See [Coexistence](./coexistence.md) if you're running both.
+The language server bundled with the full `REditorSupport.r` extension also sends semantic tokens, and covers more kinds of names. See [Coexistence](coexistence.md) if you run both.
 
-Raven ships its own copy of the REditorSupport R grammar so the editor and the knit pipeline have a working grammar in every deployment shape (local, Remote SSH, Dev Container, WSL, Codespaces). If `REditorSupport.r-syntax`, `REditorSupport.r`, or VS Code's built-in `vscode.r` is installed, those win — Raven's vendored grammar is the self-resolving fallback.
+In VS Code, Raven ships its own copy of the REditorSupport R grammar, so highlighting works locally and over Remote SSH, Dev Containers, WSL, and Codespaces. If `REditorSupport.r-syntax`, `REditorSupport.r`, or VS Code's built-in `vscode.r` is installed, its grammar is used instead; Raven's copy is the fallback.
 
-## Rendered HTML (Raven: Knit Preview)
+<a id="rendered-html-raven-knit-preview"></a>
 
-`Raven: Knit Preview` writes a self-contained `.html` to a per-session temp directory and displays it in the Knit Preview panel. Code blocks in that HTML are re-highlighted with a GitHub light/dark palette using whichever VS Code grammar contributes the chunk's language:
+## Rendered HTML in Knit Preview
 
-- For R chunks, Raven walks the installed extensions in priority order — `REditorSupport.r-syntax`, then `REditorSupport.r`, then VS Code's built-in `vscode.r`, then Raven's own vendored grammar — and uses the first grammar it finds. Function names get an additional `function` color via Raven's LSP semantic-token overlay, layered on top of the grammar's TextMate scopes.
-- For non-R chunks (Python, SQL, Bash, Julia, …), Raven uses whichever grammar VS Code's installed extensions contribute for that language. Unknown languages render as plain monospace.
-- Untagged fences (``` ``` ``` without a language tag) are left as-is — same convention as the editor.
+**Raven: Knit Preview** writes a self-contained `.html` file to a temporary folder and shows it in the Knit Preview panel. Code blocks in that HTML are highlighted with a GitHub light or dark palette, using whichever VS Code grammar handles the chunk's language:
 
-The palette is picked at render time: the in-VS-Code panel uses the variant matching VS Code's body class (`vscode-light` or `vscode-dark`), and the standalone file (used by **Open in Browser**) ships both variants behind a `@media (prefers-color-scheme: dark)` query so the browser picks based on the system theme.
+- For R chunks, Raven uses the first grammar it finds among `REditorSupport.r-syntax`, `REditorSupport.r`, VS Code's built-in `vscode.r`, and its own copy, in that order. Function names also get Raven's semantic `function` color on top of the grammar.
+- For other chunks (Python, SQL, Bash, Julia, …), Raven uses whichever installed extension provides a grammar for the language. Languages with no grammar render as plain monospace.
+- Fences without a language tag are left as they are, as in the editor.
 
-Math (`$x$`, `$$x = y$$`, LaTeX environments) is rendered through VS Code's built-in `vscode.markdown-math` extension, which bundles KaTeX. Raven inlines that CSS into the standalone HTML so math also renders when the file is opened directly in a browser.
+The panel uses the palette that matches your VS Code theme. The standalone file that **Open in Browser** opens contains both palettes and follows the system's light or dark setting.
 
-### Why Raven vendors the R and R Markdown grammars
+Math (`$x$`, `$$x = y$$`, LaTeX environments) is rendered through VS Code's built-in `vscode.markdown-math` extension, which bundles KaTeX. Raven copies its CSS into the standalone HTML, so math also renders when you open the file in a browser.
 
-VS Code's built-in `vscode.r` extension and [`REditorSupport.r-syntax`](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r-syntax) are both pure-declarative extensions — no `main` field, no runtime code — so VS Code defaults their `extensionKind` to `"ui"` and installs them on the **UI extension host** only. The built-in is a periodic sync of REditorSupport upstream (`vscode-grammar-updater` against [`REditorSupport/vscode-R-syntax`](https://github.com/REditorSupport/vscode-R-syntax)); all three copies share the same source.
+## R package development files
 
-Raven runs on the **workspace extension host** because it ships an LSP binary. In a local workspace the two hosts coincide, but in Remote SSH, Dev Container, WSL, and Codespaces setups the workspace host runs on a different machine from the UI. The workspace host cannot see UI-only extensions, and even if it could, those extensions' grammar files live on the user's local UI machine's filesystem — unreachable from the remote host. The knit-preview tokenizer is on the workspace side and needs grammar bytes reachable there.
+VS Code has no grammars for the files inside every R package, so Raven adds grammars and language settings for four file types. Each gets highlighting, bracket matching, and comment toggling: `#` for DCF, NAMESPACE, and `.Rbuildignore`, and `%` for Rd.
 
-Raven therefore vendors the R and R Markdown grammars from REditorSupport (MIT) directly into `editors/vscode/syntaxes/r.tmLanguage.json` and `editors/vscode/syntaxes/rmd.tmLanguage.json`. The provenance and sync procedure live in `editors/vscode/syntaxes/SOURCE.md`. With this contribution in place:
+<a id="dcf-description-rproj-lintr"></a>
 
-- `.Rmd` / `.Rmarkdown` files highlight out of the box, with Markdown prose styling, R code chunks, embedded highlighting for a dozen other languages in their fenced blocks, and inline `` `r ` `` expressions.
-- The knit pipeline's R-chunk tokenizer always finds a grammar, even in fresh remote sessions where the user hasn't (and can't) install a UI-only sibling.
-- Sibling grammars still win when present. The priority lists differ by file type:
-  - **`.R` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → `vscode.r` → Raven's vendored copy.
-  - **`.Rmd` / `.Rmarkdown` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → Raven's vendored copy. `vscode.r` is intentionally absent — the VS Code built-in only contributes `source.r`, never the R Markdown grammar.
-  A user with the upstream extension keeps the freshest grammar; everyone else gets the synced snapshot Raven shipped.
+### DCF files: `DESCRIPTION`, `.Rproj`, `.lintr`
 
-Raven still does **not** ship a `quarto` grammar — install [`quarto.quarto`](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) for `.qmd` highlighting and preview.
+These use the `r-dcf` language. DCF (Debian Control File) is the format of R package metadata and project files. The grammar highlights:
 
-## R Package Development Files
-
-VS Code doesn't ship grammars for the infrastructure files that ship inside every R package, so Raven adds TextMate grammars and language configurations for four file types. Each file gets syntax highlighting, bracket matching, and comment toggling (`#` for DCF/NAMESPACE/.Rbuildignore, `%` for Rd).
-
-### DCF (`DESCRIPTION`, `.Rproj`, `.lintr`)
-
-Registered via the `r-dcf` language ID for `DESCRIPTION`, `.Rproj`, and `.lintr`. DCF (Debian Control File) is the format used for R package metadata and project configuration. The grammar recognizes:
-
-- **Field names** — Identifiers before `:` (e.g., `Package`, `Version`, `Depends`), styled as keywords.
-- **Field values** — The text after `:` on the same line, styled as strings.
-- **Continuation lines** — Lines starting with whitespace that continue a multi-line field value.
-- **Comments** — `#` to end of line.
+- field names before `:` (`Package`, `Version`, `Depends`), as keywords
+- field values after `:` on the same line, as strings
+- continuation lines, which start with whitespace and continue a field value
+- comments, from `#` to the end of the line
 
 ### NAMESPACE
 
-Registered via the `r-namespace` language ID for the `NAMESPACE` file. The grammar recognizes:
+The `NAMESPACE` file uses the `r-namespace` language. The grammar highlights:
 
-- **Directives** — `export`, `exportClasses`, `exportMethods`, `exportPattern`, `import`, `importClassesFrom`, `importFrom`, `importMethodsFrom`, `S3method`, `S4method`, `useDynLib`, styled as keywords.
-- **Symbol names** — Package and function identifiers inside directive arguments.
-- **Strings** — Double-quoted names.
-- **Comments** — `#` to end of line.
+- directives, as keywords: `export`, `exportClasses`, `exportMethods`, `exportPattern`, `import`, `importClassesFrom`, `importFrom`, `importMethodsFrom`, `S3method`, `S4method`, `useDynLib`
+- package and function names inside directive arguments
+- double-quoted strings
+- comments, from `#` to the end of the line
 
-### Rd (`.Rd`, `.rd`)
+<a id="rd-rd-rd"></a>
 
-Registered via the `rd` language ID. Rd is R's documentation format. The grammar recognizes:
+### Rd files: `.Rd`, `.rd`
 
-- **Section tags** — `\title`, `\usage`, `\arguments`, `\description`, `\details`, `\value`, `\examples`, and the rest of the standard Rd section set, styled as keywords.
-- **Inline tags** — `\code`, `\emph`, `\strong`, `\link`, `\pkg`, `\url`, `\var`, and the full inline tag set, styled as entity names.
-- **Escape sequences** — `\{`, `\}`, `\\`, `\%`.
-- **Comments** — `%` to end of line (but not `\%`, which is an escaped literal percent).
+These use the `rd` language. Rd is R's documentation format. The grammar highlights:
 
-### `.Rbuildignore`
+- section tags such as `\title`, `\usage`, `\arguments`, `\description`, `\details`, `\value`, and `\examples`, as keywords
+- inline tags such as `\code`, `\emph`, `\strong`, `\link`, `\pkg`, `\url`, and `\var`, as entity names
+- escapes: `\{`, `\}`, `\\`, `\%`
+- comments, from `%` to the end of the line (an escaped `\%` is a literal percent sign)
 
-Registered via the `r-buildignore` language ID. `.Rbuildignore` contains one extended regular expression per line listing paths to exclude from the package tarball. The grammar recognizes:
+<a id="rbuildignore"></a>
 
-- **Patterns** — Non-comment lines, styled as `string.regexp`.
-- **Comments** — `#` to end of line.
+### `.Rbuildignore` files
+
+These use the `r-buildignore` language. Each line of `.Rbuildignore` is an extended regular expression for paths to leave out of the package tarball. The grammar highlights:
+
+- patterns (every line that isn't a comment), as `string.regexp`
+- comments, from `#` to the end of the line
 
 ## JAGS and Stan
 
-VS Code doesn't bundle grammars for JAGS or Stan, so Raven ships its own TextMate grammars for both languages. There are no LSP semantic tokens for these files — highlighting comes entirely from the grammar.
+VS Code has no grammars for JAGS or Stan, so Raven ships its own. These files get no semantic highlighting; all their colors come from the grammar.
 
 ### JAGS
 
-Registered for `.jags`, `.Jags`, `.JAGS`, `.bugs`, `.Bugs`, `.BUGS`, and all eight case variants of `.bug`. These suffixes select the JAGS grammar; they do not imply general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. The grammar recognizes:
+The JAGS grammar applies to `.jags`, `.bugs`, and `.bug` in any letter case. These extensions mean JAGS, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. The grammar highlights:
 
-- **Comments** — `#` to end of line.
-- **Strings** — double-quoted, with `\\`-style escapes.
-- **Block keywords** — `model`, `data`.
-- **Control flow** — `for`, `in`, `if`, `else`.
-- **Distributions** — `dnorm`, `dbern`, `dgamma`, `dunif`, `dpois`, `dbin`, `dbeta`, `dexp`, `dt`, `dweib`, `dlnorm`, `dchisqr`, `dlogis`, `dmulti`, `ddirch`, `dwish`, `dmnorm`, `dmt`, `dinterval`, `dcat`.
-- **Math functions** — `abs`, `sqrt`, `log`, `exp`, `pow`, `sin`, `cos`, `sum`, `prod`, `min`, `max`, `mean`, `sd`, `inverse`, `logit`, `probit`, `cloglog`, `ilogit`, `phi`, `step`, `equals`, `round`, `trunc`, `inprod`, `interp.lin`, `logfact`, `loggam`, `rank`, `sort`, `ifelse`, `T`.
-- **Numeric literals** — integer, decimal, and scientific notation.
-- **Operators** — `<-`, `~`, `&&`, `||`, comparisons (`==`, `!=`, `<=`, `>=`), and arithmetic (`+`, `-`, `*`, `/`, `^`).
+- comments, from `#` to the end of the line
+- double-quoted strings with backslash escapes
+- block keywords: `model`, `data`
+- control flow: `for`, `in`, `if`, `else`
+- distributions: `dnorm`, `dbern`, `dgamma`, `dunif`, `dpois`, `dbin`, `dbeta`, `dexp`, `dt`, `dweib`, `dlnorm`, `dchisqr`, `dlogis`, `dmulti`, `ddirch`, `dwish`, `dmnorm`, `dmt`, `dinterval`, `dcat`
+- math functions: `abs`, `sqrt`, `log`, `exp`, `pow`, `sin`, `cos`, `sum`, `prod`, `min`, `max`, `mean`, `sd`, `inverse`, `logit`, `probit`, `cloglog`, `ilogit`, `phi`, `step`, `equals`, `round`, `trunc`, `inprod`, `interp.lin`, `logfact`, `loggam`, `rank`, `sort`, `ifelse`, `T`
+- integer, decimal, and scientific-notation numbers
+- operators: `<-`, `~`, `&&`, `||`, comparisons (`==`, `!=`, `<=`, `>=`), and arithmetic (`+`, `-`, `*`, `/`, `^`)
 
 ### Stan
 
-Registered for `.stan`, `.Stan`, `.STAN`. The grammar recognizes:
+The Stan grammar applies to `.stan`, `.Stan`, and `.STAN`. It highlights:
 
-- **Comments** — `//` line comments and `/* ... */` block comments.
-- **Strings** — double-quoted, with `\\`-style escapes.
-- **Block keywords** — `functions`, `data`, `transformed data`, `parameters`, `transformed parameters`, `model`, `generated quantities`.
-- **Type keywords** — `int`, `real`, `vector`, `row_vector`, `matrix`, `simplex`, `unit_vector`, `ordered`, `positive_ordered`, `corr_matrix`, `cov_matrix`, `cholesky_factor_corr`, `cholesky_factor_cov`, `void`, `array`, `complex`, `complex_vector`, `complex_row_vector`, `complex_matrix`, `tuple`.
-- **Constraint keywords** — `lower`, `upper`, `offset`, `multiplier`.
-- **Control flow** — `for`, `in`, `while`, `if`, `else`, `return`, `break`, `continue`, `print`, `reject`, `profile`.
-- **Distribution-suffix functions** — any identifier ending in `_lpdf`, `_lupdf`, `_lpmf`, `_lupmf`, `_cdf`, `_lcdf`, `_lccdf`, or `_rng`, so user-defined and library-defined density/sampling functions both highlight consistently.
-- **Numeric literals** — integer, decimal, and scientific notation.
-- **Operators** — `<-`, `~`, `&&`, `||`, comparisons, arithmetic, and the Stan-specific `'` (transpose), `%` (mod), `!`, `?`, `:`.
+- `//` line comments and `/* ... */` block comments
+- double-quoted strings with backslash escapes
+- block keywords: `functions`, `data`, `transformed data`, `parameters`, `transformed parameters`, `model`, `generated quantities`
+- types: `int`, `real`, `vector`, `row_vector`, `matrix`, `simplex`, `unit_vector`, `ordered`, `positive_ordered`, `corr_matrix`, `cov_matrix`, `cholesky_factor_corr`, `cholesky_factor_cov`, `void`, `array`, `complex`, `complex_vector`, `complex_row_vector`, `complex_matrix`, `tuple`
+- constraints: `lower`, `upper`, `offset`, `multiplier`
+- control flow: `for`, `in`, `while`, `if`, `else`, `return`, `break`, `continue`, `print`, `reject`, `profile`
+- any name ending in `_lpdf`, `_lupdf`, `_lpmf`, `_lupmf`, `_cdf`, `_lcdf`, `_lccdf`, or `_rng`, so your own density and sampling functions highlight like built-in ones
+- integer, decimal, and scientific-notation numbers
+- operators: `<-`, `~`, `&&`, `||`, comparisons, arithmetic, and Stan's `'` (transpose), `%` (modulus), `!`, `?`, `:`
+
+## Limitations
+
+- Raven doesn't ship a Quarto-specific grammar. `.qmd` files fall back to Raven's R Markdown grammar; install the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) for full Quarto highlighting and preview.
+- Semantic highlighting covers function names only. Everything else comes from the grammar.
+- The grammars are part of the VS Code extension. Other editors use their own R grammars and get only the semantic highlighting.
+
+## Details
+
+### Why Raven vendors the R and R Markdown grammars
+
+VS Code's built-in `vscode.r` extension and [`REditorSupport.r-syntax`](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r-syntax) contain no code, so VS Code installs them only where its user interface runs. The built-in grammar is a periodic copy of [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax), so all three copies come from the same source.
+
+Raven contains a language server, so VS Code runs it next to your workspace. Locally that is the same machine. In Remote SSH, Dev Container, WSL, and Codespaces setups, the workspace is on a different machine, which can't see interface-only extensions or their grammar files. Knit Preview highlights code on the workspace side, so it needs a grammar there.
+
+Raven therefore includes the REditorSupport R and R Markdown grammars (MIT licensed). As a result:
+
+- `.Rmd` and `.Rmarkdown` files highlight with no other extension: Markdown prose, R chunks, a dozen other languages in their fenced blocks, and inline `` `r ` `` expressions.
+- Knit Preview always finds an R grammar, even in a new remote session where you haven't installed, or can't install, an interface-only grammar extension.
+- Other grammar extensions still win when installed. For `.R` files the order is `REditorSupport.r-syntax`, `REditorSupport.r`, `vscode.r`, then Raven's copy. For `.Rmd` and `.Rmarkdown` files it is `REditorSupport.r-syntax`, `REditorSupport.r`, then Raven's copy; `vscode.r` has no R Markdown grammar.
+
+If you install the upstream extension, you get its latest grammar. Everyone else gets the copy Raven shipped.
+
+## See also
+
+- [Document outline](document-outline.md)
+- [R Markdown preview and export](knit.md)
+- [Quarto](quarto.md)
+- [Coexistence](coexistence.md)
