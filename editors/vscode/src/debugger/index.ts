@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
     console_socket_of,
+    gate_sends,
     live_console_sockets,
     on_console_registered,
 } from '../send-to-r/console-ipc';
@@ -40,6 +41,8 @@ export const DEBUG_TYPE = 'raven-r';
 const FILTERS_KEY = 'raven.debugger.exceptionFilters';
 const R_FILE = /\.(r|rmd|rmarkdown|qmd)$/i;
 const SOCKET_WAIT_MS = 10_000;
+/** Longest a new console's first send waits for its breakpoints. */
+const MIRROR_GATE_MS = 15_000;
 
 /** The console's DAP socket lives next to its IPC socket. */
 export function dap_socket_for(ipc_socket: string): string {
@@ -147,8 +150,15 @@ class ConsoleLink {
     private control: net.Socket | null = null;
     private mirrored = new Set<string>();
     private closed = false;
+    private mirrored_once: () => void = () => undefined;
 
     constructor(readonly terminal: vscode.Terminal, readonly ipc: string) {
+        // Code sent to a console before it knows the breakpoints would run
+        // uninstrumented; hold sends until the first mirror lands.
+        gate_sends(ipc, new Promise<void>((resolve) => {
+            this.mirrored_once = resolve;
+            setTimeout(resolve, MIRROR_GATE_MS);
+        }));
         void this.connect();
     }
 
@@ -195,14 +205,17 @@ class ConsoleLink {
             sock.end();
             if (reply.includes('"not-ready"')) {
                 if (attempt < 40) setTimeout(() => this.mirror(attempt + 1), 250);
+                else this.mirrored_once();
             } else {
                 this.mirrored = files;
+                this.mirrored_once();
             }
         });
-        sock.on('error', () => undefined);
+        sock.on('error', () => this.mirrored_once());
     }
 
     dispose(): void {
+        this.mirrored_once();
         this.closed = true;
         this.control?.destroy();
         this.states = [];

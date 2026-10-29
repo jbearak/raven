@@ -66,6 +66,24 @@ let next_request_id = 1;
 /** Per socket: settles when the latest send has been acknowledged (or lost). */
 const send_tails = new Map<string, Promise<void>>();
 
+/**
+ * Per socket: settles once the console may run code. The debugger gates a
+ * new console's sends on its first breakpoint mirror, so the first code sent
+ * to a console it opened is already instrumented.
+ */
+const send_gates = new Map<string, Promise<void>>();
+
+export function gate_sends(socket_path: string, ready: Promise<void>): void {
+    send_gates.set(socket_path, ready);
+}
+
+function after_gate(socket_path: string, step: () => Promise<void>): () => Promise<void> {
+    return async () => {
+        await send_gates.get(socket_path);
+        return step();
+    };
+}
+
 /** Run `step` after every earlier send to `socket_path` has settled. */
 function in_order(socket_path: string, step: () => Promise<void>): void {
     const prev = send_tails.get(socket_path) ?? Promise.resolve();
@@ -112,6 +130,7 @@ export function forget_console_terminal(terminal: vscode.Terminal): void {
     live_consoles.delete(terminal);
     const entry = terminal_sockets.get(terminal);
     if (!entry) return;
+    send_gates.delete(entry.socket);
     terminal_sockets.delete(terminal);
     fs.rm(path.dirname(entry.socket), { recursive: true, force: true }, () => undefined);
 }
@@ -166,7 +185,7 @@ export function send_when_listening(
     in_order(socket_path, () => new Promise<void>((done) => {
         const poll = () => {
             if (fs.existsSync(socket_path)) {
-                deliver(socket_path, code, fallback, location).then(done, done);
+                after_gate(socket_path, () => deliver(socket_path, code, fallback, location))().then(done, done);
                 return;
             }
             const entry = terminal_sockets.get(terminal);
@@ -192,7 +211,7 @@ export function send_via_console(
     fallback: () => void,
     location?: SendLocation,
 ): void {
-    in_order(socket_path, () => deliver(socket_path, code, fallback, location));
+    in_order(socket_path, after_gate(socket_path, () => deliver(socket_path, code, fallback, location)));
 }
 
 /** One request; settles once it is acknowledged, or known not delivered. */
