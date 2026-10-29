@@ -1,0 +1,96 @@
+{
+  "$comment": "Single source for the docs hub (docs/README.md), llms.txt, the site navigation, and the docs lints. Regenerate derived files with `bun scripts/generate-docs-hub.ts`.",
+  "site_url": "",
+  "readmes": ["README.md", "editors/vscode/README.md"],
+  "internal": [
+    "docs/development.md",
+    "docs/shared-config-schema.md",
+    "docs/diagnostic-corpora.md",
+    "docs/package-corpus-checkpoint.md",
+    "docs/release-notes-*.md",
+    "docs/superpowers/**",
+    "docs/examples/**",
+    "docs/site/**"
+  ],
+  "groups": [
+    {
+      "title": "Start here",
+      "pages": [
+        { "file": "getting-started.md", "title": "Getting started", "kind": "guide", "description": "Install Raven and catch your first bug in two minutes." },
+        { "file": "coming-from.md", "title": "Coming from RStudio, vscode-R, Positron, or lintr", "kind": "guide", "description": "What stays the same, what changes, and which settings to flip." },
+        { "file": "editor-integrations.md", "title": "Editor setup", "kind": "guide", "description": "Set up Raven in VS Code, Neovim, Zed, Helix, Emacs, or any LSP client, and check that it works." },
+        { "file": "ci.md", "title": "Raven in CI", "kind": "guide", "description": "Run `raven check` on every pull request with GitHub Actions or Bitbucket Pipelines." }
+      ]
+    },
+    {
+      "title": "Analysis",
+      "pages": [
+        { "file": "diagnostics.md", "title": "Diagnostics", "kind": "guide", "description": "What Raven reports, how to silence or tune it, and a reference for every diagnostic code." },
+        { "file": "cross-file.md", "title": "Cross-file analysis", "kind": "guide", "description": "How Raven follows `source()` chains and resolves paths across files." },
+        { "file": "non-standard-evaluation.md", "title": "Non-standard evaluation", "kind": "guide", "description": "How Raven handles dplyr-style column names, and what to do when it can't." },
+        { "file": "r-package-dev.md", "title": "Package development", "kind": "guide", "description": "How Raven analyzes R packages: visibility between R/ and tests/, NAMESPACE, and build commands." },
+        { "file": "modules.md", "title": "box and import modules", "kind": "guide", "description": "How Raven models `box::use()` and `import::from()` imports." },
+        { "file": "rprofile.md", "title": ".Rprofile startup files", "kind": "guide", "description": "How Raven accounts for definitions in a project `.Rprofile`." },
+        { "file": "linting.md", "title": "Linting", "kind": "guide", "description": "Opt-in style rules, configured with `raven.toml`, `.lintr`, or VS Code settings." },
+        { "file": "indentation.md", "title": "Indentation", "kind": "guide", "description": "How Raven indents R code as you type, and the styles you can choose." }
+      ]
+    },
+    {
+      "title": "Navigation and editing",
+      "pages": [
+        { "file": "completion.md", "title": "Completion", "kind": "guide", "description": "Completions for symbols, packages, arguments, `$` fields, and file paths." },
+        { "file": "hover.md", "title": "Hover", "kind": "guide", "description": "What hover shows for functions, variables, and package symbols." },
+        { "file": "go-to-definition.md", "title": "Go to definition", "kind": "guide", "description": "Jump to where a symbol is defined, across files and into packages." },
+        { "file": "find-references.md", "title": "Find references", "kind": "guide", "description": "Find every use of a symbol across your project." },
+        { "file": "document-outline.md", "title": "Document outline", "kind": "guide", "description": "The outline and breadcrumbs: sections, functions, and classes." },
+        { "file": "syntax-highlighting.md", "title": "Syntax highlighting", "kind": "guide", "description": "Semantic highlighting for R, plus JAGS and Stan grammars." },
+        { "file": "snippets.md", "title": "Snippets", "kind": "guide", "description": "The R code snippets Raven provides." }
+      ]
+    },
+    {
+      "title": "R session (VS Code)",
+      "pages": [
+        { "file": "r-console.md", "title": "R console", "kind": "guide", "description": "Run R in VS Code and send code from the editor." },
+        { "file": "debugger.md", "title": "Debugger", "kind": "guide", "description": "Breakpoints, stepping, and variables for R scripts and documents." },
+        { "file": "plot-viewer.md", "title": "Plot viewer", "kind": "guide", "description": "View, browse, and save plots in a VS Code panel." },
+        { "file": "data-viewer.md", "title": "Data viewer", "kind": "guide", "description": "Browse, sort, and filter data frames of any size with `View()`." },
+        { "file": "help-viewer.md", "title": "Help viewer", "kind": "guide", "description": "Read R help for the function actually in scope." }
+      ]
+    },
+    {
+      "title": "R Markdown and Quarto",
+      "pages": [
+        { "file": "chunks.md", "title": "Code chunks", "kind": "guide", "description": "Run, navigate, and get code intelligence in R chunks." },
+        { "file": "knit.md", "title": "R Markdown preview and export", "kind": "guide", "description": "Preview `.Rmd` files and export them to HTML, PDF, or Word." },
+        { "file": "quarto.md", "title": "Quarto", "kind": "guide", "description": "Preview and render `.qmd` documents with Quarto." }
+      ]
+    },
+    {
+      "title": "Reference",
+      "pages": [
+        { "file": "directives.md", "title": "Directives", "kind": "reference", "description": "`# raven:` comments that declare symbols, relationships, and suppressions." },
+        { "file": "configuration.md", "title": "Configuration", "kind": "reference", "description": "How settings, `raven.toml`, and `.lintr` combine, and where Raven looks for them." },
+        { "file": "settings-reference.md", "title": "Settings reference", "kind": "reference", "description": "Every setting, alphabetically, with its default and `raven.toml` key." },
+        { "file": "cli.md", "title": "Command line", "kind": "reference", "description": "`raven check`, `raven lint`, `raven packages`, and the language server command." },
+        { "file": "keybinding-comparison.md", "title": "Keybindings", "kind": "reference", "description": "Chunk and console shortcuts compared with RStudio, Quarto, and vscode-R." }
+      ]
+    },
+    {
+      "title": "Understanding Raven",
+      "pages": [
+        { "file": "comparison.md", "title": "How Raven compares", "kind": "guide", "description": "Raven next to RStudio, Positron, vscode-R, languageserver, lintr, and Jarl." },
+        { "file": "coexistence.md", "title": "Using Raven with other R tools", "kind": "guide", "description": "Run Raven alongside vscode-R or Positron, and choose which tool owns the console." },
+        { "file": "limitations.md", "title": "Limitations", "kind": "guide", "description": "What Raven doesn't do yet." },
+        { "file": "package-database.md", "title": "Package database", "kind": "guide", "description": "How Raven knows package exports without R, and how to keep that data current." },
+        { "file": "cross-file-analysis-performance.md", "title": "Performance on large projects", "kind": "guide", "description": "Speed up analysis when many files source the same scripts." }
+      ]
+    },
+    {
+      "title": "Help",
+      "pages": [
+        { "file": "troubleshooting.md", "title": "Troubleshooting", "kind": "guide", "description": "A step-by-step procedure for when Raven misbehaves, and what to include in a bug report." },
+        { "file": "faq.md", "title": "FAQ", "kind": "guide", "description": "Short answers to common questions." }
+      ]
+    }
+  ]
+}
