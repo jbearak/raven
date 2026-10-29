@@ -708,6 +708,7 @@ unsafe extern "C" fn yes_no_cancel(question: *const c_char) -> c_int {
 /// reported as failed.
 unsafe extern "C" fn reset_console() {
     let _ = std::panic::catch_unwind(|| {
+        dap::note_reset();
         let parked = with_state(|s| {
             s.pending.clear();
             s.segments.clear();

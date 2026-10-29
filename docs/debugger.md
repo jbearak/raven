@@ -102,6 +102,20 @@ Errors and warnings stop only when code from a file is running: code you ran fro
 
 Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue.
 
+### Tracebacks
+
+When an error from code in a file reaches the `>` prompt, whether or not the debugger stopped on it, the console prints a short traceback under R's error message. It lists each function with the line where it called the next one, innermost first, and the top-level line, if it came from a file:
+
+```
+Error in log(x) : non-numeric argument to mathematical function
+Traceback:
+  inner(y) at /home/me/project/R/clean.R:2
+  outer("a") at /home/me/project/R/clean.R:5
+  <top level> at /home/me/project/analysis.R:1
+```
+
+Ctrl+click (Cmd+click on macOS) a location to open it. Frames without a file location, such as base R and installed packages, are left out, and so is the whole traceback when none of the code came from a file: a typo at the prompt still prints only R's error message. Errors you catch, and errors you end with Stop while the debugger is stopped on them, print no traceback.
+
 Pause (the toolbar button) interrupts running R code and stops where it is. It can't stop compiled code that never checks for interrupts until that code returns.
 
 ## Hover and the Variables view never run your code
