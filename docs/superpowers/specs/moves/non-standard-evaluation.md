@@ -1,9 +1,0 @@
-# Moves into non-standard-evaluation.md
-
-## From docs/diagnostics.md (old `#undefined-variables` › **Limitations:**)
-
-diagnostics.md's Limitations now links to `non-standard-evaluation.md#limitations` for "what the table covers". Please integrate this catalogue there (verbatim content from the old page; reword freely, keep every item):
-
-The NSE policy table covers the common, slow-moving surface: base/utils metaprogramming and object-name helpers; default-attached `stats` model-fitting `subset`/`weights` data-masking; `dplyr`/`tidyr` data-masking and tidy-select verbs, including attached Bioconductor tidy-omics generics from `plyranges`, `tidySummarizedExperiment`, and `tidySingleCellExperiment`; `tibble`/`targets` constructors and target-name helpers (including the `names` selector of `tar_make()`, `tar_make_future()`, and `tar_make_clustermq()`); common `tarchetypes` target factories plus precise `tar_map()` / `tar_plan()` / report-factory policies; `gt`/`gtsummary` table-column selectors; `recipes` step/role column captures; ggplot2 mapping helpers (`aes`/`vars`/`qplot`); `tidyr::gather` key/value outputs; `tidytext` (`unnest_tokens`/`bind_tf_idf`); `modelr::data_grid`; `drake::readd`; rlang capture helpers; the `plyr::.()` quoting helper (so `ddply(df, .(col), ...)` does not flag `col`) and the `*ply` split-apply verbs (the trailing `...` are data-masked, and so skipped, only when `.fun` is a data-masking verb such as `summarise`/`mutate`/`transform`, e.g. `ddply(df, .(g), summarise, n = length(unique(team)))`; with an ordinary `.fun` the `...` stay checked); `survival::tmerge` time-dependent terms; and a few DSLs. It is not exhaustive, and source resolution depends on package-metadata coverage, so an uncatalogued NSE helper can still produce a false positive.
-
-(The data.table `df[typo, ]`, `:=`-wholesale, and `let()` caveats stayed in diagnostics.md `## Limitations`.)

@@ -11,7 +11,7 @@ import { expect } from "bun:test";
  * and unmarked CLI output), "hub" (hub coverage), "readme-parity",
  * "images" (image alt text).
  */
-export const PENDING = new Set<string>(["lints", "examples", "hub", "readme-parity", "images"]);
+export const PENDING = new Set<string>([]);
 
 /**
  * Assert a list of violations is empty, unless its category is pending.

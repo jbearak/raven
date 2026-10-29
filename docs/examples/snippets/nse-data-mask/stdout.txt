@@ -1,0 +1,2 @@
+analysis.R:3:16 warning: missing_label is not defined [undefined-variable]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

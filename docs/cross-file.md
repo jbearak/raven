@@ -1,215 +1,180 @@
-# Cross-File & Package Awareness
+# Cross-file analysis
 
-Raven builds a dependency graph of your R project and uses it to provide scope-aware completions, diagnostics, and navigation across file boundaries. This page explains how the system works.
+[Docs](README.md) › Analysis
 
-## How It Works
+Raven follows `source()` calls between your R files, so a function defined in one file counts as defined in every file that sources it, from the `source()` line onward. <a id="cross-file--package-awareness"></a>
 
-Most R projects consist of multiple files connected by `source()` calls. Raven detects these relationships automatically:
-
+<!-- example: cross-file-source-order file=main.R -->
 ```r
-# main.R
-library(dplyr)
 source("utils.R")
-result <- helper_function(42)  # Raven knows this comes from utils.R
+total <- add_tax(100)
+refund <- add_taxes(-20)
 ```
 
+<!-- example: cross-file-source-order file=utils.R -->
 ```r
-# utils.R
-helper_function <- function(x) { x * 2 }
+add_tax <- function(x) x * 1.08
 ```
 
-When you open a file in a workspace with detectable `source()` patterns, Raven:
-1. Scans the workspace for `source()` calls and builds a dependency graph
-2. Resolves which symbols are available at each position in each file
-3. Provides completions, diagnostics, hover, and go-to-definition using the full graph
+<!-- example: cross-file-source-order -->
+```console
+$ raven check .
+main.R:3:11 warning: add_taxes is not defined [undefined-variable]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)
+```
 
-This happens automatically for standard `source()` patterns.
+Line 2 is fine: `add_tax()` comes from `utils.R`. Line 3 is flagged because no file defines `add_taxes`. You don't configure anything for this: ordinary `source()` calls just work. A sourced file's symbols count only below the `source()` line, as at runtime; see [Position-aware scope](#position-aware-scope).
 
-## Automatic source() Detection
+## How it works
 
-Raven detects `source()` and `sys.source()` calls:
-- Single and double quotes: `source("path.R")` or `source('path.R')`
-- Named arguments: `source(file = "path.R")`
-- Static `local` and `chdir` values: `TRUE`/`FALSE` and the unshadowed aliases `T`/`F`
-- `source(system.file("helper.R", package = "pkg"))` — the `system.file()` path is resolved statically: for the package being analyzed it maps to the source-tree `inst/` directory, and for an installed package it is found under the library paths (so a helper sourced this way contributes its definitions like any other `source()` target). Resolution tracks package lifecycle events live: installing or removing the referenced package mid-session, or renaming the workspace package in `DESCRIPTION`, re-resolves these edges without editing the file or restarting
-- **Computed paths** built from statically-known parts are folded to a plain path (issue #638): `file.path("scripts", "helpers.R")` (all parts must fold; `fsep` accepted only as the default `"/"`; any other named argument bails), a `normalizePath(...)` wrapper (peeled syntactically; `winslash`/`mustWork` ignored), and a local variable assigned exactly once at the top level before use — so the common testthat idiom `repo_root <- normalizePath(file.path("..", "..")); source(file.path(repo_root, "scripts/helpers.R"))` resolves. Folding is strict all-or-nothing: any component that isn't statically known (another function call, a reassigned, replacement-modified, removed, or conditionally-assigned variable, a shadowed `file.path`/`normalizePath`, or a string literal containing escape sequences) makes Raven skip the call rather than guess. Exact `readLines(...)`, `base::readLines(...)`, and `base:::readLines(...)` calls are recognized as non-binding-mutating when their arguments contain no recognized mutation; bare `readLines` receives that treatment only when Raven's bounded lexical scan finds no local shadowing or recognized dynamic binding operation anywhere in the file. Search-path attachment, sourced definitions, and opaque evaluation are outside that bare-helper check, as they are for other bare helpers. Other calls remain conservative. It is also a purely lexical analysis — `setwd()` calls and symlink resolution that runtime `normalizePath()` would perform are ignored, the same limitation every literal path already has. Folded paths work across dependency edges, scope, missing-file diagnostics, and cmd-click navigation — a click on any string segment of the expression (e.g. `"scripts/helpers.R"` inside `file.path(repo_root, "scripts/helpers.R")`) opens the full joined target, while a click on an identifier segment such as `repo_root` keeps its usual go-to-definition to the variable's assignment
-- **Optional exact sources** written as `if (file.exists("scripts/config.R")) source("scripts/config.R")` do not report a missing-file or case-mismatch diagnostic when the guarded path is absent. When the file exists, it remains an ordinary source dependency and contributes scope normally. Recognition is intentionally narrow: `file.exists()` must receive one plain literal, the `source()` path must fold statically to exactly the same string, and the source must be the sole direct or singleton-braced consequence. An `else` branch may provide fallback behavior; a source in the `else` branch is not treated as guarded. For bare `file.exists`, Raven applies the same bounded lexical helper policy as other bare base helpers: a recognized same-file binding or dynamic named assignment rejects the pattern, while definitions that might arrive only from packages or sourced code are outside the lexical proof. Write `base::file.exists(...)` when code intentionally masks the bare name. Dynamic paths and broader conditions are diagnosed conservatively like ordinary `source()` calls.
-- **Bounded directory source loops** written as `files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)` followed immediately by `for (file in files) source(file)` contribute the immediate uppercase-`.R` files in that directory as one ordered source batch. Members share the ordinary source environment from left to right, and the completed batch lends its final scope after the loop. Raven uses deterministic platform-native lexical ordering (raw bytes on Unix); R's order can vary with `LC_COLLATE`, so projects whose member definitions depend on locale-specific filename order should use explicit `source()` calls. Recognition deliberately requires adjacent executable top-level statements, one literal directory, the exact pattern and `full.names = TRUE`, and a direct or singleton-braced loop body containing only `source(iterator)`. `base::` / `base:::` qualification is accepted. `lapply`, `sapply`, and `purrr::walk` source idioms remain unsupported, as do regex equivalents such as `"\\.[Rr]$"` and `"[.]R$"`; use the exact bounded form or explicit `source()` calls. Extra arguments, alternate patterns, dynamic paths, intervening code, helper shadowing, nested/deferred loops, lowercase `.r`, hidden entries, nested files, and paths outside the workspace fail closed. Project-excluded members do not participate. A matching directory, unreadable directory entry or matching file, or more than 256 matches drops the whole inferred batch rather than modeling a partial execution. The reason is recorded at debug log level. Raven does not show an editor hint for these cases: filesystem failures can be transient and expansion runs from several detached analysis paths, so a stable user-facing diagnostic would require lifecycle-aware deduplication rather than repeating potentially stale notices. Missing and empty directories remain watched so later member creation revalidates the graph.
-- Other dynamic paths (e.g. `paste0(...)`, `Sys.getenv(...)`) are skipped gracefully
+When you open a file in a workspace, Raven:
 
-For `source()` scope propagation, omitted `local`, `FALSE`, an unshadowed `F`,
-and the unshadowed global-environment forms `.GlobalEnv` and `globalenv()` use
-global-source behavior. `TRUE` and an unshadowed `T` use local behavior. A
-shadowed alias or global-environment name, or any other dynamic `local`
-expression, is treated conservatively as a non-inheriting destination so an
-uncertain child neither borrows ordinary caller bindings nor lends symbols to
-the caller. The dependency edge is still retained for path diagnostics,
-revalidation, and graph traversal; declarations such as `# raven: var` remain
-visible to the child. For `chdir`, Raven recognizes `TRUE`/`FALSE` and
-unshadowed `T`/`F`; shadowed or dynamic values are not assumed to enable it.
+1. Scans the workspace for `source()` calls and builds a dependency graph of which file sources which.
+2. Works out which symbols are available at each line of each file.
+3. Uses that graph for completions, diagnostics, hover, and go-to-definition.
 
-`sys.source()` remains distinct: it defaults to a non-inheriting environment,
-so its child receives declarations but not ordinary caller bindings, and its
-symbols do **not** propagate to the calling file unless `envir` is the
-unshadowed `globalenv()` or `.GlobalEnv` form. Its `chdir` argument follows the
-same static boolean rules above.
+Packages follow the same model: a `library()` call in `main.R` makes the package available in the files `main.R` sources after that call. See [Package awareness](#package-awareness).
 
-**`local = TRUE` inheritance.** `source("child.R", local = TRUE)` evaluates the child in the environment from which `source()` is called. At the **top level** of a script that environment is the global environment, so the child sees all of the parent's bindings defined before the call — exactly like the default `local = FALSE` — and Raven resolves the parent's earlier definitions in the child accordingly. Only when the `source(local = TRUE)` call sits **inside a function body** does the child bind to that function's frame rather than the globals; in that case the child does not inherit the parent's top-level symbols through the relationship (declared symbols from `# raven: var` directives still flow). The child's *own* new definitions never leak back out to the parent's global scope under `local = TRUE`. This proven-current-frame case is distinct from `local = some_environment`, `local = new.env()`, or another unknown expression: those are non-inheriting even at top level. The same composition applies inside evaluated capture code: for example, `base::bquote(.(source("child.R", local = TRUE)), where = env)` is non-inheriting when `env` cannot be proven to be the caller or global environment, while a proven `.GlobalEnv` `where` promotes the call to global behavior.
+## Automatic `source()` detection
 
-**Case-only filename mismatches.** On macOS and Windows, `source("helpers.r")` resolves to an on-disk `helpers.R` (and vice versa): Raven matches the resolved path to the real directory entry's capitalization, so the sourced file's symbols are found regardless of the case used in the `source()` string. On case-sensitive filesystems (typical Linux) `source("helpers.r")` would not find `helpers.R` at runtime — but rather than drop the file from the graph and bury the real problem under a flood of false `undefined-variable` warnings, Raven resolves the single case-insensitive match into the graph anyway and reports the case mismatch once, at the `source()` call. Either way Raven flags it as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch) (information on a case-insensitive filesystem, warning on a case-sensitive one). See [Path Resolution → Case-only mismatches](#case-only-mismatches) for the exact rules (exact match always wins; an ambiguous 2+-match stays unresolved).
+Raven reads these forms without any configuration:
 
-Raven also provides **file path intellisense** inside `source()` strings and path-taking directives: completion for `.R`/`.r` files and directories, and cmd-click navigation to the target file.
+| You write | Raven does |
+|---|---|
+| `source("utils.R")`, `source('utils.R')`, `source(file = "utils.R")` | Follows the file. |
+| `sys.source("utils.R", envir = globalenv())` | Follows the file. Without a global `envir`, the child's symbols don't come back to the caller. |
+| `source(system.file("helper.R", package = "pkg"))` | Resolves to `inst/helper.R` for the package you're developing, or to the installed package's copy. |
+| `source(file.path("scripts", "helpers.R"))` | Folds a path built from fixed parts into a plain path. |
+| `if (file.exists("config.R")) source("config.R")` | Follows the file when it exists, and reports nothing when it doesn't. |
+| `files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)` then `for (file in files) source(file)` | Sources each `.R` file in that folder, in order. |
+| `source(paste0(dir, "/x.R"))`, `source(Sys.getenv("SETUP"))` | Skips the call. Use a [directive](#when-raven-cant-see-the-link). |
 
-For dynamic or conditional paths that Raven can't detect, use [directives](directives.md) to declare relationships explicitly.
+Each form has exact limits, described in [How Raven reads `source()` calls](#how-raven-reads-source-calls). Raven also models how [Shiny apps](#shiny-application-loading) load `R/` helpers and `global.R`, and how [`targets::tar_source()`](#targetstar_source-scripts) loads pipeline scripts.
 
-### Shiny application loading
-
-Raven recognizes Shiny's implicit application layouts without running R. Entry
-filenames are matched case-insensitively. A matching `server.R` selects the
-legacy layout, even when `app.R` also exists; `app.R` selects the single-file
-layout only when no `server.R` exists. The two layouts are never combined.
-Explicit `shinyAppFile()` calls naming arbitrary files are not inferred.
-
-In a **single-file application**, Raven models Shiny's shared support
-environment: immediate `R/*.[Rr]` files load in C-locale filename order, then
-`app.R` loads in a child environment. Earlier helpers are visible to later
-helpers immediately, while functions defined by an earlier helper late-bind
-names from the completed support environment. An adjacent `global.R` is not
-implicitly loaded.
-
-In a **legacy application**, `global.R` loads in the global environment, the
-immediate `R/*.[Rr]` helpers load into one shared child support environment, and
-`ui.R` and `server.R` load into separate sibling entry environments. Both
-entries see global and support bindings, with helper bindings shadowing globals;
-entries do not see one another's entry-local definitions. `global.R` cannot see
-bindings created later by helpers, and Raven does not invent an execution order
-between `ui.R` and `server.R`.
-
-Only direct children of the exact `R/` directory participate. Hidden files and
-nested files are skipped, and more than 256 matching helpers fails closed rather
-than modeling a partial batch. A direct `R/_disable_autoload.R` marker,
-case-insensitively matched, disables the helper batch. It does not disable
-legacy `global.R`, and it never causes `global.R` to load in single-file mode.
-Raven deliberately does not execute R or guess historical process-global
-`options(shiny.autoload.r = ...)` state. Project exclusions are applied before
-layout selection: an excluded `server.R` cannot select legacy mode, and excluded
-entries, globals, helpers, or disable markers do not participate in implicit
-loading. Negated exclusion rules can re-include individual helpers. Conventional
-files that are inactive in the selected layout—such as `global.R` beside
-`app.R`, `app.R` in legacy mode, or helpers suppressed by the disable marker—keep
-ordinary standalone-file path and navigation behavior.
-
-Convention-loaded global, helper, and entry files execute with the application
-directory as their working directory. Relative `source()` calls therefore
-resolve from the application root unless an explicit [`# raven: cd`](directives.md)
-override applies; `source(..., chdir = TRUE)` still switches a sourced child's
-base to that child's directory. Backward directives remain file-relative and
-ignore runtime working-directory mechanisms.
-
-Application entry files, the exact `R/` directory, helpers, `global.R`, and the
-disable marker are watched as one filesystem-derived topology. Creating,
-deleting, renaming, or changing the case of these paths refreshes the selected
-mode and scope for open and closed files. Lexical and canonical watch roots are
-both retained, so applications opened through a symlink still react to events on
-the real path without creating a second application scope. Opening only a
-helper or legacy `global.R` also materializes the selected `app.R` or `server.R`
-host on demand before initial diagnostics. The same model feeds diagnostics,
-completion, hover, navigation, references, and `raven check`; unresolved names
-inside an active application are not allowed to fall through into sibling entry
-environments or unrelated applications.
+Inside `source()` strings and path-taking directives, Raven completes `.R`/`.r` file and directory names, and Cmd/Ctrl-click opens the target file.
 
 ### R Markdown / Quarto chunks
 
-Inside `.Rmd` / `.Rmarkdown` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# raven: sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).
+Inside `.Rmd`, `.Rmarkdown`, and `.qmd` documents, only R chunk bodies count. Raven masks out prose and YAML front matter, so a `source()` or `library()` call in a chunk works exactly as in a `.R` file, while the same text in prose is ignored. Within one document, bindings from earlier chunks are visible in later chunks: define `x` in chunk 1 and it resolves in chunk 3.
 
-## Package Awareness
+A `.R` file can declare `# raven: sourced-by report.Rmd`, and Raven reads the report's chunks to supply that file's inherited scope. Raven's workspace scan doesn't include `.Rmd`, `.Rmarkdown`, or `.qmd` files, so the editor sees these relationships when the document is open or when a `.R` file points at it with a backward directive. See [Code chunks](chunks.md#cross-file-resolution-from-chunks).
 
-Raven recognizes `library()`, `require()`, `loadNamespace()`, and static
-`pacman::p_load()` calls and makes their package exports available for
-completions, hover, and diagnostics. A bare `p_load()` is recognized only when
-`pacman` is already attached to the resolved R search path and no local binding
-shadows `p_load`; this includes `pacman` inherited through an explicit
-`source()` relationship. Merely calling `loadNamespace("pacman")` does not
-enable the bare helper.
+## When Raven can't see the link
 
-For `p_load()`, quoted and unquoted package arguments are supported, along with
-an exact static `char = c("pkg1", "pkg2")` argument (or a same-file,
-assigned-once static character vector). Exact `char` follows pacman's runtime
-semantics and replaces the ordinary `...` arguments. Dynamic, malformed, and
-`character.only = TRUE` forms are left unresolved rather than evaluated.
-Raven does not install or update packages and does not treat `p_load_gh()` as a
-package attachment.
+If a path is computed at runtime, or a file is sourced by something Raven doesn't scan, declare the relationship with a [directive](directives.md):
+
+```r
+# main.R
+source(Sys.getenv("SETUP_SCRIPT"))
+# raven: source setup/default.R
+```
+
+```r
+# helpers.R
+# raven: sourced-by ../main.R
+```
+
+- `# raven: source <path>` says "this file sources `<path>` here". The target's symbols are available after the directive's line.
+- `# raven: sourced-by <path>` says "this file is sourced by `<path>`", so it sees the parent's symbols. It goes in the file's header, before any code.
+- `# raven: cd <dir>` sets the working directory used to resolve paths, for scripts that run from somewhere other than their own folder.
+
+### Backward dependency modes
+
+The `raven.crossFile.backwardDependencies` setting controls how Raven finds the files that source the current file.
+
+- **`"auto"` (default)**: Raven scans the workspace for `source()` calls and infers who sources whom, so you don't need `# raven: sourced-by`. Diagnostics wait until the workspace scan finishes, to avoid false positives.
+- **`"explicit"`**: Raven uses only relationships declared with `# raven: sourced-by`. Use this if auto inference gives unwanted results, for example a file sourced by several parents whose scopes conflict.
+- **Per-file opt-out**: adding an explicit `# raven: sourced-by` to a file turns off inference for that file.
+
+## Where symbols become visible
+
+### Position-aware scope
+
+Symbols from sourced files are available only **after** the `source()` call:
+
+```r
+x <- 1
+source("a.R")  # Symbols from a.R available after this line
+y <- foo()     # foo() from a.R is now in scope
+```
+
+This applies to `source()` calls and to forward directives. The scope model aims to match what is available at runtime, for the cases Raven can determine statically. See [Symbol recognition](#symbol-recognition) for what's covered.
+
+`source("child.R", local = TRUE)` at the top level of a script behaves like a plain `source()`. Inside a function body, the child sees that function's frame instead of the parent's top-level symbols. Under `local = TRUE`, the child's own definitions never come back out to the parent. See [`local` and `chdir`](#how-raven-reads-source-calls) for the exact rules.
+
+### Global symbol hoisting
+
+R binds names late: a function can call another function that doesn't exist yet when the first is *defined*, as long as it exists when the first is *called*:
+
+```r
+main <- function() {
+  helper()  # helper doesn't exist yet, but will when main() is called
+}
+helper <- function() { 42 }
+main()  # works fine
+```
+
+Raven supports this by hoisting global definitions into function bodies. Inside a function body, every global definition is visible regardless of position. Function-local variables stay strictly positional.
+
+Hoisting is on by default. To turn it off, set the LSP init option `crossFile.hoistGlobalsInFunctions` to `false`. It is init-only and isn't in the VS Code Settings UI; see the [settings reference](settings-reference.md).
+
+### Symbol recognition
+
+Raven recognizes these R constructs as definitions:
+
+- `name <- expr`, `name <<- expr`, `expr -> name`, `expr ->> name`
+- `name = expr` (in assignment context)
+- `assign("name", expr)` (string-literal names only)
+
+For symbols created dynamically (`eval()`, `load()`, `assign()` with a computed name), use [declaration directives](directives.md#declaration-directives).
+
+### Symbol removal (`rm`/`remove`)
+
+Raven tracks `rm()` and `remove()` calls:
+
+```r
+x <- 1
+rm(x)
+x  # Warning: undefined variable
+```
+
+Raven understands `rm(x)`, `rm(x, y)`, and `rm(list = c("x", "y"))`. Dynamic forms like `rm(list = ls())` are skipped.
+
+## Path resolution
+
+When a path in one file points at another, the base directory depends on where the path came from:
+
+- **`source()` calls and forward directives** (`# raven: source`, `run`, `include`) resolve relative to the directory of the file they're in, and honor a [`# raven: cd`](directives.md#working-directory-directives) working directory when one is in effect.
+- **Backward directives** (`# raven: sourced-by`, `run-by`, `included-by`) resolve relative to the file's own directory and **ignore `# raven: cd`**.
+- **Workspace-root fallback**: for `source()` calls and forward directives, when no working directory is in effect (neither an explicit `# raven: cd` nor one inherited from a parent file), a path that doesn't resolve from the file's directory is also tried from the workspace root. It never applies to backward directives.
+
+Forward directives resolve exactly like `source()` calls, across dependencies, scope, missing-file diagnostics, Cmd/Ctrl-click, and path completion.
+
+Two more rules handle common layouts:
+
+- **Tests run from their own folder.** Files under `tests/testthat/` or `tests/testit/` resolve forward paths from that folder, the way testthat and testit run them. See [Implicit testthat/testit working directory](#implicit-testthattestit-working-directory).
+- **Case-only mismatches still resolve.** `source("helpers.r")` finds an on-disk `helpers.R`, and Raven reports the mismatch once, as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch). See [Case-only mismatches](#case-only-mismatches).
+
+## Package awareness
+
+Raven recognizes `library()`, `require()`, `loadNamespace()`, and static `pacman::p_load()` calls, and makes the package's exports available to completions, hover, and diagnostics. See [`pacman::p_load()`](#pacmanp_load) for which `p_load()` forms count.
 
 > [!TIP]
-> **Developing an R package?** When Raven detects a `DESCRIPTION` file at the workspace root, it switches to package mode — all `R/*.R` files become mutually visible without `source()` calls, and `@import`/`@importFrom` annotations suppress undefined-variable diagnostics. See [R Package Development](r-package-dev.md).
+> **Developing an R package?** When the workspace root has a `DESCRIPTION` file, Raven switches to package mode: all `R/*.R` files see each other without `source()` calls, and `@import`/`@importFrom` annotations suppress undefined-variable diagnostics. See [Package development](r-package-dev.md).
 
-Workspace-root startup files are modeled separately from package mode. If your
-project `.Rprofile` defines helpers, attaches packages, or sources setup files,
-see [`.Rprofile` Startup Prelude](rprofile.md).
+A workspace-root `.Rprofile` is modeled separately from package mode. If your project `.Rprofile` defines helpers, attaches packages, or sources setup files, see [.Rprofile startup files](rprofile.md).
 
-### How It Works
-
+<a id="how-it-works-1"></a>
 When you write `library(dplyr)`, Raven:
-1. Detects the call and extracts the package name
-2. Resolves the package's exported symbols — usually by reading its installed `NAMESPACE` file directly, with no R involved (see [When Raven calls R](#when-raven-calls-r) for the cases that need a subprocess)
-3. Makes those symbols available with `{dplyr}` attribution in completions
-4. Suppresses "undefined variable" warnings for package exports
 
-### When Raven calls R
+1. Detects the call and extracts the package name.
+2. Resolves the package's exported symbols, usually by reading its installed `NAMESPACE` file directly with no R involved. See [When Raven calls R](#when-raven-calls-r) for the cases that need R.
+3. Makes those symbols available with `{dplyr}` attribution in completions.
+4. Stops reporting the package's exports as undefined variables.
 
-Raven's analysis is static: it parses your code and your installed packages' `NAMESPACE` files without a running R session. It does, however, launch a short-lived, non-interactive R subprocess — the `R` on your `PATH`, or [`raven.packages.rPath`](configuration.md#package-settings) — in two situations. These are Raven's own processes; they never touch your interactive R session, and when no R is found Raven falls back gracefully.
+### Position-aware loading
 
-**1. To find where your packages are installed.** Raven runs `.libPaths()` to discover your library directories. Where packages live depends on your R installation, version, and project setup — including [`renv`](https://rstudio.github.io/renv/) project-local libraries, which Raven activates before reading the paths — so there's no reliable way to determine it statically. Without R, Raven falls back to the standard platform install locations plus any [`raven.packages.additionalLibraryPaths`](configuration.md#package-settings), which may miss user- or project-local libraries.
-
-**2. To expand exports that can't be read from `NAMESPACE` text.** Most packages list their exports with explicit `export(name)` directives, which Raven reads straight from the installed `NAMESPACE` file — no R required. But a package can instead (or additionally) declare `exportPattern("<regex>")`: "export every object in my namespace whose name matches this regex." Raven can't expand that from the file alone — it would need to know every object the namespace actually defines once loaded — so for these packages it asks R via `getNamespaceExports()`. Several base R packages use `exportPattern`, as do a minority of installed CRAN packages. When R isn't available, Raven approximates their exports from the package's `INDEX` file plus any explicit `export()` entries; this covers documented functions but may miss pattern-only or dynamically generated symbols.
-
-Run **Raven: Refresh package cache** after changing `.libPaths()` or running `renv::activate()` to re-run these queries.
-
-### Resolving exports without R
-
-When a package can't be found in any local library path — typically in CI, where `.libPaths()` is empty — Raven still resolves its **export names** through an ordered three-tier fallback, consulted per package. The trigger is a **missing package directory**, not a missing R: the fallback applies only when the package isn't found on disk at all. A package that *is* installed still resolves from Tier 1 even with no R (its `exportPattern` exports just degrade to the `INDEX` approximation, as above).
-
-1. **Tier 1 — installed.** The authoritative path above: parse the installed `NAMESPACE`, expanding `exportPattern` via R when reachable (and approximating from `INDEX` when not). Version-exact to the install.
-2. **Tier 2 — repo database.** A committed, repo-specific `.raven/packages.json` you generate with [`raven packages freeze`](cli.md#raven-packages-freeze). It is "frozen Tier 1": full structure (exports, `Depends`, datasets) captured through the authoritative path, version-exact to when it was generated.
-3. **Tier 3 — `names.db` database.** Raven's `names.db` database, built **append-only** from a reference-R capture ∪ CRAN + Bioconductor (via [r-universe](https://r-universe.dev)), keeping the **highest version** of each package. It isn't bundled with the binary; install it with `raven packages update` for broad CRAN/Bioconductor coverage. Carries exports, `Depends`, and dataset names — no `:::` internals or signatures.
-
-Tier 2 outranks Tier 3 because it is project-specific and built through the authoritative path; a repo that never generates a Tier 2 file still works in CI via Tier 3 alone when the database is present. Tiers 2 and 3 carry **export names, `Depends`, and datasets only** — no `:::` internal objects and no function signatures, which still require a local install (Tier 1). This fallback feeds **export resolution** only; it never changes a package's install status (see [Diagnostics](diagnostics.md#package-names-vs-install-status)). The full model, fidelity caveats, and how to generate the repo database are in [Package database](package-database.md).
-
-### Base Packages
-
-Base R packages are always available without explicit `library()` calls: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list directly — it does not query R to discover the base packages. The R subprocess is queried for *installed user packages* (via the library paths), not to determine which base packages exist — though base-package *exports* are still expanded via R, since they use `exportPattern` (see [When Raven calls R](#when-raven-calls-r)).
-
-Lazy-loaded datasets are a related special case. Packages expose data objects — `mtcars` and `iris` from the base `datasets` package, `flights` from **nycflights13**, `diamonds` from **ggplot2** — that appear in neither `NAMESPACE` `export()` lines nor `getNamespaceExports()`. How Raven discovers them depends on whether the package uses R's LazyData mechanism:
-
-- **LazyData packages** (those whose `DESCRIPTION` sets `LazyData: true`, identifiable by the presence of `data/Rdata.rdb`) build a single binary database of all data objects. Their `data/` file stems don't reliably list object names — a package like **survival** ships `lung` with no `data/lung.rda` file — so Raven queries the R subprocess via `data(package = "pkg")$results` to enumerate the authoritative set. Without R the static file-stem walk is used as a fallback (reduced fidelity).
-- **Non-LazyData packages** store datasets as individual `.rda`/`.RData` files in `data/`. Raven walks those files and the `INDEX` file statically, with no subprocess needed.
-
-Base-package datasets are always available (auto-attached at startup); a non-base package's datasets become available after its `library()` call, exactly like its function exports, and resolve transitively through `Depends` and meta-packages (`library(tidyverse); diamonds`).
-
-`data()` calls bind a dataset's objects from the call onward, mirroring R. `data(api, package = "survey")` puts every object that the package's `api` data file binds — `apiclus1`, `apistrat`, … — in scope, even when a single data file ships several differently-named objects (the file stem and the object names differ). Because R loads those objects into the calling environment, a `data()` call overwrites earlier same-named bindings in that environment; later assignments can overwrite the data objects again. The bare form `data(api)` (no `package =`) searches the packages attached at-or-before the call and then the default-attached base packages, binding the objects from the first package that provides the dataset — mirroring R, where the first search-path hit wins and attached packages sit ahead of base packages. (Raven doesn't track attachment order, so when several attached packages provide the same dataset the alphabetically-first one is attributed.) The literal argument (`api`) is always bound too, so the behavior degrades gracefully when R is unavailable. Resolving the *object* names (beyond the file stem) requires a `data/` enumeration, captured when the package is loaded; `raven check` warms the packages named in `data(package = …)` for this. A package's namespace-internal `sysdata.rda` objects (e.g. `cli`'s internal `emojis` table) are never exposed this way — `library(cli)` followed by `emojis` is still a real R error and Raven flags it correctly.
-
-> **Parent-file `data()` scope limit.** When a child file inherits its parent's scope via `# raven: sourced-by` (or auto-inferred backward dependency), `data()` alias expansion — the mapping from file stem to the individual object names — is not propagated through the backward parent-prefix walk. The literal stem bound by the `data()` call in the parent *does* flow to the child, so the most commonly used name resolves. Only the expanded aliases (e.g. `apiclus1` / `apistrat` from `data(api)`) may be missing in the child's scope view. Forward `source()` children receive full expansion. To work around this in a child file, repeat the `data()` call there, or use a [`# raven: var` directive](directives.md#declaration-directives) to declare the alias names explicitly.
-
-### `devtools::load_all()` — Virtual Attached Package
-
-`devtools::load_all()` / `pkgload::load_all()` (and a bare `load_all()`) is modeled as attaching the package under development. Raven makes the package's internal symbols — exported and non-exported `R/` definitions, `R/sysdata.rda` objects, names bound in `.onLoad`/`.onAttach`, and NAMESPACE imports — available from the call onward, exactly as `library()` makes installed-package exports available.
-
-The propagation follows the same rules as `library()`:
-
-- **Position-aware** — symbols surface only after the `load_all()` call.
-- **Forward-propagating** — a `source()` child whose parent calls `load_all()` inherits the internals; a parent does not pick them up from a child's `load_all()`.
-- **Transitive** — propagates through multi-hop `source()` chains.
-- **Multi-parent union** — when a file has multiple parents and at least one calls `load_all()`, the internals are available in the child too.
-
-A workspace-root `.Rprofile` that calls `load_all()` surfaces the package internals in ordinary scripts. In package mode, `R/` source files, package tests, and built-documentation directories do not receive the `.Rprofile`-route internals (they already get them through the package-mode dev context). See [`.Rprofile` Startup Prelude](rprofile.md).
-
-A file **outside the package workspace root** that calls `load_all()` does NOT pick up the package internals — this avoids muting real diagnostics in unrelated scratch files.
-
-Unlike `library(yourpkg)`, `load_all()` exposes internals even when they are not exported, matching `load_all()`'s own `export_all = TRUE` default. See [R Package Development](r-package-dev.md#scripts-that-call-devtoolsload_all) for more.
-
-### Position-Aware Loading
-
-Package exports are only available after the `library()` call:
+Package exports are available only after the `library()` call:
 
 ```r
 mutate(df, x = 1)  # Warning: undefined variable 'mutate'
@@ -217,9 +182,9 @@ library(dplyr)
 mutate(df, y = 2)  # OK: dplyr is now loaded
 ```
 
-### Function-Scoped Loading
+### Function-scoped loading
 
-When `library()` is called inside a function, exports are only available within that function's scope:
+A `library()` call inside a function makes the exports available only within that function:
 
 ```r
 my_analysis <- function(data) {
@@ -229,25 +194,9 @@ my_analysis <- function(data) {
 mutate(df, y = 2)  # Warning: dplyr not available at global scope
 ```
 
-### Meta-Package Support
+### Cross-file package propagation
 
-Raven recognizes meta-packages that attach multiple packages:
-
-- **tidyverse** attaches: dplyr, readr, forcats, stringr, ggplot2, tibble, lubridate, tidyr, purrr
-- **tidymodels** attaches: broom, dials, dplyr, ggplot2, infer, modeldata, parsnip, purrr, recipes, rsample, tibble, tidyr, tune, workflows, workflowsets, yardstick
-
-### Availability vs. ownership
-
-A symbol made visible through a meta-package, an attached package, or a `Depends` chain has two distinct package answers that Raven keeps separate:
-
-- **Availability** — *which loaded package made this visible?* This is what suppresses "undefined variable" warnings. `library(tidyverse)` makes `mutate` available because Raven aggregates the exports of tidyverse's attached members.
-- **Ownership** — *which package actually contributes the symbol?* This is the **documentation / help owner** (used for hover help, the help panel, signature help, and completion detail) and the **NSE-policy owner** (used to classify data-masking arguments). For `mutate` under `library(tidyverse)`, the owner is `dplyr`.
-
-This matters because `help("mutate", package = "tidyverse")` is empty — only `dplyr` owns the topic. So `library(tidyverse); mutate(...)` stays *available* through tidyverse but resolves hover, help, signatures, completion detail, and NSE policy against `dplyr`. A direct `library(dplyr)` and an explicit `dplyr::mutate(...)` resolve to `dplyr` as before, and a genuine package export is always owned by the package that exports it (the aggregate root wins for its own exports). When no contributing owner can be resolved, existing not-found behavior is unchanged.
-
-### Cross-File Package Propagation
-
-Packages loaded in parent files are available in sourced children:
+Packages loaded in a parent file are available in the files it sources afterward:
 
 ```r
 # main.R
@@ -256,9 +205,18 @@ source("analysis.R")  # dplyr available in analysis.R
 library(ggplot2)      # NOT available in analysis.R (loaded after source)
 ```
 
-Packages loaded in child files do NOT propagate back to parents (forward-only).
+Packages loaded in a child file don't propagate back to its parents.
 
-### Supported Call Patterns
+### Meta-package support
+
+Raven knows which packages these meta-packages attach:
+
+- **tidyverse**: dplyr, readr, forcats, stringr, ggplot2, tibble, lubridate, tidyr, purrr
+- **tidymodels**: broom, dials, dplyr, ggplot2, infer, modeldata, parsnip, purrr, recipes, rsample, tibble, tidyr, tune, workflows, workflowsets, yardstick
+
+Hover, help, and NSE handling use the package that really defines a symbol, so `mutate` under `library(tidyverse)` resolves to dplyr. See [Availability vs. ownership](#availability-vs-ownership).
+
+### Supported call patterns
 
 | Pattern | Supported |
 |---|---|
@@ -267,50 +225,412 @@ Packages loaded in child files do NOT propagate back to parents (forward-only).
 | `require(pkgname)` | Yes |
 | `loadNamespace("pkgname")` | Yes |
 | `library(pkg, character.only = TRUE)` | No (dynamic) |
-| `sapply(c("a","b"), library, character.only = TRUE)` | Yes (apply family) |
+| `sapply(c("a","b"), library, character.only = TRUE)` | Yes ([apply family](#apply-family-loads)) |
 | `sapply(libs, library, character.only = TRUE)` where `libs <- c("a","b")` | Yes (same-file variable) |
 | `purrr::map(c("a","b"), library, character.only = TRUE)` | Yes (purrr family) |
-| `for (pkg in libs) library(pkg, character.only = TRUE)` where `libs <- c("a","b")` | Yes (deterministic loader loop) |
+| `for (pkg in libs) library(pkg, character.only = TRUE)` where `libs <- c("a","b")` | Yes ([loader loop](#deterministic-package-loader-loops)) |
 | `sapply(paste0(...), library, character.only = TRUE)` | No (dynamic vector) |
-| `tar_option_set(packages = c("a","b"))` | Yes, when the file also attaches targets (see below) |
-| `targets::tar_option_set(packages = "a")` | Yes (qualified — no `library(targets)` needed) |
+| `tar_option_set(packages = c("a","b"))` | Yes, when the file also attaches targets ([details](#targetstar_option_set-worker-packages)) |
+| `targets::tar_option_set(packages = "a")` | Yes (qualified, so no `library(targets)` needed) |
 | `tar_option_set(TRUE, c("a"))` | No (positional `packages` is not matched) |
 
-### Apply-Family Loads
+Base R packages (base, methods, utils, grDevices, graphics, stats, datasets) are always available without a `library()` call. See [Base packages](#base-packages) for datasets and `data()`.
 
-Raven also recognizes package loads expressed through apply-family calls when
-all the package names are statically determinable:
+### Keeping packages in sync
+
+Raven watches your `.libPaths()` directories and refreshes when packages are installed, upgraded, or removed. If it misses a change, for example after `renv::activate()`, run **Raven: Refresh package cache** from the Command Palette. The `packages.watchLibraryPaths` and `packages.watchDebounceMs` settings control the watcher.
+
+## Module & import systems
+
+The `box` and `import` packages define selective-import systems. Raven models them differently from `source()` and `library()`: an import binds only the names it requests, rather than merging a file's definitions or attaching a whole package. See [box and import modules](modules.md).
+
+## NSE directive propagation
+
+A `# raven: nse` declaration (see [Non-standard evaluation](non-standard-evaluation.md) and [NSE declarations](directives.md#nse-declarations)) applies across files, like defined symbols and `library()` loads. It governs its named function in every file connected to it through `source()`, in both directions and through any number of hops.
+
+Declare a helper's NSE contract once, next to its `library()` call, next to its definition, or in a sourced setup file, and Raven stops flagging the captured arguments at call sites in the connected files. Two files that aren't connected never share NSE declarations. See [How NSE declarations propagate](#how-nse-declarations-propagate) for the exact rules.
+
+## Self-contained sourced files (`# raven: self-contained`)
+
+By default a sourced file's scope includes what its callers had defined at each `source()` call that pulls it in. That matches R for ordinary script fragments, which may use variables their caller created.
+
+A shared helper or setup file is often different: it defines its own inputs, loads its own packages, and sources its own helpers. Put `# raven: self-contained` (alias `# raven: standalone`) in its header and Raven analyzes it **without** its callers' bindings, while its definitions and `library()` loads still flow to every caller.
+
+This is more precise, and on large projects it can be much faster: a setup file sourced by dozens of scripts, which itself sources dozens of files, is analyzed once instead of once per caller. See [Performance on large projects](cross-file-analysis-performance.md) for when to use it and [Directives](directives.md#self-contained-sourced-files) for the exact syntax. `# raven: nse` and `# raven: func` propagation is unaffected.
+
+## How this feeds into features
+
+- **[Diagnostics](diagnostics.md)**: undefined-variable warnings respect cross-file scope and loaded packages.
+- **[Completions](completion.md)**: symbols from sourced files and packages appear with where they came from.
+- **[Find references](find-references.md)**: finds occurrences by name across open and indexed files. This is a plain name match, not limited to the dependency graph.
+- **[Go to definition](go-to-definition.md)**: jumps to definitions in other files.
+- **[Hover](hover.md)**: shows where a symbol is defined and which package it comes from.
+
+## Settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| `raven.crossFile.backwardDependencies` | `"auto"` | How Raven finds the files that source the current one. See [Backward dependency modes](#backward-dependency-modes). |
+| `raven.crossFile.assumeCallSite` | `"end"` | Where a `# raven: sourced-by` parent is assumed to call `source()` when Raven can't find the call |
+| `raven.crossFile.maxChainDepth` | `64` | How deep Raven follows `source()` chains. See [Traversal budgets](#traversal-budgets-in-large-workspaces). |
+| `raven.crossFile.maxTransitiveDependentsVisited` | `50000` | How many files Raven visits when building a file's neighborhood |
+| `raven.crossFile.missingFileSeverity`, `caseMismatchSeverity`, `outOfScopeSeverity` | varies | Severity of the cross-file diagnostics |
+| `raven.packages.rPath` | `""` | The R executable Raven runs for library paths and package exports |
+| `raven.packages.additionalLibraryPaths` | `[]` | Extra package libraries to search |
+| `raven.packages.watchLibraryPaths`, `watchDebounceMs` | `true`, `500` | Watch package libraries for installs and removals |
+
+See the [settings reference](settings-reference.md) for every `raven.crossFile.*` and `raven.packages.*` setting, and [Configuration](configuration.md) for how settings combine.
+
+## Limitations
+
+- Dynamic paths such as `paste0(...)` or `Sys.getenv(...)` are skipped. Add a [forward directive](directives.md#forward-directives) for them.
+- `lapply`, `sapply`, and `purrr::walk` idioms that source a list of files aren't followed. Use the exact [`list.files()` loop](#how-raven-reads-source-calls) or explicit `source()` calls.
+- Path folding is lexical: `setwd()` calls and the symlink resolution that `normalizePath()` does at runtime are ignored, as they are for literal paths.
+- When a child inherits its parent's scope through `# raven: sourced-by` or an inferred backward link, a `data()` call in the parent passes only the dataset's literal name to the child, not every object the data file defines. In `data(api)`, `api` flows to the child but `apiclus1` and `apistrat` may not. Forward `source()` children get every object. Repeat the `data()` call in the child, or declare the names with [`# raven: var`](directives.md#declaration-directives).
+- A script that runs in more than one `tar_source()` batch is still one file to navigation, missing-file checks, and rechecking. See [`targets::tar_source()` scripts](#targetstar_source-scripts).
+
+## Details
+
+<a id="advanced"></a>
+
+### How Raven reads `source()` calls
+
+Raven reads `source()` and `sys.source()` with single or double quotes, a named `file =` argument, and static `local` and `chdir` values (`TRUE`/`FALSE` and the unshadowed aliases `T`/`F`). The blocks below give the exact limits of each form.
+
+<details markdown="1">
+<summary><code>system.file()</code> paths</summary>
+
+`source(system.file("helper.R", package = "pkg"))` is resolved statically. For the package being analyzed it maps to the source tree's `inst/` directory. For an installed package it is found under the library paths. Either way, the helper contributes its definitions like any other `source()` target.
+
+Resolution follows package changes live. Installing or removing the referenced package mid-session, or renaming the workspace package in `DESCRIPTION`, re-resolves these links without editing the file or restarting.
+
+</details>
+
+<details markdown="1">
+<summary>Computed paths that Raven folds</summary>
+
+Paths built from statically known parts are folded to a plain path:
+
+- `file.path("scripts", "helpers.R")`. Every part must fold. `fsep` is accepted only as the default `"/"`, and any other named argument stops folding.
+- A `normalizePath(...)` wrapper, peeled off syntactically. `winslash` and `mustWork` are ignored.
+- A local variable assigned exactly once at the top level before its use.
+
+So the common testthat idiom resolves:
+
+```r
+repo_root <- normalizePath(file.path("..", ".."))
+source(file.path(repo_root, "scripts/helpers.R"))
+```
+
+Folding is all-or-nothing. Raven skips the call rather than guess if any part isn't statically known: another function call, a variable that is reassigned, modified by a replacement function, removed, or assigned conditionally, a shadowed `file.path` or `normalizePath`, or a string literal containing escape sequences.
+
+A `readLines(...)` call elsewhere in the file doesn't stop a variable from folding. Raven knows that `readLines(...)`, `base::readLines(...)`, and `base:::readLines(...)` don't change bindings, as long as their arguments contain no binding change Raven recognizes. A bare `readLines` gets that treatment only when Raven's bounded scan of the file finds no local definition of `readLines` and no dynamic binding operation it recognizes. Search-path attachment, sourced definitions, and opaque evaluation are outside that check, as for other bare helpers. Other calls are treated conservatively.
+
+Folding is lexical. `setwd()` calls and the symlink resolution that runtime `normalizePath()` would do are ignored, the same limitation literal paths have.
+
+Folded paths work everywhere a literal path does: dependencies, scope, missing-file diagnostics, and Cmd/Ctrl-click. A click on any string part of the expression, such as `"scripts/helpers.R"` in `file.path(repo_root, "scripts/helpers.R")`, opens the joined target. A click on a variable part such as `repo_root` still goes to that variable's assignment.
+
+</details>
+
+<details markdown="1">
+<summary>Optional sources guarded by <code>file.exists()</code></summary>
+
+`if (file.exists("scripts/config.R")) source("scripts/config.R")` reports no missing-file or case-mismatch diagnostic when the file is absent. When the file exists, it is an ordinary source dependency and contributes scope normally.
+
+Recognition is narrow:
+
+- `file.exists()` must receive one plain literal.
+- The `source()` path must fold to exactly the same string.
+- The `source()` must be the only consequence, written directly or alone inside braces.
+- An `else` branch may provide a fallback, but a `source()` in the `else` branch isn't treated as guarded.
+
+For a bare `file.exists`, Raven applies the same bounded check as for other bare base helpers: a definition or dynamic named assignment of `file.exists` in the same file rejects the pattern, while definitions that might come only from packages or sourced code are outside the check. Write `base::file.exists(...)` when your code deliberately masks the bare name. Dynamic paths and broader conditions are diagnosed like ordinary `source()` calls.
+
+</details>
+
+<details markdown="1">
+<summary>Directory source loops with <code>list.files()</code></summary>
+
+This pair of statements sources the `.R` files directly inside `functions/` as one ordered batch:
+
+```r
+files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+for (file in files) source(file)
+```
+
+The files share one source environment from first to last, and the finished batch lends its final scope to the code after the loop. Raven orders the files by platform-native lexical order (raw bytes on Unix). R's order can vary with `LC_COLLATE`, so if your definitions depend on locale-specific filename order, use explicit `source()` calls.
+
+Raven requires all of these:
+
+- The two statements are adjacent, executable, and at the top level.
+- One literal directory, exactly `pattern = "\\.R$"`, and `full.names = TRUE`.
+- A loop body that is only `source(iterator)`, written directly or alone inside braces.
+
+`base::` and `base:::` qualification is accepted. The following fail closed, contributing nothing: extra arguments, other patterns (including regex equivalents such as `"\\.[Rr]$"` and `"[.]R$"`), dynamic paths, code between the two statements, shadowed helpers, nested or deferred loops, lowercase `.r` files, hidden entries, files in subdirectories, and paths outside the workspace. `lapply`, `sapply`, and `purrr::walk` idioms aren't supported.
+
+Project-excluded files don't take part. If a matching entry is a directory, a directory entry or matching file can't be read, or there are more than 256 matches, Raven drops the whole batch rather than model a partial run. The reason goes to the log at debug level, and the editor shows no hint, because filesystem failures can be temporary. Missing and empty directories stay watched, so creating a file there later updates the analysis.
+
+</details>
+
+<details markdown="1">
+<summary><code>local</code>, <code>chdir</code>, and <code>sys.source()</code></summary>
+
+For `source()`, these mean global sourcing: an omitted `local`, `FALSE`, an unshadowed `F`, and the unshadowed `.GlobalEnv` and `globalenv()`. `TRUE` and an unshadowed `T` mean local sourcing.
+
+A shadowed alias or environment name, or any other dynamic `local` value, is treated as an environment that doesn't inherit. The child then neither borrows the caller's ordinary bindings nor lends symbols back. The link is still kept for missing-file diagnostics, rechecking, and following the chain, and declarations such as `# raven: var` still reach the child.
+
+For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed or dynamic value isn't assumed to turn it on.
+
+`sys.source()` defaults to an environment that doesn't inherit. Its child receives declarations but not the caller's ordinary bindings, and its symbols do **not** come back to the calling file unless `envir` is the unshadowed `globalenv()` or `.GlobalEnv`. Its `chdir` argument follows the same rules as `source()`.
+
+</details>
+
+<details markdown="1">
+<summary><code>source(local = TRUE)</code> inheritance</summary>
+
+`source("child.R", local = TRUE)` evaluates the child in the environment that calls `source()`. At the **top level** of a script that environment is the global environment, so the child sees every parent binding defined before the call, exactly as with the default `local = FALSE`, and Raven resolves those earlier definitions in the child.
+
+Only when the `source(local = TRUE)` call sits **inside a function body** does the child bind to that function's frame instead of the globals. The child then doesn't inherit the parent's top-level symbols through the relationship, though declared symbols from `# raven: var` still flow. The child's own new definitions never leak back to the parent's global scope under `local = TRUE`.
+
+This proven current-frame case is different from `local = some_environment`, `local = new.env()`, or another unknown expression, which don't inherit even at top level. The same rules apply inside evaluated capture code: `base::bquote(.(source("child.R", local = TRUE)), where = env)` doesn't inherit when `env` can't be proven to be the caller or global environment, while a proven `.GlobalEnv` `where` makes the call global.
+
+</details>
+
+### Shiny application loading
+
+Raven recognizes Shiny's implicit application layouts without running R. Entry filenames match case-insensitively. A `server.R` selects the legacy layout, even when `app.R` also exists. `app.R` selects the single-file layout only when there is no `server.R`. Raven never combines the two layouts, and doesn't infer `shinyAppFile()` calls that name arbitrary files.
+
+<details markdown="1">
+<summary>How each layout loads, and which files take part</summary>
+
+In a **single-file application**, Raven models Shiny's shared support environment: the `R/*.[Rr]` files directly in `R/` load in C-locale filename order, then `app.R` loads in a child environment. Earlier helpers are visible to later helpers immediately, while functions defined by an earlier helper look up names late, in the completed support environment. An adjacent `global.R` isn't loaded implicitly.
+
+In a **legacy application**, `global.R` loads in the global environment, the `R/*.[Rr]` helpers load into one shared child support environment, and `ui.R` and `server.R` load into separate sibling environments. Both entries see global and support bindings, with helper bindings shadowing globals, but neither sees the other's own definitions. `global.R` can't see bindings that helpers create later, and Raven doesn't assume an order between `ui.R` and `server.R`.
+
+Only direct children of the exact `R/` directory take part. Hidden files and nested files are skipped, and more than 256 matching helpers fails closed rather than modeling a partial batch. A direct `R/_disable_autoload.R` marker, matched case-insensitively, turns off the helper batch. It doesn't turn off legacy `global.R`, and it never makes `global.R` load in single-file mode. Raven doesn't execute R or guess the process-wide `options(shiny.autoload.r = ...)` setting.
+
+Project exclusions apply before Raven picks a layout. An excluded `server.R` can't select legacy mode, and excluded entries, globals, helpers, or disable markers don't take part. Negated exclusion rules can re-include individual helpers. Conventional files that are inactive in the chosen layout, such as `global.R` beside `app.R`, `app.R` in legacy mode, or helpers turned off by the marker, keep ordinary standalone path and navigation behavior.
+
+Global, helper, and entry files run with the application directory as their working directory. Relative `source()` calls in them resolve from the application root unless an explicit [`# raven: cd`](directives.md#working-directory-directives) applies, and `source(..., chdir = TRUE)` still switches a sourced child's base to that child's directory. Backward directives stay file-relative and ignore runtime working directories.
+
+Entry files, the `R/` directory, helpers, `global.R`, and the disable marker are watched together. Creating, deleting, renaming, or changing the case of any of them refreshes the selected layout and scope, for open and closed files. Applications opened through a symlink still react to changes on the real path, without getting a second copy of the application's scope. If you open only a helper or a legacy `global.R`, Raven reads the selected `app.R` or `server.R` before publishing that file's first diagnostics.
+
+The same model feeds diagnostics, completion, hover, navigation, references, and `raven check`. An unresolved name inside an application never falls through to a sibling entry's environment or to an unrelated application.
+
+</details>
+
+### Open buffers, disk state, and closing files
+
+While a file is open, its buffer is the truth: unsaved edits that add or remove `source()` calls or directives update the dependency graph live, and disk changes to that file are ignored until you close it.
+
+When you close a file without saving, Raven re-reads just that file from disk. A `source()` link added only in the discarded buffer disappears, and one the buffer had removed comes back. If the file no longer exists on disk, Raven drops it entirely. Open files that depend on it get refreshed diagnostics. Closing never triggers a workspace rescan, and reopening the file right away always wins over the disk re-read.
+
+<details markdown="1">
+<summary>Files opened through a different case or a symlink</summary>
+
+If a buffer is opened under a case-only spelling difference (for example `child.R` for an on-disk `child.r`) or through a symlink that resolves to a workspace file, Raven treats the workspace file as open:
+
+- Dependents recheck as you type, and cross-file scope reads the live buffer.
+- Package-internal symbols, rechecking of sibling package files, your package's own NSE policy, and parameter and signature lookups use the workspace file.
+- Raven skips file-watcher resyncs for the workspace spelling until you close the buffer.
+- A workspace-root `.Rprofile` opened this way supplies the startup prelude while open, and scripts opened this way receive the prelude through their workspace path.
+
+Diagnostics still publish to the spelling the editor opened. For closed files, Raven keys files by their raw path spelling rather than fully resolving symlinks, because full resolution follows symlinks and could disagree with the workspace index. Path resolution may still correct a case-only mismatch to the on-disk spelling so links line up with the workspace index. The dependency link always targets the real on-disk spelling.
+
+</details>
+
+<details markdown="1">
+<summary>R Markdown and Quarto files after they close</summary>
+
+For R Markdown or Quarto documents whose extension doesn't identify them as chunk documents, Raven remembers the editor's last R Markdown or Quarto language choice after the file closes. Disk changes and closed-file reads keep masking prose until Raven drops that file's cross-file state, so `source()` calls and directives written in prose don't start counting just because the document closed.
+
+</details>
+
+### Traversal budgets in large workspaces
+
+Raven follows the `source()` graph under two budgets that bound the cost of very dense graphs:
+
+- **`raven.crossFile.maxTransitiveDependentsVisited`** (default `50000`): the most files Raven visits while building one file's neighborhood.
+- **`raven.crossFile.maxChainDepth`** (default `64`): the deepest chain Raven follows.
+
+The defaults are sized so realistic workspaces never reach them, since a neighborhood can't be larger than the workspace. If a large, dense workspace does exhaust a budget, Raven stops following some `source()` links, and the symbols those files define can show up as **false `undefined-variable` warnings**. When that happens:
+
+- The editor shows a throttled warning naming the setting to raise.
+- `raven check` prints a one-line note: with the diagnostics on stdout for the default `text` output, or on stderr for `json` and `sarif` (see [Output streams](cli.md#output-streams)). This keeps budget-induced warnings distinguishable from real undefined variables in CI.
+
+Raise the relevant setting in `raven.toml` to analyze more of the graph. See [Configuration](configuration.md).
+
+### Implicit testthat/testit working directory
+
+testthat's `test_dir()` and `test_local()`, and testit's `test_dir()`, run helper and test files with `tests/testthat/` (or `tests/testit/`) as the working directory. Raven mirrors this automatically: for a file anywhere under `<workspace root>/tests/testthat/` or `tests/testit/`, relative forward paths in `source()` calls and forward directives resolve from that directory. This depends only on the folder layout, not on a `DESCRIPTION` file or package mode.
+
+It is a **soft default**, weaker than a `# raven: cd`:
+
+- An explicit `# raven: cd`, or one inherited from a parent file, overrides it.
+- It does **not** turn off the workspace-root fallback, and it never carries into files the test file sources. A sourced `scripts/helpers.R` still resolves its own `source()` calls from its own directory, with the fallback.
+- For a file **nested below** the test directory (such as `tests/testthat/fixtures/helper.R`), Raven also tries the file's own directory when the test-directory path misses, so file-relative paths that worked before keep working.
+- Backward directives are unaffected: they always resolve from the file's own directory.
+
+Path completion inside a `source()` string or forward directive in these files offers entries from the test directory. For a nested file it also offers entries from the file's own directory, matching the fallback above. A name present in both appears once, and the test-directory entry wins, as in resolution. An explicit or inherited `# raven: cd` turns off both implicit bases, and completion uses only that working directory.
+
+### Case-only mismatches
+
+For a path in a `source()` call or directive, an **exact-case match always wins**. If the path differs from the real on-disk filename **only by case**, as in `source("scripts/templates.r")` for an on-disk `templates.R`, Raven resolves it to the real file anyway, provided exactly one file matches case-insensitively. The file joins the dependency graph and its symbols stay visible, consistently across dependencies, scope, diagnostics, Cmd/Ctrl-click, and path completion.
+
+Raven reports the mismatch once, at the path's line, as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch): information on a case-insensitive filesystem (typical on macOS and Windows), warning on a case-sensitive one (typical on Linux), where R itself wouldn't find the file. Resolving it anyway keeps one clear warning from turning into many false `undefined-variable` warnings. If two on-disk files match case-insensitively, which can only happen on a case-sensitive filesystem, the path is ambiguous and stays unresolved (`unresolved-source-path`). Matching is ASCII-only.
+
+<details markdown="1">
+<summary>Backward directives and buffers opened under another case</summary>
+
+The leniency applies in **both directions**: to `source()` calls and forward directives (`# raven: source`, `run`, `include`), **and** to backward directives (`# raven: sourced-by`, `run-by`, `included-by`). A wrong-cased `# raven: sourced-by parent.r` still resolves to an on-disk `Parent.R` on a case-sensitive filesystem such as Linux CI, so the child keeps the parent's scope instead of producing a cascade of false `undefined-variable` warnings.
+
+The backward diagnostic has a different message. R never runs a backward directive, since it's a Raven-only comment, so the message doesn't claim R would fail. It asks you to fix the directive's casing to match the file on disk.
+
+The workspace-root fallback is separate from this leniency and stays forward-only: backward directives get the case leniency but never the fallback.
+
+If the buffer itself is open under a different case spelling than the file on disk, Raven connects that buffer to the on-disk file for live rechecking and content. The dependency link still targets the real on-disk spelling, and diagnostics for the open buffer still publish to the spelling the editor opened.
+
+</details>
+
+### How NSE declarations propagate
+
+<details markdown="1">
+<summary>Path rules, which files share declarations, and precedence</summary>
+
+Propagation uses the same dependency graph and path rules (`# raven: cd`, workspace-root fallback, `maxChainDepth`) as scope and package loading. Backward directives take part as ordinary links but gain no extra path fallback.
+
+A file shares declarations with its ancestors (the files that source it, directly or indirectly), and with everything those ancestors or the file itself source, directly or indirectly. Editing a `# raven: nse`, or a `# raven: func` whose formals feed positional matching in another file, in any connected file rechecks the files that rely on it.
+
+Propagation is deliberately **coarse and file-level**. A propagated declaration ignores its original line and governs the whole connected file. Raven consults it after its precise built-in NSE policy tables, so it can't loosen a function Raven already models. See [`# raven: nse` propagates across the source graph](directives.md#-raven-nse-propagates-across-the-source-graph) for precedence against local definitions and own-file declarations.
+
+</details>
+
+### When Raven calls R
+
+Raven's analysis is static: it parses your code and your installed packages' `NAMESPACE` files without a running R session. It does start a short-lived, non-interactive R process, the `R` on your `PATH` or [`raven.packages.rPath`](configuration.md#package-settings), in two situations. These are Raven's own processes, never your interactive R session, and when no R is found Raven falls back gracefully.
+
+1. **To find where your packages are installed.** Raven runs `.libPaths()` to find your library directories. Where packages live depends on your R installation, version, and project setup, including [`renv`](https://rstudio.github.io/renv/) project libraries, which Raven activates before reading the paths. Without R, Raven falls back to the standard platform locations plus any [`raven.packages.additionalLibraryPaths`](configuration.md#package-settings), which may miss user or project libraries.
+2. **To expand exports that `NAMESPACE` text can't list.** Most packages list exports with explicit `export(name)` lines, which Raven reads directly. A package can instead, or also, declare `exportPattern("<regex>")`: "export every object whose name matches". Raven can't expand that from the file alone, so it asks R with `getNamespaceExports()`. Several base R packages use `exportPattern`, as do a minority of CRAN packages. Without R, Raven approximates their exports from the package's `INDEX` file plus any explicit `export()` lines, which covers documented functions but may miss pattern-only or generated symbols.
+
+Run **Raven: Refresh package cache** after changing `.libPaths()` or running `renv::activate()` to re-run these queries.
+
+### Resolving exports without R
+
+When a package isn't in any local library, typically in CI where `.libPaths()` is empty, Raven still resolves its **export names** from an ordered list of sources, per package. What triggers this is a **missing package directory**, not a missing R. A package that *is* installed still resolves from its installed copy even with no R, and only its `exportPattern` exports fall back to the `INDEX` approximation.
+
+1. **Installed packages.** Parse the installed `NAMESPACE`, expanding `exportPattern` through R when possible and approximating from `INDEX` when not. Exact for the installed version.
+2. **The repo database.** A committed, project-specific `.raven/packages.json` that you generate with [`raven packages freeze`](cli.md#raven-packages-freeze). It's a frozen copy of step 1: exports, `Depends`, and datasets, exact for the versions installed when you generated it.
+3. **The `names.db` database.** Raven's package database, built append-only from a reference R installation plus CRAN and Bioconductor (through [r-universe](https://r-universe.dev)), keeping the **highest version** of each package. It isn't bundled with the binary; install it with `raven packages update` for broad CRAN and Bioconductor coverage. It has exports, `Depends`, and dataset names.
+
+The repo database outranks `names.db` because it's specific to your project. A repo without one still works in CI through `names.db` alone, when that database is present. Both databases carry **export names, `Depends`, and datasets only**: no `:::` internals and no function signatures, which still need a local install.
+
+This fallback affects **export resolution** only. It never changes whether a package counts as installed (see [Package names vs. install status](diagnostics.md#package-names-vs-install-status)). The full model, its accuracy caveats, and how to generate the repo database are in [Package database](package-database.md).
+
+### Base packages
+
+Base R packages are always available without a `library()` call: **base**, **methods**, **utils**, **grDevices**, **graphics**, **stats**, **datasets**. Raven uses this fixed list rather than asking R which base packages exist. It asks R for your *installed* packages, through the library paths. Base-package *exports* are still expanded through R, since they use `exportPattern` (see [When Raven calls R](#when-raven-calls-r)).
+
+Lazy-loaded datasets are a related special case. Packages expose data objects, such as `mtcars` and `iris` from base `datasets`, `flights` from **nycflights13**, or `diamonds` from **ggplot2**, that appear neither in `NAMESPACE` `export()` lines nor in `getNamespaceExports()`. Base-package datasets are always available. A non-base package's datasets become available after its `library()` call, like its function exports, and resolve through `Depends` and meta-packages (`library(tidyverse); diamonds`).
+
+<details markdown="1">
+<summary>How Raven finds dataset names</summary>
+
+How Raven discovers datasets depends on whether the package uses R's LazyData mechanism:
+
+- **LazyData packages** (whose `DESCRIPTION` sets `LazyData: true`, recognizable by a `data/Rdata.rdb` file) build one binary database of all data objects. Their `data/` file names don't reliably list object names: **survival** ships `lung` with no `data/lung.rda` file. So Raven asks R with `data(package = "pkg")$results` for the full set. Without R it falls back to the file names, with lower accuracy.
+- **Packages without LazyData** store datasets as individual `.rda`/`.RData` files in `data/`. Raven reads those file names and the `INDEX` file directly, with no R process.
+
+</details>
+
+<details markdown="1">
+<summary>How <code>data()</code> calls bind names</summary>
+
+A `data()` call binds a dataset's objects from the call onward, as in R. `data(api, package = "survey")` puts every object the package's `api` data file defines (`apiclus1`, `apistrat`, and so on) in scope, even when one data file ships several differently named objects.
+
+Because R loads those objects into the calling environment, a `data()` call overwrites earlier bindings of the same names there, and later assignments can overwrite the data objects again.
+
+The bare form `data(api)`, with no `package =`, searches the packages attached at or before the call and then the default base packages, binding the objects from the first package that provides the dataset. This mirrors R, where the first search-path match wins and attached packages come before base packages. Raven doesn't track attachment order, so when several attached packages provide the same dataset, it picks the alphabetically first.
+
+The literal argument (`api`) is always bound too, so behavior degrades gracefully without R. Resolving the *object* names beyond the file name needs a listing of the package's `data/` directory, captured when the package is loaded; `raven check` loads the packages named in `data(package = …)` for this.
+
+A package's internal `sysdata.rda` objects, such as `cli`'s internal `emojis` table, are never exposed this way. `library(cli)` followed by `emojis` is a real R error, and Raven flags it.
+
+</details>
+
+### `pacman::p_load()`
+
+<details markdown="1">
+<summary>Which <code>p_load()</code> calls attach packages</summary>
+
+A qualified `pacman::p_load()` is always recognized. A bare `p_load()` is recognized only when `pacman` is already attached on the resolved search path and no local binding shadows `p_load`. That includes `pacman` inherited through an explicit `source()` relationship. Calling `loadNamespace("pacman")` alone doesn't enable the bare form.
+
+Quoted and unquoted package arguments work, as does an exact static `char = c("pkg1", "pkg2")`, or a same-file static character vector assigned once. `char` follows pacman's runtime rules and replaces the ordinary `...` arguments. Dynamic, malformed, and `character.only = TRUE` forms are left unresolved rather than evaluated.
+
+Raven doesn't install or update packages, and doesn't treat `p_load_gh()` as attaching a package.
+
+</details>
+
+<a id="devtoolsload_all--virtual-attached-package"></a>
+### `devtools::load_all()` as an attached package
+
+`devtools::load_all()`, `pkgload::load_all()`, and a bare `load_all()` are modeled as attaching the package under development. From the call onward, Raven makes the package's internal symbols available, as `library()` does for an installed package's exports: exported and internal `R/` definitions, `R/sysdata.rda` objects, names bound in `.onLoad`/`.onAttach`, and `NAMESPACE` imports.
+
+They propagate like `library()`:
+
+- **Position-aware**: symbols appear only after the `load_all()` call.
+- **Forward only**: a `source()` child whose parent calls `load_all()` inherits the internals. A parent doesn't pick them up from a child's `load_all()`.
+- **Through chains**: they pass through any number of `source()` hops.
+- **From any parent**: when a file has several parents and at least one calls `load_all()`, the child gets the internals.
+
+A workspace-root `.Rprofile` that calls `load_all()` gives the package internals to ordinary scripts. In package mode, `R/` source files, package tests, and built-documentation directories don't get them through `.Rprofile`, since package mode already provides them. See [.Rprofile startup files](rprofile.md).
+
+A file **outside the package workspace root** that calls `load_all()` does not get the package internals, so unrelated scratch files keep their real diagnostics.
+
+Unlike `library(yourpkg)`, `load_all()` exposes internals even when they aren't exported, matching `load_all()`'s own `export_all = TRUE` default. See [Package development](r-package-dev.md#scripts-that-call-devtoolsload_all).
+
+### Availability vs. ownership
+
+A symbol made visible through a meta-package, an attached package, or a `Depends` chain has two package answers, which Raven keeps apart:
+
+- **Availability**: *which loaded package made this visible?* This is what stops undefined-variable warnings. `library(tidyverse)` makes `mutate` available because Raven combines the exports of the packages tidyverse attaches.
+- **Ownership**: *which package actually provides the symbol?* This package supplies hover help, the help panel, signature help, completion detail, and the NSE policy for data-masking arguments. For `mutate` under `library(tidyverse)`, the owner is dplyr.
+
+This matters because `help("mutate", package = "tidyverse")` is empty: only dplyr owns the topic. So `library(tidyverse); mutate(...)` stays *available* through tidyverse but gets hover, help, signatures, completion detail, and NSE policy from dplyr. A direct `library(dplyr)` and an explicit `dplyr::mutate(...)` resolve to dplyr as before. A package's own exports are always owned by that package, even when it's the meta-package. When Raven can't find the owning package, the usual not-found behavior applies.
+
+### Apply-family loads
+
+Raven recognizes package loads written as apply-family calls when every package name is known statically:
 
 ```r
 libs <- c("dplyr", "tidyr")
 sapply(libs, require, character.only = TRUE)
 ```
 
-This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms
-(`map`, `walk`, `map_chr`, etc., bare or `purrr::`-qualified). The package
-vector must be either an inline non-empty `c("a","b",...)` of string literals
-(literal `NULL` entries are allowed and dropped, matching base `c()`),
-or a same-file variable assigned exactly once at the top level to such a vector
-via `<-`/`=` or eligible bare/base-qualified `assign()`. For `assign()`, Raven
-accepts only destinations proven to create the file's top-level binding: the
-default current frame when the call is top-level (`pos` and `envir` omitted),
-`pos = 1` or `1L` with `envir` omitted, or `envir = .GlobalEnv`,
-`globalenv()`, or `base::globalenv()` with `pos` omitted; bare `.GlobalEnv` and
-`globalenv()` must be unshadowed. In each form, `inherits` must be omitted,
-missing, or literal `FALSE` (destination-equivalent to omission for these
-otherwise compatible forms). Supplying both `pos` and `envir`, a dynamic or
-non-global destination, any other `inherits` value, or a nested call cannot
-supply a candidate. Other conditional, reassigned, or removed bindings likewise only invalidate the
-variable. `character.only = TRUE` must be present (without it, R itself would
-not load the strings as packages). Empty vectors (`c()`, `character(0)`),
-dynamic constructions such as `paste0(...)`, `tolower(x)`, or
-`c(libs1, libs2)`, function-parameter origins, and values defined in another
-file are silently ignored.
+This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms (`map`, `walk`, `map_chr`, and so on, bare or `purrr::`-qualified). `character.only = TRUE` must be present; without it, R itself wouldn't load the strings as packages.
 
-### Deterministic Package-Loader Loops
+<details markdown="1">
+<summary>Which package vectors count</summary>
 
-Raven recognizes the common explicit-loop equivalent when the package vector
-meets the same static rules:
+The package vector must be one of:
+
+- An inline, non-empty `c("a", "b", ...)` of string literals. Literal `NULL` entries are allowed and dropped, as base `c()` does.
+- A same-file variable assigned exactly once at the top level to such a vector, with `<-`, `=`, or an eligible bare or `base::`-qualified `assign()`.
+
+For `assign()`, Raven accepts only destinations proven to create the file's top-level binding:
+
+- the default current frame when the call is at top level (`pos` and `envir` omitted);
+- `pos = 1` or `1L` with `envir` omitted;
+- `envir = .GlobalEnv`, `globalenv()`, or `base::globalenv()` with `pos` omitted. Bare `.GlobalEnv` and `globalenv()` must be unshadowed.
+
+In each form, `inherits` must be omitted, missing, or literal `FALSE`, which is equivalent to omitting it here. Supplying both `pos` and `envir`, a dynamic or non-global destination, any other `inherits` value, or a nested call means the call can't supply the vector. Conditional, reassigned, or removed bindings likewise make the variable unusable.
+
+Empty vectors (`c()`, `character(0)`), dynamic constructions such as `paste0(...)`, `tolower(x)`, or `c(libs1, libs2)`, function parameters, and values defined in another file are ignored silently.
+
+</details>
+
+### Deterministic package-loader loops
+
+Raven recognizes the explicit-loop equivalent when the package vector meets the same rules as [apply-family loads](#apply-family-loads):
 
 ```r
 packages <- c("dplyr", "ggplot2", NULL)
@@ -321,25 +641,18 @@ for (package in packages) {
 source("analysis.R")
 ```
 
-The `library()` or `require()` call must be an unconditional top-level
-statement in the loop body, must load the loop iterator, and must set
-`character.only = TRUE`. Raven records the attachments only after the loop
-finishes, so they propagate into later sourced files without appearing inside
-the loop itself. Dynamic vectors, vectors reassigned before the loop,
-conditional loaders, a different package expression, iterator writes/removals
-before the loader, locally shadowed `library`/`require` helpers, and loops that
-may `break` or `return()` before loading every package are ignored. A named
-vector is resolved only for a loop known to execute eagerly in the file; a
-deferred function-body loop can still use an inline `c("a", "b")` sequence.
+<details markdown="1">
+<summary>What the loop must look like</summary>
 
-### targets::tar_option_set() Worker Packages
+The `library()` or `require()` call must be an unconditional top-level statement in the loop body, must load the loop variable, and must set `character.only = TRUE`. Raven records the packages as attached only after the loop finishes, so they reach later sourced files without appearing inside the loop itself.
 
-Raven models a [{targets}](https://docs.ropensci.org/targets/)
-`tar_option_set(packages = ...)` declaration as a file/pipeline-level worker
-package contribution, not as a source-positioned `library()` call. The package
-set is therefore available throughout the declaring targets pipeline and to
-every member of each `tar_source()` batch, regardless of whether the declaration
-appears before or after the batch:
+Raven ignores dynamic vectors, vectors reassigned before the loop, conditional loaders, a different package expression, writes to or removal of the loop variable before the loader, locally shadowed `library` or `require`, and loops that may `break` or `return()` before loading every package. A named vector is resolved only for a loop known to run eagerly in the file. A loop inside a function body, which runs later, can still use an inline `c("a", "b")` sequence.
+
+</details>
+
+### `targets::tar_option_set()` worker packages
+
+Raven treats a [{targets}](https://docs.ropensci.org/targets/) `tar_option_set(packages = ...)` declaration as packages for the whole pipeline, not as a `library()` call at one position. The packages are available throughout the declaring pipeline and in every member of each `tar_source()` batch, whether the declaration comes before or after the batch:
 
 ```r
 # _targets.R
@@ -350,129 +663,69 @@ tar_option_set(packages = c("dplyr", "tidyr"))
 # dplyr and tidyr resolve throughout _targets.R and in every tar_source() member.
 ```
 
-This special propagation is limited to targets execution. It does not flow into
-an ordinary `source()` child or a `source(list.files(...))` batch. Actual
-`library()`, `require()`, and `loadNamespace()` calls remain position-sensitive
-and retain their normal cross-file propagation behavior.
+This applies only to targets execution. It doesn't reach an ordinary `source()` child or a `source(list.files(...))` batch. Real `library()`, `require()`, and `loadNamespace()` calls stay position-sensitive and propagate normally.
 
-Details:
+<details markdown="1">
+<summary>Exact rules for <code>tar_option_set()</code></summary>
 
-- **Bare vs. qualified callee.** The qualified spellings
-  `targets::tar_option_set(...)` / `targets:::tar_option_set(...)` are
-  recognized directly. The bare spelling `tar_option_set(...)` is recognized
-  only when the same file also attaches targets via `library(targets)` /
-  `require(targets)` — anywhere in the file, before or after the call — and the
-  bare name is not locally shadowed. A qualified call remains recognized when a
-  local binding named `tar_option_set` exists.
-- **Named `packages =` only.** `tar_option_set`'s first formal is
-  `tidy_eval`, not `packages`, so positional forms like
-  `tar_option_set(TRUE, c("dplyr"))` are deliberately not matched.
-- **Accepted value shapes.** A single string literal
-  (`packages = "dplyr"`), an inline non-empty `c("a", "b", ...)` of string
-  literals, or a same-file variable assigned exactly once at the top level to
-  such a vector (including eligible bare/base-qualified `assign()` with the
-  same global-destination rules as apply-family loads). Nested, conditional,
-  dynamic, non-global, reassigned, or removed bindings, `character(0)`, and
-  empty `c()` are ignored. Raven never evaluates R to resolve a dynamic value.
-- **Per-literal anchoring.** `tar_option_set()` calls routinely span many
-  lines, so each package's missing-package diagnostic is anchored at that
-  package's own string literal — a `# nolint` on the literal's line suppresses
-  it. The variable-resolved shape anchors at the call's end instead.
-- **Union across calls.** Multiple `tar_option_set()` calls in one file union
-  their `packages =` vectors. targets' real runtime semantics are
-  last-call-wins, but Raven deliberately favors false negatives here.
+- **Bare vs. qualified.** `targets::tar_option_set(...)` and `targets:::tar_option_set(...)` are always recognized, even when a local binding named `tar_option_set` exists. The bare `tar_option_set(...)` is recognized only when the same file also attaches targets with `library(targets)` or `require(targets)`, anywhere in the file, and the bare name isn't locally shadowed.
+- **Named `packages =` only.** `tar_option_set`'s first formal is `tidy_eval`, not `packages`, so positional forms like `tar_option_set(TRUE, c("dplyr"))` aren't matched.
+- **Accepted values.** A single string literal (`packages = "dplyr"`), an inline non-empty `c("a", "b", ...)` of string literals, or a same-file variable assigned exactly once at the top level to such a vector. That includes an eligible bare or `base::`-qualified `assign()`, with the same global-destination rules as [apply-family loads](#apply-family-loads). Nested, conditional, dynamic, non-global, reassigned, or removed bindings, `character(0)`, and empty `c()` are ignored. Raven never runs R to resolve a dynamic value.
+- **Per-package location.** `tar_option_set()` calls often span many lines, so each package's missing-package diagnostic sits on that package's own string literal, and a `# nolint` on that line suppresses it. When the packages come from a variable, the diagnostic sits at the end of the call.
+- **Union across calls.** Several `tar_option_set()` calls in one file combine their `packages =` vectors. At runtime in targets the last call wins, but Raven deliberately prefers missing a problem to reporting a false one here.
 
-### targets::tar_source() Scripts
+</details>
 
-Raven expands static `targets::tar_source()` calls and adds their `.R` / `.r`
-scripts to the same dependency and scope model as `source()`. The qualified
-`targets::` / `targets:::` spellings are recognized directly; the bare
-`tar_source()` spelling requires an unshadowed top-level targets attachment.
-`files =` may be a string, a non-empty literal character vector, or a
-single-assignment top-level variable holding one of those shapes. Directories
-are walked recursively in deterministic path order; hidden entries are skipped
-unless the hidden path itself was named explicitly. Ordering compares the
-relative path's platform bytes/code units, which approximates
-`sort(..., method = "radix")` under `LC_COLLATE=C`. Project-excluded scripts do
-not participate in the batch. Locale-specific collation
-and mixed-case/non-ASCII names can therefore execute in a different order in R;
-use consistently cased ASCII script names when sibling order matters.
+### `targets::tar_source()` scripts
 
-The scripts execute as one ordered batch. Each member sees `_targets.R` state
-from before the call plus the definitions, removals, and package attachments
-produced by earlier members. A later member replaces an earlier binding of the
-same name. A member never sees a later sibling. `change_directory = TRUE` is
-honored, including for ordinary `source()` calls nested inside a member.
-The file-level `tar_option_set(packages = ...)` set seeds every member, including
-ordinal zero, while actual package loads from members continue to flow through
-the ordered environment.
+Raven expands static `targets::tar_source()` calls and adds their `.R`/`.r` scripts to the same dependency and scope model as `source()`. The scripts run as one ordered batch. Each one sees `_targets.R` as it was before the call, plus the definitions, removals, and package attachments from earlier scripts. A later script replaces an earlier binding of the same name, and no script sees a later one.
 
-In the language server, workspace watcher events keep membership live:
-creating, deleting, or renaming a script under a finalized request refreshes
-the parent metadata, artifacts, dependency edges, and affected diagnostics
-without editing `_targets.R`. Missing candidate paths, case-corrected paths,
-and symlink targets remain watchable when their paths are covered by the
-editor's workspace watcher. External paths and symlink targets outside that
-coverage are refreshed on the next workspace refresh/reopen (and every fresh
-`raven check` run), not by an independent external watcher.
+<details markdown="1">
+<summary>Which calls and files count, and in what order</summary>
 
-Scope resolution carries each batch execution's derived working-directory
-context through ordinary nested `source()` calls, so repeated members can
-contribute different symbols in different contexts without creating
-occurrence-specific graph nodes. The dependency graph itself remains URI-keyed:
-for a nested call whose lexical target differs between executions,
-go-to-definition, missing-file checks, and edit-triggered revalidation use the
-single URI-global edge. Use distinct small wrapper scripts when those
-graph-backed features must distinguish the executions as well as scope does.
+`targets::` and `targets:::` spellings are always recognized. A bare `tar_source()` needs an unshadowed top-level attachment of targets. `files =` may be a string, a non-empty literal character vector, or a top-level variable assigned once to one of those.
 
-Only statically determined calls participate. Dynamic `files =` expressions,
-computed `change_directory` values, and calls hidden in functions or quoted
-expressions are ignored. A missing literal path can become active after a
-workspace event, but an external missing path cannot be watched reliably.
+Directories are walked recursively in a fixed path order. Hidden entries are skipped unless the hidden path itself was named. Order compares the relative paths' platform bytes or code units, which approximates `sort(..., method = "radix")` under `LC_COLLATE=C`. Locale-specific collation and mixed-case or non-ASCII names can therefore run in a different order in R; use consistently cased ASCII names when sibling order matters. Project-excluded scripts don't take part.
 
-Finalized metadata and the dependency graph remain indexed by URI, not by
-execution occurrence. Consequently, a nested `tar_source()` batch in one
-physical script is finalized once under that URI's global metadata context;
-context-dependent forward directives and propagated `# raven: nse` /
-`# raven: func` facts likewise retain their URI-global graph behavior. Scope
-can carry the two-valued supplied-`PathContext` mode through ordinary nested
-`source()` calls, but it does not create a second metadata or graph identity.
-When separate executions truly need distinct nested batches, directives, NSE
-contracts, navigation, or edit revalidation, route them through distinct small
-wrapper/loader scripts so each execution has its own URI.
+`change_directory = TRUE` is honored, including for ordinary `source()` calls inside a member. The file-level `tar_option_set(packages = ...)` set applies to every member, including the first, while package loads inside members flow through the ordered batch as usual.
+
+Only calls Raven can determine statically take part. Dynamic `files =` expressions, computed `change_directory` values, and calls inside functions or quoted expressions are ignored.
+
+</details>
+
+<details markdown="1">
+<summary>Live updates in the editor</summary>
+
+Creating, deleting, or renaming a script in a `tar_source()` path updates the batch and the affected diagnostics without editing `_targets.R`. Missing paths, case-corrected paths, and symlink targets stay watched when the editor's workspace watcher covers them. Paths outside that coverage, including external symlink targets, refresh on the next workspace refresh or reopen and on every `raven check` run. A missing literal path can become active after a workspace change, but a missing path outside the workspace can't be watched reliably.
+
+</details>
+
+<details markdown="1">
+<summary>Scripts that run in more than one batch</summary>
+
+When the same script runs in several batches with different working directories, scope follows each run, so its nested `source()` calls can contribute different symbols in each.
+
+Navigation, missing-file checks, and rechecking after an edit don't follow each run separately. They treat each script as one file with one target per `source()` call, so a nested call whose target differs between runs uses a single target. The same holds for a nested `tar_source()` batch inside one script, which is expanded once for that file, and for forward directives that depend on the working directory and propagated `# raven: nse` / `# raven: func` declarations.
+
+When separate runs need distinct nested batches, directives, NSE contracts, navigation, or rechecking, give each run its own small wrapper or loader script.
+
+</details>
 
 ### tarchetypes target factories and report documents
 
-Raven extends the same static `{targets}` pipeline model to common
-[`{tarchetypes}`](https://docs.ropensci.org/tarchetypes/) archetypes. Target
-names form a separate namespace from ordinary R variables: a declaration can
-satisfy `tar_read()` / `tar_load()` without making the name an R binding, and a
-report relationship never lends the pipeline's ordinary variables, packages,
-or `# raven: nse` / `# raven: func` declarations into the document.
+Raven extends the same static `{targets}` model to common [`{tarchetypes}`](https://docs.ropensci.org/tarchetypes/) archetypes. Target names are a separate namespace from R variables: a declaration can satisfy `tar_read()` or `tar_load()` without making the name an R binding, and a report never receives the pipeline's ordinary variables, packages, or `# raven: nse` / `# raven: func` declarations.
 
-Direct `targets::` / `targets:::` and `tarchetypes::` / `tarchetypes:::` calls
-are recognized without an attachment. A bare call requires the corresponding
-package to be attached by a top-level `library()` / `require()` and no local
-binding may shadow the callee. User-defined same-named functions therefore keep
-ordinary R semantics. Aliases and programmatic invocation are not followed.
+`targets::`/`targets:::` and `tarchetypes::`/`tarchetypes:::` calls are recognized without an attachment. A bare call needs the package attached by a top-level `library()` or `require()`, and no local binding may shadow the function, so your own functions with the same names keep ordinary R behavior. Aliases and programmatic calls aren't followed.
 
 #### Static target declarations
 
-Raven records direct symbol names from `targets::tar_target()` and these
-statically modelled tarchetypes factories:
+Raven records target names from `targets::tar_target()` and these tarchetypes factories:
 
-- storage/file factories: `tar_url()`, `tar_file()`, `tar_file_fast()`,
-  `tar_rds()`, `tar_qs()`, `tar_keras()`, `tar_torch()`,
-  `tar_arrow_feather()`, `tar_parquet()`, `tar_fst()` and its data-frame/data-
-  table/tibble variants, `tar_nanoparquet()`, and the superseded `tar_aws_*()`
-  variants;
-- control/group factories: `tar_file_read()` (the requested name plus its
-  `_file` helper), `tar_change()` and `tar_force()` (the requested name plus
-  their `_change` helper), `tar_skip()`, `tar_group_by()`, `tar_group_select()`,
-  `tar_group_count()`, `tar_group_size()`, and `tar_combine()`;
-- document factories: `tar_render()`, `tar_knit()`, and `tar_quarto()`.
+- Storage and file factories: `tar_url()`, `tar_file()`, `tar_file_fast()`, `tar_rds()`, `tar_qs()`, `tar_keras()`, `tar_torch()`, `tar_arrow_feather()`, `tar_parquet()`, `tar_fst()` and its data-frame, data-table, and tibble variants, `tar_nanoparquet()`, and the superseded `tar_aws_*()` variants.
+- Control and group factories: `tar_file_read()` (the requested name plus its `_file` helper), `tar_change()` and `tar_force()` (the requested name plus their `_change` helper), `tar_skip()`, `tar_group_by()`, `tar_group_select()`, `tar_group_count()`, `tar_group_size()`, and `tar_combine()`.
+- Document factories: `tar_render()`, `tar_knit()`, and `tar_quarto()`.
 
-`tar_plan()` contributes each exact named argument as a target declaration:
+`tar_plan()` declares a target for each exactly named argument:
 
 ```r
 tarchetypes::tar_plan(
@@ -481,234 +734,46 @@ tarchetypes::tar_plan(
 )
 ```
 
-The named command is delayed code. Unnamed factory objects remain independently
-analyzable, so their own target and path policies still apply. Partial argument
-matching, missing values, computed names, and calls inside functions or quoted
-code fail closed.
+The named command is delayed code. Unnamed factory calls inside are analyzed on their own, so their own target and path rules still apply. Partial argument matching, missing values, computed names, and calls inside functions or quoted code fail closed.
 
 #### Static `tar_map()` names
 
-`tar_map()` generates one set of targets per row of a value table. Raven
-predicts those generated names when the table and selection are **literal and
-statically resolvable** — a literal `list()` / `data.frame()` / `tibble()` with
-named scalar or literal-vector columns, a static column selection, and a literal
-delimiter — reproducing tarchetypes' own name mangling. A reference to a
-generated name navigates to the base target token, since the generated spelling
-never appears in source. Expansion is all-or-nothing: if any generated name is
-not statically reproducible, Raven expands none of them, and the unsuffixed
-target objects passed through `...` are not themselves pipeline targets. Dynamic
-tables, selections, or delimiters — and the runtime-hash fallback for an empty
-selection — are left unexpanded. The exact grammar and its edge cases are in
-[Limitations — targets and tarchetypes](limitations.md#targets-and-tarchetypes).
+`tar_map()` generates a set of targets per row of a value table. Raven predicts the generated names when the table and selection are **literal**: a literal `list()`, `data.frame()`, or `tibble()` with named scalar or literal-vector columns, a static column selection, and a literal delimiter. It reproduces tarchetypes' own name mangling. A reference to a generated name navigates to the base target, since the generated spelling never appears in your code.
+
+Expansion is all-or-nothing: if any generated name can't be reproduced statically, Raven expands none of them, and the unsuffixed targets passed through `...` aren't pipeline targets themselves. Dynamic tables, selections, or delimiters, and the runtime-hash fallback for an empty selection, are left unexpanded. The exact grammar and edge cases are in [Limitations: targets and tarchetypes](limitations.md#targets-and-tarchetypes).
 
 #### Connected R Markdown and Quarto documents
 
-A document factory creates a dependency edge when both its target name and path
-are static and the literal path names a document Raven can analyze:
+A document factory links to its document when both the target name and the path are static and the path names a document Raven can analyze:
 
-- `tar_render()` / `tar_knit()`: `.Rmd` or `.Rmarkdown`;
-- single-document `tar_quarto()`: `.qmd`, `.Rmd`, or `.Rmarkdown`.
+- `tar_render()` and `tar_knit()`: `.Rmd` or `.Rmarkdown`.
+- Single-document `tar_quarto()`: `.qmd`, `.Rmd`, or `.Rmarkdown`.
 
-Paths use ordinary forward-path rules: an explicit/inherited `# raven: cd`
-applies, and otherwise Raven may use the workspace-root fallback. Cmd-click on
-the literal opens an existing document. A missing document reports
-`unresolved-source-path` at the configured missing-file severity and remains a
-watched graph target, so creating or deleting it refreshes the relationship.
-Quarto project directories and computed paths are deliberately not inferred.
+Paths follow the ordinary forward rules: an explicit or inherited `# raven: cd` applies, and otherwise the workspace-root fallback may apply. Cmd/Ctrl-click on the path opens an existing document. A missing document reports `unresolved-source-path` at the configured missing-file severity and stays watched, so creating or deleting it refreshes the link. Quarto project directories and computed paths aren't inferred.
 
-Inside connected R chunks, `targets::tar_read(name)` and direct names in
-`targets::tar_load(name)` / `targets::tar_load(c(name1, name2))` resolve against
-the pipeline's static target declarations. Target constructors written inside a
-report chunk do not declare pipeline targets or create nested report links. Bare
-calls follow the same attachment-and-shadowing rule. Missing names use the `undefined-variable`
-severity and suppression controls, with a target-specific message, and
-cmd-click navigates to the declaration. Dynamic tidyselect expressions such as
-`tar_load(starts_with(prefix))` are left unresolved rather than expanded.
+Inside the connected document's R chunks, `targets::tar_read(name)` and the plain names in `targets::tar_load(name)` or `targets::tar_load(c(name1, name2))` resolve against the pipeline's static target declarations. Target constructors written inside a report chunk don't declare pipeline targets or create nested report links. Bare calls follow the same attachment and shadowing rule. A missing name uses the `undefined-variable` severity and suppression controls, with a target-specific message, and Cmd/Ctrl-click goes to the declaration. Dynamic tidyselect expressions such as `tar_load(starts_with(prefix))` are left unresolved.
 
-The report edge participates in watching and edit-triggered revalidation in
-both directions but is intentionally non-lending for ordinary R scope. Target
-authority starts from the declaring pipeline and its ordinary lending source
-relationships: a helper sourced only while rendering the report cannot declare
-pipeline targets. Editing a pipeline declaration republishes connected reports;
-editing a report target reference republishes the declaring pipeline and its
-connected target-authority set. Canonical filesystem identities are shared
-across case/symlink aliases, while navigation prefers the URI of a matching live
-open document.
+<details markdown="1">
+<summary>How reports and pipelines recheck each other</summary>
 
-### Keeping Packages in Sync
+The report link is watched and rechecked in both directions, but it never lends ordinary R scope. Only the pipeline and the files it sources in the ordinary way can declare targets; a helper sourced only while the report renders can't.
 
-Raven watches `.libPaths()` directories and invalidates caches when packages are installed, upgraded, or removed. If the watcher misses a change (e.g., after `renv::activate()`), run **Raven: Refresh package cache** from the command palette.
+Editing a pipeline declaration rechecks connected reports. Editing a target reference in a report rechecks the declaring pipeline and the other files that declare its targets. Case and symlink spellings of the same file count as one file, and navigation opens the spelling you already have open.
 
-See [Configuration](configuration.md) for watcher settings (`packages.watchLibraryPaths`, `packages.watchDebounceMs`).
+</details>
 
-## Module & import systems
+### `$` and `@` member resolution
 
-The `box` and `import` packages define selective-import systems that Raven
-models distinctly from `source()` and `library()` — binding only the names an
-import requests rather than merging a file's definitions or attaching a whole
-package. They are documented separately in
-[Module & import systems](modules.md).
+When you Cmd/Ctrl-click `foo$bar` (or `foo@slot` for S4 objects), Raven resolves the member against `foo`, not as a free variable. It looks for:
 
-## NSE directive propagation
+- Member assignments: `foo$bar <- …`, `foo["bar"] <- …`, or `foo[["bar"]] <- …` (the string-subscript forms apply to `$` only), and `foo@slot <- …` for S4 slots.
+- Named arguments in constructors such as `list()`, `c()`, `data.frame()`, `tibble()`, `data.table()`, `environment()`, `list2env()`, and `new()`.
 
-`# raven: nse` declarations (see [Non-Standard Evaluation](non-standard-evaluation.md) and [directives](directives.md#nse-declarations)) are cross-file facts, like defined symbols and `library()` loads: a declaration governs undefined-variable suppression for its named callee in every file connected to it through the resolved `source()` graph, in both directions and transitively. Declare a helper's NSE contract once — next to its `library()` call, its definition, or in a sourced setup file — and the corresponding false positives are suppressed at call sites in the connected files.
+Completions after `$` use the same rules: typing `foo$` offers the known members of `foo`.
 
-Propagation reuses the same dependency graph and path-resolution rules (`# raven: cd`, workspace-root fallback, `max_chain_depth`) as the scope and package facts above; backward directives participate as ordinary edges but gain no extra path fallback. The propagation set is the revalidation-consistent neighborhood — a file's ancestors plus the descendant subtrees of itself and its ancestors — so editing a `# raven: nse` (or a `# raven: func` whose formals feed cross-file positional matching) in any connected file revalidates the dependents that rely on it. Cross-file propagation is intentionally **coarse and file-level**: a propagated directive ignores its original line and governs the whole connected file, and it is consulted below the precise built-in NSE policy tables so it cannot coarsen a known verb. Two unconnected files never share NSE directives.
+## See also
 
-## Self-contained sourced files (`# raven: self-contained`)
-
-By default a file's cross-file scope includes a **backward** contribution: the
-bindings visible at every `source()` call that pulls the file in. For ordinary
-script fragments, that matches R's dynamic behavior: the file may intentionally
-use variables created by its caller.
-
-Some sourced files are different. A shared helper or setup file may be
-self-contained: it defines its own inputs, loads its own packages, and sources
-its own helper chain. The header directive `# raven: self-contained`
-(alias: `# raven: standalone`) opts that file out of the backward caller
-contribution. Raven resolves it **in isolation** from callers, while still
-letting its own definitions and `library()` loads flow forward to every caller.
-
-This is both more precise and faster for true source hubs. In deeply nested,
-high-fan-out graphs - for example, a setup file sourced by dozens of scripts
-that itself sources dozens of files through a nested chain - the directive can
-let Raven reuse one caller-independent scope instead of re-resolving the same
-closure in many caller contexts.
-
-See [Speeding Up Cross-File Analysis](cross-file-analysis-performance.md) for when to use
-`# raven: self-contained`, and [Directives](directives.md#self-contained-sourced-files)
-for the exact syntax. `# raven: nse` / `# raven: func` propagation over
-`source()` edges is unaffected (it is graph-level, not scope-level).
-
-## Position-Aware Scope
-
-Symbols from sourced files are only available **after** the `source()` call:
-
-```r
-x <- 1
-source("a.R")  # Symbols from a.R available after this line
-y <- foo()     # foo() from a.R is now in scope
-```
-
-This applies to both `source()` calls and forward directives. The scope model aims to reflect runtime availability for the statically determinable cases — see [Symbol Recognition](#symbol-recognition) below for what's covered.
-
-## Symbol Recognition
-
-Raven recognizes these R constructs as definitions:
-
-- `name <- expr` / `name <<- expr` / `expr -> name` / `expr ->> name`
-- `name = expr` (in assignment context)
-- `assign("name", expr)` (string-literal only)
-
-For dynamically-created symbols (`eval()`, `load()`, dynamic `assign()`), use [declaration directives](directives.md#declaration-directives).
-
-### Symbol Removal (rm/remove)
-
-Raven tracks `rm()` and `remove()` calls to maintain accurate scope:
-
-```r
-x <- 1
-rm(x)
-x  # Warning: undefined variable
-```
-
-Supported: `rm(x)`, `rm(x, y)`, `rm(list = c("x", "y"))`. Dynamic patterns like `rm(list = ls())` are skipped.
-
-## How This Feeds Into Features
-
-The dependency graph and scope model power several features:
-
-- **[Diagnostics](diagnostics.md)** — undefined variable warnings respect cross-file scope and loaded packages
-- **[Completions](completion.md)** — symbols from sourced files and packages appear with source attribution
-- **[Find References](find-references.md)** — locates occurrences by name across all open and indexed files (a flat name match, *not* dependency-graph-scoped)
-- **Go-to-definition** — navigates to definitions in other files
-- **Hover** — shows where a symbol is defined and which package it comes from
-
-## Advanced
-
-### Backward Dependency Modes
-
-The `raven.crossFile.backwardDependencies` setting controls how Raven discovers which files source the current file.
-
-**`"auto"` (default):** Raven scans the workspace for `source()` calls and infers backward relationships automatically. No `# raven: sourced-by` directives needed. Diagnostics are deferred until the workspace scan completes to avoid false positives.
-
-**`"explicit"`:** Only relationships declared via `# raven: sourced-by` directives are used. Use this if auto-inference produces unwanted results (e.g., a file sourced by multiple parents with conflicting scopes).
-
-**Per-file opt-out:** Adding an explicit `# raven: sourced-by` directive to a file disables auto-inference for that file.
-
-See [Configuration](configuration.md) for the setting.
-
-### Open buffers, disk state, and closing files
-
-While a file is open, its buffer is authoritative: unsaved edits that add or remove `source()` calls or directives update the dependency graph live, and disk changes to that file are ignored until it closes.
-
-Open-buffer authority is alias-aware for file URIs. If a buffer is opened through a case-only spelling difference (for example `child.R` for an on-disk `child.r`) or through a symlink path that resolves to a workspace file, Raven treats the corresponding graph URI as open: dependents revalidate as you type, cross-file scope reads the live buffer, package-internal symbols and package-sibling revalidation use the canonical package file, self-package NSE policy and parameter/signature package scope use the canonical workspace identity, and watched-file resyncs for the canonical spelling are skipped until close. The same authority applies to a workspace-root `.Rprofile`: an alias-opened live buffer owns the startup prelude while it is open, and alias-opened workspace scripts receive the prelude through the canonical workspace path. Diagnostics still publish to the URI spelling the editor opened. Closed-file graph/index keys remain raw path spellings rather than symlink-canonicalized paths: Raven avoids full filesystem canonicalization because it follows symlinks and can diverge from the uncanonicalized workspace-index keys. The source-path resolver may still correct case-only mismatches to the on-disk spelling so graph edges line up with the workspace index.
-
-When you close a file without saving, Raven re-reads just that file from disk and converges the graph back to disk truth — a `source()` edge added only in the discarded buffer disappears, and an edge the buffer had removed comes back. If the file no longer exists on disk, its graph entry is removed entirely. Open files that depend on it have their diagnostics refreshed automatically. This never triggers a workspace rescan, and reopening the file immediately always wins over the disk re-read.
-
-For file-backed R Markdown / Quarto documents whose extension does not identify them as chunk documents, Raven remembers the editor's last Rmd/Quarto language classification after close. Watched disk changes and closed-file cache fallbacks keep using chunk masking until that file's cross-file state is removed, so prose `source()` calls and directives do not start contributing graph edges just because the document is closed.
-
-### Traversal budgets in large workspaces
-
-Cross-file resolution walks the `source()` dependency graph under two safety budgets that bound analysis cost on pathologically dense graphs:
-
-- **`raven.crossFile.maxTransitiveDependentsVisited`** (default `50000`) — the maximum number of files visited while building a file's dependency neighborhood.
-- **`raven.crossFile.maxChainDepth`** (default `64`) — the maximum traversal depth.
-
-The defaults are sized so realistic workspaces never reach them (the neighborhood is naturally bounded by the workspace's file count). If a workspace is large and dense enough to exhaust a budget, Raven stops following some `source()` edges, and the symbols those files define can surface as **false-positive `undefined-variable` warnings**. When that happens:
-
-- In the editor, Raven shows a throttled warning naming the setting to raise.
-- `raven check` prints a one-line note (grouped with the diagnostics on stdout for the default `text` output, or on stderr for `json`/`sarif` — see [Output streams](cli.md#output-streams)), so budget-induced drops are distinguishable from genuine undefined variables in CI.
-
-Raise the relevant setting in `raven.toml` to analyze more of the graph. See [Configuration](configuration.md).
-
-### Path Resolution
-
-When Raven resolves a relative path to another file, the base directory depends on where the path came from:
-
-- **Forward directives** (`# raven: source`, `# raven: run`, `# raven: include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`# raven: cd`](directives.md) working directory.
-- **Backward directives** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's own directory and **ignore `# raven: cd`**.
-- **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no working directory (an explicit `# raven: cd` or one inherited from a parent file) is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
-
-#### Implicit testthat/testit working directory
-
-testthat's `test_dir()`/`test_local()` (and testit's `test_dir()`) evaluate helper and test files with `tests/testthat/` (resp. `tests/testit/`) as the working directory. Raven mirrors this automatically: for a file under `<workspace root>/tests/testthat/` or `tests/testit/` (at any nesting depth), relative forward `source()` paths and forward directives anchor at that directory. This is layout-only — no `DESCRIPTION` or package mode required — and it is a **soft default**, deliberately weaker than a `# raven: cd`:
-
-- An explicit `# raven: cd` (or one inherited from a parent file) overrides it.
-- It does **not** suppress the workspace-root fallback, and it never propagates into files the test file sources (a sourced `scripts/helpers.R` still resolves its own `source()` calls from its own directory, with the fallback).
-- For a file **nested below** the anchor (e.g. `tests/testthat/fixtures/helper.R`), the file's own directory is tried as a compatibility fallback when the anchor-relative resolution misses, so file-relative paths that worked before keep working.
-- Backward directives are unaffected: they always resolve relative to the file's own directory.
-
-Path completion inside a `source()` string or forward directive in a testthat/testit file offers entries from the anchor directory. For a file nested below the anchor, it also offers entries from the file's own directory, matching the compatibility fallback above. If both directories contain the same name, Raven shows it once and the anchor entry wins, just as it does during resolution. An explicit or inherited `# raven: cd` suppresses both implicit bases and completion uses only that working directory.
-
-#### Case-only mismatches
-
-For a `source()`/directive path, an **exact-case match always wins**. If the path doesn't match exactly but differs from the real on-disk filename **only by case** (`source("scripts/templates.r")` for an on-disk `templates.R`), Raven resolves it to the real file anyway — provided there is exactly one case-insensitive match — so the file enters the source graph and its symbols stay visible. This holds uniformly across dependency edges, scope, diagnostics, cmd-click, and path completion. Raven also reports it once, at the path's line, as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch) (information on a case-insensitive filesystem, warning on a case-sensitive one). If two on-disk files match the path case-insensitively — only possible on a case-sensitive filesystem — the path is ambiguous and stays unresolved (`unresolved-source-path`). Matching is ASCII-only.
-
-This single-case-insensitive-match leniency applies to **both directions** — forward `source()` calls and forward directives (`# raven: source` / `run` / `include`), **and** backward directives (`# raven: sourced-by` / `run-by` / `included-by`). A wrong-cased `# raven: sourced-by parent.r` still resolves to an on-disk `Parent.R` on a case-sensitive filesystem (e.g. Linux CI), so the child keeps the parent's scope instead of producing a cascade of false `undefined-variable` warnings. The backward diagnostic carries a different message: because R never *executes* a backward directive (it is a Raven-only annotation), it does not claim R would error — it asks you to fix the directive's path casing to match the file on disk. The **workspace-root fallback** (above) remains forward-only and is independent of this case-leniency; backward directives gain the leniency but never the fallback.
-
-If the buffer itself is opened under a different case spelling than the resolved graph URI, Raven bridges that open buffer back to the graph URI for live revalidation and content. This does not change graph keys: the dependency edge still targets the real on-disk spelling, while diagnostics for the open buffer still publish to the client-opened spelling.
-
-### Global Symbol Hoisting
-
-R has late-binding semantics — a function can reference another function that hasn't been defined yet at the time of the function's *definition*, as long as it exists by the time the function is *called*:
-
-```r
-main <- function() {
-  helper()  # helper doesn't exist yet, but will when main() is called
-}
-helper <- function() { 42 }
-main()  # works fine
-```
-
-Raven supports this by hoisting global definitions inside function bodies. When the cursor is inside a function body, all global definitions are visible regardless of position. Function-local variables remain strictly positional.
-
-This is enabled by default. Disable with the LSP init option `crossFile.hoistGlobalsInFunctions: false` — this one is init-only and is not exposed in the VS Code Settings UI (see [Configuration](configuration.md)).
-
-### $ and @ Member Resolution
-
-When you cmd-click on `foo$bar` (or `foo@slot` for S4 objects), Raven resolves the member against `foo` — not as a free variable. It looks for:
-- Member assignments: `foo$bar <- …`, `foo["bar"] <- …`, or `foo[["bar"]] <- …` (the string-subscript forms apply to `$` only); `foo@slot <- …` for S4 slots.
-- Constructor-literal members: named arguments in constructors such as `list()`, `c()`, `data.frame()`, `tibble()`, `data.table()`, `environment()`, `list2env()`, and `new()`.
-
-Scope-aware completions after `$` use the same rules: typing `foo$` offers known members of `foo`.
+- [Directives](directives.md): every `# raven:` comment, including `source`, `sourced-by`, and `cd`
+- [Diagnostics](diagnostics.md): the codes cross-file analysis reports
+- [Package development](r-package-dev.md): how package mode changes visibility
+- [Performance on large projects](cross-file-analysis-performance.md): when to mark a file self-contained
