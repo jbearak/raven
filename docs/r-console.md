@@ -2,7 +2,7 @@
 
 [Docs](README.md) › R session (VS Code)
 
-Run R in a VS Code terminal and send code to it from the editor.
+Run R inside VS Code and send code to it from the editor.
 
 | You do | Raven does |
 |---|---|
@@ -11,24 +11,25 @@ Run R in a VS Code terminal and send code to it from the editor.
 | Press `Shift+Cmd+Enter` in an `.R` file | Runs `source("file.R", echo = TRUE)` |
 | Call `plot(1:10)` or `View(df)` in the console | Opens Raven's [plot viewer](plot-viewer.md) or [data viewer](data-viewer.md) |
 
-The R console is on unless another R extension already provides one. With the default `raven.rConsole.activation` of `"auto"`, it stays off when vscode-R (REditorSupport) is enabled or when you're in Positron; set it to `"enabled"` to turn it on anyway. See [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). The [help viewer](help-viewer.md) works either way.
-
-The R terminal runs [Raven's own console](#ravens-console), which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have. To run the standard R console instead, or the third-party consoles [arf](https://github.com/eitsupi/arf) or [radian](https://github.com/randy3k/radian), change [`raven.rTerminal.program`](#choosing-the-r-program).
-
 <a id="r-terminal-profile"></a>
+<a id="open-an-r-terminal"></a>
 
-## Open an R terminal
+## Open the console
 
-Raven adds an "R" profile to VS Code's terminal dropdown, so you can open an R terminal from the profile picker at any time. Any send command also opens one if none is running.
+The R console opens in VS Code's terminal panel whenever you send code and none is running. To open one yourself, choose **R** from the terminal panel's profile dropdown.
 
-### Choosing the R program
+If you use vscode-R (REditorSupport) or Positron, Raven leaves the console to them: under the default `raven.rConsole.activation` of `"auto"`, Raven's console and viewers stay off. Set it to `"enabled"` to use Raven's console anyway. See [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). The [help viewer](help-viewer.md) works either way.
 
-The `raven.rTerminal.program` setting controls which program the R terminal runs:
+<a id="choosing-the-r-program"></a>
 
-| Value | Description |
+### Choose a console
+
+By default you get [Raven's console](#ravens-console), which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have. `raven.rTerminal.program` picks a different one:
+
+| Value | Console |
 |-------|-------------|
-| `raven` (default) | [Raven's console](#ravens-console), built into Raven. macOS and Linux; on Windows this setting starts plain R. |
-| `R` | Standard R console |
+| `raven` (default) | [Raven's console](#ravens-console). macOS and Linux; on Windows this setting starts plain R. |
+| `R` | Plain R, as when you type `R` in a shell |
 | `arf` | Rust-based R console with syntax highlighting, fuzzy history search (`Ctrl+R`), interactive help, and rig integration |
 | `radian` | Python-based R console with syntax highlighting, multiline editing, and mouse support |
 
@@ -95,11 +96,11 @@ You can also run these commands from the editor toolbar menu (the `▶` button) 
 | Run Line or Selection | Sends the current selection to R. With no selection, detects and sends the complete multi-line statement at the cursor. |
 | Run Upward Lines | Sends all lines from the start of the file to the current line, extending to complete any multi-line statement. |
 | Run Downward Lines | Sends all lines from the current line to the end of the file, extending upward to include the full statement start. |
-| Source File | Runs `source("filepath", echo = TRUE)` in the R terminal. |
+| Source File | Runs `source("filepath", echo = TRUE)` in the R console. |
 
 ### Quick inspection commands
 
-These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R terminal, so one keystroke checks an object's shape. They're in the Raven category, so typing `Raven:` in the Command Palette lists them all. They have no default keybindings; bind them in `keybindings.json` if you want shortcuts.
+These commands wrap the word under the cursor (or the current selection) in a common inspection function and send it to the R console, so one keystroke checks an object's shape. They're in the Raven category, so typing `Raven:` in the Command Palette lists them all. They have no default keybindings; bind them in `keybindings.json` if you want shortcuts.
 
 | Command | Sends to R |
 |---------|------------|
@@ -116,7 +117,7 @@ A single-line wrapped expression is always pasted directly into the terminal. If
 
 ## Editor toolbar
 
-A `▶` button in the editor title bar for `.R`, `.Rmd`, `.Rmarkdown`, and `.qmd` files opens a menu of send commands for that file type. The main entries send code to the R terminal Raven manages, creating one if none is open. The Terminal submenu sends the same code to whichever terminal is active in VS Code, such as R running inside `tmux`, a Docker container, or any other terminal session.
+A `▶` button in the editor title bar for `.R`, `.Rmd`, `.Rmarkdown`, and `.qmd` files opens a menu of send commands for that file type. The main entries send code to the R console, opening one if none is open. The Terminal submenu sends the same code to whichever terminal is active in VS Code, such as R running inside `tmux`, a Docker container, or any other terminal session.
 
 | File type | Main entries | Terminal submenu |
 |---|---|---|
@@ -168,7 +169,7 @@ By default, the cursor moves to the next line after you send a single statement 
 
 ## Send method
 
-This section applies to R terminals other than Raven's console, which [receives code directly](#running-code-from-the-editor), and to the Terminal submenu.
+This section applies to plain R, arf, and radian, and to the Terminal submenu. Raven's console [receives code directly](#running-code-from-the-editor) instead.
 
 By default (`auto`), Raven pastes short blocks directly and switches to a temporary file once a block has at least `raven.sendToR.autoTempFileThresholdLines` lines, running it with `source()`. The default threshold is 25, so blocks of up to 24 lines are pasted and blocks of 25 or more go through a temp file. Override this with `raven.sendToR.sendMethod`:
 
@@ -188,11 +189,11 @@ The default threshold of 25 lines is arbitrary but reasonable: most blocks below
 | Setting | Default | Effect |
 |---------|---------|--------|
 | `raven.rConsole.activation` | `"auto"` | Whether Raven's R console activates; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting) |
-| `raven.rTerminal.program` | `"raven"` | Program for the R terminal: `"raven"`, `"R"`, `"arf"`, or `"radian"` |
+| `raven.rTerminal.program` | `"raven"` | Which console to run: `"raven"`, `"R"`, `"arf"`, or `"radian"` |
 | `raven.console.editMode` | `"emacs"` | Key bindings in Raven's console: `"emacs"` or `"vi"` |
 | `raven.console.colorOutput` | `"streams"` | Output colors in Raven's console: `"streams"`, `"values"`, or `"off"` |
 | `raven.sendToR.advanceCursorOnSend` | `true` | Move the cursor to the next line after sending a single statement |
-| `raven.sendToR.sendMethod` | `"auto"` | How code is sent to R terminals other than Raven's console: `"auto"`, `"paste"`, or `"tempfile"` |
+| `raven.sendToR.sendMethod` | `"auto"` | How code is sent to consoles other than Raven's: `"auto"`, `"paste"`, or `"tempfile"` |
 | `raven.sendToR.autoTempFileThresholdLines` | `25` | In `auto` mode, blocks with at least this many lines use a temp file; smaller blocks are pasted |
 
 All settings, with types and allowed values, are in the [settings reference](settings-reference.md).

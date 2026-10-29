@@ -229,7 +229,7 @@ The [Settings reference](settings-reference.md) gives a one-line description per
 <details markdown="1">
 <summary>Package settings</summary>
 
-- `raven.packages.rPath` is empty by default, in which case Raven searches `PATH`. It must point to plain `R`, not `radian` or `arf`: those are interactive wrappers and can't run the non-interactive scripts Raven uses to read package information. For the interactive console program, see [Choosing the R program](r-console.md#choosing-the-r-program).
+- `raven.packages.rPath` is empty by default, in which case Raven searches `PATH`. It must point to plain `R`, not `radian` or `arf`: those are interactive wrappers and can't run the non-interactive scripts Raven uses to read package information. To choose which console you work in, see [Choose a console](r-console.md#choosing-the-r-program).
 - `raven.packages.missingPackageSeverity` set to `"off"` turns off missing-package diagnostics.
 - `raven.packages.watchLibraryPaths` watches the `.libPaths()` directories and refreshes package information when packages are installed or removed; `raven.packages.watchDebounceMs` (default `500`) groups rapid file events into one refresh.
 - `raven.packages.packageMode`: `"auto"` detects a `DESCRIPTION` file, `"enabled"` always treats the workspace as a package, `"disabled"` never does. See [Package development](r-package-dev.md).
