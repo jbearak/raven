@@ -1,9 +1,18 @@
-# Plot Viewer
+# Plot viewer
 
-Raven shows plots from its managed R terminal directly in VS Code via a built-in viewer panel. The viewer is backed by [httpgd](https://nx10.dev/httpgd/), a headless graphics device for R that exposes plots over a local HTTP/WebSocket server. Each R session gets its own plot panel with independent history, theme-aware backgrounds, and export to PNG, SVG, or PDF.
+[Docs](README.md) › R session (VS Code)
 
-> [!NOTE]
-> The plot viewer is reached through Raven's R console: it activates only when Raven's R console activates (`raven.rConsole.activation`, default: `auto`). When the REditorSupport extension is enabled or VS Code is running as Positron, Raven's R console — and therefore the plot viewer — is off by default. See [Coexistence](./coexistence.md) for details.
+See plots from Raven's R console in a VS Code panel, with plot history and export to PNG, SVG, or PDF.
+
+| You do | Raven does |
+|---|---|
+| Run `plot(1:10)` or `ggplot(df, aes(x, y)) + geom_point()` in the R terminal | Opens a "Raven Plot Viewer" panel beside your editor and shows the plot |
+| Run another plot | Adds it to that panel's history without taking focus from your editor |
+| Click the share icon, then PNG | Exports the current plot as PNG |
+
+The viewer uses [httpgd](https://nx10.dev/httpgd/), a headless graphics device for R that serves plots over a local HTTP/WebSocket server. Each R session gets its own panel with independent history.
+
+The plot viewer works only when Raven's R console is active, which by default it isn't when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
 ## Prerequisites
 
@@ -13,44 +22,67 @@ Install the [httpgd](https://nx10.dev/httpgd/) R package, version `2.0.2` or new
 install.packages("httpgd")
 ```
 
-No other R packages are required. Standard R, [arf](https://github.com/eitsupi/arf), and [radian](https://github.com/randy3k/radian) all work because Raven loads its bootstrap profile via `R_PROFILE_USER`.
+No other R packages are required. Standard R, [arf](https://github.com/eitsupi/arf), and [radian](https://github.com/randy3k/radian) all work, because Raven loads its startup profile through `R_PROFILE_USER`.
 
-## Behavior
+<a id="behavior"></a>
 
-- Run any plotting code in the Raven R terminal (e.g., `plot(1:10)`, `ggplot(...) + geom_point()`).
-- The first plot from each R session opens its own "Raven Plot Viewer" panel in the column configured by `raven.plot.viewerColumn` (default: `beside`). The second session's panel is "Raven Plot Viewer 2", the third "Raven Plot Viewer 3", and so on (numbered per VS Code window). Each R terminal therefore gets a separate viewer with its own plot history.
-- Subsequent plots from the same session update that session's panel without stealing focus from your editor.
-- The viewer toolbar provides previous/next history navigation, remove the current plot, and three icon-only controls on the right: a **share** icon that opens a popover with **Copy** / **PNG** / **SVG** / **PDF** export actions, an **Open in browser** button, and an **Apply VS Code theme** toggle (a color-palette icon; the button background fills with the accent color when on). Hover any icon for a descriptive tooltip; the three right-side controls additionally expose `aria-label`s for assistive technologies, while the navigation/remove buttons rely on their `title` text. Right-clicking a plot copies it to the clipboard as PNG.
-- If your terminal exits (R session ends), the last rendered plot stays visible with an "R session ended" indicator and must be closed manually.
-- When a new R session is started or the panel is reopened, a subsequent plot from that new session will recreate the plot panel.
+## View and save plots
+
+- Run any plotting code in the R terminal Raven manages, for example `plot(1:10)` or `ggplot(...) + geom_point()`.
+- The first plot from each R session opens its own "Raven Plot Viewer" panel in the column set by `raven.plot.viewerColumn` (default: `beside`). The second session's panel is "Raven Plot Viewer 2", the third "Raven Plot Viewer 3", and so on, numbered per VS Code window. Each R terminal gets a separate viewer with its own plot history.
+- Later plots from the same session update that session's panel without taking focus from your editor.
+- If the R session ends, the last plot stays visible with an "R session ended" indicator until you close the panel.
+- When you start a new R session or reopen the panel, the next plot from the new session recreates the panel.
+
+The toolbar has previous and next buttons for history, a button that removes the current plot, and three icons on the right:
+
+- A share icon that opens Copy, PNG, SVG, and PDF export actions.
+- Open in browser.
+- Apply VS Code theme, a color-palette icon whose background fills with the accent color when on (see [Color theme](#color-theme)).
+
+Hover any icon for a tooltip. The three right-side controls also have accessible labels for screen readers; the history and remove buttons rely on their tooltip text. Right-clicking a plot copies it to the clipboard as PNG.
 
 ## Color theme
 
-The toolbar's **Apply VS Code theme** button recolors the live plot to match your active editor theme. When on, the plot's canvas background is hidden by a CSS overlay (the webview's editor background shows through), axis labels and tick text use `--vscode-editor-foreground`, and the strokes of other shape elements (axes, gridlines, and the outlines of shapes such as bars) use the same foreground color. When off, plots render with their R-supplied colors against a white canvas (the default — matches what `plot()` and `ggplot()` produce in any other R environment).
+The toolbar's Apply VS Code theme button recolors the live plot to match your editor theme. When on, the plot's canvas background is hidden so the editor background shows through, axis labels and tick text use the editor's foreground color, and the strokes of other shapes (axes, gridlines, and the outlines of shapes such as bars) use the same foreground color. When off, plots render with their R-supplied colors on a white canvas, which matches what `plot()` and `ggplot()` produce in any other R environment.
 
-The setting is **off by default**, persists globally via VS Code's `Memento`, and applies to every open plot panel — toggling in one panel updates the others. There is no command-palette entry or keybinding; the toolbar button is the only control. (Parity with REditorSupport.R's `r.plot.toggleStyle`.)
-
-### Known limitations
-
-- **User-supplied colors are clobbered.** Aesthetic mappings like `aes(color = species)` or `plot(..., col = "red")` are overridden by the CSS overlay's `stroke: var(--vscode-editor-foreground)` rule. If you want to see your palette, turn the toggle off.
-- **Text positions may shift.** httpgd computes text widths at render time using R's chosen font; the CSS overlay forces `--vscode-editor-font-family`, which can produce different glyph widths and cause rotated tick labels or dense legends to overlap. For publication-quality output use Export PNG / SVG with the toggle off.
-- **Exported images aren't retinted.** Copy, Save (PNG/SVG/PDF), and Open in browser always use httpgd's default (white) background so shared images stay portable across themes. The toggle is webview-only.
-- **Light themes change less.** On a light theme the editor's background is near-white and the foreground is near-black, so the visible difference vs. the default plot is subtle.
-
-### Substrate (for the curious)
-
-The toggle works by rendering the plot as **inline SVG** inside the webview's document (not as `<img src=>`). This lets CSS variables and selectors reach into the SVG nodes. The SVG is sanitized by [DOMPurify](https://github.com/cure53/DOMPurify) before insertion (script tags, event handlers, external references, and inline `style="..."` attributes are stripped). Safe presentation properties (fill, stroke, font, etc.) are first migrated from `style="..."` to SVG presentation attributes, so plot colors survive the sanitizer.
-
-## Settings
-
-| Setting | Default | Description |
-| --- | --- | --- |
-| `raven.plot.viewerColumn` | `beside` | Initial column when a new viewer opens. |
-
-The viewer's overall enable/disable is controlled by `raven.rConsole.activation` — there is no separate `raven.plot.enabled` toggle.
+The toggle is off by default, is remembered across VS Code sessions, and applies to every open plot panel: toggling it in one panel updates the others. The toolbar button is the only control; there is no Command Palette entry or keybinding. It matches REditorSupport's `r.plot.toggleStyle`.
 
 ## Troubleshooting
 
-- **No viewer appears.** Confirm httpgd is installed (`packageVersion("httpgd")`) and that you're running R inside a terminal launched via Raven (the terminal profile dropdown's "R" entry, or any of Raven's send-to-R commands). Plots from terminals you opened manually outside Raven won't trigger the viewer.
-- **httpgd console message about installing or upgrading.** Follow the printed `install.packages("httpgd")` instructions. Plots fall back to R's default graphics device until httpgd is available.
-- **The plot viewer doesn't activate at all.** Check `raven.rConsole.activation`. If you have the REditorSupport extension enabled or you're using Positron, the default `auto` value leaves Raven's R-session features off. Set it to `"enabled"` to turn them on.
+- No viewer appears. Confirm httpgd is installed (`packageVersion("httpgd")`) and that R is running in a terminal Raven launched (the "R" entry in the terminal profile dropdown, or any of Raven's send-to-R commands). Plots from terminals you opened outside Raven don't reach the viewer.
+- R prints a message about installing or upgrading httpgd. Follow the printed `install.packages("httpgd")` instructions. Plots go to R's default graphics device until httpgd is available.
+- The plot viewer doesn't activate at all. Raven's R console is probably off; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting) for when it activates and how to turn it on.
+
+## Settings
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `raven.plot.viewerColumn` | `beside` | Initial column when a new viewer opens. |
+
+There is no separate on/off setting for the plot viewer; it follows Raven's R console. See the [settings reference](settings-reference.md) for all settings.
+
+<a id="known-limitations"></a>
+
+## Limitations
+
+These apply to the Apply VS Code theme toggle:
+
+- Your own colors are overridden. Aesthetic mappings like `aes(color = species)` or `plot(..., col = "red")` are replaced by the theme's foreground color. Turn the toggle off to see your palette.
+- Text positions may shift. httpgd measures text with R's chosen font, while the themed view uses the editor's font, which can have different glyph widths. Rotated tick labels or dense legends can overlap. For publication-quality output, export PNG or SVG with the toggle off.
+- Exported images aren't recolored. Copy, PNG, SVG, PDF, and Open in browser always use httpgd's default white background, so shared images look the same in any theme. The toggle affects only the panel.
+- Light themes change less. On a light theme the editor background is near-white and the foreground near-black, so the difference from the default plot is subtle.
+
+## Details
+
+<a id="substrate-for-the-curious"></a>
+
+### How the theme toggle reaches the plot
+
+The panel shows each plot as SVG embedded in the page rather than as an image, which lets the theme's colors and fonts reach individual plot elements. Before display, the SVG is sanitized with [DOMPurify](https://github.com/cure53/DOMPurify): scripts, event handlers, external references, and inline `style` attributes are removed. Presentation properties such as fill, stroke, and font are kept, so plot colors survive sanitizing.
+
+## See also
+
+- [R console](r-console.md)
+- [Data viewer](data-viewer.md)
+- [Coexistence with other R extensions](coexistence.md)

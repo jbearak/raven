@@ -1,87 +1,29 @@
-# Data Viewer
+# Data viewer
 
-Raven includes a data viewer that overrides R's `View()` so calls in a
-Raven-managed R terminal open a virtualized grid in a VS Code webview
-instead of the default backup viewer. The grid streams row windows from
-disk, keeping scrolling responsive on multi-million-row data frames.
+[Docs](README.md) › R session (VS Code)
 
-## Why we built this
+Browse, sort, and filter data frames of any size in a VS Code panel by calling `View()` in Raven's R console.
 
-Raven serializes the frame to an Apache Arrow IPC (Feather v2) file and
-decodes only the rows currently visible, so the webview's memory and
-decode time scale with the visible viewport rather than the size of the
-frame. Writing to an on-disk Arrow file also means paging doesn't have
-to go back through R, which keeps scrolling on multi-million-row frames
-smooth.
+<a id="why-we-built-this"></a>
 
-Other R data viewers in VS Code take different staging routes — the
-REditorSupport extension's [`sess`](https://github.com/REditorSupport/vscode-R/tree/master/sess)
-helper, for example, materializes the whole frame in R memory and serves
-row windows from there to the webview over JSON-RPC. Both extensions
-paginate the wire, but the staging is different: Raven snapshots the
-frame to disk once as Arrow and the webview reads windows from the file
-directly, bypassing R for paging; `sess` keeps everything live in R. In
-our own smoke tests, the on-disk Arrow path has stayed responsive on
-multi-million-row frames where the R-staged path can hit memory limits.
-The two viewers also differ on value-labelled data: Raven recognizes
-`haven_labelled` plus `foreign` / `readstata13` label maps and
-substitutes the label when its Labels toggle is on (see
-[Labels](#labels)); `sess` classifies labelled columns as formatted
-numerics and renders the underlying codes. See
-[Comparison: Data viewer](./comparison.md#data-viewer) for the
-side-by-side.
+```r
+View(mtcars)
+```
 
-> [!NOTE]
-> The data viewer is reached through Raven's R console: it activates only
-> when Raven's R console activates (`raven.rConsole.activation`, default:
-> `auto`). When the REditorSupport extension is enabled or VS Code is
-> running as Positron, Raven's R console — and therefore the data viewer
-> — is off by default. See
-> [Coexistence](./coexistence.md) for details.
+The data frame opens in a grid beside your editor. Raven writes it once to an Apache Arrow file on disk, and the grid reads only the rows you can see, so scrolling stays responsive on multi-million-row frames and paging never waits on R. Value labels from Stata and SPSS imports show as labels, not codes (see [Labels](#labels)). For how this compares with other R data viewers, see [Comparison: Data viewer](comparison.md#data-viewer).
 
-## What it shows
+The data viewer works only when Raven's R console is active, which by default it isn't when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
-- `data.frame` (including `tibble` and `data.table` subclasses).
-- `matrix`. If the matrix has non-default rownames, they appear as a
-  leading `rowname` column; auto-generated `1..N` rownames are dropped
-  in favor of the viewer's row-number gutter.
-- **Atomic vectors and scalars** (`numeric`, `integer`, `character`,
-  `logical`, `complex`, `Date`, `POSIXct`), plus standalone `factor` and
-  `haven_labelled` vectors. A vector renders as a `values` column (a
-  `value` column when it has length 1). If the vector has `names()`,
-  those appear in a leading `name` column — the same role the `rowname`
-  column plays for a matrix. A standalone `factor` / `haven_labelled`
-  vector keeps its labels, so the [Labels](#labels) toggle works on it.
-  A **1-D array** (`array(1:3)`) is rendered the same way as a vector;
-  its `dimnames` become the `name` column.
-- **Flat lists** — a list whose elements are all scalars/vectors. Each
-  element becomes a column, padded with empty (`NA`) cells to the length
-  of the longest element, and each column keeps its own type. Unnamed
-  elements get `V1`, `V2`, … headers. A named vector and a list of
-  scalars therefore render differently — `c(a = 1, b = 2)` is a two-row
-  `name`/`values` table, while `list(a = 1, b = 2)` is a one-row,
-  two-column table — matching `as.data.frame(list(a = 1, b = 2))`.
-- Other objects raise an error in R that explains *why*:
+## Requirements
 
-  ```r
-  > View(sum)
-  Error: Can't `View()` an object of class `function`
-  ```
+- The R [`arrow`](https://arrow.apache.org/docs/r/) package (`install.packages("arrow")`). If it's missing, Raven prints a warning in R and shows a VS Code warning notification when you call `View()`, then returns without interrupting the rest of your code.
+- An R terminal Raven manages (the "R" terminal profile, or one launched by Raven's send-to-R commands). Plain R terminals you opened outside Raven don't have Raven's `View()`.
 
-  - A **nested/recursive list** (an element that is itself a list or
-    `data.frame`, or otherwise not a plain vector) names the offending
-    element rather than blaming the `list` class, e.g.
-    `` Can't `View()` this list: element `b` has class `list`. Only flat lists (every element a vector) are supported. ``
-    An empty list reports `` Can't `View()` an empty list. ``
-  - An **array with more than two dimensions** (a 3-D+ array or a
-    3-way+ `table`) reports its dimension count:
-    `` Can't `View()` an array with 3 dimensions; the data viewer shows 2-dimensional tables only. ``
-  - `raw` vectors, environments, functions, and other unsupported
-    classes keep the class-based message shown above.
+<a id="triggering"></a>
 
-## Triggering
+## Open a data frame
 
-Call `View()` in a Raven-managed R terminal:
+Call `View()` in the R terminal:
 
 ```r
 View(mtcars)
@@ -89,10 +31,25 @@ View(head(iris, 50))
 View(my_df, "Custom panel name")
 ```
 
-The panel title comes from the second argument when supplied, otherwise
-from the deparsed expression (truncated to 256 bytes with `…` if longer).
-A second `View(mtcars)` reuses the existing `mtcars` tab; a different
-expression opens a new tab.
+The panel title is the second argument when you give one, otherwise the expression you passed (cut to 256 bytes, with `…`, if longer). A second `View(mtcars)` reuses the existing `mtcars` tab; a different expression opens a new tab.
+
+## What it shows
+
+- `data.frame`, including `tibble` and `data.table` subclasses.
+- `matrix`. Non-default rownames appear as a leading `rowname` column; automatic `1..N` rownames are dropped in favor of the viewer's row-number gutter.
+- Atomic vectors and scalars (`numeric`, `integer`, `character`, `logical`, `complex`, `Date`, `POSIXct`), plus standalone `factor` and `haven_labelled` vectors. A vector renders as a `values` column (a `value` column when it has length 1). If the vector has `names()`, they appear in a leading `name` column, the same role the `rowname` column plays for a matrix. A standalone `factor` or `haven_labelled` vector keeps its labels, so the [Labels](#labels) toggle works on it. A 1-D array (`array(1:3)`) renders the same way as a vector, with its `dimnames` as the `name` column.
+- Flat lists, where every element is a scalar or vector. Each element becomes a column, padded with empty (`NA`) cells to the length of the longest element, and each column keeps its own type. Unnamed elements get `V1`, `V2`, … headers. So `c(a = 1, b = 2)` is a two-row `name`/`values` table, while `list(a = 1, b = 2)` is a one-row, two-column table, matching `as.data.frame(list(a = 1, b = 2))`.
+
+Other objects raise an error in R that says why:
+
+```r
+> View(sum)
+Error: Can't `View()` an object of class `function`
+```
+
+- A nested list (an element that is itself a list or `data.frame`, or otherwise not a plain vector) names the offending element rather than the `list` class, for example `` Can't `View()` this list: element `b` has class `list`. Only flat lists (every element a vector) are supported. `` An empty list reports `` Can't `View()` an empty list. ``
+- An array with more than two dimensions (a 3-D or higher array, or a 3-way or higher `table`) reports its dimension count: `` Can't `View()` an array with 3 dimensions; the data viewer shows 2-dimensional tables only. ``
+- `raw` vectors, environments, functions, and other unsupported classes get the class-based message shown above.
 
 ## Toolbar
 
@@ -100,377 +57,212 @@ expression opens a new tab.
 rows: 12,345 | Sort: mpg▲ cyl▼ ✕ | Filter: cyl ∈ {6,8} ✕ | [Labels] [Format] [3 digits ▾] | [Columns ▾ <7>]
 ```
 
-The `Sort` and `Filter` strips are hidden entirely when no sort or filter is active.
+The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
 
-When the panel is too narrow to fit the chip strips beside the action
-buttons, the strips drop onto their own second row so Labels / Format /
-Columns stay reachable. Each strip still scrolls horizontally on its own
-row when its chips overflow even that full-width row. The wrap decision
-holds a small hysteresis band so the toolbar doesn't flap between one
-and two rows as the panel is resized across the boundary.
-
-Each toggle is filled when active; clicking flips it. The Labels and
-Format buttons (and the digits dropdown) are hidden when no column in the
-current data set would be affected by them — e.g. an all-integer matrix
-hides all three, while a frame with only factors hides Format and digits
-but keeps Labels. The small badge on `Columns` shows the count of
-currently hidden columns (absent when none are hidden).
+Each toggle is filled when active; click to flip it. The Labels and Format buttons (and the digits dropdown) are hidden when no column in the data would be affected. For example, an all-integer matrix hides all three, while a frame with only factors hides Format and digits but keeps Labels. The badge on Columns counts the hidden columns and is absent when none are hidden.
 
 ### Labels
 
-Defaults to **on** in new panels. When on, columns with labels render
-their labels instead of raw values:
+On by default in new panels. When on, columns with labels show their labels instead of raw values:
 
-- `factor` columns swap the integer code (1-based, matching
-  `as.integer(factor_col)` in R) for the level string.
-- `haven_labelled` columns (from `haven::read_dta`) and other columns
-  with `attr(col, "labels")` (haven) or `attr(col, "value.labels")`
-  (`foreign::read.dta`, `readstata13::read.dta13`) swap the cell value
-  for the matching label, falling back to the raw value when no label
-  is mapped.
+- `factor` columns show the level string instead of the integer code (1-based, matching `as.integer(factor_col)` in R).
+- `haven_labelled` columns (from `haven::read_dta`) and other columns with `attr(col, "labels")` (haven) or `attr(col, "value.labels")` (`foreign::read.dta`, `readstata13::read.dta13`) show the matching label, or the raw value when no label is mapped.
 - Columns without label metadata are unchanged.
 
-The variable label (`attr(col, "label")`) is **always** shown in the
-column-header tooltip, regardless of the toggle.
+The variable label (`attr(col, "label")`) always appears in the column-header tooltip, whatever the toggle says.
 
 ### Format
 
-Defaults to **on** in new panels. When on, non-integer numeric columns
-are rounded to the digits chosen in the dropdown (0–6, default 3).
-Integer columns, dates, timestamps, factors, and string columns are
-unaffected. `NaN` and ±Inf are rendered as `NaN` / `Inf` / `-Inf`
-literally — they aren't formatted away.
+On by default in new panels. When on, non-integer numeric columns are rounded to the digits chosen in the dropdown (0–6, default 3). Integer columns, dates, timestamps, factors, and string columns are unaffected. `NaN` and ±Inf show as `NaN`, `Inf`, and `-Inf`; they aren't formatted away.
 
-A Float column that the source file flagged as integer-display (Stata
-`%w.0f`, SAS/SPSS `F8.0`, `COMMA10.0`, `Z3.`, etc.) is treated like an
-integer column — Format does nothing to it, and the toggle is hidden
-when no other column would be affected. Independently, a single
-integer-valued cell inside an otherwise-decimal Float column (e.g. `5`
-in a column whose other rows are `1.5`, `2.25`) is rendered as `5` —
-not `5.000` — to avoid the misleading trailing-zero look common in
-SPSS/SAS files that store integer-valued data as doubles.
+A floating-point column that the source file marked for integer display (Stata `%w.0f`, SAS/SPSS `F8.0`, `COMMA10.0`, `Z3.`, and so on) is treated like an integer column: Format does nothing to it, and the toggle is hidden when no other column would be affected. Separately, a single whole-number cell in an otherwise-decimal column (for example `5` in a column whose other rows are `1.5` and `2.25`) shows as `5`, not `5.000`. This avoids the misleading trailing zeros common in SPSS and SAS files that store whole numbers as doubles.
 
 ### Columns popover
 
-The `Columns ▾` button opens a popover with one checkbox per column.
-Hide/show changes are persisted per panel-name + schema hash, so the
-same `View(mtcars)` opened tomorrow remembers the layout.
+The Columns ▾ button opens a popover with one checkbox per column. Hidden and shown columns are remembered for the panel name and the data's column layout, so the same `View(mtcars)` opened tomorrow keeps the layout.
 
 ### Selection and copy
 
-- Click a cell, shift-click another to extend the rectangle.
-- Click-drag also extends.
-- Click a column header to select that column; click-drag across
-  column headers to select multiple contiguous columns.
-- Click a row-number gutter cell to select that row; click-drag across
-  row headers to select multiple contiguous rows.
-- Click the `#` corner cell (top-left) to select every row across all
-  currently-visible columns (a *row* selection — see the copy note
-  below).
-- `Cmd/Ctrl+A` also selects every row across all currently-visible
-  columns, but as a *column* selection. The two are visually identical
-  but copy differently: a column selection includes the column-name
-  row, a row selection doesn't.
-- `Cmd/Ctrl+C` copies the selection as TSV. Copying respects the
-  active Labels / Format / digits state — what you see is what you
-  copy.
-- Column-header selections and `Cmd/Ctrl+A` selections include the
-  column-name row when copied. Cell, row-header, and `#`-corner
-  selections copy data only, matching spreadsheet conventions.
-- Right-click a cell, column header, or row-gutter cell to show a Copy
-  menu that copies the current selection. Right-clicking a column
-  header always replaces the selection with that one column (so the
-  menu's Copy copies that column, even if other columns were
-  previously selected). For cell right-clicks, if the target isn't
-  already in the selection it gets selected first; right-clicking a
-  cell inside the existing selection leaves the selection unchanged.
-  The column-header menu also offers **Hide column**, plus the sort
-  and filter items described under [Sorting](#sorting) and
-  [Filtering](#filtering). The platform's default Cut/Copy/Paste menu
-  is suppressed elsewhere in the panel.
-- A 5,000,000-cell hard cap protects against accidental huge clipboard
-  writes; over the cap the panel shows a toast and refuses the copy.
+- Click a cell, then Shift-click another to select the rectangle between them. Click-drag also extends the selection.
+- Click a column header to select that column; drag across headers to select several adjacent columns.
+- Click a row-number cell to select that row; drag across row numbers to select several adjacent rows.
+- Click the `#` corner cell (top-left) to select every row across all visible columns, as a row selection.
+- `Cmd/Ctrl+A` also selects every row across all visible columns, but as a column selection. The two look the same but copy differently, as described below.
+- `Cmd/Ctrl+C` copies the selection as tab-separated text. Copying follows the current Labels, Format, and digits settings, so you copy what you see.
+- Column-header selections and `Cmd/Ctrl+A` selections include the column-name row when copied. Cell, row-number, and `#`-corner selections copy data only, as in spreadsheets.
+- Right-click a cell, column header, or row number for a Copy menu that copies the current selection. Right-clicking a column header always selects just that column first. Right-clicking a cell outside the selection selects it first; right-clicking a cell inside the selection keeps the selection.
+- The column-header menu also offers Hide column, plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
+- Copying is capped at 5,000,000 cells. Over the cap, the panel shows a message and doesn't copy.
 
-### Keyboard shortcuts
+<a id="keyboard-shortcuts"></a>
 
-| Key                | Action                                          |
-| ------------------ | ----------------------------------------------- |
-| `Home`             | Jump to the first column of the current row.    |
-| `End`              | Jump to the last column of the current row.     |
-| `Cmd/Ctrl+Home`    | Jump to the first cell (top-left of the grid).  |
-| `Cmd/Ctrl+End`     | Jump to the last cell (bottom-right).           |
-| `PageUp`           | Scroll one viewport up.                         |
-| `PageDown`         | Scroll one viewport down.                       |
-| `Cmd/Ctrl+A`       | Select all rows across visible columns.         |
-| `Cmd/Ctrl+C`       | Copy the current selection as TSV.              |
-| `Shift+Alt+A`      | Sort focused column ascending.                  |
-| `Shift+Alt+D`      | Sort focused column descending.                 |
-| `Shift+Alt+0`      | Clear all sorts.                                |
+### Grid shortcuts
 
-These are the data grid's built-in spreadsheet bindings: `Home` / `End`
-move within the current row (first / last column), while `Cmd`/`Ctrl`
-+`Home` / `End` jump to the first / last cell of the whole grid.
+| Key | Action |
+| --- | --- |
+| `Home` | Jump to the first column of the current row. |
+| `End` | Jump to the last column of the current row. |
+| `Cmd/Ctrl+Home` | Jump to the first cell (top-left of the grid). |
+| `Cmd/Ctrl+End` | Jump to the last cell (bottom-right). |
+| `PageUp` | Scroll one screen up. |
+| `PageDown` | Scroll one screen down. |
+| `Cmd/Ctrl+A` | Select all rows across visible columns. |
+| `Cmd/Ctrl+C` | Copy the current selection as tab-separated text. |
+| `Shift+Alt+A` | Sort the focused column ascending. |
+| `Shift+Alt+D` | Sort the focused column descending. |
+| `Shift+Alt+0` | Clear all sorts. |
 
 ## Sorting
 
-Right-click a column header to sort. The menu offers **Sort
-ascending**, **Sort descending**, and the corresponding **Add
-ascending to sort** / **Add descending to sort** when another column
-is already sorted, plus **Clear sort on this column** (only when that
-column is in the sort) and **Clear all sorts** (only when some sort is
-active). Picking *Sort* replaces the sort with that column; picking
-*Add to sort* appends it as the next priority key. Holding **Shift**
-when picking *Sort ascending* / *Sort descending* is a shortcut for the
-*Add* items.
+Right-click a column header to sort. The menu offers:
 
-A sorted column shows a hairline triangle on the right edge of its
-header — ▲ for ascending, ▼ for descending. When more than one column
-is in the sort, each sorted header also shows a small priority badge
-(1, 2, 3 …) so you can see which key takes precedence at a glance.
+- Sort ascending and Sort descending, which replace the current sort with this column.
+- Add ascending to sort and Add descending to sort, when another column is already sorted. These add this column as the next key. Holding Shift while choosing Sort ascending or Sort descending does the same.
+- Clear sort on this column, when this column is sorted.
+- Clear all sorts, when any sort is active.
 
-A chip strip appears in the toolbar listing the active keys in
-priority order. Click any chip to open a small popover with **Flip
-direction**, **Remove from sort**, and (when applicable) **Move to
-first**. The trailing **✕** on the strip clears every sort key.
+A sorted column shows a thin triangle at the right edge of its header: ▲ for ascending, ▼ for descending. When more than one column is sorted, each sorted header also shows a small priority badge (1, 2, 3 …) so you can see which key comes first.
 
-### NA / NaN
+The toolbar's Sort strip lists the active keys in priority order. Click a chip for Flip direction, Remove from sort, and, when it applies, Move to first. The ✕ at the end of the strip clears every sort key.
 
-Missing values — R's `NA`, floating-point `NaN`, and `NULL` — always
-sort to the bottom in both ascending and descending order, matching
-`order(..., na.last = TRUE)`. The `±Inf` sentinels sort numerically.
+<a id="sort-indicator"></a>
 
-### Labels and Format
+While Raven sorts a large frame, a `Sorting…` pill appears beside the chips. It is the only progress cue; the data viewer has no status bar.
+
+<a id="na--nan"></a>
+
+### Missing values in sorts
+
+Missing values (R's `NA`, floating-point `NaN`, and `NULL`) always sort to the bottom, ascending or descending, matching `order(..., na.last = TRUE)`. `Inf` and `-Inf` sort as numbers.
+
+<a id="labels-and-format"></a>
+
+### Sorting with Labels and Format
 
 Sort follows what you see in the grid:
 
-- A **factor** column sorts by integer level when Labels is off and by
-  label string when Labels is on.
-- A **value-labelled** column (`haven_labelled`, `foreign::value.labels`,
-  `readstata13::read.dta13`) sorts by the underlying numeric when
-  Labels is off and by the displayed label (or the raw value when no
-  label exists for a cell) when Labels is on.
-- **Numeric** columns always sort by the underlying double, even when
-  the Format toggle is rounding the display.
+- A factor column sorts by integer level when Labels is off and by label when Labels is on.
+- A value-labelled column (`haven_labelled`, `foreign` value labels, `readstata13::read.dta13`) sorts by the underlying number when Labels is off and by the displayed label (or the raw value where a cell has no label) when Labels is on.
+- Numeric columns always sort by the underlying number, even when Format rounds the display.
 
-Toggling Labels with a sort active on a labelled column will re-sort
-the rows.
+Toggling Labels while a labelled column is sorted re-sorts the rows.
 
-### Persistence
+<a id="persistence"></a>
 
-Sort state is persisted per panel-name + schema-hash alongside layout
-and toolbar state, so a later `View(df)` against the same dataset
-restores the sort. Only the sort keys (plus a snapshot of the Labels
-state) are stored — the row
-permutation is always recomputed against the current data on restore,
-because schema-hash equality is not evidence that two datasets share
-row values (column names and types can match while values differ).
-Set `raven.dataViewer.persistSort` to `false` to make every panel
-open unsorted.
+### Saved sorts
+
+The sort is remembered for the panel name and the data's column layout, along with the column layout and toolbar state, so a later `View(df)` of the same data restores it. Only the sort keys (and the Labels state) are saved. The row order is always recomputed from the current data, because two data frames can have the same column names and types but different values. Set `raven.dataViewer.persistSort` to `false` to open every panel unsorted.
 
 ### Reopening with a saved sort or filter
 
-The grid itself paints instantly because it is virtualized — only the
-visible window of rows is read at a time. Restoring a saved **sort** or
-**filter**, however, requires reading the relevant column(s) in full to
-recompute the permutation / survivor set, which on a multi-million-row
-frame can take a few seconds. During that time the toolbar shows
-**"Applying your saved sort & filter…"** (worded for whichever applies)
-with a **Skip and show data now** link below it. The message only appears
-if the restore takes longer than ~200 ms, so small datasets never flash it.
+The grid itself appears at once, because only the visible rows are read. Restoring a saved sort or filter, though, reads the affected columns in full, which can take a few seconds on a multi-million-row frame. If it takes longer than about 200 ms, the toolbar shows "Applying your saved sort & filter…" (worded for whichever applies) with a Skip and show data now link.
 
-**Skip and show data now** abandons the restore, **forgets** the saved
-sort/filter for that panel (clears the persisted entries), and shows the
-data in its natural, unsorted/unfiltered order. This is distinct from a
-genuine read failure: if reapplying the saved sort/filter fails for a real
-reason (a corrupt or unreadable column), the panel opens in natural order,
-a notice explains that the saved sort/filter could not be reapplied, and
-the saved preferences are **kept** so the next reopen can retry.
-
-### Sort indicator
-
-The active sort keys appear as chips in the toolbar — one per key, in
-priority order. While the host is building a large permutation, a
-`Sorting…` pill appears beside the chips; it is the only progress cue,
-as the data viewer has no bottom status bar.
+Skip and show data now stops the restore, forgets the saved sort and filter for that panel, and shows the data in its original order. A real read failure is different: if a corrupt or unreadable column stops the saved sort or filter from being applied, the panel opens in the original order with a notice, and keeps the saved settings so the next reopen can try again.
 
 ## Filtering
 
-Right-click a column header and choose **Filter…** to open the filter editor
-for that column. You can also press **⇧⌥F** to open the editor for the
-currently focused column.
+Right-click a column header and choose Filter… to open the filter editor for that column, or press `Shift+Alt+F` (⇧⌥F) for the focused column.
 
-When the column already has an active filter, the editor opens pre-populated
-with that filter's current settings — the same predicate, values, and **Include
-NA / NaN** state it had when you last applied it — so you edit in place rather
-than starting over. In that case the context-menu item reads **Edit filter…**,
-and applying updates the existing filter (it does not add a second one — see
-[Composition](#composition)). On an unfiltered column the item reads
-**Filter…** and the editor opens empty.
+If the column already has a filter, the menu item reads Edit filter…, and the editor opens with that filter's predicate, values, and Include NA / NaN setting, so you edit it in place. Applying updates the existing filter rather than adding a second one (see [Composition](#composition)). On an unfiltered column the item reads Filter… and the editor opens empty.
 
 ### Per-type predicates
 
 | Column type | Available predicates |
 | --- | --- |
 | Numeric (Int, Float) | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
-| Labelled numeric (`haven_labelled`, `foreign`, `readstata13`) | `is one of`, `is not one of` (label checklist, matched by code) **plus** the full numeric set above |
+| Labelled numeric (`haven_labelled`, `foreign`, `readstata13`) | `is one of`, `is not one of` (label checklist, matched by code), plus the full numeric set above |
 | Factor | `is one of`, `is not one of` |
 | Character | `contains`, `does not contain`, `starts with`, `ends with`, `=`, `≠`, `matches regex` |
 | Boolean | `is true`, `is false` |
 | Date / Timestamp | `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `not between` |
 | Any column | `is empty`, `is not empty` |
 
-For numeric `between` / `not between`, the editor shows a histogram of the
-column's distribution with draggable range thumbs alongside the numeric
-input fields. The histogram is computed the first time you open that
-column's filter (not up front when the table loads), so on a very large
-frame it may appear a moment after the popover opens; it is cached
-thereafter. This keeps the histogram scan off the initial load path, so
-opening a table paints the grid without waiting for every numeric column to
-be scanned.
+For numeric `between` and `not between`, the editor shows a histogram of the column with draggable range handles beside the number fields. The histogram is computed the first time you open that column's filter, not when the table loads, so on a very large frame it may appear a moment after the editor opens. It is cached after that, and opening a table never waits for histograms.
 
-For factor columns, the editor shows a searchable checklist of levels when
-the column's value dictionary has been shipped; large or unshipped
-dictionaries fall back to a free-text value list. For labelled numeric
-columns the editor defaults to a searchable checklist of the labelled
-values, each shown as label + underlying code, and also offers the full
-set of numeric predicates via the condition dropdown.
+For factor columns, the editor shows a searchable checklist of levels when the levels are available to the panel; columns with very many levels fall back to a free-text value list. For labelled numeric columns, the editor defaults to a searchable checklist of the labelled values, each shown as label plus code, and also offers the numeric predicates in the condition dropdown.
 
-The `matches regex` predicate for character columns uses ECMAScript (JavaScript)
-regex syntax — not PCRE or R regex syntax. A **Case sensitive** toggle
-controls whether all character predicates match case-sensitively.
+`matches regex` uses JavaScript regular-expression syntax, not PCRE or R regex syntax. A Case sensitive toggle controls whether all character predicates match case-sensitively.
 
-Use `is empty` to select rows where a column is missing; `is not empty`
-selects only non-missing rows.
+Use `is empty` to keep rows where a column is missing, and `is not empty` to keep only rows where it isn't.
 
-### NA / NaN
+<a id="na--nan-1"></a>
 
-By default, missing values (`NA`, `NaN`) fail every predicate and are
-excluded from filtered results. Each filter editor has an **Include NA /
-NaN** checkbox that re-includes missing rows for that specific filter.
+### Missing values in filters
 
-### Labels and Format
+By default, missing values (`NA`, `NaN`) fail every predicate and are left out of filtered results. Each filter editor has an Include NA / NaN checkbox that keeps missing rows for that filter.
 
-Filters on labelled columns match the displayed string — the label when
-Labels is on, the underlying code or value when Labels is off. This is the
-same WYSIWYG rule as sorting: what you see is what is matched. Toggling
-Labels with an active filter on a labelled column will re-evaluate the
-filter.
+<a id="labels-and-format-1"></a>
 
-Labelled **numeric** columns are the exception: their `is one of` /
-`is not one of` checklist matches the **underlying numeric code**, not the
-displayed label, so toggling Labels never changes which rows a labelled-numeric
-filter keeps. The chip still shows the labels (for example `gender ∈ {Male,
-Female}`). The numeric `compare` / `between` predicates likewise match the
-underlying value, as for any numeric column.
+### Filtering with Labels and Format
 
-The Format toggle and digits setting never affect filtering. Numeric
-predicates always match the underlying double, regardless of how many digits
-are shown in the grid.
+Filters on labelled columns match the displayed text: the label when Labels is on, the underlying code or value when it is off. This is the same what-you-see rule as sorting. Toggling Labels while a labelled column is filtered re-evaluates the filter.
+
+Labelled numeric columns are the exception. Their `is one of` and `is not one of` checklist matches the underlying numeric code, not the label, so toggling Labels never changes which rows such a filter keeps. The chip still shows the labels (for example `gender ∈ {Male, Female}`). Comparisons and `between` also match the underlying value, as for any numeric column.
+
+Format and the digits setting never affect filtering. Numeric predicates always match the underlying number, however many digits the grid shows.
 
 ### Chip strip
 
-Active filters appear as chips in the toolbar. Each chip shows a short
-summary of the filter condition (for example, `cyl ∈ {6, 8}` or `mpg > 20`).
-Click a chip to re-open its editor. The kebab menu on each chip offers
-**Edit**, **Enable** / **Disable** (disabled chips are shown greyed-out
-and are not applied), and **Remove**. The trailing **✕** on the strip
-clears all filters.
+Active filters appear as chips in the toolbar, each with a short summary such as `cyl ∈ {6, 8}` or `mpg > 20`. Click a chip to reopen its editor. Each chip's menu offers Edit, Enable / Disable (disabled chips are greyed out and not applied), and Remove. The ✕ at the end of the strip clears all filters.
 
 ### Composition
 
-Filters across different columns are combined with AND — a row must satisfy
-all active filters to appear. At most one filter is allowed per column;
-adding a second filter for the same column replaces the first.
+Filters on different columns combine with AND: a row must pass all active filters to appear. Each column has at most one filter; adding a second filter for the same column replaces the first.
 
 ### Filter indicator
 
-Active filters appear as chips in the toolbar. The row-count readout in
-the top-left reflects the filtered total — `Showing X-Y of N`, where `N`
-is the count of rows passing all filters. While the host is rebuilding the
-filter index a `Filtering…` pill appears beside the chips.
+The row count at the top left shows the filtered total as `Showing X-Y of N`, where `N` is the number of rows that pass all filters. While Raven recomputes the filter, a `Filtering…` pill appears beside the chips.
 
-### Persistence
+<a id="persistence-1"></a>
 
-Active filters are persisted per panel-name × schema-hash alongside layout,
-toolbar state, and sort, so a later `View(df)` against the same dataset
-restores the filter configuration. Only the chip descriptors (predicate
-type, values, enabled state, and the Include NA / NaN flag) are stored —
-filter membership is always recomputed against the
-current data on restore. Set `raven.dataViewer.persistFilters` to `false` to
-open every panel unfiltered.
+### Saved filters
 
-### Keyboard shortcuts
+Active filters are remembered for the panel name and the data's column layout, along with the column layout, toolbar state, and sort, so a later `View(df)` of the same data restores them. Only the filter definitions (predicate, values, enabled state, and the Include NA / NaN setting) are saved; which rows pass is always recomputed from the current data. Set `raven.dataViewer.persistFilters` to `false` to open every panel unfiltered.
+
+<a id="keyboard-shortcuts-1"></a>
+
+### Filter shortcuts
 
 | Key | Action |
 | --- | --- |
-| `Shift+Alt+F` | Open filter editor for the focused column. |
-| `Shift+Alt+X` | Clear filter on the focused column. |
+| `Shift+Alt+F` | Open the filter editor for the focused column. |
+| `Shift+Alt+X` | Clear the filter on the focused column. |
 | `Shift+Alt+9` | Clear all active filters. |
 | `Enter` (in editor) | Apply the filter and close the editor. |
 | `Escape` (in editor) | Cancel without applying. |
 
-## Settings
-
-| Setting | Default | Description |
-| --- | --- | --- |
-| `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colorize the text), `background` (tint the cell), or `none`. |
-| `raven.dataViewer.maxStoredLayouts` | `10000` | LRU cap on persisted column-width / visibility entries. Each unique panel-name × schema-hash pair counts once. |
-| `raven.dataViewer.defaultDigits` | `3` | Initial digits used when the Format toggle is on (Format defaults to on). Accepts `0`–`15`; the toolbar's digits dropdown only exposes `0`–`6`, so values above `6` only take effect as the *initial* digits and can't be picked from the dropdown afterwards. |
-| `raven.dataViewer.persistSort` | `true` | Persist the active row sort per panel-name × schema hash. Set to `false` to make every `View(df)` open unsorted. |
-| `raven.dataViewer.persistFilters` | `true` | Persist active filters per panel-name × schema hash. Set to `false` to open every panel unfiltered. |
-
-The data viewer's overall enable/disable is controlled by `raven.rConsole.activation` — there is no separate `raven.dataViewer.enabled` toggle.
-
-Changes apply to newly-opened panels.
-
-## How it works
-
-1. The Raven bootstrap profile (loaded via `R_PROFILE_USER` when you
-   start a Raven-managed R terminal) installs a custom `View()` in
-   `globalenv()` before the plot bridge runs. A failure in the plot
-   bridge does not affect `View()`.
-2. On `View(df)`, R writes the data frame to an Apache Arrow IPC
-   (Feather v2) file in `<extension globalStorage>/data-viewer/`.
-   Per-column variable-label and value-label metadata is captured into
-   a single schema-level JSON blob (R's `arrow` package doesn't expose
-   per-field metadata writes through its public API).
-3. R POSTs the path to the extension's loopback HTTP server
-   (`POST /view-data` with `{ sessionId, panelName, filePath, nrow }`).
-   The route validates that the canonical path is under the
-   per-extension data-viewer directory, rejecting anything else.
-4. The extension opens the file via `apache-arrow` (JS), indexes
-   record-batch starts, and serves row windows on demand to the
-   webview over postMessage. Decoded batches are LRU-cached.
-
-The same Arrow file backs the panel for its lifetime; closing the
-panel deletes the file. On extension activation the data-viewer
-directory is swept of files older than 24 hours.
-
-## Requirements
-
-- The R [`arrow`](https://arrow.apache.org/docs/r/) package
-  (`install.packages("arrow")`). If it's missing, Raven prints a
-  warning in R and shows a VS Code warning notification when you call
-  `View()`, then returns without interrupting the rest of your code.
-- A Raven-managed R terminal (the standard "R" terminal profile in
-  Raven, or one launched via Raven's send-to-R commands). Plain R
-  terminals you opened outside Raven won't have the override
-  installed.
-
 ## Troubleshooting
 
-- **Nothing happens when I call `View(df)`.** Check that the terminal
-  was started by Raven (the terminal profile dropdown's "R" entry,
-  or via send-to-R). Confirm `requireNamespace("arrow")`
-  returns `TRUE`. Check `raven.rConsole.activation`: if it's
-  `"disabled"`, or `"auto"` while REditorSupport is enabled or
-  you're in Positron, Raven's R console — and the data viewer — won't
-  activate.
-- **"Raven data viewer requires the 'arrow' package" warning.** Run
-  `install.packages("arrow")` in the same R installation.
-- **The `Labels` toggle doesn't change a column.** The column has no
-  label metadata. For `haven_labelled` columns, this means
-  `attr(col, "labels")` is empty.
-- **Copying a huge selection refuses with "Selection exceeds copy
-  limit".** The 5 M-cell cap is intentional; reduce the selection or
-  export the slice through R instead.
+- Nothing happens when you call `View(df)`. Check that Raven started the terminal (the "R" entry in the terminal profile dropdown, or a send-to-R command), and that `requireNamespace("arrow")` returns `TRUE`. Also check that Raven's R console is active; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
+- You see "Raven data viewer requires the 'arrow' package". Run `install.packages("arrow")` in the same R installation.
+- The Labels toggle doesn't change a column. The column has no label metadata. For `haven_labelled` columns, this means `attr(col, "labels")` is empty.
+- Copying fails with "Selection exceeds copy limit". The 5,000,000-cell cap is intentional; select less, or export the slice from R.
+
+## Settings
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `raven.dataViewer.missingValueStyle` | `foreground` | How NA / NaN cells are highlighted: `foreground` (colored text), `background` (tinted cell), or `none`. |
+| `raven.dataViewer.maxStoredLayouts` | `10000` | Maximum saved column-width and visibility entries; the least recently used are dropped first. Each panel name and column layout counts once. |
+| `raven.dataViewer.defaultDigits` | `3` | Initial digits when Format is on. Accepts `0`–`15`, but the toolbar dropdown offers only `0`–`6`, so higher values apply only as the initial setting. |
+| `raven.dataViewer.persistSort` | `true` | Remember the sort per panel name and column layout. `false` opens every `View(df)` unsorted. |
+| `raven.dataViewer.persistFilters` | `true` | Remember filters per panel name and column layout. `false` opens every panel unfiltered. |
+
+Changes apply to newly opened panels. There is no separate on/off setting for the data viewer; it follows Raven's R console. See the [settings reference](settings-reference.md) for all settings.
+
+## Details
+
+### How it works
+
+1. When Raven starts an R terminal, its startup profile (loaded through `R_PROFILE_USER`) installs Raven's `View()` in the global environment before it sets up the plot viewer. If plot-viewer setup fails, `View()` still works.
+2. `View(df)` writes the data frame to an Apache Arrow (Feather v2) file in the extension's storage folder, including variable labels and value labels.
+3. The panel reads rows from that file on demand as you scroll, without going back to R. Raven only accepts files from its own data-viewer folder.
+
+The same file backs the panel for as long as it's open, and closing the panel deletes it. When the extension starts, it removes leftover data-viewer files older than 24 hours.
+
+## See also
+
+- [R console](r-console.md)
+- [Debugger](debugger.md): open a data frame from the Variables view
+- [Comparison: Data viewer](comparison.md#data-viewer)
+- [Coexistence with other R extensions](coexistence.md)

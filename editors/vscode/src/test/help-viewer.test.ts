@@ -6,7 +6,7 @@ import { activate, openDocument, sleep } from './helper';
 
 /**
  * End-to-end smoke tests for the R help viewer. These mirror the manual
- * smoke-test plan in docs/help-viewer.md, but exercised through the live
+ * smoke test in docs/development.md ("Help viewer smoke test"), but exercised through the live
  * LSP client + extension activation. They specifically guard against
  * regressions caught only at runtime in earlier rounds:
  *
