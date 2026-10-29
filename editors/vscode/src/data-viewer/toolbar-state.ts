@@ -24,6 +24,9 @@ export type ToolbarState = {
     /** String order chosen in the sort menu, used by the next sort.
      *  Absent ⇔ `natural`. */
     sortOrder?: StringOrder;
+    /** The Σ summary band. Absent ⇔ the size default: on for frames
+     *  with ≤ 200 columns and ≤ 1M rows. */
+    summariesOn?: boolean;
 };
 
 export class ToolbarStateStore {

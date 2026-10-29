@@ -22,6 +22,7 @@
 import { Worker } from 'node:worker_threads';
 import type { GetRowsResponse } from './arrow-reader';
 import type { HistogramBin } from './messages';
+import type { ColumnProfile, ValueCounts } from './profile';
 import { MemoryCounter, PermRegistry } from './perm-buffer';
 import type { ComputeResult, TransformRequest } from './scan-core';
 import { TransformCoordinator } from './transform-coordinator';
@@ -237,12 +238,16 @@ export class WorkerEngine implements DataEngine {
     readonly reader: ThreadClient;
     readonly scan: ThreadClient;
     private scanRestarted = false;
+    /** Viewport reads in flight, shared with the scan worker, whose
+     *  profile scans pause while it's non-zero. */
+    private readonly prioritySab = new SharedArrayBuffer(4);
+    private readonly priority = new Int32Array(this.prioritySab);
 
     private constructor(opts: WorkerEngineOptions) {
         const log = opts.log ?? (() => {});
         const init: ThreadInit = { filePath: opts.filePath, counter: this.counter.sab };
         this.reader = new ThreadClient(opts.readerScript, init, 'reader', log);
-        this.scan = new ThreadClient(opts.scanScript, init, 'scan', log);
+        this.scan = new ThreadClient(opts.scanScript, { ...init, priority: this.prioritySab }, 'scan', log);
         const reader = this.reader;
         const scan = this.scan;
         this.coordinator = new TransformCoordinator(
@@ -340,8 +345,13 @@ export class WorkerEngine implements DataEngine {
         this.coordinator.registry.release(t.perm);
     }
 
-    getRows(req: ViewportRequest, gen: number | undefined): Promise<GetRowsResponse> {
-        return this.reader.call<GetRowsResponse>({ op: 'getRows', req, gen });
+    async getRows(req: ViewportRequest, gen: number | undefined): Promise<GetRowsResponse> {
+        Atomics.add(this.priority, 0, 1);
+        try {
+            return await this.reader.call<GetRowsResponse>({ op: 'getRows', req, gen });
+        } finally {
+            Atomics.sub(this.priority, 0, 1);
+        }
     }
 
     getCellText(row: number, columnIndex: number, maxBytes: number, gen: number | undefined) {
@@ -375,6 +385,28 @@ export class WorkerEngine implements DataEngine {
         } finally {
             signal.removeEventListener('abort', onAbort);
         }
+    }
+
+    /** A cancellable scan-worker request: `signal` sets its shared flag.
+     *  Not re-issued after a restart (the caller re-requests it). */
+    private async cancellable<T>(msg: Record<string, unknown>, signal: AbortSignal): Promise<T> {
+        if (signal.aborted) throw abortError('The data-viewer operation was aborted');
+        const cancel = new SharedArrayBuffer(4);
+        const onAbort = () => Atomics.store(new Int32Array(cancel), 0, 1);
+        signal.addEventListener('abort', onAbort, { once: true });
+        try {
+            return await this.scan.call<T>({ ...msg, cancel });
+        } finally {
+            signal.removeEventListener('abort', onAbort);
+        }
+    }
+
+    profile(columnIndex: number, signal: AbortSignal): Promise<ColumnProfile> {
+        return this.cancellable<ColumnProfile>({ op: 'profile', columnIndex }, signal);
+    }
+
+    valueCounts(columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal): Promise<ValueCounts> {
+        return this.cancellable<ValueCounts>({ op: 'valueCounts', columnIndex, order, limit }, signal);
     }
 
     takeScanRestarted(): boolean {

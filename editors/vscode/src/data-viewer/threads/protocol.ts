@@ -15,6 +15,9 @@ export type ThreadInit = {
     filePath: string;
     /** The shared memory counter (`MemoryCounter`). */
     counter: SharedArrayBuffer;
+    /** One `Int32` cell: viewport reads in flight. Profiles pause while
+     *  it's non-zero (scan worker only). */
+    priority?: SharedArrayBuffer;
 };
 
 export type ReaderRequest =
@@ -35,6 +38,11 @@ export type ScanRequest =
     | { id: number; op: 'seed'; gen: number; spec: TransformSpec }
     | { id: number; op: 'nullCounts'; cancel: SharedArrayBuffer }
     | { id: number; op: 'histogram'; columnIndex: number; cancel: SharedArrayBuffer }
+    | { id: number; op: 'profile'; columnIndex: number; cancel: SharedArrayBuffer }
+    | {
+        id: number; op: 'valueCounts'; columnIndex: number; order: 'desc' | 'asc';
+        limit: number; cancel: SharedArrayBuffer;
+    }
     | { op: 'commit'; gen: number; spec: TransformSpec }
     | { op: 'abort'; gen: number };
 
