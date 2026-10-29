@@ -3,7 +3,7 @@
 Date: 2026-10-29. This file records the persona findability review from §6 of `2026-10-29-docs-redesign-design.md`, following Phase 7 of the plan.
 
 - **Baseline docs SHA:** `6c7871aac52a75305cb9996412e905e7524618a0` (the docs before the redesign).
-- **Tested docs SHA:** `572f6612a7aa7553a091d3b02b0d140049d0972b`. The runs were made at `55d86e47`, `c1317332`, and `76d99864`, and carry forward as described under Carry-forward.
+- **Tested docs SHA:** `58ada0bfc453f9d323bc08f0235987b2b98f06c0`. The runs were made at `55d86e47`, `c1317332`, and `76d99864`, and carry forward as described under Carry-forward.
 - **Evidence commits:** the commits that add and update this file. It touches only `docs/superpowers/`.
 
 ## Protocol
@@ -75,7 +75,9 @@ Between `55d86e47` and `c1317332`, only `docs/diagnostics.md` changed (`git diff
 
 After acceptance, a reader found the R console page's opening confusing because it treated "the R terminal" and "the console" as two separate things. Commits `50fd5ab2` through `a8d78880`, `2018668d`, and `572f6612` restructured the top of `docs/r-console.md` around one console with a choice of program, and updated one link label in `docs/configuration.md`.
 
-The merge from `main` at `76d99864` changed `cli.md`, `debugger.md`, `limitations.md`, `r-console.md`, and `editor-integrations.md`. Of these, only `editor-integrations.md` was visited by an acceptance run (tasks 4, 5, and 6), and those tasks were re-run as final5. `git diff --stat 76d99864 572f6612 -- README.md editors/vscode/README.md docs ':!docs/superpowers'` shows only `docs/r-console.md`. Every result in the table is therefore valid at `572f6612`.
+The merge from `main` at `76d99864` changed `cli.md`, `debugger.md`, `limitations.md`, `r-console.md`, and `editor-integrations.md`. Of these, only `editor-integrations.md` was visited by an acceptance run (tasks 4, 5, and 6), and those tasks were re-run as final5. `git diff --stat 76d99864 572f6612 -- README.md editors/vscode/README.md docs ':!docs/superpowers'` shows only `docs/r-console.md`.
+
+At `58ada0bf`, a new page, `docs/console-key-bindings.md`, explains the console's emacs and vi editing styles. That commit also changed the regenerated hub (`docs/README.md`, `llms.txt`, and the site nav), `docs/user-pages.json`, and two links in `docs/r-console.md`. The root README is unchanged, and no acceptance run visited the other pages, so every result in the table is valid at `58ada0bf`.
 
 ## Spot checks
 
