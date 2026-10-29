@@ -7,7 +7,9 @@ all_functions <- character()
 
 for (pkg in packages) {
   tryCatch({
-    funcs <- ls(paste0("package:", pkg))
+    # all.names = TRUE: exported leading-dot functions (.Call, .subset2,
+    # .row_names_info, ...elt, ...) are part of the API, not hidden helpers.
+    funcs <- ls(paste0("package:", pkg), all.names = TRUE)
     # Filter to only actual functions
     funcs <- funcs[sapply(funcs, function(f) {
       obj <- get(f, envir = as.environment(paste0("package:", pkg)))
