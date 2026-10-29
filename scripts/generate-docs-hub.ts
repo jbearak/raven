@@ -2,7 +2,7 @@
 // Generates the files derived from docs/user-pages.json:
 //   - docs/README.md      the docs hub (GitHub renders it when you open docs/)
 //   - llms.txt            an agent-readable index with absolute URLs
-//   - docs/site/zensical.toml   the `nav = [...]` block, if that file exists
+//   - zensical.toml   the `nav = [...]` block, if that file exists
 //
 // Usage: bun scripts/generate-docs-hub.ts [--check]
 // With --check, exits 1 if any generated file is out of date.
@@ -75,7 +75,7 @@ const targets: [string, (current: string) => string][] = [
   ["docs/README.md", () => hub()],
   ["llms.txt", () => llms()],
 ];
-if (existsSync(path.join(repoRoot, "docs/site/zensical.toml"))) targets.push(["docs/site/zensical.toml", siteNav]);
+if (existsSync(path.join(repoRoot, "zensical.toml"))) targets.push(["zensical.toml", siteNav]);
 
 let stale = false;
 for (const [file, make] of targets) {

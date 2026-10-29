@@ -73,7 +73,7 @@ undefinedVariable = "warning"
 
 Editor-only settings, such as `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, and `raven.pandoc.*`, apply only inside VS Code and aren't read from `raven.toml`. They are documented on their feature pages ([R console](r-console.md), [Data viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard VS Code language-client trace setting (`off`, `messages`, `verbose`), useful when filing bug reports.
 
-Canonical paths shared with Sight, and their permanent compatibility aliases, are specified in [Shared project configuration schema](shared-config-schema.md).
+Canonical paths shared with Sight, and their permanent compatibility aliases, are specified in [Shared project configuration schema](https://github.com/jbearak/raven/blob/main/docs/shared-config-schema.md).
 
 ### Per-file overrides
 

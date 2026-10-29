@@ -46,7 +46,7 @@ That setup needs no R installation and does not run your analysis. Base R symbol
 
 ## GitHub Actions
 
-Use [`jbearak/setup-raven`](https://github.com/jbearak/setup-raven) to install the prebuilt Raven CLI. Copy [`docs/examples/ci/github-actions-raven.yml`](examples/ci/github-actions-raven.yml) to `.github/workflows/raven.yml`:
+Use [`jbearak/setup-raven`](https://github.com/jbearak/setup-raven) to install the prebuilt Raven CLI. Copy [`docs/examples/ci/github-actions-raven.yml`](https://github.com/jbearak/raven/blob/main/docs/examples/ci/github-actions-raven.yml) to `.github/workflows/raven.yml`:
 
 ```yaml
 name: Raven
@@ -75,7 +75,7 @@ Pin `version` to a release tag when you want a fully reproducible CLI version; t
 
 ## Bitbucket Pipelines
 
-Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publishes a signed apt repository, so a normal Ubuntu build image can install the CLI directly. Copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
+Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publishes a signed apt repository, so a normal Ubuntu build image can install the CLI directly. Copy [`docs/examples/ci/bitbucket-pipelines.yml`](https://github.com/jbearak/raven/blob/main/docs/examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
 # Runs on pull requests and on pushes to the default branch (main).
@@ -210,7 +210,7 @@ The examples below run them **one after the other in a single job**. Each additi
 
 ### Both checkers on GitHub Actions
 
-Copy [`docs/examples/ci/github-actions-raven-and-sight.yml`](examples/ci/github-actions-raven-and-sight.yml) to `.github/workflows/checks.yml`:
+Copy [`docs/examples/ci/github-actions-raven-and-sight.yml`](https://github.com/jbearak/raven/blob/main/docs/examples/ci/github-actions-raven-and-sight.yml) to `.github/workflows/checks.yml`:
 
 ```yaml
 name: Checks
@@ -250,7 +250,7 @@ To run them as **parallel jobs** instead, put two entries under `jobs:`, one wit
 
 ### Both checkers on Bitbucket Pipelines
 
-Sight is distributed on npm, so the combined pipeline uses the `node:24` image (Debian-based; Raven's signed apt repository installs on it exactly as on Ubuntu) and adds Sight with one `npm install`. Copy [`docs/examples/ci/bitbucket-pipelines-raven-and-sight.yml`](examples/ci/bitbucket-pipelines-raven-and-sight.yml) to `bitbucket-pipelines.yml`:
+Sight is distributed on npm, so the combined pipeline uses the `node:24` image (Debian-based; Raven's signed apt repository installs on it exactly as on Ubuntu) and adds Sight with one `npm install`. Copy [`docs/examples/ci/bitbucket-pipelines-raven-and-sight.yml`](https://github.com/jbearak/raven/blob/main/docs/examples/ci/bitbucket-pipelines-raven-and-sight.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
 # Runs on pull requests and on pushes to the default branch (main).

@@ -1,0 +1,108 @@
+# Docs site for https://github.com/jbearak/raven, built from the same
+# Markdown files GitHub renders. See "Docs tooling" in docs/development.md.
+# Build: uv pip install -r docs/site/requirements.txt && zensical build --strict
+# The nav block is generated from docs/user-pages.json by scripts/generate-docs-hub.ts.
+
+[project]
+site_name = "Raven"
+site_description = "Static analysis and code intelligence for R"
+repo_url = "https://github.com/jbearak/raven"
+edit_uri = "edit/main/docs/"
+docs_dir = "docs"
+site_dir = "target/docs-site"
+exclude_docs = """
+development.md
+shared-config-schema.md
+diagnostic-corpora.md
+package-corpus-checkpoint.md
+release-notes-*.md
+superpowers/
+examples/
+site/
+user-pages.json
+"""
+
+# BEGIN GENERATED NAV
+nav = [
+  { "Home" = "README.md" },
+  { "Start here" = [
+    { "Getting started" = "getting-started.md" },
+    { "Coming from RStudio, vscode-R, Positron, or lintr" = "coming-from.md" },
+    { "Editor setup" = "editor-integrations.md" },
+    { "Raven in CI" = "ci.md" },
+  ] },
+  { "Analysis" = [
+    { "Diagnostics" = "diagnostics.md" },
+    { "Cross-file analysis" = "cross-file.md" },
+    { "Non-standard evaluation" = "non-standard-evaluation.md" },
+    { "Package development" = "r-package-dev.md" },
+    { "box and import modules" = "modules.md" },
+    { ".Rprofile startup files" = "rprofile.md" },
+    { "Linting" = "linting.md" },
+    { "Indentation" = "indentation.md" },
+  ] },
+  { "Navigation and editing" = [
+    { "Completion" = "completion.md" },
+    { "Hover" = "hover.md" },
+    { "Go to definition" = "go-to-definition.md" },
+    { "Find references" = "find-references.md" },
+    { "Document outline" = "document-outline.md" },
+    { "Syntax highlighting" = "syntax-highlighting.md" },
+    { "Snippets" = "snippets.md" },
+  ] },
+  { "R session (VS Code)" = [
+    { "R console" = "r-console.md" },
+    { "Debugger" = "debugger.md" },
+    { "Plot viewer" = "plot-viewer.md" },
+    { "Data viewer" = "data-viewer.md" },
+    { "Help viewer" = "help-viewer.md" },
+  ] },
+  { "R Markdown and Quarto" = [
+    { "Code chunks" = "chunks.md" },
+    { "R Markdown preview and export" = "knit.md" },
+    { "Quarto" = "quarto.md" },
+  ] },
+  { "Reference" = [
+    { "Directives" = "directives.md" },
+    { "Configuration" = "configuration.md" },
+    { "Settings reference" = "settings-reference.md" },
+    { "Command line" = "cli.md" },
+    { "Keybindings" = "keybinding-comparison.md" },
+  ] },
+  { "Understanding Raven" = [
+    { "How Raven compares" = "comparison.md" },
+    { "Using Raven with other R tools" = "coexistence.md" },
+    { "Limitations" = "limitations.md" },
+    { "Package database" = "package-database.md" },
+    { "Performance on large projects" = "cross-file-analysis-performance.md" },
+  ] },
+  { "Help" = [
+    { "Troubleshooting" = "troubleshooting.md" },
+    { "FAQ" = "faq.md" },
+  ] },
+]
+# END GENERATED NAV
+
+[project.theme]
+features = ["navigation.sections", "navigation.top", "search.highlight", "content.code.copy"]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle = { icon = "lucide/moon", name = "Dark mode" }
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle = { icon = "lucide/sun", name = "Light mode" }
+
+[project.markdown_extensions.github-callouts]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.tables]
+[project.markdown_extensions.toc]
+permalink = true
+slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }
+[project.markdown_extensions."pymdownx.highlight"]
+[project.markdown_extensions."pymdownx.superfences"]

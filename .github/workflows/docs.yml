@@ -1,0 +1,82 @@
+# Builds the documentation site from the same Markdown GitHub renders
+# (zensical.toml at the repo root) and, on main, deploys it to GitHub Pages.
+#
+# The build is a strict render-and-link check for docs changes. It is not a
+# required check: the gating link and anchor checks run in integration.yml's
+# `bun test`, so an outage of the site tooling can't block unrelated PRs.
+#
+# Deploying needs GitHub Pages enabled with "GitHub Actions" as the source and
+# the repository variable DOCS_PAGES_ENABLED set to "true". Until then the
+# deploy job is skipped, not failed. See "Docs tooling" in docs/development.md.
+name: Docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "editors/vscode/README.md"
+      - "zensical.toml"
+      - ".github/workflows/docs.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "zensical.toml"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install pinned site tooling
+        run: python -m pip install --require-hashes -r docs/site/requirements.txt
+
+      - name: Build (strict)
+        run: zensical build --strict
+
+      - name: Check the search index
+        run: bun docs/site/search-check.ts target/docs-site
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && vars.DOCS_PAGES_ENABLED == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/docs-site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name == 'push' && vars.DOCS_PAGES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

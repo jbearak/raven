@@ -492,7 +492,7 @@ raven packages update --base-url https://mirror.example.internal/raven
 
 #### Maintainer commands
 
-`raven packages build-shipped-db`, `validate-shipped-db`, and `build-embedded-base` build and check the databases Raven publishes and embeds. You never need them to use Raven. They are documented in the [development notes](development.md#tier-3-build-pipeline).
+`raven packages build-shipped-db`, `validate-shipped-db`, and `build-embedded-base` build and check the databases Raven publishes and embeds. You never need them to use Raven. They are documented in the [development notes](https://github.com/jbearak/raven/blob/main/docs/development.md#tier-3-build-pipeline).
 
 ## Output formats
 

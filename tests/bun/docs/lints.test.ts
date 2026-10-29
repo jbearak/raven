@@ -14,6 +14,8 @@ import { expectNoViolations } from "./_lib/report";
 
 const manifest = loadManifest();
 const pages = userPagePaths(manifest).filter((f) => existsSync(path.join(repoRoot, f)));
+// Pages the docs site publishes; links to any other file under docs/ must be absolute.
+const sitePages = new Set([...userPagePaths(manifest), "docs/README.md", "docs"]);
 
 const MAX_PARAGRAPH_WORDS = 150;
 const TARGET_CELL_WORDS = 40;
@@ -136,6 +138,8 @@ function structureViolations(file: string, src: string): string[] {
     const resolved = path.posix.normalize(path.posix.join("docs", l.target.split("#")[0]));
     if (!resolved.startsWith("docs/"))
       v.push(`${file}:${l.line}: link "${l.target}" leaves docs/; use https://github.com/jbearak/raven/blob/main/…`);
+    else if (!sitePages.has(resolved) && !resolved.startsWith("docs/images/"))
+      v.push(`${file}:${l.line}: link "${l.target}" points at a file the docs site doesn't publish; use https://github.com/jbearak/raven/blob/main/${resolved}`);
   }
   return v;
 }
