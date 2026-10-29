@@ -550,10 +550,15 @@ fn executable_path(stmt: Node, text: &str) -> Result<Vec<Callee>, String> {
                         "inside `{name}()`: this argument isn't run as code"
                     ));
                 }
-                callees.push(Callee {
-                    name,
-                    pkg: table_pkg.to_string(),
-                });
+                // `pkg::name` is that function by construction (`::` is core
+                // syntax, checked for rebinding below); only a bare name
+                // needs R to confirm what it resolves to.
+                if pkg.is_none() {
+                    callees.push(Callee {
+                        name,
+                        pkg: table_pkg.to_string(),
+                    });
+                }
                 node = call;
                 continue;
             }
@@ -979,5 +984,8 @@ mod tests {
         let src = "testthat::test_that(\"t\", {\n  expect_true(TRUE)\n})\n";
         let p = plan(src, 1, &[bp("a", 2)]);
         assert_eq!(injected(&p), vec![("a".into(), 2)]);
+        // Nothing for R to confirm: it works with testthat loaded but not
+        // attached.
+        assert!(p.callees().is_empty());
     }
 }

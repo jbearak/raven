@@ -210,6 +210,9 @@ fn serve(
             Some("subscribe") => {
                 let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));
                 if let Ok(push) = writer.try_clone() {
+                    // A subscriber that stops reading is dropped rather
+                    // than stalling every later push.
+                    let _ = push.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                     subscribers
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())

@@ -47,7 +47,7 @@ R has no way to stop at a line of code that is already loaded, so Raven adds a s
 - **Source File, and `source()` calls inside your scripts.** A breakpoint in a sourced file binds when the file is sourced.
 - **`devtools::load_all()` and Shiny apps.** pkgload (≥ 1.5) and shiny (≥ 1.13) ask the debugger to instrument the files they load, through the same hook Positron uses. Breakpoints in package code bind when `load_all()` runs.
 
-A breakpoint shows as verified (solid red) once the code containing it has run. If you set a breakpoint in code that is already loaded, run that code again (re-run the function definition or re-source the file) to activate it. Hover over a hollow breakpoint to see why it isn't active. For example:
+A breakpoint shows as verified (solid red) once the code containing it has run. If you set a breakpoint in code that is already loaded, run that code again (re-run the function definition or re-source the file) to activate it. During a debug session, hover over a hollow breakpoint to see why it isn't active. Before a session starts, VS Code draws every breakpoint solid; the **R n/m** item in the status bar counts the bound ones, and its tooltip lists the reasons for the rest. For example:
 
 | Message | Meaning |
 |---|---|

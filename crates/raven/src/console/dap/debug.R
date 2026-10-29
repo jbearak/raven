@@ -526,7 +526,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$set_variable <- function(ref, name, value, frame) internal(tryCatch({
         container <- lookup_ref(as.integer(ref))
         if (!is.environment(container)) return(jobj(error = jstr("only variables in environments can be changed")))
-        v <- eval(parse(text = value, keep.source = FALSE), frame_env(frame))
+        # The new value is an expression in the variable's own scope (a
+        # frame's locals see each other), as typing it at Browse> would be.
+        v <- eval(parse(text = value, keep.source = FALSE), container)
         assign(name, v, envir = container)
         counts <- tryCatch(child_counts(v), error = function(e) c(0, 0))
         jobj(value = jstr(preview(v)), type = jstr(type_label(v)),
@@ -606,6 +608,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is.primitive(f)) return("can't debug a primitive")
         old <- state$fbp[[nm]]
         if (!is.null(old) && identical(old, f) && isdebugged(f)) return("")
+        # Redefined: the old closure may live on elsewhere (`old <- f`); it
+        # must not keep stopping once Raven no longer tracks it.
+        if (!is.null(old) && !identical(old, f)) try(undebug(old), silent = TRUE)
         ok <- tryCatch({ debug(f); TRUE }, error = function(e) FALSE)
         if (!ok) return("debug() failed")
         state$fbp[[nm]] <- f
@@ -753,6 +758,40 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     source_args <- c("local", "echo", "print.eval", "verbose", "prompt.echo", "max.deparse.length",
                      "width.cutoff", "deparseCtrl", "spaced", "keep.source", "chdir", "encoding", "skip.echo")
+    # A top-level probe in a sourced file would call browser() outside any
+    # braces, where the console's hidden `n` finishes the probe and source()
+    # runs on past the statement. Fuse each top-level probe with the
+    # statement it guards into `{probe; statement}`, with srcrefs, so the
+    # step lands on the statement as it does inside functions.
+    is_probe <- function(s) identical(utils::getSrcFilename(s), "<raven-probe>")
+    fuse_probes <- function(exprs) {
+        sr <- attr(exprs, "srcref")
+        if (is.null(sr) || length(sr) != length(exprs)) return(exprs)
+        probe <- vapply(sr, is_probe, TRUE)
+        if (!any(probe)) return(exprs)
+        out <- list()
+        osr <- list()
+        i <- 1L
+        n <- length(exprs)
+        while (i <= n) {
+            if (probe[[i]] && i < n && !probe[[i + 1L]]) {
+                blk <- call("{", exprs[[i]], exprs[[i + 1L]])
+                attr(blk, "srcref") <- list(sr[[i + 1L]], sr[[i]], sr[[i + 1L]])
+                out[[length(out) + 1L]] <- blk
+                osr[[length(osr) + 1L]] <- sr[[i + 1L]]
+                i <- i + 2L
+            } else {
+                out[length(out) + 1L] <- list(exprs[[i]])
+                osr[[length(osr) + 1L]] <- sr[[i]]
+                i <- i + 1L
+            }
+        }
+        res <- as.expression(out)
+        attr(res, "srcref") <- osr
+        attr(res, "srcfile") <- attr(exprs, "srcfile")
+        attr(res, "wholeSrcref") <- attr(exprs, "wholeSrcref")
+        res
+    }
     # `source(echo = TRUE)` echoes the lines each top-level srcref spans in its
     # srcfile, which for annotated text would show `#line` directives and
     # probes. Point the srcrefs at the user's own lines (the `#line`-mapped
@@ -767,7 +806,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         out <- vector("list", length(sr))
         nxt <- NULL
         for (i in rev(seq_along(sr))) {
-            if (identical(utils::getSrcFilename(sr[[i]]), "<raven-probe>")) {
+            if (is_probe(sr[[i]])) {
                 out[[i]] <- nxt
             } else {
                 out[[i]] <- nxt <- srcref(of, as.integer(sr[[i]])[1:6])
@@ -779,6 +818,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         exprs
     }
     env$source_hook <- function(file, local = FALSE, ...) {
+        # Scripts find their own path with `sys.frame(1)$ofile`, which
+        # base source() binds. With this wrapper in place, frame 1 is this
+        # one, so bind it here too.
+        if (!missing(file)) ofile <- file
         orig <- state$orig_source
         if (is.null(orig)) orig <- base::source
         args <- list(...)
@@ -796,13 +839,18 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             return(plain())
         }
         path <- normalizePath(file, mustWork = TRUE)
+        # Files without breakpoints, and encodings base source() would have
+        # to guess between, go to the original untouched.
+        if (identical(rpc("has_bps", path), "0")) return(plain())
         enc <- if (!is.null(args$encoding)) args$encoding else "unknown"
+        if (length(enc) != 1L) return(plain())
         lines <- readLines(file, warn = FALSE, encoding = if (identical(enc, "unknown")) "UTF-8" else enc)
         ann <- internal(tryCatch(annotate_file(path, paste(lines, collapse = "\n"), if (is.environment(local)) local else globalenv()),
                                  error = function(e) NULL))
         if (is.null(ann)) return(plain())
         alines <- strsplit(ann, "\n", fixed = TRUE)[[1L]]
         exprs <- parse(text = alines, keep.source = TRUE, srcfile = srcfilecopy(path, alines), encoding = "UTF-8")
+        exprs <- fuse_probes(exprs)
         if (isTRUE(args$echo)) exprs <- tryCatch(echo_original(exprs, path, lines), error = function(e) exprs)
         if (isTRUE(args$chdir)) {
             owd <- setwd(dirname(path))

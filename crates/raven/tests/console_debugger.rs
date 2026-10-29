@@ -983,3 +983,77 @@ fn r_markdown_breakpoints_bind_per_chunk() {
     d.event("terminated", m);
     c.expect("[1] 6");
 }
+
+#[test]
+fn breakpoints_keep_source_semantics_set_value_scope_and_fbp_cleanup() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let me = c.write_file(
+        "me.R",
+        "where <- basename(sys.frame(1)$ofile)\nwhere2 <- where\n",
+    );
+    let other = c.write_file("other.R", "cat('other ran\\n')\n");
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": me}, "breakpoints": [{"line": 2}]}),
+    );
+    d.req("configurationDone", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    // An instrumented file still finds itself through `ofile`.
+    let m = d.mark();
+    c.send(&format!("source('{me}')"), None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0].1, 2, "stops at the top-level line");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.send("cat('where:', where2, '\\n')", None);
+    c.expect("where: me.R");
+    // Files without breakpoints go to base source() untouched, including
+    // arguments the wrapper doesn't handle itself.
+    c.send(
+        &format!("source('{other}', encoding = c('UTF-8', 'latin1'))"),
+        None,
+    );
+    c.expect("other ran");
+
+    // Set Value evaluates in the variable's own frame.
+    c.send(
+        "y <- 1000; sv <- function() {\n  x <- 1; y <- 5\n  browser()\n  x\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("sv()", None);
+    d.event("stopped", m);
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let sc = d.req("scopes", json!({"frameId": frame}));
+    let r = sc["body"]["scopes"][0]["variablesReference"].clone();
+    let set = d.req(
+        "setVariable",
+        json!({"variablesReference": r, "name": "x", "value": "y + 1"}),
+    );
+    assert_eq!(set["body"]["value"], "6", "{set}");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect("[1] 6");
+
+    // A function breakpoint's old closure stops being debugged when the
+    // function is redefined.
+    c.send("fo <- function() 1", None);
+    std::thread::sleep(Duration::from_millis(300));
+    d.req(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": [{"name": "fo"}]}),
+    );
+    c.send("old <- fo; fo <- function() 2", None);
+    std::thread::sleep(Duration::from_millis(300));
+    c.send("cat('old debugged:', isdebugged(old), '\\n')", None);
+    c.expect("old debugged: FALSE");
+}

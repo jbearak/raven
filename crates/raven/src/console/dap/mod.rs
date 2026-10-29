@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use serde_json::{Value, json};
 
@@ -939,14 +939,32 @@ fn notify_breakpoints(changed: Vec<(String, LineBp)>) {
     }
 }
 
+/// Push an event to every `subscribe`d control connection. The writes
+/// happen on a thread of their own: an extension host that stops reading
+/// must never block the R thread.
 fn push_control(event: Value) {
+    static TX: OnceLock<Mutex<mpsc::Sender<String>>> = OnceLock::new();
     let Some(h) = handle() else { return };
-    let line = format!("{event}\n");
-    let mut subs = h.subscribers.lock().unwrap_or_else(|e| e.into_inner());
-    subs.retain_mut(|s| {
-        use std::io::Write;
-        s.write_all(line.as_bytes()).is_ok()
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        let subscribers = h.subscribers.clone();
+        let _ = std::thread::Builder::new()
+            .name("raven-dap-control".into())
+            .spawn(move || {
+                for line in rx {
+                    let mut subs = subscribers.lock().unwrap_or_else(|e| e.into_inner());
+                    subs.retain_mut(|s| {
+                        use std::io::Write;
+                        s.write_all(line.as_bytes()).is_ok()
+                    });
+                }
+            });
+        Mutex::new(tx)
     });
+    let _ = tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(format!("{event}\n"));
 }
 
 // ---- RPC from R (R thread, inside R's evaluation; never calls R) -----------
@@ -1046,6 +1064,13 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
         }
         "filters" => lock(h).filters.join(","),
         "plan_file" => plan_file(a, b),
+        "has_bps" => {
+            if bp_requests(&canonical(a)).is_empty() {
+                "0".into()
+            } else {
+                "1".into()
+            }
+        }
         "render_file" => render_file(a, b),
         "unsupported_source" => {
             let key = canonical(a);
