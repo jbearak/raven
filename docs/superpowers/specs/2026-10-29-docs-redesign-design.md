@@ -476,7 +476,7 @@ Out-of-`docs/` links (README, `demo/`) are written as absolute GitHub URLs so th
 
 **Enabling Pages** is a one-time repo setting (build type: GitHub Actions).
 
-**Fallback.** If the site cannot be built or deployed (e.g. Pages cannot be enabled), the site files and workflow are dropped from the change. The Markdown sources never depend on the site, so GitHub rendering does not regress. In that case:
+**Fallback.** If the site cannot be deployed (e.g. Pages is not enabled), the site build stays as a non-required PR check and the deploy job is gated off by a repo variable, so nothing deploys and nothing goes red. If the site cannot be *built*, its files and workflow are dropped. The Markdown sources never depend on the site, so GitHub rendering does not regress. In that case:
 
 - The manifest's `site_url` is empty, so the generated hub, README docs line, and `llms.txt` emit no site links. The generators are written that way from the start, so the fallback is a one-field change.
 - §6(a) must pass by the two-click route alone, and the search-index check is removed with the workflow.
