@@ -158,6 +158,30 @@ describe('data viewer App: adoption and generation tagging', () => {
         expect([retry.start, retry.end, retry.columnRange]).toEqual([first.start, first.end, first.columnRange]);
     });
 
+    test('retries for an unchanged viewport reuse its generation, so overlapping stale replies cannot cascade', async () => {
+        const { posted } = await renderApp();
+        await send(init());
+        await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+        let req = posted.find(m => m.type === 'getRows');
+        const gen = req.viewportGeneration;
+        // Each stale reply's retry carries the same generation: the reader
+        // never sees a newer one, so the retry itself is never stale.
+        for (let i = 0; i < 3; i++) {
+            posted.length = 0;
+            await send({
+                type: 'rows', panelGeneration: 1, requestId: req.requestId, viewportGeneration: req.viewportGeneration,
+                start: req.start, end: req.start, rows: [], stale: true, columnRange: req.columnRange,
+            });
+            req = posted.find(m => m.type === 'getRows');
+            expect(req.viewportGeneration).toBe(gen);
+        }
+        // A real viewport change does bump it.
+        posted.length = 0;
+        await send({ type: 'testScrollToFraction', panelGeneration: 1, fraction: 0.8 });
+        const moved = posted.find(m => m.type === 'getRows');
+        expect(moved.viewportGeneration).toBeGreaterThan(gen);
+    });
+
     test('rows from an older generation are dropped', async () => {
         const { posted } = await renderApp();
         await send(init());

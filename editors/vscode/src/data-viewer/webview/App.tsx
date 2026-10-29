@@ -331,6 +331,7 @@ export function App({
     const acceptedFilterRequestIdRef = useRef(0);
     const restoreInteractionBlockRef = useRef<{ sort: boolean; filter: boolean } | null>(null);
     const viewportGenerationRef = useRef(0);
+    const lastViewportKeyRef = useRef('');
     const toolbarBootstrappedRef = useRef(false);
     const missingRowRequestRef = useRef<VisibleRange | null>(null);
     const missingRowRequestTimerRef = useRef<number | null>(null);
@@ -684,10 +685,16 @@ export function App({
         const pinRows = cache.pagesFor(range.start, range.end, 0, 1).rowPages;
         const pinnedCols: [number, number] = [Math.floor(runs[0][0] / C), Math.floor((c1 - 1) / C)];
         cache.pin(pinRows, pinnedCols);
-        // One viewport generation for every request of this viewport: a
-        // per-run bump would make the reader see the frozen-rowname
-        // request as superseded by the viewport request sent right after.
-        let viewportGeneration: number | undefined;
+        // The viewport generation changes only when the viewport does. Every
+        // request for one viewport (the frozen rowname run, the scrolled
+        // columns, and stale-reply retries) shares it, so none of them can
+        // mark another stale.
+        const viewportKey = `${range.start}:${range.end}:${c0}:${c1}`;
+        if (viewportKey !== lastViewportKeyRef.current) {
+            lastViewportKeyRef.current = viewportKey;
+            viewportGenerationRef.current += 1;
+        }
+        const viewportGeneration = viewportGenerationRef.current;
         for (const [a, b] of runs) {
             const pages = cache.pagesFor(range.start, range.end, a, b);
             let r0 = Infinity; let r1 = -1; let p0 = Infinity; let p1 = -1;
@@ -703,7 +710,6 @@ export function App({
             }
             if (tiles.length === 0) continue;
             for (const k of tiles) inflightTilesRef.current.add(k);
-            viewportGeneration ??= ++viewportGenerationRef.current;
             const requestId = nextRequestId();
             const transformGeneration = shownTransformGenRef.current;
             inflightRef.current.set(requestId, { tiles, transformGeneration });
