@@ -392,10 +392,11 @@ This covers tagged sends (§3), Run Chunk (the `#line` path is the `.Rmd` or `.q
 
 | Filter | Default | Mechanism |
 |---|---|---|
-| Errors (uncaught) | off | Raven's global calling handler. It runs before the stack unwinds, then calls `browser()` in place. |
+| Errors (uncaught) | on | Raven's global calling handler. It runs before the stack unwinds, then calls `browser()` in place. |
 | Warnings (not muffled) | off | Same handler, for warnings. |
 | Interrupts | off | Same handler, for interrupts, then `.tryResumeInterrupt()`. |
 
+- **Errors and warnings stop only in code from a file.** On by default, as in debugpy and Julia (the original default was off, copied from Ark). The handler stops only when some frame's call or function srcref names a real file, as vscDebugger's "Errors from R Files" does, so a typo at the `>` prompt doesn't open the debugger on an empty frame. It doesn't stop either while R is already stopped at a browser prompt.
 - **Which frame an exception stop opens in.** The handler doesn't open the browser in its own frame. It finds the innermost frame that passes just-my-code (it has a srcref and isn't an installed package's internals) and runs `base::eval(quote(base::browser()), sys.frame(k))` there. RStudio's break-in-code works the same way. The qualified `base::browser()` means a frame that binds `browser` can't hijack the stop. Tests mask `browser` in the chosen frame, then check the captured environment and stepping after the stop.
   - So typed `Browse>` input and the stack's top frame both refer to the user's code, not to handler internals.
   - If no such frame exists, the stop opens in the frame that signalled the condition.

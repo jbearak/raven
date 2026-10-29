@@ -470,7 +470,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                                        loc = if (is.null(loc)) "null" else jarr(c(jstr(loc[[1L]]), loc[-1L])),
                                        fsrc = if (!is.null(fsrc)) jstr(paste0(call_name(calls[[i]]), " <- ", fsrc)) else NULL))
             }
-            gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else NULL
+            gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else state$top_loc
             items <- c(items, jobj(id = "0", name = jstr("<top level>"),
                                    loc = if (is.null(gloc)) "null" else jarr(c(jstr(gloc[[1L]]), gloc[-1L]))))
             rpc("captured", jarr(items), paste(c(if (fbp) "fbp", if (top_nosrc) "nosrc",
@@ -1117,6 +1117,38 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         0L
     }
+    # Error and warning stops are for code from a file: editor sends with a
+    # location (`#line`), source(), load_all(). Code typed at the prompt has
+    # srcrefs too, but with filename "". A builtin's error at top level
+    # carries its file srcref only on the `.handleSimpleError()` call, so
+    # every frame but the debugger's own is checked. Sends that fall back to
+    # untagged text (an unsaved buffer, a path `#line` can't carry) have no
+    # file, so they don't stop; nor does source(keep.source = FALSE), unless
+    # the file has a breakpoint (the source() wrapper parses with srcrefs).
+    file_srcref <- function(sr) {
+        if (!inherits(sr, "srcref")) return(FALSE)
+        loc <- srcref_loc(sr)
+        !is.null(loc) && nzchar(loc[[1L]]) && !startsWith(loc[[1L]], "<")
+    }
+    from_file <- function() {
+        for (i in seq_len(sys.nframe())) {
+            f <- sys.function(i)
+            if (identical(environment(f), here)) next
+            if (file_srcref(attr(sys.call(i), "srcref")) || file_srcref(attr(f, "srcref"))) return(TRUE)
+        }
+        FALSE
+    }
+    # Where a top-level line from a file signalled: the innermost call with
+    # a file srcref. R 4.3 reports no current srcref for a browser opened in
+    # globalenv(), so the `<top level>` frame takes its line from here.
+    top_file_loc <- function() {
+        for (i in rev(seq_len(sys.nframe()))) {
+            if (identical(environment(sys.function(i)), here)) next
+            sr <- attr(sys.call(i), "srcref")
+            if (file_srcref(sr)) return(srcref_loc(sr))
+        }
+        NULL
+    }
     on_condition <- function(cnd) {
         if (isTRUE(state$internal)) return(invisible(NULL))
         kind <- if (inherits(cnd, "interrupt")) "interrupt" else if (inherits(cnd, "error")) "error"
@@ -1127,12 +1159,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         pause <- identical(taken, "1")
         filters <- strsplit(rpc("filters"), ",", fixed = TRUE)[[1L]]
         if (!pause && !(kind %in% filters)) return(invisible(NULL))
+        if (!pause && kind != "interrupt" && !from_file()) return(invisible(NULL))
         k <- user_frame()
         msg <- tryCatch(conditionMessage(cnd), error = function(e) "")
         call <- tryCatch(paste(deparse(conditionCall(cnd), nlines = 1L), collapse = ""), error = function(e) "")
         rpc("exception", if (pause) "pause" else kind, paste(class(cnd)[[1L]], msg, call, sep = US))
         state$cut <- if (k > 0) k else 0L
-        on.exit(state$cut <- NULL, add = TRUE)
+        state$top_loc <- if (k == 0 && !pause && kind != "interrupt") top_file_loc()
+        on.exit({ state$cut <- NULL; state$top_loc <- NULL }, add = TRUE)
         if (k > 0) base::eval(quote(base::browser()), sys.frame(k)) else base::eval(quote(base::browser()), globalenv())
         if (kind == "interrupt") tryInvokeRestart("resume")
         invisible(NULL)

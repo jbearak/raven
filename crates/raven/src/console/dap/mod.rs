@@ -515,10 +515,10 @@ fn capabilities() -> Value {
         "supportsDelayedStackTraceLoading": true,
         "supportsClipboardContext": true,
         "exceptionBreakpointFilters": [
-            {"filter": "error", "label": "Uncaught errors", "default": false,
-             "description": "Stop where an error is signalled, if no tryCatch()/try() handles it."},
+            {"filter": "error", "label": "Uncaught errors", "default": true,
+             "description": "Stop where an error is signalled in code from a file, if no tryCatch()/try() handles it. Errors in code typed at the prompt don't stop."},
             {"filter": "warning", "label": "Warnings (not muffled)", "default": false,
-             "description": "Stop where a warning is signalled, unless a local handler muffles it."},
+             "description": "Stop where a warning is signalled in code from a file, unless a local handler muffles it."},
             {"filter": "interrupt", "label": "Interrupts", "default": false,
              "description": "Stop where R is interrupted (Ctrl-C) instead of returning to the prompt."}
         ]
@@ -1108,6 +1108,9 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 String::new()
             }
         }
+        // At a browser prompt (stopped, not resumed) the condition comes from
+        // what the user typed there; R is already stopped, so don't nest.
+        "filters" if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) => String::new(),
         "filters" => lock(h).filters.join(","),
         "plan_file" => plan_file(a, b),
         "has_bps" => {

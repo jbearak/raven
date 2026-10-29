@@ -83,6 +83,16 @@ function wait_for_file(file: string, ms: number): Promise<boolean> {
 }
 
 /**
+ * The exception filters to mirror: the last set a session used, or, before
+ * any session has run in this workspace, the adapter's defaults (Uncaught
+ * errors on; crates/raven/src/console/dap/mod.rs). A stored `[]` is the
+ * user turning them all off and is kept.
+ */
+export function exception_filters(stored: string[] | undefined): string[] {
+    return stored ?? ['error'];
+}
+
+/**
  * What the extension tells a console about breakpoints while no session
  * exists. Every file in `previous` without breakpoints now is sent as empty,
  * which clears it.
@@ -107,7 +117,7 @@ function mirror_payload(previous: Set<string>): { msg: object; files: Set<string
     }
     const now = new Set(Object.keys(files));
     for (const p of previous) if (!now.has(p)) files[p] = [];
-    const filters = context_ref?.workspaceState.get<string[]>(FILTERS_KEY, []) ?? [];
+    const filters = exception_filters(context_ref?.workspaceState.get<string[]>(FILTERS_KEY));
     return {
         msg: { v: 1, id: 0, op: 'breakpoints', files, functions, exceptionFilters: filters },
         files: now,
@@ -371,7 +381,11 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
             },
             onWillReceiveMessage(m: { command?: string; arguments?: { filters?: string[] } }) {
                 if (m.command === 'setExceptionBreakpoints') {
-                    void context_ref?.workspaceState.update(FILTERS_KEY, m.arguments?.filters ?? []);
+                    // Other consoles pick the change up now, not when this
+                    // session ends.
+                    void context_ref?.workspaceState
+                        .update(FILTERS_KEY, m.arguments?.filters ?? [])
+                        .then(mirror_all);
                 }
             },
         };
