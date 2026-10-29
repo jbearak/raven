@@ -1119,3 +1119,32 @@ fn stop_interrupts_running_code_and_values_show_faithfully() {
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
 }
+
+#[test]
+fn function_breakpoints_respect_the_users_own_debug_state() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "mine <- function() 1; debug(mine); gone <- function() 2",
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    d.req(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": [{"name": "mine"}, {"name": "gone"}]}),
+    );
+    // The name stops resolving: the closure it named stops being debugged.
+    c.send("kept <- gone; rm(gone)", None);
+    std::thread::sleep(Duration::from_millis(300));
+    // Removing the breakpoint leaves the user's own debug() in place.
+    d.req("setFunctionBreakpoints", json!({"breakpoints": []}));
+    c.send(
+        "cat('mine:', isdebugged(mine), 'kept:', isdebugged(kept), '\\n')",
+        None,
+    );
+    c.expect("mine: TRUE kept: FALSE");
+}

@@ -18,6 +18,12 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+/// The connection a request arrived on, stamped on it by the reader and
+/// copied onto its response: a response is written only to that connection,
+/// never to a client that replaced it (its `request_seq` would match one of
+/// the new client's own requests).
+const CONN: &str = "__raven_conn";
+
 /// Sends messages to the current client (dropped when none is connected).
 #[derive(Clone)]
 pub struct Outbox {
@@ -35,6 +41,7 @@ impl Outbox {
 
     pub fn respond(&self, req: &Value, body: Value) {
         self.send(json!({
+            CONN: req.get(CONN).cloned().unwrap_or(Value::Null),
             "type": "response",
             "request_seq": req.get("seq").cloned().unwrap_or(Value::Null),
             "success": true,
@@ -45,6 +52,7 @@ impl Outbox {
 
     pub fn fail(&self, req: &Value, message: &str) {
         self.send(json!({
+            CONN: req.get(CONN).cloned().unwrap_or(Value::Null),
             "type": "response",
             "request_seq": req.get("seq").cloned().unwrap_or(Value::Null),
             "success": false,
@@ -121,10 +129,15 @@ pub fn start(
             let mut seq: u64 = 1;
             for mut msg in rx {
                 let mut g = writer_current.lock().unwrap_or_else(|e| e.into_inner());
-                let Some((_, stream)) = g.as_mut() else {
+                let Some((cid, stream)) = g.as_mut() else {
                     continue;
                 };
                 if let Some(obj) = msg.as_object_mut() {
+                    if let Some(conn) = obj.remove(CONN)
+                        && conn.as_u64().is_some_and(|c| c != *cid)
+                    {
+                        continue;
+                    }
                     obj.insert("seq".into(), json!(seq));
                 }
                 seq += 1;
@@ -145,6 +158,9 @@ pub fn start(
                 let Ok(reader) = stream.try_clone() else {
                     continue;
                 };
+                // A client that stops reading must not wedge the writer (and
+                // with it the lock a replacement client needs).
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                 let id = accept_connection.fetch_add(1, Ordering::SeqCst) + 1;
                 *accept_current.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, stream));
                 let on_message = on_message.clone();
@@ -154,21 +170,24 @@ pub fn start(
                     .name("raven-dap-client".into())
                     .spawn(move || {
                         let mut r = BufReader::new(reader);
-                        while let Some(msg) = read_frame(&mut r) {
+                        while let Some(mut msg) = read_frame(&mut r) {
+                            if let Some(obj) = msg.as_object_mut() {
+                                obj.insert(CONN.into(), json!(id));
+                            }
                             // A client replaced by a newer one is gone as far
                             // as the debugger is concerned: its late requests
                             // (typically a `disconnect`) must not act on the
                             // new session's stop, and replies would reach the
                             // new client anyway.
-                            let live = current
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .as_ref()
-                                .is_some_and(|(cid, _)| *cid == id);
-                            if !live {
+                            // Held across dispatch so no replacement can
+                            // connect between the check and the handler
+                            // (handlers only queue work; they never block).
+                            let g = current.lock().unwrap_or_else(|e| e.into_inner());
+                            if g.as_ref().is_none_or(|(cid, _)| *cid != id) {
                                 break;
                             }
                             on_message(msg);
+                            drop(g);
                         }
                         let mut g = current.lock().unwrap_or_else(|e| e.into_inner());
                         if g.as_ref().is_some_and(|(cid, _)| *cid == id) {

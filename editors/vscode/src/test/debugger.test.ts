@@ -133,6 +133,25 @@ suite('Raven R debugger (end to end)', function () {
         await ended;
     });
 
+    test('a breakpoint removed right after it was added never stops', async () => {
+        const file = path.join(dir, 'k.R');
+        fs.writeFileSync(file, 'kk <- function() {\n  1\n}\nkk()\n');
+        const bp = new vscode.SourceBreakpoint(new vscode.Location(vscode.Uri.file(file), new vscode.Position(1, 0)));
+        vscode.debug.addBreakpoints([bp]);
+        vscode.debug.removeBreakpoints([bp]);
+        await sleep(1000);
+        const mark = sent.length;
+        await open_at(file, -1);
+        await vscode.commands.executeCommand('raven.runLineOrSelection');
+        await sleep(3000);
+        assert.strictEqual(
+            sent.slice(mark).filter((m) => m.event === 'stopped').length,
+            0,
+            'stopped at a deleted breakpoint',
+        );
+        assert.strictEqual(vscode.debug.activeDebugSession, undefined);
+    });
+
     test('launch with program sources the file under the debugger; Stop quits the browser', async () => {
         const file = path.join(dir, 'g.R');
         fs.writeFileSync(file, 'g <- function() {\n  z <- 5\n  z\n}\nres <- g()\n');

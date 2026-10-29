@@ -376,7 +376,6 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             state$frames <- frames
             state$browse_env <- parent.frame()
             fbp <- n > 0 && any(vapply(state$fbp, function(g) identical(g, funs[[n]]), TRUE))
-            env$reset_refs()
             items <- character()
             top_nosrc <- FALSE
             first <- TRUE
@@ -626,18 +625,31 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # currently debug()ged for them. Names are re-resolved at every top-level
     # prompt, so a function defined (or redefined) later binds then.
     state$fbp_names <- character()
+    state$fbp_owned <- list()
+    # `state$fbp_owned[[nm]]`: Raven turned debugging on for that closure
+    # (it wasn't already debug()ged by the user), so Raven may turn it off.
+    release_fbp <- function(nm) {
+        old <- state$fbp[[nm]]
+        if (!is.null(old) && isTRUE(state$fbp_owned[[nm]])) try(undebug(old), silent = TRUE)
+        state$fbp[[nm]] <- NULL
+        state$fbp_owned[[nm]] <- NULL
+    }
     bind_fbp <- function(nm) {
         f <- find_fun(nm)
-        if (is.null(f) || !is.function(f)) return("function not found")
-        if (is.primitive(f)) return("can't debug a primitive")
+        # The old closure may live on elsewhere (`old <- f`): whenever the
+        # name no longer resolves to it, it must stop stopping.
+        why <- if (is.null(f) || !is.function(f)) "function not found"
+               else if (is.primitive(f)) "can't debug a primitive"
+               else ""
         old <- state$fbp[[nm]]
-        if (!is.null(old) && identical(old, f) && isdebugged(f)) return("")
-        # Redefined: the old closure may live on elsewhere (`old <- f`); it
-        # must not keep stopping once Raven no longer tracks it.
-        if (!is.null(old) && !identical(old, f)) try(undebug(old), silent = TRUE)
+        if (!is.null(old) && (nzchar(why) || !identical(old, f))) release_fbp(nm)
+        if (nzchar(why)) return(why)
+        if (!is.null(state$fbp[[nm]]) && isdebugged(f)) return("")
+        owned <- !isdebugged(f)
         ok <- tryCatch({ debug(f); TRUE }, error = function(e) FALSE)
         if (!ok) return("debug() failed")
         state$fbp[[nm]] <- f
+        state$fbp_owned[[nm]] <- owned
         ""
     }
     fbp_status <- function() {
@@ -646,11 +658,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$function_breakpoints <- function(spec) internal(tryCatch({
         names <- if (nzchar(spec)) strsplit(spec, US, fixed = TRUE)[[1L]] else character()
         for (old in names(state$fbp)) {
-            if (!old %in% names) {
-                f <- state$fbp[[old]]
-                if (!is.null(f)) try(undebug(f), silent = TRUE)
-                state$fbp[[old]] <- NULL
-            }
+            if (!old %in% names) release_fbp(old)
         }
         state$fbp_names <- names
         st <- fbp_status()
@@ -661,7 +669,10 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # While stopped, an empty line must not repeat `n`; R's JIT is off for
     # the duration of a step-in (Ark's fix for positron#11890). Each change
     # is undone only if the value is still the one Raven set (sec. 8.3).
+    # A new stop (not a re-capture of the same one after typed input, whose
+    # Variables references the client may still be using).
     env$on_stop <- function() internal(tryCatch({
+        env$reset_refs()
         if (is.null(state$nl_saved)) {
             state$nl_saved <- list(getOption("browserNLdisabled"))
             options(browserNLdisabled = TRUE)

@@ -81,7 +81,11 @@ function wait_for_file(file: string, ms: number): Promise<boolean> {
     });
 }
 
-/** What the extension tells a console about breakpoints while no session exists. */
+/**
+ * What the extension tells a console about breakpoints while no session
+ * exists. Every file in `previous` without breakpoints now is sent as empty,
+ * which clears it.
+ */
 function mirror_payload(previous: Set<string>): { msg: object; files: Set<string> } {
     const files: Record<string, object[]> = {};
     const functions: string[] = [];
@@ -148,7 +152,15 @@ class ConsoleLink {
     /** The console's line breakpoint states, as last pushed. */
     states: BreakpointState[] = [];
     private control: net.Socket | null = null;
+    /**
+     * Every file any mirror has carried breakpoints for. Never shrinks, so a
+     * removal is sent even when the mirror that added the file is still in
+     * flight (re-sending an empty file is harmless).
+     */
     private mirrored = new Set<string>();
+    /** One mirror at a time, so the console applies them in order. */
+    private in_flight = false;
+    private again = false;
     private closed = false;
     private mirrored_once: () => void = () => undefined;
 
@@ -191,27 +203,61 @@ class ConsoleLink {
         sock.on('close', () => { this.control = null; });
     }
 
-    /** Send the current breakpoints (retrying while the console is still starting). */
-    mirror(attempt = 0): void {
-        if (this.closed || !fs.existsSync(this.ipc)) return;
+    /**
+     * Send the current breakpoints (retrying while the console is still
+     * starting). A change while a mirror is in flight is sent after it, built
+     * from the breakpoints as they are then.
+     */
+    mirror(): void {
+        if (this.in_flight) {
+            this.again = true;
+            return;
+        }
+        this.in_flight = true;
+        this.send_mirror(0);
+    }
+
+    private send_mirror(attempt: number): void {
+        const finish = () => {
+            this.in_flight = false;
+            this.mirrored_once();
+            if (this.again) {
+                this.again = false;
+                this.mirror();
+            }
+        };
+        if (this.closed || !fs.existsSync(this.ipc)) return finish();
         const { msg, files } = mirror_payload(this.mirrored);
+        for (const f of files) this.mirrored.add(f);
         const sock = net.createConnection(this.ipc);
         sock.setEncoding('utf8');
         let reply = '';
+        let done = false;
         sock.on('connect', () => sock.write(JSON.stringify(msg) + '\n'));
         sock.on('data', (d: string) => {
             reply += d;
-            if (!reply.includes('\n')) return;
+            if (done || !reply.includes('\n')) return;
+            done = true;
             sock.end();
-            if (reply.includes('"not-ready"')) {
-                if (attempt < 40) setTimeout(() => this.mirror(attempt + 1), 250);
-                else this.mirrored_once();
+            if (reply.includes('"not-ready"') && attempt < 40) {
+                // Rebuilt on retry, so it carries any change made meanwhile.
+                this.again = false;
+                setTimeout(() => this.send_mirror(attempt + 1), 250);
             } else {
-                this.mirrored = files;
-                this.mirrored_once();
+                finish();
             }
         });
-        sock.on('error', () => this.mirrored_once());
+        const fail = () => {
+            if (!done) {
+                done = true;
+                sock.destroy();
+                finish();
+            }
+        };
+        sock.on('error', fail);
+        // The console answers at once; one that doesn't mustn't hold up
+        // every later mirror.
+        sock.setTimeout(5_000, fail);
     }
 
     dispose(): void {
