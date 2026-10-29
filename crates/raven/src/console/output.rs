@@ -578,8 +578,8 @@ pub fn get() -> &'static Output {
 }
 
 pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
-    // SAFETY: isatty only inspects the descriptor.
-    let merged = unsafe { libc::isatty(1) == 1 && libc::isatty(2) == 1 };
+    use std::io::IsTerminal;
+    let merged = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     let out = OUTPUT.get_or_init(|| Output {
         inner: Mutex::new(Inner {
             mode,
@@ -639,9 +639,14 @@ pub fn init(mode: ColorMode, headers: Headers) -> &'static Output {
     // SAFETY: registers a plain extern "C" fn; see system_hook.c.
     unsafe { crate::console::libr::raven_set_flush_hook(flush_before_child) };
     // R ends the process with exit() (`q()`); drain what is buffered then.
-    // SAFETY: registering a plain extern "C" fn with atexit.
-    unsafe { libc::atexit(flush_at_exit) };
+    // SAFETY: registering a plain extern "C" fn with the C runtime's atexit
+    // (R's exit() runs it, on Windows too).
+    unsafe { atexit(flush_at_exit) };
     out
+}
+
+unsafe extern "C" {
+    fn atexit(f: extern "C" fn()) -> std::ffi::c_int;
 }
 
 /// Called by the `system()` wrapper (Linux) just before a child starts.

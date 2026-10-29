@@ -1054,7 +1054,7 @@
             "radian"
           ],
           "enumDescriptions": [
-            "Raven's built-in R console: syntax highlighting, multi-line editing, Tab completion, and colored output. Runs the same R you get by typing R, and falls back to plain R if it can't. macOS and Linux; on Windows this starts plain R.",
+            "Raven's built-in R console: syntax highlighting, multi-line editing, Tab completion, and colored output. Runs the same R you get by typing R, and falls back to plain R if it can't.",
             "The standard R console.",
             "arf, a third-party Rust R console (install separately).",
             "radian, a third-party Python R console (install separately)."

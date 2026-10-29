@@ -388,6 +388,59 @@ jobs:
       - name: Run JAGS grammar tests (debug)
         run: cargo test -p tree-sitter-jags
 
+  # ── Windows console ───────────────────────────────────────────────────
+  # `raven console` embeds R.dll through a different front-end interface
+  # than Unix (structRstart, UserBreak, named pipes), so it gets its own
+  # Windows run: clippy over the Windows-only code, the console's unit tests,
+  # and console_windows, which drives a real console through ConPTY with R
+  # installed.
+  windows-console:
+    name: Windows Console
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # The workflow-level mold flag is Linux-only.
+      RUSTFLAGS: ""
+      SCCACHE_DIR: ${{ runner.temp }}/sccache
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache sccache storage (debug)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-debug-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            sccache-debug-${{ runner.os }}-
+
+      - name: Install R
+        uses: r-lib/actions/setup-r@f9a764fea8d5c63df6ef9a5c7795bf7deb5d7e05 # v2
+        with:
+          r-version: release
+
+      - name: Clippy (Windows)
+        run: cargo clippy -p raven --all-targets --features test-support -- -D warnings
+
+      - name: Console unit tests
+        run: cargo test -p raven --features test-support --lib 'console::'
+
+      - name: Console end-to-end tests (ConPTY)
+        run: cargo test -p raven --features test-support --test console_windows -- --nocapture
+
   # ── Time-budget regression tests (required check) ──────────────────────
   # Runs the release-compiled performance_budgets binary from the build job.
   # The binary IS the performance_budgets test target, so running it with no

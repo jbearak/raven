@@ -59,17 +59,30 @@ toml = "0.8"
 globset = "0.4"
 ignore = "0.4"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-xdg = "2.5.2"
-# `raven console` (Unix only): runtime-loaded libR, line editor, terminal.
+# `raven console`: runtime-loaded libR, line editor, terminal.
 libloading = "0.9"
 reedline = { version = "=0.52.1", features = ["external_printer"] }
 crossterm = "0.29"
 nu-ansi-term = "0.50"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+xdg = "2.5.2"
+
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
+# `raven console`: named pipes, the console API, and R's registry keys.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
 
 [build-dependencies]
 cc = "1"

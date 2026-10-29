@@ -9,6 +9,7 @@ import {
     on_console_registered,
     send_debug_program,
 } from '../send-to-r/console-ipc';
+import { socket_endpoint } from '../send-to-r/console-endpoint';
 import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
 
 /**
@@ -176,7 +177,7 @@ class ConsoleLink {
 
     private async connect(): Promise<void> {
         if (!(await wait_for_file(this.ipc, SOCKET_WAIT_MS)) || this.closed) return;
-        const sock = net.createConnection(this.ipc);
+        const sock = net.createConnection(socket_endpoint(this.ipc));
         sock.setEncoding('utf8');
         this.control = sock;
         let buf = '';
@@ -229,7 +230,7 @@ class ConsoleLink {
         if (this.closed || !fs.existsSync(this.ipc)) return finish();
         const { msg, files } = mirror_payload(this.mirrored);
         for (const f of files) this.mirrored.add(f);
-        const sock = net.createConnection(this.ipc);
+        const sock = net.createConnection(socket_endpoint(this.ipc));
         sock.setEncoding('utf8');
         let reply = '';
         let done = false;
@@ -349,7 +350,7 @@ const descriptor_factory: vscode.DebugAdapterDescriptorFactory = {
     createDebugAdapterDescriptor(session) {
         const ipc: string | undefined = session.configuration.consoleSocket;
         if (!ipc) throw new Error('No R console to attach to.');
-        return new vscode.DebugAdapterNamedPipeServer(dap_socket_for(ipc));
+        return new vscode.DebugAdapterNamedPipeServer(socket_endpoint(dap_socket_for(ipc)));
     },
 };
 

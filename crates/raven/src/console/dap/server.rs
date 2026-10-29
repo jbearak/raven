@@ -1,5 +1,6 @@
-//! DAP transport: a Unix socket the console listens on, speaking the Debug
-//! Adapter Protocol's `Content-Length` framing (design §2).
+//! DAP transport: a local socket the console listens on (a named pipe on
+//! Windows; see `local_socket`), speaking the Debug Adapter Protocol's
+//! `Content-Length` framing (design §2).
 //!
 //! One client at a time (a newer connection replaces an older one: VS Code
 //! reconnects for each debug session, and the older one's messages are
@@ -9,14 +10,14 @@
 //! of these threads ever touches R.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+
+use crate::console::local_socket::{Listener, Stream};
 
 /// The connection a request arrived on, stamped on it by the reader and
 /// copied onto its response: a response is written only to that connection,
@@ -100,26 +101,10 @@ pub fn start(
     on_message: impl Fn(Value) + Send + Sync + 'static,
     on_close: impl Fn() + Send + Sync + 'static,
 ) -> std::io::Result<Outbox> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        use std::os::unix::fs::FileTypeExt;
-        if !meta.file_type().is_socket() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "path exists and is not a socket",
-            ));
-        }
-        let _ = std::fs::remove_file(path);
-    }
-    // SAFETY: umask only swaps the process file-creation mask.
-    let old = unsafe { libc::umask(0o077) };
-    let bound = UnixListener::bind(path);
-    // SAFETY: as above.
-    unsafe { libc::umask(old) };
-    let listener = bound?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = Listener::bind(path)?;
 
     let (tx, rx) = mpsc::channel::<Value>();
-    let current: Arc<Mutex<Option<(u64, UnixStream)>>> = Arc::new(Mutex::new(None));
+    let current: Arc<Mutex<Option<(u64, Stream)>>> = Arc::new(Mutex::new(None));
     let connection = Arc::new(AtomicU64::new(0));
 
     let writer_current = current.clone();
@@ -154,7 +139,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("raven-dap-accept".into())
         .spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for stream in listener.incoming() {
                 let Ok(reader) = stream.try_clone() else {
                     continue;
                 };

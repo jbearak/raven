@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use serde_json::{Value, json};
 
 use super::libr::{self, Sexp};
+use super::local_socket::Stream;
 use annotate::{BpRequest, Placement, Wrap};
 
 const DEBUG_R: &str = include_str!("debug.R");
@@ -217,14 +218,9 @@ pub struct Handle {
     /// Stop asked to end what R is running: the interrupt it sends must
     /// return R to the prompt, not open a browser.
     abort: AtomicBool,
-    main_thread: libc::pthread_t,
     /// IPC subscribers (the extension's control connections).
-    subscribers: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    subscribers: Arc<Mutex<Vec<Stream>>>,
 }
-
-// SAFETY: pthread_t is an opaque thread id; it is only passed to pthread_kill.
-unsafe impl Send for Handle {}
-unsafe impl Sync for Handle {}
 
 static HANDLE: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
 
@@ -308,8 +304,7 @@ pub fn active() -> bool {
 pub fn init(
     dap: Option<&Path>,
     break_flag: Arc<AtomicBool>,
-    main_thread: libc::pthread_t,
-    subscribers: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    subscribers: Arc<Mutex<Vec<Stream>>>,
 ) -> Result<(), String> {
     let mut err = [0 as c_char; 128];
     // SAFETY: R thread, R idle; the buffer is valid for its length.
@@ -373,7 +368,6 @@ pub fn init(
         break_flag,
         pause: Arc::new(AtomicBool::new(false)),
         abort: AtomicBool::new(false),
-        main_thread,
         subscribers,
     });
     R.with(|r| {
@@ -481,10 +475,27 @@ fn on_close(shared: &Arc<Mutex<Shared>>) {
     s.configured = false;
 }
 
+/// The key breakpoints and stops are matched on: the real path. On Windows
+/// that is the on-disk spelling (so `c:\a.R` from VS Code and `C:/A.R` from R
+/// agree) without the `\\?\` prefix `canonicalize` adds, which neither R nor
+/// VS Code uses.
 fn canonical(path: &str) -> String {
     std::fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| strip_verbatim(p.to_string_lossy().into_owned()))
         .unwrap_or_else(|_| path.to_string())
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\x` → `\\srv\x`; anything else as is.
+fn strip_verbatim(p: String) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = p.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        rest.to_string()
+    } else {
+        p
+    }
 }
 
 fn capabilities() -> Value {
@@ -750,8 +761,7 @@ fn request_abort() {
     let Some(h) = handle() else { return };
     if super::ipc::R_BUSY.load(Ordering::Relaxed) {
         h.abort.store(true, Ordering::SeqCst);
-        // SAFETY: as in `request_pause`.
-        unsafe { libc::pthread_kill(h.main_thread, libc::SIGINT) };
+        super::sys::interrupt_r();
     }
 }
 
@@ -759,10 +769,9 @@ fn request_pause() {
     let Some(h) = handle() else { return };
     if super::ipc::R_BUSY.load(Ordering::Relaxed) {
         h.pause.store(true, Ordering::SeqCst);
-        // SAFETY: delivering SIGINT to the R thread runs R's own handler
-        // there, exactly as a Ctrl-C would; the global interrupt handler sees
-        // the pause flag and opens the browser instead (§7).
-        unsafe { libc::pthread_kill(h.main_thread, libc::SIGINT) };
+        // Interrupt R exactly as a Ctrl-C would; the global interrupt
+        // handler sees the pause flag and opens the browser instead (§7).
+        super::sys::interrupt_r();
     }
 }
 
@@ -2092,6 +2101,13 @@ fn release_held(show: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_prefixes_are_stripped() {
+        assert_eq!(strip_verbatim(r"\\?\C:\w\a.R".into()), r"C:\w\a.R");
+        assert_eq!(strip_verbatim(r"\\?\UNC\srv\s\a.R".into()), r"\\srv\s\a.R");
+        assert_eq!(strip_verbatim("/w/a.R".into()), "/w/a.R");
+    }
 
     #[test]
     fn frames_compare_by_identity_and_line() {

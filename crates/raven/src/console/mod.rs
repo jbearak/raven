@@ -38,7 +38,9 @@ mod editor;
 mod ipc;
 mod lexer;
 mod libr;
+mod local_socket;
 mod output;
+mod sys;
 mod term;
 
 use std::cell::RefCell;
@@ -82,8 +84,9 @@ Options:
   --color-output MODE   streams (default), values, or off
   --history-file PATH   Where to keep input history
   --no-history          Keep history in memory only
-  --ipc PATH            Listen for code from an editor on this Unix socket
-  --dap PATH            Serve the R debugger (Debug Adapter Protocol) on this Unix socket
+  --ipc PATH            Listen for code from an editor on this local socket
+  --dap PATH            Serve the R debugger (Debug Adapter Protocol) on this local socket
+                        (on Windows, a named pipe derived from PATH)
   --help                Show this help
 
 Every other option is passed to R unchanged (e.g. --no-save, --vanilla, -q)."
@@ -139,6 +142,10 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
 }
 
 fn default_history_file() -> Option<PathBuf> {
+    if cfg!(windows) {
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from)?;
+        return Some(appdata.join("raven").join("console_history"));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let dir = if cfg!(target_os = "macos") {
         home.join("Library/Application Support/raven")
@@ -168,10 +175,14 @@ pub fn main(args: Vec<OsString>) -> i32 {
     };
 
     // A console needs a terminal. Anything else (pipes, CI) gets plain R.
-    // SAFETY: isatty only inspects the descriptor.
-    let interactive = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+    let interactive = sys::stdin_and_stdout_are_terminals();
+    let mut opts = opts;
+    if interactive && !sys::prepare_terminal() {
+        opts.color = ColorMode::Off;
+    }
 
     let install = match discovery::discover(opts.r_home.as_deref()) {
+        #[cfg(unix)]
         Ok(discovery::Discovered::NeedsReexec(install, env)) => {
             let err = discovery::reexec(&env);
             return fallback(
@@ -191,6 +202,10 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Err(reason) => return fallback(Some(&install.home), &opts, &reason),
     };
     // SAFETY: called once, on the main thread, before R is initialised.
+    if let Err(reason) = unsafe { init_r(lib, &opts, &install.home) } {
+        return fallback(Some(&install.home), &opts, &reason);
+    }
+    // SAFETY: as above; R is initialised but its main loop not set up.
     unsafe { start_r(lib, opts) }
 }
 
@@ -262,51 +277,125 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
     STATE.with(|s| s.borrow_mut().as_mut().map(f))
 }
 
-unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
-    // argv for R: program name, R's options, and --no-readline (the console
-    // owns line editing). The strings must outlive R, so they are leaked.
-    let mut argv: Vec<*mut c_char> = Vec::new();
-    let push = |argv: &mut Vec<*mut c_char>, s: &[u8]| {
-        argv.push(CString::new(s).unwrap_or_default().into_raw());
-    };
-    push(&mut argv, b"R");
+/// argv for R: program name and R's options. The strings must outlive R,
+/// so they are leaked.
+fn r_argv(opts: &Options, extra: &[&[u8]]) -> &'static mut [*mut c_char] {
+    let leak = |s: &[u8]| CString::new(s).unwrap_or_default().into_raw();
+    let mut argv = vec![leak(b"R")];
     for a in &opts.r_args {
-        use std::os::unix::ffi::OsStrExt;
-        push(&mut argv, a.as_bytes());
+        #[cfg(unix)]
+        let a = std::os::unix::ffi::OsStrExt::as_bytes(a.as_os_str());
+        #[cfg(windows)]
+        let a = a.to_string_lossy();
+        #[cfg(windows)]
+        let a = a.as_bytes();
+        argv.push(leak(a));
     }
-    push(&mut argv, b"--no-readline");
-    let argc = argv.len() as c_int;
-    let argv: &'static mut [*mut c_char] = Vec::leak(argv);
+    argv.extend(extra.iter().map(|e| leak(e)));
+    Vec::leak(argv)
+}
 
-    // SAFETY: documented embedding sequence (R-exts §8.1): initialise, then
-    // replace the console callbacks, then set up and run the main loop.
+/// Initialise R and install the console's callbacks (Unix): R-exts §8.1's
+/// embedding sequence, with `--no-readline` (the console owns line editing).
+#[cfg(unix)]
+unsafe fn init_r(
+    lib: &'static libr::LibR,
+    opts: &Options,
+    _home: &std::path::Path,
+) -> Result<(), String> {
+    let u = &lib.unix;
+    let argv = r_argv(opts, &[b"--no-readline"]);
+    // SAFETY: documented embedding sequence: initialise, then replace the
+    // console callbacks; the caller sets up and runs the main loop.
     unsafe {
-        (lib.initialize_r)(argc, argv.as_mut_ptr());
-        *lib.r_interactive = 1;
-        *lib.r_outputfile = std::ptr::null_mut();
-        *lib.r_consolefile = std::ptr::null_mut();
-        *lib.ptr_write_console = None;
-        *lib.ptr_write_console_ex = Some(write_console_ex);
+        (u.initialize_r)(argv.len() as c_int, argv.as_mut_ptr());
+        *u.r_interactive = 1;
+        *u.r_outputfile = std::ptr::null_mut();
+        *u.r_consolefile = std::ptr::null_mut();
+        *u.ptr_write_console = None;
+        *u.ptr_write_console_ex = Some(write_console_ex);
         // R calls the C wrapper, which calls `read_console` and raises any
         // interrupt it reports once the Rust frames are gone.
         libr::raven_set_read_console(read_console);
-        *lib.ptr_read_console = Some(libr::raven_read_console);
-        *lib.ptr_reset_console = Some(reset_console);
-        *lib.ptr_flush_console = Some(flush_console);
-        *lib.ptr_clearerr_console = Some(noop);
-        *lib.ptr_show_message = Some(show_message);
-        *lib.ptr_busy = Some(busy);
-        *lib.r_wait_usec = 10_000;
+        *u.ptr_read_console = Some(libr::raven_read_console);
+        *u.ptr_reset_console = Some(reset_console);
+        *u.ptr_flush_console = Some(flush_console);
+        *u.ptr_clearerr_console = Some(noop);
+        *u.ptr_show_message = Some(show_message);
+        *u.ptr_busy = Some(busy);
+        *u.r_wait_usec = 10_000;
     }
+    Ok(())
+}
+
+/// Initialise R and install the console's callbacks (Windows): the sequence
+/// of R's own embedding example (`src/gnuwin32/front-ends/rtest.c`), with
+/// R's command-line options applied first, as Rterm does. `R_SetParams`
+/// reads `Renviron.site` and the user's `.Renviron`.
+#[cfg(windows)]
+unsafe fn init_r(
+    lib: &'static libr::LibR,
+    opts: &Options,
+    home: &std::path::Path,
+) -> Result<(), String> {
+    const LINK_DLL: c_int = 2;
+    let w = &lib.windows;
+    // SAFETY: an all-zero Rstart is a valid bit pattern (null pointers,
+    // `None` callbacks); R_DefParamsEx then fills in every field.
+    let mut rp: libr::Rstart = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { (w.r_def_params_ex)(&mut rp, 1) } != 0 {
+        return Err("this R is older than 4.2, which Raven's console needs on Windows".into());
+    }
+    let argv = r_argv(opts, &[]);
+    // R_common_command_line compacts the array it is given; commandArgs()
+    // gets the untouched copy.
+    let all: &'static mut [*mut c_char] = Vec::leak(argv.to_vec());
+    let mut argc = argv.len() as c_int;
+    // SAFETY: R's documented startup sequence, on the main thread, before
+    // R is set up; every pointer handed over lives for the process.
+    unsafe {
+        if let Some(start) = w.r_set_start_time {
+            start();
+        }
+        (w.r_common_command_line)(&mut argc, argv.as_mut_ptr(), &mut rp);
+        rp.rhome = CString::new(home.to_string_lossy().as_bytes())
+            .unwrap_or_default()
+            .into_raw();
+        rp.home = (w.get_r_user)();
+        rp.character_mode = LINK_DLL;
+        rp.r_interactive = 1;
+        // R calls the C wrapper, which calls `read_console` and raises any
+        // interrupt it reports once the Rust frames are gone.
+        libr::raven_set_read_console(read_console);
+        rp.read_console = Some(libr::raven_read_console);
+        rp.write_console = None;
+        rp.write_console_ex = Some(write_console_ex);
+        rp.call_back = Some(noop);
+        rp.show_message = Some(show_message);
+        rp.yes_no_cancel = Some(yes_no_cancel);
+        rp.busy = Some(busy);
+        rp.reset_console = Some(reset_console);
+        rp.flush_console = Some(flush_console);
+        rp.clearerr_console = Some(noop);
+        (w.r_set_params)(&mut rp);
+        (w.r_set_command_line_arguments)(all.len() as c_int, all.as_mut_ptr());
+        if let Some(initapp) = w.ga_initapp {
+            initapp(0, std::ptr::null_mut());
+        }
+    }
+    Ok(())
+}
+
+unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
+    sys::init(lib);
     output::init(opts.color, output::Headers::default());
 
     let break_flag = Arc::new(AtomicBool::new(false));
     let indent = Arc::new(IndentRequest::default());
-    // SAFETY: pthread_self has no preconditions.
-    let main_thread = unsafe { libc::pthread_self() };
     let subscribers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ipc = opts.ipc.as_ref().and_then(|p| {
-        match ipc::Server::start(p, break_flag.clone(), main_thread, subscribers.clone()) {
+        match ipc::Server::start(p, break_flag.clone(), subscribers.clone()) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("raven console: cannot listen on {}: {e}", p.display());
@@ -362,12 +451,7 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
         output::get().set_headers(h.headers);
     }
     if opts.dap.is_some()
-        && let Err(e) = dap::init(
-            opts.dap.as_deref(),
-            break_flag.clone(),
-            main_thread,
-            subscribers,
-        )
+        && let Err(e) = dap::init(opts.dap.as_deref(), break_flag.clone(), subscribers)
     {
         eprintln!("\x1b[2mraven console: {e}\x1b[0m");
     }
@@ -495,8 +579,15 @@ fn load_helpers() -> Option<Helpers> {
 /// (colorout writes straight to the terminal) would bypass ordering, the
 /// editor's above-the-prompt printing, and the socket echo. Checked after the
 /// profiles run and at every prompt (a cheap pointer comparison).
+///
+/// Windows R keeps its callbacks private (they are set once, through
+/// `R_SetParams`), so nothing can replace them there.
+#[cfg(windows)]
+fn reclaim_output_hook() {}
+
+#[cfg(unix)]
 fn reclaim_output_hook() {
-    let lib = libr::get();
+    let lib = &libr::get().unix;
     // SAFETY: R thread; plain reads/writes of R's callback globals.
     let ours = unsafe { *lib.ptr_write_console_ex }
         .is_some_and(|f| std::ptr::fn_addr_eq(f, write_console_ex as libr::WriteConsoleExFn));
@@ -579,6 +670,35 @@ unsafe extern "C" fn show_message(msg: *const c_char) {
         let m = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
         output::get().write(format!("{m}\n").as_bytes(), 1);
     });
+}
+
+/// Windows R's question for `q()` ("Save workspace image?"): asked on the
+/// terminal, as Rterm does. 1 = yes, -1 = no, 0 = cancel.
+#[cfg(windows)]
+unsafe extern "C" fn yes_no_cancel(question: *const c_char) -> c_int {
+    std::panic::catch_unwind(|| {
+        let q = if question.is_null() {
+            String::new()
+        } else {
+            // SAFETY: NUL-terminated string from R.
+            unsafe { CStr::from_ptr(question) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        output::get().flush();
+        loop {
+            let Some(answer) = plain_read(&format!("{q} [y/n/c]: ")) else {
+                return 0;
+            };
+            match answer.trim().chars().next().map(|c| c.to_ascii_lowercase()) {
+                Some('y') => return 1,
+                Some('n') => return -1,
+                Some('c') => return 0,
+                _ => {}
+            }
+        }
+    })
+    .unwrap_or(0)
 }
 
 /// R calls this after an uncaught error or an interrupt (including `Q` in
@@ -1167,52 +1287,28 @@ fn plain_read(prompt: &str) -> Option<String> {
         let _ = write!(out, "{prompt}");
         let _ = out.flush();
     }
-    // Read with libc so that Ctrl-C (EINTR) interrupts instead of retrying.
-    // Poll first, so the debugger is served while this nested read waits (a
-    // breakpoint hit inside a `later`/httpuv callback stops here; design §2).
+    // While nothing is typed, serve the debugger (a breakpoint hit inside a
+    // `later`/httpuv callback stops here; design §2).
     let browser = is_browser_prompt(prompt);
-    let mut line = Vec::new();
-    let mut byte = 0u8;
-    let result = loop {
-        if line.is_empty() && dap::active() {
-            if dap::has_work() {
-                dap::service();
-            }
-            if browser && let Some(cmd) = dap::take_resume() {
-                break Some(format!("{cmd}\n"));
-            }
-            let mut pfd = libc::pollfd {
-                fd: 0,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one valid pollfd.
-            let ready = unsafe { libc::poll(&mut pfd, 1, 50) };
-            if ready == 0 {
-                continue;
-            }
-            if ready < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                request_interrupt();
-                break Some("\n".into());
-            }
+    let mut idle = || {
+        if dap::has_work() {
+            dap::service();
         }
-        // SAFETY: reading one byte into a valid buffer.
-        let n = unsafe { libc::read(0, (&raw mut byte).cast(), 1) };
-        if n == 1 {
-            line.push(byte);
-            if byte == b'\n' {
-                break Some(String::from_utf8_lossy(&line).into_owned());
-            }
-        } else if n == 0 {
-            break None;
-        } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            request_interrupt();
-            break Some("\n".into());
+        if browser {
+            dap::take_resume().map(|cmd| format!("{cmd}\n"))
         } else {
-            break None;
+            None
         }
+    };
+    let result = match sys::read_line(
+        dap::active().then_some(&mut idle as &mut dyn FnMut() -> Option<String>),
+    ) {
+        sys::Line::Text(text) => Some(text),
+        sys::Line::Interrupted => {
+            request_interrupt();
+            Some("\n".into())
+        }
+        sys::Line::Eof => None,
     };
     if raw {
         let _ = crossterm::terminal::enable_raw_mode();

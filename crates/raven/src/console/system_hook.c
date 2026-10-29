@@ -10,26 +10,25 @@
  * system() itself. libR is loaded with dlopen, and ELF resolves its call to
  * system() against the executable first (build.rs exports the symbol), so
  * this wrapper runs, flushes, and hands over to the C library's system().
- * macOS binds libR's calls to libSystem directly, so the wrapper is
- * Linux-only.
+ * macOS binds libR's calls to libSystem directly, and Windows' R.dll binds
+ * its own C runtime, so the wrapper is Linux-only.
  *
  * The flush hook is NULL until the console is running, so the language
  * server (same binary) and anything else calling system() just pass through.
  */
 
+typedef void (*flush_fn)(void);
+
+#if defined(__linux__)
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stddef.h>
-
-typedef void (*flush_fn)(void);
 
 /* Atomic: system() may be called from any thread, at any time. */
 static _Atomic(flush_fn) flush_hook;
 
 void raven_set_flush_hook(flush_fn hook) { atomic_store(&flush_hook, hook); }
-
-#if defined(__linux__)
-#include <dlfcn.h>
 
 typedef int (*system_fn)(const char *);
 
@@ -46,4 +45,8 @@ int system(const char *command) {
     if (hook) hook();
     return real(command);
 }
+#else
+/* No wrapper to call it (macOS uses R_Busy; Windows R runs children its own
+ * way), so nothing stores the hook. */
+void raven_set_flush_hook(flush_fn hook) { (void)hook; }
 #endif
