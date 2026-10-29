@@ -4,10 +4,12 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/console/shim.c");
     println!("cargo:rerun-if-changed=src/console/system_hook.c");
+    println!("cargo:rerun-if-changed=src/console/debug.c");
     if std::env::var("CARGO_CFG_UNIX").is_ok() {
         cc::Build::new()
             .file("src/console/shim.c")
             .file("src/console/system_hook.c")
+            .file("src/console/debug.c")
             .warnings(true)
             .compile("raven_console_shim");
     }
