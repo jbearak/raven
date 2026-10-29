@@ -1336,7 +1336,8 @@ static R_altrep_class_t cls, lcls;
 static int calls = 0;
 static R_xlen_t len(SEXP x) { calls++; return 3; }
 static int spy_elt(SEXP x, R_xlen_t i) { calls++; return (int)i + 1; }
-static void *dataptr(SEXP x, Rboolean w) { calls++; error("no data"); return NULL; }
+static int data[3] = {1, 2, 3};
+static void *dataptr(SEXP x, Rboolean w) { calls++; return data; }
 static const void *dataptr_or_null(SEXP x) { calls++; return NULL; }
 static SEXP lelt(SEXP x, R_xlen_t i) { calls++; return ScalarInteger(1); }
 SEXP spy_make(void) { return R_new_altrep(cls, R_NilValue, R_NilValue); }

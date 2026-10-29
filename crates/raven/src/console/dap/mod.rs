@@ -1661,6 +1661,7 @@ fn on_captured() -> Option<String> {
         .collect();
     if let (Some(top), Some((file, l))) = (frames.first_mut(), cur.as_ref())
         && top.source_ref.is_none()
+        && (l[0] > 0 || top.line == 0)
     {
         top.path = if file.is_empty() || file.starts_with('<') {
             file.clone()

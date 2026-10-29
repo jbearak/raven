@@ -437,7 +437,15 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             first <- TRUE
             for (i in rev(seq_len(n))) {
                 if (hidden[[i]]) next
-                loc <- if (i < n) srcref_loc(attr(calls[[i + 1L]], "srcref")) else NULL
+                loc <- if (i < n) {
+                    srcref_loc(attr(calls[[i + 1L]], "srcref"))
+                } else if (!is.null(state$cut) && n < length(sys.calls())) {
+                    # An exception or pause stop: the top frame is where the
+                    # condition was signalled; the call it was running then
+                    # (`stop(...)`) has the line. Some R versions report no
+                    # current srcref for the browser opened there.
+                    srcref_loc(attr(sys.calls()[[n + 1L]], "srcref"))
+                }
                 f <- funs[[i]]
                 # A function with no srcref (base R, an installed package)
                 # gets its deparsed text as a virtual source (design sec. 6).
