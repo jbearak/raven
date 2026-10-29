@@ -115,6 +115,85 @@ fn parse_flavor(raw: Option<&str>) -> SuppressionFlavor {
     }
 }
 
+/// Which lines a `# raven:` / `@lsp-` suppression marker targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuppressionKind {
+    /// `ignore` / `@lsp-ignore`: the marker's own line.
+    SameLine,
+    /// `ignore-next` / `@lsp-ignore-next`: the following line.
+    NextLine,
+    /// `ignore-start`: opens a block closed by [`Self::BlockEnd`].
+    BlockStart,
+    /// `ignore-end`: closes the open block.
+    BlockEnd,
+    /// `ignore-file`: every line in the file.
+    File,
+}
+
+/// One recognized `# raven:` / `@lsp-` suppression marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SuppressionMarker {
+    pub(crate) kind: SuppressionKind,
+    /// What the marker suppresses: blanket, or the codes in its `[code]`
+    /// selector. Always [`LineSuppression::All`] for [`SuppressionKind::BlockEnd`].
+    pub(crate) what: LineSuppression,
+    pub(crate) flavor: SuppressionFlavor,
+}
+
+/// The one grammar for Raven's `# raven:` and `@lsp-` suppression markers.
+///
+/// Every consumer classifies through this function, so the analyzer track
+/// ([`parse_directives`]), the lint track (`linting::nolint`), and the
+/// invalid-assignment collector in `handlers.rs` cannot disagree about which
+/// spellings count or which lines they target. lintr's `# nolint` forms are
+/// lint-only and stay in `linting::nolint`.
+///
+/// `line` is the whole source line. `comment` is the language scanner's
+/// comment region starting at its `#` (outside string literals), or `None`
+/// when the line has no comment. The `-next`, block, and file forms must be
+/// standalone: they match only when the whole line is the marker, so a
+/// trailing `x <- 1 # raven: ignore-next` is not a marker. The same-line forms
+/// match only inside `comment`, so marker-shaped string contents never count.
+/// A `[code]` selector must be closed; an unterminated `[` rejects the marker
+/// rather than widening it to a blanket suppression.
+pub(crate) fn classify_suppression_marker(
+    line: &str,
+    comment: Option<&str>,
+) -> Option<SuppressionMarker> {
+    let patterns = patterns();
+    let marker = |kind, caps: regex::Captures<'_>| SuppressionMarker {
+        kind,
+        flavor: parse_flavor(caps.get(1).map(|m| m.as_str())),
+        what: parse_suppression_codes(caps.get(2).map(|m| m.as_str())),
+    };
+    if let Some(caps) = comment.and_then(|comment| patterns.ignore.captures(comment)) {
+        return Some(marker(SuppressionKind::SameLine, caps));
+    }
+    if let Some(caps) = patterns.ignore_next.captures(line) {
+        return Some(marker(SuppressionKind::NextLine, caps));
+    }
+    if let Some(caps) = patterns.raven_ignore_start.captures(line) {
+        return Some(marker(SuppressionKind::BlockStart, caps));
+    }
+    if patterns.raven_ignore_end.is_match(line) {
+        return Some(SuppressionMarker {
+            kind: SuppressionKind::BlockEnd,
+            what: LineSuppression::All,
+            flavor: SuppressionFlavor::Ignore,
+        });
+    }
+    if let Some(caps) = patterns.raven_ignore_file.captures(line) {
+        return Some(marker(SuppressionKind::File, caps));
+    }
+    if let Some(caps) = patterns.raven_ignore_next.captures(line) {
+        return Some(marker(SuppressionKind::NextLine, caps));
+    }
+    if let Some(caps) = comment.and_then(|comment| patterns.raven_ignore.captures(comment)) {
+        return Some(marker(SuppressionKind::SameLine, caps));
+    }
+    None
+}
+
 /// Insert a line→suppression mapping, merging with any existing entry so a line
 /// carrying two directives accumulates both (and `All` stays absorbing).
 fn insert_line_suppression(
@@ -754,142 +833,70 @@ where
             continue;
         }
 
-        // Full-file: ignore directives. Each captures an optional flavor
-        // (`ignore`|`expect`, group 1) and `[code]` selector (group 2) that
-        // narrows what it suppresses. The same-line form is not start-anchored,
-        // so it is matched only against the language-specific scanner's actual
-        // comment/marker region — otherwise marker-shaped string contents could
-        // wrongly suppress.
-        if let Some(caps) =
-            same_line_comment(line).and_then(|comment| patterns.ignore.captures(comment))
-        {
-            log::trace!("  Parsed @lsp-ignore/expect directive at line {}", line_num);
-            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_lines, line_num, what.clone());
-            meta.suppression_directives.push(SuppressionDirective {
-                directive_line: line_num,
-                target_start: line_num,
-                target_end: line_num,
-                what,
-                flavor,
-            });
-            continue;
-        }
-
-        if let Some(caps) = patterns.ignore_next.captures(line) {
+        // Full-file: suppression markers (`# raven: ignore*`, `@lsp-ignore*`).
+        // The same-line forms are matched only against the language-specific
+        // scanner's actual comment/marker region, so marker-shaped string
+        // contents never suppress. See `classify_suppression_marker`.
+        if let Some(marker) = classify_suppression_marker(line, same_line_comment(line)) {
             log::trace!(
-                "  Parsed @lsp-ignore/expect-next directive at line {}",
+                "  Parsed {:?} suppression marker at line {}",
+                marker.kind,
                 line_num
             );
-            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what.clone());
-            meta.suppression_directives.push(SuppressionDirective {
-                directive_line: line_num,
-                target_start: line_num + 1,
-                target_end: line_num + 1,
-                what,
-                flavor,
-            });
-            continue;
-        }
-
-        // Full-file: `# raven:` primary-namespace ignore aliases (F2). The
-        // block (`-start`/`-end`) and file (`-file`) forms are checked first
-        // since `raven_ignore` (the same-line form) does not match them.
-        if let Some(caps) = patterns.raven_ignore_start.captures(line) {
-            log::trace!(
-                "  Parsed `# raven: ignore/expect-start` at line {}",
-                line_num
-            );
-            // A nested start is ignored until the current block closes (mirrors
-            // the lint track, which does not nest).
-            if open_block.is_none() {
-                let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-                let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-                open_block = Some((line_num, what, flavor));
+            let SuppressionMarker { kind, what, flavor } = marker;
+            match kind {
+                SuppressionKind::SameLine | SuppressionKind::NextLine => {
+                    let (map, target) = if kind == SuppressionKind::SameLine {
+                        (&mut meta.ignored_lines, line_num)
+                    } else {
+                        (&mut meta.ignored_next_lines, line_num + 1)
+                    };
+                    insert_line_suppression(map, target, what.clone());
+                    meta.suppression_directives.push(SuppressionDirective {
+                        directive_line: line_num,
+                        target_start: target,
+                        target_end: target,
+                        what,
+                        flavor,
+                    });
+                }
+                SuppressionKind::BlockStart => {
+                    // A nested start is ignored until the current block closes
+                    // (mirrors the lint track, which does not nest).
+                    if open_block.is_none() {
+                        open_block = Some((line_num, what, flavor));
+                    }
+                }
+                SuppressionKind::BlockEnd => {
+                    if let Some((start, what, flavor)) = open_block.take() {
+                        meta.ignored_ranges.push(SuppressionRange {
+                            start,
+                            end: line_num,
+                            what: what.clone(),
+                        });
+                        meta.suppression_directives.push(SuppressionDirective {
+                            directive_line: start,
+                            target_start: start,
+                            target_end: line_num,
+                            what,
+                            flavor,
+                        });
+                    }
+                }
+                SuppressionKind::File => {
+                    match &mut meta.ignored_file {
+                        Some(existing) => existing.merge(what.clone()),
+                        None => meta.ignored_file = Some(what.clone()),
+                    }
+                    meta.suppression_directives.push(SuppressionDirective {
+                        directive_line: line_num,
+                        target_start: 0,
+                        target_end: u32::MAX,
+                        what,
+                        flavor,
+                    });
+                }
             }
-            continue;
-        }
-
-        if patterns.raven_ignore_end.is_match(line) {
-            log::trace!("  Parsed `# raven: ignore/expect-end` at line {}", line_num);
-            if let Some((start, what, flavor)) = open_block.take() {
-                meta.ignored_ranges.push(SuppressionRange {
-                    start,
-                    end: line_num,
-                    what: what.clone(),
-                });
-                meta.suppression_directives.push(SuppressionDirective {
-                    directive_line: start,
-                    target_start: start,
-                    target_end: line_num,
-                    what,
-                    flavor,
-                });
-            }
-            continue;
-        }
-
-        if let Some(caps) = patterns.raven_ignore_file.captures(line) {
-            log::trace!(
-                "  Parsed `# raven: ignore/expect-file` at line {}",
-                line_num
-            );
-            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-            match &mut meta.ignored_file {
-                Some(existing) => existing.merge(what.clone()),
-                None => meta.ignored_file = Some(what.clone()),
-            }
-            meta.suppression_directives.push(SuppressionDirective {
-                directive_line: line_num,
-                target_start: 0,
-                target_end: u32::MAX,
-                what,
-                flavor,
-            });
-            continue;
-        }
-
-        if let Some(caps) = patterns.raven_ignore_next.captures(line) {
-            log::trace!(
-                "  Parsed `# raven: ignore/expect-next` directive at line {}",
-                line_num
-            );
-            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_next_lines, line_num + 1, what.clone());
-            meta.suppression_directives.push(SuppressionDirective {
-                directive_line: line_num,
-                target_start: line_num + 1,
-                target_end: line_num + 1,
-                what,
-                flavor,
-            });
-            continue;
-        }
-
-        // Same-line form (not start-anchored); see `patterns.ignore` above for
-        // why this is gated on the comment region rather than the raw line.
-        if let Some(caps) =
-            same_line_comment(line).and_then(|comment| patterns.raven_ignore.captures(comment))
-        {
-            log::trace!(
-                "  Parsed `# raven: ignore/expect` directive at line {}",
-                line_num
-            );
-            let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
-            let what = parse_suppression_codes(caps.get(2).map(|m| m.as_str()));
-            insert_line_suppression(&mut meta.ignored_lines, line_num, what.clone());
-            meta.suppression_directives.push(SuppressionDirective {
-                directive_line: line_num,
-                target_start: line_num,
-                target_end: line_num,
-                what,
-                flavor,
-            });
             continue;
         }
 

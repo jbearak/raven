@@ -18197,6 +18197,21 @@ mod invalid_assignment_target_tests {
     }
 
     #[test]
+    fn malformed_or_misspelled_markers_do_not_suppress_on_ast_path() {
+        // The AST path uses the same marker grammar as `parse_directives`: an
+        // unterminated `[` selector must not widen to a blanket suppression,
+        // and `-next` must be spelled with its hyphen.
+        for code in [
+            "TRUE <- 1 # raven: ignore[line-length",
+            "# raven: ignore next\nTRUE <- 1",
+            "# @lsp-ignore next\nTRUE <- 1",
+        ] {
+            let diags = collect(code);
+            assert_eq!(diags.len(), 1, "{code:?} got {diags:?}");
+        }
+    }
+
+    #[test]
     fn ignore_next_only_applies_when_standalone() {
         // Trailing `# @lsp-ignore-next` on a code line MUST NOT suppress
         // the diagnostic on the next line — this matches the directive
@@ -19204,8 +19219,6 @@ fn classify_comment_for_ignore(
     let raw = text
         .get(comment.start_byte()..comment.end_byte())
         .unwrap_or("");
-    // tree-sitter-r includes the leading `#` in the comment node's text.
-    let body = raw.trim_start_matches('#');
     let row = comment.start_position().row as u32;
     let start_col = comment.start_position().column;
     // Was there any non-whitespace code on the same line before the `#`?
@@ -19222,123 +19235,22 @@ fn classify_comment_for_ignore(
             .or_insert(what);
     };
 
-    // Collapsing these inner `if`s into match guards would force a wildcard
-    // arm and lose exhaustiveness over `LspIgnoreKind` variants.
-    #[allow(clippy::collapsible_match)]
-    match classify_lsp_ignore_marker(body) {
-        Some((LspIgnoreKind::SameLine, what)) => {
-            // Inline `# raven: ignore` suppresses *this* line — but only
-            // when there's code before the marker. A standalone
-            // `# raven: ignore` on its own line has nothing to suppress
-            // (use `# raven: ignore-next` instead).
-            if !standalone {
-                insert(out, row, what);
-            }
-        }
-        Some((LspIgnoreKind::NextLine, what)) => {
-            // `# raven: ignore-next` only applies when the comment is on its
-            // own line, matching the directive parser in
-            // `cross_file/directive.rs`. A trailing
-            // `x <- 1 # raven: ignore-next` does NOT suppress the next
-            // line.
-            if standalone {
-                insert(out, row.saturating_add(1), what);
-            }
-        }
-        None => {}
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LspIgnoreKind {
-    SameLine,
-    NextLine,
-}
-
-/// Classify the text after a `#` that opens a comment. Returns the ignore kind
-/// (`SameLine` for `# raven: ignore` / `@lsp-ignore`, `NextLine` for the
-/// `-next` forms) paired with what it suppresses (a blanket
-/// [`crate::cross_file::types::LineSuppression::All`] or a code-scoped set parsed from the `[code]`
-/// selector). Returns `None` otherwise. Matches word-boundary so
-/// `@lsp-ignored` does not match `@lsp-ignore`.
-fn classify_lsp_ignore_marker(
-    after_hash: &str,
-) -> Option<(LspIgnoreKind, crate::cross_file::types::LineSuppression)> {
-    use crate::cross_file::types::LineSuppression;
-
-    // Parse an optional `[code, code2]` selector immediately following the
-    // marker keyword into a `LineSuppression`.
-    fn codes_from(after: &str) -> LineSuppression {
-        let after = after.trim_start();
-        let Some(rest) = after.strip_prefix('[') else {
-            return LineSuppression::All;
-        };
-        let Some(end) = rest.find(']') else {
-            return LineSuppression::All;
-        };
-        let body = &rest[..end];
-        let codes: Vec<String> = body
-            .split(',')
-            .map(crate::diagnostic_code::normalize)
-            .filter(|c| !c.is_empty())
-            .collect();
-        if codes.is_empty() {
-            LineSuppression::All
-        } else {
-            LineSuppression::Codes(codes)
-        }
-    }
-
-    // Allow extra leading `#` characters (`## @lsp-ignore`) and whitespace,
-    // mirroring `linting::nolint::classify`.
-    let trimmed = after_hash.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
-
-    // `# raven:` primary namespace (F2): the analyzer track aliases the line /
-    // next-line ignore forms. `expect` is the asserting flavor; on this AST
-    // path it suppresses identically to `ignore` (the `unused-suppression`
-    // distinction is driven by the directive enumeration in `directive.rs`).
-    if let Some(rest) = trimmed.strip_prefix("raven:") {
-        let rest = rest.trim_start();
-        let action = rest.split('[').next().unwrap_or(rest).trim();
-        let suffix = action
-            .strip_prefix("ignore")
-            .or_else(|| action.strip_prefix("expect"))?;
-        let suffix = suffix.trim_start_matches('-').trim();
-        // The `[code]` selector, if any, starts at the first `[` in `rest`.
-        let what = match rest.find('[') {
-            Some(i) => codes_from(&rest[i..]),
-            None => LineSuppression::All,
-        };
-        return if suffix.starts_with("next") {
-            Some((LspIgnoreKind::NextLine, what))
-        } else if suffix.is_empty() {
-            Some((LspIgnoreKind::SameLine, what))
-        } else {
-            // `ignore-start`/`ignore-end`/`ignore-file` are not modeled on the
-            // analyzer AST path yet; don't misclassify them as a line ignore.
-            None
-        };
-    }
-
-    let rest = trimmed
-        .strip_prefix("@lsp-ignore")
-        .or_else(|| trimmed.strip_prefix("@lsp-expect"))?;
-    // Word-boundary: the next byte (if any) must not be an identifier byte.
-    // `-`, `:`, `[`, and whitespace are allowed because they begin the `-next`
-    // suffix, a rule filter, or a `[code]` selector.
-    match rest.as_bytes().first() {
-        None => Some((LspIgnoreKind::SameLine, LineSuppression::All)),
-        Some(b) if b.is_ascii_alphanumeric() || *b == b'_' => None,
-        Some(_) => {
-            // `[code]` may directly follow `@lsp-ignore` or `@lsp-ignore-next`.
-            let suffix =
-                rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-            if let Some(after_next) = suffix.strip_prefix("next") {
-                Some((LspIgnoreKind::NextLine, codes_from(after_next)))
-            } else {
-                Some((LspIgnoreKind::SameLine, codes_from(rest)))
-            }
-        }
+    // The shared marker grammar (the same one `parse_directives` and the lint
+    // track use). tree-sitter-r's comment node starts at the `#`, so its text
+    // is exactly the comment region. Block and file forms are applied later by
+    // the global `directive_meta` suppression pass, not here.
+    use crate::cross_file::directive::{SuppressionKind, classify_suppression_marker};
+    let Some(marker) = classify_suppression_marker(line_text, Some(raw)) else {
+        return;
+    };
+    match marker.kind {
+        // Inline `# raven: ignore` suppresses *this* line — but only when
+        // there's code before the marker. A standalone `# raven: ignore` on
+        // its own line has nothing to suppress (use `# raven: ignore-next`).
+        SuppressionKind::SameLine if !standalone => insert(out, row, marker.what),
+        // The grammar only accepts a standalone `-next` marker.
+        SuppressionKind::NextLine => insert(out, row.saturating_add(1), marker.what),
+        _ => {}
     }
 }
 

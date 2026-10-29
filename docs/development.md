@@ -600,7 +600,7 @@ Key files under `crates/raven/src/cross_file/`:
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
 - `binding.rs` — Shared conservative binding-count and `assign()` argument-matching walk used by static path and package-vector inference. Its bounded bare-helper policy recognizes exact local shadowing rather than attempting runtime search-path resolution; the `readLines` direct-effect classification uses a whole-document precheck so later or nested recognized bindings cannot make results traversal-order-dependent. Eager `for` nodes expose a pre-effect checkpoint before installing their unknown-mutation barrier, allowing deterministic loop consumers to snapshot an immutable shared package vector while every post-loop query still sees the barrier; pending persistent invalidations suppress the checkpoint
 - `static_path.rs` — Strict folding of computed `source()` path expressions
-- `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments
+- `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments. `classify_suppression_marker` is the single grammar for suppression markers (`ignore`, `-next`, `-start`/`-end`, `-file`, and their `expect` flavors); the analyzer track, the lint track (`linting/nolint.rs`, which adds only lintr's `# nolint`), and the invalid-assignment collector in `handlers.rs` all classify through it, so they agree on spellings, standalone placement, and `[code]` selectors
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
 - `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)
 - `parent_resolve.rs` — Parent-prefix scope resolution (backward-edge traversal)

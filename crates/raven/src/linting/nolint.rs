@@ -3,7 +3,7 @@
 //! Recognised markers:
 //! * `# raven: ignore` / `-next` / `-start` / `-end` / `-file` — Raven's
 //!   primary suppression namespace (F2), optionally with a `[code]` selector.
-//!   A `[code]` selector is enforced per rule: `parse_colon_codes` returns
+//!   A `[code]` selector is enforced per rule: it parses to
 //!   `LineSuppression::Codes` and `is_suppressed_code` matches against it, so
 //!   `# raven: ignore[line-length]` suppresses only `line-length`.
 //! * `# nolint` (or `# nolint: rule_a, rule_b`) — lintr-style line-level
@@ -13,6 +13,12 @@
 //! * `# @lsp-ignore` / `# @lsp-ignore-next` — permanent `@lsp-` aliases for
 //!   `# raven: ignore` / `# raven: ignore-next`; they parse and behave
 //!   identically (the `-next` form suppresses the *following* source line).
+//!
+//! The `# raven:` and `@lsp-` markers are classified by the shared grammar in
+//! `cross_file::directive::classify_suppression_marker`, the same one the
+//! analyzer track uses, so both tracks agree on which spellings count and
+//! which lines they target (`-next`, block, and file forms must stand on their
+//! own line). Only lintr's `# nolint` forms are parsed here.
 //!
 //! Same-line markers nested inside a commented-code line — `# x <- 1 # nolint`
 //! — are also honoured via a parse-gated fallback (issue #242). The fallback
@@ -27,6 +33,7 @@
 
 use std::collections::HashMap;
 
+use crate::cross_file::directive::{SuppressionKind, SuppressionMarker};
 use crate::cross_file::types::LineSuppression;
 use crate::linting::parse_gate::looks_like_code;
 
@@ -56,6 +63,13 @@ impl Suppressions {
 
         for (idx, line) in text.lines().enumerate() {
             let line_no = idx as u32;
+            // A leading BOM is not part of the first line's text; strip it as
+            // `parse_directives` does so line-anchored markers still match.
+            let line = if idx == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
             let marker = find_marker(line);
 
             // Collapsing these inner `if`s into match guards would force a
@@ -150,20 +164,6 @@ enum NolintMarker {
     File(LineSuppression),
 }
 
-/// Parse a `[code, code2]` bracket selector into a [`LineSuppression`]. `text`
-/// must begin at (or before, with leading whitespace) the `[`. Returns
-/// `Some(LineSuppression::All)` when there is no bracket, and `None` when a
-/// bracket is opened but never closed (a malformed selector — the caller must
-/// then reject the whole directive rather than silently blanket-suppress).
-fn parse_bracket_codes(text: &str) -> Option<LineSuppression> {
-    let text = text.trim_start();
-    let Some(rest) = text.strip_prefix('[') else {
-        return Some(LineSuppression::All);
-    };
-    let end = rest.find(']')?;
-    Some(codes_or_all(&rest[..end]))
-}
-
 /// Parse a lintr `: rule_a, rule_b` filter into a [`LineSuppression`]. `text` is
 /// everything after the `nolint` keyword. Returns [`LineSuppression::All`] when
 /// there is no `:` filter.
@@ -200,11 +200,35 @@ fn codes_or_all(body: &str) -> LineSuppression {
 /// Falls back to [`find_inline_marker`] for the same-line-in-a-commented-code
 /// shape (`# x <- 1 # nolint`).
 fn find_marker(line: &str) -> Option<NolintMarker> {
-    let (_, outer_body) = first_hash_body(line)?;
-    if let Some(marker) = classify(outer_body) {
+    // `# raven:` / `@lsp-` markers share one grammar with the analyzer track,
+    // so a spelling or position the analyzer rejects (e.g. a trailing
+    // `x <- 1 # raven: ignore-next`) does not suppress lints either.
+    let (hash_idx, outer_body) = first_hash_body(line)?;
+    // Every `raven:` / `@lsp-` marker contains one of these literals; checking
+    // them first keeps the regex grammar off ordinary comment lines (this scan
+    // runs over every line of every linted file).
+    if (outer_body.contains("raven:") || outer_body.contains("@lsp-"))
+        && let Some(marker) =
+            crate::cross_file::directive::classify_suppression_marker(line, Some(&line[hash_idx..]))
+    {
+        return Some(NolintMarker::from(marker));
+    }
+    if let Some(marker) = classify_nolint(outer_body) {
         return Some(marker);
     }
     find_inline_marker(outer_body)
+}
+
+impl From<SuppressionMarker> for NolintMarker {
+    fn from(marker: SuppressionMarker) -> Self {
+        match marker.kind {
+            SuppressionKind::SameLine => Self::Line(marker.what),
+            SuppressionKind::NextLine => Self::NextLine(marker.what),
+            SuppressionKind::BlockStart => Self::Start(marker.what),
+            SuppressionKind::BlockEnd => Self::End,
+            SuppressionKind::File => Self::File(marker.what),
+        }
+    }
 }
 
 /// Return the byte index of the first `#` outside any string literal and
@@ -233,19 +257,19 @@ fn first_hash_body(line: &str) -> Option<(usize, &str)> {
     None
 }
 
-/// Fallback for the `# code-here # nolint` shape: a marker nested inside an
-/// outer commented-code line. Issue #242.
+/// Fallback for the `# code-here # nolint` shape: a lintr marker nested inside
+/// an outer commented-code line. Issue #242.
 ///
 /// Pipeline:
 /// 1. **Substring pre-filter** — return immediately unless the outer body
-///    contains `nolint` or `@lsp-ignore` as a literal substring. Short-circuits
-///    the vast majority of prose comments before any parsing work.
+///    contains `nolint` as a literal substring. Short-circuits the vast
+///    majority of prose comments before any parsing work.
 /// 2. **Inner-`#` scan** — find the first `#` inside the outer body that is
 ///    not inside a string literal. The scan reuses the same single-/double-
 ///    quote bookkeeping as [`first_hash_body`].
-/// 3. **Marker classify** — only treat the inner `#` as a marker if [`classify`]
-///    recognises what follows it (`nolint`, `nolint start`, `nolint end`,
-///    `@lsp-ignore`, optionally with a rule filter).
+/// 3. **Marker classify** — only treat the inner `#` as a marker if
+///    [`classify_nolint`] recognises what follows it (`nolint`,
+///    `nolint start`, `nolint end`, optionally with a rule filter).
 /// 4. **Parse-gate** — require the prefix of the outer body (everything
 ///    between the outer `#` and the inner `#`) to parse as real R code. This
 ///    is the same gate `commented_code` uses; reusing it avoids accidentally
@@ -254,14 +278,12 @@ fn first_hash_body(line: &str) -> Option<(usize, &str)> {
 /// The scan stops at the first inner `#`: a further-nested inner-inner marker
 /// (`# foo # bar # nolint`) is intentionally not honoured.
 ///
-/// `# @lsp-ignore-next` in the inline position is **not** honoured: the
-/// fallback exists for same-line suppression on commented-out code, so
-/// silently mapping it to "suppress line N+1" would suppress an unrelated
-/// neighbour while leaving the user's commented-code line still flagged. A
-/// user who really wants next-line semantics should put the marker on its
-/// own line.
+/// `# raven: ignore` / `# @lsp-ignore` nested the same way never reach this
+/// fallback: the shared marker grammar (see [`find_marker`]) already matches
+/// their same-line form anywhere in the comment. Their `-next`, block, and
+/// file forms must be standalone, so a nested one is not a marker.
 fn find_inline_marker(body: &str) -> Option<NolintMarker> {
-    if !body.contains("nolint") && !body.contains("@lsp-ignore") {
+    if !body.contains("nolint") {
         return None;
     }
 
@@ -281,13 +303,9 @@ fn find_inline_marker(body: &str) -> Option<NolintMarker> {
         } else if !in_double && b == b'\'' {
             in_single = !in_single;
         } else if !in_single && !in_double && b == b'#' {
-            // First candidate inner `#`. Classify what follows, reject the
-            // `NextLine` variant (see the doc comment above), parse-gate the
-            // prefix, then commit — or give up.
-            let marker = match classify(&body[i + 1..])? {
-                NolintMarker::NextLine(_) => return None,
-                m => m,
-            };
+            // First candidate inner `#`. Classify what follows, parse-gate
+            // the prefix, then commit — or give up.
+            let marker = classify_nolint(&body[i + 1..])?;
             let prefix = &body[..i];
             let prefix_code = prefix.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
             if looks_like_code(prefix_code) {
@@ -310,88 +328,24 @@ pub(crate) fn first_hash_body_for_parity_test(line: &str) -> Option<(usize, &str
     first_hash_body(line)
 }
 
-fn classify(after_hash: &str) -> Option<NolintMarker> {
+/// Classify a lintr `# nolint` marker (`nolint`, `nolint: rules`,
+/// `nolint start[: rules]`, `nolint end`). `# raven:` / `@lsp-` markers are
+/// classified by `cross_file::directive::classify_suppression_marker`.
+fn classify_nolint(after_hash: &str) -> Option<NolintMarker> {
     // Strip an arbitrary run of leading whitespace and additional `#` chars
     // (people sometimes write `## nolint`).
     let trimmed = after_hash
         .trim_start_matches(|c: char| c == '#' || c.is_whitespace())
         .to_ascii_lowercase();
-
-    // `# raven:` is the primary suppression namespace (F2). It covers the
-    // lint track here exactly as `# nolint`/`@lsp-ignore` do, and honors a
-    // `[code]` selector that narrows suppression to specific lint rules.
-    if let Some(marker) = classify_raven(&trimmed) {
-        return Some(marker);
-    }
-
-    if let Some(rest) = matches_keyword(&trimmed, "nolint") {
-        let rest = rest.trim_start();
-        return if let Some(after) = rest.strip_prefix("start") {
-            // `# nolint start` or `# nolint start: rule_a, rule_b`.
-            Some(NolintMarker::Start(parse_colon_codes(after)))
-        } else if rest.starts_with("end") {
-            Some(NolintMarker::End)
-        } else {
-            // Either bare `# nolint` or `# nolint: rule_a, rule_b`.
-            Some(NolintMarker::Line(parse_colon_codes(rest)))
-        };
-    }
-
-    if let Some(rest) = matches_keyword(&trimmed, "@lsp-ignore")
-        .or_else(|| matches_keyword(&trimmed, "@lsp-expect"))
-    {
-        // An optional `[code]` selector may directly follow the marker.
-        // Match `-next`, `:next`, or whitespace+`next` after the marker so
-        // `@lsp-ignore-next`, `@lsp-ignore: next`, and `@lsp-ignore next`
-        // all resolve to NextLine. Anything else on the same line is a
-        // same-line ignore. `@lsp-expect*` is the asserting flavor (F2 Step 3)
-        // and suppresses identically here.
-        let same_line_codes = parse_bracket_codes(rest)?;
-        let after = rest.trim_start_matches(|c: char| c == ':' || c == '-' || c.is_whitespace());
-        return if let Some(after_next) = after.strip_prefix("next") {
-            Some(NolintMarker::NextLine(parse_bracket_codes(after_next)?))
-        } else {
-            Some(NolintMarker::Line(same_line_codes))
-        };
-    }
-
-    None
-}
-
-/// Classify a `# raven: <action>` suppression directive (lint track).
-///
-/// `trimmed` is the lowercased comment body with leading `#`/whitespace
-/// stripped. Recognizes `ignore`, `ignore-next`, `ignore-start`, `ignore-end`,
-/// and `ignore-file`, each optionally followed by a `[code]` selector that
-/// narrows suppression to specific lint rules. Returns `None` when the body is
-/// not a `raven:` directive.
-fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
-    let rest = matches_keyword(trimmed, "raven")?;
-    // Require the namespace separator `:` (optionally surrounded by spaces).
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    // `expect` is the asserting flavor (F2 Step 3); in the lint track it
-    // suppresses identically to `ignore`. The `unused-suppression` distinction
-    // is handled by the analyzer-track directive enumeration, not here.
-    let after_ignore =
-        matches_keyword(rest, "ignore").or_else(|| matches_keyword(rest, "expect"))?;
-    // `after_ignore` is "", "-next", "-start", "-end", "-file", or any of
-    // those followed by a `[code]` selector (and the bare `ignore[code]` form).
-    let action = after_ignore.trim_start_matches('-');
-    let bracket_at = action.find('[').unwrap_or(action.len());
-    let word = action[..bracket_at].trim();
-    let codes = parse_bracket_codes(&action[bracket_at..])?;
-    // Exact action words only: a typo like `ignore-filed` must NOT prefix-match
-    // `file` and escalate to a whole-file suppression, and an unterminated
-    // `[...` selector (rejected by `parse_bracket_codes` above) must not become
-    // a blanket suppression.
-    match word {
-        "" => Some(NolintMarker::Line(codes)),
-        "next" => Some(NolintMarker::NextLine(codes)),
-        "start" => Some(NolintMarker::Start(codes)),
-        "end" => Some(NolintMarker::End),
-        "file" => Some(NolintMarker::File(codes)),
-        _ => None,
+    let rest = matches_keyword(&trimmed, "nolint")?.trim_start();
+    if let Some(after) = rest.strip_prefix("start") {
+        // `# nolint start` or `# nolint start: rule_a, rule_b`.
+        Some(NolintMarker::Start(parse_colon_codes(after)))
+    } else if rest.starts_with("end") {
+        Some(NolintMarker::End)
+    } else {
+        // Either bare `# nolint` or `# nolint: rule_a, rule_b`.
+        Some(NolintMarker::Line(parse_colon_codes(rest)))
     }
 }
 
@@ -404,7 +358,7 @@ fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
 /// `pub(crate)` so other rules that need a conservative "is this comment a
 /// suppression/directive marker" test (e.g. the indentation rule's aligned-
 /// comment exemption) can reuse the same boundary discipline instead of
-/// re-approximating it and drifting out of sync with [`classify`].
+/// re-approximating it and drifting out of sync with [`classify_nolint`].
 pub(crate) fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = haystack.strip_prefix(keyword)?;
     match rest.as_bytes().first() {
@@ -426,6 +380,47 @@ pub(crate) fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `docs/directives.md`: the `-next`, block, and file forms must stand on
+    /// their own line; a trailing one is silently ignored, on the lint track
+    /// exactly as on the analyzer track.
+    #[test]
+    fn trailing_next_block_and_file_markers_do_not_suppress_lints() {
+        for marker in [
+            "# raven: ignore-next",
+            "# @lsp-ignore-next",
+            "# raven: ignore-start",
+            "# raven: ignore-file",
+        ] {
+            let text = format!("x <- 1 {marker}\ny = 2\nz = 3\n");
+            let s = Suppressions::from_text(&text);
+            assert!(
+                !s.is_suppressed(1) && !s.is_suppressed(2),
+                "trailing {marker:?} must not suppress later lines"
+            );
+        }
+    }
+
+    #[test]
+    fn first_line_marker_after_bom_still_suppresses() {
+        let s = Suppressions::from_text("\u{feff}# raven: ignore-next\ny = 2\n");
+        assert!(s.is_suppressed(1));
+        let s = Suppressions::from_text("\u{feff}# raven: ignore-file\ny = 2\n");
+        assert!(s.is_suppressed(1));
+    }
+
+    /// Spellings the analyzer rejects must not suppress lints either.
+    #[test]
+    fn non_canonical_next_spellings_do_not_suppress_lints() {
+        for marker in [
+            "# raven: ignore next",
+            "# @lsp-ignore next",
+            "# @lsp-ignore: next",
+        ] {
+            let s = Suppressions::from_text(&format!("{marker}\ny = 2\n"));
+            assert!(!s.is_suppressed(1), "{marker:?} must not suppress line 1");
+        }
+    }
 
     #[test]
     fn line_marker_suppresses_only_its_line() {
