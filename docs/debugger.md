@@ -24,7 +24,7 @@ To attach before anything stops, run **Raven: Start R Debugging**. You need this
 | Watch an expression | **Watch** view, evaluated in the selected frame |
 | Run R code | **Debug Console**, evaluated in the frame selected in **Call Stack**, with completions that include the frame's own variables. What the code prints, its messages and its warnings appear in the Debug Console. Typing in the terminal at `Browse[1]>` evaluates in R's browsed frame, as R defines |
 | Hover over a name | Shows its value without running any R code (see below) |
-| Change a variable | **Set Value** in the Variables view |
+| Change a variable | **Set Value** in the Variables view, for variables and for elements of lists and vectors. The new value is an R expression evaluated where the variable lives |
 | Open a data frame | Right-click it in the Variables view → **Open in Data Viewer** |
 | Copy a path to a value | Right-click → **Copy as Expression** (for example `lst$b$x`) |
 
@@ -36,7 +36,7 @@ To attach before anything stops, run **Raven: Start R Debugging**. You need this
 | Conditional | Stop only when an R expression is `TRUE` in the breakpoint's frame. A condition that errors stops and prints the error |
 | Hit count | `5`, `>= 5`, `== 5`, `> 5`, `< 5`, `% 3` |
 | Logpoints | Print a message instead of stopping; `{expr}` is evaluated in the frame. Output goes to the Debug Console |
-| Function breakpoints | **Breakpoints** view → **+** with a function name (`f`, or `pkg::f`). Uses `debug()`. A name that doesn't exist yet (or a package that isn't loaded) binds at the next prompt after it does, and redefining the function re-binds it |
+| Function breakpoints | **Breakpoints** view → **+** with a function name (`f`, or `pkg::f`). Uses `debug()`. A name that doesn't exist yet (or a package that isn't loaded) binds at the next prompt after it does, or, in a file you `source()`, right where the file defines it. Redefining the function re-binds it; your own `debug()` calls are left alone |
 | Errors, warnings, interrupts | Exception filters in the **Breakpoints** view (below) |
 
 ### When a breakpoint takes effect
@@ -87,7 +87,7 @@ Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handle
 
 ## Hover and the Variables view never run your code
 
-Showing variables never forces a lazy value (a promise), never calls an active binding, and never calls a `print()` or `format()` method. Values are shown from their underlying data: factors with their labels, `Date` and `POSIXct` as dates and times, data frames, tibbles and data.tables as their dimensions with paged columns. Hovering over `x`, `x$name`, `x[["name"]]` or `x@slot` reads the value directly; anything else needs the Debug Console.
+Showing variables never forces a lazy value (a promise), never calls an active binding, never calls a `print()` or `format()` method, and never reads a vector whose storage a package implements (an ALTREP class such as those from arrow or vroom; base R's own compact vectors are read). Values are shown from their underlying data: factors with their labels, `Date` and `POSIXct` as dates and times, data frames, tibbles and data.tables as their dimensions with paged columns. Hovering over `x`, `x$name`, `x[["name"]]` or `x@slot` reads the value directly; anything else needs the Debug Console.
 
 The Debug Console and Watch run R code, as you'd expect. Watch expressions stop after two seconds of runtime (R checks this cooperatively, so compiled code may overrun). If an expression reaches a `browser()` or a `debug()`ged function, R continues past it and the Debug Console says so: the debugger is already stopped and can't stop again inside its own request.
 
@@ -101,7 +101,7 @@ The Debug Console and Watch run R code, as you'd expect. Watch expressions stop 
 
 ## What the debugger changes in your R session
 
-- While any line breakpoint exists, `source()` is replaced by a wrapper that instruments the file being sourced and otherwise calls the original. `source(exprs = )`, connections and URLs go straight to the original. The original is put back when the last line breakpoint is removed.
+- While any line or function breakpoint exists, `source()` is replaced by a wrapper that instruments the file being sourced and otherwise calls the original. `source(exprs = )`, connections and URLs go straight to the original. The original is put back when the last line breakpoint is removed.
 - The base environment gets a few bindings: `.ark_annotate_source` (the hook pkgload and shiny call; Positron's Ark defines the same name) and `.raven_dbg_*` helpers the console calls at its own prompts.
 - The option `raven.debug_hook` is set; probes call it.
 

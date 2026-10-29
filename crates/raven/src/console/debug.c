@@ -18,6 +18,8 @@
  */
 
 #include <dlfcn.h>
+#include <math.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -166,26 +168,62 @@ static SEXP dbg_binding(SEXP env, SEXP name) {
     return out;
 }
 
-/* .Call(xlength, x): length without S3/S4 dispatch. */
-static SEXP dbg_xlength(SEXP x) { return r.Rf_ScalarReal((double)r.Rf_xlength(x)); }
+/*
+ * An ALTREP class's package and name. TAG(x) is the class object; its
+ * attributes hold (class symbol, package symbol, type). Reading these runs
+ * no class method.
+ */
+static int altrep_class(SEXP x, const char **pkg, const char **cls) {
+    *pkg = "";
+    *cls = "";
+    SEXP info = r.ATTRIB(r.TAG(x));
+    if (r.TYPEOF(info) != LISTSXP) return 0;
+    SEXP c = r.CAR(info);
+    SEXP p = r.CAR(r.CDR(info));
+    if (r.TYPEOF(c) == SYMSXP) *cls = r.R_CHAR(r.PRINTNAME(c));
+    if (r.TYPEOF(p) == SYMSXP) *pkg = r.R_CHAR(r.PRINTNAME(p));
+    return 1;
+}
 
 /*
- * .Call(materialized, x): TRUE when reading elements of `x` runs no package
- * code: ordinary vectors, ALTREP vectors whose data already exists, and
- * base R's own ALTREP classes (compact sequences, deferred strings).
+ * An ALTREP vector of a class some package defines: its length, data and
+ * elements come from that package's methods, which may run arbitrary code.
+ * Base R's own classes (compact sequences, deferred strings, wrappers) are
+ * known to be safe.
+ */
+static int foreign_altrep(SEXP x) {
+    if (!r.ALTREP || !r.ALTREP(x)) return 0;
+    const char *pkg, *cls;
+    if (!altrep_class(x, &pkg, &cls)) return 1;
+    return strcmp(pkg, "base") != 0;
+}
+
+/*
+ * .Call(xlength, x): length without S3/S4 dispatch; NA for a foreign ALTREP
+ * vector, whose Length method could run package code.
+ */
+static SEXP dbg_xlength(SEXP x) {
+    if (foreign_altrep(x)) return r.Rf_ScalarReal(NAN);
+    return r.Rf_ScalarReal((double)r.Rf_xlength(x));
+}
+
+/*
+ * .Call(materialized, x): TRUE when reading `x` runs no package code:
+ * ordinary vectors and base R's own ALTREP classes. Decided from the class
+ * alone; nothing of a foreign class is called (not even Dataptr_or_null).
  */
 static SEXP dbg_materialized(SEXP x) {
-    if (!r.ALTREP || !r.ALTREP(x)) return r.Rf_ScalarLogical(1);
-    if (r.DATAPTR_OR_NULL && r.DATAPTR_OR_NULL(x)) return r.Rf_ScalarLogical(1);
-    /* ALTREP class: TAG(x) is the class object; its attributes hold
-     * (class symbol, package symbol, type). */
-    SEXP info = r.ATTRIB(r.TAG(x));
-    if (r.TYPEOF(info) == LISTSXP) {
-        SEXP pkg = r.CAR(r.CDR(info));
-        if (r.TYPEOF(pkg) == SYMSXP && strcmp(r.R_CHAR(r.PRINTNAME(pkg)), "base") == 0)
-            return r.Rf_ScalarLogical(1);
-    }
-    return r.Rf_ScalarLogical(0);
+    return r.Rf_ScalarLogical(foreign_altrep(x) ? 0 : 1);
+}
+
+/* .Call(altrep_class, x): "pkg::class" of a foreign ALTREP vector, else "". */
+static SEXP dbg_altrep_class(SEXP x) {
+    if (!foreign_altrep(x)) return r.Rf_mkString("");
+    const char *pkg, *cls;
+    altrep_class(x, &pkg, &cls);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s::%s", pkg, cls);
+    return r.Rf_mkString(buf);
 }
 
 /* .Call(rdebug, env): is R's step flag set on this frame? */
@@ -225,6 +263,7 @@ static const R_CallMethodDef call_methods[] = {
     {"raven_dbg_xlength", (void *)dbg_xlength, 1},
     {"raven_dbg_materialized", (void *)dbg_materialized, 1},
     {"raven_dbg_rdebug", (void *)dbg_rdebug, 1},
+    {"raven_dbg_altrep_class", (void *)dbg_altrep_class, 1},
     {"raven_dbg_set_rdebug", (void *)dbg_set_rdebug, 2},
     {"raven_dbg_base_bind", (void *)dbg_base_bind, 2},
     {NULL, NULL, 0},

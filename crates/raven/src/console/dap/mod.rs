@@ -1845,6 +1845,11 @@ fn r_frame(frame_id: &Value) -> String {
 fn run_job(h: &Handle, job: Job) {
     let Some(out) = h.out.as_ref() else {
         if let Job::FunctionBreakpoints(_, names) = job {
+            {
+                let mut s = lock(h);
+                s.fn_names = names.clone();
+                s.hooks_dirty = true;
+            }
             let _ = call_helper("function_breakpoints", &[&names.join(US)]);
         }
         return;
@@ -1936,7 +1941,11 @@ fn run_job(h: &Handle, job: Job) {
             }
         }
         Job::FunctionBreakpoints(req, names) => {
-            lock(h).fn_names = names.clone();
+            {
+                let mut s = lock(h);
+                s.fn_names = names.clone();
+                s.hooks_dirty = true;
+            }
             let json = call_helper("function_breakpoints", &[&names.join(US)])
                 .unwrap_or_else(|| "[]".into());
             let mut bps: Value = serde_json::from_str(&json).unwrap_or(json!([]));
@@ -1977,9 +1986,13 @@ fn completion_head(text: &str, line: Option<u64>, column: u64) -> (String, u64) 
     (head, units + 1)
 }
 
-/// Keep the `source()` hook installed exactly while line breakpoints exist.
+/// Keep the `source()` hook installed while line or function breakpoints
+/// exist (a sourced file may define a function a breakpoint names).
 fn sync_source_hook(h: &Handle) {
-    let want = !lock(h).files.is_empty();
+    let want = {
+        let s = lock(h);
+        !s.files.is_empty() || !s.fn_names.is_empty()
+    };
     let _ = call_helper("set_source_hook", &[if want { "TRUE" } else { "FALSE" }]);
 }
 

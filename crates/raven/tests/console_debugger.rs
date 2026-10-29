@@ -1326,3 +1326,166 @@ fn continue_after_stepping_into_a_callee_runs_to_the_end() {
         c.expect("outer2 done 4");
     }
 }
+
+/// A package-defined ALTREP integer class whose every method counts its
+/// calls (`spy_calls()`), built with `R CMD SHLIB`.
+const SPY_ALTREP_C: &str = r#"#include <R.h>
+#include <Rinternals.h>
+#include <R_ext/Altrep.h>
+static R_altrep_class_t cls;
+static int calls = 0;
+static R_xlen_t len(SEXP x) { calls++; return 3; }
+static int spy_elt(SEXP x, R_xlen_t i) { calls++; return (int)i; }
+static void *dataptr(SEXP x, Rboolean w) { calls++; error("no data"); return NULL; }
+static const void *dataptr_or_null(SEXP x) { calls++; return NULL; }
+SEXP spy_make(void) { return R_new_altrep(cls, R_NilValue, R_NilValue); }
+SEXP spy_calls(void) { return ScalarInteger(calls); }
+void R_init_spy(DllInfo *dll) {
+  cls = R_make_altinteger_class("spy", "spypkg", dll);
+  R_set_altrep_Length_method(cls, len);
+  R_set_altinteger_Elt_method(cls, spy_elt);
+  R_set_altvec_Dataptr_method(cls, dataptr);
+  R_set_altvec_Dataptr_or_null_method(cls, dataptr_or_null);
+}
+"#;
+
+#[test]
+fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = c.write_file("spy.c", SPY_ALTREP_C);
+    let built = Command::new("R")
+        .args(["CMD", "SHLIB", &src])
+        .current_dir(&c.dir)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let so = c.dir.join("spy.so");
+    if !built || !so.exists() {
+        eprintln!("skipping: R CMD SHLIB unavailable");
+        return;
+    }
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        &format!(
+            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  browser()\n  x\n}}",
+            so.display()
+        ),
+        None,
+    );
+    let m = d.mark();
+    c.send("peek()", None);
+    d.event("stopped", m);
+    let locals = d.locals();
+    assert!(locals["x"].contains("not read"), "{locals:?}");
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let hv = d.req(
+        "evaluate",
+        json!({"expression": "x", "frameId": frame, "context": "hover"}),
+    );
+    assert!(
+        hv["body"]["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not read"),
+        "{hv}"
+    );
+    let calls = d.req(
+        "evaluate",
+        json!({"expression": ".Call('spy_calls')", "frameId": frame, "context": "repl"}),
+    );
+    assert_eq!(calls["body"]["result"], "[1] 0", "{calls}");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}
+
+#[test]
+fn set_value_edits_list_elements_and_vector_entries() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "ed <- function() {\n  k <- 10; l <- list(a = 1, b = list(c = 2)); v <- c(5, 6, 7)\n  browser()\n  cat('now', l$a, l$b$c, v[2], '\\n')\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("ed()", None);
+    d.event("stopped", m);
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let sc = d.req("scopes", json!({"frameId": frame}));
+    let kids = |d: &mut Dap, r: &Value| {
+        d.req("variables", json!({"variablesReference": r}))["body"]["variables"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let find = |vs: &[Value], n: &str| vs.iter().find(|v| v["name"] == n).unwrap().clone();
+    let locals = kids(&mut d, &sc["body"]["scopes"][0]["variablesReference"]);
+    let l = find(&locals, "l");
+    let v = find(&locals, "v");
+    let l_kids = kids(&mut d, &l["variablesReference"]);
+    let b = find(&l_kids, "b");
+    let b_kids = kids(&mut d, &b["variablesReference"]);
+    let _ = b_kids;
+    let v_kids = kids(&mut d, &v["variablesReference"]);
+    assert_eq!(v_kids[1]["name"], "[2]");
+    // The value is an expression in the frame (`k` is a local).
+    for (r, name, value) in [
+        (&l["variablesReference"], "a", "k + 1"),
+        (&b["variablesReference"], "c", "99"),
+        (&v["variablesReference"], "[2]", "-1"),
+    ] {
+        let set = d.req(
+            "setVariable",
+            json!({"variablesReference": r, "name": name, "value": value}),
+        );
+        assert_eq!(set["success"], true, "{set}");
+    }
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("now 11 99 -1");
+}
+
+#[test]
+fn a_function_breakpoint_binds_inside_the_sourced_file_that_defines_it() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let script = c.write_file(
+        "run.R",
+        "fresh <- function() {\n  41 + 1\n}\nres <- fresh()\ncat('res', res, '\\n')\n",
+    );
+    let mut d = Dap::connect(&c);
+    let fb = d.req(
+        "setFunctionBreakpoints",
+        json!({"breakpoints": [{"name": "fresh"}]}),
+    );
+    assert_eq!(fb["body"]["breakpoints"][0]["verified"], false);
+    d.req("configurationDone", json!({}));
+    std::thread::sleep(Duration::from_millis(300));
+    let m = d.mark();
+    c.send(&format!("source('{script}', echo = TRUE)"), None);
+    assert_eq!(
+        d.event("stopped", m)["body"]["reason"],
+        "function breakpoint"
+    );
+    assert_eq!(d.stack()[0].0, "fresh");
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("res 42");
+    let text = c.text();
+    assert!(!text.contains("rebind"), "{text}");
+    assert_eq!(text.matches("> fresh <- function() {").count(), 1, "{text}");
+    assert_eq!(text.matches("> res <- fresh()").count(), 1, "{text}");
+}

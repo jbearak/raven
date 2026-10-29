@@ -25,6 +25,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         xlength = sym("raven_dbg_xlength"),
         materialized = sym("raven_dbg_materialized"),
         rdebug = sym("raven_dbg_rdebug"),
+        altrep_class = sym("raven_dbg_altrep_class"),
         set_rdebug = sym("raven_dbg_set_rdebug"),
         base_bind = sym("raven_dbg_base_bind")
     )
@@ -83,14 +84,22 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # `expr` is the R expression that reaches `x` from the selected frame
     # (DAP evaluateName: Watch, Copy as Expression, Open in Data Viewer);
     # "" for a frame environment itself.
-    register <- function(x, expr = NULL) {
+    # `path` says where `x` lives, for Set Value on its children: an
+    # environment and the steps (a binding name, then `[[` indices) from it.
+    register <- function(x, expr = NULL, path = NULL) {
         id <- state$next_ref
         state$next_ref <- id + 1L
         assign(as.character(id), x, envir = state$refs)
         if (!is.null(expr)) assign(as.character(id), expr, envir = state$exprs)
+        if (!is.null(path)) assign(as.character(id), path, envir = state$paths)
         id
     }
     lookup_expr <- function(id) get0(as.character(id), envir = state$exprs, inherits = FALSE)
+    lookup_path <- function(id) get0(as.character(id), envir = state$paths, inherits = FALSE)
+    # The position of each child row of a list or vector, by its label.
+    note_child <- function(pid, label, i) {
+        if (!is.null(pid)) assign(paste(pid, label, sep = US), i, envir = state$childidx)
+    }
     bt <- function(n) if (identical(make.names(n), n)) n else paste0("`", gsub("`", "\\`", n), "`")
     child_expr <- function(parent, name = NULL, index = NULL, atomic = FALSE) {
         if (is.null(parent)) return(NULL)
@@ -100,9 +109,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     lookup_ref <- function(id) get0(as.character(id), envir = state$refs, inherits = FALSE)
     state$exprs <- new.env(parent = emptyenv())
+    state$paths <- new.env(parent = emptyenv())
+    state$childidx <- new.env(parent = emptyenv())
     env$reset_refs <- function() {
         state$refs <- new.env(parent = emptyenv())
         state$exprs <- new.env(parent = emptyenv())
+        state$paths <- new.env(parent = emptyenv())
+        state$childidx <- new.env(parent = emptyenv())
         invisible(NULL)
     }
 
@@ -215,6 +228,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (!t %in% c("logical", "integer", "double", "complex", "character", "raw", "list", "pairlist")) {
             return(sprintf("<%s>", t))
         }
+        if (foreign(x)) {
+            return(sprintf("%s <ALTREP %s: not read>", type_label(x), .Call(N$altrep_class, x)))
+        }
         n <- xlen(x)
         if (is_df(cls)) {
             nr <- .row_names_info(x, 2L)
@@ -241,8 +257,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$preview <- preview
 
     # Counts for DAP's indexedVariables / namedVariables.
+    # A vector whose class some package implements (ALTREP): its length and
+    # elements come from that package's code, which must not run.
+    foreign <- function(x) !isTRUE(.Call(N$materialized, x))
     child_counts <- function(x) {
         t <- typeof(x)
+        if (t %in% c("list", "logical", "integer", "double", "complex", "character", "raw") && foreign(x)) {
+            return(c(0, 0))
+        }
         if (t == "environment") return(c(0, length(ls(x, all.names = TRUE, sorted = FALSE))))
         if (t == "S4") return(c(0, length(attributes(x))))
         if (t %in% c("list", "pairlist")) {
@@ -256,7 +278,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         c(0, 0)
     }
-    var_json <- function(name, value, kind = "value", expr = NULL) {
+    var_json <- function(name, value, kind = "value", expr = NULL, path = NULL) {
         if (kind == "promise") {
             return(jobj(name = jstr(name), value = jstr(paste0("<promise: ", trunc_str(deparse(value, nlines = 1L, width.cutoff = 200L)[1L]), ">")),
                         type = jstr("promise"), variablesReference = "0",
@@ -267,7 +289,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                         variablesReference = "0", presentationHint = jobj(kind = jstr("data"), lazy = "true")))
         }
         counts <- tryCatch(child_counts(value), error = function(e) c(0, 0))
-        ref <- if (sum(counts) > 0) register(value, expr) else 0L
+        ref <- if (sum(counts) > 0) register(value, expr, path) else 0L
         jobj(name = jstr(name), value = jstr(preview(value)), type = jstr(tryCatch(type_label(value), error = function(e) "?")),
              variablesReference = jnum(ref),
              evaluateName = if (!is.null(expr)) jstr(expr) else NULL,
@@ -280,14 +302,16 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (start >= n) return(integer())
         seq.int(start + 1, min(n, start + count))
     }
-    children <- function(x, start, count, filter, pexpr = NULL) {
+    children <- function(x, start, count, filter, pexpr = NULL, ppath = NULL, pid = NULL) {
         t <- typeof(x)
         out <- character()
+        if (t != "environment" && t != "S4" && foreign(x)) return(out)
         if (t == "environment") {
             nms <- ls(x, all.names = TRUE, sorted = TRUE)
             for (i in page(length(nms), start, count)) {
                 b <- .Call(N$binding, x, nms[[i]])
-                out <- c(out, var_json(nms[[i]], b[[2L]], b[[1L]], child_expr(pexpr, name = nms[[i]])))
+                out <- c(out, var_json(nms[[i]], b[[2L]], b[[1L]], child_expr(pexpr, name = nms[[i]]),
+                                       list(env = x, steps = list(nms[[i]]))))
             }
             return(out)
         }
@@ -306,7 +330,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 # `x$a` finds the first `a`: a repeated name needs its index.
                 unique_name <- named && sum(nms == nms[[i]], na.rm = TRUE) == 1L
                 ex <- if (unique_name) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
-                out <- c(out, var_json(nm, .subset2(x, i), "value", ex))
+                note_child(pid, nm, i)
+                cpath <- if (!is.null(ppath)) list(env = ppath$env, steps = c(ppath$steps, list(as.integer(i))))
+                out <- c(out, var_json(nm, .subset2(x, i), "value", ex, cpath))
             }
             return(out)
         }
@@ -328,6 +354,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                     } else {
                         sprintf("[%d]", i)
                     }
+                    note_child(pid, label, i)
                     out <- c(out, jobj(name = jstr(label), value = jstr(vals[[j]]),
                                        type = jstr(type_label(x)), variablesReference = "0",
                                        evaluateName = if (!is.null(ex)) jstr(ex) else NULL))
@@ -342,7 +369,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is.null(x) && !exists(as.character(ref), envir = state$refs, inherits = FALSE)) {
             return(jarr(character()))
         }
-        jarr(children(x, as.numeric(start), as.numeric(count), filter, lookup_expr(as.integer(ref))))
+        jarr(children(x, as.numeric(start), as.numeric(count), filter, lookup_expr(as.integer(ref)),
+                      lookup_path(as.integer(ref)), as.character(ref)))
     }, error = function(e) jarr(character())))
 
     # ---- stops ---------------------------------------------------------------
@@ -444,7 +472,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$scopes <- function(frame) internal(tryCatch({
         e <- frame_env(frame)
         out <- jobj(name = jstr(if (identical(e, globalenv())) "Global" else "Locals"),
-                    presentationHint = jstr("locals"), variablesReference = jnum(register(e, "")),
+                    presentationHint = jstr("locals"), variablesReference = jnum(register(e, "", list(env = e, steps = list()))),
                     namedVariables = jnum(length(ls(e, all.names = TRUE, sorted = FALSE))),
                     expensive = jbool(identical(e, globalenv())))
         if (!identical(e, globalenv())) {
@@ -566,11 +594,24 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
 
     env$set_variable <- function(ref, name, value, frame) internal(tryCatch({
         container <- lookup_ref(as.integer(ref))
-        if (!is.environment(container)) return(jobj(error = jstr("only variables in environments can be changed")))
-        # The new value is an expression in the variable's own scope (a
-        # frame's locals see each other), as typing it at Browse> would be.
-        v <- eval(parse(text = value, keep.source = FALSE), container)
-        assign(name, v, envir = container)
+        if (is.environment(container)) {
+            # The new value is an expression in the variable's own scope (a
+            # frame's locals see each other), as typing it at Browse> would be.
+            v <- eval(parse(text = value, keep.source = FALSE), container)
+            assign(name, v, envir = container)
+        } else {
+            # An element of a list or vector: assign through the path from
+            # the environment that holds it, `x[["a"]][[2]] <- v`, as R would.
+            p <- lookup_path(as.integer(ref))
+            i <- get0(paste(ref, name, sep = US), envir = state$childidx, inherits = FALSE)
+            if (is.null(p) || !length(p$steps) || is.null(i)) {
+                return(jobj(error = jstr("this value can't be changed from here")))
+            }
+            v <- eval(parse(text = value, keep.source = FALSE), p$env)
+            target <- as.name(p$steps[[1L]])
+            for (st in p$steps[-1L]) target <- call("[[", target, st)
+            eval(call("<-", call("[[", target, as.integer(i)), v), p$env)
+        }
         counts <- tryCatch(child_counts(v), error = function(e) c(0, 0))
         jobj(value = jstr(preview(v)), type = jstr(type_label(v)),
              variablesReference = jnum(if (sum(counts) > 0) register(v) else 0L))
@@ -888,6 +929,41 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         attr(res, "wholeSrcref") <- attr(exprs, "wholeSrcref")
         res
     }
+    # A function breakpoint whose function a sourced file defines must bind
+    # before the file goes on to call it, not at the next prompt: after each
+    # top-level assignment to a watched name, run a binding pass. The added
+    # call carries its statement's srcref, so echo shows nothing for it.
+    rebind_fbps <- function() {
+        internal(tryCatch(fbp_status(), error = function(e) NULL))
+        invisible(NULL)
+    }
+    assigned_name <- function(e) {
+        if (is.call(e) && identical(e[[1L]], quote(`{`)) && length(e) == 3L) e <- e[[3L]]
+        if (is.call(e) && length(e) == 3L && as.character(e[[1L]])[[1L]] %in% c("<-", "=", "<<-") &&
+            is.name(e[[2L]])) as.character(e[[2L]]) else ""
+    }
+    bind_fbps_after_definitions <- function(exprs) {
+        names <- state$fbp_names
+        if (!length(names)) return(NULL)
+        hits <- vapply(as.list(exprs), function(e) assigned_name(e) %in% names, TRUE)
+        if (!any(hits)) return(NULL)
+        sr <- attr(exprs, "srcref")
+        out <- list()
+        osr <- list()
+        for (i in seq_along(exprs)) {
+            out[length(out) + 1L] <- list(exprs[[i]])
+            osr[length(osr) + 1L] <- list(sr[[i]])
+            if (hits[[i]]) {
+                out[[length(out) + 1L]] <- as.call(list(rebind_fbps))
+                osr[length(osr) + 1L] <- list(sr[[i]])
+            }
+        }
+        res <- as.expression(out)
+        if (!is.null(sr)) attr(res, "srcref") <- osr
+        attr(res, "srcfile") <- attr(exprs, "srcfile")
+        attr(res, "wholeSrcref") <- attr(exprs, "wholeSrcref")
+        res
+    }
     # `source(echo = TRUE)` echoes the lines each top-level srcref spans in its
     # srcfile, which for annotated text would show `#line` directives and
     # probes. Point the srcrefs at the user's own lines (the `#line`-mapped
@@ -937,16 +1013,24 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         path <- normalizePath(file, mustWork = TRUE)
         # Files without breakpoints, and encodings base source() would have
         # to guess between, go to the original untouched.
-        if (identical(rpc("has_bps", path), "0")) return(plain())
+        line_bps <- !identical(rpc("has_bps", path), "0")
+        if (!line_bps && !length(state$fbp_names)) return(plain())
         enc <- if (!is.null(args$encoding)) args$encoding else "unknown"
         if (length(enc) != 1L) return(plain())
         lines <- readLines(file, warn = FALSE, encoding = if (identical(enc, "unknown")) "UTF-8" else enc)
-        ann <- internal(tryCatch(annotate_file(path, paste(lines, collapse = "\n"), if (is.environment(local)) local else globalenv()),
-                                 error = function(e) NULL))
-        if (is.null(ann)) return(plain())
-        alines <- strsplit(ann, "\n", fixed = TRUE)[[1L]]
-        exprs <- parse(text = alines, keep.source = TRUE, srcfile = srcfilecopy(path, alines), encoding = "UTF-8")
+        ann <- if (line_bps) {
+            internal(tryCatch(annotate_file(path, paste(lines, collapse = "\n"), if (is.environment(local)) local else globalenv()),
+                              error = function(e) NULL))
+        }
+        alines <- if (is.null(ann)) lines else strsplit(ann, "\n", fixed = TRUE)[[1L]]
+        exprs <- tryCatch(parse(text = alines, keep.source = TRUE, srcfile = srcfilecopy(path, alines), encoding = "UTF-8"),
+                          error = function(e) NULL)
+        if (is.null(exprs)) return(plain())
         exprs <- fuse_probes(exprs)
+        bound <- bind_fbps_after_definitions(exprs)
+        # Nothing to change: base source() exactly as called.
+        if (is.null(ann) && is.null(bound)) return(plain())
+        if (!is.null(bound)) exprs <- bound
         if (isTRUE(args$echo)) exprs <- tryCatch(echo_original(exprs, path, lines), error = function(e) exprs)
         if (isTRUE(args$chdir)) {
             owd <- setwd(dirname(path))
