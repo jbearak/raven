@@ -45,7 +45,7 @@ Raven's console runs the same R you get by typing `R` in a terminal: the one on 
 - Syntax highlighting as you type, using the same R grammar as Raven's language server. The bracket at the cursor and its match are underlined.
 - Multi-line editing. Enter runs your input when R's own parser says it is complete, and starts a new, indented line when it isn't, for example after `function(x) {`, `data.frame(a = 1,` or a trailing `|>`, just as in plain R. R reports a syntax error rather than leaving you stuck in continuation lines. `Alt+Enter` always inserts a newline. Arrow keys move between lines.
 - History is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux, `%APPDATA%\raven\console_history` on Windows). Up and Down step through earlier entries, and a multi-line entry comes back whole. `Ctrl+R` searches history for text you type, and a dimmed suggestion from history appears as you type; press → to accept it.
-- Emacs key bindings by default; set `raven.console.editMode` to `vi` for vi bindings.
+- Emacs-style key bindings by default; set `raven.console.editMode` to `vi` for vi-style bindings. [Console key bindings](console-key-bindings.md) explains the two styles and lists their keys.
 - `Ctrl+C` clears the line you're editing, or interrupts R while it runs. At a `+` continuation line it abandons the unfinished expression, and at a `readline()` or `menu()` prompt it interrupts the code that asked, as in plain R. `Ctrl+D` on an empty line quits.
 - `options(width)` follows the terminal width as you resize it, unless you set `width` yourself.
 
@@ -191,7 +191,7 @@ The default threshold of 25 lines is arbitrary but reasonable: most blocks below
 |---------|---------|--------|
 | `raven.rConsole.activation` | `"auto"` | Whether Raven's R console activates; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting) |
 | `raven.rTerminal.program` | `"raven"` | Which console to run: `"raven"`, `"R"`, `"arf"`, or `"radian"` |
-| `raven.console.editMode` | `"emacs"` | Key bindings in Raven's console: `"emacs"` or `"vi"` |
+| `raven.console.editMode` | `"emacs"` | Key bindings in Raven's console: `"emacs"` or `"vi"`; see [Console key bindings](console-key-bindings.md) |
 | `raven.console.colorOutput` | `"streams"` | Output colors in Raven's console: `"streams"`, `"values"`, or `"off"` |
 | `raven.sendToR.advanceCursorOnSend` | `true` | Move the cursor to the next line after sending a single statement |
 | `raven.sendToR.sendMethod` | `"auto"` | How code is sent to consoles other than Raven's: `"auto"`, `"paste"`, or `"tempfile"` |

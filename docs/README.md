@@ -33,6 +33,7 @@ Raven is a static analyzer and language server for R. Start with [Getting starte
 ## R session (VS Code)
 
 - [R console](r-console.md): Run R in VS Code and send code from the editor.
+- [Console key bindings](console-key-bindings.md): What the emacs and vi editing styles mean, and their keys.
 - [Debugger](debugger.md): Breakpoints, stepping, and variables for R scripts and documents.
 - [Plot viewer](plot-viewer.md): View, browse, and save plots in a VS Code panel.
 - [Data viewer](data-viewer.md): Browse, sort, and filter data frames of any size with `View()`.

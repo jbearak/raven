@@ -33,6 +33,7 @@
 ## R session (VS Code)
 
 - [R console](https://github.com/jbearak/raven/blob/main/docs/r-console.md): Run R in VS Code and send code from the editor.
+- [Console key bindings](https://github.com/jbearak/raven/blob/main/docs/console-key-bindings.md): What the emacs and vi editing styles mean, and their keys.
 - [Debugger](https://github.com/jbearak/raven/blob/main/docs/debugger.md): Breakpoints, stepping, and variables for R scripts and documents.
 - [Plot viewer](https://github.com/jbearak/raven/blob/main/docs/plot-viewer.md): View, browse, and save plots in a VS Code panel.
 - [Data viewer](https://github.com/jbearak/raven/blob/main/docs/data-viewer.md): Browse, sort, and filter data frames of any size with `View()`.

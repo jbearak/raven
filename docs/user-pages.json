@@ -51,6 +51,7 @@
       "title": "R session (VS Code)",
       "pages": [
         { "file": "r-console.md", "title": "R console", "kind": "guide", "description": "Run R in VS Code and send code from the editor." },
+        { "file": "console-key-bindings.md", "title": "Console key bindings", "kind": "reference", "description": "What the emacs and vi editing styles mean, and their keys." },
         { "file": "debugger.md", "title": "Debugger", "kind": "guide", "description": "Breakpoints, stepping, and variables for R scripts and documents." },
         { "file": "plot-viewer.md", "title": "Plot viewer", "kind": "guide", "description": "View, browse, and save plots in a VS Code panel." },
         { "file": "data-viewer.md", "title": "Data viewer", "kind": "guide", "description": "Browse, sort, and filter data frames of any size with `View()`." },

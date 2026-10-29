@@ -52,6 +52,7 @@ nav = [
   ] },
   { "R session (VS Code)" = [
     { "R console" = "r-console.md" },
+    { "Console key bindings" = "console-key-bindings.md" },
     { "Debugger" = "debugger.md" },
     { "Plot viewer" = "plot-viewer.md" },
     { "Data viewer" = "data-viewer.md" },
