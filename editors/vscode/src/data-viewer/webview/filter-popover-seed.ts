@@ -15,7 +15,9 @@ import type { FilterPredicate } from '../messages';
 // ── Value-editor state shapes ───────────────────────────────────────────────
 
 export type NumCompareState = { op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: string };
-export type NumBetweenState = { lo: string; hi: string; inclusive: boolean };
+/** `upperInclusive` carries a histogram brush's half-open bound through
+ *  an edit; toggling Inclusive drops it. */
+export type NumBetweenState = { lo: string; hi: string; inclusive: boolean; upperInclusive?: boolean };
 export type SetState = { selected: (string | number)[] };
 export type StrState = { value: string; caseSensitive: boolean };
 export type StrRegexState = { pattern: string; caseSensitive: boolean; regexError: string | null };
@@ -85,7 +87,10 @@ export function seedFromEntry(p: FilterPredicate): FormState {
             base.numCompare = { op: p.op, value: String(p.value) };
             break;
         case 'numBetween':
-            base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
+            base.numBetween = {
+                lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive,
+                ...(p.upperInclusive !== undefined ? { upperInclusive: p.upperInclusive } : {}),
+            };
             break;
         case 'numNotBetween':
             base.numBetween = { lo: String(p.lo), hi: String(p.hi), inclusive: p.inclusive };
@@ -153,7 +158,10 @@ export function buildPredicate(
             const lo = parseFloat(s.numBetween.lo);
             const hi = parseFloat(s.numBetween.hi);
             if (isNaN(lo) || isNaN(hi)) return null;
-            return { kind: 'numBetween', lo, hi, inclusive: s.numBetween.inclusive };
+            return {
+                kind: 'numBetween', lo, hi, inclusive: s.numBetween.inclusive,
+                ...(s.numBetween.upperInclusive !== undefined ? { upperInclusive: s.numBetween.upperInclusive } : {}),
+            };
         }
         case 'numNotBetween': {
             const lo = parseFloat(s.numBetween.lo);

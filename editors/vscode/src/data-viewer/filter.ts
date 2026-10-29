@@ -173,6 +173,12 @@ async function acceptorFor(
     if (predicate.kind === 'numBetween') {
         const values = await loadNumeric(reader, columnIndex, signal);
         const lo = predicate.lo, hi = predicate.hi, incl = predicate.inclusive;
+        const hiIncl = predicate.upperInclusive ?? incl;
+        if (hiIncl !== incl) {
+            return incl
+                ? (i) => values[i] >= lo && values[i] < hi
+                : (i) => values[i] > lo && values[i] <= hi;
+        }
         return incl
             ? (i) => values[i] >= lo && values[i] <= hi
             : (i) => values[i] > lo && values[i] < hi;
