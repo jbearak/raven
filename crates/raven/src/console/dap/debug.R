@@ -732,7 +732,15 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     env$on_resume <- function(cmd) internal(tryCatch({
         if (identical(cmd, "s") && is.null(state$jit_saved)) state$jit_saved <- compiler::enableJIT(0L)
-        if (cmd %in% c("n", "f")) flag_caller() else if (cmd %in% c("c", "Q")) clear_step_flags()
+        if (cmd %in% c("n", "f")) {
+            flag_caller()
+        } else if (cmd %in% c("c", "Q")) {
+            # Continue runs to the next breakpoint, as in other debuggers. R's
+            # own `c` clears only this frame's step flag; callers flagged by
+            # earlier steps (R's or Raven's) would stop again on return.
+            for (e in state$frames) if (is.environment(e)) .Call(N$set_rdebug, e, 0L)
+            clear_step_flags()
+        }
         "ok"
     }, error = function(e) "err"))
     env$at_prompt <- function(top) internal(tryCatch({

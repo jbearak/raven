@@ -1286,3 +1286,43 @@ fn a_program_session_ends_when_its_program_finishes() {
     c.expect("program ran");
     d.event("terminated", m);
 }
+
+#[test]
+fn continue_after_stepping_into_a_callee_runs_to_the_end() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "mid <- function() {\n  z <- 1\n  z\n}\nouter2 <- function() {\n  a <- mid()\n  b <- 3\n  cat('outer2 done', a + b, '\\n')\n}\n";
+    let p = c.write_file("s.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 6}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send(src, Some(&p));
+    std::thread::sleep(Duration::from_millis(400));
+    for step in ["stepIn", "next"] {
+        let m = d.mark();
+        c.send("outer2()", None);
+        d.event("stopped", m);
+        assert_eq!(d.stack()[0], ("outer2".to_string(), 6));
+        d.step(step);
+        if step == "next" {
+            // Step Over a call with no breakpoint inside stays in outer2;
+            // step into mid to set R's own flags on the way.
+            d.step("stepIn");
+        }
+        let m = d.mark();
+        d.req("continue", json!({"threadId": 1}));
+        d.event("terminated", m);
+        assert_eq!(
+            d.count("stopped", m),
+            0,
+            "Continue after {step} stopped again"
+        );
+        d.session_ended();
+        c.expect("outer2 done 4");
+    }
+}
