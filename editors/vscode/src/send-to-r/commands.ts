@@ -5,7 +5,8 @@ import {
     get_downward_bounds,
 } from './statement-detector';
 import { get_or_create_r_terminal } from './r-terminal-manager';
-import { send_code, get_send_options } from './send-code';
+import { send_code, get_send_options, location_in } from './send-code';
+import type { SendLocation } from './console-ipc';
 
 type SendMode = 'statement' | 'upward' | 'downward' | 'file';
 
@@ -35,7 +36,7 @@ function advance_cursor(
 async function compute_send_payload(
     editor: vscode.TextEditor,
     mode: SendMode,
-): Promise<{ code: string; advance_to_line: number | null } | null> {
+): Promise<{ code: string; advance_to_line: number | null; location?: SendLocation } | null> {
     const document = editor.document;
 
     if (mode === 'file') {
@@ -52,13 +53,18 @@ async function compute_send_payload(
 
     if (mode === 'statement') {
         if (!editor.selection.isEmpty) {
-            return { code: document.getText(editor.selection), advance_to_line: null };
+            return {
+                code: document.getText(editor.selection),
+                advance_to_line: null,
+                location: location_in(document, editor.selection.start),
+            };
         }
         const lines = get_lines(document);
         const bounds = detect_r_statement(lines, editor.selection.active.line);
         return {
             code: lines.slice(bounds.start_line, bounds.end_line + 1).join('\n'),
             advance_to_line: bounds.end_line,
+            location: location_in(document, new vscode.Position(bounds.start_line, 0)),
         };
     }
 
@@ -69,6 +75,7 @@ async function compute_send_payload(
     return {
         code: lines.slice(bounds.start_line, bounds.end_line + 1).join('\n'),
         advance_to_line: null,
+        location: location_in(document, new vscode.Position(bounds.start_line, 0)),
     };
 }
 
@@ -78,7 +85,7 @@ async function handle_send(mode: SendMode): Promise<void> {
 
     const payload = await compute_send_payload(editor, mode);
     if (!payload) return;
-    const { code, advance_to_line } = payload;
+    const { code, advance_to_line, location } = payload;
 
     const terminal = await get_or_create_r_terminal();
     terminal.show(true);
@@ -86,7 +93,7 @@ async function handle_send(mode: SendMode): Promise<void> {
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
-        send_code(terminal, code, get_send_options());
+        send_code(terminal, code, get_send_options(), location);
     }
 
     if (advance_to_line !== null) {
@@ -106,14 +113,14 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
 
     const payload = await compute_send_payload(editor, mode);
     if (!payload) return;
-    const { code, advance_to_line } = payload;
+    const { code, advance_to_line, location } = payload;
 
     terminal.show(true);
 
     if (mode === 'file') {
         terminal.sendText(code);
     } else {
-        send_code(terminal, code, get_send_options());
+        send_code(terminal, code, get_send_options(), location);
     }
 
     if (advance_to_line !== null) {

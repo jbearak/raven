@@ -181,6 +181,9 @@ fn serve(
                             path: l.get("path")?.as_str()?.to_string(),
                             line: l.get("line")?.as_u64()? as u32,
                             col: l.get("col").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                            lines: l.get("lines").and_then(|m| m.as_array()).map(|a| {
+                                a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+                            }),
                         })
                     });
                     q.push_back(Request {

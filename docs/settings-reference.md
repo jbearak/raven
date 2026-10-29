@@ -46,6 +46,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.dataViewer.missingValueStyle` | `"foreground"` | `"foreground"` \| `"background"` \| `"none"` | — | [data-viewer](data-viewer.md) | How the data viewer highlights NA / NaN cells. |
 | `raven.dataViewer.persistFilters` | `true` | boolean | — | [data-viewer](data-viewer.md) | Persist the data viewer's active row filters per panel name × schema hash so a later View() call restores them. |
 | `raven.dataViewer.persistSort` | `true` | boolean | — | [data-viewer](data-viewer.md) | Persist the data viewer's active row sort per panel name × schema hash so a later View() call restores it. |
+| `raven.debugger.attach` | `"onStop"` | `"onStop"` \| `"never"` | — | — | When VS Code attaches its debugger to Raven's R console. |
+| `raven.debugger.enabled` | `true` | boolean | — | — | Run the R debugger in Raven's R console (raven.rTerminal.program = 'raven'): breakpoints, stepping, variables and the Debug Console for R, R Markdown and Quarto files. |
 | `raven.diagnostics.conditionAssignmentSeverity` | `"warning"` | `"error"` \| `"warning"` \| `"information"` \| `"info"` \| `"hint"` \| `"off"` | `diagnostics.conditionAssignmentSeverity` | [diagnostics](diagnostics.md) | Severity for the condition-assignment diagnostic. |
 | `raven.diagnostics.enabled` | `true` | boolean | `diagnostics.enabled` | [diagnostics](diagnostics.md) | Enable or disable all diagnostics. |
 | `raven.diagnostics.jags` | `"off"` | `"off"` \| `"on"` | `diagnostics.jags` | [diagnostics](diagnostics.md) | Enable Raven diagnostics for standalone JAGS/BUGS files. |

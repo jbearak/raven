@@ -31,6 +31,37 @@ type ConsoleTerminal = {
 };
 
 const terminal_sockets = new WeakMap<vscode.Terminal, ConsoleTerminal>();
+
+/**
+ * Where sent code came from. The console wraps it so R's srcrefs point at
+ * this file and line, which is what lets breakpoints bind to code run from
+ * the editor (see the debugger design, §3). `lines` maps each line of the
+ * code to its file line when the code isn't one contiguous range.
+ */
+export type SendLocation = { path: string; line: number; col: number; lines?: number[] };
+
+/** Console sockets by terminal, for the debugger (which needs to enumerate them). */
+const live_consoles = new Map<vscode.Terminal, string>();
+const console_listeners = new Set<(terminal: vscode.Terminal, socket: string) => void>();
+
+/** Be told when a Raven console terminal is registered (and of those already open). */
+export function on_console_registered(
+    listener: (terminal: vscode.Terminal, socket: string) => void,
+): vscode.Disposable {
+    console_listeners.add(listener);
+    for (const [t, s] of live_consoles) listener(t, s);
+    return new vscode.Disposable(() => console_listeners.delete(listener));
+}
+
+/** The IPC socket of a Raven console terminal, if `terminal` is one. */
+export function console_socket_of(terminal: vscode.Terminal): string | undefined {
+    return live_consoles.get(terminal);
+}
+
+/** Every open Raven console terminal and its IPC socket. */
+export function live_console_sockets(): Array<[vscode.Terminal, string]> {
+    return [...live_consoles];
+}
 let next_request_id = 1;
 /** Per socket: settles when the latest send has been acknowledged (or lost). */
 const send_tails = new Map<string, Promise<void>>();
@@ -72,10 +103,13 @@ export function make_console_socket_path(): string {
 
 export function register_console_terminal(terminal: vscode.Terminal, socket_path: string): void {
     terminal_sockets.set(terminal, { socket: socket_path, launched_ms: Date.now(), fell_back: false });
+    live_consoles.set(terminal, socket_path);
+    for (const l of console_listeners) l(terminal, socket_path);
 }
 
 /** Remove the socket's directory once its terminal is gone. */
 export function forget_console_terminal(terminal: vscode.Terminal): void {
+    live_consoles.delete(terminal);
     const entry = terminal_sockets.get(terminal);
     if (!entry) return;
     terminal_sockets.delete(terminal);
@@ -127,11 +161,12 @@ export function send_when_listening(
     socket_path: string,
     code: string,
     fallback: () => void,
+    location?: SendLocation,
 ): void {
     in_order(socket_path, () => new Promise<void>((done) => {
         const poll = () => {
             if (fs.existsSync(socket_path)) {
-                deliver(socket_path, code, fallback).then(done, done);
+                deliver(socket_path, code, fallback, location).then(done, done);
                 return;
             }
             const entry = terminal_sockets.get(terminal);
@@ -151,12 +186,22 @@ export function send_when_listening(
  * Send `code` for execution. `fallback` runs only if nothing was delivered
  * (connect failed).
  */
-export function send_via_console(socket_path: string, code: string, fallback: () => void): void {
-    in_order(socket_path, () => deliver(socket_path, code, fallback));
+export function send_via_console(
+    socket_path: string,
+    code: string,
+    fallback: () => void,
+    location?: SendLocation,
+): void {
+    in_order(socket_path, () => deliver(socket_path, code, fallback, location));
 }
 
 /** One request; settles once it is acknowledged, or known not delivered. */
-function deliver(socket_path: string, code: string, fallback: () => void): Promise<void> {
+function deliver(
+    socket_path: string,
+    code: string,
+    fallback: () => void,
+    location?: SendLocation,
+): Promise<void> {
     return new Promise<void>((settled) => {
         const id = next_request_id++;
         let connected = false;
@@ -165,7 +210,7 @@ function deliver(socket_path: string, code: string, fallback: () => void): Promi
         socket.setEncoding('utf8');
         socket.on('connect', () => {
             connected = true;
-            socket.write(JSON.stringify({ v: 1, id, op: 'execute', code }) + '\n');
+            socket.write(JSON.stringify({ v: 1, id, op: 'execute', code, ...(location ? { location } : {}) }) + '\n');
         });
         let buffered = '';
         socket.on('data', (chunk: string) => {

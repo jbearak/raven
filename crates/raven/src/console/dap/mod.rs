@@ -75,6 +75,9 @@ pub struct Location {
     pub line: u32,
     /// 0-based character column of the code's first character.
     pub col: u32,
+    /// The file line of each line of the code, when the code isn't one
+    /// contiguous range (e.g. several R Markdown chunks run together).
+    pub lines: Option<Vec<u32>>,
 }
 
 /// One top-level expression of a tagged submission, rendered lazily just
@@ -1084,12 +1087,20 @@ pub fn split_submission(code: &str, loc: &Location) -> Option<VecDeque<Segment>>
         } else {
             Vec::new()
         };
-        let col = if l1 == 1 { loc.col } else { 0 } + c1.saturating_sub(1);
+        let (line, first_col) = match &loc.lines {
+            Some(map) => {
+                // An expression must lie on consecutive file lines for `#line`
+                // to map it; one that doesn't is fed with the first line's
+                // mapping (its srcrefs are approximate, never wrong-file).
+                (*map.get((l1 - 1) as usize)?, 0)
+            }
+            None => (loc.line + l1 - 1, if l1 == 1 { loc.col } else { 0 }),
+        };
         out.push_back(Segment {
             text,
             path: path.clone(),
-            line: loc.line + l1 - 1,
-            col,
+            line,
+            col: first_col + c1.saturating_sub(1),
             echo,
         });
     }
