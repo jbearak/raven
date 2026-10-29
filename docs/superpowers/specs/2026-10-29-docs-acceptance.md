@@ -3,7 +3,7 @@
 Date: 2026-10-29. This file records the persona findability review from §6 of `2026-10-29-docs-redesign-design.md`, following Phase 7 of the plan.
 
 - **Baseline docs SHA:** `6c7871aac52a75305cb9996412e905e7524618a0` (the docs before the redesign).
-- **Tested docs SHA:** `7f6027c3a6d5259ec81668f7f729c551732d05a3`. The runs were made at `55d86e47` and `c1317332`, and carry forward as described under Carry-forward.
+- **Tested docs SHA:** `a8d788802673bfdb86edd6b8389485b62cd45cc6`. The runs were made at `55d86e47` and `c1317332`, and carry forward as described under Carry-forward.
 - **Evidence commits:** the commits that add and update this file. It touches only `docs/superpowers/`.
 
 ## Protocol
@@ -72,7 +72,7 @@ Between `55d86e47` and `c1317332`, only `docs/diagnostics.md` changed (`git diff
 - `non-standard-evaluation.md`
 - `troubleshooting.md`
 
-After acceptance, a reader pointed out that two paragraphs in `docs/r-console.md` seemed to contradict each other about what the console does by default. They were merged into one at `50fd5ab2` and reworded at `7f6027c3`; both commits changed only `docs/r-console.md` (`git diff --stat c1317332 7f6027c3`). No acceptance run visited that page, so every result carries forward to `7f6027c3`.
+After acceptance, a reader found the R console page's opening confusing because it treated "the R terminal" and "the console" as two separate things. Commits `50fd5ab2` through `a8d78880` restructured the top of `docs/r-console.md` around one console with a choice of program, and updated one link label in `docs/configuration.md` (`git diff --stat c1317332 a8d78880`). The final4 runs and the carried-forward runs never visited either page, so every result in the table carries forward to `a8d78880`.
 
 ## Spot checks
 
