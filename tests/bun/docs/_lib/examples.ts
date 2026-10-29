@@ -15,11 +15,14 @@ import type { Fence } from "./markdown";
 
 export const corpusDir = path.join(repoRoot, "docs", "examples", "snippets");
 
+/** The raven crate version, which the crate inherits from the workspace. */
 export function crateVersion(): string {
-  const toml = readFileSync(path.join(repoRoot, "crates", "raven", "Cargo.toml"), "utf8");
-  const m = /^version\s*=\s*"([^"]+)"/m.exec(toml);
-  if (!m) throw new Error("no version in crates/raven/Cargo.toml");
-  return m[1];
+  const toml = Bun.TOML.parse(readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8")) as {
+    workspace?: { package?: { version?: string } };
+  };
+  const version = toml.workspace?.package?.version;
+  if (!version) throw new Error("no [workspace.package] version in Cargo.toml");
+  return version;
 }
 
 export type Marker =
