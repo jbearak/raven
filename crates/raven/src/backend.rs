@@ -17314,26 +17314,12 @@ async fn run_debounced_diagnostics(
         } else {
             None
         };
-        let workspace_folder = state.workspace_folders.first().cloned();
-        let missing_file_severity = state.cross_file_config.missing_file_severity;
         let coherence_generation = state.diagnostics_coherence.generation();
 
-        (
-            snapshot,
-            diagnostics_enabled,
-            workspace_folder,
-            missing_file_severity,
-            coherence_generation,
-        )
+        (snapshot, coherence_generation)
     }; // Read lock released here
 
-    let (
-        snapshot,
-        diagnostics_enabled,
-        workspace_folder,
-        missing_file_severity,
-        coherence_generation,
-    ) = snapshot_data;
+    let (snapshot, coherence_generation) = snapshot_data;
 
     if let Some(traversal_truncation) = traversal_truncation.as_deref() {
         check_and_warn_traversal_truncation(&state_arc, &client, traversal_truncation).await;
@@ -17364,22 +17350,14 @@ async fn run_debounced_diagnostics(
     }
 
     // Perform async missing file existence checks (non-blocking I/O)
-    let diagnostics = if let Some(snapshot) = snapshot.as_ref()
-        && snapshot.file_type == crate::file_type::FileType::R
-    {
-        handlers::diagnostics_async_standalone(
-            &affected_uri,
-            sync_diagnostics,
-            &snapshot.directive_meta,
-            workspace_folder.as_ref(),
-            missing_file_severity,
-            snapshot.cross_file_config.case_mismatch_severity,
-        )
-        .await
-    } else if diagnostics_enabled {
-        sync_diagnostics
-    } else {
-        Vec::new()
+    let diagnostics = match snapshot.as_ref() {
+        Some(snapshot) => {
+            snapshot
+                .missing_file_checks()
+                .apply(&affected_uri, sync_diagnostics)
+                .await
+        }
+        None => Vec::new(),
     };
 
     if cancel.is_cancelled() {
@@ -24817,16 +24795,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // Phase 1: brief read lock — gate check, build the diagnostics
     // snapshot, capture inputs for the off-lock work. NO scope
     // resolution or other heavy work happens inside this scope.
-    let (
-        trigger,
-        diagnostics_enabled,
-        snapshot,
-        directive_meta,
-        workspace_folder,
-        missing_file_severity,
-        case_mismatch_severity,
-        coherence_generation,
-    ) = {
+    let (trigger, snapshot, coherence_generation) = {
         let state = state_arc.read().await;
         // Full trigger capture (version + revision + epoch + config
         // generation): the direct path has no cancellation token, so the
@@ -24887,36 +24856,9 @@ pub(crate) async fn publish_diagnostics_inner(
             .then(|| handlers::DiagnosticsSnapshot::build(&state, uri))
             .flatten();
 
-        // Metadata for async missing-file checks. Reuse the snapshot's
-        // `directive_meta`, which is `extract_metadata` (not just directives):
-        // it carries AST-detected `source()` calls AND is masked-correct for
-        // Rmd/Quarto (chunk bodies only). The old `parse_directives(doc.text())`
-        // here was raw and directives-only, so an AST `source("missing.R")`
-        // inside a chunk was stripped by `diagnostics_async_standalone`'s
-        // retain() and never re-added — losing the missing-file diagnostic
-        // (#343). Mirrors the dependent-revalidation path, which already passes
-        // `snapshot.directive_meta`. When the snapshot is absent (diagnostics
-        // disabled) the async phase below is skipped, so the fallback is inert.
-        let directive_meta = snapshot
-            .as_ref()
-            .map(|s| s.directive_meta.clone())
-            .unwrap_or_default();
-
-        let workspace_folder = state.workspace_folders.first().cloned();
-        let missing_file_severity = state.cross_file_config.missing_file_severity;
-        let case_mismatch_severity = state.cross_file_config.case_mismatch_severity;
         let coherence_generation = state.diagnostics_coherence.generation();
 
-        (
-            trigger,
-            diagnostics_enabled,
-            snapshot,
-            directive_meta,
-            workspace_folder,
-            missing_file_severity,
-            case_mismatch_severity,
-            coherence_generation,
-        )
+        (trigger, snapshot, coherence_generation)
     };
     // Read lock released — scope resolution and async I/O run unlocked.
 
@@ -24925,49 +24867,32 @@ pub(crate) async fn publish_diagnostics_inner(
     // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
     // Replicate the remaining `handlers::diagnostics` early-exits via
     // snapshot fields, which already mirror `doc.file_type` from build time.
-    let snapshot_file_type = snapshot.as_ref().map(|snapshot| snapshot.file_type);
-    let sync_diagnostics = match snapshot {
-        // Rmd/Quarto documents flow through too (issue #343): the snapshot
-        // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
-        // sees only real R chunk-body content. Stan follows its native syntax
-        // and conservative variable-resolution collectors; JAGS dispatches
-        // strict syntax for `.jags`, `.bugs`, and `.bug` through their shared
-        // language identity.
-        Some(snap)
-            if matches!(
-                snap.file_type,
-                crate::file_type::FileType::R
-                    | crate::file_type::FileType::Jags
-                    | crate::file_type::FileType::Stan
-            ) =>
-        {
-            handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
-
-    // Phase 3: async missing-file existence checks. Gated on
-    // `diagnostics_enabled` so a master-switch-off reload doesn't keep
-    // publishing missing-file diagnostics while the sync phase was
-    // empty. When disabled, publish an explicit empty `Vec` so the
-    // client clears any prior diagnostics for the URI.
-    let diagnostics =
-        if diagnostics_enabled && snapshot_file_type == Some(crate::file_type::FileType::R) {
-            handlers::diagnostics_async_standalone(
+    //
+    // Rmd/Quarto documents flow through too (issue #343): the snapshot
+    // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
+    // sees only real R chunk-body content. Stan and JAGS run their own
+    // collectors and skip the R-only missing-file phase inside
+    // `MissingFileChecks::apply`, which reuses the snapshot's masked-correct
+    // `directive_meta` (AST `source()` calls inside chunks included, #343).
+    //
+    // When diagnostics are disabled (or the snapshot is unavailable) publish an
+    // explicit empty `Vec` so the client clears any prior diagnostics for the
+    // URI, and a master-switch-off reload doesn't keep publishing missing-file
+    // diagnostics.
+    let diagnostics = match snapshot {
+        Some(snap) => {
+            let sync_diagnostics = handlers::diagnostics_from_snapshot(
+                &snap,
                 uri,
-                sync_diagnostics,
-                &directive_meta,
-                workspace_folder.as_ref(),
-                missing_file_severity,
-                case_mismatch_severity,
+                &handlers::DiagCancelToken::never(),
             )
-            .await
-        } else if diagnostics_enabled {
-            sync_diagnostics
-        } else {
-            Vec::new()
-        };
+            .unwrap_or_default();
+            snap.missing_file_checks()
+                .apply(uri, sync_diagnostics)
+                .await
+        }
+        None => Vec::new(),
+    };
 
     pause_if_armed_for_test(state_arc, uri).await;
 

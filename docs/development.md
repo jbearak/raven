@@ -1042,6 +1042,18 @@ One cache lives outside the cross-file system: `compile_cached` in `crates/raven
 
 Cross-file revalidation is debounced and cancelable.
 
+Every diagnostics publisher (the debounced worker, the direct
+`publish_diagnostics_inner` path, and `raven check`) computes a file's
+findings in the same three steps: build a `DiagnosticsSnapshot` under the
+`WorldState` read lock, run `diagnostics_from_snapshot` off-lock, then finish
+with `MissingFileChecks::apply` (`handlers.rs`), which replaces the snapshot's
+cache-based missing-file findings with on-disk existence and case-mismatch
+checks. `snapshot.missing_file_checks()` captures that phase's inputs
+(directive metadata, workspace root, severities) from the snapshot, and
+`apply` owns the R-only rule (Stan and JAGS pass through). `raven check`
+carries the small `MissingFileChecks` value between its parallel sync pass and
+the async pass so the heavy snapshot is dropped in between.
+
 A diagnostics gate enforces monotonic publishing:
 - never publish diagnostics for an older document version
 - allow “force republish” at the same version for dependency-triggered revalidation

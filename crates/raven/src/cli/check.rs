@@ -8,7 +8,7 @@
 //! on startup, auto-detects R to populate the package library, then drives the
 //! shared diagnostic pipeline per reported file:
 //! `DiagnosticsSnapshot::build` → `handlers::diagnostics_from_snapshot` →
-//! `handlers::diagnostics_async_standalone` (the same three steps as the LSP
+//! `handlers::MissingFileChecks::apply` (the same three steps as the LSP
 //! publish path — notably NOT the `handlers::diagnostics()` convenience
 //! wrapper, which skips the async on-disk missing-file checks).
 //!
@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
+use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
@@ -25,6 +25,7 @@ use crate::cli::shared::{
     is_jags_file, is_r_file, is_stan_file, parse_color_choice, parse_output_format,
     parse_severity_level, render, resolve_color_from_env,
 };
+use crate::handlers::MissingFileChecks;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct CheckArgs {
@@ -1581,7 +1582,7 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
 /// builds.
 /// The synchronous half of a file's diagnostics: build the snapshot and run the
 /// CPU-bound scope-resolution pass. Returns the pre-async findings plus the
-/// inputs the async missing-file pass needs (`directive_meta`, severity). Split
+/// inputs the async missing-file pass needs ([`MissingFileChecks`]). Split
 /// out so `raven check` can run this — the expensive part — across files in
 /// parallel (issue #479 WI3), then do the cheap async filesystem checks
 /// afterward. `open_documents` is the worker's coherent one-entry store, while
@@ -1593,12 +1594,7 @@ fn compute_file_diagnostics_sync(
     uri: &Url,
     open_documents: &impl crate::content_provider::OpenDocumentsView,
     contextual_providers: &CliContextualProviderPlan,
-) -> Option<(
-    Vec<Diagnostic>,
-    crate::cross_file::CrossFileMetadata,
-    Option<DiagnosticSeverity>,
-    crate::cross_file::CaseMismatchSeverity,
-)> {
+) -> Option<(Vec<Diagnostic>, MissingFileChecks)> {
     // Gate before building the snapshot, not after. `diagnostics_from_snapshot`
     // applies the same per-language check and returns empty, but only once the
     // text has been cloned and the whole cross-file snapshot assembled — so a
@@ -1620,38 +1616,7 @@ fn compute_file_diagnostics_sync(
         )?;
     let cancel = crate::handlers::DiagCancelToken::never();
     let sync_diags = crate::handlers::diagnostics_from_snapshot(&snapshot, uri, &cancel)?;
-    let missing_file_severity = snapshot.cross_file_config.missing_file_severity;
-    let case_mismatch_severity = snapshot.cross_file_config.case_mismatch_severity;
-    Some((
-        sync_diags,
-        snapshot.directive_meta,
-        missing_file_severity,
-        case_mismatch_severity,
-    ))
-}
-
-/// The async half: replace the snapshot's cache-based missing-file checks with
-/// real on-disk existence checks — exactly what the LSP publish path does.
-async fn finalize_file_diagnostics(
-    state: &crate::state::WorldState,
-    uri: &Url,
-    sync_diags: Vec<Diagnostic>,
-    directive_meta: &crate::cross_file::CrossFileMetadata,
-    missing_file_severity: Option<DiagnosticSeverity>,
-    case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
-) -> Vec<Diagnostic> {
-    if crate::file_type::file_type_from_uri(uri) != crate::file_type::FileType::R {
-        return sync_diags;
-    }
-    crate::handlers::diagnostics_async_standalone(
-        uri,
-        sync_diags,
-        directive_meta,
-        state.workspace_folders.first(),
-        missing_file_severity,
-        case_mismatch_severity,
-    )
-    .await
+    Some((sync_diags, snapshot.missing_file_checks()))
 }
 
 async fn compute_file_diagnostics(
@@ -1659,20 +1624,12 @@ async fn compute_file_diagnostics(
     uri: &Url,
 ) -> Vec<Diagnostic> {
     let contextual_providers = prepare_cli_contextual_providers(state, uri);
-    let Some((sync_diags, directive_meta, missing_file_severity, case_mismatch_severity)) =
+    let Some((sync_diags, missing_file_checks)) =
         compute_file_diagnostics_sync(state, uri, &state.documents, &contextual_providers)
     else {
         return Vec::new();
     };
-    finalize_file_diagnostics(
-        state,
-        uri,
-        sync_diags,
-        &directive_meta,
-        missing_file_severity,
-        case_mismatch_severity,
-    )
-    .await
+    missing_file_checks.apply(uri, sync_diags).await
 }
 
 /// Compute the sorted `(path, Diagnostic)` set for every report target (issue
@@ -1723,9 +1680,7 @@ async fn collect_target_diagnostics(
         path: PathBuf,
         uri: Url,
         sync_diags: Vec<Diagnostic>,
-        directive_meta: crate::cross_file::CrossFileMetadata,
-        missing_file_severity: Option<DiagnosticSeverity>,
-        case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
+        missing_file_checks: MissingFileChecks,
         loaded_packages: Vec<String>,
     }
 
@@ -1777,15 +1732,13 @@ async fn collect_target_diagnostics(
             );
             let empty_plan = CliContextualProviderPlan::default();
             let contextual_providers = contextual_provider_plans.get(&uri).unwrap_or(&empty_plan);
-            let (sync_diags, directive_meta, missing_file_severity, case_mismatch_severity) =
+            let (sync_diags, missing_file_checks) =
                 compute_file_diagnostics_sync(state, &uri, &open_documents, contextual_providers)?;
             Some(SyncResult {
                 path: path.clone(),
                 uri,
                 sync_diags,
-                directive_meta,
-                missing_file_severity,
-                case_mismatch_severity,
+                missing_file_checks,
                 loaded_packages,
             })
         })
@@ -1796,15 +1749,7 @@ async fn collect_target_diagnostics(
     // whole `all_diags` set is sorted below.
     for r in sync_results {
         reported_loaded_packages.extend(r.loaded_packages);
-        let diags = finalize_file_diagnostics(
-            state,
-            &r.uri,
-            r.sync_diags,
-            &r.directive_meta,
-            r.missing_file_severity,
-            r.case_mismatch_severity,
-        )
-        .await;
+        let diags = r.missing_file_checks.apply(&r.uri, r.sync_diags).await;
         for d in diags {
             all_diags.push((r.path.clone(), d));
         }
@@ -1952,6 +1897,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use tower_lsp::lsp_types::DiagnosticSeverity;
 
     fn run_blocking(args: CheckArgs) -> i32 {
         tokio::runtime::Runtime::new().unwrap().block_on(run(args))
