@@ -14,6 +14,7 @@ import {
     formatTimestamp,
     isRightAligned,
     parseDisplayFormat,
+    isNumericText,
 } from '../../editors/vscode/src/data-viewer/display-format';
 import { encodeTimestampMicros } from '../../editors/vscode/src/data-viewer/wire-format';
 
@@ -235,5 +236,16 @@ describe('alignment', () => {
     });
     test('the rowname column is left-aligned', () => {
         expect(isRightAligned({ ...chr, isRowname: true }, true)).toBe(false);
+    });
+});
+
+describe('isNumericText (overflow draws ### only for numbers)', () => {
+    test('numbers, padded, signed, scientific, grouped, $ and %', () => {
+        for (const t of ['5', '-5.250', '5    ', '1.23e-10', '1,234.5', '$12.00', '45%', 'Inf', '-Inf', 'NaN', '.5'])
+            expect([t, isNumericText(t)]).toEqual([t, true]);
+    });
+    test('value labels are text', () => {
+        for (const t of ['Strongly agree', 'eight', '5 or more', 'NA', ''])
+            expect([t, isNumericText(t)]).toEqual([t, false]);
     });
 });

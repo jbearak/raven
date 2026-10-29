@@ -85,6 +85,15 @@ describe('copy columns', () => {
     test('copy follows display order, not selection order', () => {
         expect(copyColumns(dc, [3, 2], false)).toEqual([1, 2]);
     });
+    test('"Copy with row names" copies the frame\'s names even when the rowname column is hidden', () => {
+        const hidden = buildDisplayColumns(withRownames, [0]);
+        expect(hidden.rownameCols).toEqual([]);
+        expect(hidden.allRownameCols).toEqual([0]);
+        // Display 1 is now mpg (source 1).
+        expect(copyColumns(hidden, [1], true)).toEqual([0, 1]);
+        expect(allCopyColumns(hidden, true)).toEqual([0, 1, 2, 3]);
+        expect(copyColumns(hidden, [1], false)).toEqual([1]);
+    });
 });
 
 describe('gutter R row numbers', () => {

@@ -33,6 +33,10 @@ export type DisplayColumns = {
     readonly displayBySource: ReadonlyMap<number, number>;
     /** Source indices of visible rowname columns. */
     readonly rownameCols: readonly number[];
+    /** Source indices of every rowname column, hidden ones included:
+     *  "Copy with row names" copies the frame's names even when the
+     *  column is hidden. */
+    readonly allRownameCols: readonly number[];
 };
 
 export function buildDisplayColumns(
@@ -41,8 +45,10 @@ export function buildDisplayColumns(
 ): DisplayColumns {
     const hidden = new Set(hiddenColumns);
     const rownameCols: number[] = [];
+    const allRownameCols: number[] = [];
     const rest: number[] = [];
     for (let i = 0; i < columns.length; i++) {
+        if (columns[i].isRowname) allRownameCols.push(i);
         if (hidden.has(i)) continue;
         (columns[i].isRowname ? rownameCols : rest).push(i);
     }
@@ -55,6 +61,7 @@ export function buildDisplayColumns(
         count: dataCols.length + 1,
         displayBySource,
         rownameCols,
+        allRownameCols,
     };
 }
 
@@ -94,21 +101,22 @@ export function clampToData(dc: DisplayColumns, displayIndex: number): number {
 /**
  * Source columns to copy for a set of selected display indices, in
  * display order. The gutter is never copied; rowname columns only when
- * `withRowNames` is set (and then always, first, even if not selected).
+ * `withRowNames` is set (and then always, first, even if not selected or
+ * hidden).
  */
 export function copyColumns(
     dc: DisplayColumns,
     displayIndices: Iterable<number>,
     withRowNames: boolean,
 ): number[] {
-    const rownames = new Set(dc.rownameCols);
+    const rownames = new Set(dc.allRownameCols);
     const picked = new Set<number>();
     for (const d of displayIndices) {
         const src = sourceAt(dc, d);
         if (src !== undefined && !rownames.has(src)) picked.add(src);
     }
     const ordered = dc.dataCols.filter(src => picked.has(src));
-    return withRowNames ? [...dc.rownameCols, ...ordered] : ordered;
+    return withRowNames ? [...dc.allRownameCols, ...ordered] : ordered;
 }
 
 /** Every copyable data column (row selections copy whole rows). */

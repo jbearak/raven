@@ -40,7 +40,7 @@ import type { ToolbarState } from '../toolbar-state';
 import type { Cell } from '../wire-format';
 import { RowCache } from './row-cache';
 import { formatCell, type FormattedCell } from './cell-render';
-import { displayTypeTag, isRightAligned } from '../display-format';
+import { displayTypeTag, isNumericText, isRightAligned } from '../display-format';
 import {
     allCopyColumns,
     buildDisplayColumns,
@@ -201,12 +201,12 @@ function createColumnSelection(colIndex: number): GridSelection {
     };
 }
 
-/** Every data column (display 1..count−1); the gutter is never part of
- *  a column selection. */
-function createAllColumnsSelection(displayCount: number): GridSelection {
+/** Every data column (display `firstData`..count−1); the gutter and
+ *  rowname columns are never part of a column selection. */
+function createAllColumnsSelection(displayCount: number, firstData: number): GridSelection {
     return {
-        columns: displayCount > 1
-            ? CompactSelection.fromSingleSelection([1, displayCount])
+        columns: displayCount > firstData
+            ? CompactSelection.fromSingleSelection([firstData, displayCount])
             : CompactSelection.empty(),
         rows: CompactSelection.empty(),
     };
@@ -1529,7 +1529,7 @@ export function App({
             formatOn: toolbar.formatOn,
             digits: toolbar.digits,
             includeHeader,
-            rowNumbers: withRowNames && display.rownameCols.length === 0,
+            rowNumbers: withRowNames && display.allRownameCols.length === 0,
         });
     }, [display, effectiveNrow, gridSelection, nextRequestId, panelGeneration, showCopyToast, toolbar, visibleCols.length, vscode]);
 
@@ -1593,7 +1593,7 @@ export function App({
             if (!meta) return;
             if (event.key === 'a' || event.key === 'A') {
                 event.preventDefault();
-                const next = createAllColumnsSelection(display.count);
+                const next = createAllColumnsSelection(display.count, display.freezeColumns);
                 setGridSelection(next);
                 postLifecycle('select-all', visibleRange, next);
             } else if (event.key === 'c' || event.key === 'C') {
@@ -1697,6 +1697,13 @@ export function App({
             return;
         }
         const text = args.cell.displayData;
+        // A value label shown in place of the number is text: it clips
+        // like text, never as `###`.
+        if (toolbar.labelsOn && (col.valueLabels || col.dictionaryShipped)
+            && !isNumericText(text)) {
+            drawContent();
+            return;
+        }
         if (!text || !numericOverflows(text, args.rect.width)) {
             drawContent();
             return;
@@ -1715,7 +1722,7 @@ export function App({
             args.rect.y + args.rect.height / 2,
         );
         args.ctx.restore();
-    }, [columns, display, isNumericColumn, numericOverflows]);
+    }, [columns, display, isNumericColumn, numericOverflows, toolbar.labelsOn]);
 
     const getRowThemeOverride = useCallback((row: number): Partial<Theme> | undefined => {
         if (row === hoverRow) return { bgCell: theme.hoverBg };
@@ -1753,7 +1760,9 @@ export function App({
             : undefined;
         return {
             kind: GridCellKind.Text,
-            data: formatted.copyText,
+            // `data` is what Glide's accessibility table reads, so it gets
+            // the display text ("NA", not the empty clipboard form).
+            data: formatted.text,
             displayData: formatted.text,
             readonly: true,
             allowOverlay: false,
@@ -2124,15 +2133,18 @@ export function App({
                     experimental={glideExperimental}
                     gridSelection={gridSelection}
                     onGridSelectionChange={selection => {
-                        // The gutter is never part of a column selection.
-                        const next = selection.columns.hasIndex(0)
-                            ? { ...selection, columns: selection.columns.remove(0) }
+                        // The gutter and rowname columns (the frozen
+                        // display indices) are never part of a column
+                        // selection.
+                        const frozen: [number, number] = [0, display.freezeColumns];
+                        const next = selection.columns.hasIndex(0) || display.freezeColumns > 1
+                            ? { ...selection, columns: selection.columns.remove(frozen) }
                             : selection;
                         setGridSelection(next);
                         postLifecycle('selection', visibleRange, next);
                     }}
                     onHeaderClicked={colIndex => {
-                        if (colIndex < 0 || isGutter(colIndex)) return;
+                        if (colIndex < display.freezeColumns) return;
                         const next = createColumnSelection(colIndex);
                         setGridSelection(next);
                         postLifecycle('header-click', visibleRange, next);

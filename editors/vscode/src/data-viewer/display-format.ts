@@ -405,3 +405,11 @@ export function formatCell(
     if (typeof cell === 'boolean') return plain(cell ? 'TRUE' : 'FALSE');
     return plain(String(cell));
 }
+
+/** Whether a cell's display text is a number (possibly padded, signed,
+ *  scientific, grouped, or carrying a display format's `$`/`%`) rather than
+ *  a value label. The grid draws numeric text that overflows as `###`;
+ *  label text clips like any other text. */
+export function isNumericText(text: string): boolean {
+    return /^[\s\u2007$]*[-+]?(\d[\d,]*(\.\d*)?|\.\d+)(e[-+]?\d+)?[\s\u2007%]*$|^-?Inf$|^NaN$/i.test(text);
+}
