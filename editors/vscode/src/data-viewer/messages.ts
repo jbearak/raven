@@ -157,6 +157,8 @@ export type ExtensionToWebview =
          *  Omitted when no sort is active — the gutter falls back to
          *  `position + 1`. */
         originalRowIndices?: number[];
+        /** Echo of the request's `columnRange`, when it sent one. */
+        columnRange?: { start: number; end: number };
     }
     | {
         type: 'labels';
@@ -335,6 +337,12 @@ export type WebviewToExtension =
         start: number;
         end: number;
         columns: number[];
+        /** Optional half-open range of positions in `columns` needed now
+         *  (the horizontally visible ones). When present the host reads
+         *  only those columns and each reply row holds `end - start` cells
+         *  in `columns` order; the reply echoes the range. Omitted ⇔ all
+         *  of `columns`. */
+        columnRange?: { start: number; end: number };
     }
     | {
         type: 'getLabels';

@@ -94,11 +94,14 @@ describe('computeFilteredIndices — multi-entry AND', () => {
 });
 
 describe('computeFilteredIndices — includeMissing', () => {
-    test('includeMissing makes NA rows pass an isNotEmpty entry trivially', async () => {
+    test('isNotEmpty ignores includeMissing: NA / NaN rows still fail', async () => {
+        // Mirrors isEmpty, which keeps missing rows regardless of the flag.
+        // The UI hides the checkbox for both, but a seeded or restored entry
+        // can still carry includeMissing: true.
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const e = entry('a', 1, { kind: 'isNotEmpty' }, { includeMissing: true });
         const out = await computeFilteredIndices(r, state([e]), CTX_LABELS_ON);
-        expect(Array.from(out!)).toEqual([0, 1, 2, 3, 4]);
+        expect(Array.from(out!)).toEqual([0, 3, 4]);
         await r.close();
     });
 });

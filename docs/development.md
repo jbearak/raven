@@ -2422,9 +2422,39 @@ From docs/data-viewer.md "How it works":
 1. The Raven bootstrap profile (loaded via `R_PROFILE_USER` when you start a Raven-managed R terminal) installs a custom `View()` in `globalenv()` before the plot bridge runs. A failure in the plot bridge does not affect `View()`.
 2. On `View(df)`, R writes the data frame to an Apache Arrow IPC (Feather v2) file in `<extension globalStorage>/data-viewer/`. Per-column variable-label and value-label metadata is captured into a single schema-level JSON blob (R's `arrow` package doesn't expose per-field metadata writes through its public API).
 3. R POSTs the path to the extension's loopback HTTP server (`POST /view-data` with `{ sessionId, panelName, filePath, nrow }`). The route validates that the canonical path is under the per-extension data-viewer directory, rejecting anything else.
-4. The extension opens the file via `apache-arrow` (JS), indexes record-batch starts, and serves row windows on demand to the webview over postMessage. Decoded batches are LRU-cached.
+4. The extension opens the file via `apache-arrow` (JS), takes batch starts from the writer's `raven.nrow` / `raven.chunk_rows` metadata (verified against the footer), and serves row windows on demand to the webview over postMessage. It reads only the requested columns' buffers, and gathers single elements for sorted or filtered windows; the module doc of `editors/vscode/src/data-viewer/arrow-reader.ts` has the details.
 
 Also: persisted layout/sort/filter state is keyed by panel name × schema hash; the user page now says "panel name and the data's column layout". Sort restore stores only keys plus a Labels-state snapshot; the permutation is always recomputed because schema-hash equality doesn't imply equal row values. The toolbar wrap decision uses a hysteresis band. Factor filter checklists depend on whether the column's value dictionary has been shipped to the webview; large or unshipped dictionaries fall back to a free-text list.
+
+### Data viewer performance
+
+The design and its budgets are in `docs/superpowers/specs/2026-10-29-data-viewer-redesign-design.md` (sections F0–F6). What is in place:
+
+- **Writer** (`.raven_write_arrow` in `editors/vscode/src/plot/r-bootstrap-profile.ts`): batches of `max(1024, min(65536, 2^21 %/% w))` rows, where `w` is the estimated bytes per row ÷ 8, so a batch decodes to roughly 16 MB at any width. Schema metadata carries `raven.nrow`, `raven.chunk_rows`, `raven.session_tz`, and per-column `raven.type_tag` and `raven.subsecond_digits` inside `raven.fields`. `View()` never touches `.Random.seed`.
+- **Reader** (`arrow-reader.ts`, `arrow-ipc.ts`): open reads the footer, dictionaries, and at most one batch header. Unsorted windows and scans read only the requested columns; sorted or filtered windows gather single elements with coalesced `readSync` calls. Viewport chunks live in a 128 MB byte-bounded LRU, parsed headers in a 32 MB one; scans bypass both. `reader.nullCounts()` sums `FieldNode.null_count` from the batch headers and is never on the open path. `tests/bun/data-viewer-arrow-projected-spike.test.ts` pins the apache-arrow 21.1.0 API this relies on.
+- **Panel**: the composed sort + filter permutation is cached per change (`effective-permutation.ts`), not rebuilt per `getRows`.
+
+Budgets the benchmark tracks (reference: Apple M-series, 32 GB, warm page cache):
+
+| Measure | Fixture | Budget |
+|---|---|---|
+| Open → first rows, viewer side | A | < 300 ms |
+| `getRows` host time, sort + filter active | A | < 5 ms |
+| Numeric sort | A | < 2 s, event loop never blocked > 50 ms (needs the F4 worker) |
+| Header null-count scan, all columns | A | < 300 ms |
+| Sorted 64 × 32 gather | A | < 15 ms |
+
+Run the benchmark (not part of `bun test`; fixtures are generated once into `$TMPDIR/raven-dv-bench`, outside the timed sections):
+
+```bash
+bun tests/bun/bench/data-viewer/bench.ts                      # A, C, D, G at full size
+bun tests/bun/bench/data-viewer/bench.ts --fixtures A --out /tmp/a.json
+bun tests/bun/bench/data-viewer/bench.ts --baseline /tmp/a.json --threshold 0.15
+```
+
+Each measure reports the median and p95 of `--samples` runs (default 10; `--sort-samples`, default 3, for full sorts) after one discarded warm-up, plus the longest event-loop block from `perf_hooks.monitorEventLoopDelay`. With `--baseline`, a median more than `--threshold` slower is re-measured once and reported only if it repeats; `--fail-on-regression` turns that into exit code 1. To measure an older revision, copy its `editors/vscode/src/data-viewer/*.ts` into a directory inside `editors/vscode/` (so `apache-arrow` resolves) and pass it as `--src`.
+
+CI runs the `data-viewer-bench` job in `integration.yml` with A and C at 10% of their rows. It doesn't block merges and uploads `data-viewer-bench.json`. Once a few runs have settled, check one in as `tests/bun/bench/data-viewer/baselines/ci-linux.json`; the job then compares against it.
 
 ### Knit internals
 

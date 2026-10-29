@@ -22,13 +22,21 @@
  *     double.
  *   - **NA / NaN semantics**: missing rows fail any predicate unless
  *     `includeMissing` is true on that entry, in which case the entry
- *     passes for missing rows regardless of predicate value.
+ *     passes for missing rows regardless of predicate value. The two
+ *     missingness predicates ignore `includeMissing`: `isEmpty` always
+ *     keeps missing rows and `isNotEmpty` always drops them (a seeded or
+ *     restored entry can carry the flag even though the UI hides it).
  *
  * Performance:
  *   - Row mask is a `Uint8Array(nrow)`; final compaction to
  *     `Uint32Array` is O(nrow).
  *   - Per-entry column reads stream through the reader's batch loader
- *     (same iterator the sort engine uses).
+ *     (same iterator the sort engine uses), reading only that column.
+ *   - String predicates are evaluated once per distinct value, not once
+ *     per row: once per dictionary entry for factor columns, and through
+ *     a bounded memo for plain string columns (see
+ *     {@link stringAcceptor}). Case-insensitive matching therefore folds
+ *     each distinct value once.
  */
 
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
@@ -82,9 +90,12 @@ async function applyEntry(
     }
     const p = entry.predicate;
     const accept = await acceptorFor(reader, entry.columnIndex, schema, p, ctx, signal);
-    // isEmpty targets missing values — they always pass regardless of includeMissing.
-    // All other predicates use the entry's includeMissing flag.
-    const include = p.kind === 'isEmpty' ? true : entry.includeMissing;
+    // isEmpty / isNotEmpty target missingness itself, so includeMissing
+    // never applies to them: missing rows always pass isEmpty and always
+    // fail isNotEmpty. All other predicates use the entry's flag.
+    const include = p.kind === 'isEmpty'
+        ? true
+        : p.kind === 'isNotEmpty' ? false : entry.includeMissing;
     const missing = await missingMaskFor(reader, entry.columnIndex, schema, signal);
 
     // Yield once more before the synchronous mask scan so a Cancel queued
@@ -157,39 +168,37 @@ async function acceptorFor(
         || predicate.kind === 'strStartsWith'
         || predicate.kind === 'strEndsWith'
         || predicate.kind === 'strRegex') {
-        const values = await loadString(reader, columnIndex, signal);
         const cs = predicate.caseSensitive;
+        const fold = (x: string): string => (cs ? x : x.toLowerCase());
+        let test: (hay: string) => boolean;
         switch (predicate.kind) {
             case 'strCompare': {
-                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                const needle = fold(predicate.value);
                 const eq = predicate.op === '=';
-                return (i) => {
-                    const hay = cs ? values[i] : values[i].toLowerCase();
-                    return eq ? hay === needle : hay !== needle;
-                };
+                test = (hay) => (fold(hay) === needle) === eq;
+                break;
             }
             case 'strContains': {
-                const needle = cs ? predicate.value : predicate.value.toLowerCase();
+                const needle = fold(predicate.value);
                 const neg = predicate.negate;
-                return (i) => {
-                    const hay = cs ? values[i] : values[i].toLowerCase();
-                    const hit = hay.includes(needle);
-                    return neg ? !hit : hit;
-                };
+                test = (hay) => fold(hay).includes(needle) !== neg;
+                break;
             }
             case 'strStartsWith': {
-                const needle = cs ? predicate.value : predicate.value.toLowerCase();
-                return (i) => (cs ? values[i] : values[i].toLowerCase()).startsWith(needle);
+                const needle = fold(predicate.value);
+                test = (hay) => fold(hay).startsWith(needle);
+                break;
             }
             case 'strEndsWith': {
-                const needle = cs ? predicate.value : predicate.value.toLowerCase();
-                return (i) => (cs ? values[i] : values[i].toLowerCase()).endsWith(needle);
+                const needle = fold(predicate.value);
+                test = (hay) => fold(hay).endsWith(needle);
+                break;
             }
             case 'strRegex': {
                 // NB: the compiled pattern is user-supplied and `r.test` runs
-                // synchronously over every row on the extension-host event
-                // loop. A catastrophic-backtracking pattern (e.g. `(a+)+$`)
-                // on a large frame can stall the host. This is user-
+                // synchronously on the extension-host event loop, once per
+                // distinct value. A catastrophic-backtracking pattern (e.g.
+                // `(a+)+$`) on a large frame can stall the host. This is user-
                 // self-inflicted and the webview validates syntax (not ReDoS)
                 // before applying; a hard guard would require a worker. If we
                 // ever see this in practice, move filter compute off-thread.
@@ -205,9 +214,11 @@ async function acceptorFor(
                 }
                 if (!rx) return () => false;
                 const r = rx;
-                return (i) => r.test(values[i]);
+                test = (hay) => r.test(hay);
+                break;
             }
         }
+        return stringAcceptor(reader, columnIndex, schema, test, signal);
     }
 
     if (predicate.kind === 'dateCompare'
@@ -314,6 +325,53 @@ async function acceptorFor(
     throw new Error(`filter: unhandled predicate ${(_exhaustive as { kind: string }).kind}`);
 }
 
+/** Memo bound for {@link stringAcceptor} on non-dictionary columns. Past
+ *  it, values are tested directly (a high-cardinality column gains
+ *  nothing from memoizing). */
+const STRING_MEMO_MAX = 100_000;
+
+/**
+ * Row acceptor for a string predicate `test`, evaluating `test` once per
+ * distinct value rather than once per row:
+ *   - dictionary (factor) columns: once per dictionary entry, against the
+ *     dictionary strings the reader loaded at open, then a code lookup;
+ *   - other columns: through a memo of up to {@link STRING_MEMO_MAX}
+ *     distinct values.
+ * Missing rows never reach the acceptor (the caller's mask loop handles
+ * them), so null codes and empty placeholders are irrelevant.
+ */
+async function stringAcceptor(
+    reader: ArrowSliceReader,
+    columnIndex: number,
+    schema: ColumnSchema,
+    test: (hay: string) => boolean,
+    signal?: AbortSignal,
+): Promise<(row: number) => boolean> {
+    const dict = schema.arrowType.startsWith('Dictionary')
+        ? reader.dictionaryVector(columnIndex)
+        : undefined;
+    if (dict) {
+        const pass = new Uint8Array(dict.length);
+        for (let d = 0; d < dict.length; d++) {
+            const v = dict.get(d);
+            pass[d] = v !== null && v !== undefined && test(String(v)) ? 1 : 0;
+        }
+        const codes = await loadFactorCodes(reader, columnIndex, signal);
+        return (i) => pass[codes[i]] === 1;
+    }
+    const values = await loadString(reader, columnIndex, signal);
+    const memo = new Map<string, boolean>();
+    return (i) => {
+        const v = values[i];
+        let hit = memo.get(v);
+        if (hit === undefined) {
+            hit = test(v);
+            if (memo.size < STRING_MEMO_MAX) memo.set(v, hit);
+        }
+        return hit;
+    };
+}
+
 async function missingMaskFor(
     reader: ArrowSliceReader,
     columnIndex: number,
@@ -323,7 +381,7 @@ async function missingMaskFor(
     const nrow = reader.nrow;
     const m = new Uint8Array(nrow);
     const isFloat = schema.arrowType.startsWith('Float');
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
@@ -337,7 +395,7 @@ async function missingMaskFor(
 async function loadBool(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Uint8Array> {
     const nrow = reader.nrow;
     const values = new Uint8Array(nrow);
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
@@ -351,7 +409,7 @@ async function loadBool(reader: ArrowSliceReader, columnIndex: number, signal?: 
 async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Float64Array> {
     const nrow = reader.nrow;
     const out = new Float64Array(nrow);
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
@@ -370,7 +428,7 @@ async function loadNumeric(reader: ArrowSliceReader, columnIndex: number, signal
 async function loadString(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<string[]> {
     const nrow = reader.nrow;
     const out: string[] = new Array(nrow).fill('');
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
@@ -383,7 +441,7 @@ async function loadString(reader: ArrowSliceReader, columnIndex: number, signal?
 async function loadFactorCodes(reader: ArrowSliceReader, columnIndex: number, signal?: AbortSignal): Promise<Int32Array> {
     const nrow = reader.nrow;
     const codes = new Int32Array(nrow);
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         const data = child.data[0];
         for (let r = 0; r < length; r++) codes[start + r] = data.values[r] as number;
@@ -418,7 +476,7 @@ async function loadValueLabelled(
     const nrow = reader.nrow;
     const out: string[] = new Array(nrow).fill('');
     const labels = schema.valueLabels ?? {};
-    for await (const { batch, start, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
