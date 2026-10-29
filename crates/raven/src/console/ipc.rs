@@ -31,14 +31,15 @@
 //! ← {"id":11,"status":"ok"}                            // session exists
 //! ```
 //!
-//! Access control is the filesystem: the socket is created mode 0600 inside a
-//! directory the editor created 0700.
+//! Access control: the socket is owner-only, inside a directory the editor
+//! created private (see `local_socket`, which also covers Windows' named
+//! pipes).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+
+use super::local_socket::{Listener, Stream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +51,7 @@ pub struct Request {
     /// The `program` of a debug session (`"debugProgram": true`): the
     /// session ends when this request finishes.
     pub debug_program: bool,
-    reply: Option<UnixStream>,
+    reply: Option<Stream>,
 }
 
 impl Request {
@@ -78,47 +79,24 @@ impl Server {
     pub fn start(
         path: &Path,
         break_flag: Arc<AtomicBool>,
-        main_thread: libc::pthread_t,
-        subscribers: Arc<Mutex<Vec<UnixStream>>>,
+        subscribers: Arc<Mutex<Vec<Stream>>>,
     ) -> std::io::Result<Self> {
-        // Replace only a stale socket: `--ipc` is a public option, and a
-        // mistyped path must never delete an ordinary file.
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            use std::os::unix::fs::FileTypeExt;
-            if !meta.file_type().is_socket() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "path exists and is not a socket",
-                ));
-            }
-            let _ = std::fs::remove_file(path);
-        }
-        // Create the socket owner-only from the start (no window where the
-        // umask's mode applies). Runs at startup, before any thread that
-        // creates files.
-        // SAFETY: umask only swaps the process file-creation mask.
-        let old = unsafe { libc::umask(0o077) };
-        let bound = UnixListener::bind(path);
-        // SAFETY: as above.
-        unsafe { libc::umask(old) };
-        let listener = bound?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = Listener::bind(path)?;
         let server = Server {
             queue: Arc::new(Mutex::new(VecDeque::new())),
         };
         let queue = server.queue.clone();
-        let main = main_thread;
         std::thread::Builder::new()
             .name("raven-console-ipc".into())
             .spawn(move || {
-                for stream in listener.incoming().flatten() {
+                for stream in listener.incoming() {
                     let queue = queue.clone();
                     let break_flag = break_flag.clone();
                     let subscribers = subscribers.clone();
                     let _ = std::thread::Builder::new()
                         .name("raven-console-client".into())
                         .spawn(move || {
-                            serve(stream, &queue, &break_flag, main, &subscribers);
+                            serve(stream, &queue, &break_flag, &subscribers);
                         });
                 }
             })?;
@@ -142,11 +120,10 @@ impl Server {
 }
 
 fn serve(
-    stream: UnixStream,
+    stream: Stream,
     queue: &Mutex<VecDeque<Request>>,
     break_flag: &AtomicBool,
-    main: libc::pthread_t,
-    subscribers: &Mutex<Vec<UnixStream>>,
+    subscribers: &Mutex<Vec<Stream>>,
 ) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
@@ -209,9 +186,7 @@ fn serve(
             }
             Some("interrupt") => {
                 if R_BUSY.load(Ordering::Relaxed) {
-                    // SAFETY: delivering SIGINT to the R thread runs R's own
-                    // handler there, exactly as a Ctrl-C would.
-                    unsafe { libc::pthread_kill(main, libc::SIGINT) };
+                    super::sys::interrupt_r();
                 }
                 let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));
             }

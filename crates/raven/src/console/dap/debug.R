@@ -401,7 +401,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         fn <- if (is.environment(sf)) get0("filename", envir = sf, inherits = FALSE) else NULL
         if (is.null(fn) || !length(fn)) fn <- ""
         wd <- if (is.environment(sf)) get0("wd", envir = sf, inherits = FALSE) else NULL
-        if (nzchar(fn) && !startsWith(fn, "/") && !startsWith(fn, "<") && !is.null(wd) && length(wd)) {
+        # Absolute: `/x`, and on Windows `\x`, `C:/x`, `C:\x`.
+        if (nzchar(fn) && !grepl("^([A-Za-z]:)?[/\\\\]", fn) && !startsWith(fn, "<") && !is.null(wd) && length(wd)) {
             fn <- file.path(wd, fn)
         }
         c(fn, sr[[1L]], sr[[5L]], sr[[3L]], sr[[6L]])

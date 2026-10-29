@@ -3,10 +3,12 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { socket_endpoint } from './console-endpoint';
 
 /**
  * Client side of `raven console --ipc`: code sent from the editor goes to
- * Raven's console over a Unix socket instead of being typed into the
+ * Raven's console over a local socket (a named pipe on Windows; see
+ * `socket_endpoint`) instead of being typed into the
  * terminal. The console echoes it as if typed, runs it through R's own REPL,
  * and stops at the first error.
  *
@@ -112,7 +114,8 @@ const ACK_TIMEOUT_MS = 10_000;
 /**
  * A fresh socket path in a new 0700 directory (mkdtemp). Kept short: macOS
  * limits Unix socket paths to 104 bytes and `os.tmpdir()` there is already
- * ~50.
+ * ~50. (On Windows the console marks this path with a file and listens on a
+ * pipe named after it.)
  */
 export function make_console_socket_path(): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-c'));
@@ -238,7 +241,7 @@ function deliver(
         const id = next_request_id++;
         let connected = false;
         let acknowledged = false;
-        const socket = net.createConnection(socket_path);
+        const socket = net.createConnection(socket_endpoint(socket_path));
         socket.setEncoding('utf8');
         socket.on('connect', () => {
             connected = true;

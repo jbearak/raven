@@ -17,7 +17,7 @@ The `raven.rTerminal.program` setting controls which program is launched:
 
 | Value | Description |
 |-------|-------------|
-| **raven** (default) | [Raven's console](#ravens-console), built into Raven. macOS and Linux; on Windows this setting starts plain R. |
+| **raven** (default) | [Raven's console](#ravens-console), built into Raven. |
 | **R** | Standard R console |
 | **arf** | Rust-based R console with syntax highlighting, fuzzy history search (`Ctrl+R`), interactive help, and rig integration |
 | **radian** | Python-based R console with syntax highlighting, multiline editing, and mouse support |
@@ -26,13 +26,13 @@ arf and radian must be available on your PATH. Raven's console needs only R itse
 
 ## Raven's console
 
-Raven's console runs the same R you get by typing `R` in a terminal: the one on your `PATH`, or `R_HOME` if you set it. It loads that installation's R library into its own process and drives R's own read–eval–print loop. Everything R does at its prompt works as usual: autoprinting, `.Last.value`, `browser()`, `readline()`, `menu()`, error recovery, and your `.Rprofile` and `.Renviron`. If the console can't embed your R (for example, R built without `--enable-R-shlib`), it says why in one line and starts plain R instead, so you always get a working session.
+Raven's console runs the same R you get by typing `R` in a terminal: the one on your `PATH`, or `R_HOME` if you set it. On Windows, where the installer doesn't put R on `PATH`, it also finds the R recorded in the registry; it needs R 4.2 or later there. It loads that installation's R library into its own process and drives R's own read–eval–print loop. Everything R does at its prompt works as usual: autoprinting, `.Last.value`, `browser()`, `readline()`, `menu()`, error recovery, and your `.Rprofile` and `.Renviron`. If the console can't embed your R (for example, R built without `--enable-R-shlib`), it says why in one line and starts plain R instead, so you always get a working session.
 
 ### Editing
 
 - **Syntax highlighting** as you type, using the same R grammar as Raven's language server. The bracket at the cursor and its match are underlined.
 - **Multi-line editing.** Enter runs your input when R's own parser says it is complete, and starts a new, indented line when it isn't — after `function(x) {`, `data.frame(a = 1,` or a trailing `|>`, just as in plain R. A syntax error is reported by R rather than leaving you stuck in continuation lines. **Alt+Enter** always inserts a newline. Arrow keys move between lines.
-- **History** is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux). Up and Down step through earlier entries, and a multi-line entry comes back whole. **Ctrl+R** searches history for text you type, and a dimmed suggestion from history appears as you type; press → to accept it.
+- **History** is kept across sessions (`~/Library/Application Support/raven/console_history` on macOS, `~/.local/share/raven/console_history` on Linux, `%APPDATA%\raven\console_history` on Windows). Up and Down step through earlier entries, and a multi-line entry comes back whole. **Ctrl+R** searches history for text you type, and a dimmed suggestion from history appears as you type; press → to accept it.
 - **Emacs key bindings** by default; set `raven.console.editMode` to `vi` for vi bindings.
 - **Ctrl+C** clears the line you're editing, or interrupts R while it runs. At a `+` continuation line it abandons the unfinished expression, and at a `readline()` or `menu()` prompt it interrupts the code that asked, as in plain R. **Ctrl+D** on an empty line quits.
 - `options(width)` follows the terminal width as you resize it, unless you set `width` yourself.

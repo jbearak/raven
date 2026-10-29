@@ -1,1 +1,4 @@
 crates/raven/data/names-db-seed.db filter=lfs diff=lfs merge=lfs -text
+# Embedded with include_str! and parsed by R_ParseVector, which rejects CRLF;
+# a Windows checkout (core.autocrlf) must not convert them.
+crates/raven/src/console/**/*.R text eol=lf
