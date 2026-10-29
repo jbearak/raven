@@ -188,12 +188,11 @@ struct Shared {
     /// The session asked to step into code without source too
     /// (`justMyCode: false`).
     all_code: bool,
-    /// Console requests (sends) finished so far, and, for a session
-    /// launched to run a `program`, the count when it was configured: a
-    /// later finish is the program's.
-    finished: u64,
-    session_from: Option<u64>,
+    /// The current session was launched to run a `program`, and that
+    /// program's request (marked `debugProgram` by the extension) has
+    /// finished.
     runs_program: bool,
+    program_done: bool,
     /// The current session has seen a stop and not yet been ended.
     session_open: bool,
     /// `terminated` was sent to the current client: its `disconnect` is
@@ -529,8 +528,8 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 s.connected = true;
                 s.ended = false;
                 s.configured = false;
-                s.session_from = None;
                 s.runs_program = false;
+                s.program_done = false;
             }
             out.respond(&msg, capabilities());
             out.event("initialized", json!({}));
@@ -546,7 +545,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             let stop = {
                 let mut s = lock_shared(shared);
                 s.configured = true;
-                s.session_from = s.runs_program.then_some(s.finished);
+                s.program_done = false;
                 s.stop.clone()
             };
             out.respond(&msg, json!({}));
@@ -1494,12 +1493,12 @@ fn end_session_at_prompt(more: bool) {
     let Some(h) = handle() else { return };
     let end = {
         let mut s = lock(h);
-        let ran = s.session_from.is_some_and(|n| s.finished > n);
+        let ran = s.runs_program && s.program_done;
         if more || !(s.session_open || ran) {
             return;
         }
         s.session_open = false;
-        s.session_from = None;
+        s.program_done = false;
         for bps in s.files.values_mut() {
             for bp in bps.iter_mut() {
                 bp.hits = 0;
@@ -1519,10 +1518,10 @@ fn end_session_at_prompt(more: bool) {
     push_control(json!({"event": "running"}));
 }
 
-/// A console request (a send from the editor) has finished.
-pub fn on_request_finished() {
+/// A debug session's `program` request has finished.
+pub fn on_program_finished() {
     if let Some(h) = handle() {
-        lock(h).finished += 1;
+        lock(h).program_done = true;
     }
 }
 

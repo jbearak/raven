@@ -183,7 +183,18 @@ impl Console {
     }
 
     fn send_tagged(&self, code: &str, at: Option<(&str, u32)>) {
-        let mut msg = json!({"v": 1, "id": 1, "op": "execute", "code": code});
+        self.execute(json!({"v": 1, "id": 1, "op": "execute", "code": code}), at);
+    }
+
+    /// Send `code` as a debug session's `program` (what F5 does).
+    fn send_program(&self, code: &str) {
+        self.execute(
+            json!({"v": 1, "id": 1, "op": "execute", "code": code, "debugProgram": true}),
+            None,
+        );
+    }
+
+    fn execute(&self, mut msg: Value, at: Option<(&str, u32)>) {
         if let Some((p, line)) = at {
             msg["location"] = json!({"path": p, "line": line, "col": 0});
         }
@@ -1203,5 +1214,75 @@ fn step_out_and_over_return_to_the_caller_and_switch_arms_bind() {
     assert_eq!(d.stack()[0], ("pick".to_string(), 13));
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}
+
+#[test]
+fn expressions_name_exactly_the_value_shown() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    c.send(
+        "x <- 'global'; sh <- function() {\n  x <- 'local'; l <- list(a = 1, a = 2)\n  browser()\n  x\n}",
+        None,
+    );
+    let m = d.mark();
+    c.send("sh()", None);
+    d.event("stopped", m);
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let frame = st["body"]["stackFrames"][0]["id"].clone();
+    let sc = d.req("scopes", json!({"frameId": frame}));
+    let scopes = sc["body"]["scopes"].as_array().unwrap().clone();
+    let vars = |d: &mut Dap, r: &Value| {
+        d.req("variables", json!({"variablesReference": r}))["body"]["variables"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let global = scopes.iter().find(|s| s["name"] == "Global").unwrap();
+    let gx = vars(&mut d, &global["variablesReference"])
+        .into_iter()
+        .find(|v| v["name"] == "x")
+        .unwrap();
+    let locals = vars(&mut d, &scopes[0]["variablesReference"]);
+    let l = locals.iter().find(|v| v["name"] == "l").unwrap();
+    let second = vars(&mut d, &l["variablesReference"])[1].clone();
+    // Each evaluateName, evaluated in the stopped frame, gives the value
+    // that row shows.
+    for (row, want) in [(&gx, "global"), (&second, "2")] {
+        let ex = row["evaluateName"].as_str().unwrap();
+        let ev = d.req(
+            "evaluate",
+            json!({"expression": ex, "frameId": frame, "context": "repl"}),
+        );
+        let got = ev["body"]["result"].as_str().unwrap_or("");
+        assert!(got.contains(want), "{ex} gave {got}, row shows {want}");
+    }
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}
+
+#[test]
+fn a_program_session_ends_when_its_program_finishes() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("launch", json!({"program": "/w/p.R"}));
+    d.req("configurationDone", json!({}));
+    // Another send finishing first doesn't end the session...
+    let m = d.mark();
+    c.send("Sys.sleep(0.2); cat('other\\n')", None);
+    c.expect("other");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(d.count("terminated", m), 0, "ended on an unrelated send");
+    // ...the program finishing does.
+    c.send_program("cat('program ran\\n')");
+    c.expect("program ran");
     d.event("terminated", m);
 }

@@ -18,6 +18,9 @@
 //! ```text
 //! → {"v":1,"id":9,"op":"execute","code":"f(1)",
 //!    "location":{"path":"/w/a.R","line":12,"col":0}}   // tagged send (§3)
+//! → {"v":1,"id":12,"op":"execute","code":"source(…)",
+//!    "debugProgram":true}                              // F5's program: its
+//!                                                      // session ends with it
 //! → {"v":1,"id":10,"op":"subscribe"}                  // keeps the connection:
 //! ← {"id":10,"status":"ok"}                            // the console pushes
 //! ← {"event":"stopped","reason":"breakpoint"}          // stop/run events
@@ -44,6 +47,9 @@ pub struct Request {
     pub code: String,
     /// Where the code came from in the editor, when the sender knows.
     pub location: Option<super::dap::Location>,
+    /// The `program` of a debug session (`"debugProgram": true`): the
+    /// session ends when this request finishes.
+    pub debug_program: bool,
     reply: Option<UnixStream>,
 }
 
@@ -194,6 +200,8 @@ fn serve(
                         id,
                         code: code.to_string(),
                         location,
+                        debug_program: msg.get("debugProgram").and_then(|v| v.as_bool())
+                            == Some(true),
                         reply,
                     });
                 }

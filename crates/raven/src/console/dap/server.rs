@@ -192,9 +192,12 @@ pub fn start(
                         let mut g = current.lock().unwrap_or_else(|e| e.into_inner());
                         if g.as_ref().is_some_and(|(cid, _)| *cid == id) {
                             *g = None;
-                            drop(g);
+                            // Still under the lock: a replacement client
+                            // can't connect and configure in between, only
+                            // to have this close reset its state.
                             on_close();
                         }
+                        drop(g);
                     });
             }
         })?;

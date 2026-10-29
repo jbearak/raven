@@ -301,9 +301,11 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             n <- xlen(x)
             nms <- attr(x, "names", exact = TRUE)
             for (i in page(n, start, count)) {
-                named <- !is.null(nms) && nzchar(nms[[i]])
+                named <- !is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])
                 nm <- if (named) nms[[i]] else sprintf("[[%d]]", i)
-                ex <- if (named) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
+                # `x$a` finds the first `a`: a repeated name needs its index.
+                unique_name <- named && sum(nms == nms[[i]], na.rm = TRUE) == 1L
+                ex <- if (unique_name) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
                 out <- c(out, var_json(nm, .subset2(x, i), "value", ex))
             }
             return(out)
@@ -447,10 +449,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                     expensive = jbool(identical(e, globalenv())))
         if (!identical(e, globalenv())) {
             p <- parent.env(e)
+            # Expressions for these must not resolve to a shadowing local:
+            # globals are reached explicitly; an enclosing environment has
+            # no reliable name, so its values get none.
             if (!identical(p, globalenv()) && !identical(p, emptyenv())) {
-                out <- c(out, jobj(name = jstr("Enclosing"), variablesReference = jnum(register(p, "")), expensive = "true"))
+                out <- c(out, jobj(name = jstr("Enclosing"), variablesReference = jnum(register(p)), expensive = "true"))
             }
-            out <- c(out, jobj(name = jstr("Global"), variablesReference = jnum(register(globalenv(), "")), expensive = "true"))
+            out <- c(out, jobj(name = jstr("Global"), variablesReference = jnum(register(globalenv(), "base::globalenv()")), expensive = "true"))
         }
         jarr(out)
     }, error = function(e) jarr(character())))

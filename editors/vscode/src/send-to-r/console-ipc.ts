@@ -214,12 +214,25 @@ export function send_via_console(
     in_order(socket_path, after_gate(socket_path, () => deliver(socket_path, code, fallback, location)));
 }
 
+/**
+ * Run a debug session's `program` (F5). The console ends that session when
+ * this request finishes, so it is marked as the program's, not inferred
+ * from whichever send finishes next.
+ */
+export function send_debug_program(socket_path: string, code: string): void {
+    in_order(
+        socket_path,
+        after_gate(socket_path, () => deliver(socket_path, code, () => undefined, undefined, { debugProgram: true })),
+    );
+}
+
 /** One request; settles once it is acknowledged, or known not delivered. */
 function deliver(
     socket_path: string,
     code: string,
     fallback: () => void,
     location?: SendLocation,
+    extra: Record<string, unknown> = {},
 ): Promise<void> {
     return new Promise<void>((settled) => {
         const id = next_request_id++;
@@ -229,7 +242,7 @@ function deliver(
         socket.setEncoding('utf8');
         socket.on('connect', () => {
             connected = true;
-            socket.write(JSON.stringify({ v: 1, id, op: 'execute', code, ...(location ? { location } : {}) }) + '\n');
+            socket.write(JSON.stringify({ v: 1, id, op: 'execute', code, ...(location ? { location } : {}), ...extra }) + '\n');
         });
         let buffered = '';
         socket.on('data', (chunk: string) => {

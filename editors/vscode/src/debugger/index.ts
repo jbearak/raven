@@ -7,9 +7,9 @@ import {
     gate_sends,
     live_console_sockets,
     on_console_registered,
+    send_debug_program,
 } from '../send-to-r/console-ipc';
 import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
-import { get_send_options, send_code } from '../send-to-r/send-code';
 
 /**
  * VS Code side of Raven's R debugger. The debug adapter itself runs inside
@@ -365,7 +365,7 @@ const tracker_factory: vscode.DebugAdapterTrackerFactory = {
                     const terminal = live_console_sockets().find(([, sock]) => sock === ipc)?.[0];
                     if (!terminal) return;
                     terminal.show(true);
-                    send_code(terminal, `source(${JSON.stringify(program)}, echo = TRUE)`, get_send_options());
+                    send_debug_program(ipc, `source(${JSON.stringify(program)}, echo = TRUE)`);
                 }
             },
             onWillReceiveMessage(m: { command?: string; arguments?: { filters?: string[] } }) {

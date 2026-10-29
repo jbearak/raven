@@ -919,8 +919,11 @@ fn finish_request() {
     })
     .flatten();
     if let Some((r, failed)) = finished {
+        let program = r.debug_program;
         r.finish(if failed { "error" } else { "done" });
-        dap::on_request_finished();
+        if program {
+            dap::on_program_finished();
+        }
     }
 }
 
