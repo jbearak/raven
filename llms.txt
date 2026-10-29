@@ -2,6 +2,8 @@
 
 > Raven is a static analyzer and language server for R. It finds undefined variables and broken `source()` chains across files without running code, and provides completion, navigation, and hover in any LSP editor. Its VS Code extension adds an R console, debugger, plot/data/help viewers, and R Markdown/Quarto preview. The `raven check` CLI runs the same analysis in CI.
 
+Documentation site: https://jbearak.github.io/raven/
+
 ## Start here
 
 - [Getting started](https://github.com/jbearak/raven/blob/main/docs/getting-started.md): Install Raven and catch your first bug in two minutes.

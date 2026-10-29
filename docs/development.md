@@ -2232,7 +2232,7 @@ User docs live in `docs/` as plain GitHub-flavored Markdown, and GitHub renders 
   /tmp/docs-venv/bin/zensical build --strict && bun docs/site/search-check.ts
   ```
 
-  `.github/workflows/docs.yml` runs that build on docs PRs (a check, not a required one). On `main` it deploys to GitHub Pages once Pages is enabled with "GitHub Actions" as the source and the repository variable `DOCS_PAGES_ENABLED` is `true`. After enabling it, set `site_url` in `docs/user-pages.json` and regenerate, so the hub, README, and `llms.txt` link the site.
+  `.github/workflows/docs.yml` runs that build on docs PRs (a check, not a required one). On `main` it deploys to GitHub Pages at <https://jbearak.github.io/raven/>. Pages uses "GitHub Actions" as its source, and the deploy runs only while the repository variable `DOCS_PAGES_ENABLED` is `true`; set it to anything else to pause deploys. `site_url` in `docs/user-pages.json` makes the generated hub and `llms.txt` link the site. The two READMEs link it by hand.
 - **Tutorial checks.** `editors/vscode/src/test-getting-started/getting-started.test.ts` walks through `docs/getting-started.md` in VS Code. It runs as the `getting-started` label in `.vscode-test.mjs`, with a temp copy of the tutorial files as its workspace. `scripts/fresh-install-check.sh` packages the VSIX, installs it into an empty profile on a machine without R or `raven` on PATH, and runs the same test against the installed extension. Run it under `xvfb-run -a` on Linux.
 
 ## Docs verification

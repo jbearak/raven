@@ -2,6 +2,8 @@
 
 Raven is a static analyzer and language server for R. Start with [Getting started](getting-started.md), or pick a topic below.
 
+Prefer search? The same pages are on the [documentation site](https://jbearak.github.io/raven/).
+
 ## Start here
 
 - [Getting started](getting-started.md): Install Raven and catch your first bug in two minutes.
