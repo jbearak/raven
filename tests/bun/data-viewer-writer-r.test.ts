@@ -97,7 +97,10 @@ describe('View() writer (real R)', () => {
             'df$cp <- complex(real = 1:3, imaginary = 1)',
             'df$lst <- I(list(1, "a", TRUE))',
             'View(df)',
-            'cat("SESSION_TZ=", Sys.timezone(), "\\n", sep = "")',
+            'tz <- tryCatch(Sys.timezone(), error = function(e) NA_character_)',
+            'if (is.null(tz) || length(tz) != 1L || is.na(tz) || !nzchar(tz)) tz <- Sys.getenv("TZ")',
+            'if (!nzchar(tz)) tz <- "UTC"',
+            'cat("SESSION_TZ=", tz, "\\n", sep = "")',
         ].join('\n'));
         expect(r.files.length).toBe(1);
         const reader = await ArrowSliceReader.open(r.files[0]);
@@ -105,7 +108,7 @@ describe('View() writer (real R)', () => {
         expect(md.get('raven.nrow')).toBe('3');
         expect(md.get('raven.chunk_rows')).toBe('65536');
         const tz = /^SESSION_TZ=(.*)$/m.exec(r.stdout)?.[1]?.trim();
-        expect(md.get('raven.session_tz')).toBe(tz || 'UTC');
+        expect(md.get('raven.session_tz')).toBe(tz);
         const f = fieldsMd(reader);
         const tags = Object.fromEntries(Object.entries(f).map(([k, v]) => [k, v['raven.type_tag']]));
         expect(tags).toEqual({

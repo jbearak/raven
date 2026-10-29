@@ -179,6 +179,9 @@ async function measuresFor(fx: FixtureInfo): Promise<{ measures: Measures; teard
 /** Time the real R `View()` writer (design F0's end-to-end budget, minus
  *  the webview paint): R-side `View()` elapsed time measured inside R, and
  *  the reader's open → first rows on the file it wrote. */
+/** A failed run with its prerequisites present: fails the bench. */
+class BenchFailure extends Error {}
+
 async function rWriterMeasures(): Promise<Record<string, Stat>> {
     const R = process.env.RAVEN_TEST_R_BIN ?? 'R';
     const profileMod = await import(join(import.meta.dir, '../../../../editors/vscode/src/plot/r-bootstrap-profile.ts'));
@@ -213,10 +216,13 @@ async function rWriterMeasures(): Promise<Record<string, Stat>> {
                 stdout: 'pipe', stderr: 'pipe',
             });
             const stdout = await new Response(p.stdout).text();
+            const stderr = await new Response(p.stderr).text();
             await p.exited;
             if (stdout.includes('NOARROW')) { console.error('[bench] R: arrow not installed; skipped'); return out; }
             const line = stdout.split('\n').find(l => l.startsWith('TIMES'));
-            if (!line) { console.error(`[bench] R: ${metric} produced no timings; skipped`); continue; }
+            // R and arrow are present, so no timings means View() failed:
+            // a benchmark failure, not a skip.
+            if (!line) throw new BenchFailure(`R View() produced no timings for ${metric}:\n${stderr.slice(-2000)}`);
             const times = line.split(/\s+/).slice(1).filter(Boolean).map(Number).sort((a, b) => a - b);
             out[`${metric}_r_side`] = {
                 median_ms: round(quantile(times, 0.5)), p95_ms: round(quantile(times, 0.95)),
@@ -233,6 +239,7 @@ async function rWriterMeasures(): Promise<Record<string, Stat>> {
             for (const f of files) rmSync(f, { force: true });
         }
     } catch (e) {
+        if (e instanceof BenchFailure) throw e;
         console.error(`[bench] R: unavailable (${(e as Error).message}); skipped`);
     } finally {
         rmSync(tmp, { recursive: true, force: true });
