@@ -148,10 +148,13 @@ export class TransformCoordinator {
                 });
             }
             if (stop()) return this.abortCandidate(desc, true);
-            // Point of no return.
-            this.candidateDesc = undefined;
+            // Point of no return. The candidate stays in `readerSeed()`
+            // until the reader acks the commit: a reader that restarts
+            // while `commit` is in flight is re-seeded with it, so the
+            // re-issued commit finds the generation it promotes.
             this.scan.commit(desc.gen, desc.spec);
             await this.reader.commit(desc.gen);
+            this.candidateDesc = undefined;
             const previous = this.committedDesc;
             this.committedDesc = desc;
             if (this.adoptionRequired && !this.disposed) {

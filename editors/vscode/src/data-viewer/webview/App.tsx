@@ -684,6 +684,10 @@ export function App({
         const pinRows = cache.pagesFor(range.start, range.end, 0, 1).rowPages;
         const pinnedCols: [number, number] = [Math.floor(runs[0][0] / C), Math.floor((c1 - 1) / C)];
         cache.pin(pinRows, pinnedCols);
+        // One viewport generation for every request of this viewport: a
+        // per-run bump would make the reader see the frozen-rowname
+        // request as superseded by the viewport request sent right after.
+        let viewportGeneration: number | undefined;
         for (const [a, b] of runs) {
             const pages = cache.pagesFor(range.start, range.end, a, b);
             let r0 = Infinity; let r1 = -1; let p0 = Infinity; let p1 = -1;
@@ -699,7 +703,7 @@ export function App({
             }
             if (tiles.length === 0) continue;
             for (const k of tiles) inflightTilesRef.current.add(k);
-            viewportGenerationRef.current += 1;
+            viewportGeneration ??= ++viewportGenerationRef.current;
             const requestId = nextRequestId();
             const transformGeneration = shownTransformGenRef.current;
             inflightRef.current.set(requestId, { tiles, transformGeneration });
@@ -707,7 +711,7 @@ export function App({
                 type: 'getRows',
                 panelGeneration: panelGenerationRef.current,
                 requestId,
-                viewportGeneration: viewportGenerationRef.current,
+                viewportGeneration,
                 start: r0 * R,
                 end: Math.min((r1 + 1) * R, total),
                 columns: [...cols],
@@ -881,7 +885,16 @@ export function App({
         if (!req) return;
         inflightRef.current.delete(m.requestId);
         for (const k of req.tiles) inflightTilesRef.current.delete(k);
-        if (m.stale) return;
+        if (m.stale) {
+            // A newer viewport superseded this read. Re-request whatever the
+            // current viewport still lacks (cached and in-flight tiles are
+            // skipped), so no visible cell is left loading.
+            const range = visibleRangeRef.current;
+            if (range.end > range.start) {
+                requestRows(paddedRange(range.start, range.end - range.start, live.current.effectiveNrow, OVERSCAN_ROWS));
+            }
+            return;
+        }
         // Rows of an older transform generation (the tiles were dropped).
         if (req.transformGeneration !== shownTransformGenRef.current) return;
         const cache = tileCacheRef.current;
@@ -909,7 +922,7 @@ export function App({
         if (damageList.length > 0) gridRef.current?.updateCells(damageList);
         onRowsArrivedRef.current();
         postLifecycle('rows');
-    }, [postLifecycle]);
+    }, [postLifecycle, requestRows]);
 
     const applyLabels = useCallback((m: Extract<ExtensionToWebview, { type: 'labels' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;

@@ -142,6 +142,22 @@ describe('data viewer App: adoption and generation tagging', () => {
         expect(get.start % 64).toBe(0);
     });
 
+    test('a stale reply re-requests the tiles the viewport still needs', async () => {
+        const { posted } = await renderApp();
+        await send(init());
+        await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+        const first = posted.find(m => m.type === 'getRows');
+        posted.length = 0;
+        await send({
+            type: 'rows', panelGeneration: 1, requestId: first.requestId, viewportGeneration: first.viewportGeneration,
+            start: first.start, end: first.start, rows: [], stale: true, columnRange: first.columnRange,
+        });
+        const retry = posted.find(m => m.type === 'getRows');
+        expect(retry).toBeDefined();
+        expect(retry.requestId).not.toBe(first.requestId);
+        expect([retry.start, retry.end, retry.columnRange]).toEqual([first.start, first.end, first.columnRange]);
+    });
+
     test('rows from an older generation are dropped', async () => {
         const { posted } = await renderApp();
         await send(init());

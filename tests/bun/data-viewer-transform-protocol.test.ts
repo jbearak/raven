@@ -412,6 +412,23 @@ describe('WorkerEngine: thread lifecycles', () => {
         expect(after.rows.map(r => r[0])).toEqual([4, 5]);
     }, 30_000);
 
+    test('reader restart while commit is in flight: the re-issued commit finds its candidate', async () => {
+        engine = await start(TINY, 5);
+        const c = engine.coordinator;
+        const t = await engine.compute({ sort: SORT_X_DESC });
+        // Crash the reader right after `commit` is posted, before its ack.
+        const port = (c as any).reader;
+        const commit = port.commit;
+        port.commit = async (gen: number) => {
+            const sent = commit(gen);
+            await engine.reader.crashForTest();
+            await sent;
+        };
+        expect(await c.install(t)).toBe(true);
+        const rows = await engine.getRows({ start: 0, end: 5, columns: [0], viewportGeneration: 1 }, t.gen);
+        expect(rows.rows.map(r => r[0])).toEqual([5, 4, 3, 2, 1]);
+    }, 30_000);
+
     test('a request naming a generation the reader does not hold is a protocol error', async () => {
         engine = await start(TINY, 5);
         const err = await engine.getRows({ start: 0, end: 1, columns: [0], viewportGeneration: 1 }, 123456)
