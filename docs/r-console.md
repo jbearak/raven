@@ -19,7 +19,7 @@ Run R inside VS Code and send code to it from the editor.
 The R console opens in VS Code's terminal panel whenever you send code and none is running. To open one yourself, choose **R** from the terminal panel's profile dropdown. It runs [Raven's console](#ravens-console), which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have.
 
 > [!NOTE]
-> If vscode-R (REditorSupport) is enabled, or you're in Positron, Raven leaves R sessions to that tool and turns off its R console, its send-code commands, and its plot and data viewers. To use them anyway, set `raven.rConsole.activation` to `"enabled"`. See [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). The [help viewer](help-viewer.md) works either way.
+> If vscode-R (REditorSupport) is enabled, or you're in Positron, Raven leaves R sessions to that tool and turns off its R console, its send-code commands, and its plot and data viewers. To use them anyway, set `raven.rConsole.activation` to `"enabled"`. See [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
 <a id="choosing-the-r-program"></a>
 
