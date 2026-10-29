@@ -73,7 +73,7 @@ Raven's [style lints](https://github.com/jbearak/raven/blob/main/docs/linting.md
 <a id="settings"></a><a id="more-information"></a>
 ## Settings and documentation
 
-Every setting is under `raven.*`. See the [settings reference](https://github.com/jbearak/raven/blob/main/docs/settings-reference.md), and the [documentation hub](https://github.com/jbearak/raven/blob/main/docs/README.md) for everything else, including [Troubleshooting](https://github.com/jbearak/raven/blob/main/docs/troubleshooting.md) and running the same checks in [CI](https://github.com/jbearak/raven/blob/main/docs/ci.md).
+Every setting is under `raven.*`. See the [settings reference](https://github.com/jbearak/raven/blob/main/docs/settings-reference.md), and the [documentation hub](https://github.com/jbearak/raven/blob/main/docs/README.md) for everything else, including [Troubleshooting](https://github.com/jbearak/raven/blob/main/docs/troubleshooting.md) and running the same checks in [CI](https://github.com/jbearak/raven/blob/main/docs/ci.md). To search all pages, use the [documentation site](https://jbearak.github.io/raven/).
 
 If you work with Stata, Raven's sibling project [Sight](https://github.com/jbearak/sight) brings the same cross-file model to Stata.
 

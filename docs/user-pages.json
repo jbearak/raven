@@ -1,6 +1,6 @@
 {
   "$comment": "Single source for the docs hub (docs/README.md), llms.txt, the site navigation, and the docs lints. Regenerate derived files with `bun scripts/generate-docs-hub.ts`.",
-  "site_url": "",
+  "site_url": "https://jbearak.github.io/raven/",
   "readmes": ["README.md", "editors/vscode/README.md"],
   "internal": [
     "docs/development.md",
