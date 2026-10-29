@@ -26,6 +26,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         materialized = sym("raven_dbg_materialized"),
         rdebug = sym("raven_dbg_rdebug"),
         altrep_class = sym("raven_dbg_altrep_class"),
+        nrow = sym("raven_dbg_nrow"),
         set_rdebug = sym("raven_dbg_set_rdebug"),
         base_bind = sym("raven_dbg_base_bind")
     )
@@ -121,6 +122,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
 
     # ---- previews (no dispatch) ----------------------------------------------
     xlen <- function(x) .Call(N$xlength, x)
+    # An attribute, or NULL when it is a vector some package implements
+    # (ALTREP): attributes are read like values, so the same rule applies.
+    sattr <- function(x, which) {
+        a <- attr(x, which, exact = TRUE)
+        if (!is.null(a) && !isTRUE(.Call(N$materialized, a))) NULL else a
+    }
     trunc_str <- function(s, n = 200L) {
         s <- s[1L]
         if (is.na(s)) return("NA")
@@ -179,14 +186,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         v <- .subset(x, i)
         if (!is.null(cls)) {
             if ("factor" %in% cls && typeof(v) == "integer") {
-                lev <- attr(x, "levels", exact = TRUE)
+                lev <- sattr(x, "levels")
                 out <- as.character(lev[v])
                 out[is.na(out)] <- "NA"
                 return(out)
             }
             if ("Date" %in% cls && is.numeric(v)) return(civil(v))
-            if ("POSIXct" %in% cls && is.numeric(v)) return(fmt_posixct(v, attr(x, "tzone", exact = TRUE)))
-            if ("difftime" %in% cls && is.numeric(v)) return(paste(fmt_num(v), attr(x, "units", exact = TRUE)))
+            if ("POSIXct" %in% cls && is.numeric(v)) return(fmt_posixct(v, sattr(x, "tzone")))
+            if ("difftime" %in% cls && is.numeric(v)) return(paste(fmt_num(v), sattr(x, "units")))
         }
         switch(typeof(v),
             logical = ifelse(is.na(v), "NA", ifelse(v, "TRUE", "FALSE")),
@@ -209,7 +216,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     fmt_len <- function(n) format(n, scientific = FALSE, trim = TRUE)
     # "[3 x 4]" for a matrix or array, "[12]" otherwise.
     dims_label <- function(x, n) {
-        d <- attr(x, "dim", exact = TRUE)
+        d <- sattr(x, "dim")
         if (is.null(d)) fmt_len(n) else paste(fmt_len(d), collapse = " x ")
     }
     fn_label <- function(x) {
@@ -233,7 +240,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         n <- xlen(x)
         if (is_df(cls)) {
-            nr <- .row_names_info(x, 2L)
+            nr <- .Call(N$nrow, x)
+            if (is.na(nr)) nr <- "?"
             label <- if ("tbl_df" %in% cls) "tibble" else if ("data.table" %in% cls) "data.table" else "data.frame"
             return(sprintf("%s [%s x %s]", label, fmt_len(nr), fmt_len(n)))
         }
@@ -248,7 +256,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         shown <- elems(x, seq_len(k))
         s <- paste(shown, collapse = " ")
         if (n > k) s <- paste(s, "...")
-        if (n != 1 || !is.null(attr(x, "dim", exact = TRUE))) {
+        if (n != 1 || !is.null(sattr(x, "dim"))) {
             s <- sprintf("%s [%s] %s", type_label(x), dims_label(x, n), s)
         }
         trunc_str(s)
@@ -269,7 +277,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (t == "S4") return(c(0, length(attributes(x))))
         if (t %in% c("list", "pairlist")) {
             n <- xlen(x)
-            if (!is.null(attr(x, "names", exact = TRUE)) || is_df(oldClass(x))) return(c(0, n))
+            if (!is.null(sattr(x, "names")) || is_df(oldClass(x))) return(c(0, n))
             return(c(n, 0))
         }
         if (t %in% c("logical", "integer", "double", "complex", "character", "raw")) {
@@ -323,12 +331,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         if (t %in% c("list", "pairlist")) {
             n <- xlen(x)
-            nms <- attr(x, "names", exact = TRUE)
+            nms <- sattr(x, "names")
             for (i in page(n, start, count)) {
                 named <- !is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])
-                nm <- if (named) nms[[i]] else sprintf("[[%d]]", i)
-                # `x$a` finds the first `a`: a repeated name needs its index.
+                # `x$a` finds the first `a`: a repeated name needs its index,
+                # in the expression and in the row's name (which Set Value
+                # uses to find the element).
                 unique_name <- named && sum(nms == nms[[i]], na.rm = TRUE) == 1L
+                nm <- if (unique_name) nms[[i]] else if (named) sprintf("%s [[%d]]", nms[[i]], i) else sprintf("[[%d]]", i)
                 ex <- if (unique_name) child_expr(pexpr, name = nms[[i]]) else child_expr(pexpr, index = i)
                 note_child(pid, nm, i)
                 cpath <- if (!is.null(ppath)) list(env = ppath$env, steps = c(ppath$steps, list(as.integer(i))))
@@ -341,13 +351,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             idx <- page(n, start, count)
             if (length(idx)) {
                 vals <- elems(x, idx)
-                nms <- attr(x, "names", exact = TRUE)
-                d <- attr(x, "dim", exact = TRUE)
+                nms <- sattr(x, "names")
+                d <- sattr(x, "dim")
                 for (j in seq_along(idx)) {
                     i <- idx[[j]]
                     ex <- child_expr(pexpr, index = i, atomic = TRUE)
                     label <- if (!is.null(nms) && !is.na(nms[[i]]) && nzchar(nms[[i]])) {
-                        nms[[i]]
+                        if (sum(nms == nms[[i]], na.rm = TRUE) == 1L) nms[[i]] else sprintf("%s [%d]", nms[[i]], i)
                     } else if (length(d) == 2L) {
                         # Column-major position as [row,col].
                         sprintf("[%d,%d]", (i - 1L) %% d[[1L]] + 1L, (i - 1L) %/% d[[1L]] + 1L)
@@ -610,7 +620,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             v <- eval(parse(text = value, keep.source = FALSE), p$env)
             target <- as.name(p$steps[[1L]])
             for (st in p$steps[-1L]) target <- call("[[", target, st)
-            eval(call("<-", call("[[", target, as.integer(i)), v), p$env)
+            # Quoted: `v` is the value itself, not code to run again (a
+            # language object would otherwise be evaluated).
+            eval(call("<-", call("[[", target, as.integer(i)), call("quote", v)), p$env)
         }
         counts <- tryCatch(child_counts(v), error = function(e) c(0, 0))
         jobj(value = jstr(preview(v)), type = jstr(type_label(v)),
@@ -670,7 +682,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     state$hook <- hook
 
     # Function breakpoints (DAP setFunctionBreakpoints): `debug()` on each.
-    find_fun <- function(name) {
+    find_fun <- function(name, where = globalenv()) {
         if (grepl("::", name, fixed = TRUE)) {
             p <- strsplit(name, ":::?")[[1L]]
             if (length(p) != 2L) return(NULL)
@@ -678,13 +690,14 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             if (!isNamespaceLoaded(p[[1L]])) return(NULL)
             return(tryCatch(get(p[[2L]], envir = asNamespace(p[[1L]]), mode = "function"), error = function(e) NULL))
         }
-        get0(name, envir = globalenv(), mode = "function")
+        get0(name, envir = where, mode = "function")
     }
     # `state$fbp_names` are the requested names; `state$fbp` the closures
     # currently debug()ged for them. Names are re-resolved at every top-level
     # prompt, so a function defined (or redefined) later binds then.
     state$fbp_names <- character()
     state$fbp_owned <- list()
+    state$fbp_local <- list()
     # `state$fbp_owned[[nm]]`: Raven turned debugging on for that closure
     # (it wasn't already debug()ged by the user), so Raven may turn it off.
     release_fbp <- function(nm) {
@@ -692,15 +705,23 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (!is.null(old) && isTRUE(state$fbp_owned[[nm]])) try(undebug(old), silent = TRUE)
         state$fbp[[nm]] <- NULL
         state$fbp_owned[[nm]] <- NULL
+        state$fbp_local[[nm]] <- NULL
     }
-    bind_fbp <- function(nm) {
-        f <- find_fun(nm)
+    # `where`: the environment names resolve from, global at prompts, or
+    # the environment a file is being sourced into (`source(local = TRUE)`).
+    # A function bound from such a local environment stays bound at later
+    # prompts while no global function of that name exists.
+    bind_fbp <- function(nm, where = globalenv()) {
+        f <- find_fun(nm, where)
+        old <- state$fbp[[nm]]
+        if (is.null(f) && identical(where, globalenv()) && !is.null(old) && isTRUE(state$fbp_local[[nm]])) {
+            return("")
+        }
         # The old closure may live on elsewhere (`old <- f`): whenever the
         # name no longer resolves to it, it must stop stopping.
         why <- if (is.null(f) || !is.function(f)) "function not found"
                else if (is.primitive(f)) "can't debug a primitive"
                else ""
-        old <- state$fbp[[nm]]
         if (!is.null(old) && (nzchar(why) || !identical(old, f))) release_fbp(nm)
         if (nzchar(why)) return(why)
         if (!is.null(state$fbp[[nm]]) && isdebugged(f)) return("")
@@ -709,10 +730,11 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (!ok) return("debug() failed")
         state$fbp[[nm]] <- f
         state$fbp_owned[[nm]] <- owned
+        state$fbp_local[[nm]] <- !identical(where, globalenv())
         ""
     }
-    fbp_status <- function() {
-        vapply(state$fbp_names, bind_fbp, "")
+    fbp_status <- function(where = globalenv()) {
+        vapply(state$fbp_names, bind_fbp, "", where = where)
     }
     env$function_breakpoints <- function(spec) internal(tryCatch({
         names <- if (nzchar(spec)) strsplit(spec, US, fixed = TRUE)[[1L]] else character()
@@ -931,11 +953,16 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     }
     # A function breakpoint whose function a sourced file defines must bind
     # before the file goes on to call it, not at the next prompt: after each
-    # top-level assignment to a watched name, run a binding pass. The added
-    # call carries its statement's srcref, so echo shows nothing for it.
-    rebind_fbps <- function() {
-        internal(tryCatch(fbp_status(), error = function(e) NULL))
-        invisible(NULL)
+    # top-level assignment to a watched name, run a binding pass. The
+    # statement keeps its srcref, so echo is unchanged.
+    # Wraps the assignment, so the file's last value (`source()$value`)
+    # and its invisibility are unchanged; binds from the environment the
+    # assignment ran in.
+    rebind_after <- function(value) {
+        force(value)
+        where <- parent.frame()
+        internal(tryCatch(fbp_status(where), error = function(e) NULL))
+        invisible(value)
     }
     assigned_name <- function(e) {
         if (is.call(e) && identical(e[[1L]], quote(`{`)) && length(e) == 3L) e <- e[[3L]]
@@ -947,22 +974,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (!length(names)) return(NULL)
         hits <- vapply(as.list(exprs), function(e) assigned_name(e) %in% names, TRUE)
         if (!any(hits)) return(NULL)
-        sr <- attr(exprs, "srcref")
-        out <- list()
-        osr <- list()
-        for (i in seq_along(exprs)) {
-            out[length(out) + 1L] <- list(exprs[[i]])
-            osr[length(osr) + 1L] <- list(sr[[i]])
-            if (hits[[i]]) {
-                out[[length(out) + 1L]] <- as.call(list(rebind_fbps))
-                osr[length(osr) + 1L] <- list(sr[[i]])
-            }
-        }
-        res <- as.expression(out)
-        if (!is.null(sr)) attr(res, "srcref") <- osr
-        attr(res, "srcfile") <- attr(exprs, "srcfile")
-        attr(res, "wholeSrcref") <- attr(exprs, "wholeSrcref")
-        res
+        for (i in which(hits)) exprs[[i]] <- as.call(list(rebind_after, exprs[[i]]))
+        exprs
     }
     # `source(echo = TRUE)` echoes the lines each top-level srcref spans in its
     # srcfile, which for annotated text would show `#line` directives and

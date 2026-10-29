@@ -19,6 +19,7 @@
 
 #include <dlfcn.h>
 #include <math.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
@@ -216,6 +217,27 @@ static SEXP dbg_materialized(SEXP x) {
     return r.Rf_ScalarLogical(foreign_altrep(x) ? 0 : 1);
 }
 
+/*
+ * .Call(nrow, df): a data frame's row count from its row.names attribute,
+ * read from the attribute list directly (getAttrib would ask a foreign
+ * ALTREP row.names for its length). NA when that can't be done safely.
+ */
+static SEXP dbg_nrow(SEXP x) {
+    SEXP sym = r.Rf_install("row.names");
+    for (SEXP a = r.ATTRIB(x); r.TYPEOF(a) == LISTSXP; a = r.CDR(a)) {
+        if (r.TAG(a) != sym) continue;
+        SEXP v = r.CAR(a);
+        if (foreign_altrep(v)) break;
+        /* Compact form: c(NA_integer_, -n) or c(NA_integer_, n). */
+        if (r.TYPEOF(v) == 13 && r.Rf_xlength(v) == 2 && r.INTEGER(v)[0] == INT_MIN) {
+            int n = r.INTEGER(v)[1];
+            return r.Rf_ScalarReal((double)(n < 0 ? -n : n));
+        }
+        return r.Rf_ScalarReal((double)r.Rf_xlength(v));
+    }
+    return r.Rf_ScalarReal(NAN);
+}
+
 /* .Call(altrep_class, x): "pkg::class" of a foreign ALTREP vector, else "". */
 static SEXP dbg_altrep_class(SEXP x) {
     if (!foreign_altrep(x)) return r.Rf_mkString("");
@@ -264,6 +286,7 @@ static const R_CallMethodDef call_methods[] = {
     {"raven_dbg_materialized", (void *)dbg_materialized, 1},
     {"raven_dbg_rdebug", (void *)dbg_rdebug, 1},
     {"raven_dbg_altrep_class", (void *)dbg_altrep_class, 1},
+    {"raven_dbg_nrow", (void *)dbg_nrow, 1},
     {"raven_dbg_set_rdebug", (void *)dbg_set_rdebug, 2},
     {"raven_dbg_base_bind", (void *)dbg_base_bind, 2},
     {NULL, NULL, 0},

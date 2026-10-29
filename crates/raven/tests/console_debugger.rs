@@ -1335,7 +1335,7 @@ const SPY_ALTREP_C: &str = r#"#include <R.h>
 static R_altrep_class_t cls;
 static int calls = 0;
 static R_xlen_t len(SEXP x) { calls++; return 3; }
-static int spy_elt(SEXP x, R_xlen_t i) { calls++; return (int)i; }
+static int spy_elt(SEXP x, R_xlen_t i) { calls++; return (int)i + 1; }
 static void *dataptr(SEXP x, Rboolean w) { calls++; error("no data"); return NULL; }
 static const void *dataptr_or_null(SEXP x) { calls++; return NULL; }
 SEXP spy_make(void) { return R_new_altrep(cls, R_NilValue, R_NilValue); }
@@ -1370,7 +1370,7 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
     d.req("configurationDone", json!({}));
     c.send(
         &format!(
-            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  browser()\n  x\n}}",
+            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  fy <- structure(1:2, levels = .Call('spy_make'), class = 'factor')\n  dd <- data.frame(a = 1:3); attr(dd, 'row.names') <- .Call('spy_make')\n  n0 <- .Call('spy_calls')\n  browser()\n  x\n}}",
             so.display()
         ),
         None,
@@ -1393,9 +1393,18 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
             .contains("not read"),
         "{hv}"
     );
+    // The factor (levels) and data frame (row names) whose attributes are
+    // such vectors: shown without reading them either.
+    let _ = d.locals();
+    for e in ["fy", "dd"] {
+        d.req(
+            "evaluate",
+            json!({"expression": e, "frameId": frame, "context": "hover"}),
+        );
+    }
     let calls = d.req(
         "evaluate",
-        json!({"expression": ".Call('spy_calls')", "frameId": frame, "context": "repl"}),
+        json!({"expression": ".Call('spy_calls') - n0", "frameId": frame, "context": "repl"}),
     );
     assert_eq!(calls["body"]["result"], "[1] 0", "{calls}");
     let m = d.mark();
@@ -1412,7 +1421,7 @@ fn set_value_edits_list_elements_and_vector_entries() {
     let mut d = Dap::connect(&c);
     d.req("configurationDone", json!({}));
     c.send(
-        "ed <- function() {\n  k <- 10; l <- list(a = 1, b = list(c = 2)); v <- c(5, 6, 7)\n  browser()\n  cat('now', l$a, l$b$c, v[2], '\\n')\n}",
+        "ed <- function() {\n  k <- 10; l <- list(a = 1, b = list(c = 2)); v <- c(5, 6, 7); dup <- list(a = 1, a = 2)\n  browser()\n  cat('now', l$a, l$b$c, v[2], dup[[1]], deparse(dup[[2]]), '\\n')\n}",
         None,
     );
     let m = d.mark();
@@ -1438,10 +1447,19 @@ fn set_value_edits_list_elements_and_vector_entries() {
     let v_kids = kids(&mut d, &v["variablesReference"]);
     assert_eq!(v_kids[1]["name"], "[2]");
     // The value is an expression in the frame (`k` is a local).
+    // Repeated names get distinct rows; a language value is stored, not run.
+    let dup = find(&locals, "dup");
+    let dup_kids = kids(&mut d, &dup["variablesReference"]);
+    let dup_names: Vec<&str> = dup_kids
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(dup_names, vec!["a [[1]]", "a [[2]]"]);
     for (r, name, value) in [
         (&l["variablesReference"], "a", "k + 1"),
         (&b["variablesReference"], "c", "99"),
         (&v["variablesReference"], "[2]", "-1"),
+        (&dup["variablesReference"], "a [[2]]", "quote(stop('ran'))"),
     ] {
         let set = d.req(
             "setVariable",
@@ -1452,7 +1470,7 @@ fn set_value_edits_list_elements_and_vector_entries() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
-    c.expect("now 11 99 -1");
+    c.expect("now 11 99 -1 1 stop(\"ran\")");
 }
 
 #[test]
@@ -1483,7 +1501,24 @@ fn a_function_breakpoint_binds_inside_the_sourced_file_that_defines_it() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+    d.session_ended();
     c.expect("res 42");
+    // source()'s value is the file's last value, breakpoint or not; and a
+    // function the file defines locally binds too.
+    let local = c.write_file(
+        "loc.R",
+        "fresh <- function() {\n  'local'\n}\ncat('got', fresh(), '\\n')\nfresh\n",
+    );
+    let m = d.mark();
+    c.send(
+        &format!("(function() {{ v <- source('{local}', local = TRUE)$value; cat('fn', is.function(v), '\\n') }})()"),
+        None,
+    );
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    c.expect("fn TRUE");
     let text = c.text();
     assert!(!text.contains("rebind"), "{text}");
     assert_eq!(text.matches("> fresh <- function() {").count(), 1, "{text}");
