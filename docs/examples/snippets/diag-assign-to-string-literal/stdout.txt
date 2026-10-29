@@ -1,0 +1,3 @@
+setup.R:1:1 warning: The assignment target "total" is a string literal; R will bind the value to the variable named by that string. Was this intentional? [assign-to-string-literal]
+setup.R:2:1 error: Cannot assign to logical literal `TRUE`. [assign-to-string-literal]
+2 issues (1 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

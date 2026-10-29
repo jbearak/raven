@@ -1,0 +1,2 @@
+report.R:2:1 hint: This `expect` directive matched no diagnostic. [unused-suppression]
+1 issues (0 errors, 0 warnings, 0 infos, 1 hints, 0 notes)

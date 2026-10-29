@@ -1,0 +1,2 @@
+range.R:2:19 error: R does not support chained comparisons: `a < b < c` is a parse error. Combine separate comparisons with `&&` for scalar conditions (`x > 0 && x < 1`) or `&` for vectorized expressions (`x > 0 & x < 1`). [chained-comparison]
+1 issues (1 errors, 0 warnings, 0 infos, 0 hints, 0 notes)

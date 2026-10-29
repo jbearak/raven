@@ -13,39 +13,9 @@ All three block merge. Fix the underlying issue rather than suppressing it; when
 ## What to read
 
 User-facing:
-- `README.md`
-- `docs/cross-file.md`
-- `docs/modules.md`
-- `docs/r-package-dev.md`
-- `docs/rprofile.md`
-- `docs/package-database.md`
-- `docs/directives.md`
-- `docs/diagnostics.md`
-- `docs/linting.md`
-- `docs/completion.md`
-- `docs/hover.md`
-- `docs/go-to-definition.md`
-- `docs/find-references.md`
-- `docs/indentation.md`
-- `docs/syntax-highlighting.md`
-- `docs/snippets.md`
-- `docs/r-console.md`
-- `docs/debugger.md`
-- `docs/chunks.md`
-- `docs/knit.md`
-- `docs/quarto.md`
-- `docs/plot-viewer.md`
-- `docs/data-viewer.md`
-- `docs/help-viewer.md`
-- `docs/document-outline.md`
-- `docs/ci.md`
-- `docs/cli.md`
-- `docs/editor-integrations.md`
-- `docs/coexistence.md`
-- `docs/configuration.md`
-- `docs/settings-reference.md`
-- `docs/comparison.md`
-- `docs/limitations.md`
+- `README.md` (also the GitHub landing page) and `editors/vscode/README.md` (the Marketplace page)
+- `docs/README.md`: the docs hub, generated from `docs/user-pages.json`, which lists every user page (getting started, coming-from, editor setup, CI, each feature, the references, troubleshooting, and the FAQ). Add new pages there, then run `bun scripts/generate-docs-hub.ts`.
+- User pages follow a fixed template and style that `bun test tests/bun/docs` enforces. Any `raven check` output they show is asserted against the real binary (`docs/examples/snippets/`). See "Docs tooling" in `docs/development.md` before editing docs.
 
 Maintainer/internal:
 - `docs/development.md`

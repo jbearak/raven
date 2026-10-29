@@ -1,0 +1,2 @@
+totals.R:1:23 error: Mismatched brackets: `(` opened here; close with `)` not `]`. [syntax-error]
+1 issues (1 errors, 0 warnings, 0 infos, 0 hints, 0 notes)

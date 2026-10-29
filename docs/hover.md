@@ -1,136 +1,135 @@
 # Hover
 
-Hovering over an identifier shows what the symbol is and, when available, its signature or documentation. R hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols. JAGS and Stan use separate static catalog paths described below.
+[Docs](README.md) › Navigation and editing
 
-## What You See
+Hover over a name to see what it refers to at that point in your code: its definition, its package and help text, or its documentation.
+
+```r
+library(stats)
+filter(x, filt, method = "convolution")  # hover: stats::filter
+
+library(dplyr)
+filter(df, x > 0)                        # hover: dplyr::filter (dplyr loaded after stats)
+```
+
+The same name can hover differently on different lines, because Raven reports the definition or package that is in scope at the cursor. This is the same scope that [completion](completion.md), [diagnostics](diagnostics.md), and [go to definition](go-to-definition.md) use.
+
+## What you see
 
 | At the cursor | Hover shows |
 |---|---|
-| Member side of `pkg::name` / `pkg:::name` | Bold `pkg::name` help-panel link + R help text for that topic (nothing if `name` is not in the package's *complete* export set — see below) |
-| Package side of `pkg::name` (the `pkg`) | The package's `Title` — `Description` from its installed `DESCRIPTION` (nothing when the package is not installed — the [`package-not-installed`](diagnostics.md#package-diagnostics) diagnostic already reports that on the same token) |
-| Local or cross-file definition | A code block with the definition statement and a file-location line |
-| Named-argument label resolving to a user-defined function's formal (`param` in `f(param = …)`) | A code block with the formal (and its default), *parameter of* `f`, and the formal's `@param` doc when documented |
-| Function-parameter name at a definition site (`x` in `f <- function(x)`) | The parameter's `@param` roxygen — when the enclosing *named* function is documented |
-| `obj$name` / `obj@slot` member with a *local* member definition | A code block with that member's definition statement and a file-location line (parity with go-to-definition) |
-| Exported member of a static `box::use()` namespace alias (`mod$name`, `mod@name`, `mod[["name"]]`) | The original local-module definition statement and location, including through renamed/wildcard re-exports; package-backed members retain package attribution without fabricated source navigation |
-| Symbol declared via `# raven: var` / `# raven: func` | `name (declared function\|variable)` + the directive and line where it's declared |
-| Package export in scope (via `library()` / `require()` / `loadNamespace()` / directives) | Bold `pkg::name` help-panel link + R help text |
-| Built-in or otherwise unresolved symbol | R help text, if R has a topic for it |
+| The member in `pkg::name` or `pkg:::name` | A bold `pkg::name` help link and R's help text for that topic. Nothing if `name` is missing from the package's complete export set. |
+| The package in `pkg::name` | The package's `Title` and `Description` from its installed `DESCRIPTION`. Nothing if the package isn't installed, since [`package-not-installed`](diagnostics.md#package-diagnostics) already flags that token. |
+| A local or cross-file definition | The definition statement in a code block, then a [file location line](#file-location-lines) |
+| An argument name that matches a formal of your own function (`param` in `f(param = …)`) | The formal and its default, "parameter of `f`", and the formal's `@param` doc if it has one |
+| A parameter name where a function is defined (`x` in `f <- function(x)`) | The parameter's `@param` roxygen doc, if the named function is documented |
+| An `obj$name` or `obj@slot` member defined in your code | The member's definition statement and a file location line, matching go to definition |
+| An exported member of a static `box::use()` alias (`mod$name`, `mod@name`, `mod[["name"]]`) | The original module definition and its location, including through renamed or wildcard re-exports. Package-backed members show the package without a source location. |
+| A symbol declared with `# raven: var` or `# raven: func` | `name (declared function)` or `name (declared variable)`, and the directive line that declares it |
+| A package export in scope (from `library()`, `require()`, `loadNamespace()`, or directives) | A bold `pkg::name` help link and R's help text |
+| A built-in or other unresolved symbol | R's help text, if R has a topic for it |
 
-Hover returns nothing for symbols R doesn't recognize and that aren't in scope, and for structural labels it cannot resolve (see step 2 below).
+Hover shows nothing for names R doesn't know that aren't in scope. It also shows nothing for an argument name or `$` member it can't resolve, rather than guessing a package.
 
-## JAGS Hover
+## Scope-aware package attribution
 
-In `.jags`, `.bugs`, and `.bug` files, hovering a known JAGS 4.3.2 call shows its signature, providing component, alias relationship when applicable, and the pinned catalog provenance. All three extensions are matched case-insensitively as strict JAGS, not as general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE input. Raven recognizes only call sites; plain identifiers, comments, quoted noise in incomplete buffers, unknown names, and optional-module names remain silent.
+Hover finds a symbol's package the same way Raven checks scope everywhere else. A package counts as loaded after `library()` or `require()`, and also after `loadNamespace()` (which R itself treats as load-only), plus namespace qualifiers and declared symbols. The package shown therefore depends on what is loaded at the cursor, as in the example at the top of this page.
 
-Role selection follows JAGS syntax. Immediately after `~`, the distribution entry wins and its signature lists only distribution parameters; the stochastic node is on the left side of the relation. Elsewhere, the ordinary callable entry wins. This matters for names such as `dnorm`, which JAGS exposes in both roles with different arities. A distribution-only name such as `dbern` does not receive ordinary-call hover.
+`dplyr::filter` and `stats::filter` always hover as their own packages, whatever else is loaded. For how this differs from other R hover implementations, see [Comparison: hover help](comparison.md#hover-help).
 
-JAGS signature help uses the same catalog and lexical call context. It tracks nested calls, indexing, multiline arguments, trailing arguments, comments, and UTF-16 cursor positions without consulting the temporary R parse tree or starting R/JAGS subprocesses.
+## Package exports and the help-panel link
 
-## Stan Hover
+When a hover resolves to a package export and R has a help topic for it, the first line is a bold link such as `dplyr::filter`. In VS Code, clicking it opens the [help viewer](help-viewer.md) beside the editor: the same topic, rendered from Rd, in a resizable panel with back and forward navigation.
 
-In a `.stan` file, hovering a compiler-known function call shows representative compiler signatures and a link to the versioned [Stan Functions Reference](https://mc-stan.org/docs/2_39/functions-reference/functions_index.html). The link targets the callable's alphabetical-index anchor; compiler aliases that the reference does not document separately land at the index. Raven bundles metadata generated through the `stanc3` npm package 2.39.1, whose bundled compiler identifies itself as 2.39.0, so hover requires neither a local Stan installation nor a runtime subprocess or network request.
+If R hasn't rendered the help yet (a cold cache, a large package, or a name without a topic), the hover is shorter. It omits the bold link and shows the name or Raven's parsed signature with a `from {pkg}` attribution. The next hover on the same topic uses Raven's help cache and shows the full text and link.
 
-Distribution-statement syntax is distribution-aware: hovering `normal` in `y ~ normal(mu, sigma)` explains that the bare name is notation after `~`. The statement contributes the unnormalized log density from `normal_lupdf` to `target`. The hover labels the displayed `normal_lpdf` compiler signatures as the normalized log-density function and links to that reference entry. Discrete distributions are described analogously with `_lupmf` and `_lpmf`; truncation syntax may add normalization adjustments beyond the unnormalized probability-function contribution.
+Qualified calls such as `dplyr::filter` always get the bold link, even when R can't render the topic. The exception: if Raven holds a complete export set for the package and the member isn't in it, hover shows nothing. This is the same condition that raises [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember). It never applies to `pkg:::name`, because internal names are real members, or when the package's metadata is incomplete or still loading.
 
-Outside a distribution statement, an exact callable wins when a name is ambiguous; for example, `beta(1, 2)` describes the beta special function rather than the beta distribution. Bare distribution names with no exact callable still get distribution hover for incomplete code, but the hover clearly says that forms such as `normal(...)` are not standalone Stan functions and are valid only on the right side of `~`.
+## File location lines
 
-Some Stan functions have hundreds of overloads. Hover shows at most 12 representative signatures and reports the full compiler overload count. Compiler-known statement-like callables such as `print()` and `reject()` have a reference link even when stanc does not expose a conventional signature for them.
+When a hover comes from a local or sourced definition, a line under the code block says where the definition is. Package exports show the help link instead.
 
-Stan hover is intentionally limited to call sites. It returns nothing for names in comments or strings, plain non-call identifiers, unknown functions, and ordinary calls resolved to a user-defined function in the current file. Same-named variables do not suppress callable hover, and distribution-statement syntax remains distribution-aware even when an ordinary user function has the distribution's name. Raven does not yet extract documentation for user-defined Stan functions.
+| Where the definition is | The line reads |
+|---|---|
+| The same file | `this file, line N` |
+| Another file | `[rel/path.R](file:///…), line N`. The link opens the file at the top; use go to definition to land on the line. |
+| A file that has moved or changed since Raven read it | *Defined in rel/path.R* |
 
-## Resolution Order
+Paths are relative to the workspace root when there is one, so a symbol defined in `R/utils.R` shows exactly that. The link opens the same file that [go to definition](go-to-definition.md#cross-file-navigation) opens.
 
-For R documents, hover tries sources in this order and stops at the first match. This matches the R path in `crates/raven/src/handlers.rs::hover`:
+Bindings from testthat helper and setup files also show their definition and location. That includes later helpers visible inside function bodies and definitions loaded by static `source()` calls. Hover follows the helper source order and `raven.crossFile.hoistGlobalsInFunctions`. If a contributed name has no recoverable definition, hover shows the name without a location.
 
-1. **Namespace qualifier.** If the cursor is inside a `pkg::name` or `pkg:::name` expression, the qualifier wins — even if the file-local scope would resolve `name` to something else. Without this rule, hovering `filter` inside `dplyr::filter(...)` could show `stats::filter` whenever the workspace happened to surface that one first. The two sides differ: hovering the **member** (`filter`) shows that topic's help, while hovering the **package** (`dplyr`) shows the package's `Title`/`Description` from its installed `DESCRIPTION` (and nothing when it is not installed, since the `package-not-installed` diagnostic already reports that) — not a `dplyr::dplyr` help artifact.
-2. **Structural labels: resolve where possible, otherwise suppress.** An identifier that never refers to a value at runtime — a named-argument label (`title` in `labs(title = ...)`), a function-parameter name, or the member name in `obj$name` — is not a plain value lookup, so hover must never attribute it to a definition or package (the misleading `from {base}` bug). But where Raven has something *correct* to show, it resolves rather than suppressing:
-   - a named-argument label that maps to a **user-defined** function's exact formal → that formal (+ default, + `@param` doc);
-   - a parameter name at a definition site → its `@param` roxygen, when the enclosing *named* function is documented;
-   - an `obj$name` / `obj@slot` member with a **local** member definition → that definition (reusing go-to-definition's resolver).
+## Declared symbols
 
-   This is **resolve-or-suppress, never resolve-or-attribute**: anything that does not resolve to one of the above (an unknown callee, a package/builtin's data-keyword like `list(a = 1)`, a runtime/`$`-member with no local definition) produces *nothing* rather than a guess. Hover and the diagnostics pass still share the underlying structural-label predicate, so they agree on what counts as a label — these are hover-only carve-outs layered on top of it. An **assignment target** (the `add` in `add <- function(...)`) is treated differently again: the diagnostics pass counts it as a non-reference, but hover does *not* suppress it — it is a definition site, so hover continues to the next step and surfaces the definition.
-3. **Cross-file scope.** Raven resolves the identifier through the dependency graph at the cursor's position. If it finds a local definition, a sourced definition, a declared symbol, or a package export that's in scope, it builds the hover from that symbol.
-4. **Package exports from loaded packages.** If the identifier isn't in the cross-file scope but it matches a symbol exported by any package loaded at the cursor (including packages inherited from parent files), hover shows that package's help topic.
-5. **R help fallback.** For anything left over — base/recommended built-ins, or symbols whose origin Raven can't infer — hover asks R for a help topic and returns it verbatim in a code block.
-
-Each step takes the first hit and stops; steps 3–5 never run once a match is found.
-
-### box module members
-
-Static [`box::use()` imports](modules.md#box-modules-boxuse) are resolved before ordinary structural-member scanning. Hover on an exported local-module member follows exact definition provenance through named, renamed, and wildcard re-exports, including when the defining module is closed but workspace-indexed. Private members and members proven absent from a complete export set produce no hover. Partial/unknown export metadata remains conservative. Installed-package imports use Raven's package metadata and help attribution, but Raven does not invent a source-file location for installed code.
-
-## File Location Lines
-
-When the hover is built from a local or sourced definition, Raven adds one line underneath the code block so you can jump to the definition (package exports use the help-panel link instead — see below):
-
-- Defined in the same file: `this file, line N`.
-- Defined in another file: `[rel/path.R](file:///…), line N` — click the link to open that file. The link carries no line fragment, so the file opens at the top; the `line N` text is informational. To land on the definition, use go-to-definition instead.
-- Definition statement couldn't be extracted (e.g. the defining file has since moved or changed): Raven falls back to a `*Defined in rel/path.R*` italic attribution.
-
-The relative path is computed against the workspace root when one is available, so hovering a symbol defined in `R/utils.R` shows exactly that — not an absolute URI. The link points at the same file go-to-definition navigates to (go-to-definition additionally positions the cursor on the definition); see [Go-to-Definition](go-to-definition.md#cross-file-navigation).
-
-Testthat helper/setup bindings also show their definition and file location,
-including later helpers visible inside function bodies and definitions loaded by
-static `source()` calls. Hover respects helper source order and
-`hoistGlobalsInFunctions`. If a contributed name has no recoverable definition,
-hover shows the name without a fabricated file location.
-
-## Declared Symbols
-
-Symbols declared via [`# raven: var` or `# raven: func`](directives.md#declaration-directives) hover as an R code block with the declaration, followed by the directive line and (for cross-file declarations) a file attribution. For a function declared in another file, the hover renders the code block:
+A symbol declared with [`# raven: var` or `# raven: func`](directives.md#declaration-directives) hovers as a code block with the declaration, then the directive line and, for declarations in another file, that file. For a function declared in another file, the code block is:
 
 ```r
 name (declared function)
 ```
 
-…then, as markdown beneath it, `Declared via # raven: func directive at line 12` and *Defined in analysis/helpers.R*.
+Below it, as text, are `Declared via # raven: func directive at line 12` and *Defined in analysis/helpers.R*. The "Defined in" line is left out when the declaration is in the current file.
 
-The "Defined in" line is omitted when the declaration lives in the current file. If the same name is declared more than once in the providing file, hover shows the **most recent declaration at or before the cursor** — the same position-aware scope [completions](completion.md) and [diagnostics](diagnostics.md) use. [Go-to-definition](go-to-definition.md#declared-symbols) differs here: it navigates to the *first* declaration by line number.
+If a file declares the same name more than once, hover shows the most recent declaration at or before the cursor, matching [completion](completion.md) and [diagnostics](diagnostics.md). [Go to definition](go-to-definition.md#declared-symbols) differs: it jumps to the first declaration in the file.
 
-## Package Exports and the Help-Panel Link
+## With REditorSupport also installed
 
-When hover resolves to a package export and R has a help topic for it, the first line of the hover is a bold Markdown link of the form `pkg::name`. In VS Code, clicking that link opens the [help viewer](help-viewer.md) beside the editor with the rendered Rd documentation — the same topic the hover is showing, but in a resizable panel with back/forward navigation.
+VS Code asks every enabled extension for a hover and stacks the answers, separated by lines. With both Raven and the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) active, REditorSupport's bold help links appear at the top and Raven's result below.
 
-If R hasn't rendered help text for that topic yet (cold cache, large package, or a symbol R doesn't have a topic for), hover falls back to a shorter form that omits the bold heading and just shows the name or Raven's parsed signature followed by a `from {pkg}` attribution. Subsequent hovers on the same topic hit Raven's help cache and render the full help text with the clickable heading.
+REditorSupport doesn't check scope at the cursor. When it can't narrow a name to one package, it looks the topic up in every installed package. Hovering `filter` after `library(dplyr)` may show both `dplyr::filter` and `stats::filter` at the top, with Raven's single `dplyr::filter` underneath. [Comparison: hover help](comparison.md#hover-help) explains the mechanism.
 
-Namespace-qualified calls (`dplyr::filter`) get the bold heading whether or not help text is available — Raven honors the qualifier even when R can't render a topic for it. The one exception is **resolve-or-suppress**: if Raven holds a *complete* export set for the package and the member is not in it (the same condition that raises the [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember) diagnostic), hover shows **nothing** rather than fabricating a `from {pkg}` attribution for a member that does not exist. This never applies to `pkg:::name` (internal symbols are real members, just unexported) or when the package's metadata is incomplete/not-yet-warmed.
+Both extensions answer independently and VS Code joins the output. To see only Raven's hover, set `"r.lsp.enabled": false`; see [Coexistence](coexistence.md#language-servers-raven-alone-vs-both).
 
-## Scope-Aware Package Attribution
+## JAGS hover
 
-Because hover goes through the cross-file scope engine, the package attributed at each cursor depends on what's in scope at that position:
+In `.jags`, `.bugs`, and `.bug` files, hovering a call to a known JAGS 4.3.2 function shows its signature, the module that provides it, any alias relationship, and the catalog version. The extensions are matched case-insensitively as strict JAGS, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE input. Only call sites get a hover. Plain identifiers, comments, unknown names, names from optional modules, and quoted text in incomplete code stay silent.
 
-```r
-library(stats)
-filter(x, filt, method = "convolution")  # → stats::filter
+Right after `~`, a name hovers as a distribution, and its signature lists only the distribution parameters (the stochastic node is on the left of the `~`). Elsewhere, the ordinary function wins. This matters for names like `dnorm`, which JAGS has in both roles with different numbers of arguments. A distribution-only name such as `dbern` doesn't get a function hover.
 
-library(dplyr)
-filter(df, x > 0)                        # → dplyr::filter (dplyr loaded after stats)
-```
+JAGS signature help uses the same catalog. It handles nested calls, indexing, arguments split across lines, trailing arguments, and comments, and it never starts R or JAGS.
 
-Explicit qualifiers short-circuit this — `dplyr::filter` and `stats::filter` always hover as their qualified packages regardless of what else is loaded. For how this differs from other R hover implementations, see [Comparison: Hover help](comparison.md#hover-help).
+## Stan hover
 
-## With REditorSupport Also Installed
+In a `.stan` file, hovering a call to a compiler-known function shows representative signatures and a link to the [Stan Functions Reference](https://mc-stan.org/docs/2_39/functions-reference/functions_index.html) for that version. The link goes to the function's entry in the alphabetical index; compiler aliases the reference doesn't document separately land on the index itself. Raven bundles this metadata from the `stanc3` npm package 2.39.1 (compiler 2.39.0), so hover needs no Stan installation, subprocess, or network request.
 
-VS Code runs hover providers from every enabled extension and stacks their output, separated by horizontal rules. If you have both Raven and the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) active, you'll see REditorSupport's bold help link at the top of the hover and Raven's result below it — and sometimes REditorSupport contributes several bold links instead of one.
+In a sampling statement, hover knows it is looking at a distribution. Hovering `normal` in `y ~ normal(mu, sigma)` explains that the bare name is notation after `~` and that the statement adds the unnormalized log density from `normal_lupdf` to `target`. The hover labels the `normal_lpdf` signatures it shows as the normalized log-density function and links to that entry. Discrete distributions work the same way with `_lupmf` and `_lpmf`. Truncation can add normalization terms beyond that contribution.
 
-REditorSupport's hover doesn't resolve scope at the cursor. When its `guess_namespace` heuristic can't narrow a name down to a single package, it falls through to an unqualified `utils::help((topic))` lookup, which returns matches across every installed package. Hovering `filter` after `library(dplyr)`, for example, may show **both** `dplyr::filter` and `stats::filter` as bold links at the top — see [Comparison: Hover help](comparison.md#hover-help) for the mechanism. Raven's single scope-aware result (`dplyr::filter`, in this case) appears underneath.
+Outside a sampling statement, an exact function wins when a name is ambiguous: `beta(1, 2)` describes the beta special function, not the beta distribution. A bare distribution name with no matching function still gets a distribution hover in incomplete code, and the hover says that forms like `normal(...)` are valid only on the right of `~`.
 
-This isn't a Raven bug. Both extensions are answering the hover request independently, and VS Code is concatenating their output. If you'd rather see only Raven's hover, disable REditorSupport's language server with `"r.lsp.enabled": false` — see [Coexistence](coexistence.md#language-servers-raven-alone-vs-both).
+Some Stan functions have hundreds of overloads. Hover shows at most 12 signatures and gives the full count. Statement-like functions such as `print()` and `reject()` get a reference link even without a conventional signature.
 
-## Limits
+Stan hover covers call sites only. It shows nothing for names in comments or strings, plain identifiers that aren't calls, unknown functions, and calls to a function defined in the current file. A variable with the same name doesn't block a function's hover, and a sampling statement still hovers as a distribution even if you defined a function with the distribution's name.
 
-- **No navigation to installed package sources.** Hover attributes a symbol to its package and links to the help viewer, but cmd-click on a package export does not jump into the package's source. See [Go-to-Definition: Package Exports](go-to-definition.md#package-exports).
-- **R-help fallback is async.** The first hover for a topic spawns an R subprocess to render help; re-hovering the same topic uses the cached result.
-- **R Markdown / Quarto: chunk bodies only.** Hover (and its help-panel link) works on identifiers inside R code chunks of `.Rmd` and `.qmd` documents. Hovering prose, YAML front matter, or a non-R chunk produces nothing.
-- **Stan user functions.** Raven suppresses built-in attribution when a name is declared locally, but does not yet show the local Stan function's signature or comments.
+<a id="limits"></a>
 
-## Related
+## Limitations
 
-- [Cross-File & Package Awareness](cross-file.md) — the scope and dependency model hover uses
-- [Go-to-Definition](go-to-definition.md) — follows the same file-location link hover displays
-- [Help Viewer](help-viewer.md) — the panel opened by the bold `pkg::name` link at the top of a hover
-- [Directives](directives.md) — `# raven: var` / `# raven: func` declaration format
-- [Completions](completion.md) — shares the position-aware scope model with hover
-- [Diagnostics](diagnostics.md) — if hover resolves a symbol, the diagnostics pass won't flag it as undefined
-- [Comparison: Hover help](comparison.md#hover-help) — how Raven's scope-aware attribution differs from REditorSupport's
+- Hover doesn't open installed package sources. It names the package and links to the help viewer, but go to definition on a package export doesn't jump into the package. See [Go to definition: package exports](go-to-definition.md#package-exports).
+- The first hover on an R help topic starts an R process to render the help, so it can take a moment. Later hovers on the same topic use the cache.
+- In R Markdown and Quarto, hover and its help link work only in R chunks. Prose, YAML front matter, and non-R chunks show nothing.
+- For a Stan function defined in the current file, Raven suppresses the built-in hover but doesn't yet show your function's signature or comments.
+
+## Details
+
+### Resolution order
+
+For R files, hover tries these sources in order and stops at the first match:
+
+1. **Namespace qualifier.** Inside `pkg::name` or `pkg:::name`, the qualifier wins, even if the file's own scope would resolve `name` to something else. Otherwise `filter` in `dplyr::filter(...)` could show `stats::filter`. Hovering the member shows the topic's help; hovering the package shows its `Title` and `Description` (or nothing if it isn't installed), not a `dplyr::dplyr` help page.
+2. **Argument names, parameter names, and `$` members.** These never refer to a value when the code runs, so hover never attributes them to an unrelated definition or package. It shows something only when it can resolve them exactly: an argument name that matches a formal of your own function, a parameter name in a documented named function, or an `obj$name` / `obj@slot` member defined in your code. Anything else shows nothing. Hover and diagnostics agree on which names count. The name being assigned, such as `add` in `add <- function(...)`, is a definition, so hover continues to the next step and shows it.
+3. **Cross-file scope.** Raven looks the name up in the scope at the cursor, across sourced files. A local definition, sourced definition, declared symbol, or in-scope package export produces the hover.
+4. **Loaded packages.** If the name isn't in scope but a package loaded at the cursor exports it (including packages loaded in parent files), hover shows that package's help topic.
+5. **R help.** For anything left, such as base and recommended built-ins, hover asks R for a help topic and shows it as is.
+
+### box module members
+
+Static [`box::use()` imports](modules.md#box-modules-boxuse) are resolved before ordinary `$` member lookup. Hover on an exported member of a local module follows the exact definition through named, renamed, and wildcard re-exports, even when the defining module is closed but indexed in the workspace. Private members, and members a complete export set proves absent, show nothing. Partial or unknown export metadata stays conservative. Installed-package imports use Raven's package metadata and help, without inventing a source location for installed code.
+
+<a id="related"></a>
+
+## See also
+
+- [Go to definition](go-to-definition.md)
+- [Help viewer](help-viewer.md)
+- [Cross-file analysis](cross-file.md)
+- [Directives](directives.md)
+- [Comparison: hover help](comparison.md#hover-help)

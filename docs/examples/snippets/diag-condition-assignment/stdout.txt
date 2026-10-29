@@ -1,0 +1,2 @@
+check.R:2:7 warning: Use `==` to test equality; `=` is not valid in R conditions. For assignment use `<-`. [condition_assignment]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

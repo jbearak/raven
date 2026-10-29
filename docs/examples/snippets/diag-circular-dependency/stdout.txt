@@ -1,0 +1,3 @@
+a.R:1:1 error: Circular dependency: b.R line 1 sources this file []
+b.R:1:1 error: Circular dependency: a.R line 1 sources this file []
+2 issues (2 errors, 0 warnings, 0 infos, 0 hints, 0 notes)

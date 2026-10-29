@@ -2211,6 +2211,243 @@ No fallback to a different source revision is allowed. Run it with:
 RAVEN_CORPUS_GROUPS=modules-r6 cargo test -p raven --test package_corpus -- --ignored --nocapture
 ```
 
+## Docs tooling
+
+User docs live in `docs/` as plain GitHub-flavored Markdown, and GitHub renders them directly. Runtime links point there: the `raven check` footer, a VS Code notification, a setting description, and the Marketplace README. The design and the reasons behind it are in `docs/superpowers/specs/2026-10-29-docs-redesign-design.md`.
+
+- **Manifest.** `docs/user-pages.json` lists every user page, its hub group, and a one-line description. `bun scripts/generate-docs-hub.ts` regenerates `docs/README.md` (the hub), the root `llms.txt`, and the nav block in `zensical.toml` from it. `--check` is the drift test (`tests/bun/docs/generated.test.ts`). To add a page, add it to the manifest, give it the breadcrumb `[Docs](README.md) › <Group>`, and regenerate.
+- **Docs tests** (`bun test tests/bun/docs`, part of the integration `bun test` job):
+  - `links.test.ts`: every relative link and `#anchor` in user pages, both READMEs, the hub, and `llms.txt`, plus `blob/main/docs/…` URLs in `crates/`, `editors/`, and `scripts/`.
+  - `anchor-baseline.test.ts`: every anchor in `tests/bun/fixtures/docs-anchor-baseline.json` still resolves. Old releases link to them, so the fixture is frozen. When you rename a heading, put `<a id="old-slug"></a>` above it.
+  - `lints.test.ts`: the page template, voice, paragraph length (150 words), no em dashes in prose, no issue numbers or source paths, `<details markdown="1">`, and absolute links for files the site doesn't publish.
+  - `examples.test.ts` with `escape-detector.test.ts`: doc blocks bound with `<!-- example: … -->` equal the example corpus, and any unmarked block that looks like CLI output fails.
+  - `snippet-syntax.test.ts`: JSON, TOML, and Lua snippets parse.
+  - `readme-parity.test.ts`: both READMEs link the same feature pages.
+  - `tests/bun/docs/_lib/report.ts` holds a `PENDING` set for checks that report instead of failing. Keep it empty.
+- **Executable examples.** `docs/examples/snippets/<name>/` holds a mini-workspace with `cmd`, `stdout.txt`, `stderr.txt`, and `exit`. `crates/raven/tests/docs_examples.rs` runs the real binary on each, isolated from R and user config. After an intended output change, run `UPDATE_DOCS_EXAMPLES=1 cargo test -p raven --test docs_examples` and review the diff. The pages bound to that example then fail `examples.test.ts` until you update them too.
+- **Docs site.** `zensical.toml` at the repo root builds the same Markdown into a searchable site in `target/docs-site`:
+
+  ```sh
+  uv venv /tmp/docs-venv && uv pip install --python /tmp/docs-venv --require-hashes -r docs/site/requirements.txt
+  /tmp/docs-venv/bin/zensical build --strict && bun docs/site/search-check.ts
+  ```
+
+  `.github/workflows/docs.yml` runs that build on docs PRs (a check, not a required one). On `main` it deploys to GitHub Pages once Pages is enabled with "GitHub Actions" as the source and the repository variable `DOCS_PAGES_ENABLED` is `true`. After enabling it, set `site_url` in `docs/user-pages.json` and regenerate, so the hub, README, and `llms.txt` link the site.
+- **Tutorial checks.** `editors/vscode/src/test-getting-started/getting-started.test.ts` walks through `docs/getting-started.md` in VS Code. It runs as the `getting-started` label in `.vscode-test.mjs`, with a temp copy of the tutorial files as its workspace. `scripts/fresh-install-check.sh` packages the VSIX, installs it into an empty profile on a machine without R or `raven` on PATH, and runs the same test against the installed extension. Run it under `xvfb-run -a` on Linux.
+
+## Docs verification
+
+What backs the claims on editor-only pages. `raven check` output on any page is asserted by the example corpus. Re-check a page's row when you change that page (the PR template asks).
+
+| Page | How its claims are verified |
+|---|---|
+| getting-started | `getting-started.test.ts` (VS Code), `docs_examples.rs` (CLI output), `scripts/fresh-install-check.sh` (fresh install, no R) |
+| completion, hover, go-to-definition, find-references, document-outline | `editors/vscode/src/test/lsp.test.ts`; Rust handler tests in `crates/raven/src/handlers.rs` |
+| indentation | `crates/raven/tests/indentation_integration.rs` |
+| syntax-highlighting | the Grammar Validation CI job; `tests/bun/grammar-*.test.ts` |
+| snippets | `editors/vscode/src/test/snippets.test.ts` |
+| editor-integrations | Snippets parse (`snippet-syntax.test.ts`). The Neovim 0.11 config was run headless against a real `raven` on 2026-10-29. Other editors' configs are checked by hand against each editor's LSP documentation. |
+| r-console | `editors/vscode/src/test/send-to-r/`, `r-console-activation.test.ts` |
+| debugger | `editors/vscode/src/test/debugger.test.ts`, `debug_workspace.test.ts`; `crates/raven/tests/console_debugger.rs` |
+| plot-viewer | `editors/vscode/src/test/plot/`; `tests/bun/plot-*.test.ts` |
+| data-viewer | `editors/vscode/src/test/data-viewer.test.ts`; `tests/bun/data-viewer-*.test.ts` |
+| help-viewer | `editors/vscode/src/test/help-viewer.test.ts`; the manual [help viewer smoke test](#help-viewer-smoke-test) |
+| chunks | `editors/vscode/src/test/chunks.test.ts`, `rmarkdown-quarto.test.ts` |
+| knit | `editors/vscode/src/test/knit-*.test.ts`; `tests/bun/knit-*.test.ts` |
+| quarto | `editors/vscode/src/test/quarto-*.test.ts` |
+| coexistence | `editors/vscode/src/test/r-console-activation.test.ts`, `language-activation.test.ts` |
+| Everything, by hand | Open the `demo/` workspaces (see `demo/README.md`) and follow each page's examples |
+
+## Help viewer smoke test
+From docs/help-viewer.md "Manual smoke test plan". `editors/vscode/src/test/help-viewer.test.ts` points here; keep this heading name.
+
+1. Hover over `dplyr::filter` in an R file → bold `dplyr::filter` heading at the top of hover; click → panel opens beside.
+2. Panel shows R help with package header, title, usage, arguments, examples.
+3. Click "See also: arrange" → panel navigates, back arrow now enabled.
+4. Back arrow → returns to filter, scroll position restored.
+5. Hover `plot(1:5)` → bold `graphics::plot` heading; click → navigates correctly even cross-package.
+6. Hover an operator: `` ?\`[\` `` or `` ?\`%in%\` `` → bold heading uses the operator, click navigates and renders correctly (verifies percent-encoding round-trip and `is_valid_help_topic`).
+7. Trigger a help page with images (e.g., `?ggplot2::theme` if installed) → images load.
+8. Trigger an unknown topic (hover a symbol whose topic cannot be resolved, or invoke `raven.openHelpPanel` programmatically with a bogus topic) → panel shows the not-found message; previous content & history preserved.
+9. Configure a non-default R via `raven.packages.rPath` and verify help renders against that R installation (open a topic only available in a package installed for that R; should succeed where it would fail against system R).
+
+### Help viewer internals (from docs/help-viewer.md)
+
+- Internal cross-references are rewritten to a custom URL scheme that round-trips operator topics like `` \`[\` `` and `` \`%in%\` ``.
+- `tools::Rd2HTML()` output is sanitized with ammonia. Remote `<img>` sources are stripped by the sanitizer; local images are served via webview URIs from package help directories.
+- Bundled-manual links: `Rd2HTML` emits `<a href="/doc/manual/<name>.html">`; the renderer rewrites the allowlisted names (`R-intro`, `R-admin`, `R-data`, `R-exts`, `R-FAQ`, `R-ints`, `R-lang`) to `https://cran.r-project.org/doc/manuals/r-release/<name>.html`, percent-encoding the anchor.
+- `Run examples` and per-package `Index` footer links are stripped because they target R's dynamic-help-server endpoints, which the panel doesn't run. Vignette links (`../../<pkg>/doc/<vignette>.html`) are neutralized.
+
+## Internals moved from user docs
+
+The 2026-10 docs redesign moved implementation detail out of the user pages (see `docs/superpowers/specs/2026-10-29-docs-redesign-design.md`). It is kept here, grouped by the page it came from, so maintainers don't lose it.
+
+### From docs/diagnostics.md
+
+- Issue references removed from user text (state as maintainer notes if wanted): issue #503 (namespace-member diagnostic republishes across other open documents after background package warming); issue #505 (a `::`-accurate data-member authority is a tracked follow-up; user text now says "a precise check for data members is planned").
+- Internal detail dropped from user text: the namespace-member authority is "synchronous and never spawns R" (user text now: "Raven never starts R to check a member").
+- Code facts the reworded page now states that came from source, not the old page (reviewers: keep in sync with `handlers.rs` collectors): `box-module-not-found` / `import-module-not-found` use `crossFile.missingFileSeverity`; `box-module-case-mismatch` always resolves `caseMismatchSeverity` with the case-sensitive regime (warning under `auto`), `import-module-case-mismatch` uses the host regime; `box-export-not-found` / `import-export-not-found` use `packages.namespaceMemberSeverity`; circular-dependency and redundant-directive diagnostics carry no code (CLI prints `[]`).
+
+### From docs/cross-file.md
+
+- Computed-path folding (`file.path`/`normalizePath`/single-assignment variables) landed with issue #638; the testthat helper preamble's transitive `source()` following came in the same change. The `readLines` carve-out (exact and `base::`/`base:::` calls never invalidate an unrelated static path variable; bare `readLines` needs a document-wide unshadowed name) is tested in `crates/raven/src/cross_file/static_path.rs` (`pristine_read_lines_does_not_invalidate_unrelated_static_paths`, `bare_read_lines_requires_a_document_wide_unshadowed_name`).
+- `list.files()` directory source loops: when expansion is dropped (directory match, unreadable entry, >256 matches) the reason is logged at debug level only. There is deliberately no user-facing hint because filesystem failures can be transient and expansion runs from several detached analysis paths; a stable diagnostic would need lifecycle-aware deduplication rather than repeating possibly stale notices.
+- Shiny application topology: lexical and canonical watch roots are both retained so a symlinked app reacts to events on the real path without creating a second application scope. Opening only a helper or legacy `global.R` materializes the selected `app.R`/`server.R` host on demand before initial diagnostics.
+- `targets::tar_source()`: finalized metadata and the dependency graph are URI-keyed, not execution-occurrence-keyed. Scope carries the two-valued supplied-`PathContext` mode through ordinary nested `source()` calls, but this creates no second metadata or graph identity, so go-to-definition, missing-file checks, and edit-triggered revalidation use the single URI-global edge. A nested `tar_source()` batch is finalized once under that URI's global metadata context; context-dependent forward directives and propagated `# raven: nse` / `# raven: func` facts are URI-global. The user page now says "one file, one target per `source()` call" and recommends wrapper scripts.
+- tarchetypes report edges participate in watching and revalidation in both directions but are non-lending. Target authority starts from the declaring pipeline and its ordinary lending source relationships. Canonical filesystem identities are shared across case/symlink aliases; navigation prefers the URI of a matching live open document.
+- Open-buffer authority is alias-aware for file URIs (case-only spelling or symlink to a workspace file): the corresponding graph URI is treated as open for dependent revalidation, live scope reads, package-internal symbols and package-sibling revalidation (canonical package file), self-package NSE policy and parameter/signature package scope (canonical workspace identity), and watched-file resync skipping. Closed-file graph/index keys stay raw path spellings rather than symlink-canonicalized, because full canonicalization follows symlinks and can diverge from the uncanonicalized workspace-index keys; the source-path resolver may still case-correct to the on-disk spelling.
+- File-backed Rmd/Quarto documents whose extension doesn't identify them as chunk documents: the last client language classification is remembered after close, and watched disk changes and closed-file cache fallbacks keep chunk masking until that file's cross-file state is removed.
+- NSE propagation set is the revalidation-consistent set `S(Q) = ancestors(Q) ∪ descendants(ancestors(Q) ∪ {Q})` (already documented in CLAUDE.md and `DependencyGraph::revalidation_consistent_set`). The user page now says "ancestors, and everything those ancestors or the file itself source".
+- "Tier 1 / Tier 2 / Tier 3" labels were removed from cross-file.md and r-package-dev.md in favor of "installed packages / repo database (`.raven/packages.json`) / `names.db`". package-database.md and diagnostics.md still use the tier labels; reconcile if the tiers should be user vocabulary.
+
+### From docs/r-package-dev.md
+
+- Build-command visibility is gated by the VS Code when-clause `raven.rConsoleEnabled && raven.isRPackage` (Command Palette and editor-title submenu). The user page now links coexistence.md for when the console is active instead of restating `raven.rConsole.activation`.
+- Testthat helper `source()` following was issue #638 (see cross-file note above).
+
+### From docs/directives.md
+
+- Positional `# raven: nse` matching for installed-package callees needs a paired `# raven: func` because installed-package functions expose only export names (not formals) to the synchronous diagnostic pass.
+
+### From docs/cli.md
+
+#### Maintainer `raven packages` commands (was "Appendix: maintainer and advanced topics")
+
+cli.md keeps `<a id>` anchors `raven-packages-build-shipped-db`, `raven-packages-validate-shipped-db`, `raven-packages-build-embedded-base` on a one-line pointer to `development.md#tier-3-build-pipeline`. The user-facing `--base-url` self-hosting section stayed in cli.md (under `raven packages update`), with the `appendix-maintainer-and-advanced-topics` anchor on it.
+
+##### `raven packages build-shipped-db`
+
+**Maintainer / CI-only.** Builds Raven's Tier 3 `names.db` database. All base-priority packages are excluded from `names.db` (they are embedded in the binary). The shipped binary is **network-free**: this command transforms r-universe JSON that the build workflow has already downloaded with `curl`, merging it **append-only** over an authoritative reference-R capture of the build machine's installed library. The reference capture **auto-discovers every R `.libPaths()` entry**. The result is published to the `names-db` GitHub Release, where `raven packages update` downloads it on demand. It is **not** bundled with the binary, and the VSIX omits it too (VS Code users resolve their locally installed packages via Tier 1). Its Tier 3 reference-R capture (always on) picks up authoritative dataset lists for LazyData packages when R is available at build time (this sentence was in package-database.md "Base packages and datasets").
+
+##### `raven packages validate-shipped-db`
+
+**Maintainer / CI-only.** Opens a `names.db` database with the current Raven binary, verifies the container header, format version, payload checksum, index bounds, and decodes every package record. The command fails if the file is corrupt, uses a newer unsupported format, or if the fully decoded record count does not match the database provenance.
+
+```text
+raven packages validate-shipped-db names.db
+```
+
+Raven's release workflow runs this against the current `names-db` Release asset before building the release binaries: a **compatibility gate** confirming the version of Raven being shipped can open and validate the database users will download. It is not a bundling step: `names.db` is not shipped with the binary.
+
+##### `raven packages build-embedded-base`
+
+**Maintainer-only.** Regenerates the embedded base export/dataset table (`crates/raven/src/package_db/embedded_base_generated.rs`) from a reference R installation, covering all 14 base-priority packages. The generated file is compiled into the binary so base symbols are available without any database file or R installation.
+
+```text
+raven packages build-embedded-base --reference-lib DIR [--output PATH]
+```
+
+- `--reference-lib DIR`: path to the R library containing the base packages (e.g. the output of `Rscript -e 'cat(.Library)'`).
+- `--output PATH`: where to write the generated file (default: `crates/raven/src/package_db/embedded_base_generated.rs`).
+
+After running, verify with `cargo test -p raven embedded_base` and commit the result.
+
+#### `targets::tar_source()` in `raven check` (internal mechanics)
+
+User page now says this in user terms. The original internal wording:
+
+> `raven check` supplements the ordinary URI-based dependency neighborhood with a bounded, context-sensitive provider traversal; providers outside the initial workspace scan are parsed and finalized into the same workspace index before diagnostics run. This affects scope only: navigation, missing-file checks, and dependency revalidation continue to use one URI-global graph edge per source entry.
+
+#### Package warming
+
+The user page calls it "loads export lists"; the original term was "warms the export cache" (before reporting, `raven check` warms the export cache for packages each reported file attaches). Keep the term in development.md if useful.
+
+#### NSE footer design rationale
+
+> The footer is framed carefully so it never reads as Raven asserting the call *is* NSE ... The snippet is enough to apply without understanding the syntax; the links explain it, mirroring how ShellCheck and Clippy attach a docs URL rather than explaining suppression inline. The footer carries no header or per-line prefix (it is `raven check`'s own output, so labeling it as such mid-stream would be redundant).
+
+### From docs/package-database.md
+
+#### Exports completeness internals
+
+- Each cached `PackageInfo` records how complete its export set is; the `namespace-member-not-found` diagnostic uses it.
+- The member authority (`namespace_member_status_sync`) is synchronous, never spawns R, and never touches disk: it consults the warmed cache, then the providers, and concludes `Absent` only from a `Complete` set. It deliberately does not parse the on-disk `NAMESPACE` synchronously, which would block the keystroke path and could not see datasets.
+- Data objects (`lazy_data`, the per-file `data_aliases` object names, and base-package datasets via `base_exports`) are positive-only.
+- The cache write path (`insert_package`) is monotonically authoritative: once a package is cached `Complete`, a later weaker (`Partial`/`Unknown`) load can never downgrade its exports or completeness; it only folds in additional positive-only data.
+
+#### Provider architecture and rationale
+
+- Tier 2 and Tier 3 share one in-memory model, one reader, and one writer.
+- The embedded base table is a `// @generated` per-package record; the other 7 non-attached base packages sit in the per-package cache.
+- `names.db`'s post-merge filter strips all 14 base-priority packages.
+- "Bundling third-party data carries supply-chain responsibility, so provenance and a tamper check are part of the pipeline." (rationale for the blake3 checksum and header provenance)
+- Non-base package datasets are captured as a `lazy_data` list in every tier's records and folded into the resolvable set when the package's exports are collected.
+
+### From docs/linting.md
+
+- The `commented_code` rule re-parses each candidate comment body via a thread-local parser pool; every other rule walks only the already-parsed tree. (User page keeps "re-parses each candidate comment".)
+- Lint rules run against the tree-sitter AST; `commented_code` classification differs from `lintr` because Raven parses with tree-sitter and `lintr` with R. (User page says "Raven's own R parser".)
+
+### From docs/configuration.md
+
+- Package-affecting `raven.toml` changes reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied, all asynchronously, off the LSP write lock.
+- `[workspace].exclude`: Raven prunes directories during the serial workspace walk only when a positive directory glob proves every descendant is excluded; directory globs prune before the parallel parse/index phase (wording from cli.md).
+- `raven.crossFile.maxChainDepth` also bounds the bidirectional neighborhood-walk depth.
+- `maxTransitiveDependentsVisited` budget is consumed by dependent revalidation, package-scope snapshots, and open-neighborhood pinning (settings-reference wording).
+
+### From docs/hover.md
+
+- R hover resolution order is implemented in `crates/raven/src/handlers.rs::hover` (the user page used to say so). Keep `docs/hover.md` § Resolution order in sync with that function.
+- Hover and the diagnostics pass share the structural-label predicate (`is_structural_non_reference`); hover layers its own "resolve-or-suppress, never resolve-or-attribute" carve-outs on top (named-argument → user formal, parameter → `@param`, local `$`/`@` member via the go-to-definition resolver). The rule exists to prevent the old misleading `from {base}` attribution on labels.
+- JAGS signature help tracks call context lexically, uses UTF-16 cursor positions, and never consults the temporary R parse tree or starts R/JAGS subprocesses.
+
+### From docs/syntax-highlighting.md
+
+- R semantic tokens come from the tree-sitter parse; in `.Rmd`/`.qmd` the document is walked with the same chunk detector the outline uses, each R chunk body is parsed in isolation, and tokens are rebased onto document coordinates.
+- Vendored grammars live in `editors/vscode/syntaxes/r.tmLanguage.json` and `editors/vscode/syntaxes/rmd.tmLanguage.json`; provenance and the sync procedure are in `editors/vscode/syntaxes/SOURCE.md`. Background: `vscode.r` and `REditorSupport.r-syntax` have no `main`, so VS Code defaults them to `extensionKind: "ui"`; the built-in is synced from REditorSupport via `vscode-grammar-updater`.
+- `contributes.grammars` maps the `quarto` language ID to the vendored R Markdown grammar (`text.html.markdown.rmarkdown`). The old user page said "Raven does not ship a quarto grammar"; the rewritten page now says `.qmd` falls back to the R Markdown grammar.
+
+### From docs/document-outline.md
+
+- JAGS/Stan block detection is text-based pattern matching with brace-depth tracking (unclosed block extends to EOF).
+- The old troubleshooting step "status bar shows Raven" had no backing code: the extension creates no status-bar item for the language server (only the debugger's breakpoint item). The user page now points at the **Raven** output channel.
+
+### From docs/indentation.md
+
+- Syntax-aware indentation is the LSP `textDocument/onTypeFormatting` handler (first trigger `\n`, more triggers `)`, `]`, `}`), sharing the indentation lint's structural analysis. It returns no edits when the client inserts tabs.
+
+### Plot viewer internals
+
+From docs/plot-viewer.md "Substrate (for the curious)" and "Color theme":
+
+- The theme toggle renders the plot as inline SVG inside the webview document (not `<img src=>`) so CSS variables and selectors reach SVG nodes.
+- DOMPurify strips script tags, event handlers, external references, and inline `style="..."` attributes. Before sanitizing, safe presentation properties (fill, stroke, font, etc.) are migrated from `style="..."` to SVG presentation attributes so plot colors survive.
+- The overlay hides the canvas background with CSS; text uses `--vscode-editor-foreground` and `--vscode-editor-font-family`; non-text shape strokes use `stroke: var(--vscode-editor-foreground)`.
+- The toggle state persists globally via VS Code's `Memento`. The three right-side toolbar controls carry `aria-label`s; history/remove buttons use `title` text.
+
+### Data viewer internals
+
+From docs/data-viewer.md "How it works":
+
+1. The Raven bootstrap profile (loaded via `R_PROFILE_USER` when you start a Raven-managed R terminal) installs a custom `View()` in `globalenv()` before the plot bridge runs. A failure in the plot bridge does not affect `View()`.
+2. On `View(df)`, R writes the data frame to an Apache Arrow IPC (Feather v2) file in `<extension globalStorage>/data-viewer/`. Per-column variable-label and value-label metadata is captured into a single schema-level JSON blob (R's `arrow` package doesn't expose per-field metadata writes through its public API).
+3. R POSTs the path to the extension's loopback HTTP server (`POST /view-data` with `{ sessionId, panelName, filePath, nrow }`). The route validates that the canonical path is under the per-extension data-viewer directory, rejecting anything else.
+4. The extension opens the file via `apache-arrow` (JS), indexes record-batch starts, and serves row windows on demand to the webview over postMessage. Decoded batches are LRU-cached.
+
+Also: persisted layout/sort/filter state is keyed by panel name × schema hash; the user page now says "panel name and the data's column layout". Sort restore stores only keys plus a Labels-state snapshot; the permutation is always recomputed because schema-hash equality doesn't imply equal row values. The toolbar wrap decision uses a hysteresis band. Factor filter checklists depend on whether the column's value dictionary has been shipped to the webview; large or unshipped dictionaries fall back to a free-text list.
+
+### Knit internals
+
+From docs/knit.md "What it does, step by step", "Fonts", and the preview-panel description:
+
+- YAML front matter is parsed with js-yaml's `JSON_SCHEMA`, preserving YAML `null`, booleans, and numbers as their JS equivalents.
+- The knit R process is spawned with `child_process.spawn` (never a shell), inheriting the environment.
+- Post-knit, the in-memory Markdown (front matter stripped) is rendered with VS Code's `markdown.api.render` (KaTeX, image rewriting, scroll-sync metadata, registered `markdown-it` plugins), then `<pre><code class="language-X">` blocks are re-highlighted. R grammar priority: `REditorSupport.r-syntax` → `REditorSupport.r` → built-in `vscode.r` → Raven's vendored grammar. Raven's `function` LSP semantic-token overlay is layered on R blocks.
+- The preview HTML loads in `<iframe srcdoc="..." sandbox="allow-same-origin">` (scripts, forms, popups, top-navigation blocked). HTML is inlined via `srcdoc` because a nested webview iframe cannot navigate to `webview.asWebviewUri(...)` URLs (Electron's resource handler does not intercept nested-frame navigations); an injected `<base href>` lets relative CSS and fonts resolve through the webview resource handler.
+- Local `<img>` sources are read off disk and inlined as `data:` URLs before the HTML reaches the iframe, because a nested `<iframe srcdoc>` cannot fetch webview subresources. Containment uses `realpath`. Only the in-memory copy is rewritten; the on-disk `.html` keeps original paths.
+- Copy, Select All, and the context menu are wired by hand on the iframe's same-origin `contentWindow`, because VS Code suppresses the default context menu and doesn't forward Cmd-C from a nested iframe.
+- Theme toggle state is persisted in `globalState`; syntax colors come from the theme's TextMate `tokenColors` plus `semanticTokenColors` that map to a coarse role, plus `editor.tokenColorCustomizations`. The pressed state is exposed with `aria-pressed`.
+- `<workspaceHash>` is SHA-256 of the first workspace folder URI (or the source's parent directory); `<sessionId>` is a UUID generated at extension activation; `<sourceHash>` is SHA-256 of the source's absolute path. Base is `<os.tmpdir()>/raven-knit/`.
+- Fonts: the panel recomputes the fallback chain on every `onDidChangeConfiguration` event and pushes it into the webview (`__ravenFontFamilies` postMessage). The Settings UI enforces character and length rules via a JSON schema `pattern`; balanced-paren and balanced-quote checks live only in the runtime sanitizer. Bare parens are rejected because they would open a CSS function token; empty comma entries would be dropped by the browser via IACVT.
+
+### Quarto internals
+
+From docs/quarto.md "Quarto Preview", "Apply VS Code theme", and "The preview panel is blank":
+
+- Readiness: Raven reads both stdout and stderr and strips terminal control sequences; takes the server origin from Quarto's `Listening on` line and the document path from `Browse at` when both are present; validates the URL as loopback-only HTTP; and probes it from the extension host until it responds before installing it in the panel. Stopping Preview cancels any outstanding readiness probe.
+- The theme bridge is injected into eligible HTML responses by the loopback proxy. Only the enabled state, colors, and sanitized font families cross the frame boundary; the bridge accepts an exact, parent-source-checked message. The blank-panel advisory fires when the bridge hasn't confirmed a responsive HTML page within eight seconds.
+- Render runs one-at-a-time per Quarto project (standalone files have independent slots; symlink aliases are the same file). The guard is released when the Quarto process finishes, not when the outcome notification is dismissed.
+
 ## Coding conventions (repo-level)
 
 - Avoid `bail!`; prefer explicit `return Err(anyhow!(...))`.

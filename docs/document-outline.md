@@ -1,42 +1,64 @@
-# Document Outline
+# Document outline
 
-Raven provides a hierarchical document outline view that displays symbols such as functions, variables, classes, sections, and loops across R, JAGS, and Stan files. This feature helps you navigate large files and understand code structure at a glance.
+[Docs](README.md) › Navigation and editing
 
-## Overview
+The outline and breadcrumbs show your file's sections, functions, variables, and classes as a tree, so you can see a long file's structure and jump to any part of it.
 
-The document outline appears in VS Code's **Outline** view (usually in the Explorer sidebar) and provides:
+```r
+# Data loading ----
+load_data <- function(path) {
+  read.csv(path)
+}
+raw_data <- load_data("data.csv")
 
-- **Hierarchical symbol tree** - See nested functions, variables within sections, and class methods
-- **R code sections** - Organize your code with collapsible section headers (`# Section ----`)
-- **R Markdown / Quarto headings** - Prose Markdown headings (`# Title`, `## Section`) form the document outline
-- **R Markdown / Quarto chunks** - Each ```` ```{r ...} ```` block (and `# %%` cell in plain `.R` files) appears as its own outline entry, distinct from section headers
-- **Rich symbol types** - Distinguish functions, constants, classes, and methods with distinct icons
-- **Quick navigation** - Click any symbol to jump to its definition
-- **JAGS/Stan model structure** - Navigate JAGS and Stan model files with blocks, decorative comment headings, and `for` loops
-- **Breadcrumb navigation** - See your current position in the file structure
+## Cleaning ----
+MAX_RECORDS <- 10000
+```
 
-The outline updates automatically as you edit your code.
+The Outline view shows:
 
-## Accessing the Outline
+```text
+▼ Data loading
+    load_data (path)
+    raw_data
+  ▼ Cleaning
+      MAX_RECORDS
+```
 
-**VS Code:**
-- Open the **Outline** view in the Explorer sidebar
-- Use **Ctrl+Shift+O** (Windows/Linux) or **Cmd+Shift+O** (Mac) to open the symbol picker
-- Enable breadcrumbs: **View → Show Breadcrumbs**
+<a id="overview"></a>
 
-**Workspace symbols (project-wide search):**
-- Use **Ctrl+T** (Windows/Linux) or **Cmd+T** (Mac) to search symbols across all files
+## What appears in the outline
 
-## R Code Sections
+- Section comments such as `# Section ----`, as collapsible nodes. `##` sections nest under `#` sections.
+- Functions, variables, constants, classes, S4 methods, and generics, each with its own icon.
+- Symbols inside functions and sections, nested under them.
+- In R Markdown and Quarto, the Markdown headings and every code chunk. In `.R` files, each `# %%` cell.
+- In JAGS and Stan files, model blocks, decorative comment headings, and `for` loops.
 
-Raven recognizes R code section comments as collapsible outline nodes. Sections help organize large files into logical groups.
+The outline updates as you edit. Click any entry to jump to it.
 
-### Section Syntax
+## Accessing the outline
 
-A valid section comment requires:
-1. One or more `#` characters (determines heading level)
-2. A section name (text content)
-3. Four or more delimiter characters: `-`, `=`, `#`, `*`, or `+`
+In VS Code:
+
+- Open the **Outline** view in the Explorer sidebar.
+- Press Cmd+Shift+O (Ctrl+Shift+O on Windows and Linux) to pick a symbol in the current file.
+- Turn on breadcrumbs with **View → Show Breadcrumbs** to see where the cursor is in the tree.
+- Press Cmd+T (Ctrl+T on Windows and Linux) to search symbols across all files; see [Workspace symbol search](#workspace-symbol-search).
+
+Other LSP editors show the same symbols in their own outline or symbol picker.
+
+## R code sections
+
+A comment that ends in four or more dashes (or `=`, `#`, `*`, `+`) is a section. Sections are collapsible outline nodes that group the code below them.
+
+### Section syntax
+
+A section comment needs:
+
+1. one or more `#` characters, which set the heading level
+2. a section name
+3. four or more of the same delimiter: `-`, `=`, `#`, `*`, or `+`
 
 ```r
 # Section Name ----
@@ -46,13 +68,11 @@ A valid section comment requires:
 # Section Name ++++
 ```
 
-**Optional features:**
-- `%%` prefix for special sections: `# %% Section Name ----`
-- Leading/trailing whitespace is ignored
+You can also start a section with `%%`, as in `# %% Section Name ----`. Leading and trailing whitespace is ignored.
 
-### Heading Levels
+### Heading levels
 
-Use multiple `#` characters to create nested sections:
+Use more `#` characters to nest sections:
 
 ```r
 # Level 1 Section ----
@@ -64,14 +84,11 @@ Use multiple `#` characters to create nested sections:
 # Another Level 1 Section ----
 ```
 
-In the outline view:
-- Level 1 sections (`#`) appear as top-level nodes
-- Level 2 sections (`##`) nest under the preceding Level 1 section
-- Level 3 sections (`###`) nest under the preceding Level 2 section
+In the outline, `#` sections are top-level nodes, `##` sections nest under the `#` section before them, and `###` sections nest under the `##` section before them.
 
-### Section Ranges
+### Section ranges
 
-A section's range extends from its comment line to the line before the next sibling or parent section:
+A section runs from its comment line to the line before the next section at the same or a higher level:
 
 ```r
 # Data Loading ----
@@ -88,23 +105,25 @@ validate_data(data)
 # This starts a new Level 1 section
 ```
 
-Symbols defined within a section's range appear as children of that section in the outline.
+Symbols defined inside a section's range appear as its children.
 
-### Invalid Sections
+### Invalid sections
 
-These patterns are **not** recognized as sections:
+These are not sections:
 
 ```r
-# ==================  (no text content - just delimiters)
-# ----                (no text content)
-# Section --          (only 2 delimiters, need 4+)
+# ==================  (no name, only delimiters)
+# ----                (no name)
+# Section --          (only 2 delimiters; 4 or more are needed)
 ```
 
-## R Markdown / Quarto Chunks
+<a id="r-markdown--quarto-chunks"></a>
 
-For `.Rmd` and `.qmd` files, every fenced code chunk gets its own outline entry. The label, if present, becomes the entry name; unlabeled chunks fall back to `Chunk #N` numbered in source order across the whole document. For non-R chunks (`{python}`, `{julia}`, ...) the language tag appears in the detail field.
+## R Markdown and Quarto chunks
 
-````rmd
+In `.Rmd` and `.qmd` files, every fenced code chunk gets its own outline entry. A chunk's label becomes the entry name. Unlabeled chunks are named `Chunk #N`, numbered in order through the whole document. Non-R chunks (`{python}`, `{julia}`, …) show their language as the detail.
+
+`````rmd
 ```{r setup, include=FALSE}
 library(dplyr)
 ```
@@ -116,9 +135,9 @@ analysis(data)
 ```{python}
 print("hi")
 ```
-````
+`````
 
-Outline view shows:
+The Outline view shows:
 
 ```text
 setup
@@ -126,15 +145,34 @@ Chunk #2
 Chunk #3        {python}
 ```
 
-Chunks use a distinct symbol kind (`OBJECT`) so the outline filter can include or exclude them separately from section headers.
+Chunks have their own symbol kind (object), so the outline's filter can show or hide them separately from section comments.
 
-R symbols defined *inside* an R chunk body — functions, variable assignments, S4/R6 classes — also appear in the outline, nested under their chunk, at their real document line. Prose, YAML front matter, and non-R chunk bodies are ignored, so a `library(...)` call in prose or a Python chunk never produces a phantom outline entry. (For non-R chunks only the chunk entry itself is shown.)
+R symbols defined inside an R chunk (functions, variables, S4 and R6 classes) also appear, nested under their chunk at their real line in the document. Prose, YAML front matter, and non-R chunks are ignored, so a `library(...)` call in prose or a Python chunk never creates an outline entry. Non-R chunks show only the chunk entry.
 
-## R Markdown / Quarto Headings
+### `# %%` cells in `.R` files
 
-For `.Rmd` and `.qmd` files, prose Markdown headings (`#`, `##`, …) form the document outline, so the Outline view and breadcrumbs reflect the document's section structure as you edit the source.
+Plain `.R` files can use the VS Code cell convention: a `# %%` line starts a cell that runs until the next marker, a section comment, or the end of the file. Text after the marker becomes the cell's name:
 
-```rmd
+```r
+# %% Setup
+library(dplyr)
+
+# %% Analysis
+fit_model(data)
+```
+
+Cells with no name are called `Chunk #N`.
+
+> [!NOTE]
+> A line like `# %% Setup ----` is both a cell marker and a section comment, so it appears twice in the outline: once as a collapsible section and once as a cell. Write `# %% Setup`, without the trailing `----`, if you want only a cell.
+
+<a id="r-markdown--quarto-headings"></a>
+
+## R Markdown and Quarto headings
+
+In `.Rmd` and `.qmd` files, the Markdown headings (`#`, `##`, …) form the outline, so the Outline view and breadcrumbs follow the document's structure as you edit.
+
+`````rmd
 ---
 title: "My Report"
 ---
@@ -152,9 +190,9 @@ library(dplyr)
 ```{r model}
 fit <- lm(y ~ x, data = df)
 ```
-```
+`````
 
-Outline view shows:
+The Outline view shows:
 
 ```text
 ▼ Introduction
@@ -164,62 +202,51 @@ Outline view shows:
         fit
 ```
 
-Details:
+- Headings nest by level, from `#` (level 1) to `######`, like R code sections.
+- A chunk appears under the heading whose section contains it, and the R symbols defined in the chunk nest under the chunk.
+- Only prose headings count. Headings inside YAML front matter, fenced code blocks, and R chunks are ignored, so a `#` comment in code never becomes a heading. A `# Section ----` comment inside a chunk still appears as an entry, but it doesn't take part in the document's heading structure.
+- Headings have their own icon (the string symbol kind), so the outline's filter can show or hide them separately from code chunks (object) and R sections (module).
+- Only `#`-style (ATX) headings are recognized. Text underlined with `===` or `---` (setext headings) isn't.
 
-- **Levels nest by depth.** `#` is level 1, `##` is level 2, and so on through `######`; deeper headings nest under shallower ones, just like R code sections.
-- **Chunks and chunk-body symbols nest under their heading.** A chunk appears under the heading whose section contains it, and the R symbols defined in that chunk nest under the chunk.
-- **Only prose headings count.** Headings inside YAML front matter, fenced code blocks, and R chunk bodies are ignored, so a `#` comment in code never becomes a phantom heading. A `# Section ----` divider inside a chunk body still appears as an entry, but it does not compete with Markdown headings for the document's section structure.
-- **Distinct icon.** Headings use the heading (string) symbol kind, so the outline filter can show or hide them separately from code chunks (object) and R sections (module).
-- **ATX headings only.** Setext (underline-style) headings — text underlined with `===` or `---` — are not recognized; use `#`-prefixed (ATX) headings.
+## Symbol types
 
-### `# %%` cells in `.R` files
+Raven gives each kind of R definition its own icon:
 
-Plain `.R` files use the VS Code interactive-cell convention: a `# %%` line starts a new cell that runs until the next marker, a section divider, or end of file. Any text after the marker is used as the label:
-
-```r
-# %% Setup
-library(dplyr)
-
-# %% Analysis
-fit_model(data)
-```
-
-Cells with no trailing text fall back to `Chunk #N`.
-
-> **Note:** A line like `# %% Setup ----` matches *both* the `# %%` cell-marker pattern and the section-divider pattern, so in a `.R` file it appears **twice** in the outline — once as a collapsible section (Module) and once as a cell entry (Chunk). Use `# %% Setup` (no trailing `----`) if you want only a plain cell.
-
-## Symbol Types
-
-Raven recognizes the following R constructs and assigns appropriate symbol types:
+| Definition | Icon | Example |
+|---|---|---|
+| Function | Function, with the parameter list as the detail | `calculate <- function(x, y) …` |
+| Variable assigned a call or other expression | Field | `data <- read.csv("data.csv")` |
+| Variable assigned a literal | Boolean, Number, String, Null, Constant, Array, or List | `count <- 42` |
+| ALL_CAPS name | Constant | `MAX_ITERATIONS <- 1000` |
+| R6, S4, or reference class | Class | `MyClass <- R6Class("MyClass", …)` |
+| S4 method | Method | `setMethod("show", "Person", …)` |
+| S4 generic | Interface | `setGeneric("process", …)` |
 
 ### Functions
 
 ```r
-# Standard function - shows parameter list in detail
+# Standard function: shows its parameter list as the detail
 calculate <- function(x, y, z = 10) {
   x + y + z
 }
 ```
 
-**Icon:** Function symbol  
-**Detail:** `(x, y, z = 10)` (parameter list)
+The entry has the Function icon and `(x, y, z = 10)` as its detail.
 
 ### Variables
 
 ```r
-# Regular variable assignment (RHS is a function call → Field)
+# The right side is a function call, so these are Fields
 data <- read.csv("data.csv")
 result = process_data(data)
 cached_value <<- compute_default()
 ```
 
-**Icon:** Field symbol (LSP `SymbolKind::FIELD`)
-
-This Field fallback applies only when the right-hand side isn't a recognized literal value. When the RHS *is* a literal, Raven assigns a more specific kind — see [Value-typed variables](#value-typed-variables) below.
+These get the Field icon. Field is the fallback for a right side that isn't a recognized literal. When the right side is a literal, Raven uses a more specific icon; see [Value-typed variables](#value-typed-variables).
 
 ### Value-typed variables
 
-When a non-constant-named variable is assigned a literal value, Raven classifies it by the value's type rather than as a plain Field:
+When a variable whose name isn't ALL_CAPS is assigned a literal value, its icon follows the value's type:
 
 ```r
 flag    <- TRUE          # Boolean
@@ -231,11 +258,11 @@ items   <- c(1, 2, 3)    # Array (c(), vector(), matrix(), array())
 config  <- list(a = 1)   # List
 ```
 
-Classification order is: class constructor (`R6Class`/`setRefClass`) → ALL_CAPS constant name → function definition → value type (above) → Field. So `MAX <- 42` is a Constant (name wins), while `count <- 42` is a Number.
+The name is checked before the value, so `MAX <- 42` is a Constant while `count <- 42` is a Number. The [full order](#wrong-symbol-typeicon) is under Troubleshooting.
 
 ### Constants
 
-Variables with ALL_CAPS names (minimum 2 characters) are classified as constants:
+Names in ALL_CAPS, at least 2 characters long and matching `^[A-Z][A-Z0-9_.]+$`, get the Constant icon:
 
 ```r
 PI <- 3.14159
@@ -243,10 +270,9 @@ MAX_ITERATIONS <- 1000
 DB_CONNECTION_STRING <- "postgresql://..."
 ```
 
-**Icon:** Constant symbol  
-**Pattern:** `^[A-Z][A-Z0-9_.]+$`
-
 ### Classes
+
+R6 classes, S4 classes, and reference classes get the Class icon:
 
 ```r
 # R6 class
@@ -267,12 +293,13 @@ MyRefClass <- setRefClass("MyRefClass",
 )
 ```
 
-**Icon:** Class symbol
+<a id="methods-1"></a>
 
 ### Methods
 
+S4 methods get the Method icon. The entry is named from the first string argument, here `show`:
+
 ```r
-# S4 method
 setMethod("show", "Person",
   function(object) {
     cat("Person:", object@name, "\n")
@@ -280,24 +307,19 @@ setMethod("show", "Person",
 )
 ```
 
-**Icon:** Method symbol  
-**Name:** Extracted from the first string argument (`"show"`)
-
 ### Generics
 
+S4 generics get the Interface icon. The entry is named from the first string argument, here `process`:
+
 ```r
-# S4 generic
 setGeneric("process",
   function(x, ...) standardGeneric("process")
 )
 ```
 
-**Icon:** Interface symbol  
-**Name:** Extracted from the first string argument (`"process"`)
+## Hierarchical nesting
 
-## Hierarchical Nesting
-
-The outline shows symbols nested within their containing scopes:
+Symbols nest under the function or section that contains them:
 
 ```r
 # Data Processing ----
@@ -306,10 +328,10 @@ process_data <- function(df) {
   # These assignments appear as children of process_data()
   clean_df <- remove_na(df)
   validated_df <- validate(clean_df)
-  
+
   # Nested function also appears as a child
   helper <- function(x) { x * 2 }
-  
+
   return(validated_df)
 }
 
@@ -317,8 +339,9 @@ process_data <- function(df) {
 CACHE_SIZE <- 1000
 ```
 
-**Outline structure:**
-```
+The Outline view shows:
+
+```text
 ▼ Data Processing
   ▼ process_data (df)
       clean_df
@@ -327,25 +350,25 @@ CACHE_SIZE <- 1000
   CACHE_SIZE
 ```
 
-## JAGS and Stan Model Structure
+## JAGS and Stan model structure
 
-Raven recognizes top-level block structures in JAGS and Stan files and displays them as the top-level hierarchy in the document outline. Decorative comment headings nest beneath those blocks, and `for` loops appear as intermediate outline containers for symbols declared inside them.
+In JAGS and Stan files, the model blocks are the top level of the outline. Decorative comment headings nest inside the blocks, and `for` loops are containers for the symbols declared in them.
 
-### JAGS Blocks
+### JAGS blocks
 
-JAGS files (`.jags`, `.bugs`, `.bug`, case-insensitively) support two block types. These suffixes select strict JAGS behavior and do not imply general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility:
+JAGS files (`.jags`, `.bugs`, `.bug`, in any letter case) have two blocks. These extensions mean JAGS, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility.
 
-| Block | Outline Name |
-|-------|--------------|
+| Block | Outline name |
+|---|---|
 | `data { }` | data |
 | `model { }` | model |
 
-### Stan Blocks
+### Stan blocks
 
-Stan files (`.stan`) support seven block types:
+Stan files (`.stan`) have seven blocks:
 
-| Block | Outline Name |
-|-------|--------------|
+| Block | Outline name |
+|---|---|
 | `functions { }` | functions |
 | `data { }` | data |
 | `transformed data { }` | transformed data |
@@ -354,13 +377,13 @@ Stan files (`.stan`) support seven block types:
 | `model { }` | model |
 | `generated quantities { }` | generated quantities |
 
-Constrained declarations keep the declared identifier in the outline, so `real<lower=0, upper=1> foo;` appears as `foo`, not the constraint names.
+A constrained declaration shows the declared name, so `real<lower=0, upper=1> foo;` appears as `foo`, not as the constraint names.
 
-### Decorative Comment Headings
+### Decorative comment headings
 
-JAGS and Stan files recognize **decorative headings only**. Plain title comments such as `// DIMENSIONS` or `# levels:` are not added to the outline.
+JAGS and Stan files recognize decorative headings only. A plain comment such as `// DIMENSIONS` or `# levels:` isn't added to the outline.
 
-Recognized patterns include banner fences:
+Banner headings are recognized:
 
 ```stan
 // =====================================================================
@@ -368,7 +391,7 @@ Recognized patterns include banner fences:
 // =====================================================================
 ```
 
-and inline decorative headings:
+So are inline decorative headings:
 
 ```stan
 // --- Incomplete official statistics (minima) ---
@@ -378,11 +401,11 @@ and inline decorative headings:
 # --- Priors ---
 ```
 
-Banner headings default to top-level within their enclosing block, while inline decorative headings default to the next level down. Existing hash-decorated banner title lines such as `## NAME ##` in JAGS preserve their explicit depth.
+Banner headings sit at the top level inside their block, and inline headings one level below. Hash-decorated banner titles such as `## NAME ##` in JAGS keep the depth they spell out.
 
 ### Loops
 
-`for` loops in JAGS and Stan files appear in the outline as container nodes. This applies to both braced loops and brace-less loops:
+`for` loops in JAGS and Stan files are container nodes in the outline, with or without braces:
 
 ```stan
 for (p_idx in 1:n_p1) {
@@ -393,7 +416,7 @@ for (j in 1:M)
   real bar = j;
 ```
 
-Symbols declared inside those loops appear as children of the corresponding loop node, and nested loops appear recursively in the outline.
+Symbols declared inside a loop appear as its children, and nested loops nest in the outline.
 
 ### Example
 
@@ -417,7 +440,8 @@ model {
 }
 ```
 
-**Outline view shows:**
+The Outline view shows:
+
 ```text
 ▼ data
   ▼ DIMENSIONS
@@ -431,13 +455,13 @@ model {
     ▼ for (n in 1:N)
 ```
 
-Blocks are detected using text-based pattern matching with brace-depth tracking, so nested braces within block bodies are handled correctly. Decorative headings nest under their containing block instead of competing with block nodes at the top level. If a closing brace is missing, the block range extends to the end of the file.
+Braces nested inside a block are handled correctly, and decorative headings nest under their block rather than competing with blocks at the top level. If a block's closing brace is missing, the block runs to the end of the file.
 
-## Workspace Symbol Search
+## Workspace symbol search
 
-Press **Ctrl+T** (Windows/Linux) or **Cmd+T** (Mac) to search for symbols across your entire project:
+Press Cmd+T (Ctrl+T on Windows and Linux) to search for symbols across the whole project:
 
-```
+```text
 Type: "calc"
 Results:
   calculate        main.R
@@ -445,33 +469,13 @@ Results:
   recalculate      analysis.R
 ```
 
-**Features:**
-- Substring matching (case-insensitive): "calc" matches "calculate"
-- Shows file location for each symbol
-- Jump to definition with Enter
-- Searches open documents and indexed workspace files
-
-## Configuration
-
-### Workspace Symbol Limit
-
-Control the maximum number of results returned by workspace symbol search:
-
-```json
-{
-  "raven.symbols.workspaceMaxResults": 1000
-}
-```
-
-| Setting | Default | Range | Description |
-|---------|---------|-------|-------------|
-| `raven.symbols.workspaceMaxResults` | 1000 | 100-10000 | Maximum symbols in Ctrl+T search results |
-
-Higher values may impact performance on large projects.
+- Matching is by substring and ignores case, so "calc" matches "calculate".
+- Each result shows its file. Press Enter to jump to the definition.
+- The search covers open files and indexed workspace files.
 
 ## Examples
 
-### Organizing a Large Analysis Script
+### Organizing a large analysis script
 
 ```r
 # Setup ----
@@ -516,8 +520,9 @@ fit_model <- function(df) {
 model <- fit_model(processed_data)
 ```
 
-**Outline view shows:**
-```
+The Outline view shows:
+
+```text
 ▼ Setup
     DATA_PATH
     OUTPUT_PATH
@@ -540,29 +545,26 @@ model <- fit_model(processed_data)
 
 ### Outline view is empty
 
-1. Verify the file extension is `.R`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, or `.stan`
-2. Check that Raven is running (status bar shows "Raven")
-3. Reload VS Code: **Ctrl+Shift+P** → "Developer: Reload Window"
+1. Check that the file extension is `.R`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, or `.stan`.
+2. Check that Raven is running: in VS Code, the **Raven** channel in the Output panel shows the server's log.
+3. Reload the window: run **Developer: Reload Window** from the command palette.
 
 ### Sections not appearing in outline
 
-Verify your section comment syntax:
-- Needs at least 4 delimiter characters: `# Section ----` ✓
-- Only 2-3 delimiters won't work: `# Section --` ✗
-- Must have text content: `# ----` ✗
+Check the section comment:
+
+- `# Section ----` works: it has a name and at least 4 delimiters.
+- `# Section --` doesn't: 2 or 3 delimiters aren't enough.
+- `# ----` doesn't: it has no name.
 
 ### Symbols showing at wrong level
 
-The hierarchy is determined by:
-1. Code position (line numbers)
-2. Section heading levels (`#` vs `##` vs `###`)
-3. Function body boundaries
-
-Check that your section heading levels match your intended hierarchy.
+The tree comes from three things: the order of lines, the section levels (`#`, `##`, `###`), and function bodies. Check that your section levels match the hierarchy you want.
 
 ### Workspace symbol search returns too few results
 
-Increase the limit:
+Raise `raven.symbols.workspaceMaxResults`:
+
 ```json
 {
   "raven.symbols.workspaceMaxResults": 5000
@@ -571,13 +573,30 @@ Increase the limit:
 
 ### Wrong symbol type/icon
 
-Symbol types are determined in this order (first match wins):
-- **Classes:** `R6Class()`, `setClass()`, `setRefClass()` calls
-- **Constants:** ALL_CAPS naming pattern (2+ characters)
-- **Functions:** `function(...)` on right-hand side
-- **Value type:** literal right-hand side → Boolean (`TRUE`/`FALSE`), Number (numeric literal), String, Null (`NULL`), Constant (`NA`/`Inf`/`NaN`), Array (`c()`/`vector()`/`matrix()`/`array()`), or List (`list()`)
-- **Variables:** all other assignments (Field)
+Raven picks the icon by checking these in order; the first match wins:
 
-So a literal assignment like `x <- 42` shows as a Number, not a Field — see [Value-typed variables](#value-typed-variables). A name like `MAX <- 42` is a Constant because the ALL_CAPS rule is checked before the value type.
+1. Class: an `R6Class()`, `setClass()`, or `setRefClass()` call.
+2. Constant: an ALL_CAPS name of 2 or more characters.
+3. Function: `function(...)` on the right side.
+4. Value type: a literal on the right side gives Boolean (`TRUE`/`FALSE`), Number, String, Null (`NULL`), Constant (`NA`, `Inf`, `NaN`), Array (`c()`, `vector()`, `matrix()`, `array()`), or List (`list()`).
+5. Field: every other assignment.
 
-Reserved words (if, else, for, while, TRUE, FALSE, NULL, etc.) are automatically filtered out.
+So `x <- 42` is a Number, not a Field, and `MAX <- 42` is a Constant because the name is checked before the value. Reserved words (`if`, `else`, `for`, `while`, `TRUE`, `FALSE`, `NULL`, and so on) never appear as symbols.
+
+<a id="configuration"></a>
+
+## Settings
+
+<a id="workspace-symbol-limit"></a>
+
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| `raven.symbols.workspaceMaxResults` | `1000` | 100 to 10000 | Maximum number of results in workspace symbol search (Cmd/Ctrl+T) |
+
+Higher values can slow the search in large projects. See [Settings reference](settings-reference.md) for every setting.
+
+## See also
+
+- [Code chunks](chunks.md)
+- [Find references](find-references.md)
+- [Syntax highlighting](syntax-highlighting.md)

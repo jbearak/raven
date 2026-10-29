@@ -1,11 +1,30 @@
-# R Code Chunks
+# R code chunks
 
-Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delimited cells in plain `.R` files. In regular Markdown documentation, Raven also provides a `Run Chunk` CodeLens for fenced blocks tagged `r` or `R`. You can run a single chunk, every chunk above the cursor, or every chunk in an R Markdown / Quarto / R-cell document; navigate forward and backward between chunks; and see a subtle background tint that makes chunks easy to scan.
+[Docs](README.md) › R Markdown and Quarto
 
-This is the daily-driver workflow for `.Rmd` / `.Rmarkdown` / `.qmd` users coming from RStudio or vscode-R.
+Run, navigate, and get full R code intelligence in the R chunks of `.Rmd`, `.Rmarkdown`, and `.qmd` documents and in `# %%` cells of `.R` files.
 
-> [!NOTE]
-> All chunk-related features — navigation commands (Go to Next/Previous Chunk, Select Current Chunk), chunk background highlighting and the active-cell indicator, `.R` cell mode (`# %%` markers and RStudio-style `# Section ----` dividers), the **run** commands (for example, Run Current Chunk, Run Above Chunks, Run All Chunks — see [Commands](#commands) for the full set), and every chunk CodeLens button (defaults `▷ Run Chunk` / `↘ Run Next Chunk` / `↥ Run Above`, plus any others added via `raven.chunks.codeLens.commands`) — are gated behind `raven.rConsole.activation`. The run commands and CodeLens additionally require Raven's R console because they create or reuse the R terminal Raven manages. If the R console is disabled (or `auto` defers to another R extension), none of these surfaces register, so REditorSupport / Positron handle chunks instead. See [Coexistence](./coexistence.md).
+````markdown
+```{r}
+fit <- lm(mpg ~ wt, data = mtcars)
+```
+
+Some prose.
+
+```{r}
+summary(fit)   # `fit` resolves to the chunk above; hover and go-to-definition work
+```
+````
+
+| You do | Raven does |
+|---|---|
+| Press `Cmd+Alt+Enter` (`Ctrl+Alt+Enter`) in a chunk | Sends that chunk to the R console |
+| Click `▷ Run Chunk` above a chunk header | Same, from the CodeLens |
+| Press `Cmd+PageDown` | Moves the cursor into the next chunk |
+
+Each chunk gets a faint background tint that makes chunks easy to scan. In regular Markdown files, fenced blocks tagged `r` or `R` get a Run Chunk CodeLens too.
+
+Chunk navigation, highlighting, cell mode, the run commands, and the CodeLens buttons are part of Raven's R-session features, so by default they step aside when REditorSupport or Positron handles chunks; see [Coexistence](coexistence.md#what-steps-aside-and-what-doesnt). The run commands and CodeLens also need Raven's R console, because they create or reuse the R terminal Raven manages.
 
 ## Chunk forms
 
@@ -15,76 +34,52 @@ This is the daily-driver workflow for `.Rmd` / `.Rmarkdown` / `.qmd` users comin
 | Markdown R block | `.md`, `.markdown` | ```` ```r ```` |
 | Cell marker | `.R` | `# %% Section 1` |
 
-Fenced blocks may use either backticks or tildes, and four-or-more-character fences nest naturally (so a chunk can contain a literal `` ``` ``).
+Fenced blocks may use backticks or tildes, and fences of four or more characters nest, so a chunk can contain a literal `` ``` ``.
 
-Regular Markdown support is intentionally limited to execution: an `r` / `R`
-fence gets a single `Run Chunk` CodeLens that sends its body to Raven's R
-console. It does not enable knitting, chunk navigation or highlighting, or R
-language-server features in `.md` files. Like every Raven execution surface,
-the lens appears only when `raven.rConsole.activation` resolves to `enabled`.
+In regular Markdown, Raven supports only running code: an `r` / `R` fence gets a single Run Chunk CodeLens that sends its body to Raven's R console. It doesn't add knitting, chunk navigation or highlighting, or R language-server features to `.md` files. Like every Raven run command, the lens appears only when Raven's R console is active.
 
-Only **R** chunks are sent to the R console. Chunks tagged with other languages (`{python}`, `{bash}`, `{julia}`, …) are still recognized for navigation and outline but not for execution.
+Only R chunks are sent to the R console. Chunks in other languages (`{python}`, `{bash}`, `{julia}`, …) are recognized for navigation and the outline but not run.
 
-Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct symbol kind, separate from section headers — see [Document Outline](./document-outline.md#r-markdown--quarto-chunks).
+Chunks appear in the document outline (`Cmd/Ctrl+Shift+O`) as their own symbol kind, separate from section headers; see [Document outline](document-outline.md#r-markdown--quarto-chunks).
 
 ## Language features inside chunks
 
-The R code inside chunk bodies is first-class. Raven analyzes all R chunk bodies as a single R program, so the editor's R language features work inside chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents and resolve symbols across chunks (a function defined in one chunk can be used, navigated to, and completed in a later chunk):
+Raven analyzes all R chunk bodies in a document as a single R program, so R language features work inside chunks of `.Rmd`, `.Rmarkdown`, and `.qmd` documents and resolve symbols across chunks. A function defined in one chunk can be used, navigated to, and completed in a later chunk. This covers [diagnostics](diagnostics.md), [completion](completion.md), [hover](hover.md), signature help, [go-to-definition](go-to-definition.md), [find-references](find-references.md), folding, expand-selection, and on-type [indentation](indentation.md).
 
-- [Diagnostics](./diagnostics.md), [completion](./completion.md), [hover](./hover.md), signature help, [go-to-definition](./go-to-definition.md), [find-references](./find-references.md), folding, expand-selection, and on-type [indentation](./indentation.md).
-
-These features apply only inside R chunk bodies. On prose, YAML front matter, or non-R chunks they stand down — completion, signature help, and on-type indentation produce nothing rather than treating the line as top-level R. Non-R chunks (`{python}`, `{bash}`, …) are not analyzed as R.
+These features work only inside R chunk bodies. On prose, YAML front matter, or non-R chunks, completion, signature help, and on-type indentation produce nothing rather than treating the line as top-level R. Non-R chunks are not analyzed as R.
 
 ### Cross-file resolution from chunks
 
-Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk bodies, never prose. A `source("helpers.R")` written inside an R chunk creates a real dependency edge — symbols defined in the sourced file resolve in later chunks, and a missing target is flagged — while the same text in prose or a comment outside a chunk is ignored. `library()` calls and `# raven: cd` / `# raven: sourced-by`-style directives are likewise honored only inside chunks.
+[Cross-file analysis](cross-file.md) reads only chunk bodies, never prose. A `source("helpers.R")` inside an R chunk creates a real dependency: symbols defined in the sourced file resolve in later chunks, and a missing target is flagged. The same text in prose, or in a comment outside a chunk, is ignored. `library()` calls and directives such as `# raven: cd` and `# raven: sourced-by` are also honored only inside chunks.
 
-The relationship also works in the other direction: a plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
+It works in the other direction too. A plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven reads the Rmd's chunks (not its prose) to supply the helper's inherited scope. Raven doesn't scan the workspace for `.Rmd`, `.Rmarkdown`, or `.qmd` files ahead of time, so this direction needs the directive on the `.R` file, or the Rmd open in the editor.
 
-A targets pipeline can also connect a document through a literal
-`tarchetypes::tar_render()`, `tar_knit()`, or single-document `tar_quarto()`
-path. In that relationship the document does **not** inherit ordinary pipeline
-variables or packages. Instead, its R chunks share only the pipeline's static
-target-name authority: `targets::tar_read(model)` and statically enumerable
-`tar_load()` names are diagnosed and navigable against declarations in the
-pipeline. See [Cross-file awareness — tarchetypes target factories and report
-documents](./cross-file.md#tarchetypes-target-factories-and-report-documents).
+A targets pipeline can also connect a document through a literal `tarchetypes::tar_render()`, `tar_knit()`, or single-document `tar_quarto()` path. The document then does not inherit ordinary pipeline variables or packages. Its R chunks share only the pipeline's target names: `targets::tar_read(model)` and statically listable `tar_load()` names are checked and navigable against the pipeline's declarations. See [Cross-file analysis: tarchetypes target factories and report documents](cross-file.md#tarchetypes-target-factories-and-report-documents).
 
 ### Suppressing diagnostics in a chunk
 
-Two ways to silence Raven's diagnostics for an entire chunk:
+You can silence Raven's diagnostics for a whole chunk in two ways.
 
-- **knitr chunk option** `raven.ignore` in the chunk header:
+Use the knitr chunk option `raven.ignore` in the chunk header:
 
-  ````markdown
-  ```{r, raven.ignore=TRUE}
-  result <- some_undefined_thing   # no diagnostics in this chunk
-  ```
-  ````
+````markdown
+```{r, raven.ignore=TRUE}
+result <- some_undefined_thing   # no diagnostics in this chunk
+```
+````
 
-  `raven.ignore=TRUE` (or `=T`) suppresses everything in the chunk body;
-  `raven.ignore=FALSE` (the default) does nothing. Narrow it to specific codes
-  with a quoted, comma-separated list:
-  `raven.ignore="undefined-variable, line-length"`. An explicitly empty list
-  (`raven.ignore=""`) is the empty set of codes and therefore suppresses
-  nothing — use `raven.ignore=TRUE` to silence the whole chunk.
+`raven.ignore=TRUE` (or `=T`) suppresses everything in the chunk body, and `raven.ignore=FALSE` (the default) does nothing. Narrow it to specific codes with a quoted, comma-separated list: `raven.ignore="undefined-variable, line-length"`. An explicitly empty list (`raven.ignore=""`) is the empty set of codes, so it suppresses nothing; use `raven.ignore=TRUE` to silence the whole chunk.
 
-- **in-chunk directive** `# raven: ignore-chunk` anywhere in the chunk body
-  (optionally `# raven: ignore-chunk[undefined-variable]`):
+Or put the directive `# raven: ignore-chunk` anywhere in the chunk body, optionally with codes as in `# raven: ignore-chunk[undefined-variable]`:
 
-  ````markdown
-  ```{r}
-  # raven: ignore-chunk
-  result <- some_undefined_thing
-  ```
-  ````
+````markdown
+```{r}
+# raven: ignore-chunk
+result <- some_undefined_thing
+```
+````
 
-Both map the chunk body onto the same machinery as the file/line/block
-[ignore directives](directives.md#ignore-directives), so the `[code]` selector
-is enforced the same way. For finer control you can still use ordinary
-`# raven: ignore` / `# raven: ignore-next` / `# raven: ignore-start` …
-`# raven: ignore-end` markers inside a chunk body — they work exactly as in a
-plain `.R` file.
+Both work like the file, line, and block [ignore directives](directives.md#ignore-directives), so the `[code]` selector behaves the same way. For finer control, the ordinary `# raven: ignore`, `# raven: ignore-next`, and `# raven: ignore-start` … `# raven: ignore-end` markers work inside a chunk body exactly as in a plain `.R` file. Other ways to silence diagnostics are in [Diagnostics](diagnostics.md).
 
 ## Keyboard shortcuts
 
@@ -101,27 +96,27 @@ plain `.R` file.
 | `Cmd+PageDown` | `Ctrl+PageDown` | Go to Next Chunk |
 | `Cmd+PageUp` | `Ctrl+PageUp` | Go to Previous Chunk |
 
-The letter-key shortcuts (`P`/`N`) are execution commands aligned with the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs a single neighbor chunk, Shift escalates to all chunks above/below. Navigation uses `PageDown`/`PageUp`. See [Keybinding Comparison](./keybinding-comparison.md) for a cross-tool reference.
+The letter-key shortcuts (`P`/`N`) run code and follow the [Quarto VS Code extension](https://quarto.org/docs/tools/vscode.html): unshifted runs one neighboring chunk, and Shift runs all chunks above or below. `PageDown`/`PageUp` only move the cursor. See [Keybindings](keybinding-comparison.md) for a comparison with other tools.
 
-In `.R` files without `# %%` cell markers the current-chunk shortcuts surface an information notification; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
+In `.R` files without `# %%` cell markers, the current-chunk shortcuts show an information notification; use [cell mode](#plain-r-cell-mode) to make them useful in plain `.R` files.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| **Run Current Chunk** | Sends the chunk at the cursor to R. |
-| **Run Current Chunk and Move** | Runs the current chunk, then moves the cursor into the next R chunk. |
-| **Run Above Chunks** | Runs every R chunk that ends before the cursor. The current chunk is not included. |
-| **Run Below Chunks** | Runs every R chunk whose header is strictly below the cursor. The current chunk is not included. |
-| **Run Current and Below Chunks** | Runs the chunk at the cursor plus every R chunk after it. |
-| **Run Previous Chunk** | Runs the R chunk immediately above the cursor (skipping non-R chunks). The cursor does not move. |
-| **Run Previous Chunk and Move** | Runs the previous R chunk and moves the cursor into its first body line (or the header line if the chunk is empty). Quarto's "Run Previous Chunk" behavior. |
-| **Run Next Chunk** | Runs the R chunk immediately below the cursor (skipping non-R chunks). The cursor does not move. |
-| **Run Next Chunk and Move** | Runs the next R chunk and moves the cursor into its first body line (or the header line if the chunk is empty). Quarto's "Run Next Chunk" behavior. |
-| **Run All Chunks** | Runs every R chunk in the document, top to bottom. |
-| **Go to Next Chunk** | Moves the cursor to the body of the next chunk (or its header line if the chunk is empty). Navigation visits every chunk, not just R chunks. |
-| **Go to Previous Chunk** | Moves the cursor to the body of the previous chunk (or its header line if the chunk is empty). Navigation visits every chunk, not just R chunks. |
-| **Select Current Chunk** | Selects the body of the chunk at the cursor (excludes header and closing fence). |
+| Run Current Chunk | Sends the chunk at the cursor to R. |
+| Run Current Chunk and Move | Runs the current chunk, then moves the cursor into the next R chunk. |
+| Run Above Chunks | Runs every R chunk that ends before the cursor. The current chunk is not included. |
+| Run Below Chunks | Runs every R chunk whose header is strictly below the cursor. The current chunk is not included. |
+| Run Current and Below Chunks | Runs the chunk at the cursor plus every R chunk after it. |
+| Run Previous Chunk | Runs the R chunk immediately above the cursor, skipping non-R chunks. The cursor does not move. |
+| Run Previous Chunk and Move | Runs the previous R chunk and moves the cursor to its first body line (or its header line if the chunk is empty). This is Quarto's "Run Previous Chunk" behavior. |
+| Run Next Chunk | Runs the R chunk immediately below the cursor, skipping non-R chunks. The cursor does not move. |
+| Run Next Chunk and Move | Runs the next R chunk and moves the cursor to its first body line (or its header line if the chunk is empty). This is Quarto's "Run Next Chunk" behavior. |
+| Run All Chunks | Runs every R chunk in the document, top to bottom. |
+| Go to Next Chunk | Moves the cursor to the body of the next chunk (or its header line if the chunk is empty). Visits every chunk, not just R chunks. |
+| Go to Previous Chunk | Moves the cursor to the body of the previous chunk (or its header line if the chunk is empty). Visits every chunk, not just R chunks. |
+| Select Current Chunk | Selects the body of the chunk at the cursor, without the header and closing fence. |
 
 ## CodeLens buttons
 
@@ -129,13 +124,11 @@ By default each R chunk header shows up to three buttons:
 
 ```text
 ▷ Run Chunk    ↘ Run Next Chunk    ↥ Run Above
-```{r}
-…
 ```
 
-Sibling-targeted lenses are hidden on chunks where they have nothing to point at: the first runnable chunk drops `↥ Run Above` and `← Run Previous` (and `↖ Run Previous Chunk`); the last runnable chunk drops `↧ Run Below`, `→ Run Next`, and `↘ Run Next Chunk`. Buttons for non-R languages are intentionally omitted.
+A button that targets a neighboring chunk is hidden when there is none. The first runnable chunk drops `↥ Run Above`, `← Run Previous`, and `↖ Run Previous Chunk`; the last drops `↧ Run Below`, `→ Run Next`, and `↘ Run Next Chunk`. Chunks in other languages get no buttons.
 
-The set of buttons (and their order) is controlled by `raven.chunks.codeLens.commands` — an array of run-command ids. The available ids are:
+`raven.chunks.codeLens.commands` sets which buttons appear and in what order. It is an array of these command ids:
 
 | Command id | Default label |
 |------------|---------------|
@@ -150,7 +143,7 @@ The set of buttons (and their order) is controlled by `raven.chunks.codeLens.com
 | `raven.runNextChunkAndMove` | `↘ Run Next Chunk` |
 | `raven.runAllChunks` | `↻ Run All` |
 
-Example — show four buttons in a custom order:
+For example, to show four buttons in a custom order:
 
 ```jsonc
 {
@@ -163,28 +156,22 @@ Example — show four buttons in a custom order:
 }
 ```
 
-Set the array to `[]` to hide all lenses while keeping the commands available from the palette and keybindings. Unknown command ids are silently ignored.
+Set the array to `[]` to hide all buttons while keeping the commands in the palette and on their keybindings. Unknown command ids are ignored.
 
-When a chunk's header sets `eval = FALSE`, the `▷ Run Chunk` and `▷⇣ Run & Move` labels gain a `(eval = FALSE)` suffix so you know the chunk would otherwise be skipped by `knitr` / `quarto render`.
+When a chunk's header sets `eval = FALSE`, the `▷ Run Chunk` and `▷⇣ Run & Move` labels gain an `(eval = FALSE)` suffix, so you know `knitr` / `quarto render` would skip the chunk.
 
-If you also have the Quarto extension installed, `.qmd` files will show two CodeLens rows — Raven's (when Raven's R console is active) and Quarto's. See [Coexistence with the Quarto extension](./coexistence.md#coexistence-with-the-quarto-extension) for what each row does and how to choose between them.
+With the Quarto extension also installed, `.qmd` files show two CodeLens rows: Raven's (when Raven's R console is active) and Quarto's. See [Coexistence with the Quarto extension](coexistence.md#coexistence-with-the-quarto-extension) for what each row does.
 
 ## Chunk options
 
-Raven parses the header inside `{…}` and recognizes:
+Raven reads the chunk header inside `{…}`: the label (the first bare identifier, such as `setup` in `{r setup}`) and comma-separated `key=value` options. Two options affect Raven:
 
-- The **label** — the first bare identifier (e.g. `setup` in `{r setup}`).
-- **Key-value options** — comma-separated `key=value` pairs.
+- `eval = FALSE` (or `eval = F`) in the header, or `#| eval: false` in the body, dims the chunk's background tint and suppresses diagnostics inside it. Its definitions and imports don't enter the scope of other chunks. The CodeLens still offers to run the chunk.
+- `raven.ignore` suppresses Raven's diagnostics for the chunk body; see [Suppressing diagnostics in a chunk](#suppressing-diagnostics-in-a-chunk).
 
-Two options affect Raven specifically:
+Raven keeps every other option but doesn't interpret it.
 
-- `eval = FALSE` (or `eval = F`) in the header, or `#| eval: false` in the body, dims the chunk's background tint and suppresses diagnostics inside it. Its definitions and imports do not enter the scope of other chunks. The CodeLens still offers to run the chunk manually.
-- `raven.ignore` — suppresses Raven's diagnostics for the chunk body: `raven.ignore=TRUE` silences everything, `raven.ignore="undefined-variable, line-length"` narrows it to the listed codes (`raven.ignore=FALSE` is the default no-op). See [Suppressing diagnostics in a chunk](#suppressing-diagnostics-in-a-chunk).
-
-Every other option is preserved on the parsed chunk but Raven does not interpret it.
-
-For Quarto and R Markdown, Raven also reads `eval` from the contiguous block of
-`#| ` YAML option lines immediately after the opening fence:
+In Quarto and R Markdown, Raven also reads `eval` from the `#| ` YAML option lines directly after the opening fence:
 
 ````qmd
 ```{r}
@@ -194,26 +181,15 @@ unfinished <- (
 ```
 ````
 
-A body `eval` option overrides the header, so `#| eval: true` re-enables a
-chunk with header `eval=FALSE`. A blank line, ordinary comment, or R code ends
-the option block. Nested `eval` keys and text inside captions are not chunk
-options. Raven infers YAML booleans `false`, `False`, and `FALSE`; quoted values and expressions
-such as `!expr` do not disable analysis. Invalid options, aliases, merge keys,
-and explicit tags leave analysis enabled. Mapping keys must be ASCII names
-such as `eval`, `fig-width`, or `fig.cap`, not numeric, boolean, null, or
-collection keys. This also applies inside nested option values. Mappings in
-flow sequences need braces, such as `[{name: value}]` instead of `[name: value]`.
-Parsing is limited to 64 KiB of body options and bounded nesting. R-style
-`#| eval=FALSE` body options are not interpreted. These rules do not apply to
-`.R` cells or ordinary Markdown fences.
+A body `eval` option overrides the header, so `#| eval: true` re-enables a chunk whose header says `eval=FALSE`. The exact parsing rules are under [Details](#details).
 
 ## Highlighting
 
-Each R chunk gets a faint background tint via two themable colors:
+Each R chunk gets a faint background tint from two theme colors:
 
 | Color id | Used for |
 |----------|----------|
-| `raven.chunk.activeBackground` | Default runnable R chunks. |
+| `raven.chunk.activeBackground` | Runnable R chunks. |
 | `raven.chunk.inactiveBackground` | Chunks with `eval = FALSE`. Lower opacity by default. |
 
 Customize them in `settings.json`:
@@ -227,17 +203,17 @@ Customize them in `settings.json`:
 }
 ```
 
-Set `raven.chunks.highlight.enabled` to `false` to turn the background off entirely.
+Set `raven.chunks.highlight.enabled` to `false` to turn the background off.
 
 ## Plain `.R` cell mode
 
-A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until **whichever comes first**:
+A line matching `# %%`, `## %%`, `### %%`, … starts a new cell. The cell extends until whichever comes first:
 
 1. The next `# %%` marker.
-2. An RStudio-style section divider (a comment line ending in 4+ `-`, `#`, `+`, `=`, or `*` characters — for example `# Title ====`, `# Setup ----`, `# Section #####`). Roxygen doc-comment lines (`#'`) are excluded, so a line like `#' @param x A value -----` does not end a cell.
-3. End of file.
+2. An RStudio-style section divider: a comment line ending in 4 or more `-`, `#`, `+`, `=`, or `*` characters, such as `# Title ====`, `# Setup ----`, or `# Section #####`. Roxygen lines (`#'`) don't count, so `#' @param x A value -----` doesn't end a cell.
+3. The end of the file.
 
-This matches VS Code's native interactive-cell convention used by the Jupyter extension and brings parity with vscode-R's section dividers.
+This follows VS Code's interactive-cell convention used by the Jupyter extension, and matches vscode-R's section dividers.
 
 ```r
 # %% Load
@@ -253,7 +229,7 @@ Run Current Chunk on any line inside a cell sends that cell to the R console.
 
 ### Section dividers as cell boundaries
 
-When you mix `# %%` cells with RStudio section dividers, the divider terminates the surrounding cell. The divider line itself stays in the prior cell; any code between the divider and the next `# %%` is **not** part of a cell and won't be sent by `Run Current Chunk`.
+When you mix `# %%` cells with RStudio section dividers, a divider ends the cell around it. The divider line itself stays in the earlier cell; code between the divider and the next `# %%` isn't in any cell, and Run Current Chunk won't send it.
 
 ```r
 # %% load
@@ -265,14 +241,49 @@ helper <- function() 1
 mtcars |> mutate(x = helper())
 ```
 
-In the example above the `load` cell ends at `# Setup ----`. The `helper <- function() 1` line is orphan — it belongs to neither cell. A line that matches both forms (for example `# %% ====`) is treated as a cell marker, so you can still use section-style decoration on a cell header without losing the cell-start meaning.
+Here the `load` cell ends at `# Setup ----`, and the `helper <- function() 1` line belongs to neither cell. A line that matches both forms (for example `# %% ====`) is a cell marker, so you can decorate a cell header like a section without losing the cell.
 
 ### Active-cell border
 
-The cell containing the cursor gets a top and bottom border so you can see at a glance which cell `Run Current Chunk` will run. Turn it off with `raven.chunks.activeCellIndicator: false`. The colors are themable via `raven.chunk.activeCellBorderTop` and `raven.chunk.activeCellBorderBottom`.
+The cell containing the cursor gets a top and bottom border, so you can see which cell Run Current Chunk will run. Turn it off with `raven.chunks.activeCellIndicator: false`. The colors are the theme colors `raven.chunk.activeCellBorderTop` and `raven.chunk.activeCellBorderBottom`.
+
+## Settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `raven.chunks.codeLens.commands` | Run Chunk, Run Next Chunk, Run Above | Which CodeLens buttons appear, in order; see [CodeLens buttons](#codelens-buttons) |
+| `raven.chunks.highlight.enabled` | `true` | Background tint on R chunks and `# %%` cells |
+| `raven.chunks.activeCellIndicator` | `true` | Border around the `# %%` cell containing the cursor |
+
+See the [settings reference](settings-reference.md) for all settings.
 
 ## Limitations
 
-- `Raven: Knit Preview` (in this extension) runs `knitr::knit` plus Raven's HTML render pipeline for `.Rmd` / `.Rmarkdown` files. Pandoc export (HTML/PDF/Word) is invoked separately by the `Raven: Knit: Export to …` commands. See [docs/knit.md](knit.md). For `.qmd` files Raven defers to `quarto.quarto`'s `Quarto: Render` / `Quarto: Preview`.
-- Nested chunks (the inner chunk inside an outer chunk's body) are not supported — the inner chunk header is treated as ordinary content of the outer chunk.
-- `eval = !my_condition` and other dynamic option expressions are read literally; Raven does not evaluate R to determine `eval`.
+- Whole-document rendering is separate from chunks: [Knit Preview](knit.md) runs `.Rmd` / `.Rmarkdown` files, and [Quarto Preview and Render](quarto.md) handle `.qmd` files.
+- Nested chunks (a chunk inside another chunk's body) are not supported; the inner chunk header is ordinary content of the outer chunk.
+- `eval = !my_condition` and other computed option values are read literally; Raven doesn't run R to work out `eval`.
+
+## Details
+
+<details markdown="1">
+<summary>Exactly how Raven reads <code>#| eval</code> body options</summary>
+
+- The option block is the contiguous run of `#| ` lines directly after the opening fence. A blank line, ordinary comment, or R code ends it.
+- Nested `eval` keys and text inside captions are not chunk options.
+- Raven treats the YAML booleans `false`, `False`, and `FALSE` as false. Quoted values and expressions such as `!expr` do not disable analysis.
+- Invalid options, aliases, merge keys, and explicit tags leave analysis enabled.
+- Mapping keys must be ASCII names such as `eval`, `fig-width`, or `fig.cap`, not numeric, boolean, null, or collection keys. This also applies inside nested option values.
+- Mappings in flow sequences need braces, such as `[{name: value}]` instead of `[name: value]`.
+- Parsing is limited to 64 KiB of body options and bounded nesting.
+- R-style `#| eval=FALSE` body options are not interpreted.
+- These rules don't apply to `.R` cells or ordinary Markdown fences.
+
+</details>
+
+## See also
+
+- [R console](r-console.md)
+- [R Markdown preview and export](knit.md)
+- [Quarto](quarto.md)
+- [Keybindings](keybinding-comparison.md)
+- [Coexistence with other R extensions](coexistence.md)

@@ -1,25 +1,39 @@
 # Directives
 
-Raven recognizes special comment directives that provide hints the static analyzer cannot infer on its own. Directives cover cross-file relationships, working directory context, symbol declarations, and diagnostic suppression.
+[Docs](README.md) › Reference
 
-## General Syntax
+Directives are `# raven:` comments that tell Raven what it can't work out from your code: which files source each other, the working directory, names created at runtime, how a function evaluates its arguments, and which diagnostics to silence.
 
-**`# raven:` is the canonical prefix for every directive family** — cross-file relationships, working directory, declarations, and diagnostic suppression alike. The legacy **`@lsp-`** prefix remains a permanent, backward-compatible alias for every directive: `# raven: source utils.R` and `# @lsp-source utils.R` are exactly equivalent, as are `# raven: sourced-by ../main.R` / `# @lsp-sourced-by ../main.R`, `# raven: cd /data` / `# @lsp-cd /data`, and so on. You never need to mix the two; pick `# raven:` for new code.
+| Directive | What it tells Raven | Where it goes |
+|---|---|---|
+| [`# raven: source <path>`](#forward-directives) | This file sources `<path>` at this line | Anywhere |
+| [`# raven: sourced-by <path>`](#backward-directives) | This file is sourced by `<path>` | Header |
+| [`# raven: cd <dir>`](#working-directory-directives) | Resolve paths in this file from `<dir>` | Header |
+| [`# raven: self-contained`](#self-contained-sourced-files) | Analyze this file without its callers' bindings | Header |
+| [`# raven: var <name>`](#variable-declarations) | `<name>` exists from the next line on | Anywhere |
+| [`# raven: func <name>(<formals>)`](#function-declarations) | Function `<name>` exists, with these formals | Anywhere |
+| [`# raven: nse <name>(<formals>)`](#nse-declarations) | These arguments of `<name>` are captured, not evaluated | Anywhere |
+| [`# raven: ignore`, `ignore-next`, `ignore-file`, …](#ignore-directives) | Silence diagnostics | Trailing, or anywhere |
 
-All directives must appear on their own comment line (starting with `#`, optionally indented). They are not recognized in trailing comments like `x <- 1 # raven: source file.R`. The exceptions are the line-level ignore markers `# raven: ignore` / `# raven: expect` (and their aliases `@lsp-ignore` / `@lsp-expect`), which work as trailing comments.
+## General syntax
 
-All directives support optional colon and quotes:
+`# raven:` is the prefix for every directive family. The older `@lsp-` prefix is a permanent alias for every directive: `# raven: source utils.R` and `# @lsp-source utils.R` are equivalent, as are `# raven: sourced-by ../main.R` and `# @lsp-sourced-by ../main.R`, `# raven: cd /data` and `# @lsp-cd /data`, and so on. Use `# raven:` in new code; you never need to mix the two.
+
+Directives must be on their own comment line, starting with `#` and optionally indented. Raven doesn't recognize them in trailing comments like `x <- 1 # raven: source file.R`. The exceptions are the line-level ignore markers `# raven: ignore` and `# raven: expect` (and their aliases `@lsp-ignore` and `@lsp-expect`), which work as trailing comments.
+
+Every directive accepts an optional colon and quotes:
+
 ```r
 # raven: sourced-by ../main.R
 # raven: sourced-by: "../main.R"
 # raven: sourced-by: '../main.R'
 ```
 
-**Header-only directives:** Backward directives and working directory directives must appear in the **file header** — the region of consecutive blank and comment lines at the top of the file, before any code. They are ignored if placed after the first line of code. Forward directives, declaration directives, and ignore directives can appear anywhere.
+**Header-only directives.** Backward directives, working-directory directives, and `self-contained` must be in the file header: the consecutive blank and comment lines at the top of the file, before any code. After the first line of code they are ignored. Forward, declaration, and ignore directives can go anywhere.
 
-## Forward Directives
+## Forward directives
 
-Declare that this file sources another file. Useful when the path is dynamic or conditional:
+Declare that this file sources another file. Use it when the path is dynamic or conditional:
 
 ```r
 # raven: source utils/helpers.R
@@ -28,7 +42,7 @@ Declare that this file sources another file. Useful when the path is dynamic or 
 # @lsp-source utils/helpers.R       # alias (also @lsp-run / @lsp-include)
 ```
 
-Symbols from the target file become available after the directive's line. Optional `line=` parameter overrides the call-site:
+Symbols from the target file become available after the directive's line. An optional `line=` parameter moves that point:
 
 ```r
 # raven: source utils/helpers.R line=25
@@ -40,11 +54,13 @@ Symbols from the target file become available after the directive's line. Option
 # Symbols become available at end of file (line=end is an accepted synonym)
 ```
 
-**Path resolution:** Forward directives respect `# raven: cd` (same as `source()` calls).
+**Path resolution.** Forward directives resolve exactly like `source()` calls: relative to the file's directory, respecting `# raven: cd`, with the workspace-root fallback when no working directory is in effect. See [Path resolution](cross-file.md#path-resolution).
 
-## Backward Directives
+A forward directive without `line=` that names the same file as an earlier `source()` call is reported as a [redundant directive](diagnostics.md#circular-dependency-chain-depth-and-redundant-directives).
 
-Declare that this file is sourced by another file (header-only):
+## Backward directives
+
+Declare that this file is sourced by another file. These are header-only:
 
 ```r
 # raven: sourced-by ../main.R
@@ -54,9 +70,10 @@ Declare that this file is sourced by another file (header-only):
 ```
 
 Optional parameters:
-- `line=N` — 1-based line number in parent where the source() call occurs
-- `line=eof` or `line=end` — use scope at end of parent file
-- `match="pattern"` — text pattern to locate the source() call in parent
+
+- `line=N`: the 1-based line in the parent where the `source()` call is.
+- `line=eof` or `line=end`: use the scope at the end of the parent file.
+- `match="pattern"`: text to search for in the parent to find the `source()` call.
 
 ```r
 # raven: sourced-by ../main.R line=15
@@ -72,15 +89,15 @@ Optional parameters:
 # Searches for "source(" in main.R and uses the first match
 ```
 
-**Call-site inference:** When neither `line=` nor `match=` is specified, Raven scans the parent for `source()` calls referencing this file. If none found, the configured default (`assumeCallSite`) is used.
+**Call-site inference.** Without `line=` or `match=`, Raven scans the parent for `source()` calls that reference this file. If it finds none, it uses the `raven.crossFile.assumeCallSite` setting (default `"end"`).
 
-**Path resolution:** Backward directives resolve relative to the file's own directory and **ignore** `# raven: cd`.
+**Path resolution.** Backward directives resolve relative to the file's own directory and **ignore** `# raven: cd`. They get the same case-only-mismatch leniency as forward paths, but never the workspace-root fallback. See [Case-only mismatches](cross-file.md#case-only-mismatches).
 
-**Per-file opt-out of auto mode:** If a file has explicit `# raven: sourced-by` directives, auto-inferred backward edges are disabled for that file.
+**Per-file opt-out of auto mode.** A file with an explicit `# raven: sourced-by` has auto-inferred backward links turned off. See [Backward dependency modes](cross-file.md#backward-dependency-modes).
 
-## Working Directory Directives
+## Working directory directives
 
-Set working directory context for path resolution (header-only):
+Set the working directory used to resolve paths in this file. These are header-only:
 
 ```r
 # raven: cd /data/scripts
@@ -92,21 +109,24 @@ Set working directory context for path resolution (header-only):
 # @lsp-cd /data/scripts                    # alias (every synonym also has an @lsp- form)
 ```
 
-Path interpretation:
-- Paths starting with `/` are workspace-root-relative (e.g., `/data` → `<workspace>/data`)
-- Other paths are file-relative (e.g., `../shared` → parent directory's `shared`)
+How the path is read:
 
-**What it affects:**
+- A path starting with `/` is relative to the workspace root: `/data` means `<workspace>/data`.
+- Any other path is relative to the file: `../shared` means the parent directory's `shared`.
 
-| Directive Type | Uses the `cd` directive? |
+What it affects:
+
+| Directive type | Uses the `cd` directive? |
 |---|---|
 | Forward (`source` / `run` / `include`) | **Yes** |
 | `source()` calls | **Yes** |
 | Backward (`sourced-by` / `run-by` / `included-by`) | **No** |
 
-### Working Directory Inheritance
+While a `cd` is in effect, explicit or inherited, Raven doesn't apply the workspace-root fallback, and it overrides the implicit [testthat/testit working directory](cross-file.md#implicit-testthattestit-working-directory).
 
-When a child file uses a backward directive without its own `cd` directive, it inherits the working directory from its parent. Inheritance is transitive. An explicit `cd` directive in the child always takes precedence.
+### Working directory inheritance
+
+A child file that uses a backward directive and has no `cd` of its own inherits the working directory from its parent. Inheritance carries through any number of levels. An explicit `cd` in the child always wins.
 
 ```r
 # parent.R
@@ -121,7 +141,7 @@ source("child.R")
 source("utils.R")  # Resolves to <workspace>/data/project/utils.R
 ```
 
-## Self-Contained Sourced Files
+## Self-contained sourced files
 
 ```r
 # raven: self-contained
@@ -130,58 +150,27 @@ source("utils.R")  # Resolves to <workspace>/data/project/utils.R
 # @lsp-standalone            # alias
 ```
 
-Place `# raven: self-contained` in the **header** of a sourced helper, setup,
-or library-style file to declare that it does not rely on caller-provided
-bindings. It takes no arguments and is **header-only** (it must appear before
-any code; a `self-contained` or `standalone` token after code is ignored).
+Put `# raven: self-contained` in the **header** of a sourced helper, setup, or library-style file to declare that it doesn't rely on bindings its callers provide. It takes no arguments and is header-only: a `self-contained` or `standalone` token after code is ignored.
 
-A self-contained file is resolved **in isolation** from the files that
-`source()` it - both when computing its own diagnostics and when it is pulled in
-as another file's forward `source()` child:
+Raven analyzes a self-contained file **in isolation** from the files that `source()` it, both for its own diagnostics and when another file pulls it in as a forward `source()` child:
 
-- It does **not** inherit variables, loaded packages, or working directory from
-  any caller - no backward parent-prefix walk, and a caller's forward resolution
-  feeds it canonical, caller-independent inputs. Its cross-file scope is a pure
-  function of the file itself and its own forward `source()` closure, not of who
-  sources it.
-- It **still contributes** its own definitions *and* its own `library()`-loaded
-  packages forward to callers (the normal additive `source()` merge is
-  unchanged). A module that loads the packages its callers rely on still works.
-- Its own `rm()`/`remove()` of its own symbols still affects what it exports
-  (unchanged); it never removes a caller's bindings.
+- It does **not** inherit variables, loaded packages, or the working directory from any caller. Its scope depends only on the file itself and the files it sources, not on who sources it.
+- It **still contributes** its own definitions *and* its own `library()` packages to callers, as any sourced file does. A module that loads the packages its callers rely on still works.
+- Its own `rm()`/`remove()` of its own symbols still affects what it exports, but it never removes a caller's bindings.
 
-**When to use it.** A self-contained helper/setup file that is sourced by many
-others, especially when that hub also sources a deep or broad chain of files.
-Declaring it self-contained both **prevents** caller-union over-approximation
-(one caller's bindings leaking into the file's analysis on behalf of another)
-and can make Raven much faster on deeply nested, high-fan-out source graphs.
+**When to use it.** On a helper or setup file that many others source, especially one that itself sources a deep or broad chain of files. It stops one caller's bindings from leaking into the file's analysis on behalf of another, and can make Raven much faster on deeply nested, widely sourced graphs. See [Performance on large projects](cross-file-analysis-performance.md).
 
-**Opt-in and safe-direction.** You vouch that the file is self-contained. If it
-actually relies on a binding a caller provides, the worst case is a
-false-positive *"undefined variable"* **inside the self-contained file itself** -
-never a hidden real bug in a caller. (Mark the *root* setup file that provides
-the shared environment as self-contained, not a leaf that consumes it.)
+**You vouch for it.** If the file actually relies on a binding a caller provides, the worst case is a false *undefined variable* warning **inside the self-contained file itself**, never a hidden bug in a caller. Mark the *root* setup file that provides the shared environment as self-contained, not a leaf that consumes it.
 
-**Interactions.** `self-contained` only suppresses the *caller -> file*
-direction. It composes with `# raven: cd` (the file uses its own working
-directory), `# raven: nse` / `# raven: func` (directive propagation over
-`source()` edges is unaffected), package mode, and per-call `local = TRUE` /
-`sys.source()` (which govern how a *caller* sources the file, independent of
-the file's own isolation). See [Speeding Up Cross-File Analysis](cross-file-analysis-performance.md)
-for the practical guidance and [Cross-File Analysis](cross-file.md) for the
-resolution model.
+**Interactions.** `self-contained` only cuts the caller-to-file direction. It works alongside `# raven: cd` (the file uses its own working directory), `# raven: nse` and `# raven: func` (their propagation across `source()` links is unaffected), package mode, and a caller's `local = TRUE` or `sys.source()` (which govern how a *caller* sources the file, separately from the file's own isolation). See [Cross-file analysis](cross-file.md) for the resolution model.
 
-## Declaration Directives
+## Declaration directives
 
-Declare symbols created dynamically that the parser cannot detect. These suppress false-positive "undefined variable" diagnostics for symbols from `eval()`, `assign()`, `load()`, or external data loading.
+Declare symbols created at runtime that Raven can't see. They stop false *undefined variable* warnings for symbols from `eval()`, `assign()`, `load()`, or external data loading.
 
-Declaration directives work in any R file, whether or not it participates in
-cross-file chains. In Stan, local `# raven: var` and `# raven: func`
-declarations are also honored by the conservative undeclared-variable pass from
-the following line onward. This is local only: it does not create R scope or
-cross-file relationships for a `.stan` file.
+Declaration directives work in any R file, whether or not it is part of a `source()` chain. In Stan, local `# raven: var` and `# raven: func` declarations are also honored by the conservative undeclared-variable check, from the following line onward. This is local only: it doesn't create R scope or cross-file links for a `.stan` file.
 
-### Variable Declarations
+### Variable declarations
 
 ```r
 # raven: var myvar
@@ -191,9 +180,9 @@ cross-file relationships for a `.stan` file.
 # @lsp-var myvar                  # alias (every synonym also has an @lsp- form)
 ```
 
-Raven also treats an `exists("myvar")` call as an automatic `# raven: var myvar` — a probe like `if (!exists("myvar")) myvar <- default` declares `myvar` without any directive, with the same next-line visibility as the directive: the name resolves from the line *after* the `exists()` call onward, and a use before it is still flagged. See [Undefined Variables](diagnostics.md#undefined-variables) for the exact rules (string-literal name; next-line visibility).
+Raven also treats an `exists("myvar")` call as an automatic `# raven: var myvar`. A probe like `if (!exists("myvar")) myvar <- default` declares `myvar` with no directive, with the same next-line visibility: the name resolves from the line *after* the `exists()` call, and a use before it is still flagged. See [`undefined-variable`](diagnostics.md#undefined-variables) for the exact rules (string-literal name, next-line visibility).
 
-### Function Declarations
+### Function declarations
 
 ```r
 # raven: func myfunc
@@ -203,7 +192,7 @@ Raven also treats an `exists("myvar")` call as an automatic `# raven: var myvar`
 # @lsp-func myfunc                # alias (every synonym also has an @lsp- form)
 ```
 
-`# raven: func` can also declare a formal list alongside the symbol, which records the order of parameters for use by `# raven: nse` positional matching (see below). You can paste a real signature — `= default` suffixes are dropped, keeping just the formal names:
+`# raven: func` can also declare a formal list, which records the parameter order for `# raven: nse` positional matching (see below). You can paste a real signature; `= default` parts are dropped, keeping just the formal names:
 
 ```r
 # raven: func my_func(data, x, y)        # declares existence + formal order
@@ -212,14 +201,11 @@ Raven also treats an `exists("myvar")` call as an automatic `# raven: var myvar`
 # raven: func "my data fn"               # quote a name with spaces / special chars
 ```
 
-The unquoted name accepts a bare `name` or a single `pkg::name` qualifier — including dotted names like `make.names`, since `.` is a normal identifier character in R. Only a name containing characters *outside* `[A-Za-z0-9._]` (names with spaces, replacement functions like `` `dim<-` ``) must use the quoted form. A default whose value itself contains a comma or parentheses (`x = c(1, 2)`) is out of scope — keep formal lists to names and simple literal defaults.
+An unquoted name can be a bare `name` or a single `pkg::name` qualifier, including dotted names like `make.names`, since `.` is an ordinary identifier character in R. Only a name with characters *outside* `[A-Za-z0-9._]`, such as a name with spaces or a replacement function like `` `dim<-` ``, needs the quoted form. A default whose value contains a comma or parentheses (`x = c(1, 2)`) isn't supported; keep formal lists to names and simple literal defaults.
 
-### NSE Declarations
+### NSE declarations
 
-Teach Raven that a function uses non-standard evaluation (NSE), so bare
-identifiers in its captured arguments are not flagged as undefined variables.
-For examples and guidance on when to use this directive, see
-[Non-Standard Evaluation](non-standard-evaluation.md).
+Tell Raven that a function uses non-standard evaluation (NSE), so bare names in its captured arguments aren't flagged as undefined variables. For examples and when to use it, see [Non-standard evaluation](non-standard-evaluation.md).
 
 ```r
 # raven: nse my_func              # whole-call: every argument is NSE
@@ -231,63 +217,18 @@ For examples and guidance on when to use this directive, see
 # @lsp-nse my_func(x)             # alias (optional colon/spacing also accepted)
 ```
 
-As with `# raven: func`, the callee name accepts a bare `name` or a single
-`pkg::name` qualifier unquoted; a name with characters outside `[A-Za-z0-9._]`
-(e.g. spaces) must use the quoted form. The NSE policy is consulted only for
-ordinary `callee(args)` calls, so it cannot apply to operators (`a %+% b` is not
-a call). An operator name contains characters outside `[A-Za-z0-9._]`, so it
-would have to use the quoted form (`# raven: nse "%+%"`) to parse at all — and
-even then it is inert, because operator calls are not `callee(args)` calls.
+As with `# raven: func`, the function name can be a bare `name` or a single `pkg::name` unquoted, and a name with characters outside `[A-Za-z0-9._]`, such as spaces, must be quoted.
 
-A literal `...` in the captured list declares that the arguments a call passes
-through the function's `...` are captured (checked formals before `...` are
-still verified). Combine it with named formals, e.g. `# raven: nse my_func(x, ...)`.
+The declaration applies only to ordinary `name(args)` calls, so it can't apply to operators: `a %+% b` isn't such a call. An operator name has characters outside `[A-Za-z0-9._]`, so it would have to be quoted (`# raven: nse "%+%"`) to parse at all, and even then it has no effect.
 
-`# raven: nse` is position-aware: it applies to calls **after** the directive
-line, and the most recent declaration for a function wins. It is an
-authoritative declaration that overrides Raven's own inference for that callee —
-but it is **not** a blanket diagnostic ignore: it declares a reusable
-argument-evaluation policy for the named function. An *unqualified* declaration
-overrides even a local `name <- function(...)` definition's inferred policy
-(R calls the named binding, and you are declaring how it evaluates its
-arguments); a *qualified* one yields to a local binding of the bare name, as
-below.
+A literal `...` in the captured list means the arguments a call passes through the function's `...` are captured. Formals listed before `...` that aren't captured are still checked. Combine it with named formals, as in `# raven: nse my_func(x, ...)`.
 
-A qualified declaration (`pkg::my_func`) matches both `pkg::my_func(...)` calls
-and unqualified `my_func(...)` calls when `pkg` is in scope (loaded via
-`library()` or package imports) — except when a local binding shadows the bare
-name, since R would then invoke the local value rather than `pkg::my_func`.
+`# raven: nse` is position-aware: it applies to calls **after** the directive line, and the most recent declaration for a function wins. It overrides Raven's own inference for that function, but it is **not** a blanket diagnostic ignore: it declares how the named function evaluates its arguments, for every call.
 
-#### `# raven: nse` is deliberately coarse
+- An *unqualified* declaration overrides even a local `name <- function(...)` definition's inferred policy, since R calls that binding and you are declaring how it evaluates its arguments.
+- A *qualified* declaration (`pkg::my_func`) matches both `pkg::my_func(...)` and unqualified `my_func(...)` calls when `pkg` is in scope (through `library()` or package imports). The exception is when a local binding shadows the bare name, since R would then call the local value rather than `pkg::my_func`.
 
-`# raven: nse` is a file-level, name-keyed, authoritative override. Apart from
-the position-awareness of the directive line itself (it governs calls *after*
-it), it is intentionally **not**:
-
-- **Scope-aware.** It applies to every call of the named function in the file,
-  including calls inside nested function bodies that locally rebind the name — a
-  nested helper sharing a top-level name is still governed by the file-level
-  directive, not its inner definition.
-- **`library()`-position-aware.** Whether a `pkg::` qualifier's package is "in
-  scope" is judged file-wide, so a qualified declaration can govern a bare call
-  even if the matching `library(pkg)` appears later in the file.
-- **Arity- or signature-aware.** It does not validate the captured formals
-  against the callee's real definition. In particular, `# raven: nse f(...)`
-  captures a call's trailing arguments even if `f` does not actually declare a
-  `...` formal.
-
-This is by design: the directive is an opt-in escape hatch where you take
-responsibility for declaring an accurate policy. It **replaces** Raven's own
-inference for the named callee rather than merely adding to it, so an inaccurate
-or stale directive cuts both ways — one *broader* than the real NSE behavior
-hides diagnostics you may have wanted, while one *narrower* than Raven's own
-inference (for example declaring a partial capture on a function Raven already
-recognizes as data-masking) can re-surface diagnostics it would otherwise have
-suppressed.
-
-Named arguments are matched by formal name regardless of order. For
-**positional** arguments Raven needs the formal order, which it reads from a
-visible local definition or from a paired `# raven: func` declaration:
+Named arguments match by formal name, in any order. For **positional** arguments Raven needs the formal order, which it reads from a visible local definition or a paired `# raven: func` declaration:
 
 ```r
 # raven: func my_func(data, x, y)   # declares existence + formal order
@@ -295,18 +236,21 @@ visible local definition or from a paired `# raven: func` declaration:
 my_func(df, col_a, col_b)           # col_a, col_b suppressed; df checked
 ```
 
-Installed-package functions expose only export names (not formals) to the
-synchronous diagnostic pass, so positional matching for an installed-package
-callee also requires a paired `# raven: func` with formals.
+Raven's diagnostics know installed packages' export names but not their formals, so positional matching for a function from an installed package also needs a paired `# raven: func` with formals.
+
+#### `# raven: nse` is deliberately coarse
+
+`# raven: nse` is a file-level, name-keyed override. Apart from applying only to calls after its own line, it is deliberately **not**:
+
+- **Scope-aware.** It applies to every call of the named function in the file, including calls inside nested function bodies that rebind the name locally. A nested helper that shares a top-level name is still governed by the file-level directive, not by its inner definition.
+- **Aware of where `library()` is.** Whether a `pkg::` qualifier's package is in scope is judged for the whole file, so a qualified declaration can govern a bare call even if the matching `library(pkg)` comes later in the file.
+- **Checked against the signature.** Raven doesn't compare the captured formals with the function's real definition. In particular, `# raven: nse f(...)` captures a call's trailing arguments even if `f` has no `...` formal.
+
+This is by design: the directive is an opt-in escape hatch, and you're responsible for declaring an accurate policy. It **replaces** Raven's own inference for that function rather than adding to it, so a wrong or stale directive cuts both ways. One *broader* than the real behavior hides diagnostics you may have wanted. One *narrower* than Raven's own inference, such as a partial capture on a function Raven already treats as data-masking, can bring back diagnostics Raven would otherwise have suppressed.
 
 #### `# raven: nse` propagates across the source graph
 
-A `# raven: nse` declaration governs matching call sites in **every file
-connected to it through the resolved `source()` graph** — not just the file that
-physically contains it. So you can declare a helper's NSE contract next to its
-`library()` call, its definition, or in a sourced setup file, and it suppresses
-the corresponding false positives wherever the helper is called. Propagation
-works in both directions and transitively:
+A `# raven: nse` declaration governs matching calls in **every file connected to it through `source()`**, not just the file it's written in. Declare a helper's NSE contract next to its `library()` call, its definition, or in a sourced setup file, and it suppresses the matching false positives wherever the helper is called. Propagation works in both directions and through any number of hops:
 
 ```r
 # setup.R
@@ -318,32 +262,20 @@ source("setup.R")
 lmer(undefined_var)   # `undefined_var` suppressed — lmer is declared NSE in setup.R
 ```
 
-Cross-file propagation is intentionally **coarse and file-level**: a propagated
-declaration ignores its original line in the other file and governs the whole
-connected file. Within the file that *physically contains* the directive, the
-usual position-aware, latest-wins behavior still applies, and an own directive
-takes precedence over one propagated from a connected file. A directive
-propagated from another file is consulted *below* the precise built-in policy
-tables, so it never coarsens a known verb (e.g. `dplyr::filter`) — it governs
-callees that would otherwise be checked as standard-eval (like `lmer`). Two
-unconnected files never share NSE directives. The context an NSE directive needs
-to resolve — the `library()` call, a `# raven: func` formal-order declaration —
-may live in any connected file and may appear before or after the directive.
+How a propagated declaration ranks:
 
-Propagation reuses the same dependency graph as cross-file scope analysis, so it
-honors the `# raven: cd` and workspace-root path-resolution rules and the
-`max_chain_depth` limit, and editing a directive in any connected file
-revalidates the dependents that rely on it. A propagated **per-formal** directive
-needs the callee's formal order from a `# raven: func` declaration in some
-connected file; without one it falls back to named-argument-only matching. A
-local `name <- function(...)` definition does **not** supply that order — a local
-binding *shadows* the propagated directive entirely (R would call the local
-value, so the local definition's own inferred policy applies instead), exactly as
-a local binding overrides a qualified `# raven: nse pkg::name`.
+- In another connected file, it ignores its original line and governs the whole file.
+- In the file that contains it, the usual position-aware, latest-wins rule applies, and that file's own directive beats one propagated from a connected file.
+- Raven consults it after its precise built-in policy tables, so it never loosens a function Raven already models (such as `dplyr::filter`). It governs functions that would otherwise be checked as standard evaluation, like `lmer`.
+- A local `name <- function(...)` definition **shadows** a propagated declaration entirely, because R would call the local value, so the local definition's own inferred policy applies. A local binding overrides a qualified `# raven: nse pkg::name` the same way.
 
-### Position-Aware Behavior
+Two files that aren't connected never share NSE declarations. The context a declaration needs, such as the `library()` call or a `# raven: func` formal order, may be in any connected file, before or after the directive. A propagated **per-formal** declaration gets the function's formal order only from a `# raven: func` in some connected file; a local definition doesn't supply it. Without one, it matches named arguments only.
 
-Declared symbols are available starting from the next line (line N+1):
+Propagation uses the same dependency graph as cross-file scope, so it follows `# raven: cd`, the workspace-root fallback, and the `maxChainDepth` limit, and editing a directive in any connected file rechecks the files that rely on it. See [NSE directive propagation](cross-file.md#nse-directive-propagation).
+
+### Position-aware behavior
+
+Declared symbols are available from the next line on:
 
 ```r
 # raven: var data_from_api
@@ -355,9 +287,9 @@ x <- data_from_api  # ERROR: used before declaration
 # raven: var data_from_api
 ```
 
-### Cross-File Inheritance
+### Cross-file inheritance
 
-Declarations propagate to sourced child files when declared before the `source()` call:
+Declarations reach sourced child files when they come before the `source()` call:
 
 ```r
 # parent.R
@@ -365,7 +297,7 @@ Declarations propagate to sourced child files when declared before the `source()
 source("child.R")  # child.R can use shared_data
 ```
 
-### Use Cases
+### Use cases
 
 ```r
 # Dynamic assignment
@@ -383,95 +315,23 @@ eval(parse(text = code_string))
 # raven: func dynamic_function
 ```
 
-## Ignore Directives
+## Ignore directives
 
-Raven's primary suppression namespace is **`# raven:`**. It works both in the
-editor (LSP) and in `raven check`, and covers **all** diagnostics — the
-always-on analyzer diagnostics ([Diagnostics](diagnostics.md)) and the opt-in
-[style/lint rules](linting.md) alike. The legacy `@lsp-ignore` /
-`@lsp-ignore-next` markers remain permanent aliases for the line and next-line
-forms.
+Ignore directives silence diagnostics in the editor and in `raven check`, for both Raven's correctness diagnostics and the opt-in [lint rules](linting.md). [Suppressing diagnostics](diagnostics.md#suppressing-diagnostics) is the full reference, including which codes can be suppressed and lintr's `# nolint`.
 
-For Stan, these directives suppress conservative `undefined-variable`
-findings only; native `syntax-error` findings remain non-suppressible. A
-trailing `# raven: ignore` preserves and parses the Stan code before the marker,
-while standalone `ignore-next`, file, and block forms keep their normal line
-targeting.
+| Form | What it silences | Full rules |
+|---|---|---|
+| <a id="line-and-next-line"></a>`x # raven: ignore` (trailing), `# raven: ignore-next` (own line) | This line, or the next line | [Silence a line](diagnostics.md#per-line--raven-ignore) |
+| <a id="per-code-selector"></a>`# raven: ignore[undefined-variable, line-length]` | Only the listed codes | [Silence one code](diagnostics.md#silence-one-code) |
+| <a id="file-and-block-forms"></a>`# raven: ignore-file`, `# raven: ignore-start` … `# raven: ignore-end` | The whole file, or a block | [Silence a block or a whole file](diagnostics.md#silence-a-block-or-a-whole-file) |
+| <a id="expect--assert-that-a-suppression-is-used"></a>`# raven: expect`, `expect-next`, `expect[code]`, `expect-file`, `expect-start` / `expect-end` | Same as `ignore`, and reports an `unused-suppression` hint when nothing was silenced | [Get told when a suppression goes stale](diagnostics.md#get-told-when-a-suppression-goes-stale) |
+| <a id="chunk-level-suppression-r-markdown--quarto"></a>`# raven: ignore-chunk`, or the `raven.ignore` chunk option | A whole R Markdown or Quarto chunk | [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk) |
 
-### Line and next-line
+`# @lsp-ignore`, `# @lsp-ignore-next`, `# @lsp-expect`, and `# @lsp-expect-next` are permanent aliases. In Stan files, ignore directives silence only `undefined-variable`; see [Stan undeclared variables](diagnostics.md#stan-undeclared-variables).
 
-```r
-x <- foo # raven: ignore    # Trailing form: suppresses diagnostics on this line
-# raven: ignore-next        # Standalone form: suppresses diagnostics on the next line
+## See also
 
-x <- foo # @lsp-ignore      # Alias of `# raven: ignore`
-# @lsp-ignore-next          # Alias of `# raven: ignore-next`
-```
-
-A standalone `# raven: ignore` (or `# @lsp-ignore`) on its own line has no
-effect — comment lines carry no diagnostics. Use the `-next` form to suppress
-the following line, or place the marker as a trailing comment on the line you
-want suppressed. The plain `ignore` / `@lsp-ignore` line forms may appear as
-trailing comments; the `-next`, file, and block forms must be standalone (on
-their own line) — a trailing `x <- 1 # raven: ignore-next` is silently
-ignored.
-
-### Per-code selector
-
-An optional `[code]` selector narrows a suppression to one or more diagnostic
-codes, e.g. `# raven: ignore[undefined-variable]` or
-`x <- foo # @lsp-ignore[undefined-variable]`. List several codes
-comma-separated: `# raven: ignore[undefined-variable, line-length]`. The codes
-are the kebab-case names listed in [Diagnostics](diagnostics.md) and the lint
-rule names in [Linting](linting.md) (both `kebab-case` and lintr's `snake_case`
-spelling are accepted). A bare `# raven: ignore` with no selector suppresses
-every diagnostic on the target line. The selector is **enforced**: a
-`[code]` directive leaves diagnostics with other codes in place.
-
-### File and block forms
-
-```r
-# raven: ignore-file                     # suppress the whole file
-# raven: ignore-file[undefined-variable] # …only this code
-
-# raven: ignore-start                    # open a block
-x <- foo
-y <- bar
-# raven: ignore-end                      # close it (inclusive of both directive lines)
-```
-
-These cover both the analyzer diagnostics and the lint rules. An unterminated
-`ignore-start` extends to the end of the file. For lintr compatibility,
-`# nolint` / `# nolint start` / `# nolint end` also remain (lint diagnostics
-only) — see the [Linting suppression matrix](linting.md).
-
-### `expect` — assert that a suppression is used
-
-Every form above also comes in an **`expect`** flavor: `# raven: expect`,
-`# raven: expect-next`, `# raven: expect[code]`, `# raven: expect-file`,
-`# raven: expect-start` / `# raven: expect-end`, and the `@lsp-expect` /
-`@lsp-expect-next` aliases. `expect` suppresses exactly like `ignore`, but it
-also **asserts that it actually suppressed something**: if an `expect`
-directive matches no diagnostic, Raven reports an
-[`unused-suppression`](diagnostics.md) hint at the directive's line. This
-mirrors Rust's `#[expect]` and TypeScript's `@ts-expect-error`: use `ignore`
-for a silent suppression, `expect` when you want to be told once the underlying
-diagnostic is gone so the now-stale directive can be removed.
-
-```r
-result <- compute() # raven: expect[undefined-variable]
-# If `compute` later becomes defined/imported, the expect no longer suppresses
-# anything and Raven flags it as an unused suppression (a HINT) — your cue to
-# delete the directive.
-```
-
-A plain `ignore` is never reported as unused by default. Set
-[`raven.diagnostics.reportUnusedSuppressions`](configuration.md) to `true` to
-extend the unused-suppression sweep to **every** ignore directive
-(Pyright-style), not just `expect`.
-
-### Chunk-level suppression (R Markdown / Quarto)
-
-Inside `.Rmd` / `.qmd` documents you can suppress a whole chunk with the knitr
-chunk option `raven.ignore` or the in-chunk `# raven: ignore-chunk` directive.
-See [Code chunks](chunks.md#suppressing-diagnostics-in-a-chunk).
+- [Cross-file analysis](cross-file.md): how `source()` chains and paths resolve
+- [Non-standard evaluation](non-standard-evaluation.md): when to use `# raven: nse`
+- [Diagnostics](diagnostics.md#suppressing-diagnostics): suppression in full
+- [Performance on large projects](cross-file-analysis-performance.md): when to use `# raven: self-contained`

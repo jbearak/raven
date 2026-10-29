@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
+import { anchorsOf, parse } from "./docs/_lib/markdown";
+
 const repoRoot = path.resolve(__dirname, "..", "..");
 
 function readRepoFile(...parts: string[]): string {
@@ -130,11 +132,18 @@ describe("apt packaging release integration", () => {
   });
 
   test("CLI docs frame GitHub and Bitbucket setup as CI guidance", () => {
-    const docs = readRepoFile("docs", "cli.md");
-    expect(docs).toContain("## CI examples");
-    expect(docs).toContain("### GitHub Actions example");
-    expect(docs).toContain("### Bitbucket Pipelines example");
-    expect(docs.indexOf("## CI examples")).toBeLessThan(docs.indexOf("### GitHub Actions example"));
-    expect(docs.indexOf("### GitHub Actions example")).toBeLessThan(docs.indexOf("### Bitbucket Pipelines example"));
+    // ci.md is the single home of the CI templates.
+    const ci = readRepoFile("docs", "ci.md");
+    const github = ci.search(/^## GitHub Actions$/m);
+    const bitbucket = ci.search(/^## Bitbucket Pipelines$/m);
+    expect(github).toBeGreaterThan(-1);
+    expect(bitbucket).toBeGreaterThan(-1);
+    expect(github).toBeLessThan(bitbucket);
+
+    // cli.md keeps the legacy anchors old links point at.
+    const cliAnchors = anchorsOf(parse(readRepoFile("docs", "cli.md")));
+    for (const anchor of ["ci-examples", "github-actions-example", "bitbucket-pipelines-example"]) {
+      expect(cliAnchors.has(anchor), `docs/cli.md#${anchor}`).toBe(true);
+    }
   });
 });

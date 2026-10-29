@@ -1,0 +1,20 @@
+[
+  {
+    "path": "analysis.R",
+    "diagnostic": {
+      "range": {
+        "start": {
+          "line": 1,
+          "character": 11
+        },
+        "end": {
+          "line": 1,
+          "character": 17
+        }
+      },
+      "severity": 2,
+      "code": "undefined-variable",
+      "message": "scroes is not defined"
+    }
+  }
+]

@@ -1,61 +1,78 @@
-# Find References
+# Find references
 
-Raven locates all occurrences of a symbol — definitions and usages alike — across your project, not just the current file.
+[Docs](README.md) › Navigation and editing
 
-## How It Works
-
-When you invoke Find References (Shift+F12 / right-click → Find All References), Raven:
-1. Identifies the name of the identifier at the cursor.
-2. Searches the current file, all other open documents, and every workspace-indexed file for identifier nodes with that same name.
-3. Returns every match — both definition sites (assignments, function parameters) and usage sites.
-
-Find References is ordinarily a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. Static members imported through `box::use()` or supported `import::` calls are the exception: Raven follows their local definition or installed-package export identity so unrelated same-named members are excluded. See [Scope and pooling](#scope-and-pooling) and [selective-import member identity](#selective-import-member-identity).
-
-## Cross-File Scoping
-
-Because the search spans all open and indexed files, a definition in one file and its usages in another are returned together:
+Find references lists every place a name appears in your project, definitions and uses alike, not only in the current file.
 
 ```r
 # main.R
 source("utils.R")
-result <- helper_function(42)  # ← reference
+result <- helper_function(42)  # reference
 ```
 
 ```r
 # utils.R
-helper_function <- function(x) { x * 2 }  # ← definition
+helper_function <- function(x) { x * 2 }  # definition
 ```
 
-Invoking Find References on `helper_function` in either file returns both locations — whether or not a `source()` path connects them.
+Find references on `helper_function` in either file returns both locations.
+
+## How it works
+
+Press Shift+F12, or right-click and choose **Find All References**. Raven:
+
+1. takes the name at the cursor
+2. searches the current file, every other open file, and every indexed file in the workspace for that name
+3. returns every match, both definitions (assignments, function parameters) and uses
+
+The search matches names, not scope. It doesn't check `source()` links or where in the file the cursor is. The exception is members imported through `box::use()` or supported `import::` calls: Raven follows them to their exact definition or package export and leaves out unrelated members with the same name. See [Scope and pooling](#scope-and-pooling) and [Selective-import member identity](#selective-import-member-identity).
+
+## Cross-file scoping
+
+Because the search covers every open and indexed file, a definition in one file and its uses in another come back together, whether or not a `source()` call connects the files.
 
 ## Scope and pooling
 
-Unlike completions and diagnostics, Find References does **not** consult the `source()` dependency graph or position-aware scope. Every identifier in the workspace whose name matches is returned, which means:
+Unlike completion and diagnostics, find references doesn't use `source()` links or position-aware scope. Every name in the workspace that matches is returned, so:
 
-- Definitions (left-hand sides of assignments, function parameters) are listed alongside usages.
-- Same-named symbols in files that are *not* connected by any `source()` path are pooled together rather than treated as distinct symbols.
-- Because the search keys on the member *name* and not the accessor operator, the `` x$`name` `` and `x@name` forms, the `x[["name"]]` literal-string subscript form, and a `name =` constructor argument all pool together — cmd-clicking any one returns the others. The `[[` form participates only for a single, positional, literal string subscript (the same rule [Go-to-Definition](go-to-definition.md) uses); `x[[i]]`, `x[[1]]`, `x["name"]`, and computed/named/multi-argument subscripts are not matched, and a plain string literal that is not a `[[` subscript is never treated as a reference.
+- Definitions (the left side of assignments, function parameters) are listed alongside uses.
+- Same-named symbols in files that no `source()` path connects are pooled together, not treated as different symbols.
+- `` x$`name` ``, `x@name`, `x[["name"]]`, and a `name =` constructor argument all pool together, because the search matches the member name and not the operator. Running find references on any one returns the others.
 
-If you need a result scoped to one ordinary symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
+The `[[` form counts only for a single literal string subscript, the same rule [go to definition](go-to-definition.md#which-subscripts-navigate) uses. `x[[i]]`, `x[[1]]`, `x["name"]`, and computed, named, or multi-argument subscripts aren't matched. A string that isn't a `[[` subscript is never a reference.
+
+For a result tied to one symbol's definition, use [go to definition](go-to-definition.md), which does follow scope and `source()` links.
 
 ### Selective-import member identity
 
-For a resolved local-module member imported through static [`box::use()`](modules.md#box-modules-boxuse) or a supported [`import::` call](modules.md#import-package-importfrom), Raven starts from the original definition and keeps only occurrences that resolve to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]` where the syntax supports it, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files.
+For a member of a local module imported through a static [`box::use()`](modules.md#box-modules-boxuse) or a supported [`import::` call](modules.md#import-package-importfrom), Raven starts from the original definition and keeps only the occurrences that resolve to it. Results can include access through `$`, `@`, or literal `[["name"]]` where the syntax allows it, named and wildcard attachments, renamed local bindings, re-export chains, and the definition itself in open or indexed files.
 
-Selected installed-package members have no navigable source definition, so Raven instead preserves the exact `(package, exported name)` identity. Renamed declaration tokens and uses remain linked to the original export, while unrelated local bindings or imports from another package with the same spelling are excluded. Ordinary non-selective structural references retain the broad pooling described above.
+Selected members of installed packages have no source to navigate to, so Raven matches on the package and exported name instead. Renamed bindings and their uses stay linked to the original export. Unrelated local bindings, or imports of the same name from another package, are left out. References that don't come from a selective import keep the broad pooling described above.
 
-> Find References works inside R code chunks of R Markdown / Quarto (`.Rmd` / `.Rmarkdown` / `.qmd`) documents — all R chunk bodies are pooled as one R program, so references span chunks. Invoking it on prose, YAML, or a non-R chunk returns no results.
+## R Markdown and Quarto
 
-## Workspace Symbols (Cmd/Ctrl+T)
+Find references works inside R chunks of `.Rmd`, `.Rmarkdown`, and `.qmd` documents. All R chunks count as one script, so references span chunks. On prose, YAML, or a non-R chunk, it returns nothing.
 
-For project-wide symbol search by name, use **Cmd/Ctrl+T**. This searches all indexed symbols across the workspace by name, regardless of dependency relationships.
+## Workspace symbols (Cmd/Ctrl+T)
 
-The maximum number of results is configurable via `raven.symbols.workspaceMaxResults` (default: 1000).
+To search for a symbol by name across the project, press Cmd+T (Ctrl+T on Windows and Linux). This searches every indexed symbol in the workspace by name, regardless of `source()` links. [Document outline](document-outline.md#workspace-symbol-search) describes the search in more detail.
 
 ## JAGS and Stan
 
-For `.stan`, `.jags`, `.bugs`, and `.bug` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. The JAGS extensions are matched case-insensitively and select strict JAGS behavior, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. As with R, this is a flat name match — there is no dependency graph; results are collected by name across all Stan (or JAGS) files in the workspace.
+In `.stan`, `.jags`, `.bugs`, and `.bug` files, find references returns every occurrence of the name across all open or indexed files of the same language. The JAGS extensions are matched case-insensitively and mean strict JAGS, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. As with R, this is a plain name match: results are collected by name across all Stan files, or all JAGS files, in the workspace.
 
-## Go-to-Definition
+## Settings
 
-Go-to-definition is the reverse of find references — it navigates to a symbol's definition rather than listing its usages. See [Go-to-Definition](go-to-definition.md).
+| Setting | Default | What it does |
+|---|---|---|
+| `raven.symbols.workspaceMaxResults` | `1000` | Maximum number of workspace symbol (Cmd/Ctrl+T) results |
+
+See [Settings reference](settings-reference.md) for every setting.
+
+<a id="go-to-definition"></a>
+
+## See also
+
+- [Go to definition](go-to-definition.md), which jumps to a symbol's definition instead of listing its uses
+- [Document outline](document-outline.md)
+- [box and import modules](modules.md)
