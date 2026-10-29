@@ -24234,7 +24234,94 @@ fn is_jags_builtin_occurrence(text: &str, position: Position) -> bool {
     }
 }
 
-fn collect_stan_references(
+/// Identifier occurrences in a Stan or JAGS file, scanned through the same
+/// view its parser sees. Stan has no `#` comments, so Raven directive lines
+/// are masked first; JAGS needs no mask because `#` is its comment syntax.
+fn model_identifier_occurrences(
+    language: FileType,
+    raw_text: &str,
+) -> Vec<StanIdentifierOccurrence> {
+    match language {
+        FileType::Stan => {
+            let masked = crate::stan::mask_raven_directives(raw_text);
+            collect_stan_identifier_occurrences(masked.as_deref().unwrap_or(raw_text))
+        }
+        FileType::Jags => collect_jags_identifier_occurrences(raw_text),
+        FileType::R => Vec::new(),
+    }
+}
+
+/// Find References for a Stan or JAGS identifier: a flat name match across
+/// every open or indexed file of the same language (see
+/// `docs/find-references.md`). Every file, current or not, is scanned through
+/// [`model_identifier_occurrences`], so directive lines never count as code.
+fn model_references(
+    state: &WorldState,
+    uri: &Url,
+    language: FileType,
+    raw_text: &str,
+    position: Position,
+) -> Option<Vec<Location>> {
+    let occurrences = model_identifier_occurrences(language, raw_text);
+    let target = stan_identifier_at_position(&occurrences, position)?;
+    let name = target.name.as_str();
+    let mut locations = Vec::new();
+    collect_model_references(&occurrences, name, uri, &mut locations);
+
+    let content_provider = state.content_provider();
+    for file_uri in state.documents.uris() {
+        if &file_uri == uri {
+            continue;
+        }
+        let file_type = state
+            .get_document(&file_uri)
+            .map(|doc| doc.file_type)
+            .unwrap_or_else(|| file_type_from_uri(&file_uri));
+        if file_type != language {
+            continue;
+        }
+        if let Some(content) = content_provider.get_content(&file_uri) {
+            let file_occurrences = model_identifier_occurrences(language, &content);
+            collect_model_references(&file_occurrences, name, &file_uri, &mut locations);
+        }
+    }
+
+    for (file_uri, entry) in state.workspace_index.iter() {
+        if &file_uri == uri
+            || state.documents.contains_key(&file_uri)
+            || file_type_from_uri(&file_uri) != language
+        {
+            continue;
+        }
+        let file_occurrences = model_identifier_occurrences(language, &entry.contents.to_string());
+        collect_model_references(&file_occurrences, name, &file_uri, &mut locations);
+    }
+
+    Some(locations)
+}
+
+/// Path navigation for a Raven directive in a Stan or JAGS file. These
+/// languages contribute no R cross-file metadata, so directives are parsed
+/// locally from the raw source (the analysis text masks them for the Stan
+/// parser) to keep semantics such as `# raven: cd`.
+fn model_directive_definition(
+    state: &WorldState,
+    uri: &Url,
+    raw_text: &str,
+    position: Position,
+) -> Option<Location> {
+    let target =
+        crate::file_path_intellisense::detect_directive_path_navigation_target(raw_text, position)?;
+    let directive_metadata = crate::cross_file::directive::parse_directives(raw_text);
+    crate::file_path_intellisense::file_path_definition(
+        target,
+        uri,
+        &directive_metadata,
+        state.workspace_folders.first(),
+    )
+}
+
+fn collect_model_references(
     occurrences: &[StanIdentifierOccurrence],
     name: &str,
     uri: &Url,
@@ -24543,26 +24630,6 @@ fn find_jags_definition(
         })
         .cloned()
         .or_else(|| matching.into_iter().next())
-}
-
-fn collect_jags_references(
-    occurrences: &[StanIdentifierOccurrence],
-    name: &str,
-    uri: &Url,
-    locations: &mut Vec<Location>,
-) {
-    locations.extend(
-        occurrences
-            .iter()
-            .filter(|occurrence| occurrence.name == name)
-            .map(|occurrence| Location {
-                uri: uri.clone(),
-                range: Range {
-                    start: Position::new(occurrence.line, occurrence.start_col),
-                    end: Position::new(occurrence.line, occurrence.end_col),
-                },
-            }),
-    );
 }
 
 fn collect_stan_document_completions(
@@ -28070,24 +28137,7 @@ pub fn goto_definition_with_cancel(
     // those lines geometry-masked for the Stan parser.
     if doc.file_type == FileType::Stan {
         let raw_text = doc.text();
-        // Stan does not contribute R cross-file metadata to the workspace
-        // graph. Parse directives locally only so path navigation preserves
-        // established directive semantics such as `# raven: cd`.
-        let directive_metadata = crate::cross_file::directive::parse_directives(&raw_text);
-        if let Some(crate::file_path_intellisense::FilePathNavigationTarget::Directive {
-            directive_type,
-            path,
-        }) = crate::file_path_intellisense::detect_directive_path_navigation_target(
-            &raw_text, position,
-        ) && let Some(location) = crate::file_path_intellisense::file_path_definition(
-            crate::file_path_intellisense::FilePathNavigationTarget::Directive {
-                directive_type,
-                path,
-            },
-            uri,
-            &directive_metadata,
-            state.workspace_folders.first(),
-        ) {
+        if let Some(location) = model_directive_definition(state, uri, &raw_text, position) {
             return Some(GotoDefinitionResponse::Scalar(location));
         }
 
@@ -28110,21 +28160,7 @@ pub fn goto_definition_with_cancel(
     // metadata, attachment, or source-call logic can consume its native tree.
     if doc.file_type == FileType::Jags {
         let raw_text = doc.text();
-        let directive_metadata = crate::cross_file::directive::parse_directives(&raw_text);
-        if let Some(crate::file_path_intellisense::FilePathNavigationTarget::Directive {
-            directive_type,
-            path,
-        }) = crate::file_path_intellisense::detect_directive_path_navigation_target(
-            &raw_text, position,
-        ) && let Some(location) = crate::file_path_intellisense::file_path_definition(
-            crate::file_path_intellisense::FilePathNavigationTarget::Directive {
-                directive_type,
-                path,
-            },
-            uri,
-            &directive_metadata,
-            state.workspace_folders.first(),
-        ) {
+        if let Some(location) = model_directive_definition(state, uri, &raw_text, position) {
             return Some(GotoDefinitionResponse::Scalar(location));
         }
 
@@ -29212,94 +29248,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // directive mask likewise keeps Raven metadata out of identifier scans.
     let text = doc.analysis_text();
 
-    if doc.file_type == FileType::Stan {
-        let occurrences = collect_stan_identifier_occurrences(&text);
-        let target = stan_identifier_at_position(&occurrences, position)?;
-        let name = target.name.as_str();
-        let mut locations = Vec::new();
-
-        collect_stan_references(&occurrences, name, uri, &mut locations);
-
-        // Search all authoritative open documents.
-        for file_uri in state.documents.uris() {
-            if &file_uri == uri {
-                continue;
-            }
-
-            let file_type = state
-                .get_document(&file_uri)
-                .map(|doc| doc.file_type)
-                .unwrap_or_else(|| file_type_from_uri(&file_uri));
-            if file_type != FileType::Stan {
-                continue;
-            }
-
-            if let Some(content) = content_provider.get_content(&file_uri) {
-                let file_occurrences = collect_stan_identifier_occurrences(&content);
-                collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
-            }
-        }
-
-        // Search workspace index using new WorkspaceIndex.
-        for (file_uri, entry) in state.workspace_index.iter() {
-            if &file_uri == uri
-                || state.documents.contains_key(&file_uri)
-                || file_type_from_uri(&file_uri) != FileType::Stan
-            {
-                continue;
-            }
-
-            let file_text = entry.contents.to_string();
-            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
-            collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
-        }
-
-        return Some(locations);
-    }
-
-    if doc.file_type == FileType::Jags {
-        let occurrences = collect_jags_identifier_occurrences(&text);
-        let target = stan_identifier_at_position(&occurrences, position)?;
-        let name = target.name.as_str();
-        let mut locations = Vec::new();
-
-        collect_jags_references(&occurrences, name, uri, &mut locations);
-
-        // Search all open JAGS documents.
-        for file_uri in state.documents.uris() {
-            if &file_uri == uri {
-                continue;
-            }
-
-            let file_type = state
-                .get_document(&file_uri)
-                .map(|doc| doc.file_type)
-                .unwrap_or_else(|| file_type_from_uri(&file_uri));
-            if file_type != FileType::Jags {
-                continue;
-            }
-
-            if let Some(content) = content_provider.get_content(&file_uri) {
-                let file_occurrences = collect_jags_identifier_occurrences(&content);
-                collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
-            }
-        }
-
-        // Search workspace index.
-        for (file_uri, entry) in state.workspace_index.iter() {
-            if &file_uri == uri
-                || state.documents.contains_key(&file_uri)
-                || file_type_from_uri(&file_uri) != FileType::Jags
-            {
-                continue;
-            }
-
-            let file_text = entry.contents.to_string();
-            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
-            collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
-        }
-
-        return Some(locations);
+    if matches!(doc.file_type, FileType::Stan | FileType::Jags) {
+        return model_references(state, uri, doc.file_type, &doc.text(), position);
     }
 
     let tree = doc.tree.as_ref()?;
@@ -75719,6 +75669,30 @@ generated quantities {
         refs
     }
 
+    /// Raven directive lines in *other* Stan files are not Stan code, so their
+    /// words (`fit`, `R`, ...) must not show up as references, exactly as they
+    /// don't in the current file.
+    #[test]
+    fn stan_references_skip_raven_directives_in_other_files() {
+        let current = "data {\n  int R;\n}\n";
+        let (mut state, uri) = make_state(current);
+        let other_uri = Url::parse("file:///test/other.stan").unwrap();
+        let other = "# raven: sourced-by fit.R\ndata {\n  int R;\n}\n";
+        state.documents.insert(
+            other_uri.clone(),
+            Document::new_with_uri(other, None, &other_uri),
+        );
+
+        let mut refs: Vec<_> = references(&state, &uri, Position::new(1, 6))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|location| location.uri == other_uri)
+            .map(|location| location.range.start.line)
+            .collect();
+        refs.sort_unstable();
+        assert_eq!(refs, vec![2], "only the declaration in other.stan");
+    }
+
     #[test]
     fn test_stan_references_from_data_declaration() {
         let code = r#"data {
@@ -76224,7 +76198,7 @@ mod jags_goto_definition_tests {
         let occurrences = collect_jags_identifier_occurrences(code);
         let uri = Url::parse("file:///test.jags").unwrap();
         let mut locations = Vec::new();
-        collect_jags_references(&occurrences, "x", &uri, &mut locations);
+        collect_model_references(&occurrences, "x", &uri, &mut locations);
         assert_eq!(locations.len(), 3);
     }
 
