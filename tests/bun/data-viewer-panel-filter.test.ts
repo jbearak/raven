@@ -1247,11 +1247,13 @@ describe('DataViewerPanel: effective permutation cache (F3)', () => {
         await flush();
 
         expect((await rowsOf(fakeWebview, gen, 10)).rows.map((r: any[]) => r[0])).toEqual([5, 4, 3]);
-        const cached = panel.effectiveCache?.value;
+        // The effective permutation is the committed generation's buffer
+        // (composed once in the scan worker, F4).
+        const cached = panel.coordinator.committed.perm;
         expect(cached).toBeInstanceOf(Uint32Array);
         // A second read reuses the composed permutation (no O(nrow) pass).
         await rowsOf(fakeWebview, gen, 11);
-        expect(panel.effectiveCache.value).toBe(cached);
+        expect(panel.coordinator.committed.perm).toBe(cached);
 
         // Changing the filter recomposes.
         fakeWebview.deliverFromWebview({
@@ -1259,7 +1261,7 @@ describe('DataViewerPanel: effective permutation cache (F3)', () => {
         });
         await flush();
         expect((await rowsOf(fakeWebview, gen, 12)).rows.map((r: any[]) => r[0])).toEqual([5, 4]);
-        expect(panel.effectiveCache.value).not.toBe(cached);
+        expect(panel.coordinator.committed.perm).not.toBe(cached);
 
         // Clearing the filter leaves the sort; clearing the sort leaves natural order.
         fakeWebview.deliverFromWebview({

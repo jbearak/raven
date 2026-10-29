@@ -62,10 +62,10 @@ describe('getRows with permutation: tiny fixture', () => {
         const out = await r.getRows({
             start: 0, end: 5, columns: [0, 1], viewportGeneration: 1, permutation: perm,
         });
-        // Asc puts -Inf first, then 1.5, +Inf, then [NA, NaN] in original order.
-        expect(out.originalRowIndices).toEqual([4, 0, 3, 1, 2]);
-        // x column values follow the same row order: [5, 1, 4, 2, 3]
-        expect(out.rows.map(r => r[0])).toEqual([5, 1, 4, 2, 3]);
+        // Asc puts -Inf first, then 1.5, +Inf, then NaN, then NA.
+        expect(out.originalRowIndices).toEqual([4, 0, 3, 2, 1]);
+        // x column values follow the same row order: [5, 1, 4, 3, 2]
+        expect(out.rows.map(r => r[0])).toEqual([5, 1, 4, 3, 2]);
         await r.close();
     });
 });

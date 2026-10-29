@@ -77,6 +77,28 @@ export async function computeFilteredIndices(
     return compact(mask);
 }
 
+/**
+ * The pass mask of one entry over every row (1 ⇔ the row passes). The
+ * scan worker caches these per entry, so editing one entry of a filter
+ * recombines masks instead of re-evaluating the others (F3).
+ */
+export async function computeEntryMask(
+    reader: ArrowSliceReader,
+    entry: FilterEntry,
+    ctx: FilterContext,
+    opts?: { signal?: AbortSignal },
+): Promise<Uint8Array> {
+    const mask = new Uint8Array(reader.nrow);
+    mask.fill(1);
+    await applyEntry(reader, entry, ctx, mask, opts?.signal);
+    return mask;
+}
+
+/** Row indices where `mask` is non-zero, ascending. */
+export function maskToIndices(mask: Uint8Array): Uint32Array {
+    return compact(mask);
+}
+
 async function applyEntry(
     reader: ArrowSliceReader,
     entry: FilterEntry,

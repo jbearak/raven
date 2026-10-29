@@ -556,7 +556,9 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
             panelGeneration: gen,
             requestId: 41,
             rollbackBaseRequestId: 0,
-            keys: [{ columnIndex: 0, direction: 'desc' }],
+            // Another column: sort keys are cached per column, so re-sorting
+            // column 0 would not read (and hit the injected failure) again.
+            keys: [{ columnIndex: 1, direction: 'desc' }],
             labelsOn: true,
             formatOn: true,
             digits: 3,
@@ -626,7 +628,9 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
             panelGeneration: gen,
             requestId: 44,
             rollbackBaseRequestId: 0,
-            keys: [{ columnIndex: 0, direction: 'desc' }],
+            // Another column: sort keys are cached per column, so re-sorting
+            // column 0 would not read (and hit the injected failure) again.
+            keys: [{ columnIndex: 1, direction: 'desc' }],
             labelsOn: true,
             formatOn: true,
             digits: 3,
