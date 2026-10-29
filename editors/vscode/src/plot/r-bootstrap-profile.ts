@@ -174,6 +174,28 @@ local({
         any(rn != as.character(seq_len(n)))
     }
 
+    # Name for a materialized rownames column: "rowname", or ".rowname",
+    # "..rowname", ... when the frame already has a column by that name.
+    .raven_rowname_name <- function(existing) {
+        nm <- "rowname"
+        while (nm %in% existing) nm <- paste0(".", nm)
+        nm
+    }
+
+    # Prepend a data frame's explicit row names as a leading character
+    # column. .row_names_info(type = 1L) is negative for compact automatic
+    # row names, zero for zero-row frames, and positive only for explicit
+    # ones, so automatic row names are never materialized (rstudio#1705).
+    # Returns list(df, rowname column name or NULL).
+    .raven_df_with_rownames <- function(x) {
+        if (.row_names_info(x, type = 1L) <= 0L) return(list(x, NULL))
+        nm <- .raven_rowname_name(names(x))
+        # as.list() keeps each column's attributes (labels, formats,
+        # factor levels); .raven_bare_df restamps without coercion.
+        cols <- c(stats::setNames(list(as.character(rownames(x))), nm), as.list(x))
+        list(.raven_bare_df(cols, nrow(x)), nm)
+    }
+
     # Stamp a named list of equal-length columns as an n-row data.frame
     # WITHOUT data.frame() — a bare class assignment preserves each
     # column's class/attributes (factor levels, haven_labelled labels) so
@@ -337,7 +359,7 @@ local({
         if (is.factor(col)) return(if (is.ordered(col)) "<ord>" else "<fct>")
         base <- if (inherits(col, "POSIXt")) "dttm"
             else if (inherits(col, "Date")) "date"
-            else if (inherits(col, "difftime")) "drtn"
+            else if (inherits(col, "difftime")) paste("drtn", units(col))
             else if (is.list(col)) "list"
             else if (is.complex(col)) "cpl"
             else if (is.logical(col)) "lgl"
@@ -500,15 +522,20 @@ local({
         # a content-specific error naming the offending element). Then a
         # >2-D array (a dimensionality error). Anything else errors with
         # the Positron-style class message.
+        rowname_col <- NULL
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
-            if (.raven_meaningful_rownames(x)) {
-                d <- cbind(rowname = rownames(x), d, stringsAsFactors = FALSE)
-            }
             rownames(d) <- NULL
+            if (.raven_meaningful_rownames(x)) {
+                rowname_col <- .raven_rowname_name(names(d))
+                cols <- c(stats::setNames(list(as.character(rownames(x))), rowname_col), as.list(d))
+                d <- .raven_bare_df(cols, nrow(d))
+            }
             d
         } else if (is.data.frame(x)) {
-            x
+            with_rn <- .raven_df_with_rownames(x)
+            rowname_col <- with_rn[[2L]]
+            with_rn[[1L]]
         } else if (!is.null(x) && length(dim(x)) <= 1L && !is.raw(x) &&
                    (is.atomic(x) || is.factor(x) || inherits(x, "haven_labelled"))) {
             if (length(dim(x)) == 1L) {
@@ -568,6 +595,7 @@ local({
             md <- list("raven.type_tag" = .raven_type_tag(col))
             ssd <- .raven_subsecond_digits(col)
             if (!is.null(ssd)) md[["raven.subsecond_digits"]] <- as.character(ssd)
+            if (identical(nm, rowname_col)) md[["raven.rowname"]] <- "true"
             extra_md[[nm]] <- md
         }
         # Pre-encode every column.

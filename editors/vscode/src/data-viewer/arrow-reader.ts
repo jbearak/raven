@@ -111,6 +111,21 @@ export type ColumnSchema = {
     dictionaryShipped: boolean;
     /** True iff the column type is integer (Format toggle ignores these). */
     isInteger: boolean;
+    /** pillar-style type tag from the R class (`<dbl>`, `<fct>`,
+     *  `<dttm>`, `<drtn secs>`, `<dbl+lbl>`, ...), from `raven.type_tag`.
+     *  Absent for files not written by Raven's `View()`. */
+    typeTag?: string;
+    /** Fixed fractional-second digits (0, 3 or 6) for a POSIXct or
+     *  difftime column, from `raven.subsecond_digits`. */
+    subsecondDigits?: number;
+    /** Display zone for a timestamp column: the Arrow type's zone, else
+     *  the R session zone (`raven.session_tz`), else `UTC`. */
+    timeZone?: string;
+    /** Where `timeZone` came from: the column's own `tzone`, the R session
+     *  zone, or a UTC fallback because neither was known. */
+    timeZoneSource?: 'column' | 'session' | 'fallback';
+    /** True for the column R materialized from explicit row names. */
+    isRowname?: boolean;
 };
 
 export type ReaderSchema = {
@@ -188,7 +203,6 @@ type GatherKind =
 type ColumnInfo = {
     type: DataType;
     arrowType: string;
-    tz: string;
     layout: ColumnLayout;
     gather: GatherKind;
     dictionary: any;
@@ -297,6 +311,7 @@ export class ArrowSliceReader {
             const ravenFields: Record<string, Record<string, string>> =
                 ravenFieldsRaw ? (safeParseJson(ravenFieldsRaw) ?? {}) : {};
 
+            const sessionTz = schemaMd?.get('raven.session_tz') || undefined;
             const cols: ColumnInfo[] = [];
             const schemaCols: ColumnSchema[] = fields.map((f: any, i: number) => {
                 const md: Map<string, string> = f.metadata;
@@ -315,9 +330,6 @@ export class ArrowSliceReader {
                 cols.push({
                     type: f.type,
                     arrowType,
-                    tz: arrowType.startsWith('Timestamp')
-                        ? ((f.type as any).timezone ?? 'UTC')
-                        : 'UTC',
                     layout: layouts[i],
                     gather: gatherKindFor(f.type, arrowType),
                     dictionary: dict,
@@ -330,6 +342,8 @@ export class ArrowSliceReader {
                 const isIntType = /^Int\d+$/.test(arrowType);
                 const isFloatIntFormatted =
                     arrowType.startsWith('Float') && formatDeclaresInteger(format);
+                const ssd = Number(lookup('raven.subsecond_digits'));
+                const zone = timestampZone(f.type, arrowType, sessionTz);
                 return {
                     name: f.name,
                     arrowType,
@@ -340,6 +354,10 @@ export class ArrowSliceReader {
                     dictionary,
                     dictionaryShipped: isDict && dictLen <= threshold,
                     isInteger: isIntType || isFloatIntFormatted,
+                    typeTag: lookup('raven.type_tag') ?? undefined,
+                    ...(ssd === 0 || ssd === 3 || ssd === 6 ? { subsecondDigits: ssd } : {}),
+                    ...zone,
+                    ...(lookup('raven.rowname') === 'true' ? { isRowname: true } : {}),
                 };
             });
 
@@ -464,6 +482,35 @@ export class ArrowSliceReader {
         return counts;
     }
 
+    /**
+     * Full text of one cell for the cell-detail view, capped at
+     * `maxBytes` of UTF-8 (row windows truncate strings at 1 KiB). `row`
+     * is a display row, mapped through `permutation` when given. Null for
+     * NA.
+     */
+    async getCellText(
+        row: number,
+        columnIndex: number,
+        maxBytes: number,
+        permutation?: Uint32Array,
+    ): Promise<{ text: string | null; truncated: boolean }> {
+        const raw = permutation ? permutation[row] : row;
+        if (raw === undefined || raw < 0 || raw >= this.nrow || !this.cols[columnIndex]) {
+            return { text: null, truncated: false };
+        }
+        const bi = upperBoundLE(this.batchStarts, raw);
+        const [chunk] = await this.viewportChunks(bi, [columnIndex]);
+        const v = chunk.get(raw - this.batchStarts[bi]);
+        if (v === null || v === undefined) return { text: null, truncated: false };
+        const text = String(v);
+        const bytes = Buffer.from(text, 'utf8');
+        if (bytes.length <= maxBytes) return { text, truncated: false };
+        let cut = maxBytes;
+        // Step back to a UTF-8 lead byte so no code point is split.
+        while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
+        return { text: bytes.subarray(0, cut).toString('utf8'), truncated: true };
+    }
+
     async getRows(req: GetRowsRequest): Promise<GetRowsResponse> {
         if (req.viewportGeneration < this.latestViewportGen) {
             return { rows: [], stale: true };
@@ -504,7 +551,7 @@ export class ArrowSliceReader {
                 const info = this.cols[columns[ci]];
                 const child = chunks[ci];
                 for (let r = localLo; r < localHi; r++) {
-                    rows[batchRowStart + r - start][ci] = encodeArrowCell(child, r, info.arrowType, info.tz);
+                    rows[batchRowStart + r - start][ci] = encodeArrowCell(child, r, info.arrowType);
                 }
             }
         }
@@ -574,7 +621,7 @@ export class ArrowSliceReader {
                 const ci = chunkCols[k];
                 const info = this.cols[columns[ci]];
                 for (let j = 0; j < g.local.length; j++) {
-                    rows[g.out[j]][ci] = encodeArrowCell(chunks[k], g.local[j], info.arrowType, info.tz);
+                    rows[g.out[j]][ci] = encodeArrowCell(chunks[k], g.local[j], info.arrowType);
                 }
             }
         }
@@ -590,7 +637,7 @@ export class ArrowSliceReader {
         for (let ci = 0; ci < columns.length; ci++) {
             const info = this.cols[columns[ci]];
             for (let j = 0; j < g.local.length; j++) {
-                rows[g.out[j]][ci] = encodeArrowCell(chunks[ci], g.local[j], info.arrowType, info.tz);
+                rows[g.out[j]][ci] = encodeArrowCell(chunks[ci], g.local[j], info.arrowType);
             }
         }
     }
@@ -719,7 +766,7 @@ export class ArrowSliceReader {
             case 'date32':
                 return encodeDate(dv.getInt32(0, true));
             case 'ts':
-                return encodeTimestampMicros(dv.getBigInt64(0, true), e.info.tz);
+                return encodeTimestampMicros(dv.getBigInt64(0, true));
         }
         return null;
     }
@@ -927,6 +974,19 @@ function buildData(
     }
 }
 
+/** Display zone for a timestamp field (see `ColumnSchema.timeZone`). */
+function timestampZone(
+    type: any,
+    arrowType: string,
+    sessionTz: string | undefined,
+): Pick<ColumnSchema, 'timeZone' | 'timeZoneSource'> {
+    if (!arrowType.startsWith('Timestamp')) return {};
+    const own = type?.timezone;
+    if (typeof own === 'string' && own) return { timeZone: own, timeZoneSource: 'column' };
+    if (sessionTz) return { timeZone: sessionTz, timeZoneSource: 'session' };
+    return { timeZone: 'UTC', timeZoneSource: 'fallback' };
+}
+
 /** Which gather decoder serves a column, mirroring `encodeArrowCell`'s
  *  type dispatch so both paths produce identical cells. */
 function gatherKindFor(type: any, arrowType: string): GatherKind {
@@ -985,7 +1045,7 @@ function isNullAt(data: any, row: number): boolean {
 
 /** Encode one cell of an arrow Vector for the wire. Exported so the
  *  reader tests can compare every read path against it. */
-export function encodeArrowCell(child: any, row: number, arrowType: string, tz: string): Cell {
+export function encodeArrowCell(child: any, row: number, arrowType: string): Cell {
     if (arrowType.startsWith('Dictionary')) {
         const data = child.data[0];
         if (isNullAt(data, row)) return null;
@@ -1021,7 +1081,7 @@ export function encodeArrowCell(child: any, row: number, arrowType: string, tz: 
     if (arrowType.startsWith('Timestamp')) {
         const data = child.data[0];
         if (isNullAt(data, row)) return null;
-        return encodeTimestampMicros(data.values[row] as bigint, tz);
+        return encodeTimestampMicros(data.values[row] as bigint);
     }
     // Fallback: stringify.
     const v = child.get(row);

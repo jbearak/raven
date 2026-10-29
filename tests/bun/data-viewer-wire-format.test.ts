@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import {
-    encodeNumber, encodeString, encodeDate, encodeTimestampMicros,
+    encodeNumber, encodeString, encodeDate, encodeTimestampMicros, formatRYear,
     TRUNC_LIMIT_BYTES,
 } from '../../editors/vscode/src/data-viewer/wire-format';
 
@@ -61,41 +61,45 @@ describe('encodeDate', () => {
 });
 
 describe('encodeTimestampMicros', () => {
-    test('UTC microsecond timestamps encode to ISO-8601 with Z', () => {
-        const us = BigInt(Date.UTC(2024, 0, 15, 12, 0, 0)) * 1000n;
-        const r = encodeTimestampMicros(us, 'UTC') as { _: string; v: string };
-        expect(r._).toBe('ts');
-        expect(r.v).toBe('2024-01-15T12:00:00Z');
-    });
-    test('sub-second microseconds are preserved', () => {
+    // Wire value {ms, us}: ms = floor(µs / 1000), us ∈ [0, 999].
+    test('decomposes epoch microseconds into {ms, us}', () => {
         const us = BigInt(Date.UTC(2024, 0, 15, 12, 0, 0)) * 1000n + 123456n;
-        const r = encodeTimestampMicros(us, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('2024-01-15T12:00:00.123456Z');
+        expect(encodeTimestampMicros(us)).toEqual({ _: 'ts', ms: Date.UTC(2024, 0, 15, 12, 0, 0) + 123, us: 456 });
     });
     test('null is null', () => {
-        expect(encodeTimestampMicros(null, 'UTC')).toBeNull();
+        expect(encodeTimestampMicros(null)).toBeNull();
     });
-    test('exact epoch produces no fractional component', () => {
-        const r = encodeTimestampMicros(0n, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('1970-01-01T00:00:00Z');
+    test('exact epoch', () => {
+        expect(encodeTimestampMicros(0n)).toEqual({ _: 'ts', ms: 0, us: 0 });
     });
-    test('one microsecond before epoch encodes as 1969-12-31T23:59:59.999999Z', () => {
-        const r = encodeTimestampMicros(-1n, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('1969-12-31T23:59:59.999999Z');
+    test('pre-epoch values floor, never truncate (remainder stays in [0, 999])', () => {
+        expect(encodeTimestampMicros(-1n)).toEqual({ _: 'ts', ms: -1, us: 999 });
+        expect(encodeTimestampMicros(-1000n)).toEqual({ _: 'ts', ms: -1, us: 0 });
+        expect(encodeTimestampMicros(-1001n)).toEqual({ _: 'ts', ms: -2, us: 999 });
+        expect(encodeTimestampMicros(-999001n)).toEqual({ _: 'ts', ms: -1000, us: 999 });
     });
-    test('one millisecond before epoch encodes as 1969-12-31T23:59:59.999Z', () => {
-        const r = encodeTimestampMicros(-1000n, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('1969-12-31T23:59:59.999Z');
+    test('9999-12-31 23:59:59.999999 stays exact', () => {
+        const us = BigInt(Date.UTC(9999, 11, 31, 23, 59, 59, 999)) * 1000n + 999n;
+        expect(encodeTimestampMicros(us)).toEqual({ _: 'ts', ms: Date.UTC(9999, 11, 31, 23, 59, 59, 999), us: 999 });
     });
-    test('pre-epoch sub-millisecond timestamps (BigInt floor-division correction)', () => {
-        // BigInt division truncates toward zero, not floor. The encoder must
-        // correct for that or it produces garbled "00-1" fractional strings
-        // for any negative microsecond not aligned to a millisecond boundary.
-        const r = encodeTimestampMicros(-1001n, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('1969-12-31T23:59:59.998999Z');
+    test('range check runs on the int64: ±8.64e15 ms is valid, one µs further is not', () => {
+        const edge = 8_640_000_000_000_000_000n;
+        expect(encodeTimestampMicros(edge)).toEqual({ _: 'ts', ms: 8.64e15, us: 0 });
+        expect(encodeTimestampMicros(-edge)).toEqual({ _: 'ts', ms: -8.64e15, us: 0 });
+        expect(encodeTimestampMicros(edge + 1n)).toEqual({ _: 'tsx', s: '8640000000000.000001' });
+        expect(encodeTimestampMicros(-edge - 1n)).toEqual({ _: 'tsx', s: '-8640000000000.000001' });
     });
-    test('pre-epoch microsecond-only offset', () => {
-        const r = encodeTimestampMicros(-999001n, 'UTC') as { _: string; v: string };
-        expect(r.v).toBe('1969-12-31T23:59:59.000999Z');
+});
+
+describe('formatRYear', () => {
+    // R: format(as.Date(...)) / sprintf("%04d")
+    test.each([[-44, '-044'], [0, '0000'], [1, '0001'], [9999, '9999'], [10000, '10000'], [-1234, '-1234']])(
+        'year %d prints as %s', (y, want) => {
+            expect(formatRYear(y)).toBe(want);
+        });
+    test('dates outside 1-9999 print like R', () => {
+        expect(encodeDate(-735963)).toEqual({ _: 'date', v: '-045-01-02' });
+        expect(encodeDate(-719528)).toEqual({ _: 'date', v: '0000-01-01' });
+        expect(encodeDate(2932897)).toEqual({ _: 'date', v: '10000-01-01' });
     });
 });

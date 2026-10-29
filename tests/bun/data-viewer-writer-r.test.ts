@@ -113,7 +113,7 @@ describe('View() writer (real R)', () => {
         const tags = Object.fromEntries(Object.entries(f).map(([k, v]) => [k, v['raven.type_tag']]));
         expect(tags).toEqual({
             i: '<int>', d: '<dbl>', s: '<chr>', l: '<lgl>', f: '<fct>', o: '<ord>', dt: '<date>',
-            t0: '<dttm>', t3: '<dttm>', t6: '<dttm>', dur: '<drtn>', cp: '<cpl>', lst: '<list>',
+            t0: '<dttm>', t3: '<dttm>', t6: '<dttm>', dur: '<drtn mins>', cp: '<cpl>', lst: '<list>',
         });
         expect(f.t0['raven.subsecond_digits']).toBe('0');
         expect(f.t3['raven.subsecond_digits']).toBe('3');
@@ -179,6 +179,108 @@ describe('View() writer (real R)', () => {
         expect(reader.geometrySource).toBe('headers');
         const out = await reader.getRows({ start: 0, end: 10, columns: [0, 1], viewportGeneration: 1 });
         expect(out.rows.map(row => row[0])).toEqual(Array.from({ length: 10 }, (_, i) => String(i + 1)));
+        await reader.close();
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('rownames: explicit kept, compact and zero-row never materialized', async () => {
+        const r = await runR([
+            'View(mtcars)',                                     // explicit character rownames
+            'View(data.frame(x = 1:3))',                        // compact automatic
+            'View(data.frame(x = integer()))',                  // zero rows
+            'View(data.frame(x = 1:3, row.names = c(5L, 7L, 9L)))', // explicit integer rownames
+        ].join('\n'));
+        expect(r.files.length).toBe(4);
+        const readers = await Promise.all(r.files.sort().map(f => ArrowSliceReader.open(f)));
+        const [mt, compact, empty, intRn] = readers;
+        const mtCols = mt.schema.columns;
+        expect(mtCols[0].name).toBe('rowname');
+        expect(mtCols[0].isRowname).toBe(true);
+        expect(mtCols[0].typeTag).toBe('<chr>');
+        expect(mtCols.slice(1).map(c => c.name)).toEqual(
+            ['mpg', 'cyl', 'disp', 'hp', 'drat', 'wt', 'qsec', 'vs', 'am', 'gear', 'carb']);
+        const first = await mt.getRows({ start: 0, end: 2, columns: [0, 1], viewportGeneration: 1 });
+        expect(first.rows).toEqual([['Mazda RX4', 21], ['Mazda RX4 Wag', 21]]);
+        expect(compact.schema.columns.map(c => c.name)).toEqual(['x']);
+        expect(empty.schema.columns.map(c => c.name)).toEqual(['x']);
+        expect(intRn.schema.columns.map(c => c.name)).toEqual(['rowname', 'x']);
+        const ir = await intRn.getRows({ start: 0, end: 3, columns: [0], viewportGeneration: 1 });
+        expect(ir.rows.map(row => row[0])).toEqual(['5', '7', '9']);
+        await Promise.all(readers.map(x => x.close()));
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('rownames: an existing rowname column becomes .rowname, then ..rowname', async () => {
+        const r = await runR([
+            'df <- data.frame(rowname = c("p", "q"), v = 1:2, row.names = c("a", "b"))',
+            'View(df)',
+            'df2 <- data.frame(rowname = 1:2, .rowname = 3:4, row.names = c("a", "b"))',
+            'View(df2)',
+            'm <- matrix(1:4, 2, dimnames = list(c("r1", "r2"), c("rowname", "z")))',
+            'View(m)',
+        ].join('\n'));
+        const readers = await Promise.all(r.files.sort().map(f => ArrowSliceReader.open(f)));
+        const [a, b, m] = readers;
+        expect(a.schema.columns.map(c => c.name)).toEqual(['.rowname', 'rowname', 'v']);
+        expect(a.schema.columns.map(c => !!c.isRowname)).toEqual([true, false, false]);
+        expect(b.schema.columns.map(c => c.name)).toEqual(['..rowname', 'rowname', '.rowname']);
+        expect(m.schema.columns.map(c => c.name)).toEqual(['.rowname', 'rowname', 'z']);
+        expect(m.schema.columns[0].isRowname).toBe(true);
+        const rows = await a.getRows({ start: 0, end: 2, columns: [0, 1], viewportGeneration: 1 });
+        expect(rows.rows).toEqual([['a', 'p'], ['b', 'q']]);
+        await Promise.all(readers.map(x => x.close()));
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('rownames keep column attributes (labels, factor levels) intact', async () => {
+        const r = await runR([
+            'df <- data.frame(f = factor(c("lo", "hi")), n = c(1.5, 2), row.names = c("a", "b"))',
+            'attr(df$n, "label") <- "A number"',
+            'View(df)',
+        ].join('\n'));
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const cols = reader.schema.columns;
+        expect(cols.map(c => c.name)).toEqual(['rowname', 'f', 'n']);
+        expect(cols[1].typeTag).toBe('<fct>');
+        expect(cols[1].dictionary).toEqual(['hi', 'lo']);
+        expect(cols[2].variableLabel).toBe('A number');
+        await reader.close();
+    }, 60_000);
+
+    test.skipIf(!HAS_ARROW)('compact rownames at 1e7 rows are never materialized', async () => {
+        // A materialized character rowname column would add ~80 MB and
+        // seconds; the frame must come through with just its own column.
+        const r = await runR([
+            'df <- data.frame(x = seq_len(1e7))',
+            't0 <- proc.time()[["elapsed"]]',
+            'stopifnot(.row_names_info(df, 1L) < 0L)',
+            'View(df)',
+            'cat("ELAPSED=", proc.time()[["elapsed"]] - t0, "\\n", sep = "")',
+        ].join('\n'));
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        expect(reader.schema.columns.map(c => c.name)).toEqual(['x']);
+        expect(reader.nrow).toBe(10_000_000);
+        const elapsed = Number(/ELAPSED=([\d.]+)/.exec(r.stdout)?.[1]);
+        expect(elapsed).toBeLessThan(20);
+        await reader.close();
+    }, 120_000);
+
+    test.skipIf(!HAS_ARROW)('POSIXct without a tzone takes the session zone; NA and NaN round-trip distinctly', async () => {
+        const r = await runR([
+            'Sys.setenv(TZ = "America/Chicago")',
+            // as.POSIXct() without tz gives tzone "", which arrow writes
+            // with no zone: R shows it in the session zone.
+            't <- as.POSIXct(c("2024-07-01 09:00:00", "2024-07-02 09:00:00"))',
+            'stopifnot(identical(attr(t, "tzone"), ""))',
+            'df <- data.frame(t = t, u = as.POSIXct(c("2024-07-01", "2024-07-02"), tz = "Asia/Tokyo"),',
+            '  d = c(NA_real_, NaN))',
+            'View(df)',
+        ].join('\n'));
+        const reader = await ArrowSliceReader.open(r.files[0]);
+        const [t, u] = reader.schema.columns;
+        expect(u.timeZone).toBe('Asia/Tokyo');
+        expect(u.timeZoneSource).toBe('column');
+        expect(t.timeZoneSource).toBe('session');
+        expect(t.timeZone).toBe(schemaMd(reader).get('raven.session_tz'));
+        const rows = await reader.getRows({ start: 0, end: 2, columns: [2], viewportGeneration: 1 });
+        expect(rows.rows.map(x => x[0])).toEqual([null, { _: 'nan' }]);
         await reader.close();
     }, 60_000);
 });

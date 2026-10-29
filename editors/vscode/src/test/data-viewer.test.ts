@@ -128,8 +128,9 @@ suite('data-viewer smoke tests', function (this: Mocha.Suite) {
         }, 10000);
         assert.ok(Array.isArray(cols), 'expected column names array for "mtcars" panel');
 
-        // mtcars ships with R and always has these 11 columns in order.
-        const expected = ['mpg', 'cyl', 'disp', 'hp', 'drat', 'wt', 'qsec', 'vs', 'am', 'gear', 'carb'];
+        // mtcars ships with R and always has these 11 columns in order,
+        // after the car names (explicit rownames become a leading column).
+        const expected = ['rowname', 'mpg', 'cyl', 'disp', 'hp', 'drat', 'wt', 'qsec', 'vs', 'am', 'gear', 'carb'];
         assert.deepStrictEqual(
             cols,
             expected,

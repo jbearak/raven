@@ -83,14 +83,13 @@ describe('ArrowSliceReader: getRows wire format (tiny fixture)', () => {
         expect(out.rows[4][0]).toEqual({ _: 'date', v: '2024-01-05' });
     });
 
-    test('Timestamp cells encode as { _:ts, v:ISO-8601 }', async () => {
+    test('Timestamp cells encode as { _:ts, ms, us }', async () => {
         const r = await openReader(FIX('tiny.arrow'));
         const out = await r.getRows({
             start: 0, end: 1, columns: [5], viewportGeneration: 1,
         });
         const cell = out.rows[0][0] as any;
-        expect(cell._).toBe('ts');
-        expect(cell.v).toBe('2024-01-01T12:00:00Z');
+        expect(cell).toEqual({ _: 'ts', ms: Date.UTC(2024, 0, 1, 12), us: 0 });
     });
 
     test('column subset returns only requested columns in order', async () => {

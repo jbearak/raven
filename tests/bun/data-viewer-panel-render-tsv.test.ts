@@ -51,11 +51,11 @@ describe('render_tsv', () => {
     test('NaN / Inf / Date / ts sentinels render as readable strings', () => {
         const rows = [
             [{ _: 'nan' }, { _: 'inf' }, { _: '-inf' }, { _: 'date', v: '2024-01-01' }] as any,
-            [null, { _: 'ts', v: '2024-01-01T12:00:00Z' }, { _: 'trunc', v: 'long…' }, 'plain'] as any,
+            [null, { _: 'ts', ms: Date.UTC(2024, 0, 1, 12), us: 0 }, { _: 'trunc', v: 'long…' }, 'plain'] as any,
         ];
         const tsv = render_tsv(rows, [0, 1, 0, 0], cols, dictionaries, false, false, 3);
         expect(tsv).toBe(
-            'NaN\tInf\t-Inf\t2024-01-01\n\t2024-01-01T12:00:00Z\tlong…\tplain',
+            'NaN\tInf\t-Inf\t2024-01-01\n\t2024-01-01 12:00:00\tlong…\tplain',
         );
     });
 
