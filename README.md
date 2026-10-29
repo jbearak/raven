@@ -98,6 +98,8 @@ Raven adds to the R tools you already use. Its language server runs alongside vs
 
 ## Documentation
 
+Project settings go in a `raven.toml` at the project root, which Raven finds by searching upward from the folder you open; VS Code settings and a `.lintr` work too. See [Configuration](docs/configuration.md).
+
 All pages are listed in the [documentation hub](docs/README.md). Start with [Getting started](docs/getting-started.md), and see [Troubleshooting](docs/troubleshooting.md) or the [FAQ](docs/faq.md) when something is unclear. Raven is under active development; bug reports and feedback are welcome in [issues](https://github.com/jbearak/raven/issues).
 
 Raven's sibling project [Sight](https://github.com/jbearak/sight) is a language server for Stata with the same cross-file model.
