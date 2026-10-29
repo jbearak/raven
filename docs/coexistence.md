@@ -1,95 +1,185 @@
-# Coexistence with Other R Extensions
+# Using Raven with other R tools
 
-Raven's VS Code extension includes both a **language server** (completions, diagnostics, navigation) and **R-session features** (R console, plot viewer, data viewer, help viewer). If you also use the [REditorSupport extension](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) or [Positron](https://github.com/posit-dev/positron), Raven is designed to stay out of the way by default.
+[Docs](README.md) › Understanding Raven
+
+Raven's language server runs next to any other R tool, and its R console and viewers turn themselves off by default when vscode-R or Positron already provides them. <a id="coexistence-with-other-r-extensions"></a>
+
+| You run | Raven's language server and help viewer | Raven's R console, viewers, chunk and preview commands |
+|---|---|---|
+| VS Code with Raven only | On | On |
+| VS Code with Raven and the Quarto extension | On | On |
+| VS Code with Raven and vscode-R (REditorSupport) enabled | On | Off by default |
+| Positron with Raven | On | Off by default |
+| Any of the above, with `raven.rConsole.activation` set to `"enabled"` | On | On |
+| Any of the above, with `raven.rConsole.activation` set to `"disabled"` | On | Off |
+| Neovim, Zed, Helix, Emacs, or another LSP editor | Language server only | Not available; these are part of the VS Code extension |
+
+## Why Raven's console stepped aside
+
+If you saw a notification saying Raven left its R console, plot viewer, and data viewer turned off, Raven found the vscode-R (REditorSupport) extension enabled, or found it was running inside Positron. Both already give you an R session in the editor, so under the default `raven.rConsole.activation` value, `"auto"`, Raven doesn't add a second one. Its completions, diagnostics, and navigation work either way.
+
+The notification appears once and offers three choices: **Learn more** opens this page, **Open setting** jumps to `raven.rConsole.activation`, and **Don't show again** silences it.
+
+To use Raven's console anyway, set `raven.rConsole.activation` to `"enabled"` and reload the window. [Who benefits from Raven's R console](#who-benefits-from-ravens-r-console) helps you decide.
 
 ## The `raven.rConsole.activation` setting
 
-The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers, chunk run commands, Knit Preview, and Quarto Preview/Render — activates:
+This setting decides whether Raven's R-session features activate. It is the only switch for them: there is no separate setting for the plot viewer or the data viewer.
 
-- **`"auto"`** (default) — Raven's R-session features activate *unless* the REditorSupport extension is enabled or VS Code is running as Positron. This keeps Raven out of the way when you already have R-session integration.
-- **`"enabled"`** — Always activate Raven's R console, plot viewer, and data viewer, even when another R extension is present. With REditorSupport also enabled, both extensions' R consoles are available; `Cmd+Enter` / `Ctrl+Enter` can only be bound to one extension's send command, and VS Code's keybinding editor lets you rebind either.
-- **`"disabled"`** — Never activate Raven's R-session features, even when no other R extension is present.
+| Value | What Raven does |
+|---|---|
+| `"auto"` (default) | Activates the R-session features unless the vscode-R (REditorSupport) extension is installed and enabled, or VS Code is running as Positron. |
+| `"enabled"` | Always activates them, even next to another R extension. |
+| `"disabled"` | Never activates them, even when no other R extension is present. |
 
-Code intelligence and the help viewer are unaffected by this setting. The help viewer shells out to R on demand to render Rd documentation as HTML, so it works whether or not Raven's R console is active — provided Raven can run the configured R executable.
+Raven doesn't start or stop these features mid-session. When you change the setting, or when enabling or disabling vscode-R changes what `"auto"` resolves to, Raven asks you to reload the window. With `"enabled"` or `"disabled"`, enabling or disabling vscode-R changes nothing.
 
+With `"enabled"` and vscode-R also enabled, both extensions' R consoles are available. `Cmd+Enter` / `Ctrl+Enter` can be bound to only one extension's send command; use VS Code's keybinding editor to choose which.
 
-## What steps aside and what doesn't
+### What steps aside and what doesn't
 
-Raven's **language server** and **help viewer** always activate — they don't overlap with a running R session.
+The setting turns these on or off together:
 
-Raven's **R console**, **plot viewer**, and **data viewer** are the features that can overlap with another extension's R-session integration. The plot and data viewers are reached *through* Raven's R console: the R console boots a profile that overrides `View()` (data viewer) and starts httpgd (plot viewer). When Raven's R console isn't activated, neither of those viewers is wired up — `View(df)` and `plot(...)` go to whatever R session your other extension manages.
+- Raven's [R console](r-console.md).
+- The [plot viewer](plot-viewer.md) and [data viewer](data-viewer.md). Both are reached through Raven's R console: the console starts a profile that overrides `View()` and starts httpgd. When the console is off, `View(df)` and `plot(...)` go to whatever R session your other extension manages.
+- [Chunk](chunks.md) navigation commands and keybindings (Go to Next Chunk, Go to Previous Chunk, Select Current Chunk).
+- Chunk background highlighting and the active-cell indicator in `.Rmd`, `.Rmarkdown`, and `.qmd` files.
+- `.R` cell mode: `# %%` cell markers and RStudio-style `# Section ----` dividers in plain `.R` files.
+- Chunk run commands and every chunk CodeLens button, including the **Run Chunk** lens on R code blocks in plain Markdown files.
+- Raven's R [snippets](snippets.md) (`if`, `fun`, `for`, and others) inside R chunks of `.Rmd`, `.Rmarkdown`, and `.qmd` files.
+- [Knit Preview](knit.md), its command, and its `Shift+Cmd+Enter` / `Shift+Ctrl+Enter` keybinding. Knit Preview also needs `raven.rmdKnit.enabled`.
+- [Quarto Preview and Render](quarto.md): the commands, the editor-title button, and the Preview keybinding. **Stop Quarto Preview** stays in the Command Palette so you can always stop a running preview.
+- The [R package build commands](r-package-dev.md) (Load All, Document, Test Package, Check Package, and the rest).
 
-Several editor surfaces that overlap with REditorSupport's R Markdown / Quarto tooling are gated behind the same R-console-activation switch:
+These stay on regardless of the setting:
 
-- **Chunk navigation** commands and keybindings (`raven.goToNextChunk`, `raven.goToPreviousChunk`, `raven.selectCurrentChunk`).
-- **Chunk background highlighting** and the **active-cell indicator** in `.Rmd` / `.Rmarkdown` / `.qmd` documents.
-- **`.R` cell mode** support: `# %%` cell markers and RStudio-style `# Section ----` dividers used for chunk navigation / highlighting in plain `.R` files.
-- **R-language snippets in `.Rmd` / `.Rmarkdown` / `.qmd` fenced chunks** — Raven's `r.json` snippets (`if`, `fun`, `for`, etc.) are registered for `rmd` / `quarto` only when Raven's R console is active. R-Markdown- and Quarto-specific snippets that scaffold new chunks (`rchunk`, `setupchunk`, ...) always register, since REditorSupport doesn't ship equivalents.
-- **Knit Preview** keybinding (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter`) and the `Raven: Knit Preview` command — gated on the R-console switch together with the `raven.rmdKnit.enabled` flag.
-- **Quarto Preview and Render** commands, editor-title button, and Preview keybinding — gated on the R-console switch. **Stop Quarto Preview** stays available from the Command Palette so a running process can always be cleaned up.
+- The language server: completions, diagnostics, hover, navigation, and everything else that doesn't need an R session.
+- The [help viewer](help-viewer.md). It runs R on demand to render help pages, so it works whenever Raven can run the configured R executable, whether or not Raven's console is active.
+- Raven's R snippets in plain `.R` files, and the R Markdown and Quarto snippets that scaffold new chunks (`rchunk`, `setupchunk`, and others). vscode-R's R Markdown snippets use different prefixes, so the two sets don't collide.
 
-## Who benefits from Raven's R console?
+### Who benefits from Raven's R console
 
-Raven's R console, plot viewer, and data viewer overlap with [REditorSupport](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r)'s equivalents. Whether Raven's versions help you depends on your workflow:
+Raven's console and viewers overlap with vscode-R's. Whether Raven's versions help you depends on how you work.
 
-- **You'd benefit** — e.g., you send large blocks to R (Raven's temp-file `source()` sidesteps bracketed-paste delays); you regularly view large frames (Raven's data viewer streams Arrow rows on demand); you work with labelled data (Raven's data viewer reads variable and value labels from `haven` imports of Stata / SPSS files, showing value labels instead of the underlying codes); or you want a themeable `.Rmd` / `.Rmarkdown` preview (`Raven: Knit Preview` renders through VS Code's built-in Markdown pipeline rather than a Pandoc round-trip, and its **Apply VS Code theme** toggle recolors the whole rendered document — prose, syntax highlighting, and plots — to match your editor theme in real time). See [Comparison: R session integration](./comparison.md#r-session-integration).
-- **You'd lose something** — REditorSupport ships a few R-session features Raven doesn't: a workspace viewer, an htmlwidget / Shiny viewer, and `View()` on lists and environments (Raven's data viewer handles only data frames and matrices).
+You would likely benefit if you:
 
-For a broader list of Raven's gaps across features, see [Limitations](./limitations.md).
+- send large blocks to R. Raven sends larger blocks through a temp-file `source()`, which avoids the delays of simulated typing and bracketed paste.
+- view large data frames. Raven's data viewer streams rows from an Arrow file on demand.
+- work with labelled data. Raven's data viewer reads variable and value labels from `haven` imports of Stata and SPSS files and shows value labels instead of the underlying codes.
+- want a themeable `.Rmd` / `.Rmarkdown` preview. Knit Preview renders through VS Code's built-in Markdown pipeline, and its **Apply VS Code theme** toggle recolors prose, syntax highlighting, and plots to match your editor theme.
 
-## Language servers: Raven alone vs. both
+You would lose something if you rely on vscode-R's workspace viewer, its htmlwidget and Shiny viewer, or `View()` on lists and environments. Raven has no equivalents; its data viewer handles only data frames and matrices.
 
-Raven's language server traces `source()` chains across your project, so its completions, diagnostics, and navigation reflect actual execution order at the cursor position — including cross-file go-to-definition, find-references, and detection of circular dependencies and scope violations. It doesn't need a running R session.
+See [How Raven compares: R session integration](comparison.md#r-session-integration) and [Limitations](limitations.md).
 
-REditorSupport's language server provides [`lintr`](https://lintr.r-lib.org/) diagnostics, which covers a different surface than Raven's diagnostics: it catches style violations and certain correctness issues that Raven doesn't flag, while Raven catches cross-file scope problems that lintr doesn't see. Raven also has its own [opt-in style linter](./linting.md) that re-implements 18 of `lintr`'s default linters — most of its default rule set; for the rules Raven doesn't ship, run `lintr` via REditorSupport alongside Raven.
+## Run Raven next to vscode-R
 
-To avoid double-reporting style issues, Raven's default `raven.linting.enabled: "auto"` will *not* auto-enable its native linter from a discovered `.lintr` while REditorSupport's `lintr` path is live (installed and enabled with `r.lsp.enabled` and `r.lsp.diagnostics` on) or while you're in Positron — that `.lintr` is REditorSupport's / Positron's to lint. If you want both linters running on the same project on purpose, set `raven.linting.enabled` to `true`. See [Linting § `"auto"` and REditorSupport / Positron](./linting.md#auto-and-reditorsupport--positron).
+| You want | Do this |
+|---|---|
+| Both language servers (the default) | Leave `r.lsp.enabled` at `true`. Completions and diagnostics overlap somewhat. |
+| Raven alone for code intelligence, keeping vscode-R for its workspace viewer | Set `"r.lsp.enabled": false`. |
+| vscode-R's language server without its lintr style diagnostics | Set `"r.lsp.diagnostics": false`. You keep Raven's syntax and scope diagnostics. |
+| Raven's style lints instead of lintr | Turn off vscode-R's diagnostics as above, then set `raven.linting.enabled` to `true`. See [Linting](linting.md). |
+| Both linters on the same project, on purpose | Set `raven.linting.enabled` to `true`. |
+| Raven's R console too | Set `raven.rConsole.activation` to `"enabled"`. |
 
-If you want both, leave `r.lsp.enabled` at its default (`true`). Both language servers will run, with some overlap in completions and diagnostics.
-
-One reason to keep REditorSupport installed even if Raven covers your language-intelligence needs is its workspace viewer — a sidebar panel that introspects your active R session, showing live objects, their types, and dimensions. Raven doesn't have an equivalent.
-
-If you keep REditorSupport installed but don't need its language server (e.g. you only want the workspace viewer), you can disable it to avoid the overhead of running two LSPs:
-
-```json
-"r.lsp.enabled": false
-```
-
-See [Editor Integrations](./editor-integrations.md) for setup details across editors.
-
-## Coexistence with the Quarto extension
-
-When the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed alongside Raven, *and* Raven's R console is active, you'll see two CodeLens rows above every R chunk in a `.qmd` file: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · ↘ Run Next Chunk · ↥ Run Above**, configurable via `raven.chunks.codeLens.commands`).
-
-Raven's chunk CodeLens activates with Raven's R console — see [The `raven.rConsole.activation` setting](#the-ravenrconsoleactivation-setting). Under the default `"auto"`, Raven's R console activates only when no other R extension (REditorSupport.r, or Positron) is enabled. So the dueling-row case appears when you have Quarto installed but not REditorSupport.r, or when you've explicitly set `raven.rConsole.activation` to `"enabled"` alongside REditorSupport.r.
-
-What each row does depends on whether REditorSupport.r is installed:
-
-- **REditorSupport.r not installed**. Quarto's row shows "Executing r cells requires the R extension" and does nothing — its dispatcher checks for REditorSupport's extension ID, not for the underlying `r.runSelection` command. Raven's row works as usual: clicking **▷ Run Chunk** sends the chunk to Raven's R terminal.
-- **REditorSupport.r installed, `raven.rConsole.activation` set to `"enabled"`**. Both rows work — Quarto's dispatches to REditorSupport's `r.runSelection`; Raven's runs the chunk in Raven's terminal.
-
-Both extensions register CodeLens providers for `.qmd`, and VS Code doesn't expose a way for one extension to suppress another's lenses, so when both rows appear they stay independent. Quarto's check looks for the REditorSupport extension by ID, so Raven can't satisfy it from this side regardless of which commands Raven registers — the only clean fix lives upstream in the Quarto extension.
-
-If the duplication bothers you, a standalone Raven workflow is now viable with `quarto.quarto` disabled. Raven maps `.qmd` to its bundled R Markdown grammar for syntax highlighting, supplies Quarto and R snippets, provides chunk navigation and CodeLens execution through Raven's R console, and offers CLI-backed [Quarto Preview and Render](./quarto.md). With no competing R extension, the default `raven.rConsole.activation: "auto"` enables Raven's R console; set it to `"enabled"` if another R extension would otherwise close that gate.
-
-The trade-off is that disabling `quarto.quarto` also removes its Visual Mode, Quarto-aware YAML intelligence, and Python / Julia cell executors. Raven's chunk executor handles R through Raven's R console; it does not replace those non-R execution surfaces. If you need them, keep both extensions and use Raven's CodeLens row for R chunks. Quarto's row remains useful for other languages when their respective executors are installed.
-
-### `.Rmd` / `.Rmarkdown` files belong to the `rmd` language
-
-Raven anchors `.Rmd` / `.Rmarkdown` files to its `rmd` language by default, so the conflict described here doesn't bite you out of the box — the rest of this section explains why that default exists and how to undo it if you'd rather Quarto own `.rmd` variants.
-
-The Quarto extension contributes both `.qmd` and `.rmd` under `editorLangId == quarto`. When only Raven and Quarto are installed, VS Code's `contributes.languages` extension resolver can pick Quarto's claim over Raven's `rmd` contribution — the resolution order across extensions is not a documented invariant — so `.Rmd` files can end up tagged as `quarto`. Most Raven affordances handle both lang ids (run-line, navigation, CodeLens, the send-to-R menus), but **Knit Preview** is gated on `editorLangId == rmd || == r` (with a `resourceExtname =~ /\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/` guard) and silently stops firing when the `.Rmd` buffer is tagged `quarto`. The visible symptom is `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Linux/Windows) triggering Quarto's "Editor selection is not within an executable cell" message instead of opening the knit preview.
-
-Raven ships a `files.associations` default pinning six explicit case variants — `*.rmd`, `*.Rmd`, `*.RMD`, `*.rmarkdown`, `*.Rmarkdown`, and `*.RMARKDOWN` — all to the `rmd` language (matching the extensions in Raven's `contributes.languages` block). `files.associations` is registered ahead of `contributes.languages` in VS Code's resolver, so this anchors R Markdown files to `rmd` regardless of whether REditorSupport.r-syntax is installed alongside.
-
-Trade-off: this also disables Quarto's `.Rmd`-targeted UI (Run Cell, Insert Cell, preview-related menus, the chunk CodeLens) for users who keep the default, because those gate on `editorLangId == quarto`. Quarto's `.qmd` handling is untouched. If you'd rather hand `.rmd` variants back to Quarto, override the default explicitly in user or workspace settings:
+To turn off vscode-R's language server, add this to your VS Code settings:
 
 ```json
-"files.associations": {
-  "*.rmd": "quarto",
-  "*.Rmd": "quarto",
-  "*.RMD": "quarto"
+{
+  "r.lsp.enabled": false
 }
 ```
 
-`files.associations` is an object-merge setting, so the override above replaces only the keys it lists — other Raven `files.associations` defaults (none today, but possible in the future) stay in effect.
+### Language servers: Raven alone vs. both
+
+Raven's language server traces `source()` chains across your project, so its completions, diagnostics, and navigation follow execution order at the cursor. That includes cross-file go-to-definition, find references, and detection of circular dependencies and scope violations. It doesn't need a running R session.
+
+vscode-R's language server provides [lintr](https://lintr.r-lib.org/) diagnostics. They cover different ground: lintr catches style problems and some correctness issues Raven doesn't flag, and Raven catches cross-file scope problems lintr can't see. Raven's [opt-in lints](linting.md) re-implement 18 of lintr's default linters. For the rest, run lintr through vscode-R next to Raven.
+
+To avoid reporting style problems twice, the default `raven.linting.enabled: "auto"` doesn't turn on Raven's lints from a discovered `.lintr` while vscode-R's lintr diagnostics are live (vscode-R installed and enabled, with `r.lsp.enabled` and `r.lsp.diagnostics` on) or while you're in Positron. That `.lintr` belongs to them. See [Linting: `"auto"` and REditorSupport / Positron](linting.md#auto-and-reditorsupport--positron).
+
+A reason to keep vscode-R installed even when Raven covers your code intelligence is its workspace viewer, a sidebar panel that shows the live objects in your R session with their types and dimensions. Raven has no equivalent. If that's all you use vscode-R for, turn off its language server to avoid running two.
+
+See [Editor setup](editor-integrations.md) for other editors.
+
+## Run Raven in Positron
+
+Raven's language server and help viewer activate in Positron as in VS Code. Under the default `"auto"`, Raven's R console, viewers, chunk commands, and preview commands stay off, and Positron's own R session handles them. Raven's lints also don't turn on automatically from a `.lintr` in Positron. To use Raven's console in Positron, set `raven.rConsole.activation` to `"enabled"`.
+
+<a id="coexistence-with-the-quarto-extension"></a>
+
+## Run Raven next to the Quarto extension
+
+If the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed and Raven's R console is active, every R chunk in a `.qmd` file shows two CodeLens rows: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · ↘ Run Next Chunk · ↥ Run Above**, configurable with `raven.chunks.codeLens.commands`). Under `"auto"`, this happens when you have Quarto but not vscode-R, or when you set `raven.rConsole.activation` to `"enabled"` next to vscode-R.
+
+- **Without vscode-R**, Quarto's row says "Executing r cells requires the R extension" and does nothing. Raven's row works: **▷ Run Chunk** sends the chunk to Raven's R terminal.
+- **With vscode-R and `raven.rConsole.activation` set to `"enabled"`**, both rows work. Quarto's sends to vscode-R; Raven's runs the chunk in Raven's terminal.
+
+VS Code doesn't let one extension hide another's CodeLens, and Quarto checks for vscode-R by extension ID, so Raven can't fix the duplicate row from its side.
+
+If the duplicate row bothers you, you can disable the Quarto extension and use Raven alone. Raven highlights `.qmd` with its bundled R Markdown grammar, supplies Quarto and R snippets, provides chunk navigation and CodeLens execution through its R console, and offers [Quarto Preview and Render](quarto.md) through the Quarto CLI. You lose the Quarto extension's Visual Mode, its Quarto-aware YAML intelligence, and its Python and Julia cell runners. If you need those, keep both extensions and use Raven's row for R chunks.
+
+### `.Rmd` / `.Rmarkdown` files belong to the `rmd` language
+
+Raven opens `.Rmd` and `.Rmarkdown` files as its `rmd` language by default, so Knit Preview works even with the Quarto extension installed. This also turns off the Quarto extension's `.Rmd` features (Run Cell, Insert Cell, preview menus, and its chunk CodeLens). Quarto's `.qmd` handling is untouched.
+
+To give `.Rmd` files back to Quarto, override the default in your user or workspace settings:
+
+```json
+{
+  "files.associations": {
+    "*.rmd": "quarto",
+    "*.Rmd": "quarto",
+    "*.RMD": "quarto"
+  }
+}
+```
+
+The override replaces only the keys it lists.
+
+## Run Raven next to lintr, Jarl, or Air
+
+- **lintr.** Run it through vscode-R's language server, or from the command line, next to Raven. Raven's own lints are off by default and cover 18 lintr rules; see [Linting](linting.md) for how Raven reads a `.lintr`.
+- **Jarl.** Run it alongside Raven. Raven's lints are off by default, so the two don't report the same problem unless you turn Raven's lints on.
+- **Air.** Raven indents lines as you type but never reformats whole files, so it doesn't conflict with Air formatting your files. See [Indentation](indentation.md).
+
+## Settings
+
+| Setting | What it controls |
+|---|---|
+| `raven.rConsole.activation` | Whether Raven's R console, viewers, chunk commands, and preview commands activate. |
+| `raven.linting.enabled` | Whether Raven's style lints run, and whether `"auto"` defers to vscode-R or Positron. |
+| `raven.chunks.codeLens.commands` | Which run commands appear in Raven's chunk CodeLens row. |
+| `raven.rmdKnit.enabled` | Whether Knit Preview is available, together with the console activation. |
+
+See the [settings reference](settings-reference.md) for defaults and allowed values.
+
+## Details
+
+<details markdown="1">
+<summary>Why the Quarto extension can take over <code>.Rmd</code> files, and how Raven prevents it</summary>
+
+The Quarto extension registers both `.qmd` and `.rmd` under its `quarto` language. With only Raven and Quarto installed, VS Code can pick Quarto's claim over Raven's `rmd` language, because the order in which VS Code resolves competing language contributions from different extensions isn't documented. A `.Rmd` file can then open as `quarto`.
+
+Most Raven features handle both languages: run line, chunk navigation, CodeLens, and the send-to-R menus. Knit Preview only runs for files in the `rmd` or `r` language with an R Markdown extension, so it stops working when a `.Rmd` file opens as `quarto`. The symptom is `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Linux and Windows) showing Quarto's "Editor selection is not within an executable cell" message instead of opening the preview.
+
+To prevent this, Raven sets a default `files.associations` entry for six case variants, `*.rmd`, `*.Rmd`, `*.RMD`, `*.rmarkdown`, `*.Rmarkdown`, and `*.RMARKDOWN`, all mapped to `rmd`. VS Code applies `files.associations` before extension language contributions, so these files open as `rmd` whether or not vscode-R's syntax extension is also installed.
+
+`files.associations` merges by key, so an override like the one above replaces only the keys it lists. Any other `files.associations` defaults Raven adds stay in effect.
+
+</details>
+
+<details markdown="1">
+<summary>Why Quarto's CodeLens row does nothing without vscode-R</summary>
+
+Quarto's R cell runner checks for vscode-R's extension ID, not for the `r.runSelection` command it calls. Raven can't satisfy that check whatever commands it registers, so the fix would have to come from the Quarto extension. Quarto's row stays useful for other languages when their runners are installed.
+
+</details>
+
+## See also
+
+- [How Raven compares](comparison.md): Raven next to RStudio, Positron, vscode-R, lintr, Jarl, and Air.
+- [R console](r-console.md): run R and send code from the editor.
+- [Linting](linting.md): Raven's opt-in style rules and how they read `.lintr`.
+- [Limitations](limitations.md): what Raven doesn't do yet.
