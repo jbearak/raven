@@ -1585,3 +1585,129 @@ fn step_out_of_a_loop_still_stops_at_later_breakpoints_in_it() {
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
 }
+
+#[test]
+fn error_and_warning_filters_stop_in_code_from_files_only() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let h = c.write_file(
+        "h.R",
+        "h <- function(x) {\n  y <- x * 2\n  stop(\"boom: \", y)\n}\nw <- function() {\n  warning(\"ww\")\n  1\n}\n",
+    );
+    let top = c.write_file("top.R", "x <- log('a')\n");
+    let s = c.write_file("s.R", "\nz <- log('s')\n");
+    let mut d = Dap::connect(&c);
+    let caps = d.req("initialize", json!({"adapterID": "raven-r"}));
+    let filters = &caps["body"]["exceptionBreakpointFilters"];
+    assert_eq!(filters[0]["filter"], "error");
+    assert_eq!(filters[0]["default"], true);
+    assert_eq!(filters[1]["default"], false);
+    assert_eq!(filters[2]["default"], false);
+    d.req(
+        "setExceptionBreakpoints",
+        json!({"filters": ["error", "warning"]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send(&std::fs::read_to_string(&h).unwrap(), Some(&h));
+    c.expect("> ");
+
+    // Typed at the prompt: R prints the error, the debugger stays out.
+    let m = d.mark();
+    c.type_line("log('typed')");
+    c.expect("Error in log(\"typed\")");
+    c.type_line("{ stop('brace') }");
+    c.expect("Error: brace");
+    c.type_line("g <- function() stop('typed fn')");
+    c.type_line("g()");
+    c.expect("typed fn");
+    c.type_line("warning('typed warning')");
+    c.expect("typed warning");
+    c.send("log('untagged')", None);
+    c.expect("Error in log(\"untagged\")");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(d.count("stopped", m), 0);
+
+    // A top-level line sent from a file stops at that line.
+    let m = d.mark();
+    c.send("x <- log('a')", Some(&top));
+    assert_eq!(d.event("stopped", m)["body"]["reason"], "exception");
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let f0 = &st["body"]["stackFrames"][0];
+    assert_eq!(f0["line"], 1);
+    assert_eq!(f0["source"]["path"], top.as_str());
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+
+    // A function from a file, called from the prompt, stops inside it; an
+    // error typed at its Browse> prompt doesn't stop again.
+    let m = d.mark();
+    c.type_line("h(5)");
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("h".to_string(), 3));
+    let m = d.mark();
+    c.type_line("log('at browse')");
+    c.expect("Error in log(\"at browse\")");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(d.count("stopped", m), 0);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect("boom: 10");
+
+    // Warnings follow the same rule.
+    let m = d.mark();
+    c.type_line("w()");
+    let stop = d.event("stopped", m);
+    assert_eq!(stop["body"]["reason"], "exception");
+    assert_eq!(d.stack()[0], ("w".to_string(), 6));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+
+    // source() of a file with no breakpoints (base R's source()).
+    let m = d.mark();
+    c.type_line(&format!("source('{s}')"));
+    d.event("stopped", m);
+    let st = d.req("stackTrace", json!({"threadId": 1}));
+    let f0 = &st["body"]["stackFrames"][0];
+    assert_eq!(f0["line"], 2);
+    assert_eq!(f0["source"]["path"], s.as_str());
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect("Error in log(\"s\")");
+
+    // keep.source = FALSE leaves no file to stop in...
+    let m = d.mark();
+    c.type_line(&format!("source('{s}', keep.source = FALSE)"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(d.count("stopped", m), 0);
+
+    // ...unless the file has a breakpoint: Raven's source() parses it
+    // with srcrefs to instrument it.
+    let si = c.write_file("si.R", "unused <- function() {\n  1\n}\nq <- log('i')\n");
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": si}, "breakpoints": [{"line": 2}]}),
+    );
+    for keep in ["TRUE", "FALSE"] {
+        let m = d.mark();
+        c.type_line(&format!("source('{si}', keep.source = {keep})"));
+        d.event("stopped", m);
+        let st = d.req("stackTrace", json!({"threadId": 1}));
+        let f0 = &st["body"]["stackFrames"][0];
+        assert_eq!(f0["line"], 4, "keep.source = {keep}");
+        assert_eq!(f0["source"]["path"], si.as_str());
+        let m = d.mark();
+        d.req("continue", json!({"threadId": 1}));
+        d.event("terminated", m);
+        d.session_ended();
+    }
+}

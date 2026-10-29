@@ -1117,6 +1117,27 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         0L
     }
+    # Error and warning stops are for code from a file: editor sends with a
+    # location (`#line`), source(), load_all(). Code typed at the prompt has
+    # srcrefs too, but with filename "". A builtin's error at top level
+    # carries its file srcref only on the `.handleSimpleError()` call, so
+    # every frame but the debugger's own is checked. Sends that fall back to
+    # untagged text (an unsaved buffer, a path `#line` can't carry) have no
+    # file, so they don't stop; nor does source(keep.source = FALSE), unless
+    # the file has a breakpoint (the source() wrapper parses with srcrefs).
+    file_srcref <- function(sr) {
+        if (!inherits(sr, "srcref")) return(FALSE)
+        loc <- srcref_loc(sr)
+        !is.null(loc) && nzchar(loc[[1L]]) && !startsWith(loc[[1L]], "<")
+    }
+    from_file <- function() {
+        for (i in seq_len(sys.nframe())) {
+            f <- sys.function(i)
+            if (identical(environment(f), here)) next
+            if (file_srcref(attr(sys.call(i), "srcref")) || file_srcref(attr(f, "srcref"))) return(TRUE)
+        }
+        FALSE
+    }
     on_condition <- function(cnd) {
         if (isTRUE(state$internal)) return(invisible(NULL))
         kind <- if (inherits(cnd, "interrupt")) "interrupt" else if (inherits(cnd, "error")) "error"
@@ -1127,6 +1148,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         pause <- identical(taken, "1")
         filters <- strsplit(rpc("filters"), ",", fixed = TRUE)[[1L]]
         if (!pause && !(kind %in% filters)) return(invisible(NULL))
+        if (!pause && kind != "interrupt" && !from_file()) return(invisible(NULL))
         k <- user_frame()
         msg <- tryCatch(conditionMessage(cnd), error = function(e) "")
         call <- tryCatch(paste(deparse(conditionCall(cnd), nlines = 1L), collapse = ""), error = function(e) "")

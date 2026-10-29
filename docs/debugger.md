@@ -18,9 +18,9 @@ You need Raven's console (`raven.rTerminal.program` = `raven`, the default). It 
 2. Run the code that defines it with Run Line or Selection, Run Chunk, or Source File (`Cmd+Enter`, `Shift+Cmd+Enter`).
 3. Call the code. When R reaches the breakpoint, VS Code switches to the debugger, showing the stopped line, the call stack and the variables.
 
-You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error (if you turned that on), and detaches when R gets back to the `>` prompt. When you run several expressions at once (a selection, Run All Chunks, a sourced file), the session lasts until all of them have run, so stopping again in a later one doesn't restart the debugger.
+You don't need a `launch.json`. VS Code attaches when R stops, whether at a breakpoint, at a `browser()` you wrote, in a function you `debug()`ed, or at an error in your code, and detaches when R gets back to the `>` prompt. When you run several expressions at once (a selection, Run All Chunks, a sourced file), the session lasts until all of them have run, so stopping again in a later one doesn't restart the debugger.
 
-To attach before anything stops, run Raven: Start R Debugging. You need this to turn on an exception filter for the first time, because the filters live in the Breakpoints view of a running session (Raven remembers them per workspace after that).
+To attach before anything stops, run Raven: Start R Debugging. You need this to change an exception filter (for example, to stop on warnings) for the first time, because the filters live in the Breakpoints view of a running session (Raven remembers them per workspace after that).
 
 F5 with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger; the session ends when the file has run. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script.
 
@@ -90,13 +90,15 @@ Steps behave as R defines them, with four conveniences:
 
 ## Errors, warnings and interrupts
 
-The Breakpoints view lists three exception filters, all off by default:
+The Breakpoints view lists three exception filters. Uncaught errors is on by default, as in Python's and Julia's debuggers; the other two are off:
 
-| Filter | Stops |
-|---|---|
-| Uncaught errors | Where an error is signalled, in your code, with the frames still alive |
-| Warnings (not muffled) | Where a warning is signalled |
-| Interrupts | When you press Ctrl+C, instead of returning to the prompt |
+| Filter | Default | Stops |
+|---|---|---|
+| Uncaught errors | On | Where an error is signalled, in your code, with the frames still alive |
+| Warnings (not muffled) | Off | Where a warning is signalled |
+| Interrupts | Off | When you press Ctrl+C, instead of returning to the prompt |
+
+Errors and warnings stop only when code from a file is running: code you ran from the editor, a file you `source()`d, or a function such code defined. An error in something you type at the `>` prompt, such as `log("a")`, prints as usual, and so does one you type at `Browse[1]>` while already stopped. Code run from an unsaved editor has no file, so its errors don't stop either, and neither do errors in a file sourced with `source(keep.source = FALSE)`, unless that file has a breakpoint.
 
 Errors caught by `tryCatch()` or `try()`, and warnings muffled by a local handler, never reach these filters; no R debugger can break on them without tracing `stop()` itself. After a stop on an error, Step Over lets the error continue.
 
