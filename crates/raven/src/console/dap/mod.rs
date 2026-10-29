@@ -65,8 +65,15 @@ const STEP_PROBE: &str = "step";
 
 unsafe extern "C" {
     fn raven_dbg_init(err: *mut c_char, errlen: c_int) -> c_int;
-    fn raven_dbg_set_rpc(f: unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *const c_char);
-    fn raven_dbg_current_srcref(use_na: c_int, lines: *mut c_int, file: *mut c_char, filelen: c_int) -> c_int;
+    fn raven_dbg_set_rpc(
+        f: unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *const c_char,
+    );
+    fn raven_dbg_current_srcref(
+        use_na: c_int,
+        lines: *mut c_int,
+        file: *mut c_char,
+        filelen: c_int,
+    ) -> c_int;
     fn raven_dbg_clear_global_rdebug();
 }
 
@@ -392,7 +399,11 @@ fn r_version_at_least(major: u32, minor: u32) -> bool {
     unsafe { libr::raven_release(out) };
     let mut it = v
         .first()
-        .map(|s| s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split('.')
+                .filter_map(|p| p.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default()
         .into_iter();
     let (ma, mi) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
@@ -523,7 +534,11 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
         "setExceptionBreakpoints" => {
             let filters: Vec<String> = args["filters"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             lock_shared(shared).filters = filters;
             out.respond(&msg, json!({}));
@@ -538,7 +553,11 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
             let start = args["startFrame"].as_u64().unwrap_or(0) as usize;
             let levels = args["levels"].as_u64().unwrap_or(0) as usize;
             let total = stop.frames.len();
-            let end = if levels == 0 { total } else { (start + levels).min(total) };
+            let end = if levels == 0 {
+                total
+            } else {
+                (start + levels).min(total)
+            };
             let frames: Vec<Value> = stop.frames[start.min(total)..end]
                 .iter()
                 .map(frame_to_dap)
@@ -637,7 +656,11 @@ fn request_resume(cmd: &str) {
         if s.stop.is_none() {
             return;
         }
-        let cmd = if cmd == "n" && s.rewrite_next { "f" } else { cmd };
+        let cmd = if cmd == "n" && s.rewrite_next {
+            "f"
+        } else {
+            cmd
+        };
         s.resume = Some(cmd.to_string());
     }
     h.break_flag.store(true, Ordering::Relaxed);
@@ -754,7 +777,9 @@ pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String
     for (line, condition, hit_condition, log_message) in wanted {
         let placement = plan.as_ref().and_then(|p| {
             p.placements.iter().find(|pl| match pl {
-                Placement::Inject { id, .. } | Placement::Invalid { id, .. } => *id == line.to_string(),
+                Placement::Inject { id, .. } | Placement::Invalid { id, .. } => {
+                    *id == line.to_string()
+                }
             })
         });
         let (anchor, invalid) = match placement {
@@ -829,7 +854,10 @@ pub fn set_mirrored(functions: Option<Vec<String>>, filters: Option<Vec<String>>
 fn notify_breakpoints(changed: Vec<(String, LineBp)>) {
     let Some(out) = outbox() else { return };
     for (path, bp) in changed {
-        out.event("breakpoint", json!({"reason": "changed", "breakpoint": bp.to_dap(&path)}));
+        out.event(
+            "breakpoint",
+            json!({"reason": "changed", "breakpoint": bp.to_dap(&path)}),
+        );
     }
 }
 
@@ -903,10 +931,9 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 return "stop".into();
             }
             let id = a.parse::<u64>().ok();
-            let stepping = with_r(|r| {
-                matches!(r.last_user_resume.as_deref(), Some("n" | "s")) && r.resumed
-            })
-            .unwrap_or(false);
+            let stepping =
+                with_r(|r| matches!(r.last_user_resume.as_deref(), Some("n" | "s")) && r.resumed)
+                    .unwrap_or(false);
             if b == "1" && stepping {
                 // R's own step stops at the next statement of this frame
                 // anyway (§4): count the hit, but don't open a second browser.
@@ -1039,16 +1066,18 @@ fn apply_plan(
                     line,
                     callees,
                 } => {
-                    let unconfirmed = callees
-                        .iter()
-                        .find(|c| !verified_callees.contains(&format!("{}::{}", c.pkg, c.name).as_str()));
+                    let unconfirmed = callees.iter().find(|c| {
+                        !verified_callees.contains(&format!("{}::{}", c.pkg, c.name).as_str())
+                    });
                     let Ok(num) = id.parse::<u64>() else {
                         if id == STEP_PROBE {
                             inj.push((*byte, *line, id.clone()));
                         }
                         continue;
                     };
-                    let Some((_, bp)) = s.bp_by_id(num) else { continue };
+                    let Some((_, bp)) = s.bp_by_id(num) else {
+                        continue;
+                    };
                     if let Some(c) = unconfirmed {
                         bp.verified = false;
                         bp.reason = Some(format!(
@@ -1109,8 +1138,16 @@ pub fn split_submission(code: &str, loc: &Location) -> Option<VecDeque<Segment>>
         for l in l1..=l2 {
             let line = lines[(l - 1) as usize];
             let chars: Vec<char> = line.chars().collect();
-            let from = if l == l1 { (c1.saturating_sub(1)) as usize } else { 0 };
-            let to = if l == l2 { (c2 as usize).min(chars.len()) } else { chars.len() };
+            let from = if l == l1 {
+                (c1.saturating_sub(1)) as usize
+            } else {
+                0
+            };
+            let to = if l == l2 {
+                (c2 as usize).min(chars.len())
+            } else {
+                chars.len()
+            };
             text.extend(chars[from.min(chars.len())..to.max(from).min(chars.len())].iter());
             if l != l2 {
                 text.push('\n');
@@ -1229,9 +1266,7 @@ pub fn on_repl_prompt(level: u32) -> Option<String> {
     }
     let use_na = with_r(|r| r.use_na)?;
     let cur = read_current_srcref(use_na);
-    let marker = cur
-        .as_ref()
-        .is_some_and(|(f, _)| f == annotate::PROBE_FILE);
+    let marker = cur.as_ref().is_some_and(|(f, _)| f == annotate::PROBE_FILE);
     if marker {
         let step = with_r(|r| {
             if r.hidden_steps < MAX_HIDDEN_STEPS {
@@ -1308,7 +1343,10 @@ fn on_top_level() -> Option<String> {
             }
         }
         if let Some(out) = outbox() {
-            out.event("continued", json!({"threadId": 1, "allThreadsContinued": true}));
+            out.event(
+                "continued",
+                json!({"threadId": 1, "allThreadsContinued": true}),
+            );
             out.event("terminated", json!({}));
         }
         push_control(json!({"event": "running"}));
@@ -1324,17 +1362,8 @@ fn on_top_level() -> Option<String> {
 /// the stop isn't shown (stepping back out of code with no srcref).
 fn on_captured() -> Option<String> {
     let h = handle()?;
-    let (captured, cur, stopped, resumed) = match with_r(|r| {
-        (
-            r.captured.take(),
-            r.current.clone(),
-            r.stopped,
-            r.resumed,
-        )
-    }) {
-        Some(v) => v,
-        None => return None,
-    };
+    let (captured, cur, stopped, resumed) =
+        with_r(|r| (r.captured.take(), r.current.clone(), r.stopped, r.resumed))?;
     let (frames_json, flags) = captured.unwrap_or_else(|| ("[]".into(), String::new()));
     let fbp = flags.split(',').any(|f| f == "fbp");
     let top_nosrc = flags.split(',').any(|f| f == "nosrc");
@@ -1407,7 +1436,10 @@ fn on_captured() -> Option<String> {
         if same {
             release_held(true);
             if let Some(out) = outbox() {
-                out.event("invalidated", json!({"areas": ["variables"], "threadId": 1}));
+                out.event(
+                    "invalidated",
+                    json!({"areas": ["variables"], "threadId": 1}),
+                );
             }
             return None;
         }
@@ -1507,7 +1539,10 @@ fn note_resume(cmd: &str) {
         r.pending_hit = None;
     });
     if let Some(out) = outbox() {
-        out.event("continued", json!({"threadId": 1, "allThreadsContinued": true}));
+        out.event(
+            "continued",
+            json!({"threadId": 1, "allThreadsContinued": true}),
+        );
     }
 }
 
@@ -1593,7 +1628,8 @@ fn run_job(h: &Handle, job: Job) {
                 call_helper("evaluate", &[expr, &frame, context, timeout])
             }
             .unwrap_or_else(|| "{\"error\":\"evaluation failed\"}".into());
-            let v: Value = serde_json::from_str(&json).unwrap_or(json!({"error": "evaluation failed"}));
+            let v: Value =
+                serde_json::from_str(&json).unwrap_or(json!({"error": "evaluation failed"}));
             if let Some(e) = v.get("error").and_then(Value::as_str) {
                 out.fail(&req, e);
             } else {
@@ -1643,7 +1679,10 @@ enum FilterMode {
     Hold,
 }
 
-const DROP: &[&str] = &["debug at <raven-probe>#", "debug: base::`if`(base::identical("];
+const DROP: &[&str] = &[
+    "debug at <raven-probe>#",
+    "debug: base::`if`(base::identical(",
+];
 const HOLD: &str = "Called from: ";
 
 /// Filter R's stdout so the debugger's own steps stay invisible: a probe's

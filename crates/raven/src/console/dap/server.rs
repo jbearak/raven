@@ -21,9 +21,6 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 pub struct Outbox {
     tx: mpsc::Sender<Value>,
-    /// Incremented per connection; messages queued for an older connection
-    /// are discarded.
-    pub connection: Arc<AtomicU64>,
 }
 
 impl Outbox {
@@ -168,7 +165,7 @@ pub fn start(
                     });
             }
         })?;
-    Ok(Outbox { tx, connection })
+    Ok(Outbox { tx })
 }
 
 #[cfg(test)]

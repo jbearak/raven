@@ -182,7 +182,9 @@ fn serve(
                             line: l.get("line")?.as_u64()? as u32,
                             col: l.get("col").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
                             lines: l.get("lines").and_then(|m| m.as_array()).map(|a| {
-                                a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+                                a.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect()
                             }),
                         })
                     });
@@ -215,7 +217,11 @@ fn serve(
             Some("breakpoints") => {
                 let ok = apply_breakpoint_mirror(&msg);
                 let status = if ok { "ok" } else { "not-ready" };
-                let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": status}));
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::json!({"id": id, "status": status})
+                );
             }
             Some("ping") => {
                 let _ = writeln!(
@@ -249,7 +255,9 @@ fn apply_breakpoint_mirror(msg: &serde_json::Value) -> bool {
                 .map(|a| {
                     a.iter()
                         .map(|b| {
-                            let s = |k: &str| b.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let s = |k: &str| {
+                                b.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                            };
                             (
                                 b.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                                 s("condition"),

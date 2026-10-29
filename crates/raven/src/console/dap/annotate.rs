@@ -90,8 +90,15 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
     use ArgUse::*;
     let first: &'static [(usize, &'static str)] = &[(0, "expr")];
     Some(match name {
-        "local" | "suppressWarnings" | "suppressMessages" | "suppressPackageStartupMessages"
-        | "invisible" | "system.time" | "withVisible" | "force" | "identity" => ("base", Code(first)),
+        "local"
+        | "suppressWarnings"
+        | "suppressMessages"
+        | "suppressPackageStartupMessages"
+        | "invisible"
+        | "system.time"
+        | "withVisible"
+        | "force"
+        | "identity" => ("base", Code(first)),
         "try" => ("base", Code(first)),
         "tryCatch" => ("base", Code(&[(0, "expr"), (usize::MAX, "finally")])),
         "withCallingHandlers" => ("base", Code(first)),
@@ -103,10 +110,7 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
         "test_that" => ("testthat", Code(&[(1, "code")])),
         "describe" => ("testthat", Code(&[(1, "code")])),
         "it" => ("testthat", Code(&[(1, "code")])),
-        "observeEvent" => (
-            "shiny",
-            Code(&[(0, "eventExpr"), (1, "handlerExpr")]),
-        ),
+        "observeEvent" => ("shiny", Code(&[(0, "eventExpr"), (1, "handlerExpr")])),
         "eventReactive" => ("shiny", Code(&[(0, "eventExpr"), (1, "valueExpr")])),
         "observe" | "reactive" | "isolate" | "renderPlot" | "renderText" | "renderPrint"
         | "renderUI" | "renderTable" | "renderImage" | "renderDataTable" | "renderCachedPlot" => {
@@ -130,14 +134,18 @@ const CORE_NAMES: &[&str] = &[
 /// Calls that change scope dynamically; with any of these in the expression,
 /// injections that depend on a callee check are refused (§5.3).
 const DYNAMIC_SCOPE: &[&str] = &[
-    "eval", "evalq", "list2env", "attach", "sys.source", "environment<-", "sys.function",
+    "eval",
+    "evalq",
+    "list2env",
+    "attach",
+    "sys.source",
+    "environment<-",
+    "sys.function",
 ];
 
 pub fn parse(text: &str) -> Option<Tree> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .ok()?;
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
     parser.parse(text, None)
 }
 
@@ -233,7 +241,9 @@ fn bound_names(root: Node, text: &str) -> BTreeSet<String> {
                 }
             }
             "parameter" => {
-                if let Some(name) = n.child_by_field_name("name").and_then(|t| ident_name(t, text))
+                if let Some(name) = n
+                    .child_by_field_name("name")
+                    .and_then(|t| ident_name(t, text))
                 {
                     out.insert(name);
                 }
@@ -273,7 +283,9 @@ fn bound_names(root: Node, text: &str) -> BTreeSet<String> {
 fn first_arg_value(call: Node) -> Option<Node> {
     let args = call.child_by_field_name("arguments")?;
     let mut c = args.walk();
-    let first = args.named_children(&mut c).find(|a| a.kind() == "argument")?;
+    let first = args
+        .named_children(&mut c)
+        .find(|a| a.kind() == "argument")?;
     first.child_by_field_name("value")
 }
 
@@ -282,8 +294,12 @@ fn callee_of(f: Node, text: &str) -> Option<(String, Option<String>)> {
     match f.kind() {
         "identifier" => ident_name(f, text).map(|n| (n, None)),
         "namespace_operator" => {
-            let pkg = f.child_by_field_name("lhs").and_then(|l| ident_name(l, text))?;
-            let name = f.child_by_field_name("rhs").and_then(|r| ident_name(r, text))?;
+            let pkg = f
+                .child_by_field_name("lhs")
+                .and_then(|l| ident_name(l, text))?;
+            let name = f
+                .child_by_field_name("rhs")
+                .and_then(|r| ident_name(r, text))?;
             Some((name, Some(pkg)))
         }
         _ => None,
@@ -352,7 +368,9 @@ fn executable_path(stmt: Node, text: &str) -> Result<Vec<Callee>, String> {
             "function_definition" => {
                 let body = parent.child_by_field_name("body");
                 if body.map(|b| b.id()) != Some(node.id()) {
-                    return Err("inside a default argument: Raven can't verify this runs as code".into());
+                    return Err(
+                        "inside a default argument: Raven can't verify this runs as code".into(),
+                    );
                 }
             }
             "binary_operator" => {
@@ -375,7 +393,9 @@ fn executable_path(stmt: Node, text: &str) -> Result<Vec<Callee>, String> {
                 let args = parent.parent().ok_or("malformed call")?;
                 let call = args.parent().ok_or("malformed call")?;
                 if call.kind() != "call" {
-                    return Err("inside an index expression: Raven can't verify this runs as code".into());
+                    return Err(
+                        "inside an index expression: Raven can't verify this runs as code".into(),
+                    );
                 }
                 let Some((name, pkg)) = call
                     .child_by_field_name("function")
@@ -738,7 +758,15 @@ mod tests {
 
     #[test]
     fn file_mode_has_no_wrapper() {
-        let out = render("a <- 1\nb <- 2", "/a.R", 1, 0, &[(7, 2, "x".into())], 1, Wrap::File);
+        let out = render(
+            "a <- 1\nb <- 2",
+            "/a.R",
+            1,
+            0,
+            &[(7, 2, "x".into())],
+            1,
+            Wrap::File,
+        );
         assert!(out.starts_with("#line 1 \"/a.R\"\na <- 1\n"));
         assert!(out.contains("#line 2 \"/a.R\"\nb <- 2"));
         assert!(!out.contains('{'));

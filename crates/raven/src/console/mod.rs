@@ -32,7 +32,7 @@
 //! and socket requests are only ever fed to R's own REPL prompts, never to
 //! `readline()`/`menu()`/`scan()` input (R marks those with `hist = 0`).
 
-pub mod dap;
+mod dap;
 mod discovery;
 mod editor;
 mod ipc;
@@ -362,7 +362,12 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
         output::get().set_headers(h.headers);
     }
     if opts.dap.is_some()
-        && let Err(e) = dap::init(opts.dap.as_deref(), break_flag.clone(), main_thread, subscribers)
+        && let Err(e) = dap::init(
+            opts.dap.as_deref(),
+            break_flag.clone(),
+            main_thread,
+            subscribers,
+        )
     {
         eprintln!("\x1b[2mraven console: {e}\x1b[0m");
     }
@@ -1164,7 +1169,9 @@ fn plain_read(prompt: &str) -> Option<String> {
             if ready == 0 {
                 continue;
             }
-            if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
                 request_interrupt();
                 break Some("\n".into());
             }
