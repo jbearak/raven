@@ -1,6 +1,6 @@
 # Docs redesign: implementation plan
 
-Date: 2026-10-29. Status: plan, revision 3 (addresses round-1 and round-2 reviews by Terra and Sonnet; see the tables at the end).
+Date: 2026-10-29. Status: plan, revision 4 (addresses round-1 to round-3 reviews by Terra and Sonnet; see the tables at the end).
 
 This plan implements `docs/superpowers/specs/2026-10-29-docs-redesign-design.md` (revision 4, approved by Terra and Sonnet; referred to as "the design" and cited by §). Everything ships as one PR from branch `t3/documentation-redesign`, reviewed with sol-loop and merged by squash, the repo's only allowed method. Steps are ordered so that guards exist before content changes. Phases 1–3 build the tooling, Phase 4 rewrites content, and Phases 5–8 verify and ship.
 
@@ -36,20 +36,42 @@ This plan implements `docs/superpowers/specs/2026-10-29-docs-redesign-design.md`
 
 All tests live under `tests/bun/docs/`, with shared helpers in `tests/bun/docs/_lib/`.
 
-**Gating from the first commit:** the anchor-baseline test, the link test, the slug and escape-detector unit tests, settings-reference, and apt-packaging. Every commit on the branch keeps these green.
+**Always gating, from the first commit:**
 
-**Report mode during Phase 4:** the content lints that the rewrite is meant to satisfy (`docs-lints`, `docs-examples` binding/escape, hub drift, README parity) run in report mode via `DOCS_LINT_REPORT=1`, which prints violations and does not fail. **No report-mode switch exists in CI.** The image-existence lint can't pass until images exist, so it becomes gating in Phase 6 (§Phase 6.3). The final commit has every test gating.
+- `anchor-baseline.test.ts`
+- `links.test.ts`: link and image-file existence
+- `slug.test.ts`, `escape-detector.test.ts`
+- `generated.test.ts`: hub, `llms.txt`, and nav drift
+- `snippet-syntax.test.ts`
+- settings-reference, apt-packaging
+
+Every commit on the branch keeps these green.
+
+**Pending until satisfied, as a property of the committed code.** `tests/bun/docs/_lib/report.ts` holds a `PENDING` set of check categories, which **report instead of failing in CI and locally**:
+
+- `lints`: style and template
+- `examples`: doc/corpus binding and unmarked CLI output
+- `hub`: hub coverage
+- `readme-parity`
+- `images`: alt text
+
+So `bun test` in `integration.yml` stays green and the vscode-test steps after it still run. Categories are removed from `PENDING` as they turn clean:
+
+- `lints`, `examples`, `hub`, and `readme-parity` at the Phase 4 close-out
+- `images` in Phase 6.3
+
+The final commit has `PENDING` empty. `DOCS_LINT_REPORT=1` remains a local triage switch only.
 
 1. **`_lib/markdown.ts`**: a fence-aware line scanner that returns:
    - headings, links, `<a id|name>` anchors
    - fenced blocks with their info string and the preceding HTML comment
    - paragraphs, excluding tables, code, `<details>` bodies, and blockquotes that are GitHub alerts (which still count as paragraphs)
 2. **`_lib/slug.ts`**: GitHub slugger. It lowercases, strips punctuation except `-` and `_`, maps spaces to `-`, and adds `-1`/`-2` duplicate suffixes. Unit test `slug.test.ts` uses fixture headings with known GitHub slugs: backticks, `&`, `/`, `.`, emoji/Unicode, and duplicates.
-3. **`docs-links.test.ts` (§4.2)** resolves:
+3. **`tests/bun/docs/links.test.ts` (§4.2)** resolves:
    - relative links and anchors in manifest pages, both READMEs, `llms.txt`, and `docs/README.md`
    - `https://github.com/jbearak/raven/blob/main/<path>#anchor` and `raw.githubusercontent.com/jbearak/raven/main/<path>` URLs in those files, plus `crates/`, `editors/`, and `scripts/`, mapped to local files
    - `<a id>` as valid targets
-4. **`docs-anchor-baseline.test.ts` (§4.1)**: every baseline `file#slug` still resolves in the current file.
+4. **`tests/bun/docs/anchor-baseline.test.ts` (§4.1)**: every baseline `file#slug` still resolves in the current file.
 5. **`docs-examples.test.ts` (§5.1 binding)**:
    - `<!-- example: name [file=…] [stream=stdout|stderr|both] -->` blocks equal the corpus files, with `{{version}}` substituted from `crates/raven/Cargo.toml`.
    - The no-silent-escape detector (all §5.1 patterns, case-insensitive message prefixes) fails on unmarked, unexempted blocks.
@@ -71,7 +93,7 @@ All tests live under `tests/bun/docs/`, with shared helpers in `tests/bun/docs/_
      - every `<details>` is written `<details markdown="1">`
      - links that leave `docs/` (to the README, `demo/`, LICENSE, `editors/`) are absolute `https://github.com/jbearak/raven/blob/main/...` URLs
      - the exceptions are the root README and editors/vscode/README.md, whose links into `docs/` stay relative in the root README (so branch-pinned review works) and absolute in the Marketplace README (required by the Marketplace)
-7. **`scripts/generate-docs-hub.mjs`** reads the manifest and writes three things:
+7. **`scripts/generate-docs-hub.ts`** (run with bun) reads the manifest and writes three things:
    - `docs/README.md`, the hub, with a site link only if `site_url` is non-empty
    - root `llms.txt`, with absolute `blob/main` URLs
    - the nav block of `docs/site/zensical.toml`
@@ -80,7 +102,7 @@ All tests live under `tests/bun/docs/`, with shared helpers in `tests/bun/docs/_
 8. **`docs-snippet-syntax.test.ts`**: every ```` ```json ```` and ```` ```toml ```` block in manifest pages parses (JSONC comments allowed for VS Code `settings.json` snippets). Every ```` ```lua ```` block passes `luac -p` when `luac` is on PATH and is skipped otherwise.
 9. **`docs-readme-parity.test.ts`**: the set of `docs/*.md` targets linked from the "What you get" section of README.md equals the set linked from the matching section of editors/vscode/README.md, normalized to repo-relative paths.
 10. **settings-reference generator.** `generate-settings-reference.mjs` emits the breadcrumb, a lead sentence, and a See also section. Regenerate the file and update `tests/bun/settings-reference.test.ts` for the new header lines, keeping every existing assertion, including the `workspace.respectGitignore` row.
-11. **apt-packaging test.** `tests/bun/apt-packaging.test.ts:133–138` retargets the CI-heading assertions from `docs/cli.md` to `docs/ci.md`. The test also asserts that `docs/cli.md` still contains the legacy anchors `ci-examples`, `github-actions-example`, and `bitbucket-pipelines-example` (as headings or `<a id>`).
+11. **apt-packaging test.** Done by batch D, in the same change that moves the templates: `tests/bun/apt-packaging.test.ts:133–138` retargets the CI-heading assertions from `docs/cli.md` to `docs/ci.md`, pinning `## GitHub Actions` and `## Bitbucket Pipelines` (today's ci.md headings, which batch D's brief says to keep). The test also asserts that `docs/cli.md` still contains the legacy anchors `ci-examples`, `github-actions-example`, and `bitbucket-pipelines-example` (as headings or `<a id>`).
 
 12. **Stub the four new pages in the same commit as the manifest and hub:** `getting-started.md`, `coming-from.md`, `troubleshooting.md`, and `faq.md`. Each stub has the title, the breadcrumb, a lead sentence, and a "This page is being written" line. Then the hub, `llms.txt`, and the gating link test hold from the first commit, and batches B–G can link to them. Batch A replaces the stubs, and no stub text survives to the final commit (the lints reject the "being written" line).
 13. **`tests/bun/tsconfig.json`**: add `docs/**/*.ts` to its narrow `include` list, following the rule in its header comment, so editors resolve the new test files.
@@ -183,7 +205,8 @@ Agents don't commit. I review each batch's diff before the next phase.
 
    This updates the design §7 fallback: the site build and workflow are kept (deploy gated off) rather than dropped. That is strictly safer, since nothing deploys and nothing goes red.
 5. **Build-failure fallback (design §7).** If Zensical cannot build the rewritten docs strictly, and a bounded fix (≤ a config change or a small source-compatible tweak) does not resolve it, then:
-   - Remove `docs/site/` and `docs.yml`.
+   - Remove `docs/site/` and `docs.yml`. The hub generator only touches `docs/site/zensical.toml` when that file exists, so it and its drift test keep working unchanged.
+   - Every later site step is conditional on the site existing: Phase 5.6, the strict build in Phase 7.1, the docs CI requirement in Phase 8.2, and the post-merge build check in Phase 8.4. The final report states which path was taken.
    - Keep `site_url` empty, so no site links are emitted.
    - Drop the search-index check.
    - Acceptance gates on the two-click route, as it already does.
@@ -253,8 +276,11 @@ Agents don't commit. I review each batch's diff before the next phase.
    - **Failures** go back to Phase 4 for the affected pages, followed by a re-run of the affected tasks.
    - **Evidence.** `docs/superpowers/specs/2026-10-29-docs-acceptance.md` holds the per-task table, every transcript (or a link to it), and the spot-check notes. The PR description summarizes them.
 5. **Binding to the shipped revision.**
-   - **Docs SHA vs evidence commit.** The acceptance file records the **tested docs SHA**. Evidence lands in a separate commit that touches only `docs/superpowers/`, so the docs a reviewer sees at the head equal the docs at the tested SHA. A test-free check enforces this: `git diff --stat <tested-sha> HEAD -- README.md editors/vscode/README.md docs ':!docs/superpowers'` is empty.
-   - **Content-only changes.** If a later commit changes only a page's content (not headings, links, or the hub), the tasks whose recorded path touches that page are re-run.
+   - **Docs SHA vs evidence commit.** The acceptance file records the **tested docs SHA**. Evidence lands in a separate commit that touches only `docs/superpowers/`, so the docs a reviewer sees at the head equal the docs at the tested SHA. A check enforces this: `git diff --stat <tested-sha> HEAD -- <files this PR changes under README.md, editors/vscode/README.md, docs/, excluding docs/superpowers/>` is empty. Scoping to the PR's own files keeps docs changes on `main` from being counted after a rebase.
+   - **After the Phase 8 rebase**, the binding check runs again. If the rebase brought `main` changes to any page a retained run visited, those tasks go through carry-forward or a re-run.
+   - **Old SHAs** remain available in the local clone, and reflog is kept, for `git diff`. The evidence commit is pushed before any re-run, so the evidence on GitHub always matches the current head.
+   - **Rebinding after any later docs change** uses a per-task carry-forward. A new tested SHA is chosen, and each retained run is checked individually: if every Raven page it visited is byte-identical between its recorded SHA and the new SHA (`git diff --quiet <old> <new> -- <visited pages>`), the run carries forward. The acceptance table records both SHAs and the check. Otherwise that task is re-run at the new SHA. Every task in the final table therefore has a run that is valid for the final docs, even if its transcript URLs name an earlier SHA.
+   - **Content-only changes.** If a later commit changes only a page's content (not headings, links, or the hub), carry-forward applies as above.
    - **Navigation changes.** If a later commit changes any link, heading, the hub, the manifest, or either README's link set, the **full** 20-task set is re-run, along with the comparator checks for any task whose effort changed.
    - **Budget.** One persona run is about 20 short web sessions. The full set (baseline, final, and comparators) is about 60–80 sessions, and the plan allows up to two full re-runs.
 
@@ -270,14 +296,14 @@ Agents don't commit. I review each batch's diff before the next phase.
    - the model attribution
 2. Link the PR to this thread, watch it, and babysit:
    - Fix CI failures and real bot findings, with proof for each, and push with `--force-with-lease` after a rebase.
-   - Docs CI (`docs.yml`) and the temporary fresh-install workflow are not required, but both must be green before merge. The fresh-install workflow is then deleted (Phase 6.2).
+   - Docs CI (`docs.yml`, if the site survived Phase 5) and the temporary fresh-install workflow are not required, but both must be green before merge. The fresh-install workflow is then deleted (Phase 6.2).
 3. **Merge gate (full-send):**
    - required checks green
    - bots done and every finding handled
    - the branch up to date and mergeable
    - squash merge
 4. **After merge:**
-   - Confirm `docs.yml`'s build job is green on `main`, and that `deploy` is skipped (Pages not enabled).
+   - If the site survived Phase 5, confirm `docs.yml`'s build job is green on `main`, and that `deploy` is skipped (Pages not enabled).
    - The site/search spot-check is deferred until the owner enables Pages (see the report).
 5. **Report**: the PR link, merge commit, proof, decisions, and the two owner steps to enable the site.
 
@@ -321,3 +347,12 @@ Agents don't commit. I review each batch's diff before the next phase.
 | Sonnet r2-1: PR doesn't exist when CI is needed | Phase 3.4: draft PR right after the harness; Phase 8 marks it ready |
 | Sonnet r2-2: green commits vs new pages | Phase 2.12: stubs for the four new pages, committed with the manifest |
 | Sonnet r2 non-blocking | symlink-based PATH; R-not-found assertion and `R_HOME` unset; separate user-data dir; tsconfig include; persona budget |
+
+## Changes from revision 3
+
+| Review item | Resolution |
+|---|---|
+| Terra r3-1: build fallback through merge | Phase 5.5: generator unaffected; site steps in 5.6, 7.1, 8.2, and 8.4 conditional; report states the path |
+| Terra r3-2: rebinding evidence | Phase 7.5: per-task carry-forward with byte-identical visited pages, or a re-run; binding re-checked after the Phase 8 rebase |
+| Sonnet r3-1: report mode in CI | Phase 2 preamble: `PENDING` set in committed code, emptied by the Phase 4 close-out (images in Phase 6.3); always-gating list stated. Already implemented on the branch |
+| Sonnet r3 non-blocking | File names aligned; apt-packaging headings pinned and moved to batch D; rebase-scoped diff; SHA availability |
