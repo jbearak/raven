@@ -195,7 +195,17 @@ Each category has a severity setting that accepts `"error"`, `"warning"`, `"info
 }
 ```
 
-The [code index](#diagnostic-codes) names the setting for each code. In `raven.toml` the same settings use the paths listed in the [settings reference](settings-reference.md).
+To turn a category off for everyone working on the project, put the same settings in the project's `raven.toml`:
+
+```toml
+[crossFile.diagnostics]
+missingFile = "off"
+
+[diagnostics.severity]
+undefinedVariable = "off"
+```
+
+The [code index](#diagnostic-codes) names the setting for each code, and the [settings reference](settings-reference.md) gives each one's `raven.toml` path.
 
 ## Diagnostics in other file types
 
