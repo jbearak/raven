@@ -345,6 +345,11 @@
         "title": "Start R Debugging",
         "category": "Raven",
         "icon": "$(debug-alt)"
+      },
+      {
+        "command": "raven.debugger.viewData",
+        "title": "Open in Data Viewer",
+        "category": "Raven"
       }
     ],
     "keybindings": [
@@ -522,6 +527,10 @@
         },
         {
           "command": "raven.help.forward",
+          "when": "false"
+        },
+        {
+          "command": "raven.debugger.viewData",
           "when": "false"
         }
       ],
@@ -702,6 +711,13 @@
           "command": "raven.terminal.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@1"
+        }
+      ],
+      "debug/variables/context": [
+        {
+          "command": "raven.debugger.viewData",
+          "when": "debugType == 'raven-r'",
+          "group": "navigation"
         }
       ]
     },

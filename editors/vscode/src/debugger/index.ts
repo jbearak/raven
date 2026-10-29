@@ -265,6 +265,29 @@ export function register_debugger(context: vscode.ExtensionContext): void {
                 name: 'R console',
             });
         }),
+        vscode.commands.registerCommand(
+            'raven.debugger.viewData',
+            async (arg?: { variable?: { evaluateName?: string; name?: string } }) => {
+                const session = vscode.debug.activeDebugSession;
+                const expr = arg?.variable?.evaluateName;
+                if (!session || session.type !== DEBUG_TYPE) return;
+                if (!expr) {
+                    void vscode.window.showInformationMessage(
+                        `Raven: can't open ${arg?.variable?.name ?? 'this value'} in the data viewer (it has no R expression).`,
+                    );
+                    return;
+                }
+                // `activeStackItem` (VS Code 1.90+) is newer than the API
+                // version this extension compiles against; read it if present.
+                const dbg = vscode.debug as unknown as { activeStackItem?: { frameId?: number } };
+                const frameId = dbg.activeStackItem?.frameId;
+                try {
+                    await session.customRequest('evaluate', { expression: `View(${expr})`, frameId, context: 'repl' });
+                } catch (e) {
+                    void vscode.window.showErrorMessage(`Raven: ${e instanceof Error ? e.message : String(e)}`);
+                }
+            },
+        ),
         on_console_registered((terminal, ipc) => {
             if (!debugger_enabled() || links.has(ipc)) return;
             links.set(ipc, new ConsoleLink(terminal, ipc));
