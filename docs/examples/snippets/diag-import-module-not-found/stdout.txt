@@ -1,0 +1,2 @@
+main.R:1:14 warning: Cannot resolve literal import script module [import-module-not-found]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

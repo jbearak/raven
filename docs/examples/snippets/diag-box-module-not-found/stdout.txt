@@ -1,0 +1,2 @@
+main.R:1:10 warning: Cannot resolve local box module [box-module-not-found]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

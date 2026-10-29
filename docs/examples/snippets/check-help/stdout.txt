@@ -1,0 +1,50 @@
+raven check {{version}} — R and model diagnostics for CI
+
+Usage: raven check [OPTIONS] [PATHS...]
+
+Indexes the workspace, then reports diagnostics for the requested files (or
+every R / R Markdown / Quarto / JAGS / Stan file in the workspace when no PATHS
+are given): syntax errors, semantic checks, style lints, cross-file diagnostics
+(missing source files, circular dependencies, out-of-scope usage),
+missing-package warnings, and undefined-variable diagnostics. For .Rmd /
+.Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
+are ignored. JAGS `.jags` / `.bugs` / `.bug` and Stan `.stan` files are always
+discovered, but their diagnostics are opt-in: set `jags = "on"` and/or `stan =
+"on"` under `[diagnostics]` in raven.toml. JAGS receives native syntax checks;
+complete Stan programs also receive conservative undeclared-variable checks.
+`--no-config` therefore leaves model diagnostics disabled.
+Honors raven.toml / .lintr.
+
+Options:
+  --workspace DIR             Workspace root to index (default: current directory)
+  --config PATH               Path to raven.toml or .lintr (default: search upward from
+                              --workspace, skipping literal ~/.lintr unless passed here)
+  --no-config                 Use built-in defaults; ignore raven.toml/.lintr
+  --format text|json|sarif    Output format (default: text)
+  --max-severity LEVEL        Highest severity that does NOT fail the build
+                              (off, hint, info, warning, error; default: info)
+  --quiet                     Suppress summary line in text output
+  --color auto|always|never   When to colorize text output (default: auto —
+                              color when stdout is a terminal). Honors NO_COLOR
+                              and FORCE_COLOR under auto; json/sarif are never
+                              colorized.
+  --no-color                  Alias for --color never
+
+R / packages:
+  raven check auto-detects R on PATH to resolve installed-package exports and
+  base R symbols. If R is not found and no offline package data is present
+  (`raven packages update`/`freeze`), package symbol resolution is limited to
+  base R (still covered by the embedded database) and a note is printed to
+  stderr; all other diagnostics still run.
+
+  --report-uninstalled        Report packages from library() calls that are not
+                              present in the local library paths. Disabled by
+                              default; useful when the environment DID install
+                              packages (e.g. renv::restore()) and you want to
+                              catch failures.
+
+Exit codes:
+  0   No diagnostic exceeded --max-severity
+  1   A diagnostic exceeded --max-severity, or a usage error (unknown flag / bad option value)
+  2   Operator error while running (config parse failure, unreadable path)
+

@@ -1,0 +1,2 @@
+model.stan:9:18 warning: sigma is not defined [undefined-variable]
+1 issues (0 errors, 1 warnings, 0 infos, 0 hints, 0 notes)

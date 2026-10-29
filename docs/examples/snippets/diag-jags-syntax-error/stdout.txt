@@ -1,0 +1,2 @@
+model.jags:5:13 error: Unclosed `(`: missing matching `)` [syntax-error]
+1 issues (1 errors, 0 warnings, 0 infos, 0 hints, 0 notes)

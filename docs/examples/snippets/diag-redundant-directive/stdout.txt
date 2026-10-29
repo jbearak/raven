@@ -1,0 +1,2 @@
+main.R:2:1 hint: Redundant source directive: 'helpers.R' is already sourced by a source() call []
+1 issues (0 errors, 0 warnings, 0 infos, 1 hints, 0 notes)
