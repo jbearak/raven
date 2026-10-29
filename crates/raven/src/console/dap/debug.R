@@ -827,6 +827,9 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     env$on_resume <- function(cmd) internal(tryCatch({
         if (identical(cmd, "s") && is.null(state$jit_saved)) state$jit_saved <- compiler::enableJIT(0L)
         if (cmd %in% c("n", "f")) {
+            # Leaving this frame by Step Out: it runs on unstepped (the
+            # console feeds `c`), so its breakpoints stop as usual.
+            if (identical(cmd, "f")) .Call(N$set_rdebug, state$browse_env, 0L)
             flag_caller()
         } else if (cmd %in% c("c", "Q")) {
             # Continue runs to the next breakpoint, as in other debuggers. R's

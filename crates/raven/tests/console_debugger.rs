@@ -1550,3 +1550,38 @@ fn a_function_breakpoint_binds_inside_the_sourced_file_that_defines_it() {
     assert_eq!(text.matches("> fresh <- function() {").count(), 1, "{text}");
     assert_eq!(text.matches("> res <- fresh()").count(), 1, "{text}");
 }
+
+#[test]
+fn step_out_of_a_loop_still_stops_at_later_breakpoints_in_it() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    let src = "lp <- function() {\n  for (i in 1:3) {\n    x <- i\n  }\n  'done'\n}\n";
+    let p = c.write_file("lp.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 3}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send(src, Some(&p));
+    std::thread::sleep(Duration::from_millis(400));
+    let m = d.mark();
+    c.send("lp()", None);
+    d.event("stopped", m);
+    assert_eq!(d.locals().get("i").map(String::as_str), Some("1"));
+    // Step Out finishes the loop in R, but the breakpoint inside it stops
+    // again on the next iteration.
+    let stop = d.step("stepOut");
+    assert_eq!(stop["body"]["reason"], "breakpoint", "{stop}");
+    assert_eq!(d.stack()[0], ("lp".to_string(), 3));
+    assert_eq!(d.locals().get("i").map(String::as_str), Some("2"));
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": []}),
+    );
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}

@@ -644,7 +644,7 @@ fn on_message(shared: &Arc<Mutex<Shared>>, msg: Value) {
                 "continue" => "c",
                 "next" => "n",
                 "stepIn" => "s",
-                _ => "f",
+                _ => STEP_OUT,
             };
             // Respond first: the resume's `continued` (and any next
             // `stopped`) must follow the response.
@@ -722,6 +722,10 @@ fn queue_job(job: Job) {
         lock(h).jobs.push_back(job);
     }
 }
+
+/// The UI's Step Out, distinct from an `f` meant as R's own (exception and
+/// pause stops rewrite Step Over to `f`, to let the condition unwind).
+const STEP_OUT: &str = "out";
 
 /// Feed `cmd` to R's browser at the next opportunity (the editor's break
 /// flag interrupts the line being edited).
@@ -1777,6 +1781,13 @@ fn frames_equal(a: &[Frame], b: &[Frame]) -> bool {
 pub fn take_resume() -> Option<String> {
     let h = handle()?;
     let cmd = lock(h).resume.take()?;
+    // Step Out is R's `c` once the caller is flagged to stop (`on_resume`
+    // for "f"): R's own `f` would mark a loop as finishing, where R takes
+    // no steps, so a breakpoint later in the loop couldn't stop.
+    if cmd == STEP_OUT {
+        note_resume("f");
+        return Some("c".into());
+    }
     note_resume(&cmd);
     Some(cmd)
 }

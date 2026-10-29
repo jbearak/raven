@@ -445,6 +445,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "raven.debugger.start",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
           "command": "raven.goToNextChunk",
           "when": "raven.rConsoleEnabled"
         },
