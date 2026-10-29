@@ -116,6 +116,21 @@ Traceback:
 
 Ctrl+click (Cmd+click on macOS) a location to open it. Frames without a file location, such as base R and installed packages, are left out, and so is the whole traceback when none of the code came from a file: a typo at the prompt still prints only R's error message. Errors you catch, and errors you end with Stop while the debugger is stopped on them, print no traceback.
 
+### Where warnings came from
+
+R's deferred warnings name the call that raised them, but not where it is. When a warning comes from code in a file, the console adds the line under R's warning block:
+
+```
+Warning messages:
+1: In log(-1) : NaNs produced
+2: In as.integer("q") : NAs introduced by coercion
+Warning locations:
+  1: /home/me/project/R/clean.R:2
+  2: (no file)
+```
+
+A single warning gets `  at /path/file.R:2`. The location is the innermost line from one of your files on the call stack when the warning was raised, so for a warning inside a package function it is the line that called that function. Nothing is added when no warning came from a file, when R prints only a count (more than ten warnings), with `options(warn = 1)` or `suppressWarnings()`, or when Raven can't match its record to the warnings R printed.
+
 Pause (the toolbar button) interrupts running R code and stops where it is. It can't stop compiled code that never checks for interrupts until that code returns.
 
 ## Hover and the Variables view never run your code

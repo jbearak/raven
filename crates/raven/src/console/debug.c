@@ -297,6 +297,15 @@ static SEXP dbg_base_bind(SEXP name, SEXP value) {
     return *r.R_NilValue;
 }
 
+/*
+ * .Call(same, a, b): TRUE when `a` and `b` are the same object (not merely
+ * equal). R assigns a new `last.warning` each time it prints warnings, so
+ * this tells a fresh one from an equal earlier one.
+ */
+static SEXP dbg_same(SEXP a, SEXP b) {
+    return r.Rf_ScalarLogical(a == b ? 1 : 0);
+}
+
 static const R_CallMethodDef call_methods[] = {
     {"raven_dbg_rpc", (void *)dbg_rpc, 3},
     {"raven_dbg_binding", (void *)dbg_binding, 2},
@@ -307,6 +316,7 @@ static const R_CallMethodDef call_methods[] = {
     {"raven_dbg_nrow", (void *)dbg_nrow, 1},
     {"raven_dbg_set_rdebug", (void *)dbg_set_rdebug, 2},
     {"raven_dbg_base_bind", (void *)dbg_base_bind, 2},
+    {"raven_dbg_same", (void *)dbg_same, 2},
     {NULL, NULL, 0},
 };
 
