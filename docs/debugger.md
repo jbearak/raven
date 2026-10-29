@@ -64,8 +64,9 @@ A breakpoint on a line that only defines a function, like `sq <- function(x) x^2
 
 ### Stepping
 
-Steps behave as R defines them, with three conveniences:
+Steps behave as R defines them, with four conveniences:
 
+- **Back into the caller.** **Step Out**, or **Step Over** past a function's last line, stops in the function that called it, even when you got there by a breakpoint (plain R's `f` and `n` would run on to the end).
 - **Across top-level lines.** When you step past the end of one top-level expression of code you sent, the debugger stops at the start of the next one, as if the whole selection were one function.
 - **Just my code.** **Step Into** a function that has no source (base R or an installed package) steps back out instead of showing R's internals. Turn this off with `raven.debugger.justMyCode`.
 - **No double stops.** Stepping onto a line that has a breakpoint stops once.
@@ -106,7 +107,8 @@ The Debug Console and Watch run R code, as you'd expect. Watch expressions stop 
 
 ## Limitations
 
-- **Code already loaded.** Breakpoints bind when code runs from the editor, `source()`, or `load_all()`. A breakpoint set in a function that was defined earlier activates when you run the definition again. Ark/Positron has the same limitation.
+- **Code already loaded.** Breakpoints bind when code runs from the editor, `source()`, or `load_all()`. A breakpoint set in a function that was defined earlier activates when you run the definition again. Ark/Positron has the same limitation. This includes breakpoints you add while stopped, and **Run to Cursor**, which works by adding a temporary breakpoint: in code loaded before the breakpoint existed, it continues instead.
+- **Stepping into callbacks.** **Step Into** a call to base R or package code steps over it, including the functions you pass to it, as in `lapply(xs, function(x) …)` or an S3 method reached through `print()`. Set a breakpoint inside the callback instead; it binds when you run the code that defines it.
 - **Instrumented functions run slower.** A function that holds a breakpoint isn't byte-compiled, so loops in it run several times slower until you remove the breakpoint and run it again. `print(f)` shows the probe lines.
 - **Rebinding base functions.** If code redefines `local`, `if`, `with` or a similar function after it was instrumented, the probe can show up in data that code captures. Raven prints a notice when it sees such a rebinding in the global environment.
 - **Compiled code.** A pause or error stop inside a function R has already byte-compiled steps like **Continue** on the first **Step Over**, as in plain R.

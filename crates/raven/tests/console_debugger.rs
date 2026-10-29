@@ -1148,3 +1148,60 @@ fn function_breakpoints_respect_the_users_own_debug_state() {
     );
     c.expect("mine: TRUE kept: FALSE");
 }
+
+#[test]
+fn step_out_and_over_return_to_the_caller_and_switch_arms_bind() {
+    if !r_available() {
+        return;
+    }
+    let c = Console::spawn();
+    // CRLF line endings, as a Windows-edited file sends them.
+    let src = "inner <- function(x) {\r\n  y <- x * 2\r\n  y\r\n}\r\nouter <- function() {\r\n  a <- inner(1)\r\n  b <- inner(2)\r\n  a + b\r\n}\r\npick <- function(t) {\r\n  switch(t,\r\n    one = {\r\n      1\r\n    },\r\n    2)\r\n}\r\n";
+    let p = c.write_file("o.R", src);
+    let mut d = Dap::connect(&c);
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 2}, {"line": 13}]}),
+    );
+    d.req("configurationDone", json!({}));
+    c.send(src, Some(&p));
+    std::thread::sleep(Duration::from_millis(500));
+    let m = d.mark();
+    c.send("outer()", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("inner".to_string(), 2));
+    // Step Out lands in outer, at the statement after the call.
+    d.step("stepOut");
+    assert_eq!(d.stack()[0], ("outer".to_string(), 7));
+    // Into inner again (its breakpoint line stops once), then Step Over
+    // past its last line: back in outer.
+    d.step("stepIn");
+    assert_eq!(d.stack()[0], ("inner".to_string(), 2));
+    d.step("next");
+    assert_eq!(d.stack()[0], ("inner".to_string(), 3));
+    let back = d.step("next");
+    assert_eq!(back["body"]["reason"], "step");
+    assert_eq!(d.stack()[0], ("outer".to_string(), 8));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect("[1] 6");
+    // After Continue, the caller flag is gone: a later call runs through.
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": p}, "breakpoints": [{"line": 13}]}),
+    );
+    let m = d.mark();
+    c.send("outer()", None);
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(d.count("stopped", m), 0);
+    // A breakpoint inside a switch() arm stops.
+    let m = d.mark();
+    c.send("pick('one')", None);
+    d.event("stopped", m);
+    assert_eq!(d.stack()[0], ("pick".to_string(), 13));
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+}

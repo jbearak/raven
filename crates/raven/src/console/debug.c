@@ -194,6 +194,19 @@ static SEXP dbg_rdebug(SEXP env) {
 }
 
 /*
+ * .Call(set_rdebug, env, on): set a frame's step flag (`on` 1L or 0L) (what `n` sets on
+ * the browsed frame), returning its previous value. Stepping out of a
+ * function stops in the caller only when the caller's flag is set.
+ */
+static SEXP dbg_set_rdebug(SEXP env, SEXP on) {
+    if (r.TYPEOF(env) != ENVSXP) return r.Rf_ScalarLogical(0);
+    int was = r.RDEBUG(env) ? 1 : 0;
+    /* `on` is an integer (13 = INTSXP); anything else clears. */
+    r.SET_RDEBUG(env, r.TYPEOF(on) == 13 && r.Rf_length(on) == 1 && r.INTEGER(on)[0] == 1 ? 1 : 0);
+    return r.Rf_ScalarLogical(was);
+}
+
+/*
  * .Call(base_bind, name, value): bind `name` in the (locked) base
  * environment by writing the symbol's value cell, where base bindings live.
  * This is what Ark's `base_bind` does (ark/crates/ark/src/modules/positron/
@@ -212,6 +225,7 @@ static const R_CallMethodDef call_methods[] = {
     {"raven_dbg_xlength", (void *)dbg_xlength, 1},
     {"raven_dbg_materialized", (void *)dbg_materialized, 1},
     {"raven_dbg_rdebug", (void *)dbg_rdebug, 1},
+    {"raven_dbg_set_rdebug", (void *)dbg_set_rdebug, 2},
     {"raven_dbg_base_bind", (void *)dbg_base_bind, 2},
     {NULL, NULL, 0},
 };

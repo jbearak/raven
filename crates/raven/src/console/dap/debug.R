@@ -25,6 +25,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         xlength = sym("raven_dbg_xlength"),
         materialized = sym("raven_dbg_materialized"),
         rdebug = sym("raven_dbg_rdebug"),
+        set_rdebug = sym("raven_dbg_set_rdebug"),
         base_bind = sym("raven_dbg_base_bind")
     )
     env$N <- N
@@ -191,10 +192,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         nm <- environmentName(x)
         if (nzchar(nm)) sprintf("<environment: %s>", nm) else "<environment>"
     }
+    # Lengths and dims as plain integers (100000, not 1e+05).
+    fmt_len <- function(n) format(n, scientific = FALSE, trim = TRUE)
     # "[3 x 4]" for a matrix or array, "[12]" otherwise.
     dims_label <- function(x, n) {
         d <- attr(x, "dim", exact = TRUE)
-        if (is.null(d)) format(n) else paste(format(d), collapse = " x ")
+        if (is.null(d)) fmt_len(n) else paste(fmt_len(d), collapse = " x ")
     }
     fn_label <- function(x) {
         args <- tryCatch(names(formals(x)), error = function(e) NULL)
@@ -216,13 +219,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         if (is_df(cls)) {
             nr <- .row_names_info(x, 2L)
             label <- if ("tbl_df" %in% cls) "tibble" else if ("data.table" %in% cls) "data.table" else "data.frame"
-            return(sprintf("%s [%s x %s]", label, format(nr), format(n)))
+            return(sprintf("%s [%s x %s]", label, fmt_len(nr), fmt_len(n)))
         }
         if (t %in% c("list", "pairlist")) {
-            return(sprintf("%s [%s]", if (is.null(cls)) "list" else cls[[1L]], format(n)))
+            return(sprintf("%s [%s]", if (is.null(cls)) "list" else cls[[1L]], fmt_len(n)))
         }
         if (!isTRUE(.Call(N$materialized, x))) {
-            return(sprintf("%s [%s] (not materialized)", type_label(x), format(n)))
+            return(sprintf("%s [%s] (not materialized)", type_label(x), fmt_len(n)))
         }
         if (n == 0) return(sprintf("%s(0)", if (is.null(cls)) typeof(x) else cls[[1L]]))
         k <- min(n, 10)
@@ -374,10 +377,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 identical(environment(f), here) || identical(f, state$hook)
             }, TRUE)
             state$frames <- frames
+            state$funs <- funs
             state$browse_env <- parent.frame()
             fbp <- n > 0 && any(vapply(state$fbp, function(g) identical(g, funs[[n]]), TRUE))
             items <- character()
             top_nosrc <- FALSE
+            entry <- NULL
             first <- TRUE
             for (i in rev(seq_len(n))) {
                 if (hidden[[i]]) next
@@ -389,6 +394,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (first) {
                     top_nosrc <- nosrc
                     first <- FALSE
+                    # The line of the body's opening brace: a step into the
+                    # function first stops there, on the whole body.
+                    b <- if (!nosrc && is.function(f) && !is.primitive(f)) body(f)
+                    if (is.call(b) && identical(b[[1L]], quote(`{`))) {
+                        bs <- attr(b, "srcref")
+                        if (length(bs)) entry <- as.integer(bs[[1L]])[[1L]]
+                    }
                 }
                 fsrc <- if (nosrc) {
                     tryCatch(paste(deparse(f, width.cutoff = 80L, nlines = 2000L), collapse = "\n"),
@@ -401,7 +413,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             gloc <- if (n > 0) srcref_loc(attr(calls[[1L]], "srcref")) else NULL
             items <- c(items, jobj(id = "0", name = jstr("<top level>"),
                                    loc = if (is.null(gloc)) "null" else jarr(c(jstr(gloc[[1L]]), gloc[-1L]))))
-            rpc("captured", jarr(items), paste(c(if (fbp) "fbp", if (top_nosrc) "nosrc"), collapse = ","))
+            rpc("captured", jarr(items), paste(c(if (fbp) "fbp", if (top_nosrc) "nosrc",
+                                                 if (!is.null(entry)) paste0("entry:", entry)), collapse = ","))
         }, error = function(e) rpc("captured", "[]")))
         invisible(lv)
     }
@@ -679,8 +692,42 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         "ok"
     }, error = function(e) "err"))
+    # Step Over / Step Out leaving a function stop in its caller, as in
+    # other debuggers. R keeps stepping in the caller only if the caller's
+    # frame has its step flag set, which it has only when the user stepped
+    # into this function, not when a breakpoint stopped here. So flag the
+    # nearest caller with source (skipping base R and package frames such as
+    # lapply's), and remember it: Continue must not stop there.
+    state$step_flags <- list()
+    flag_caller <- function() {
+        frames <- state$frames
+        funs <- state$funs
+        k <- 0L
+        for (i in rev(seq_along(frames))) {
+            if (identical(frames[[i]], state$browse_env)) {
+                k <- i
+                break
+            }
+        }
+        if (k <= 1L) return(invisible(NULL))
+        for (i in rev(seq_len(k - 1L))) {
+            f <- funs[[i]]
+            if (!is.function(f) || is.primitive(f)) next
+            if (identical(environment(f), here) || identical(f, state$hook)) next
+            if (is.null(attr(f, "srcref"))) next
+            was <- .Call(N$set_rdebug, frames[[i]], 1L)
+            if (!isTRUE(was)) state$step_flags[[length(state$step_flags) + 1L]] <- frames[[i]]
+            break
+        }
+        invisible(NULL)
+    }
+    clear_step_flags <- function() {
+        for (e in state$step_flags) .Call(N$set_rdebug, e, 0L)
+        state$step_flags <- list()
+    }
     env$on_resume <- function(cmd) internal(tryCatch({
         if (identical(cmd, "s") && is.null(state$jit_saved)) state$jit_saved <- compiler::enableJIT(0L)
+        if (cmd %in% c("n", "f")) flag_caller() else if (cmd %in% c("c", "Q")) clear_step_flags()
         "ok"
     }, error = function(e) "err"))
     env$at_prompt <- function(top) internal(tryCatch({
@@ -689,6 +736,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             state$jit_saved <- NULL
         }
         if (isTRUE(as.logical(top))) {
+            clear_step_flags()
             if (!is.null(state$nl_saved)) {
                 if (isTRUE(getOption("browserNLdisabled"))) options(browserNLdisabled = state$nl_saved[[1L]])
                 state$nl_saved <- NULL

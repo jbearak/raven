@@ -1069,7 +1069,12 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
 
 /// Pop a socket request (if any) and return its first line for R.
 fn start_request(prompt: &str, kind: PromptKind, cap: usize) -> Option<String> {
-    let req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
+    let mut req = with_state(|s| s.ipc.as_ref().and_then(ipc::Server::pop)).flatten()?;
+    // A CRLF file's lines arrive with their `\r`, which R rejects as an
+    // invalid token.
+    if req.code.contains("\r\n") {
+        req.code = req.code.replace("\r\n", "\n");
+    }
     // Code sent from an editor with its location, at a top-level prompt,
     // runs expression by expression wrapped in `{ #line … }` so its srcrefs
     // point at the file (and breakpoints can be injected; design §3).

@@ -246,7 +246,8 @@ struct RState {
     awaiting_capture: bool,
     hidden_steps: u8,
     current: Option<(String, [u32; 4])>,
-    /// The capture call's frames (JSON) and flags (`fbp`, `nosrc`).
+    /// The capture call's frames (JSON) and flags (`fbp`, `nosrc`,
+    /// `entry:<line>`).
     captured: Option<(String, String)>,
     /// A stop is active (reported and not resumed into running code).
     stopped: bool,
@@ -1056,9 +1057,10 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 return "stop".into();
             }
             let id = a.parse::<u64>().ok();
-            let stepping =
-                with_r(|r| matches!(r.last_user_resume.as_deref(), Some("n" | "s")) && r.resumed)
-                    .unwrap_or(false);
+            let stepping = with_r(|r| {
+                matches!(r.last_user_resume.as_deref(), Some("n" | "s" | "f")) && r.resumed
+            })
+            .unwrap_or(false);
             if b == "1" && stepping {
                 // R's own step stops at the next statement of this frame
                 // anyway (§4): count the hit, but don't open a second browser.
@@ -1615,6 +1617,21 @@ fn on_captured() -> Option<String> {
         release_held(false);
         return Some("f\n".into());
     }
+    // Step Into first stops on the function's whole body, at its opening
+    // brace; step once more, unseen, so it lands on the first statement as
+    // in other debuggers.
+    let entry = flags
+        .split(',')
+        .find_map(|f| f.strip_prefix("entry:"))
+        .and_then(|l| l.parse::<u32>().ok());
+    let on_body =
+        entry.is_some_and(|e| cur.as_ref().is_some_and(|(_, l)| l[0] == e && l[2] > l[0]));
+    let stepped_in =
+        with_r(|r| r.resumed && r.last_user_resume.as_deref() == Some("s")).unwrap_or(false);
+    if on_body && stepped_in && !fbp {
+        release_held(false);
+        return Some("n\n".into());
+    }
     let mut sources: Vec<(i64, String)> = Vec::new();
     let mut frames: Vec<Frame> = serde_json::from_str::<Vec<Value>>(&frames_json)
         .unwrap_or_default()
@@ -1765,7 +1782,7 @@ pub fn take_resume() -> Option<String> {
 }
 
 fn note_resume(cmd: &str) {
-    if cmd == "s" && call_helper("on_resume", &["s"]).as_deref() == Some("ok") {
+    if call_helper("on_resume", &[cmd]).as_deref() == Some("ok") && cmd == "s" {
         with_r(|r| r.jit_off = true);
     }
     with_r(|r| {

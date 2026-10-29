@@ -126,6 +126,8 @@ fn known_callee(name: &str) -> Option<(&'static str, ArgUse)> {
         // Handlers are evaluated (to functions) too.
         "try" | "tryCatch" | "withCallingHandlers" => ("base", All),
         "with" => ("base", Code(&[(1, "expr")])),
+        // Its arms are code; the selector is evaluated too.
+        "switch" => ("base", All),
         "within" => ("base", Code(&[(1, "expr")])),
         "lapply" | "sapply" | "vapply" | "mapply" | "Map" | "Filter" | "Reduce" | "Find"
         | "Position" | "outer" | "apply" | "tapply" | "do.call" | "Recall" | "on.exit"
@@ -899,6 +901,14 @@ mod tests {
         let p = plan(src, 1, &[bp("a", 2), bp("b", 4)]);
         assert_eq!(injected(&p), vec![("b".into(), 4)]);
         assert!(invalid(&p)[0].1.contains("isn't run as code"));
+    }
+
+    #[test]
+    fn switch_arms_qualify() {
+        let src =
+            "f <- function(type) {\n  switch(type,\n    a = {\n      x <- 1\n    },\n    2)\n}\n";
+        let p = plan(src, 1, &[bp("a", 4)]);
+        assert_eq!(injected(&p), vec![("a".into(), 4)]);
     }
 
     #[test]
