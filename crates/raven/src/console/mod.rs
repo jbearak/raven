@@ -1050,7 +1050,9 @@ fn finish_request() {
 
 fn read_new_input(prompt: &str, kind: PromptKind, cap: usize, depth: u32) -> Option<String> {
     ipc::R_BUSY.store(false, Ordering::Relaxed);
+    dap::set_idle_top_level(kind == PromptKind::TopLevel && depth == 1);
     let result = read_new_input_from(prompt, kind, cap, depth);
+    dap::set_idle_top_level(false);
     if result.is_some() {
         // R runs again (also after a `readline()` answer): socket interrupts
         // apply from here.

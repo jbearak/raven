@@ -1606,6 +1606,15 @@ static HAS_LAST_ERROR: AtomicBool = AtomicBool::new(false);
 /// top-level prompt.
 static INSPECT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// The console is waiting for input at R's top-level prompt, the only place
+/// a requested inspection is picked up (not a `+` continuation, a
+/// `readline()`, or a browser).
+static IDLE_TOP_LEVEL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_idle_top_level(idle: bool) {
+    IDLE_TOP_LEVEL.store(idle, Ordering::SeqCst);
+}
+
 /// The socket thread's answer to an `inspect` request: `ok` (R opens the
 /// last error at its prompt), or why not (`none`, `busy`, `stopped`).
 pub fn request_inspect() -> &'static str {
@@ -1613,11 +1622,11 @@ pub fn request_inspect() -> &'static str {
     if !HAS_LAST_ERROR.load(Ordering::SeqCst) {
         return "none";
     }
-    if super::ipc::R_BUSY.load(Ordering::Relaxed) {
-        return "busy";
-    }
     if lock(h).stop.is_some() {
         return "stopped";
+    }
+    if !IDLE_TOP_LEVEL.load(Ordering::SeqCst) {
+        return "busy";
     }
     INSPECT_REQUESTED.store(true, Ordering::SeqCst);
     h.break_flag.store(true, Ordering::Relaxed);

@@ -1955,6 +1955,20 @@ fn inspect_last_error_opens_its_frames_after_the_fact() {
     assert_eq!(c.ipc_status("inspect"), "busy");
     std::thread::sleep(Duration::from_millis(1500));
 
+    // Busy at a continuation prompt or a readline(), where it can't open.
+    c.send("(1 +", None);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(c.ipc_status("inspect"), "busy");
+    c.type_line("1)");
+    c.expect("[1] 2");
+    c.type_line("ans <- readline('answer: ')");
+    c.expect("answer: ");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(c.ipc_status("inspect"), "busy");
+    c.type_line("yes");
+    c.type_line("cat(ans, '\\n')");
+    c.expect("yes ");
+
     // The next printed error replaces it.
     c.type_line("inner(1:2 > 0)");
     c.expect("inner(1:2 > 0) at");
