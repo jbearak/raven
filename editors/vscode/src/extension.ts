@@ -22,10 +22,12 @@ import {
     invalidateResolvedEditorOptions,
     isIndentUnitDocument,
     isRDocument,
+    isServerDocument,
     planDotInWordMigration,
     resolveFormatOnTypeForDocument,
     resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
+    serverDocumentSelector,
 } from './extensionHelpers';
 import { registerRunningStateReconciliation } from './client-state';
 import {
@@ -180,13 +182,13 @@ function sendActivityNotification() {
     const visibleEditors = vscode.window.visibleTextEditors;
 
     const activeDocument = activeEditor?.document;
-    const activeUriStr = activeDocument && isRDocument(activeDocument)
+    const activeUriStr = activeDocument && isServerDocument(activeDocument)
         ? activeDocument.uri.toString()
         : null;
 
     const visibleUris = visibleEditors
         .map(editor => editor.document)
-        .filter(isRDocument)
+        .filter(isServerDocument)
         .map(document => document.uri.toString());
 
     client.sendNotification('raven/activeDocumentsChanged', {
@@ -279,25 +281,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     const outputChannel = vscode.window.createOutputChannel('Raven');
 
     const clientOptions: LanguageClientOptions = {
-        // `rmd` and `quarto` are included so the document outline can surface
-        // chunk entries (issue #227). The server side gates diagnostics for
-        // these documents because the R tree-sitter parser would otherwise
-        // emit syntax errors on prose. Chunk-level LSP features inside R
-        // chunks (hover/completion/go-to-def) are tracked as a follow-up to
-        // #230 and will need a more targeted flow (e.g. virtual-document
-        // injection per fenced R block).
-        documentSelector: [
-            { scheme: 'file', language: 'r' },
-            { scheme: 'untitled', language: 'r' },
-            { scheme: 'file', language: 'rmd' },
-            { scheme: 'untitled', language: 'rmd' },
-            { scheme: 'file', language: 'quarto' },
-            { scheme: 'untitled', language: 'quarto' },
-            { scheme: 'file', language: 'jags' },
-            { scheme: 'untitled', language: 'jags' },
-            { scheme: 'file', language: 'stan' },
-            { scheme: 'untitled', language: 'stan' },
-        ],
+        // Every server language, saved or untitled (`SERVER_LANGUAGE_IDS` in
+        // `extensionHelpers.ts`, which also drives editor-activity reporting).
+        documentSelector: serverDocumentSelector(),
         synchronize: {
             // Matches the LSP `documentSelector` above. `.Rmd`,
             // `.Rmarkdown`, and `.qmd` are included so workspace file events

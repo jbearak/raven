@@ -8,10 +8,12 @@ import {
     invalidateResolvedEditorOptions,
     isIndentUnitDocument,
     isRDocument,
+    isServerDocument,
     planDotInWordMigration,
     resolveFormatOnTypeForDocument,
     resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
+    serverDocumentSelector,
 } from '../extensionHelpers';
 
 suite('Extension Helpers', () => {
@@ -140,6 +142,24 @@ suite('Extension Helpers', () => {
         }
     });
 
+    test('every server language reports editor activity and is in the selector', () => {
+        // The server analyzes R Markdown and Quarto too, so their editors must
+        // count as active/visible for revalidation priority.
+        for (const languageId of ['r', 'rmd', 'quarto', 'jags', 'stan']) {
+            assert.strictEqual(isServerDocument({ languageId }), true, languageId);
+            for (const scheme of ['file', 'untitled']) {
+                assert.ok(
+                    serverDocumentSelector().some(
+                        (entry) => entry.scheme === scheme && entry.language === languageId,
+                    ),
+                    `${scheme}:${languageId}`,
+                );
+            }
+        }
+        assert.strictEqual(isServerDocument({ languageId: 'plaintext' }), false);
+        assert.strictEqual(serverDocumentSelector().length, 10);
+    });
+
     test('isRDocument accepts untitled R-like documents by language id', () => {
         const makeUntitledDocument = (
             languageId: string,
@@ -152,10 +172,9 @@ suite('Extension Helpers', () => {
         assert.strictEqual(isRDocument(makeUntitledDocument('r')), true);
         assert.strictEqual(isRDocument(makeUntitledDocument('jags')), true);
         assert.strictEqual(isRDocument(makeUntitledDocument('stan')), true);
-        // R Markdown and Quarto are tracked under their own language IDs but
-        // the LSP server does not parse them, so they intentionally do NOT
-        // count as "R documents" for activity-tracking / path-completion-
-        // trigger purposes.
+        // R Markdown and Quarto use their own language IDs and chunk-aware
+        // wiring, so they do NOT count as plain "R documents" for the
+        // path-completion suggest trigger (see `isServerDocument` for activity).
         assert.strictEqual(isRDocument(makeUntitledDocument('rmd')), false);
         assert.strictEqual(isRDocument(makeUntitledDocument('quarto')), false);
         assert.strictEqual(isRDocument(makeUntitledDocument('plaintext')), false);
