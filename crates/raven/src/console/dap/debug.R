@@ -98,8 +98,13 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     lookup_expr <- function(id) get0(as.character(id), envir = state$exprs, inherits = FALSE)
     lookup_path <- function(id) get0(as.character(id), envir = state$paths, inherits = FALSE)
     # The position of each child row of a list or vector, by its label.
+    # A label naming two positions (a real name that equals a generated
+    # `a [[1]]`) is ambiguous: Set Value refuses it rather than guess.
     note_child <- function(pid, label, i) {
-        if (!is.null(pid)) assign(paste(pid, label, sep = US), i, envir = state$childidx)
+        if (is.null(pid)) return(invisible(NULL))
+        key <- paste(pid, label, sep = US)
+        old <- get0(key, envir = state$childidx, inherits = FALSE)
+        assign(key, if (!is.null(old) && !identical(old, i)) NA_integer_ else i, envir = state$childidx)
     }
     bt <- function(n) if (identical(make.names(n), n)) n else paste0("`", gsub("`", "\\`", n), "`")
     child_expr <- function(parent, name = NULL, index = NULL, atomic = FALSE) {
@@ -579,6 +584,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                     return(list(ok = FALSE))
                 }
                 if (typeof(x) == "list" && (is.null(cls) || all(cls %in% c("data.frame", "tbl_df", "tbl", "data.table")))) {
+                    # A package-implemented list (or names vector) would run
+                    # that package's code on indexing.
+                    if (foreign(x) || (is.character(key) && is.null(sattr(x, "names")) &&
+                                       !is.null(attr(x, "names", exact = TRUE)))) {
+                        return(list(ok = FALSE))
+                    }
                     v <- tryCatch(.subset2(x, key, exact = TRUE), error = function(err) NULL)
                     return(list(ok = TRUE, value = v))
                 }
@@ -617,6 +628,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             if (is.null(p) || !length(p$steps) || is.null(i)) {
                 return(jobj(error = jstr("this value can't be changed from here")))
             }
+            if (is.na(i)) return(jobj(error = jstr("two elements have this name; change it from the Debug Console")))
             v <- eval(parse(text = value, keep.source = FALSE), p$env)
             target <- as.name(p$steps[[1L]])
             for (st in p$steps[-1L]) target <- call("[[", target, st)

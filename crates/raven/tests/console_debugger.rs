@@ -1332,13 +1332,15 @@ fn continue_after_stepping_into_a_callee_runs_to_the_end() {
 const SPY_ALTREP_C: &str = r#"#include <R.h>
 #include <Rinternals.h>
 #include <R_ext/Altrep.h>
-static R_altrep_class_t cls;
+static R_altrep_class_t cls, lcls;
 static int calls = 0;
 static R_xlen_t len(SEXP x) { calls++; return 3; }
 static int spy_elt(SEXP x, R_xlen_t i) { calls++; return (int)i + 1; }
 static void *dataptr(SEXP x, Rboolean w) { calls++; error("no data"); return NULL; }
 static const void *dataptr_or_null(SEXP x) { calls++; return NULL; }
+static SEXP lelt(SEXP x, R_xlen_t i) { calls++; return ScalarInteger(1); }
 SEXP spy_make(void) { return R_new_altrep(cls, R_NilValue, R_NilValue); }
+SEXP spy_list(void) { return R_new_altrep(lcls, R_NilValue, R_NilValue); }
 SEXP spy_calls(void) { return ScalarInteger(calls); }
 void R_init_spy(DllInfo *dll) {
   cls = R_make_altinteger_class("spy", "spypkg", dll);
@@ -1346,6 +1348,11 @@ void R_init_spy(DllInfo *dll) {
   R_set_altinteger_Elt_method(cls, spy_elt);
   R_set_altvec_Dataptr_method(cls, dataptr);
   R_set_altvec_Dataptr_or_null_method(cls, dataptr_or_null);
+  lcls = R_make_altlist_class("spylist", "spypkg", dll);
+  R_set_altrep_Length_method(lcls, len);
+  R_set_altlist_Elt_method(lcls, lelt);
+  R_set_altvec_Dataptr_method(lcls, dataptr);
+  R_set_altvec_Dataptr_or_null_method(lcls, dataptr_or_null);
 }
 "#;
 
@@ -1370,7 +1377,7 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
     d.req("configurationDone", json!({}));
     c.send(
         &format!(
-            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  fy <- structure(1:2, levels = .Call('spy_make'), class = 'factor')\n  dd <- data.frame(a = 1:3); attr(dd, 'row.names') <- .Call('spy_make')\n  n0 <- .Call('spy_calls')\n  browser()\n  x\n}}",
+            "dyn.load('{}'); peek <- function() {{\n  x <- .Call('spy_make')\n  fy <- structure(1:2, levels = .Call('spy_make'), class = 'factor')\n  dd <- data.frame(a = 1:3); attr(dd, 'row.names') <- .Call('spy_make')\n  xl <- .Call('spy_list')\n  n0 <- .Call('spy_calls')\n  browser()\n  x\n}}",
             so.display()
         ),
         None,
@@ -1396,7 +1403,7 @@ fn inspecting_a_package_altrep_vector_runs_none_of_its_code() {
     // The factor (levels) and data frame (row names) whose attributes are
     // such vectors: shown without reading them either.
     let _ = d.locals();
-    for e in ["fy", "dd"] {
+    for e in ["fy", "dd", "xl", "xl[[1]]"] {
         d.req(
             "evaluate",
             json!({"expression": e, "frameId": frame, "context": "hover"}),
@@ -1421,7 +1428,7 @@ fn set_value_edits_list_elements_and_vector_entries() {
     let mut d = Dap::connect(&c);
     d.req("configurationDone", json!({}));
     c.send(
-        "ed <- function() {\n  k <- 10; l <- list(a = 1, b = list(c = 2)); v <- c(5, 6, 7); dup <- list(a = 1, a = 2)\n  browser()\n  cat('now', l$a, l$b$c, v[2], dup[[1]], deparse(dup[[2]]), '\\n')\n}",
+        "ed <- function() {\n  k <- 10; l <- list(a = 1, b = list(c = 2)); v <- c(5, 6, 7); dup <- list(a = 1, a = 2, `a [[1]]` = 3)\n  browser()\n  cat('now', l$a, l$b$c, v[2], dup[[1]], deparse(dup[[2]]), '\\n')\n}",
         None,
     );
     let m = d.mark();
@@ -1454,7 +1461,13 @@ fn set_value_edits_list_elements_and_vector_entries() {
         .iter()
         .map(|v| v["name"].as_str().unwrap())
         .collect();
-    assert_eq!(dup_names, vec!["a [[1]]", "a [[2]]"]);
+    assert_eq!(dup_names, vec!["a [[1]]", "a [[2]]", "a [[1]]"]);
+    // A label that names two elements is refused, not guessed.
+    let amb = d.req(
+        "setVariable",
+        json!({"variablesReference": dup["variablesReference"], "name": "a [[1]]", "value": "0"}),
+    );
+    assert_eq!(amb["success"], false, "{amb}");
     for (r, name, value) in [
         (&l["variablesReference"], "a", "k + 1"),
         (&b["variablesReference"], "c", "99"),
