@@ -616,3 +616,52 @@ jobs:
       - name: Run integration tests under Xvfb
         working-directory: editors/vscode
         run: xvfb-run -a bun run test
+
+  # ── Data-viewer benchmark (report-only) ────────────────────────────────
+  # Design F0 (docs/development.md, "Data viewer performance"): fixtures A
+  # and C at 10% of their rows (full size is too slow for runners), D and G
+  # at full size. Uploads the JSON report. Compares against a baseline only
+  # once one recorded on this runner class is checked in at
+  # tests/bun/bench/data-viewer/baselines/ci-linux.json (download this
+  # job's artifact to create it); a >15% median regression that repeats on
+  # the automatic re-run fails the job. `continue-on-error` keeps it from
+  # blocking merges until the baseline has settled.
+  data-viewer-bench:
+    name: Data Viewer Benchmark (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install VS Code extension dependencies
+        working-directory: editors/vscode
+        run: npm ci
+
+      - name: Run data-viewer benchmark
+        run: |
+          args=(--fixtures A,C,D,G --scale 0.1 --samples 10 --sort-samples 3
+                --dir "$RUNNER_TEMP/dv-bench" --out data-viewer-bench.json)
+          baseline=tests/bun/bench/data-viewer/baselines/ci-linux.json
+          if [ -f "$baseline" ]; then
+            args+=(--baseline "$baseline" --fail-on-regression)
+          fi
+          bun tests/bun/bench/data-viewer/bench.ts "${args[@]}"
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: data-viewer-bench
+          path: data-viewer-bench.json
+          if-no-files-found: warn

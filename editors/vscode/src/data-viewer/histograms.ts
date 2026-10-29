@@ -69,7 +69,7 @@ export async function computeHistogramForColumn(
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
 
-    for await (const { batch, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);
@@ -95,7 +95,7 @@ export async function computeHistogramForColumn(
     }
     bins[BIN_COUNT - 1].hi = max;
 
-    for await (const { batch, length } of iterateBatches(reader, signal)) {
+    for await (const { batch, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
         for (let r = 0; r < length; r++) {
             const v = child.get(r);

@@ -22,10 +22,10 @@
  *     never affects sort order. Format only controls rendering.
  *
  * Performance:
- *   - Per-key column reads use the same async batch path as `getRows`,
- *     so the existing batch LRU absorbs random access from subsequent
- *     window reads. We read each sort-key column exactly once per
- *     `computePermutation` call.
+ *   - Per-key column reads are projected scans (`batch-iter.ts`): only
+ *     the key column's buffers are read, and the reads bypass the
+ *     viewport chunk cache. We read each sort-key column exactly once
+ *     per `computePermutation` call.
  *   - String columns are compared via `Intl.Collator` with
  *     `numeric: true` so "file_2" sorts before "file_10".
  *   - The off-main-thread worker path (spec §5.2) is not yet wired —
@@ -203,7 +203,7 @@ async function buildNumericSortColumn(
     const values = new Float64Array(nrow);
     const missing = new Uint8Array(nrow);
     let written = 0;
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const v = child.get(r);
@@ -250,7 +250,7 @@ async function buildBigIntSortColumn(
         ? new BigUint64Array(nrow)
         : new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const v = child.get(r);
@@ -285,7 +285,7 @@ async function buildTimestampSortColumn(
     const nrow = reader.nrow;
     const values = new BigInt64Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         const data = child.data[0];
         for (let r = 0; r < batch.length; r++) {
@@ -315,7 +315,7 @@ async function buildStringSortColumn(
     const nrow = reader.nrow;
     const values: string[] = new Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const i = batch.start + r;
@@ -348,7 +348,7 @@ async function buildDictionarySortColumn(
     const nrow = reader.nrow;
     const codes = new Int32Array(nrow);
     const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         const data = child.data[0];
         for (let r = 0; r < batch.length; r++) {
@@ -420,7 +420,7 @@ async function buildValueLabelledSortColumn(
     const display: string[] = new Array(nrow);
     const missing = new Uint8Array(nrow);
     const valueLabels = schema.valueLabels ?? {};
-    for await (const batch of iterateBatches(reader, signal)) {
+    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.batch.getChildAt(columnIndex);
         for (let r = 0; r < batch.length; r++) {
             const i = batch.start + r;

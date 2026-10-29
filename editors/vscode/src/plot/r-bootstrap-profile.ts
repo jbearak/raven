@@ -329,7 +329,102 @@ local({
         md
     }
 
-    .raven_write_arrow <- function(df, file_path, schema_md = list()) {
+    # pillar-style type tag from the column's R class, taken BEFORE
+    # .raven_encode_col strips haven_labelled / stringifies list columns.
+    # Value-labelled columns (haven_labelled, or a "labels" /
+    # "value.labels" attribute) get a "+lbl" suffix on dbl/int/chr.
+    .raven_type_tag <- function(col) {
+        if (is.factor(col)) return(if (is.ordered(col)) "<ord>" else "<fct>")
+        base <- if (inherits(col, "POSIXt")) "dttm"
+            else if (inherits(col, "Date")) "date"
+            else if (inherits(col, "difftime")) "drtn"
+            else if (is.list(col)) "list"
+            else if (is.complex(col)) "cpl"
+            else if (is.logical(col)) "lgl"
+            else if (is.integer(col)) "int"
+            else if (is.double(col)) "dbl"
+            else if (is.character(col)) "chr"
+            else class(col)[[1L]]
+        labelled <- inherits(col, "haven_labelled") ||
+            !is.null(attr(col, "labels", exact = TRUE)) ||
+            !is.null(attr(col, "value.labels", exact = TRUE))
+        if (labelled && base %in% c("dbl", "int", "chr")) base <- paste0(base, "+lbl")
+        paste0("<", base, ">")
+    }
+
+    # Fewest fractional-second digits (0, 3 or 6) that show every value of
+    # a POSIXct / difftime column exactly. One vectorized pass over integer
+    # microseconds: 0.1 s isn't exactly representable as a double, so
+    # testing x %% 1 directly would misreport. NULL for other classes.
+    .raven_subsecond_digits <- function(col) {
+        x <- if (inherits(col, "POSIXct")) {
+            as.numeric(unclass(col))
+        } else if (inherits(col, "difftime")) {
+            as.numeric(col, units = "secs")
+        } else {
+            return(NULL)
+        }
+        x <- x[is.finite(x)]
+        if (length(x) == 0L) return(0L)
+        us <- round(x * 1e6) %% 1e6
+        if (all(us == 0)) 0L else if (all(us %% 1000 == 0)) 3L else 6L
+    }
+
+    # Estimated decoded bytes per row of an ENCODED frame: fixed-width
+    # columns count their Arrow width; character columns count 4 bytes of
+    # offset plus the mean byte length of up to 1,000 evenly spaced
+    # values (no RNG, so .Random.seed is untouched).
+    .raven_row_bytes <- function(df) {
+        n <- nrow(df)
+        idx <- if (n > 1000L) unique(as.integer(round(seq(1, n, length.out = 1000L)))) else seq_len(n)
+        total <- 0
+        for (nm in names(df)) {
+            col <- df[[nm]]
+            total <- total + if (is.factor(col) || is.integer(col) || inherits(col, "Date")) {
+                4
+            } else if (is.logical(col)) {
+                1
+            } else if (is.character(col)) {
+                s <- col[idx]
+                s <- s[!is.na(s)]
+                4 + if (length(s) > 0L) mean(nchar(s, type = "bytes")) else 0
+            } else {
+                8
+            }
+        }
+        total
+    }
+
+    # Rows per record batch: max(1024, min(65536, 2^21 %/% w)) with w the
+    # estimated bytes per row / 8. Targets ~16 MB per decoded batch; it is
+    # not a bound (skewed strings can exceed it), the reader's byte-bounded
+    # caches are.
+    .raven_chunk_rows <- function(df) {
+        w <- max(1, .raven_row_bytes(df) / 8)
+        as.integer(max(1024, min(65536, floor(2^21 / w))))
+    }
+
+    # Zone R displays POSIXct in when a column has no tzone: Sys.timezone(),
+    # then TZ, then UTC.
+    .raven_session_tz <- function() {
+        tz <- tryCatch(Sys.timezone(), error = function(e) NA_character_)
+        if (is.null(tz) || length(tz) != 1L || is.na(tz) || !nzchar(tz)) tz <- Sys.getenv("TZ")
+        if (!nzchar(tz)) tz <- "UTC"
+        tz
+    }
+
+    # Write an encoded frame as an uncompressed Arrow IPC file. Schema
+    # metadata the JS reader relies on:
+    # - raven.nrow / raven.chunk_rows: batch geometry. Every batch has
+    #   exactly chunk_rows rows except the last, so the reader computes
+    #   batch starts without reading headers (it verifies the footer's
+    #   block count and the last batch's length, and falls back to parsing
+    #   headers when either check fails).
+    # - raven.session_tz: the session zone for POSIXct without a tzone.
+    # - raven.fields: per-column metadata as one JSON object (see below),
+    #   merged with extra_field_md (type tags, subsecond digits) computed
+    #   from the pre-encode columns.
+    .raven_write_arrow <- function(df, file_path, schema_md = list(), extra_field_md = list()) {
         # Per-field metadata isn't settable through the public R arrow API
         # (Field$create's metadata arg raises "metadata= is currently
         # ignored" through 2025-era versions). Encode per-field metadata
@@ -339,24 +434,33 @@ local({
         tbl <- arrow::arrow_table(df)
         per_field <- list()
         for (nm in names(df)) {
-            md <- .raven_field_metadata(nm, df[[nm]])
+            md <- c(.raven_field_metadata(nm, df[[nm]]), extra_field_md[[nm]])
             if (length(md) > 0L) per_field[[nm]] <- md
         }
+        chunk_rows <- .raven_chunk_rows(df)
         meta <- as.list(schema_md)
+        meta[["raven.nrow"]] <- format(nrow(df), scientific = FALSE)
+        meta[["raven.chunk_rows"]] <- as.character(chunk_rows)
+        meta[["raven.session_tz"]] <- .raven_session_tz()
         if (length(per_field) > 0L) {
             entries <- vapply(names(per_field), function(nm) {
                 fld <- per_field[[nm]]
                 kv <- vapply(names(fld), function(k) {
-                    paste0(.raven_json_str(k), ":", .raven_json_str(fld[[k]]))
+                    paste0(.raven_json_str(k), ":", .raven_json_str(as.character(fld[[k]])))
                 }, character(1L))
                 paste0(.raven_json_str(nm), ":{", paste(kv, collapse = ","), "}")
             }, character(1L))
             meta[["raven.fields"]] <- paste0("{", paste(entries, collapse = ","), "}")
         }
-        if (length(meta) > 0L) tbl <- tbl$ReplaceSchemaMetadata(meta)
+        tbl <- tbl$ReplaceSchemaMetadata(meta)
         # apache-arrow JS does not ship LZ4/Zstd codecs, so write uncompressed.
-        arrow::write_feather(tbl, file_path, chunk_size = 65536L, compression = "uncompressed")
+        # Random access by byte offset needs it uncompressed too.
+        arrow::write_feather(tbl, file_path, chunk_size = chunk_rows, compression = "uncompressed")
     }
+
+    # Per-view file-name counter. File names must be unique without
+    # sample.int(): viewing data must never advance .Random.seed.
+    .raven_view_seq <- 0L
 
     .raven_view <- function(x, title) {
         if (!requireNamespace("arrow", quietly = TRUE)) {
@@ -456,17 +560,28 @@ local({
             stop("Can't \`View()\` an object of class \`",
                  paste(class(x), collapse = "/"), "\`", call. = FALSE)
         }
+        # Class-derived metadata comes from the columns as the user has
+        # them; encoding below strips haven_labelled and stringifies lists.
+        extra_md <- list()
+        for (nm in names(df)) {
+            col <- df[[nm]]
+            md <- list("raven.type_tag" = .raven_type_tag(col))
+            ssd <- .raven_subsecond_digits(col)
+            if (!is.null(ssd)) md[["raven.subsecond_digits"]] <- as.character(ssd)
+            extra_md[[nm]] <- md
+        }
         # Pre-encode every column.
         for (nm in names(df)) df[[nm]] <- .raven_encode_col(df[[nm]])
 
         nr <- nrow(df)
+        .raven_view_seq <<- .raven_view_seq + 1L
         path <- file.path(.raven_dv_dir,
                            paste0(.raven_session_id, "-",
                                    format(as.numeric(Sys.time()) * 1e6, scientific = FALSE),
-                                   "-", sample.int(.Machine$integer.max, 1L), ".arrow"))
+                                   "-", Sys.getpid(), "-", .raven_view_seq, ".arrow"))
 
         tryCatch(
-            .raven_write_arrow(df, path),
+            .raven_write_arrow(df, path, extra_field_md = extra_md),
             error = function(e) {
                 stop("data viewer write failed: ", conditionMessage(e), call. = FALSE)
             })

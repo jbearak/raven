@@ -27,6 +27,7 @@ import {
 } from './messages';
 import { computePermutation } from './sort';
 import { computeFilteredIndices } from './filter';
+import { composeEffectivePermutation } from './effective-permutation';
 import { isAbortError } from './abort';
 import { computeHistogramForColumn, isNumericArrowType } from './histograms';
 import { LayoutStore, schemaHash } from './layout-state';
@@ -95,9 +96,8 @@ export class DataViewerPanel {
      *  glyphs and toolbar chip strip. Updated by `setSort` and by
      *  init/replace's restore path. */
     private sort: SortState = EMPTY_SORT;
-    /** Permutation backing the current sort. `undefined` ↔ identity
-     *  ordering. Plumbed into every reader.getRows call below. */
-    private permutation: Uint32Array | undefined;
+    /** Backing store for {@link permutation}; written only via its setter. */
+    private permutationValue: Uint32Array | undefined;
     /** Monotonic request token — bumped for every setSort and lifecycle
      *  abort so stale async sort work can be detected and dropped. */
     private sortGeneration = 0;
@@ -109,9 +109,12 @@ export class DataViewerPanel {
     /** Current filter state. Mirrors what the webview shows in the chip
      *  strip. Updated by `setFilters` and by init/replace's restore path. */
     private filter: FilterState = EMPTY_FILTER;
-    /** Row indices surviving the active filter, in original (unsorted)
-     *  order. `undefined` ↔ no filter active (all rows pass). */
-    private filteredIndices: Uint32Array | undefined;
+    /** Backing store for {@link filteredIndices}; written only via its setter. */
+    private filteredIndicesValue: Uint32Array | undefined;
+    /** Cached composition of {@link permutation} and {@link filteredIndices}
+     *  (see {@link effectivePermutation}). `undefined` ⇔ not yet computed
+     *  for the current pair; `{ value: undefined }` ⇔ identity order. */
+    private effectiveCache: { value: Uint32Array | undefined } | undefined;
     /** Monotonic counter — bumped on every setFilters call so stale
      *  async results can be detected and dropped. */
     private filterGeneration = 0;
@@ -246,6 +249,25 @@ export class DataViewerPanel {
         this.webviewPanel.webview.onDidReceiveMessage(
             (m: WebviewToExtension) => { void this.handle(m); },
         );
+    }
+
+    /** Permutation backing the current sort. `undefined` ↔ identity
+     *  ordering. Every assignment (sort, restore, rollback, clear, replace)
+     *  goes through this setter, which drops the cached effective
+     *  permutation, so the cache can never outlive the state it composes. */
+    private get permutation(): Uint32Array | undefined { return this.permutationValue; }
+    private set permutation(v: Uint32Array | undefined) {
+        this.permutationValue = v;
+        this.effectiveCache = undefined;
+    }
+
+    /** Row indices surviving the active filter, in original (unsorted)
+     *  order. `undefined` ↔ no filter active (all rows pass). The setter
+     *  invalidates the effective permutation like {@link permutation}'s. */
+    private get filteredIndices(): Uint32Array | undefined { return this.filteredIndicesValue; }
+    private set filteredIndices(v: Uint32Array | undefined) {
+        this.filteredIndicesValue = v;
+        this.effectiveCache = undefined;
     }
 
     static async create(
@@ -1123,26 +1145,20 @@ export class DataViewerPanel {
         }
     }
 
-    /** Combine filter + sort into the single permutation handed to the
-     *  reader. `filteredIndices` is the surviving row set in ORIGINAL order;
-     *  `permutation` (when present) is a sort permutation over the ORIGINAL
-     *  frame. We post-filter the sort permutation by the filteredIndices set
-     *  so the visible window reflects both, in sorted order.
-     *
-     *  Spec open-question 4 / follow-up #328: building the sort permutation
-     *  over the full nrow rather than the filtered domain wastes memory; the
-     *  first cut accepts that. */
-    private composeEffective(): Uint32Array | undefined {
-        if (!this.filteredIndices) return this.permutation;
-        if (!this.permutation) return this.filteredIndices;
-        const survives = new Uint8Array(this.reader.nrow);
-        for (let i = 0; i < this.filteredIndices.length; i++) survives[this.filteredIndices[i]] = 1;
-        const out = new Uint32Array(this.filteredIndices.length);
-        let j = 0;
-        for (let i = 0; i < this.permutation.length; i++) {
-            if (survives[this.permutation[i]]) out[j++] = this.permutation[i];
+    /** The single row order handed to the reader for `getRows` and copy:
+     *  the sort permutation restricted to the filter's survivors (see
+     *  `effective-permutation.ts`). Computed at most once per sort/filter
+     *  change — the {@link permutation} / {@link filteredIndices} setters
+     *  drop the cache — instead of an O(nrow) pass per scroll. */
+    private effectivePermutation(): Uint32Array | undefined {
+        if (!this.effectiveCache) {
+            this.effectiveCache = {
+                value: composeEffectivePermutation(
+                    this.permutation, this.filteredIndices, this.reader.nrow,
+                ),
+            };
         }
-        return out;
+        return this.effectiveCache.value;
     }
 
     private collectDictionaries(): Record<number, string[]> {
@@ -1312,12 +1328,14 @@ export class DataViewerPanel {
                     columns: m.columns.length,
                 });
                 let out;
-                const effectivePerm = this.composeEffective();
+                const effectivePerm = this.effectivePermutation();
+                const columnRange = validColumnRange(m.columnRange, m.columns.length);
                 try {
                     out = await reader.getRows({
                         start: m.start,
                         end: m.end,
                         columns: m.columns,
+                        columnRange,
                         viewportGeneration: m.viewportGeneration,
                         permutation: effectivePerm,
                     });
@@ -1336,6 +1354,7 @@ export class DataViewerPanel {
                     rows: out.rows,
                     stale: out.stale,
                     originalRowIndices: out.originalRowIndices,
+                    columnRange,
                 };
                 this.trace('post-rows', {
                     generation: gen,
@@ -1807,7 +1826,7 @@ export class DataViewerPanel {
             await this.postCopyDone(m, gen, false, 'Selection exceeds copy limit');
             return;
         }
-        const copyPerm = this.composeEffective();
+        const copyPerm = this.effectivePermutation();
         const got = await this.reader.getRows({
             start: m.range.rowStart,
             end: m.range.rowEnd,
@@ -1973,4 +1992,15 @@ function build_html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 <script nonce="${nonce}" type="module" src="${jsUri}"></script>
 </body>
 </html>`;
+}
+
+/** A webview-supplied `columnRange`, clamped to `[0, ncols]`, or
+ *  undefined when absent or malformed (panel.ts is the trust boundary). */
+function validColumnRange(
+    r: { start: number; end: number } | undefined,
+    ncols: number,
+): { start: number; end: number } | undefined {
+    if (!r || !Number.isInteger(r.start) || !Number.isInteger(r.end)) return undefined;
+    const start = Math.min(Math.max(0, r.start), ncols);
+    return { start, end: Math.min(Math.max(start, r.end), ncols) };
 }

@@ -1214,3 +1214,79 @@ describe('DataViewerPanel: filter round-trips', () => {
         expect(rows.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3, 4, 5]);
     });
 });
+
+describe('DataViewerPanel: effective permutation cache (F3)', () => {
+    async function rowsOf(fakeWebview: FakeWebview, gen: number, requestId: number, extra: object = {}) {
+        fakeWebview.deliverFromWebview({
+            type: 'getRows', panelGeneration: gen, requestId,
+            viewportGeneration: 1, start: 0, end: 5, columns: [0], ...extra,
+        });
+        await flush();
+        return fakeWebview.posted.find(m => m.type === 'rows' && m.requestId === requestId) as any;
+    }
+    const filterGt = (v: number) => [{
+        id: 'e1', columnIndex: 0,
+        predicate: { kind: 'numCompare', op: '>', value: v },
+        enabled: true, includeMissing: false,
+    }];
+
+    test('composed once per sort/filter change, invalidated by every change', async () => {
+        const { fakeWebview, panel } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const gen = (fakeWebview.posted.find(m => m.type === 'init') as any).panelGeneration;
+
+        fakeWebview.deliverFromWebview({
+            type: 'setSort', panelGeneration: gen, requestId: 1,
+            keys: [{ columnIndex: 0, direction: 'desc' }], labelsOn: true, formatOn: true, digits: 3,
+        });
+        await flush();
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters', panelGeneration: gen, requestId: 2, entries: filterGt(2), labelsOn: true,
+        });
+        await flush();
+
+        expect((await rowsOf(fakeWebview, gen, 10)).rows.map((r: any[]) => r[0])).toEqual([5, 4, 3]);
+        const cached = panel.effectiveCache?.value;
+        expect(cached).toBeInstanceOf(Uint32Array);
+        // A second read reuses the composed permutation (no O(nrow) pass).
+        await rowsOf(fakeWebview, gen, 11);
+        expect(panel.effectiveCache.value).toBe(cached);
+
+        // Changing the filter recomposes.
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters', panelGeneration: gen, requestId: 3, entries: filterGt(3), labelsOn: true,
+        });
+        await flush();
+        expect((await rowsOf(fakeWebview, gen, 12)).rows.map((r: any[]) => r[0])).toEqual([5, 4]);
+        expect(panel.effectiveCache.value).not.toBe(cached);
+
+        // Clearing the filter leaves the sort; clearing the sort leaves natural order.
+        fakeWebview.deliverFromWebview({
+            type: 'setFilters', panelGeneration: gen, requestId: 4, entries: [], labelsOn: true,
+        });
+        await flush();
+        expect((await rowsOf(fakeWebview, gen, 13)).rows.map((r: any[]) => r[0])).toEqual([5, 4, 3, 2, 1]);
+        fakeWebview.deliverFromWebview({
+            type: 'setSort', panelGeneration: gen, requestId: 5, keys: [],
+            labelsOn: true, formatOn: true, digits: 3,
+        });
+        await flush();
+        const natural = await rowsOf(fakeWebview, gen, 14);
+        expect(natural.rows.map((r: any[]) => r[0])).toEqual([1, 2, 3, 4, 5]);
+        expect(natural.originalRowIndices).toBeUndefined();
+    });
+
+    test('getRows honors and echoes an optional columnRange', async () => {
+        const { fakeWebview } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const gen = (fakeWebview.posted.find(m => m.type === 'init') as any).panelGeneration;
+        const reply = await rowsOf(fakeWebview, gen, 20, {
+            columns: [2, 0, 1], columnRange: { start: 1, end: 9 },
+        });
+        expect(reply.columnRange).toEqual({ start: 1, end: 3 });
+        expect(reply.rows[0]).toHaveLength(2);
+        expect(reply.rows[0][0]).toBe(1);
+    });
+});
