@@ -552,6 +552,15 @@ describe('detect_chunks — .R cell markers', () => {
         expect(chunks[1].end_line).toBe(5);
     });
 
+    test('minimal section dividers (one # plus the boundary run) end the cell', () => {
+        // Parity with the Rust detector (`chunks.rs` `section_divider_re`).
+        for (const divider of ['#----', '#====', '#####', '#****', '#++++']) {
+            const src = lines(['# %% a', 'x <- 1', divider, 'y <- 2', '# %% b', 'z <- 3'].join('\n'));
+            const chunks = detect_chunks(src, 'r');
+            expect(chunks[0].end_line).toBe(2);
+        }
+    });
+
     test('section divider with dashes ends the cell, orphan content between is excluded', () => {
         const src = lines([
             '# %% Load',

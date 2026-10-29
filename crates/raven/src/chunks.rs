@@ -74,10 +74,13 @@ fn section_divider_re() -> &'static Regex {
     // Acts as a cell-END boundary when mixed with `# %%` cells.
     // Excludes roxygen `#'` lines.
     RE.get_or_init(|| {
-        // `[^']` (mandatory, not `[^']?`) — without it, the character class
-        // could match zero chars and a roxygen line like `#' Title ----`
-        // would be misread as a divider.
-        Regex::new(r"^#+[^'].*[-#+=*]{4,}\s*$").expect("section divider regex")
+        // Same boundary logic as the TS detector's `^#+(?!')\s*.*[-#+=*]{4,}\s*$`
+        // (the `regex` crate has no lookahead; the engines' `\s` classes still
+        // differ for exotic Unicode whitespace): the character after the first
+        // `#` must not be `'`, so a roxygen line like `#' Title ----` is not a
+        // divider, but the boundary run may start right after that `#`, so a
+        // minimal `#----` or `#####` still is.
+        Regex::new(r"^#(?:[^'].*)?[-#+=*]{4,}\s*$").expect("section divider regex")
     })
 }
 
@@ -1211,6 +1214,17 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         // The divider line itself is the last line of the first cell.
         assert_eq!(chunks[0].end_line, 2);
+    }
+
+    /// Parity with the TS detector's `(?!')` lookahead: a lone `#` followed
+    /// directly by the four-character boundary run is still a divider.
+    #[test]
+    fn minimal_section_dividers_end_cell() {
+        for divider in ["#----", "#====", "#####", "#****", "#++++"] {
+            let src = format!("# %% a\nx <- 1\n{divider}\ny <- 2\n# %% b\nz <- 3");
+            let chunks = detect(&src, ChunkKind::R);
+            assert_eq!(chunks[0].end_line, 2, "{divider:?} must end the cell");
+        }
     }
 
     #[test]
