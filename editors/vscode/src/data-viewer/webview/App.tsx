@@ -40,7 +40,7 @@ import type { ToolbarState } from '../toolbar-state';
 import type { Cell } from '../wire-format';
 import { RowCache } from './row-cache';
 import { formatCell, type FormattedCell } from './cell-render';
-import { displayTypeTag, isNumericText, isRightAligned } from '../display-format';
+import { displayTypeTag, isRightAligned } from '../display-format';
 import {
     allCopyColumns,
     buildDisplayColumns,
@@ -1698,9 +1698,8 @@ export function App({
         }
         const text = args.cell.displayData;
         // A value label shown in place of the number is text: it clips
-        // like text, never as `###`.
-        if (toolbar.labelsOn && (col.valueLabels || col.dictionaryShipped)
-            && !isNumericText(text)) {
+        // like text, never as `###`, even when it looks numeric.
+        if (formattedAt(args.col, args.row)?.isLabel) {
             drawContent();
             return;
         }
@@ -1722,7 +1721,7 @@ export function App({
             args.rect.y + args.rect.height / 2,
         );
         args.ctx.restore();
-    }, [columns, display, isNumericColumn, numericOverflows, toolbar.labelsOn]);
+    }, [columns, display, formattedAt, isNumericColumn, numericOverflows]);
 
     const getRowThemeOverride = useCallback((row: number): Partial<Theme> | undefined => {
         if (row === hoverRow) return { bgCell: theme.hoverBg };

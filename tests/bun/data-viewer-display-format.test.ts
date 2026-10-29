@@ -14,7 +14,6 @@ import {
     formatTimestamp,
     isRightAligned,
     parseDisplayFormat,
-    isNumericText,
 } from '../../editors/vscode/src/data-viewer/display-format';
 import { encodeTimestampMicros } from '../../editors/vscode/src/data-viewer/wire-format';
 
@@ -239,13 +238,15 @@ describe('alignment', () => {
     });
 });
 
-describe('isNumericText (overflow draws ### only for numbers)', () => {
-    test('numbers, padded, signed, scientific, grouped, $ and %', () => {
-        for (const t of ['5', '-5.250', '5    ', '1.23e-10', '1,234.5', '$12.00', '45%', 'Inf', '-Inf', 'NaN', '.5'])
-            expect([t, isNumericText(t)]).toEqual([t, true]);
+
+describe('isLabel (labels never overflow to ###)', () => {
+    const lbl = { ...dbl, typeTag: '<dbl+lbl>', valueLabels: { 1: '001234567890', 2: 'Strongly agree' } };
+    test('a resolved value label is flagged, even when it looks numeric', () => {
+        expect(formatCell(1, lbl, undefined, on)).toMatchObject({ text: '001234567890', isLabel: true });
+        expect(formatCell(2, lbl, undefined, on)).toMatchObject({ text: 'Strongly agree', isLabel: true });
     });
-    test('value labels are text', () => {
-        for (const t of ['Strongly agree', 'eight', '5 or more', 'NA', ''])
-            expect([t, isNumericText(t)]).toEqual([t, false]);
+    test('an unlabelled value, or Labels off, is a number', () => {
+        expect(formatCell(3, lbl, undefined, on).isLabel).toBeUndefined();
+        expect(formatCell(1, lbl, undefined, { ...on, labelsOn: false }).isLabel).toBeUndefined();
     });
 });

@@ -320,6 +320,9 @@ export type FormattedCell = {
     /** Draw in the missing style (NA, NaN, out-of-range timestamps). */
     missing: boolean;
     /** Text for clipboard copy (no alignment padding; NA is empty). */
+    /** The text is a value label shown in place of the value: it clips
+     *  like text, never as a numeric `###`, however numeric it looks. */
+    isLabel?: true;
     copyText: string;
     /** Extra hover detail (a timestamp's UTC offset, raw seconds). */
     tooltip?: string;
@@ -382,13 +385,13 @@ export function formatCell(
             ? (col.dictionaryShipped ? dictionary?.[cell] : o.resolvedLabel)
             : undefined;
         // Display 1-based code so it matches as.integer(factor) in R.
-        return plain(label ?? String(cell + 1));
+        return label !== undefined ? { ...plain(label), isLabel: true } : plain(String(cell + 1));
     }
     // haven_labelled: non-dict numeric/string column with raven.value_labels.
     if (o.labelsOn && col?.valueLabels
         && (typeof cell === 'number' || typeof cell === 'string')) {
         const lbl = col.valueLabels[String(cell)];
-        if (lbl !== undefined) return plain(lbl);
+        if (lbl !== undefined) return { ...plain(lbl), isLabel: true };
     }
     if (typeof cell === 'number') {
         const opts: NumberFormatOptions = {
@@ -406,10 +409,3 @@ export function formatCell(
     return plain(String(cell));
 }
 
-/** Whether a cell's display text is a number (possibly padded, signed,
- *  scientific, grouped, or carrying a display format's `$`/`%`) rather than
- *  a value label. The grid draws numeric text that overflows as `###`;
- *  label text clips like any other text. */
-export function isNumericText(text: string): boolean {
-    return /^[\s\u2007$]*[-+]?(\d[\d,]*(\.\d*)?|\.\d+)(e[-+]?\d+)?[\s\u2007%]*$|^-?Inf$|^NaN$/i.test(text);
-}
