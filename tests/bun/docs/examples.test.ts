@@ -38,7 +38,7 @@ describe("doc examples", () => {
             `${file}:${fence.line}: ${why} in an unmarked block; add <!-- example: … --> or <!-- example-exempt: reason -->`,
           );
       }
-      expectNoViolations(`examples ${file}`, violations);
+      expectNoViolations("examples", `examples ${file}`, violations);
     });
   }
 });
@@ -50,5 +50,5 @@ test("every corpus example has cmd, stdout.txt, stderr.txt, and exit", () => {
     for (const f of ["cmd", "stdout.txt", "stderr.txt", "exit"])
       if (!existsSync(path.join(corpusDir, name, f))) violations.push(`${name}: missing ${f}`);
   }
-  expectNoViolations("corpus layout", violations);
+  expectNoViolations("examples", "corpus layout", violations);
 });

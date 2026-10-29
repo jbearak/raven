@@ -76,7 +76,7 @@ describe("config snippets parse", () => {
           if (r.status !== 0) v.push(`${file}:${f.line}: lua block does not parse: ${r.stderr.trim()}`);
         }
       }
-      expectNoViolations(`snippets ${file}`, v);
+      expectNoViolations("snippets", `snippets ${file}`, v);
     });
   }
 });
