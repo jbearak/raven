@@ -67,9 +67,9 @@ fn main() -> anyhow::Result<()> {
     // it is dispatched before any tokio runtime (and its threads) exists.
     let mut raw = env::args_os().skip(1);
     if raw.next().is_some_and(|a| a == "console") {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         std::process::exit(raven::console::main(raw.collect()));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             eprintln!("raven console is not available on this platform yet; use R instead.");
             std::process::exit(2);

@@ -12,7 +12,7 @@ The debugger is built into Raven's [R console](r-console.md) and driven by R's o
 
 ## Getting started
 
-You need Raven's console (`raven.rTerminal.program` = `raven`, the default) on macOS or Linux. See [Limitations](#limitations) for Windows.
+You need Raven's console (`raven.rTerminal.program` = `raven`, the default), on macOS, Linux, or Windows.
 
 1. Open an R file and click in the gutter to set a breakpoint.
 2. Run the code that defines it with Run Line or Selection, Run Chunk, or Source File (`Cmd+Enter`, `Shift+Cmd+Enter`).
@@ -120,7 +120,7 @@ See the [settings reference](settings-reference.md) for all settings.
 
 ## Limitations
 
-- Platforms. The debugger works on macOS and Linux. On Windows, Raven's console starts plain R, so there is no debugger there yet. It works only with Raven's console, not with plain R, radian or arf.
+- Consoles. The debugger works only with Raven's console, not with plain R, radian or arf.
 - Code already loaded. Breakpoints bind when code runs from the editor, `source()`, or `load_all()`. A breakpoint set in a function that was defined earlier activates when you run the definition again. Ark/Positron has the same limitation. This includes breakpoints you add while stopped, and Run to Cursor, which works by adding a temporary breakpoint: in code loaded before the breakpoint existed, it continues instead.
 - Stepping into callbacks. Step Into a call to base R or package code steps over it, including the functions you pass to it, as in `lapply(xs, function(x) …)` or an S3 method reached through `print()`. Set a breakpoint inside the callback instead; it binds when you run the code that defines it.
 - Instrumented functions run slower. A function that holds a breakpoint isn't byte-compiled, so loops in it run several times slower until you remove the breakpoint and run it again. `print(f)` shows the probe lines.

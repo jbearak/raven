@@ -201,7 +201,7 @@ The language server provides the code intelligence in any editor. The rest comes
 | [On-type indentation](indentation.md) | Yes, if the editor sends on-type formatting requests | Yes |
 | Code actions and quick fixes | No | No |
 | [Snippets](snippets.md) | No | Yes |
-| [R console](r-console.md) | `raven console` in a terminal (macOS and Linux), without send-from-editor | Yes |
+| [R console](r-console.md) | `raven console` in a terminal, without send-from-editor | Yes |
 | [Debugger](debugger.md) | No | Yes |
 | [Plot](plot-viewer.md), [data](data-viewer.md), and [help](help-viewer.md) viewers | No | Yes |
 | [R Markdown preview and export](knit.md) | No | Yes |

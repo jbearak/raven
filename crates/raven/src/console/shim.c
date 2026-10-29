@@ -10,8 +10,8 @@
  * context, unwinds only C frames, and comes back to Rust as a status code.
  *
  * The console loads libR at runtime, so this file cannot link against it.
- * Rust resolves the R entry points with dlsym and hands them over in
- * `RavenRApi` before any other function here is called.
+ * Rust resolves the R entry points (dlsym / GetProcAddress) and hands them
+ * over in `RavenRApi` before any other function here is called.
  *
  * Rules for this file:
  *   - Only call R through `api`, and only inside a `toplevel_*` callback
@@ -56,6 +56,9 @@ typedef struct RavenRApi {
     SEXP *R_GlobalEnv;           /* addresses of R's data symbols */
     SEXP *R_NilValue;
     SEXP *R_UnboundValue;
+    /* Windows event loop and interrupt flag. NULL elsewhere. */
+    void (*R_ProcessEvents)(void);
+    int *UserBreak;
 } RavenRApi;
 
 #define STRSXP 16
@@ -239,8 +242,10 @@ void raven_set_read_console(RustReadConsole f) { rust_read_console = f; }
 int raven_read_console(const char *prompt, unsigned char *buf, int len, int hist) {
     int interrupt = 0;
     int r = rust_read_console ? rust_read_console(prompt, buf, len, hist, &interrupt) : 0;
-    if (interrupt && api.R_interrupts_pending && api.R_CheckUserInterrupt) {
-        *api.R_interrupts_pending = 1;
+    if (interrupt && (api.R_interrupts_pending || api.UserBreak) && api.R_CheckUserInterrupt) {
+        /* Windows R takes interrupts from UserBreak (R_ProcessEvents). */
+        if (api.R_interrupts_pending) *api.R_interrupts_pending = 1;
+        if (api.UserBreak) *api.UserBreak = 1;
         api.R_CheckUserInterrupt(); /* jumps to the top level */
     }
     return r;
@@ -250,6 +255,8 @@ int raven_read_console(const char *prompt, unsigned char *buf, int len, int hist
 
 static void toplevel_pump(void *data) {
     (void)data;
+    /* Windows: graphics windows, Tcl/Tk, a pending interrupt. */
+    if (api.R_ProcessEvents) api.R_ProcessEvents();
     if (api.R_PolledEvents && *api.R_PolledEvents) (*api.R_PolledEvents)();
     if (!api.R_checkActivity || !api.R_runHandlers || !api.R_InputHandlers) return;
     /* Drain ready file-descriptor handlers (later, httpuv, the help server),
@@ -263,7 +270,8 @@ static void toplevel_pump(void *data) {
 
 /*
  * Service R's event loop once without blocking: polled events (Tcl/Tk,
- * graphics devices) and ready input handlers. Returns 1, or 0 when an event
+ * graphics devices) and ready input handlers (Unix), or R_ProcessEvents
+ * (Windows). Returns 1, or 0 when an event
  * handler errored or was interrupted (R has already reported it).
  */
 int raven_pump_events(void) {

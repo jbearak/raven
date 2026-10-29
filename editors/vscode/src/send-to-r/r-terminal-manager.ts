@@ -198,11 +198,8 @@ export function _set_validator_for_test(
 export async function resolve_program(): Promise<string> {
     const configured = get_program();
     if (configured === 'R') return 'R';
-    // Raven's console is bundled (no PATH check). It isn't available on
-    // Windows yet, where the same setting means plain R.
-    if (configured === RAVEN_CONSOLE_PROGRAM) {
-        return process.platform === 'win32' ? 'R' : RAVEN_CONSOLE_PROGRAM;
-    }
+    // Raven's console is bundled (no PATH check).
+    if (configured === RAVEN_CONSOLE_PROGRAM) return RAVEN_CONSOLE_PROGRAM;
     if (is_program_validated_on_this_machine(configured)) return configured;
 
     if (await _validator(configured)) {

@@ -10,6 +10,13 @@
 //! result, because the dynamic loader only honours its search path from
 //! process start — which is when compiled packages' shared objects will later
 //! need it.
+//!
+//! On Windows there is no launcher to replay: R's front ends (Rterm.exe)
+//! live in the directory holding `R.dll` and its sibling DLLs, which is what
+//! puts those on the DLL search path. The console puts that directory on
+//! `PATH` instead, which Windows honours immediately, so no re-exec is
+//! needed. R itself is often not on `PATH` there; the installer records it
+//! in the registry, which is the last place looked.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Marks the re-exec'd child so discovery runs only once.
+#[cfg_attr(windows, allow(dead_code))]
 const BOOTSTRAPPED_ENV: &str = "RAVEN_CONSOLE_BOOTSTRAPPED";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,6 +39,7 @@ pub enum Discovered {
     /// The environment is already launcher-equivalent: load R in-process.
     Ready(RInstall),
     /// Environment computed; caller must re-exec with it.
+    #[cfg(unix)]
     NeedsReexec(RInstall, Vec<(String, OsString)>),
 }
 
@@ -50,6 +59,7 @@ impl From<String> for DiscoverError {
 
 /// Find R. `explicit_home` (from `--r-home`) wins, then a valid `R_HOME`, then
 /// `R RHOME` from the `R` on `PATH`.
+#[cfg(unix)]
 pub fn discover(explicit_home: Option<&Path>) -> Result<Discovered, DiscoverError> {
     let bootstrapped = std::env::var_os(BOOTSTRAPPED_ENV).is_some();
     let home = if let Some(h) = explicit_home {
@@ -86,11 +96,114 @@ pub fn discover(explicit_home: Option<&Path>) -> Result<Discovered, DiscoverErro
     Ok(Discovered::NeedsReexec(install, env))
 }
 
+/// Find R (Windows). `explicit_home` (from `--r-home`) wins, then a valid
+/// `R_HOME`, then `R RHOME` from the `R` on `PATH`, then the registry.
+#[cfg(windows)]
+pub fn discover(explicit_home: Option<&Path>) -> Result<Discovered, DiscoverError> {
+    let home = if let Some(h) = explicit_home {
+        validate_home(h)
+            .ok_or_else(|| format!("--r-home {} is not an R installation", h.display()))?
+    } else if let Some(h) = std::env::var_os("R_HOME")
+        .map(PathBuf::from)
+        .and_then(|h| validate_home(&h))
+    {
+        h
+    } else {
+        match probe_rhome() {
+            Ok(h) => h,
+            Err(path_err) => registry_home()
+                .ok_or_else(|| format!("{path_err}, and the registry names no R installation"))?,
+        }
+    };
+    let Some(libr) = shared_library(&home) else {
+        return Err(DiscoverError {
+            reason: format!("{} has no R.dll for this architecture", home.display()),
+            home: Some(home),
+        });
+    };
+    let bin = libr.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|p| p != &bin)
+        .collect::<Vec<_>>();
+    path.insert(0, bin);
+    // SAFETY: single-threaded at this point (called before any thread is
+    // spawned).
+    unsafe {
+        if let Ok(joined) = std::env::join_paths(path) {
+            std::env::set_var("PATH", joined);
+        }
+        std::env::set_var("R_HOME", &home);
+    }
+    Ok(Discovered::Ready(RInstall { home, libr }))
+}
+
+/// The R the installer registered: per-user first, then machine-wide.
+#[cfg(windows)]
+fn registry_home() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let value = wide("InstallPath");
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        for key in [r"SOFTWARE\R-core\R64", r"SOFTWARE\R-core\R"] {
+            let key = wide(key);
+            let mut buf = [0u16; 1024];
+            let mut bytes = (buf.len() * 2) as u32;
+            // SAFETY: NUL-terminated names; `buf` holds `bytes` bytes.
+            let rc = unsafe {
+                RegGetValueW(
+                    root,
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr().cast(),
+                    &mut bytes,
+                )
+            };
+            if rc != 0 {
+                continue;
+            }
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let home = PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+            if let Some(h) = validate_home(&home) {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
 fn validate_home(home: &Path) -> Option<PathBuf> {
     let home = home.canonicalize().ok()?;
     home.join("bin").join("R").is_file().then_some(home)
 }
 
+/// `std::path::absolute`, not `canonicalize`: R must not be handed a
+/// `\\?\` path.
+#[cfg(windows)]
+fn validate_home(home: &Path) -> Option<PathBuf> {
+    let home = std::path::absolute(home).ok()?;
+    home.join("bin").join("R.exe").is_file().then_some(home)
+}
+
+/// `bin\x64\R.dll` (x64 builds), else `bin\R.dll`.
+#[cfg(windows)]
+fn shared_library(home: &Path) -> Option<PathBuf> {
+    let bin = home.join("bin");
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x64"
+    };
+    [bin.join(arch).join("R.dll"), bin.join("R.dll")]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+#[cfg(unix)]
 fn shared_library(home: &Path) -> Option<PathBuf> {
     let name = if cfg!(target_os = "macos") {
         "libR.dylib"
@@ -120,6 +233,7 @@ pub(crate) fn parse_rhome_output(text: &str) -> Option<&str> {
 /// assignments are taken from the installation's own `bin/R` (so relocated
 /// layouts such as Debian's `/usr/share/R/share` are honoured) and `ldpaths`
 /// is sourced exactly as the launcher does.
+#[cfg(unix)]
 fn launcher_environment(home: &Path) -> Result<Vec<(String, OsString)>, String> {
     const VARS: [&str; 6] = [
         "R_SHARE_DIR",
@@ -206,6 +320,7 @@ fn run_with_timeout(cmd: &mut Command) -> std::io::Result<Vec<u8>> {
 }
 
 /// Replace this process with itself, with `env` applied. Only returns on error.
+#[cfg(unix)]
 pub fn reexec(env: &[(String, OsString)]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let exe = match std::env::current_exe() {
@@ -223,6 +338,7 @@ pub fn reexec(env: &[(String, OsString)]) -> std::io::Error {
 /// Replace this process with plain R (the automatic fallback). Prefers the
 /// launcher of the installation already selected so the fallback runs the same
 /// R; otherwise the `R` on PATH. Only returns on error.
+#[cfg(unix)]
 pub fn exec_plain_r(home: Option<&Path>, r_args: &[OsString]) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let program: OsString = home
@@ -232,6 +348,26 @@ pub fn exec_plain_r(home: Option<&Path>, r_args: &[OsString]) -> std::io::Error 
     cmd.args(r_args);
     cmd.env_remove(BOOTSTRAPPED_ENV);
     cmd.exec()
+}
+
+/// Windows has no exec: run plain R (`R.exe`, which starts Rterm) as a child
+/// on the same console and exit with its status. Only returns on error.
+#[cfg(windows)]
+pub fn exec_plain_r(home: Option<&Path>, r_args: &[OsString]) -> std::io::Error {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn ignore(_event: u32) -> windows_sys::core::BOOL {
+        1
+    }
+    let program: OsString = home
+        .map(|h| h.join("bin").join("R.exe").into_os_string())
+        .unwrap_or_else(|| OsString::from("R"));
+    // Ctrl-C belongs to R now; R gets its own copy of the event.
+    // SAFETY: registers a plain extern "system" fn.
+    unsafe { SetConsoleCtrlHandler(Some(ignore), 1) };
+    match Command::new(program).args(r_args).status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) => e,
+    }
 }
 
 #[cfg(test)]

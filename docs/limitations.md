@@ -112,7 +112,7 @@ Quarto Preview leaves refresh-on-save to Quarto's own file watcher. Raven reject
 
 ## R-session features
 
-- **Debugger.** Breakpoints in code that's already loaded take effect when the code runs again. There are no data breakpoints, Restart Frame, or step back, and there is no debugger on Windows until Raven's console runs there. See [Debugger: limitations](debugger.md#limitations).
+- **Debugger.** Breakpoints in code that's already loaded take effect when the code runs again. There are no data breakpoints, Restart Frame, or step back. See [Debugger: limitations](debugger.md#limitations).
 - **No workspace viewer.** vscode-R has a sidebar panel showing the objects in the live session's `globalenv()` with their types and dimensions, plus attached and loaded namespaces. Raven has no equivalent. See [How Raven compares](comparison.md#what-reditorsupports-vs-code-extension-offers-that-raven-doesnt).
 - **No htmlwidget or Shiny viewer.** vscode-R shows interactive HTML output (plotly, DT, profvis) and Shiny apps in webview panels. Raven has no equivalent.
 - **Knit Preview doesn't refresh automatically.** Raven's [Knit Preview](knit.md) for `.Rmd` / `.Rmarkdown` re-knits when you click **Knit again** or press `Shift+Cmd+Enter` / `Shift+Ctrl+Enter`. vscode-R's preview has an opt-in auto-refresh mode. [Quarto Preview](quarto.md) does refresh `.qmd` output on save.
