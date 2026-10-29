@@ -63,7 +63,7 @@ function siteNav(current: string): string {
   const lines = ["nav = [", '  { "Home" = "README.md" },'];
   for (const g of m.groups) {
     lines.push(`  { "${g.title}" = [`);
-    for (const p of g.pages) lines.push(`    { "${p.title.replace(/"/g, '\\"')}" = "${p.file}" },`);
+    for (const p of g.pages) lines.push(`    { "${p.title.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" = "${p.file}" },`);
     lines.push("  ] },");
   }
   lines.push("]");

@@ -26,7 +26,7 @@ for (const file of [...manifest.readmes, ...userPagePaths(manifest)]) {
   const doc = parse(src);
   out.push(`## ${file}`, "", "| Section | Disposition | Destination / notes |", "|---|---|---|");
   for (const h of doc.headings.filter((h) => h.level === 2 || h.level === 3)) {
-    out.push(`| ${"&nbsp;&nbsp;".repeat(h.level - 2)}${h.text.replace(/\|/g, "\\|")} (\`#${h.slug}\`) | | |`);
+    out.push(`| ${"&nbsp;&nbsp;".repeat(h.level - 2)}${h.text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|")} (\`#${h.slug}\`) | | |`);
   }
   out.push("");
 }
