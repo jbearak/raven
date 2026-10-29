@@ -367,7 +367,7 @@ Exempt reasons are free text, e.g. "absolute paths vary per machine". The checke
 2. Installs it into an empty `--extensions-dir`, with an empty `--user-data-dir` and no `raven` or R on PATH.
 3. Runs the same `getting-started.test.ts` against that installed extension. The test runner is loaded through a stub `extensionDevelopmentPath` that contributes nothing, so the installed VSIX is the only Raven.
 
-The screenshot session (§8) reuses this profile, but nothing in §5 depends on it.
+The screenshot session (§8) uses an equally fresh profile with the identical VSIX file. A desktop profile can't be loaded by `code serve-web`. Nothing in §5 depends on that session.
 
 **Other editor-only claims.** Hover, completion, go-to-definition, debugger, viewers, knit, and Quarto examples are hand-written. Each such page lists, in development.md's new "Docs verification" table, how its claims are verified:
 

@@ -1,6 +1,6 @@
 # Docs redesign: implementation plan
 
-Date: 2026-10-29. Status: plan, revision 2 (addresses round-1 reviews by Terra and Sonnet; see the table at the end).
+Date: 2026-10-29. Status: plan, revision 3 (addresses round-1 and round-2 reviews by Terra and Sonnet; see the tables at the end).
 
 This plan implements `docs/superpowers/specs/2026-10-29-docs-redesign-design.md` (revision 4, approved by Terra and Sonnet; referred to as "the design" and cited by §). Everything ships as one PR from branch `t3/documentation-redesign`, reviewed with sol-loop and merged by squash, the repo's only allowed method. Steps are ordered so that guards exist before content changes. Phases 1–3 build the tooling, Phase 4 rewrites content, and Phases 5–8 verify and ship.
 
@@ -82,6 +82,9 @@ All tests live under `tests/bun/docs/`, with shared helpers in `tests/bun/docs/_
 10. **settings-reference generator.** `generate-settings-reference.mjs` emits the breadcrumb, a lead sentence, and a See also section. Regenerate the file and update `tests/bun/settings-reference.test.ts` for the new header lines, keeping every existing assertion, including the `workspace.respectGitignore` row.
 11. **apt-packaging test.** `tests/bun/apt-packaging.test.ts:133–138` retargets the CI-heading assertions from `docs/cli.md` to `docs/ci.md`. The test also asserts that `docs/cli.md` still contains the legacy anchors `ci-examples`, `github-actions-example`, and `bitbucket-pipelines-example` (as headings or `<a id>`).
 
+12. **Stub the four new pages in the same commit as the manifest and hub:** `getting-started.md`, `coming-from.md`, `troubleshooting.md`, and `faq.md`. Each stub has the title, the breadcrumb, a lead sentence, and a "This page is being written" line. Then the hub, `llms.txt`, and the gating link test hold from the first commit, and batches B–G can link to them. Batch A replaces the stubs, and no stub text survives to the final commit (the lints reject the "being written" line).
+13. **`tests/bun/tsconfig.json`**: add `docs/**/*.ts` to its narrow `include` list, following the rule in its header comment, so editors resolve the new test files.
+
 ## Phase 3: Executable examples (Rust harness)
 
 1. **`crates/raven/tests/docs_examples.rs`**, per design §5.1:
@@ -105,6 +108,7 @@ All tests live under `tests/bun/docs/`, with shared helpers in `tests/bun/docs/_
 
    Batch B decides which codes are CLI-producible. Each code it can't produce gets an `example-exempt` reason in diagnostics.md and a ledger row naming the reason (e.g. "needs an installed package", "editor-only tab scoping").
 3. The harness runs under the normal `cargo test` CI job. Run fmt, clippy (`--all-targets --features test-support -D warnings`), and rustdoc locally on the pinned toolchain.
+4. **Open a draft PR now.** Push the branch and open a **draft** PR, so `integration.yml` (Rust, Bun, and vscode-test) and later the docs and fresh-install workflows run on every push from here on. CI proof of `getting-started.test.ts`, the fresh-install run, and the site build therefore arrive before sol-loop and acceptance, not after. Link the PR to the thread right away. Phase 8 marks it ready for review.
 
 ## Phase 4: Content rewrite
 
@@ -178,7 +182,13 @@ Agents don't commit. I review each batch's diff before the next phase.
    - a one-line `site_url` edit, followed by a regenerate
 
    This updates the design §7 fallback: the site build and workflow are kept (deploy gated off) rather than dropped. That is strictly safer, since nothing deploys and nothing goes red.
-5. Verify locally:
+5. **Build-failure fallback (design §7).** If Zensical cannot build the rewritten docs strictly, and a bounded fix (≤ a config change or a small source-compatible tweak) does not resolve it, then:
+   - Remove `docs/site/` and `docs.yml`.
+   - Keep `site_url` empty, so no site links are emitted.
+   - Drop the search-index check.
+   - Acceptance gates on the two-click route, as it already does.
+   - Record the missing search as an open gap in the PR and the final report.
+6. Verify locally:
    - The strict build passes.
    - The search check passes.
    - Load the built site through a local static server in the T3 preview browser, and check the hub, a long page with `<details>`, an alert, and a legacy `<a id>` anchor.
@@ -190,7 +200,9 @@ Agents don't commit. I review each batch's diff before the next phase.
    - **Separate test config.** `.vscode-test.mjs` gains a second labeled config, `getting-started`:
      - `files: out/test/getting-started.test.js`, with that file excluded from the default config's glob
      - `workspaceFolder` set to the copied workspace
-     - `env.PATH` set to the system PATH with every directory containing `R`/`Rscript` or `raven` removed (computed in the config)
+     - `env.PATH` set to a temp `bin/` directory built by the config. It holds symlinks to every executable on the system PATH except `R`, `Rscript`, and `raven`. Dropping whole directories would strip `/usr/bin` on the CI image, which `r-base-core` installs into.
+     - its own PID-suffixed `--user-data-dir`, keeping `--disable-extensions`, which is correct for the dev-extension config
+     - The test also asserts that Raven's output channel or status reports no R found, so the proof doesn't rest on PATH alone (R discovery may probe `R_HOME` or fixed paths; the config unsets `R_HOME`)
 
      The extension uses its bundled server, so this proves "no R, no CLI on PATH" even though the CI job installs `r-base-core`. CI's `bun run test` runs both configs (`vscode-test` runs all labeled configs by default; verified in Phase 6 by checking the CI log lists both).
    - It asserts each step:
@@ -205,9 +217,10 @@ Agents don't commit. I review each batch's diff before the next phase.
    - installs it into empty `--extensions-dir` and `--user-data-dir` with the same R/raven-free PATH
    - runs `getting-started.test.ts` through `@vscode/test-electron` with a stub `extensionDevelopmentPath` (`scripts/fresh-install-stub/package.json`) and launch args that **omit `--disable-extensions`**, so the installed VSIX loads
 
-   **Where it runs:** a `workflow_dispatch` workflow can't be dispatched before it exists on `main`. So a **temporary** `.github/workflows/fresh-install.yml` (ubuntu + xvfb) triggers on `pull_request` with `paths: [.github/workflows/fresh-install.yml, scripts/fresh-install-check.sh]`, which runs it on this PR. The run's link and log excerpt are recorded in the PR description, and the workflow file is **deleted in the last commit before merge**. The script itself stays.
+   **Where it runs:** a `workflow_dispatch` workflow can't be dispatched before it exists on `main`. So a **temporary** `.github/workflows/fresh-install.yml` (ubuntu + xvfb) triggers on `pull_request` with `paths: [.github/workflows/fresh-install.yml, scripts/fresh-install-check.sh]`, which runs it on the draft PR opened in Phase 3.4. The run's link and log excerpt are recorded in the PR description, and the workflow file is **deleted in the last commit before merge**. The script itself stays.
 3. **Screenshots (§8).**
-   - **Session.** Run `code serve-web --without-connection-token --port <free>` with a fresh `--server-data-dir`, and install the same VSIX built by the fresh-install script into it (a fresh profile, the same build as §5.2). Open it with the T3 preview browser, then open the tutorial workspace.
+   - **Session.** Run `code serve-web --without-connection-token --port <free>` with an empty `--server-data-dir`, and install into it the **same VSIX file** that the fresh-install script built (its SHA-256 is recorded in development.md next to the screenshots). Open it with the T3 preview browser, then open the tutorial workspace.
+   - **Design amendment.** Design §5.2 says the screenshot session "reuses" the fresh-install profile. A desktop `--user-data-dir`/`--extensions-dir` profile can't be loaded by `serve-web`, which keeps its own server-side data layout. So the plan amends the wording to "an equally fresh profile with the identical VSIX". Nothing in §5 depends on the screenshot session, so this changes no verification.
    - **Captures:** three screenshots:
      - the squiggle with its hover
      - the go-to-definition peek
@@ -232,15 +245,22 @@ Agents don't commit. I review each batch's diff before the next phase.
 4. **Acceptance review (§6).** It runs against the pushed head SHA.
    - **Isolation is enforced.** Each persona is a `delegate_task` child with no repo checkout access. Its brief allows only web fetch/search tools, and it must return a transcript listing every tool call (tool, URL or query). Any transcript containing a non-web tool call (shell, file read, grep) is rejected and the task is re-run. I audit every transcript.
    - **Inputs.** Each persona gets only the start URL (`https://github.com/jbearak/raven/blob/<head-sha>/README.md`). Root README and hub links are relative, so they stay on the pinned SHA. It records clicks, searches, path, answer, and confidence.
-   - **Gate.** Raven is gated on the **two-click route only** (the site isn't deployed, design §7 fallback). Comparator runs use each tool's live docs under the same rules.
+   - **Gate: both design §6 criteria must hold.**
+     - **(a)** All 20 Raven tasks are answered correctly via the two-click route. Search is unavailable because the site isn't deployed, so only that route applies.
+     - **(b)** For every task mapped to comparators, Raven's correctness is ≥ each comparator's, and Raven's effort is ≤ each comparator's. Comparator runs use each tool's live docs under the same rules, and comparators may use their own site search, counted as searches.
+   - **SHA audit.** Every Raven page a persona visits must be at the tested SHA: a `blob/<sha>/` URL, or a page byte-identical at `main` and the tested SHA, which the auditor confirms with `git diff`. Otherwise the run is rejected and re-run.
    - **Spot checks.** I spot-check every failure and ≥25% of passes against the docs, and re-run marginal results twice.
    - **Failures** go back to Phase 4 for the affected pages, followed by a re-run of the affected tasks.
    - **Evidence.** `docs/superpowers/specs/2026-10-29-docs-acceptance.md` holds the per-task table, every transcript (or a link to it), and the spot-check notes. The PR description summarizes them.
-5. **Binding to the shipped revision.** Any later commit that changes a user page (bot fixes, rebases with doc conflicts) triggers a re-run of the tasks whose recorded path touches that page, against the new head. The acceptance file records the final SHA each task passed on.
+5. **Binding to the shipped revision.**
+   - **Docs SHA vs evidence commit.** The acceptance file records the **tested docs SHA**. Evidence lands in a separate commit that touches only `docs/superpowers/`, so the docs a reviewer sees at the head equal the docs at the tested SHA. A test-free check enforces this: `git diff --stat <tested-sha> HEAD -- README.md editors/vscode/README.md docs ':!docs/superpowers'` is empty.
+   - **Content-only changes.** If a later commit changes only a page's content (not headings, links, or the hub), the tasks whose recorded path touches that page are re-run.
+   - **Navigation changes.** If a later commit changes any link, heading, the hub, the manifest, or either README's link set, the **full** 20-task set is re-run, along with the comparator checks for any task whose effort changed.
+   - **Budget.** One persona run is about 20 short web sessions. The full set (baseline, final, and comparators) is about 60–80 sessions, and the plan allows up to two full re-runs.
 
 ## Phase 8: PR, CI, merge
 
-1. Rebase on `origin/main` and rerun the gates after any conflict. Run the file-pr skill. The title follows repo conventions, e.g. `docs: rebuild the user docs around a getting-started path, a hub, and tested examples`. The description includes:
+1. Rebase on `origin/main` and rerun the gates after any conflict. Run the file-pr skill to write the final title and description on the existing draft PR, then mark it ready for review. The title follows repo conventions, e.g. `docs: rebuild the user docs around a getting-started path, a hub, and tested examples`. The description includes:
    - the problem and the approach
    - the acceptance table
    - the fresh-install result
@@ -271,7 +291,7 @@ Agents don't commit. I review each batch's diff before the next phase.
 | The PR is huge to review | One concern per commit, in this order: guards, harness, then each content batch, then site, then visuals. The PR description gives the ledger and acceptance results as review aids |
 | Zensical (0.0.x) churn | Pinned with hashes; the site is non-required CI; the sources don't depend on it |
 | Pages not enabled (agent lacks authority) | Fallback config ships; deploy gated by a repo variable; owner steps in the report |
-| vscode-test can't run locally | CI proves `getting-started.test.ts`; fresh-install runs in a temporary PR-triggered workflow |
+| vscode-test can't run locally | Draft PR from Phase 3.4 runs CI on every push; fresh-install runs in a temporary PR-triggered workflow |
 
 ## Changes from revision 1
 
@@ -289,3 +309,15 @@ Agents don't commit. I review each batch's diff before the next phase.
 | Sonnet 7: authoring rules for the site | Brief and `docs-lints` enforce `<details markdown="1">` and absolute out-of-docs links |
 | Sonnet 8: branch name | Fixed to `t3/documentation-redesign` |
 | Sonnet non-blocking | Empty-PATH harness; relative root and hub links; snippet-syntax test in Phase 2; cargo serialized; AGENTS.md / CONTEXT.md; exempt reasons in the ledger |
+
+## Changes from revision 2
+
+| Review item | Resolution |
+|---|---|
+| Terra r2-1: build-failure fallback | Phase 5.5 |
+| Terra r2-2: screenshot profile reuse | Phase 6.3: identical VSIX (hash recorded) in an equally fresh serve-web profile; design wording amended with the reason (desktop profiles can't load in serve-web) |
+| Terra r2-3: both acceptance criteria; SHA audit | Phase 7.4: gates (a) and (b); visited pages must be at the tested SHA |
+| Terra r2-4: final-revision binding | Phase 7.5: full re-run on navigation changes; tested docs SHA separate from the evidence commit, enforced with an empty diff |
+| Sonnet r2-1: PR doesn't exist when CI is needed | Phase 3.4: draft PR right after the harness; Phase 8 marks it ready |
+| Sonnet r2-2: green commits vs new pages | Phase 2.12: stubs for the four new pages, committed with the manifest |
+| Sonnet r2 non-blocking | symlink-based PATH; R-not-found assertion and `R_HOME` unset; separate user-data dir; tsconfig include; persona budget |
