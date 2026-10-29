@@ -10,6 +10,9 @@ type Entry = {
     start: number;
     end: number;
     rows: Cell[][];
+    /** Original 0-based row index per row, when the host sent them (a
+     *  sort or filter was active). */
+    originalRowIndices?: number[];
     cells: number;
 };
 
@@ -41,7 +44,7 @@ export class RowCache {
         return false;
     }
 
-    put(start: number, end: number, rows: Cell[][]): void {
+    put(start: number, end: number, rows: Cell[][], originalRowIndices?: number[]): void {
         const cells = rows.length * (rows[0]?.length ?? 0);
         const key = this.k(start, end);
         const old = this.entries.get(key);
@@ -49,7 +52,7 @@ export class RowCache {
             this.cells -= old.cells;
             this.entries.delete(key);
         }
-        this.entries.set(key, { start, end, rows, cells });
+        this.entries.set(key, { start, end, rows, originalRowIndices, cells });
         this.cells += cells;
         while (this.cells > this.capacity && this.entries.size > 0) {
             const first = this.entries.keys().next().value as string;
@@ -67,6 +70,37 @@ export class RowCache {
             return e.rows[row - e.start];
         }
         return undefined;
+    }
+
+    /** Original row index of display row `row`, if a cached window
+     *  carried one. Undefined means natural order (or not loaded). */
+    getOriginalRowIndex(row: number): number | undefined {
+        for (const e of this.entries.values()) {
+            if (row < e.start || row >= e.end) continue;
+            return e.originalRowIndices?.[row - e.start];
+        }
+        return undefined;
+    }
+
+    /** Whether display row `row` is in any cached window. */
+    hasRow(row: number): boolean {
+        for (const e of this.entries.values()) {
+            if (row >= e.start && row < e.end && row - e.start < e.rows.length) return true;
+        }
+        return false;
+    }
+
+    /** Up to `limit` cached rows, in no particular order (for width
+     *  measurement). */
+    sampleRows(limit: number): Cell[][] {
+        const out: Cell[][] = [];
+        for (const e of this.entries.values()) {
+            for (const row of e.rows) {
+                if (out.length >= limit) return out;
+                out.push(row);
+            }
+        }
+        return out;
     }
 
     clear(): void {

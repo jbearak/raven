@@ -1,5 +1,54 @@
 :root {
     color-scheme: light dark;
+    /* One chrome font size; the grid canvas follows editor.fontSize (see
+       grid-theme.ts). Steps: ×0.92 for secondary text, ×0.85 for badges
+       and the status line. */
+    --dv-font-size: var(--vscode-font-size, 13px);
+    --dv-font-size-sm: calc(var(--dv-font-size) * 0.92);
+    --dv-font-size-xs: calc(var(--dv-font-size) * 0.85);
+    /* Fallbacks for when a --vscode-* variable is unset, by theme kind
+       (dark defaults; overridden per body class below). */
+    --dv-fb-bg: #1e1e1e;
+    --dv-fb-fg: #cccccc;
+    --dv-fb-focus: #007fd4;
+    --dv-fb-button: #0e639c;
+    --dv-fb-button-fg: #ffffff;
+    --dv-fb-selection: #094771;
+    --dv-fb-selection-fg: #ffffff;
+    --dv-fb-badge: #4d4d4d;
+    --dv-fb-error: #f14c4c;
+}
+
+body.vscode-light {
+    --dv-fb-bg: #ffffff;
+    --dv-fb-fg: #3b3b3b;
+    --dv-fb-focus: #0090f1;
+    --dv-fb-button: #005fb8;
+    --dv-fb-button-fg: #ffffff;
+    --dv-fb-selection: #0060c0;
+    --dv-fb-selection-fg: #ffffff;
+    --dv-fb-badge: #c4c4c4;
+    --dv-fb-error: #e51400;
+}
+
+body.vscode-high-contrast {
+    --dv-fb-bg: #000000;
+    --dv-fb-fg: #ffffff;
+    --dv-fb-focus: #f38518;
+    --dv-fb-button: #000000;
+    --dv-fb-selection: #000000;
+    --dv-fb-badge: #000000;
+    --dv-fb-error: #f48771;
+}
+
+body.vscode-high-contrast-light {
+    --dv-fb-bg: #ffffff;
+    --dv-fb-fg: #292929;
+    --dv-fb-focus: #006bbd;
+    --dv-fb-button: #0f4a85;
+    --dv-fb-selection: #0f4a85;
+    --dv-fb-badge: #0f4a85;
+    --dv-fb-error: #b5200d;
 }
 
 * {
@@ -14,10 +63,10 @@ body,
     margin: 0;
     padding: 0;
     overflow: hidden;
-    background: var(--vscode-editor-background, #1e1e1e);
-    color: var(--vscode-foreground, #cccccc);
-    font-family: var(--vscode-editor-font-family, monospace);
-    font-size: var(--vscode-editor-font-size, 13px);
+    background: var(--vscode-editor-background, var(--dv-fb-bg));
+    color: var(--vscode-foreground, var(--dv-fb-fg));
+    font-family: var(--vscode-font-family, system-ui, sans-serif);
+    font-size: var(--dv-font-size);
 }
 
 .data-viewer-root {
@@ -36,7 +85,7 @@ body,
     min-width: 0;
     padding: 6px 8px;
     border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-    background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background, #1e1e1e));
+    background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background, var(--dv-fb-bg)));
 }
 
 .row-count {
@@ -47,7 +96,7 @@ body,
     flex: 0 1 auto;
     min-width: 80px;
     overflow: hidden;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, var(--dv-fb-fg)));
     text-overflow: ellipsis;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -99,20 +148,20 @@ body,
 }
 
 .toggle:hover:not(:disabled) {
-    border-color: var(--vscode-focusBorder, #007fd4);
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .toggle.active {
-    border-color: var(--vscode-button-background, #0e639c);
-    background: var(--vscode-button-background, #0e639c);
-    color: var(--vscode-button-foreground, #ffffff);
+    border-color: var(--vscode-button-background, var(--dv-fb-button));
+    background: var(--vscode-button-background, var(--dv-fb-button));
+    color: var(--vscode-button-foreground, var(--dv-fb-button-fg));
 }
 
 .toggle:focus-visible:not(:disabled) {
-    border-color: var(--vscode-focusBorder, #007fd4);
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: 2px;
-    box-shadow: 0 0 0 1px var(--vscode-focusBorder, #007fd4);
+    box-shadow: 0 0 0 1px var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .digits {
@@ -121,8 +170,8 @@ body,
     padding: 0 6px;
     border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 3px;
-    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     font: inherit;
 }
 
@@ -141,9 +190,9 @@ body,
     margin-left: 5px;
     padding: 0 5px;
     border-radius: 8px;
-    background: var(--vscode-badge-background, #4d4d4d);
-    color: var(--vscode-badge-foreground, #ffffff);
-    font-size: 10px;
+    background: var(--vscode-badge-background, var(--dv-fb-badge));
+    color: var(--vscode-badge-foreground, var(--dv-fb-fg));
+    font-size: var(--dv-font-size-xs);
     line-height: 14px;
     text-align: center;
     vertical-align: baseline;
@@ -162,10 +211,10 @@ body,
     max-height: min(420px, 70vh);
     border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
 }
 
 .columns-popover-filter {
@@ -179,7 +228,7 @@ body,
 }
 
 .columns-popover-filter:focus-visible {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: -1px;
 }
 
@@ -264,13 +313,14 @@ body,
     padding: 6px 8px;
     border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
     line-height: 1.35;
     pointer-events: none;
-    white-space: normal;
+    /* Header tooltips are several lines (name, label, class, NA, labels). */
+    white-space: pre-line;
 }
 
 /* Transient "Sorting…" / "Filtering…" pill in the toolbar chip group — the
@@ -281,8 +331,8 @@ body,
     padding: 2px 8px;
     border-radius: 10px;
     background: var(--vscode-badge-background, rgba(128, 128, 128, 0.25));
-    color: var(--vscode-badge-foreground, var(--vscode-foreground, #cccccc));
-    font-size: 11px;
+    color: var(--vscode-badge-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
+    font-size: var(--dv-font-size-xs);
     white-space: nowrap;
     animation: toolbar-progress-pulse 1.2s ease-in-out infinite;
 }
@@ -300,10 +350,10 @@ body,
     gap: 2px;
     padding: 4px 8px;
     border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-    background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background, #1e1e1e));
+    background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-editor-background, var(--dv-fb-bg)));
     min-width: 0;
-    font-size: 12px;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
+    font-size: var(--dv-font-size-sm);
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, var(--dv-fb-fg)));
 }
 
 .toolbar-restore > span {
@@ -316,7 +366,7 @@ body,
 
 .restore-skip {
     padding: 0;
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
     color: var(--vscode-textLink-foreground, inherit);
     background: none;
     border: none;
@@ -355,10 +405,10 @@ body,
     padding: 6px 12px;
     border: 1px solid var(--vscode-notifications-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 3px;
-    background: var(--vscode-notifications-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-notifications-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-notifications-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-notifications-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     box-shadow: 0 2px 8px rgb(0 0 0 / 0.24);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
 }
 
 .toast-copying {
@@ -366,7 +416,7 @@ body,
 }
 
 .toast-error {
-    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, var(--dv-fb-error)));
 }
 
 .context-menu {
@@ -376,8 +426,8 @@ body,
     padding: 4px 0;
     border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
-    color: var(--vscode-menu-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg))));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
 }
 
@@ -396,8 +446,8 @@ body,
 
 .context-menu-item:hover,
 .context-menu-item:focus {
-    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
-    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, var(--dv-fb-selection)));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, var(--dv-fb-selection-fg)));
     outline: none;
 }
 
@@ -418,7 +468,7 @@ body,
 .context-menu-item .context-menu-shortcut {
     margin-left: 16px;
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--dv-font-size-xs);
     opacity: 0.7;
 }
 
@@ -441,8 +491,8 @@ body,
 
 .sort-strip-label {
     flex: 0 0 auto;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
-    font-size: 11px;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, var(--dv-fb-fg)));
+    font-size: var(--dv-font-size-xs);
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
@@ -476,27 +526,27 @@ body,
 
 .sort-chip:hover,
 .sort-chip.open {
-    border-color: var(--vscode-focusBorder, #007fd4);
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .sort-chip:focus-visible {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: 1px;
 }
 
 .sort-chip-name {
     max-width: 14ch;
     overflow: hidden;
-    color: var(--vscode-foreground, #cccccc);
+    color: var(--vscode-foreground, var(--dv-fb-fg));
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
 }
 
 .sort-chip-arrow {
     flex: 0 0 auto;
-    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007fd4));
-    font-size: 11px;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, var(--dv-fb-focus)));
+    font-size: var(--dv-font-size-xs);
     line-height: 1;
 }
 
@@ -512,9 +562,9 @@ body,
     padding: 4px 0;
     border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg))));
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
 }
 
 .sort-chip-popover-item {
@@ -529,8 +579,8 @@ body,
 
 .sort-chip-popover-item:hover,
 .sort-chip-popover-item:focus {
-    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
-    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, var(--dv-fb-selection)));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, var(--dv-fb-selection-fg)));
     outline: none;
 }
 
@@ -547,7 +597,7 @@ body,
     background: transparent;
     color: var(--vscode-icon-foreground, inherit);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--dv-font-size);
     line-height: 1;
     opacity: 0.65;
 }
@@ -571,8 +621,8 @@ body,
 
 .filter-strip-label {
     flex: 0 0 auto;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #cccccc));
-    font-size: 11px;
+    color: var(--vscode-descriptionForeground, var(--vscode-foreground, var(--dv-fb-fg)));
+    font-size: var(--dv-font-size-xs);
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
@@ -604,7 +654,7 @@ body,
 }
 
 .filter-chip:hover {
-    border-color: var(--vscode-focusBorder, #007fd4);
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .filter-chip.disabled {
@@ -613,8 +663,8 @@ body,
 
 .filter-chip-toggle {
     flex: 0 0 auto;
-    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, #007fd4));
-    font-size: 11px;
+    color: var(--vscode-textLink-foreground, var(--vscode-focusBorder, var(--dv-fb-focus)));
+    font-size: var(--dv-font-size-xs);
     line-height: 1;
 }
 
@@ -625,7 +675,7 @@ body,
     color: inherit;
     cursor: pointer;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
     max-width: 18ch;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -633,7 +683,7 @@ body,
 }
 
 .filter-chip-body:focus-visible {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: 1px;
 }
 
@@ -644,7 +694,7 @@ body,
     background: transparent;
     color: var(--vscode-icon-foreground, inherit);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--dv-font-size);
     line-height: 1;
     opacity: 0.65;
 }
@@ -652,11 +702,11 @@ body,
 .filter-chip-kebab:hover,
 .filter-chip-kebab.open {
     opacity: 1;
-    color: var(--vscode-focusBorder, #007fd4);
+    color: var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .filter-chip-kebab:focus-visible {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: 1px;
 }
 
@@ -672,9 +722,9 @@ body,
     padding: 4px 0;
     border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e)));
+    background: var(--vscode-menu-background, var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg))));
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
 }
 
 .filter-chip-popover-item {
@@ -689,8 +739,8 @@ body,
 
 .filter-chip-popover-item:hover,
 .filter-chip-popover-item:focus {
-    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, #094771));
-    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, #ffffff));
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground, var(--dv-fb-selection)));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground, var(--dv-fb-selection-fg)));
     outline: none;
 }
 
@@ -701,7 +751,7 @@ body,
     background: transparent;
     color: var(--vscode-icon-foreground, inherit);
     cursor: pointer;
-    font-size: 13px;
+    font-size: var(--dv-font-size);
     line-height: 1;
     opacity: 0.65;
 }
@@ -722,10 +772,10 @@ body,
     max-height: min(520px, 80vh);
     border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 4px;
-    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     box-shadow: 0 4px 20px rgb(0 0 0 / 0.32);
-    font-size: 12px;
+    font-size: var(--dv-font-size-sm);
     overflow: hidden;
 }
 
@@ -746,7 +796,7 @@ body,
 
 .filter-popover-subtitle {
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--dv-font-size-xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -763,7 +813,7 @@ body,
 }
 
 .filter-popover-field-label {
-    font-size: 11px;
+    font-size: var(--dv-font-size-xs);
     color: var(--vscode-descriptionForeground, inherit);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -776,8 +826,8 @@ body,
     padding: 4px 6px;
     border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 3px;
-    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     font: inherit;
 }
 
@@ -788,7 +838,7 @@ body,
 
 .filter-popover-select:focus,
 .filter-popover-op-select:focus {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: -1px;
 }
 
@@ -797,18 +847,18 @@ body,
     padding: 4px 6px;
     border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 3px;
-    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     font: inherit;
 }
 
 .filter-popover-input:focus {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: -1px;
 }
 
 .filter-popover-input-error {
-    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, var(--dv-fb-error)));
 }
 
 .filter-popover-textarea {
@@ -816,14 +866,14 @@ body,
     padding: 4px 6px;
     border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
     border-radius: 3px;
-    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
-    color: var(--vscode-input-foreground, var(--vscode-foreground, #cccccc));
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
     font: inherit;
     resize: vertical;
 }
 
 .filter-popover-textarea:focus {
-    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
     outline-offset: -1px;
 }
 
@@ -880,17 +930,17 @@ body,
     border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
     border-radius: 3px;
     padding: 4px 6px;
-    background: var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e));
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
 }
 
 .filter-popover-error {
-    color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f14c4c));
-    font-size: 11px;
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, var(--dv-fb-error)));
+    font-size: var(--dv-font-size-xs);
 }
 
 .filter-popover-hint {
     color: var(--vscode-descriptionForeground, inherit);
-    font-size: 11px;
+    font-size: var(--dv-font-size-xs);
     opacity: 0.8;
 }
 
@@ -913,7 +963,7 @@ body,
 }
 
 .filter-popover-btn:hover:not(:disabled) {
-    border-color: var(--vscode-focusBorder, #007fd4);
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
 }
 
 .filter-popover-btn:disabled {
@@ -922,9 +972,9 @@ body,
 }
 
 .filter-popover-btn-primary {
-    background: var(--vscode-button-background, #0e639c);
-    border-color: var(--vscode-button-background, #0e639c);
-    color: var(--vscode-button-foreground, #ffffff);
+    background: var(--vscode-button-background, var(--dv-fb-button));
+    border-color: var(--vscode-button-background, var(--dv-fb-button));
+    color: var(--vscode-button-foreground, var(--dv-fb-button-fg));
 }
 
 .filter-popover-btn-primary:hover:not(:disabled) {
@@ -939,7 +989,7 @@ body,
 }
 
 .filter-histogram-bar {
-    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, var(--dv-fb-button)));
     opacity: 0.35;
 }
 
@@ -953,13 +1003,13 @@ body,
 }
 
 .filter-histogram-range {
-    fill: var(--vscode-charts-blue, var(--vscode-button-background, #0e639c));
+    fill: var(--vscode-charts-blue, var(--vscode-button-background, var(--dv-fb-button)));
     opacity: 0.4;
 }
 
 .filter-histogram-thumb {
-    fill: var(--vscode-button-background, #0e639c);
-    stroke: var(--vscode-editor-background, #1e1e1e);
+    fill: var(--vscode-button-background, var(--dv-fb-button));
+    stroke: var(--vscode-editor-background, var(--dv-fb-bg));
     stroke-width: 2;
 }
 
@@ -982,4 +1032,141 @@ body,
     padding-left: 8px;
     opacity: 0.6;
     font-variant-numeric: tabular-nums;
+}
+
+/* Status line under the grid: exact visible row range and filter
+   context. */
+.status-line {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
+    font-size: var(--dv-font-size-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-height: calc(var(--dv-font-size-xs) * 1.5 + 4px);
+}
+
+/* Zero rows / filter matches nothing: centered over the (empty) body,
+   below the header so the columns stay listed. */
+.grid-empty {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
+    pointer-events: none;
+}
+
+.grid-empty-clear {
+    pointer-events: auto;
+    padding: 3px 10px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-button-background, var(--dv-fb-button));
+    color: var(--vscode-button-foreground, var(--dv-fb-button-fg));
+    font: inherit;
+    cursor: pointer;
+}
+
+.grid-empty-clear:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
+    outline-offset: 2px;
+}
+
+/* Cell detail: a long value's full text, read-only, with Copy. */
+.cell-detail {
+    position: absolute;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    width: min(560px, calc(100% - 16px));
+    max-height: min(360px, calc(100% - 16px));
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 4px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.24);
+    outline: none;
+}
+
+.cell-detail:focus-visible {
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
+}
+
+.cell-detail-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    font-size: var(--dv-font-size-sm);
+}
+
+.cell-detail-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
+}
+
+.cell-detail-copy {
+    padding: 2px 8px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-button-secondaryBackground, var(--dv-fb-badge));
+    color: var(--vscode-button-secondaryForeground, var(--dv-fb-fg));
+    font: inherit;
+    cursor: pointer;
+}
+
+.cell-detail-body {
+    flex: 1 1 auto;
+    margin: 0;
+    padding: 8px;
+    overflow: auto;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, var(--dv-font-size));
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.cell-detail-body.missing {
+    color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
+    font-style: italic;
+}
+
+.cell-detail-note {
+    padding: 2px 8px 6px;
+    color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
+    font-size: var(--dv-font-size-xs);
+}
+
+@media (forced-colors: active) {
+    .toolbar,
+    .status-line,
+    .cell-detail,
+    .header-tooltip,
+    .context-menu {
+        border-color: CanvasText;
+        background: Canvas;
+        color: CanvasText;
+        forced-color-adjust: none;
+    }
+
+    .grid-empty-clear,
+    .cell-detail-copy {
+        border-color: ButtonText;
+        background: ButtonFace;
+        color: ButtonText;
+    }
 }

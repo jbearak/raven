@@ -263,6 +263,24 @@ export type ExtensionToWebview =
         filter: boolean;
     }
     | {
+        /** Per-column NA counts from the record-batch headers, posted
+         *  progressively after first paint (`done` on the last one).
+         *  Indexed by source column; drives the header missing bars. */
+        type: 'nullCounts';
+        panelGeneration: number;
+        counts: number[];
+        done: boolean;
+    }
+    | {
+        /** Full value of one cell for the cell-detail popover. */
+        type: 'cellDetail';
+        panelGeneration: number;
+        requestId: number;
+        text: string | null;
+        /** True when the value exceeded the 64 KiB cap. */
+        truncated: boolean;
+    }
+    | {
         type: 'copyDone';
         panelGeneration: number;
         requestId: number;
@@ -388,6 +406,25 @@ export type WebviewToExtension =
          *  paste lands with headers. Set by the webview for column /
          *  select-all selections. */
         includeHeader: boolean;
+        /** "Copy with row names" on a frame without a rowname column:
+         *  prepend each row's 1-based R row number. */
+        rowNumbers?: boolean;
+    }
+    | {
+        /** Fetch one cell's untruncated value (capped at 64 KiB) for the
+         *  cell-detail popover. `row` is a display row. */
+        type: 'getCellDetail';
+        panelGeneration: number;
+        requestId: number;
+        row: number;
+        columnIndex: number;
+    }
+    | {
+        /** Write text the webview already has to the clipboard (the
+         *  cell-detail popover's Copy button). */
+        type: 'copyText';
+        panelGeneration: number;
+        text: string;
     }
     | {
         /** Apply (or update, or clear) the active sort. The extension
@@ -453,3 +490,5 @@ export type WebviewToExtension =
  *  single copy request. Above this we refuse the copy and surface a
  *  toast in the panel. */
 export const COPY_CELL_LIMIT = 5_000_000;
+/** Cap on the cell-detail popover's value, in UTF-8 bytes. */
+export const CELL_DETAIL_LIMIT_BYTES = 64 * 1024;

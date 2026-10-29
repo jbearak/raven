@@ -4,7 +4,14 @@ import {
     buildVisibleGridColumns,
     clampColumnWidth,
     describeRestoreMessage,
-    describeToolbarRowCount,
+    capFrozenWidths,
+    clampAutoWidth,
+    describeShape,
+    describeStatusLine,
+    emptyStateMessage,
+    gutterHeaderText,
+    measuredColumnWidth,
+    typeDefaultWidth,
     describeVisibleRows,
     fitLeadingText,
     MAX_COLUMN_WIDTH_PX,
@@ -60,7 +67,11 @@ describe('React data-viewer grid model', () => {
         expect(rowMarkerWidth(10_000_000)).toBeGreaterThanOrEqual('10000000'.length * 8 + 24);
     });
 
-    test('clampColumnWidth bounds user and default widths', () => {
+    test('clampColumnWidth bounds a drag to 40-3200 px; measured widths to 60-400 px', () => {
+        expect(MIN_COLUMN_WIDTH_PX).toBe(40);
+        expect(MAX_COLUMN_WIDTH_PX).toBe(3200);
+        expect(clampAutoWidth(10)).toBe(60);
+        expect(clampAutoWidth(1000)).toBe(400);
         expect(clampColumnWidth(undefined)).toBeGreaterThanOrEqual(MIN_COLUMN_WIDTH_PX);
         expect(clampColumnWidth(1)).toBe(MIN_COLUMN_WIDTH_PX);
         expect(clampColumnWidth(9999)).toBe(MAX_COLUMN_WIDTH_PX);
@@ -200,47 +211,47 @@ describe('formatCell', () => {
     };
 
     test('factor with Labels off shows 1-based code', () => {
-        expect(formatCell(0, factor, factor.dictionary, false, false, 3))
-            .toEqual({ text: '1', missing: false });
+        expect(formatCell(0, factor, factor.dictionary, { labelsOn: false, formatOn: false, digits: 3 }))
+            .toMatchObject({ text: '1', missing: false });
     });
 
     test('factor with Labels on shows level', () => {
-        expect(formatCell(2, factor, factor.dictionary, true, false, 3))
-            .toEqual({ text: 'high', missing: false });
+        expect(formatCell(2, factor, factor.dictionary, { labelsOn: true, formatOn: false, digits: 3 }))
+            .toMatchObject({ text: 'high', missing: false });
     });
 
     test('integer column ignores Format', () => {
-        expect(formatCell(7, intCol, undefined, false, true, 4))
-            .toEqual({ text: '7', missing: false });
+        expect(formatCell(7, intCol, undefined, { labelsOn: false, formatOn: true, digits: 4 }))
+            .toMatchObject({ text: '7', missing: false });
     });
 
     test('float column rounds when Format on', () => {
-        expect(formatCell(1.23456, floatCol, undefined, false, true, 2))
-            .toEqual({ text: '1.23', missing: false });
+        expect(formatCell(1.23456, floatCol, undefined, { labelsOn: false, formatOn: true, digits: 2 }))
+            .toMatchObject({ text: '1.23', missing: false });
     });
 
     test('float column with integer-valued cell skips toFixed', () => {
-        expect(formatCell(5, floatCol, undefined, false, true, 3))
-            .toEqual({ text: '5', missing: false });
+        expect(formatCell(5, floatCol, undefined, { labelsOn: false, formatOn: true, digits: 3 }))
+            .toMatchObject({ text: '5', missing: false });
     });
 
-    test('null and NaN cells are missing', () => {
-        expect(formatCell(null, floatCol, undefined, false, false, 3))
-            .toEqual({ text: '', missing: true });
-        expect(formatCell({ _: 'nan' }, floatCol, undefined, false, false, 3))
-            .toEqual({ text: 'NaN', missing: true });
+    test('null prints NA and NaN prints NaN; both are missing', () => {
+        expect(formatCell(null, floatCol, undefined, { labelsOn: false, formatOn: false, digits: 3 }))
+            .toMatchObject({ text: 'NA', missing: true });
+        expect(formatCell({ _: 'nan' }, floatCol, undefined, { labelsOn: false, formatOn: false, digits: 3 }))
+            .toMatchObject({ text: 'NaN', missing: true });
     });
 
     test('haven_labelled with Labels on swaps to label', () => {
-        expect(formatCell(1, labelledCol, undefined, true, false, 3))
-            .toEqual({ text: 'one', missing: false });
+        expect(formatCell(1, labelledCol, undefined, { labelsOn: true, formatOn: false, digits: 3 }))
+            .toMatchObject({ text: 'one', missing: false });
     });
 
     test('sentinel display values pass through', () => {
         expect(formatCell({ _: 'date', v: '2024-01-15' }, undefined, undefined, false, false, 3))
-            .toEqual({ text: '2024-01-15', missing: false });
+            .toMatchObject({ text: '2024-01-15', missing: false });
         expect(formatCell({ _: 'trunc', v: 'long...' }, undefined, undefined, false, false, 3))
-            .toEqual({ text: 'long...', missing: false });
+            .toMatchObject({ text: 'long...', missing: false });
     });
 });
 
@@ -254,17 +265,59 @@ describe('saved sort/filter restore messaging (#519)', () => {
             .toBe('Applying your saved filter…');
     });
 
-    test('describeToolbarRowCount keeps the row count visible while a restore banner shows', () => {
-        // The restore banner sits below the toolbar, so the row-count
-        // readout remains useful context while the saved prefs reapply.
-        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, true)).toBe('Loading…');
-        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, true))
-            .toBe('Showing 1-50 of 1,000');
+    test('describeShape keeps the frame shape visible while a restore banner shows', () => {
+        expect(describeShape(0, 0, undefined, true)).toBe('Loading…');
+        expect(describeShape(1000, 11, undefined, false)).toBe('1,000 × 11');
+        expect(describeShape(32, 11, 12, false)).toBe('12 of 32 rows × 11');
     });
+});
 
-    test('describeToolbarRowCount falls through to the normal label when no restore', () => {
-        expect(describeToolbarRowCount(0, { start: 0, end: 0 }, true, false)).toBe('Loading…');
-        expect(describeToolbarRowCount(1000, { start: 0, end: 50 }, false, false))
-            .toBe('Showing 1-50 of 1,000');
+describe('widths', () => {
+    const measure = {
+        name: (t: string) => t.length * 8,
+        tag: (t: string) => t.length * 6,
+        label: (t: string) => t.length * 7,
+        cell: (t: string) => t.length * 7,
+    };
+    test('measured width is the widest of name + sort slot, tag, label, and values', () => {
+        expect(measuredColumnWidth('mpg', '<dbl>', undefined, ['21.000'], measure, 18)).toBe(62);
+        expect(measuredColumnWidth('x', '<dbl>', 'A long variable label here', [], measure, 18))
+            .toBe(26 * 7 + 20);
+        expect(measuredColumnWidth('x', '<chr>', undefined, ['y'.repeat(200)], measure, 18)).toBe(400);
+    });
+    test('type defaults for wide frames', () => {
+        const c = (typeTag: string): ColumnSchema =>
+            ({ name: 'c', arrowType: 'Float64', isInteger: false, dictionaryShipped: false, typeTag });
+        expect(typeDefaultWidth(c('<dttm UTC>'))).toBeGreaterThan(typeDefaultWidth(c('<dbl>')));
+        expect(typeDefaultWidth(c('<lgl>'))).toBeLessThan(typeDefaultWidth(c('<chr>')));
+    });
+    test('a persisted user width wins over the measured default', () => {
+        const all = buildGridColumns(cols, { columnWidths: { 0: 2000 }, hiddenColumns: [] }, { 0: 90, 1: 95 });
+        expect(all[0].width).toBe(2000);
+        expect(all[1].width).toBe(95);
+    });
+    test('frozen rowname columns shrink to keep the frozen region within half the viewport', () => {
+        expect(capFrozenWidths(50, [300], 1000)).toEqual([300]);
+        expect(capFrozenWidths(50, [600], 1000)).toEqual([450]);
+    });
+});
+
+describe('status line, gutter header, empty states', () => {
+    test('status line shows the exact visible range and filter context', () => {
+        expect(describeStatusLine(32, 11, undefined, { start: 0, end: 20 })).toBe('rows 1–20 of 32 · 11 cols');
+        expect(describeStatusLine(32, 11, 12, { start: 0, end: 12 }))
+            .toBe('rows 1–12 of 12 (filtered from 32) · 11 cols');
+        expect(describeStatusLine(5000, 1, undefined, { start: 1200, end: 1240 }))
+            .toBe('rows 1,201–1,240 of 5,000 · 1 col');
+    });
+    test('gutter header shows shown / total only while filtered', () => {
+        expect(gutterHeaderText(32, undefined)).toBe('');
+        expect(gutterHeaderText(32, 12)).toBe('12 / 32');
+    });
+    test('empty states', () => {
+        expect(emptyStateMessage(0, undefined, false)).toEqual({ text: 'No rows', clearFilters: false });
+        expect(emptyStateMessage(32, 0, false)).toEqual({ text: 'No rows match these filters', clearFilters: true });
+        expect(emptyStateMessage(32, 5, false)).toBeUndefined();
+        expect(emptyStateMessage(0, undefined, true)).toBeUndefined();
     });
 });
