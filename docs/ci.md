@@ -176,6 +176,12 @@ For a static gate that doesn't run the scripts, keep the default. It suppresses 
 
 `--max-severity LEVEL` sets the highest severity still allowed to pass; anything more severe fails the build. From most to least severe the scale is `error`, `warning`, `info`, `hint`. The default is `info`, so `warning` and `error` findings fail and `info` and `hint` findings pass. See [Exit codes](cli.md#exit-codes) for every case.
 
+To fail only on errors and let warnings pass, raise the threshold to `warning`:
+
+```yaml
+- run: raven check --max-severity warning
+```
+
 A failing `raven check` fails the pipeline, but a red build does not block a merge by itself. To prevent merging when the check fails, mark it as a required status check (GitHub branch protection) or a merge check (Bitbucket).
 
 Use a committed [`raven.toml`](configuration.md) to keep editor diagnostics and CI aligned. Common CI-specific settings include `[workspace].exclude` for generated outputs and `diagnostics.reportUnusedSuppressions = true` to flag stale `# raven: ignore` comments.

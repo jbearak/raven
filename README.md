@@ -35,7 +35,7 @@ Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags
 - **Cursor, Positron, VSCodium:** install from [Open VSX](https://open-vsx.org/extension/jbearak/raven-r).
 - **Other editors:** install the `raven` binary (below), then follow [Editor setup](docs/editor-integrations.md) for Neovim, Zed, Helix, Emacs, and others.
 
-Then follow [Getting started](docs/getting-started.md). It takes two minutes.
+Open a folder of R files and Raven starts on its own: problems show up as squiggles and in the Problems panel, with nothing else to install and no R needed. [Getting started](docs/getting-started.md) walks through a first example in two minutes.
 
 ### Command line
 
