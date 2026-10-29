@@ -706,19 +706,22 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # Fed as hidden input at a level-0 prompt (globalCallingHandlers() must
     # run at R's real top level). Raven's handler is registered first, so it
     # runs after every handler the user has or adds later.
+    # globalCallingHandlers() refuses to run with any local handler on the
+    # stack, so this part must not be inside tryCatch(); the calls below
+    # can't fail at R's top level.
     env$install <- function() {
         lv <- get0(".Last.value", envir = baseenv())
         internal(tryCatch({
             options(raven.debug_hook = hook)
             .Call(N$base_bind, ".raven_dbg_capture", env$capture)
             .Call(N$base_bind, ".ark_annotate_source", env$ark_annotate_source)
-            if (!isTRUE(state$handlers)) {
-                old <- globalCallingHandlers(NULL)
-                globalCallingHandlers(error = on_condition, warning = on_condition, interrupt = on_condition)
-                if (length(old)) do.call(globalCallingHandlers, old)
-                state$handlers <- TRUE
-            }
         }, error = function(e) NULL))
+        if (!isTRUE(state$handlers) && sys.nframe() == 1L) {
+            old <- globalCallingHandlers(NULL)
+            globalCallingHandlers(error = on_condition, warning = on_condition, interrupt = on_condition)
+            if (length(old)) do.call(globalCallingHandlers, old)
+            state$handlers <- TRUE
+        }
         invisible(lv)
     }
     env$install_hook_only <- function() internal(tryCatch({

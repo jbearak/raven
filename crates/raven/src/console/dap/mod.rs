@@ -164,6 +164,8 @@ struct Shared {
     fn_names: Vec<String>,
     /// Whether a stop's `n` should become `f` (after exception/pause stops).
     rewrite_next: bool,
+    /// Line breakpoints changed: the R thread re-syncs the `source()` hook.
+    hooks_dirty: bool,
 }
 
 impl Shared {
@@ -216,6 +218,8 @@ struct RState {
     had_stop: bool,
     last_user_resume: Option<String>,
     pending_hit: Option<u64>,
+    /// The one-shot step probe fired: the next stop is a step (§4).
+    pending_step: bool,
     pending_exception: Option<(String, String)>,
     step_next_segment: bool,
     /// One-shot step probe armed for the segment being fed.
@@ -334,6 +338,7 @@ pub fn init(
             had_stop: false,
             last_user_resume: None,
             pending_hit: None,
+            pending_step: false,
             pending_exception: None,
             step_next_segment: false,
             step_probe_armed: false,
@@ -758,6 +763,7 @@ pub fn set_file_breakpoints(path: &str, wanted: Vec<(u32, String, String, String
         new.push(bp);
     }
     let result = new.iter().map(|b| b.to_dap(&key)).collect();
+    s.hooks_dirty = true;
     if new.is_empty() {
         s.files.remove(&key);
     } else {
@@ -851,6 +857,10 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
             }
         }
         "stop" => {
+            if a == STEP_PROBE {
+                with_r(|r| r.pending_step = true);
+                return "stop".into();
+            }
             let id = a.parse::<u64>().ok();
             let stepping = with_r(|r| {
                 matches!(r.last_user_resume.as_deref(), Some("n" | "s")) && r.resumed
@@ -1200,7 +1210,9 @@ fn on_top_level() -> Option<String> {
         // SAFETY: R thread at a prompt.
         unsafe { raven_dbg_clear_global_rdebug() };
         let stepping = with_r(|r| {
-            let s = matches!(r.last_user_resume.as_deref(), Some("n" | "s")) && r.resumed;
+            // A step that finished a top-level expression stops at the
+            // start of the next expression of the same submission (§4).
+            let s = matches!(r.last_user_resume.as_deref(), Some("n" | "s" | "f")) && r.resumed;
             r.stopped = false;
             r.resumed = false;
             r.last_user_resume = None;
@@ -1297,14 +1309,15 @@ fn on_captured() {
             return;
         }
     }
-    let (hit, exception, last) = with_r(|r| {
+    let (hit, exception, last, step_probe) = with_r(|r| {
         (
             r.pending_hit.take(),
             r.pending_exception.take(),
             r.last_user_resume.clone(),
+            std::mem::take(&mut r.pending_step),
         )
     })
-    .unwrap_or((None, None, None));
+    .unwrap_or((None, None, None, false));
     let (reason, description, exc) = if let Some((kind, detail)) = exception {
         let mut parts = detail.split(US);
         let class = parts.next().unwrap_or("condition").to_string();
@@ -1321,6 +1334,8 @@ fn on_captured() {
         }
     } else if hit.is_some() {
         ("breakpoint".to_string(), "Breakpoint".to_string(), None)
+    } else if step_probe {
+        ("step".to_string(), "Step".to_string(), None)
     } else if fbp && !resumed {
         (
             "function breakpoint".to_string(),
@@ -1412,12 +1427,15 @@ pub fn service() {
         let Some(job) = job else { break };
         run_job(h, job);
     }
+    if std::mem::take(&mut lock(h).hooks_dirty) {
+        sync_source_hook(h);
+    }
 }
 
 pub fn has_work() -> bool {
     handle().is_some_and(|h| {
         let s = lock(h);
-        !s.jobs.is_empty() || s.resume.is_some()
+        !s.jobs.is_empty() || s.resume.is_some() || s.hooks_dirty
     })
 }
 
@@ -1497,21 +1515,12 @@ fn run_job(h: &Handle, job: Job) {
             }
         }
     }
-    // Keep the source() hook installed exactly while line breakpoints exist.
-    sync_source_hook(h);
 }
 
+/// Keep the `source()` hook installed exactly while line breakpoints exist.
 fn sync_source_hook(h: &Handle) {
     let want = !lock(h).files.is_empty();
     let _ = call_helper("set_source_hook", &[if want { "TRUE" } else { "FALSE" }]);
-}
-
-/// Called at prompts so breakpoint changes made over IPC/DAP install or
-/// remove the `source()` hook promptly.
-pub fn sync_hooks() {
-    if let Some(h) = handle() {
-        sync_source_hook(h);
-    }
 }
 
 // ---- output filtering (R thread) -------------------------------------------
