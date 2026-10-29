@@ -12,7 +12,7 @@ The debugger is built into Raven's [R console](r-console.md) and driven by R's o
 
 ## Getting started
 
-You need Raven's console (`raven.rTerminal.program` = `raven`, the default), on macOS, Linux, or Windows.
+You need Raven's console (`raven.rTerminal.program` = `raven`, the default). It works the same on macOS, Linux, and Windows.
 
 1. Open an R file and click in the gutter to set a breakpoint.
 2. Run the code that defines it with Run Line or Selection, Run Chunk, or Source File (`Cmd+Enter`, `Shift+Cmd+Enter`).
