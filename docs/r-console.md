@@ -11,9 +11,9 @@ Run R in a VS Code terminal and send code to it from the editor.
 | Press `Shift+Cmd+Enter` in an `.R` file | Runs `source("file.R", echo = TRUE)` |
 | Call `plot(1:10)` or `View(df)` in the console | Opens Raven's [plot viewer](plot-viewer.md) or [data viewer](data-viewer.md) |
 
-By default the terminal runs [Raven's own console](#ravens-console), which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have. You can switch to the standard R console, or to the third-party consoles [arf](https://github.com/eitsupi/arf) or [radian](https://github.com/randy3k/radian). The [help viewer](help-viewer.md) works without the R console.
+The R console is on unless another R extension already provides one. With the default `raven.rConsole.activation` of `"auto"`, it stays off when vscode-R (REditorSupport) is enabled or when you're in Positron; set it to `"enabled"` to turn it on anyway. See [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). The [help viewer](help-viewer.md) works either way.
 
-Whether the R console activates depends on `raven.rConsole.activation`, which by default steps aside for REditorSupport and Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
+When the console is on, its terminal runs [Raven's own console](#ravens-console) by default, which adds syntax highlighting, multi-line editing, Tab completion, and colored output to the R you already have. You can [switch](#choosing-the-r-program) to the standard R console, or to the third-party consoles [arf](https://github.com/eitsupi/arf) or [radian](https://github.com/randy3k/radian).
 
 <a id="r-terminal-profile"></a>
 
