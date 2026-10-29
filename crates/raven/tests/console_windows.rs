@@ -503,7 +503,11 @@ fn the_debugger_stops_at_a_breakpoint_in_a_sourced_file() {
         "setBreakpoints",
         json!({"source": {"path": vscode_path}, "breakpoints": [{"line": 2}]}),
     );
-    assert_eq!(set["body"]["breakpoints"][0]["verified"], true, "{set}");
+    // Not run yet, so not bound yet; but filed under the file's real path.
+    let bp_path = set["body"]["breakpoints"][0]["source"]["path"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(bp_path.eq_ignore_ascii_case(&real), "{set}");
     dap.req("configurationDone", json!({}));
 
     let source = format!("source({:?})", real.replace('\\', "/"));
