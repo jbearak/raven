@@ -55,6 +55,8 @@ function contentViolations(file: string, src: string, exemptLegal: boolean): str
       inComment = !/-->/.test(text) && (inComment || /<!--(?![\s\S]*-->)/.test(text));
       continue;
     }
+    if (!text.trim().startsWith("|") && /—/.test(proseOnly(text)))
+      v.push(`${file}:${line}: em dash in prose; use a period or comma`);
     if (/This page is being written/.test(text)) v.push(`${file}:${line}: stub text left in a page`);
     const prose = proseOnly(text);
     if (/\bissues? #\d+|\(#\d+\)|\bPR #\d+/i.test(text)) v.push(`${file}:${line}: issue/PR number in user docs`);

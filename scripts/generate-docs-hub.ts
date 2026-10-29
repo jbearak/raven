@@ -27,14 +27,14 @@ function hub(): string {
   if (site) out.push(`Prefer search? The same pages are on the [documentation site](${site}/).`, "");
   for (const g of m.groups) {
     out.push(`## ${g.title}`, "");
-    for (const p of g.pages) out.push(`- [${p.title}](${p.file}) — ${p.description}`);
+    for (const p of g.pages) out.push(`- [${p.title}](${p.file}): ${p.description}`);
     out.push("");
   }
   out.push(
     "## More",
     "",
-    `- [Project README](${BLOB}/README.md) — what Raven is, installation, and license.`,
-    `- [Report a problem](https://github.com/jbearak/raven/issues) — see [Troubleshooting](troubleshooting.md) first for what to include.`,
+    `- [Project README](${BLOB}/README.md): what Raven is, installation, and license.`,
+    `- [Report a problem](https://github.com/jbearak/raven/issues). See [Troubleshooting](troubleshooting.md) first for what to include.`,
     "",
     "<!-- Generated from docs/user-pages.json by scripts/generate-docs-hub.ts. Edit the manifest, then regenerate. -->",
     "",
