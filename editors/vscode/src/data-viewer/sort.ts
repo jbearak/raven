@@ -400,7 +400,8 @@ export function stringComparator(ctx: Pick<SortContext, 'stringOrder' | 'locale'
     return c.compare;
 }
 
-function isNullAt(data: any, row: number): boolean {
+/** Whether row `row` of an Arrow data chunk is null (validity bit clear). */
+export function isNullAt(data: any, row: number): boolean {
     const bm = data.nullBitmap;
     if (!bm || bm.length === 0 || data.nullCount === 0) return false;
     const bit = (data.offset ?? 0) + row;
