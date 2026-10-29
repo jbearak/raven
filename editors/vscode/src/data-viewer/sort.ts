@@ -1,455 +1,388 @@
 /**
  * Sort engine for the data viewer.
  *
- * Produces a row permutation (`Uint32Array` of length `nrow`) from one or
- * more {@link SortKey}s, sourced directly from the open
- * {@link ArrowSliceReader}.
+ * Produces a row permutation from one or more {@link SortKey}s, sourced
+ * from an open {@link ArrowSliceReader}. In the extension it runs in the
+ * scan worker (`scan-core.ts`), never on the extension host's event loop.
  *
  * Invariants:
- *   - **Stable**: equal keys retain their original (pre-sort) order. We
- *     rely on `Array.prototype.sort` which is required to be stable
- *     since ES2019.
- *   - **NA-last in both directions**: null, NaN, and other missing
- *     sentinels always sort after present values regardless of `'asc' |
- *     'desc'`. Matches R's `order(..., na.last = TRUE)` and the
- *     end-state of every reference product we surveyed.
+ *   - **Stable.** Every pass is a stable radix sort of the current
+ *     permutation (`radix.ts`), and the initial permutation is ascending
+ *     row index, so ties always end in original row order. Row index is
+ *     never a sort key.
+ *   - **Multi-key sorts are LSD over keys**: a pass on the last key, then
+ *     on each earlier one.
+ *   - **Missing values last in both directions**: NaN just before NA, both
+ *     after every present value (R's `order(..., na.last = TRUE)` puts both
+ *     last; we separate them so NaN and NA rows don't interleave).
+ *   - **`-0` ties with `+0`.**
  *   - **WYSIWYG label routing**: when `labelsOn` is true, factor and
- *     value-labelled columns sort by the displayed label string. When
- *     `labelsOn` is false, they sort by the underlying integer code /
- *     numeric value. This is Raven-specific and is documented as a
- *     trade-off in `docs/data-viewer.md`.
- *   - **Format independence**: the `formatOn` / `digits` toolbar state
- *     never affects sort order. Format only controls rendering.
+ *     value-labelled columns sort by the displayed label; when false, by
+ *     the underlying code or value. Factor codes are level order, so an
+ *     ordered factor sorts by its levels with Labels off.
+ *   - **Format independence**: `formatOn` / `digits` never affect order.
+ *   - **Strings sort by rank**: the distinct values are sorted once and
+ *     each row maps to a `Uint32Array` rank, which is radix-sorted. Values
+ *     the collator calls equal (e.g. NFC vs NFD forms) share a rank, so
+ *     their rows tie. Three orders ({@link StringOrder}): Natural (the
+ *     default, `Intl.Collator(locale, {numeric: true})`), Locale (the same
+ *     collator without `numeric`), and C (Unicode code point order, as
+ *     `sort(method = "radix")` and `dplyr::arrange()` use). The locale is
+ *     always the explicit UI language the host passes in, never the
+ *     runtime default, so Copy as R code can name it.
  *
- * Performance:
- *   - Per-key column reads are projected scans (`batch-iter.ts`): only
- *     the key column's buffers are read, and the reads bypass the
- *     viewport chunk cache. We read each sort-key column exactly once
- *     per `computePermutation` call.
- *   - String columns are compared via `Intl.Collator` with
- *     `numeric: true` so "file_2" sorts before "file_10".
- *   - The off-main-thread worker path (spec §5.2) is not yet wired —
- *     for ≥ 500k rows we still run on the extension-host event loop.
- *     Adding the worker is a follow-up; the current path is correct
- *     and bounded by reader-batch I/O.
+ * Performance: each key column is materialized once over **all** rows
+ * into an encoded key and cached in a {@link SortKeyCache}, so flipping a
+ * direction, adding a key, or re-sorting a different subset of rows (the
+ * survivors of a filter, #328) never re-reads the file.
  */
 
 import type { ArrowSliceReader, ColumnSchema } from './arrow-reader';
-import type { SortKey } from './messages';
+import type { SortKey, StringOrder } from './messages';
 import { iterateBatches } from './batch-iter';
-import { throwIfAborted, yieldToEventLoop } from './abort';
+import { throwIfAborted } from './abort';
+import {
+    CLS_NA,
+    CLS_NAN,
+    compareCodePoints,
+    encodeBigInt64,
+    encodeFloat64,
+    encodeRanks,
+    radixSortByKey,
+    rankDistinct,
+} from './radix';
+import type { CancelCheck, EncodedKey } from './radix';
+
+export type { StringOrder } from './messages';
 
 /** Toolbar snapshot used to derive sort keys WYSIWYG. */
 export type SortContext = {
     labelsOn: boolean;
     formatOn: boolean;
     digits: number;
+    /** String order; defaults to Natural. */
+    stringOrder?: StringOrder;
+    /** BCP 47 tag for Natural and Locale orders (VS Code's UI language).
+     *  `undefined` falls back to the runtime default (tests only). */
+    locale?: string;
 };
 
-/** Per-key cached column data. `missing[i]` is non-zero iff row `i`
- *  should be considered null/NaN. The `compare(a, b)` function returns a
- *  signed integer for two present rows; sign convention is asc (low to
- *  high). The driver multiplies by ±1 per the direction. */
-type SortColumn = {
-    missing: Uint8Array;
-    compare: (a: number, b: number) => number;
+/** Called while a key is being built or sorted. `phase` names the step;
+ *  `done`/`total` measure it when known. */
+export type SortProgress = (phase: 'read' | 'rank' | 'sort', done: number, total: number) => void;
+
+export type SortOptions = {
+    signal?: AbortSignal;
+    /** Rows to sort (e.g. a filter's survivors, in original order).
+     *  Defaults to every row. The result is a permutation of these. */
+    rows?: Uint32Array;
+    /** Materialized keys to reuse and fill. */
+    cache?: SortKeyCache;
+    onProgress?: SortProgress;
 };
 
-const COLLATOR = new Intl.Collator(undefined, {
-    sensitivity: 'variant',
-    numeric: true,
-});
+/** Cached encoded keys, keyed by column and by whatever changes the
+ *  key's meaning (labels, string order, locale). Owned by one reader. */
+export class SortKeyCache {
+    private readonly map = new Map<string, EncodedKey>();
+    get(k: string): EncodedKey | undefined { return this.map.get(k); }
+    set(k: string, v: EncodedKey): void { this.map.set(k, v); }
+    has(k: string): boolean { return this.map.has(k); }
+    clear(): void { this.map.clear(); }
+    get size(): number { return this.map.size; }
+    /** Approximate bytes held, for the memory counter and bench. */
+    get bytes(): number {
+        let b = 0;
+        for (const k of this.map.values()) {
+            b += k.hi.byteLength + (k.lo?.byteLength ?? 0) + k.cls.byteLength;
+        }
+        return b;
+    }
+}
 
 /**
- * Build a row permutation that, when applied to the unsorted reader
- * row stream, yields rows in the order described by `keys`.
- *
- * An empty `keys` array returns the identity permutation.
+ * Build a row permutation that, applied to the unsorted rows (or to
+ * `opts.rows`), yields rows in the order described by `keys`. An empty
+ * `keys` returns the input order.
  */
 export async function computePermutation(
     reader: ArrowSliceReader,
     keys: readonly SortKey[],
     ctx: SortContext,
-    opts?: { signal?: AbortSignal },
+    opts: SortOptions = {},
 ): Promise<Uint32Array> {
-    const signal = opts?.signal;
-    const nrow = reader.nrow;
-    const perm = new Uint32Array(nrow);
-    for (let i = 0; i < nrow; i++) perm[i] = i;
+    const { signal } = opts;
+    const check: CancelCheck = () => throwIfAborted(signal);
+    let perm: Uint32Array;
+    if (opts.rows) {
+        perm = new Uint32Array(opts.rows);
+    } else {
+        perm = new Uint32Array(reader.nrow);
+        for (let i = 0; i < perm.length; i++) perm[i] = i;
+    }
     if (keys.length === 0) return perm;
 
-    const cols: SortColumn[] = [];
-    const directions: (1 | -1)[] = [];
+    const encoded: EncodedKey[] = [];
     for (const k of keys) {
-        const schema = reader.schema.columns[k.columnIndex];
-        if (!schema) {
-            throw new Error(
-                `computePermutation: unknown columnIndex ${k.columnIndex}`,
-            );
-        }
-        cols.push(await buildSortColumn(reader, k.columnIndex, schema, ctx, signal));
-        directions.push(k.direction === 'desc' ? -1 : 1);
+        encoded.push(await materializeSortKey(reader, k.columnIndex, ctx, opts));
     }
-
-    // Materialize the permutation as a plain number[] for sort(), then
-    // copy back. Uint32Array.sort exists but lacks the stability guarantee
-    // and the comparator signature isn't well-typed.
-    const idx: number[] = Array.from(perm);
-    // Yield once more before the (synchronous, potentially expensive) sort so
-    // a Cancel queued during the final column read is delivered and observed
-    // here, leaving the data in natural order rather than running the full
-    // sort first. Only the cancellable restore passes a signal.
-    if (signal) {
-        await yieldToEventLoop();
-        throwIfAborted(signal);
+    check();
+    for (let k = keys.length - 1; k >= 0; k--) {
+        opts.onProgress?.('sort', keys.length - 1 - k, keys.length);
+        perm = radixSortByKey(perm, encoded[k], keys[k].direction === 'desc', check);
     }
-    idx.sort((a, b) => compareRows(a, b, cols, directions));
-    throwIfAborted(signal);
-    for (let i = 0; i < nrow; i++) perm[i] = idx[i];
+    check();
     return perm;
 }
 
-/** Multi-key, NA-last comparator. Missing rows always sort after present
- *  ones, regardless of direction. Equal across all keys → return 0
- *  (sort() is stable). */
-function compareRows(
-    a: number,
-    b: number,
-    cols: SortColumn[],
-    directions: (1 | -1)[],
-): number {
-    for (let k = 0; k < cols.length; k++) {
-        const col = cols[k];
-        const am = col.missing[a] !== 0;
-        const bm = col.missing[b] !== 0;
-        if (am && bm) continue;
-        if (am) return 1;       // a missing → after b
-        if (bm) return -1;      // b missing → after a
-        const c = col.compare(a, b);
-        if (c !== 0) return c * directions[k];
+/** Cache key for a column's sort key under `ctx`. */
+export function sortKeyId(schema: ColumnSchema, columnIndex: number, ctx: SortContext): string {
+    const kind = keyKind(schema, ctx);
+    const strOrder = `${ctx.stringOrder ?? 'natural'}:${ctx.locale ?? ''}`;
+    switch (kind) {
+        case 'string':
+        case 'dictLabel':
+        case 'valueLabel':
+            return `${columnIndex}:${kind}:${strOrder}`;
+        default:
+            return `${columnIndex}:${kind}`;
     }
-    return 0;
 }
 
-async function buildSortColumn(
-    reader: ArrowSliceReader,
-    columnIndex: number,
-    schema: ColumnSchema,
-    ctx: SortContext,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const arrowType = schema.arrowType;
+type KeyKind =
+    | 'dictLabel' | 'dictCode' | 'valueLabel'
+    | 'int64' | 'uint64' | 'timestamp' | 'number' | 'string';
 
-    if (arrowType.startsWith('Dictionary')) {
-        return buildDictionarySortColumn(reader, columnIndex, schema, ctx, signal);
-    }
+function keyKind(schema: ColumnSchema, ctx: SortContext): KeyKind {
+    const t = schema.arrowType;
+    if (t.startsWith('Dictionary')) return ctx.labelsOn ? 'dictLabel' : 'dictCode';
     // Value-labelled columns (haven_labelled, foreign::value.labels,
-    // readstata13) can be backed by any Arrow type whose `.get()`
-    // produces a number, bigint, or string — cell-render.ts shows the
-    // label for any such cell, regardless of underlying storage. Sort
-    // must match: when Labels is on, route through the displayed-text
-    // key. Restricted to the type families whose wire form yields a
-    // labels-eligible cell (Int*/Float/Utf8); Bool, Date, Timestamp
-    // never get label rendering today and so don't need label sorting.
+    // readstata13) show a label for any Int*/Float/Utf8 cell that has one;
+    // with Labels on, sort by what's displayed.
     if (ctx.labelsOn && schema.valueLabels
-        && (arrowType.startsWith('Int')
-            || arrowType.startsWith('Float')
-            || arrowType === 'Utf8'
-            || arrowType === 'LargeUtf8')) {
-        return buildValueLabelledSortColumn(reader, columnIndex, schema, signal);
+        && (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float')
+            || t === 'Utf8' || t === 'LargeUtf8')) {
+        return 'valueLabel';
     }
-    if (arrowType === 'Int64') {
-        // 64-bit integers exceed Number's 2^53 safe range; use signed
-        // BigInt storage + bigint comparator so the order stays exact.
-        return buildBigIntSortColumn(reader, columnIndex, false, signal);
+    // 64-bit integers exceed Number's 2^53 safe range; keep them exact.
+    if (t === 'Int64') return 'int64';
+    if (t === 'Uint64') return 'uint64';
+    if (t.startsWith('Timestamp')) return 'timestamp';
+    if (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float')
+        || t === 'Bool' || t.startsWith('Date')) {
+        return 'number';
     }
-    if (arrowType === 'Uint64') {
-        // Same reasoning, but unsigned storage — BigInt64Array would
-        // wrap any value above 2^63-1 to a negative two's-complement
-        // bigint and corrupt ascending order.
-        return buildBigIntSortColumn(reader, columnIndex, true, signal);
-    }
-    if (arrowType.startsWith('Int') || arrowType === 'Bool') {
-        return buildNumericSortColumn(reader, columnIndex, false, signal);
-    }
-    if (arrowType.startsWith('Float')) {
-        return buildNumericSortColumn(reader, columnIndex, true, signal);
-    }
-    if (arrowType.startsWith('Date')) {
-        return buildNumericSortColumn(reader, columnIndex, false, signal);
-    }
-    if (arrowType.startsWith('Timestamp')) {
-        return buildTimestampSortColumn(reader, columnIndex, signal);
-    }
-    // Utf8 / LargeUtf8 / fallback.
-    return buildStringSortColumn(reader, columnIndex, signal);
+    return 'string';
 }
 
-/** Numeric sort column from Int8/16/32, Bool, Float, or Date columns.
- *  All of these have `.get()` results that fit in JS Number without
- *  precision loss (Int8/16/32 < 2^32, Bool 0/1, Float64 IEEE-754,
- *  Date32 < ~5.8M days, Date64 ms < 2^53 for any plausible year).
- *  Int64/Uint64 columns route through {@link buildBigIntSortColumn}.
- *
- *  When `floatNaNMissing` is true, NaN values are treated as missing
- *  (matches Float NA semantics from the bootstrap profile). */
-async function buildNumericSortColumn(
+/** The encoded key for one column over all rows, from `opts.cache` when
+ *  present. */
+export async function materializeSortKey(
     reader: ArrowSliceReader,
     columnIndex: number,
-    floatNaNMissing: boolean,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const nrow = reader.nrow;
-    const values = new Float64Array(nrow);
-    const missing = new Uint8Array(nrow);
-    let written = 0;
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        for (let r = 0; r < batch.length; r++) {
-            const v = child.get(r);
-            const i = batch.start + r;
-            if (v === null || v === undefined) {
-                missing[i] = 1;
-                values[i] = 0;
-            } else if (floatNaNMissing && Number.isNaN(v as number)) {
-                missing[i] = 1;
-                values[i] = 0;
-            } else {
-                values[i] = v as number;
-            }
-            written++;
-        }
+    ctx: SortContext,
+    opts: SortOptions = {},
+): Promise<EncodedKey> {
+    const schema = reader.schema.columns[columnIndex];
+    if (!schema) {
+        throw new Error(`computePermutation: unknown columnIndex ${columnIndex}`);
     }
-    if (written !== nrow) {
-        throw new Error(`buildNumericSortColumn: read ${written}, expected ${nrow}`);
-    }
-    return {
-        missing,
-        compare: (a, b) => Math.sign(values[a] - values[b]),
-    };
+    const id = sortKeyId(schema, columnIndex, ctx);
+    const hit = opts.cache?.get(id);
+    if (hit) return hit;
+    const key = await buildKey(reader, columnIndex, schema, ctx, opts);
+    opts.cache?.set(id, key);
+    return key;
 }
 
-/** Sort column for Int64 / Uint64. Bigint storage + bigint comparator
- *  so distinct values beyond 2^53 stay distinct (Number coercion would
- *  coalesce them and produce spurious sort ties). Storage type depends
- *  on signedness:
- *
- *  - `Int64`  uses `BigInt64Array`  — range [-2^63, 2^63 - 1].
- *  - `Uint64` uses `BigUint64Array` — range [0, 2^64 - 1].
- *
- *  Cross-storage works in both directions: indexed access returns
- *  `bigint`, and bigint `<` / `>` is exact across all magnitudes. */
-async function buildBigIntSortColumn(
-    reader: ArrowSliceReader,
-    columnIndex: number,
-    unsigned: boolean,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const nrow = reader.nrow;
-    const values: BigInt64Array | BigUint64Array = unsigned
-        ? new BigUint64Array(nrow)
-        : new BigInt64Array(nrow);
-    const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        for (let r = 0; r < batch.length; r++) {
-            const v = child.get(r);
-            const i = batch.start + r;
-            if (v === null || v === undefined) {
-                missing[i] = 1;
-                continue;
-            }
-            values[i] = typeof v === 'bigint' ? v : BigInt(v as number);
-        }
-    }
-    return {
-        missing,
-        compare: (a, b) => {
-            const va = values[a];
-            const vb = values[b];
-            return va < vb ? -1 : va > vb ? 1 : 0;
-        },
-    };
-}
-
-/** Timestamp sort: raw values are microseconds-since-epoch bigints
- *  from Arrow. Storage stays as `BigInt64Array` so far-future or
- *  pre-1970 timestamps (which would exceed Number's safe-int range at
- *  microsecond resolution beyond ~285 years from epoch) sort
- *  exactly. */
-async function buildTimestampSortColumn(
-    reader: ArrowSliceReader,
-    columnIndex: number,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const nrow = reader.nrow;
-    const values = new BigInt64Array(nrow);
-    const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        const data = child.data[0];
-        for (let r = 0; r < batch.length; r++) {
-            const i = batch.start + r;
-            if (isNullAt(data, r)) {
-                missing[i] = 1;
-                continue;
-            }
-            values[i] = data.values[r] as bigint;
-        }
-    }
-    return {
-        missing,
-        compare: (a, b) => {
-            const va = values[a];
-            const vb = values[b];
-            return va < vb ? -1 : va > vb ? 1 : 0;
-        },
-    };
-}
-
-async function buildStringSortColumn(
-    reader: ArrowSliceReader,
-    columnIndex: number,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const nrow = reader.nrow;
-    const values: string[] = new Array(nrow);
-    const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        for (let r = 0; r < batch.length; r++) {
-            const i = batch.start + r;
-            const v = child.get(r);
-            if (v === null || v === undefined) {
-                missing[i] = 1;
-                values[i] = '';
-            } else {
-                values[i] = String(v);
-            }
-        }
-    }
-    return {
-        missing,
-        compare: (a, b) => COLLATOR.compare(values[a], values[b]),
-    };
-}
-
-/** Dictionary-encoded column. When Labels is on, sort by the resolved
- *  label string (via the shipped dictionary or, for unshipped large
- *  dictionaries, by fetched label slices). When Labels is off, sort by
- *  the integer code. */
-async function buildDictionarySortColumn(
+async function buildKey(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
     ctx: SortContext,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
+    opts: SortOptions,
+): Promise<EncodedKey> {
+    const { signal } = opts;
+    const check: CancelCheck = () => throwIfAborted(signal);
     const nrow = reader.nrow;
-    const codes = new Int32Array(nrow);
-    const missing = new Uint8Array(nrow);
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        const data = child.data[0];
-        for (let r = 0; r < batch.length; r++) {
-            const i = batch.start + r;
-            if (isNullAt(data, r)) {
-                missing[i] = 1;
-                codes[i] = -1;
-                continue;
-            }
-            codes[i] = data.values[r] as number;
-        }
-    }
-
-    if (!ctx.labelsOn) {
-        return {
-            missing,
-            compare: (a, b) => Math.sign(codes[a] - codes[b]),
-        };
-    }
-
-    // Labels on. Resolve each unique code to its label. For shipped
-    // dictionaries we have the strings; for large/unshipped dictionaries
-    // we fetch on demand and cache.
-    const labelByCode = new Map<number, string>();
-    const dict = schema.dictionary;
-    if (dict) {
-        for (let i = 0; i < dict.length; i++) labelByCode.set(i, dict[i]);
-    } else {
-        // Determine which codes appear, fetch in bulk via reader.getLabels.
-        const need = new Set<number>();
-        for (let i = 0; i < nrow; i++) {
-            if (!missing[i]) need.add(codes[i]);
-        }
-        const fetched = await reader.getLabels(columnIndex, [...need]);
-        // getLabels is an extra async hop after the cancellable batch scan;
-        // check the signal so a Cancel delivered during it is observed
-        // promptly rather than only after the (cheap) compare step.
-        throwIfAborted(signal);
-        for (const [k, v] of Object.entries(fetched)) {
-            labelByCode.set(Number(k), v);
-        }
-    }
-    return {
-        missing,
-        compare: (a, b) => {
-            const la = labelByCode.get(codes[a]) ?? '';
-            const lb = labelByCode.get(codes[b]) ?? '';
-            return COLLATOR.compare(la, lb);
-        },
+    const cls = new Uint8Array(nrow);
+    const kind = keyKind(schema, ctx);
+    let done = 0;
+    const progress = (len: number) => {
+        done += len;
+        opts.onProgress?.('read', done, nrow);
     };
+
+    if (kind === 'number') {
+        const values = new Float64Array(nrow);
+        const isFloat = schema.arrowType.startsWith('Float');
+        for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+            const child = batch.getChildAt(columnIndex);
+            const data = child.data[0];
+            const fast = isFloat || /^U?[Ii]nt(8|16|32)$/.test(schema.arrowType);
+            const vals = fast ? data.values : undefined;
+            const off: number = data.offset ?? 0;
+            for (let r = 0; r < length; r++) {
+                const i = start + r;
+                if (isNullAt(data, r)) { cls[i] = CLS_NA; continue; }
+                const v = vals ? vals[off + r] : child.get(r);
+                if (v === null || v === undefined) { cls[i] = CLS_NA; continue; }
+                const x = typeof v === 'number' ? v : Number(v);
+                if (Number.isNaN(x)) { cls[i] = CLS_NAN; continue; }
+                values[i] = x;
+            }
+            progress(length);
+        }
+        return encodeFloat64(values, cls);
+    }
+
+    if (kind === 'int64' || kind === 'uint64' || kind === 'timestamp') {
+        const values = kind === 'uint64' ? new BigUint64Array(nrow) : new BigInt64Array(nrow);
+        for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+            const child = batch.getChildAt(columnIndex);
+            const data = child.data[0];
+            const off: number = data.offset ?? 0;
+            for (let r = 0; r < length; r++) {
+                const i = start + r;
+                if (isNullAt(data, r)) { cls[i] = CLS_NA; continue; }
+                const v = kind === 'timestamp' ? data.values[off + r] : child.get(r);
+                if (v === null || v === undefined) { cls[i] = CLS_NA; continue; }
+                values[i] = typeof v === 'bigint' ? v : BigInt(v as number);
+            }
+            progress(length);
+        }
+        return encodeBigInt64(values, cls, kind !== 'uint64');
+    }
+
+    if (kind === 'dictCode') {
+        const codes = new Float64Array(nrow);
+        for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+            const data = batch.getChildAt(columnIndex).data[0];
+            const off: number = data.offset ?? 0;
+            for (let r = 0; r < length; r++) {
+                const i = start + r;
+                if (isNullAt(data, r)) { cls[i] = CLS_NA; continue; }
+                codes[i] = Number(data.values[off + r]);
+            }
+            progress(length);
+        }
+        return encodeFloat64(codes, cls);
+    }
+
+    const compare = stringComparator(ctx);
+
+    if (kind === 'dictLabel') {
+        const codes = new Uint32Array(nrow);
+        let maxCode = -1;
+        for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+            const data = batch.getChildAt(columnIndex).data[0];
+            const off: number = data.offset ?? 0;
+            for (let r = 0; r < length; r++) {
+                const i = start + r;
+                if (isNullAt(data, r)) { cls[i] = CLS_NA; continue; }
+                const c = Number(data.values[off + r]);
+                codes[i] = c;
+                if (c > maxCode) maxCode = c;
+            }
+            progress(length);
+        }
+        const labels = await dictionaryLabels(reader, columnIndex, schema, codes, cls, maxCode);
+        check();
+        opts.onProgress?.('rank', 0, labels.length);
+        const dictRank = rankDistinct(labels, compare, check);
+        const ranks = new Uint32Array(nrow);
+        for (let i = 0; i < nrow; i++) {
+            if (cls[i] === 0) ranks[i] = dictRank[codes[i]] ?? 0;
+        }
+        return encodeRanks(ranks, cls);
+    }
+
+    // string / valueLabel: map each row to a distinct-value id while
+    // reading, rank the distinct values once, then map ids to ranks.
+    const ids = new Uint32Array(nrow);
+    const idOf = new Map<string, number>();
+    const distinct: string[] = [];
+    const valueLabels = kind === 'valueLabel' ? (schema.valueLabels ?? {}) : undefined;
+    for await (const { batch, start, length } of iterateBatches(reader, [columnIndex], signal)) {
+        const child = batch.getChildAt(columnIndex);
+        for (let r = 0; r < length; r++) {
+            const i = start + r;
+            const v = child.get(r);
+            if (v === null || v === undefined) { cls[i] = CLS_NA; continue; }
+            if (typeof v === 'number' && Number.isNaN(v)) { cls[i] = CLS_NAN; continue; }
+            let s = typeof v === 'bigint' ? v.toString() : String(v);
+            if (valueLabels) s = valueLabels[s] ?? s;
+            let id = idOf.get(s);
+            if (id === undefined) {
+                id = distinct.length;
+                idOf.set(s, id);
+                distinct.push(s);
+            }
+            ids[i] = id;
+        }
+        progress(length);
+    }
+    check();
+    opts.onProgress?.('rank', 0, distinct.length);
+    const distinctRank = rankDistinct(distinct, compare, check);
+    for (let i = 0; i < nrow; i++) {
+        ids[i] = cls[i] === 0 ? distinctRank[ids[i]] : 0;
+    }
+    return encodeRanks(ids, cls);
 }
 
-/** Value-labelled column (haven_labelled, foreign::value.labels,
- *  readstata13) with Labels on: sort by the displayed label, falling
- *  back to the raw value's string form when no label exists. Works
- *  across the storage types whose `.get()` returns a `number`,
- *  `bigint`, or `string` — the same set that cell-render.ts's label
- *  lookup applies to. Keys are looked up via `String(rawValue)` to
- *  match the JSON-key form that the R-side bootstrap writes (numeric
- *  haven_labelled values become decimal-string keys; string values
- *  stay as-is). */
-async function buildValueLabelledSortColumn(
+/** Label strings indexed by dictionary code: the reader's loaded
+ *  dictionary when available, else labels fetched for the codes present. */
+async function dictionaryLabels(
     reader: ArrowSliceReader,
     columnIndex: number,
     schema: ColumnSchema,
-    signal?: AbortSignal,
-): Promise<SortColumn> {
-    const nrow = reader.nrow;
-    const display: string[] = new Array(nrow);
-    const missing = new Uint8Array(nrow);
-    const valueLabels = schema.valueLabels ?? {};
-    for await (const batch of iterateBatches(reader, [columnIndex], signal)) {
-        const child = batch.batch.getChildAt(columnIndex);
-        for (let r = 0; r < batch.length; r++) {
-            const i = batch.start + r;
-            const v = child.get(r);
-            if (v === null || v === undefined) {
-                missing[i] = 1;
-                display[i] = '';
-                continue;
-            }
-            if (typeof v === 'number' && Number.isNaN(v)) {
-                missing[i] = 1;
-                display[i] = '';
-                continue;
-            }
-            const key = typeof v === 'bigint' ? v.toString() : String(v);
-            const label = valueLabels[key];
-            display[i] = label !== undefined ? label : key;
+    codes: Uint32Array,
+    cls: Uint8Array,
+    maxCode: number,
+): Promise<string[]> {
+    if (schema.dictionary) return schema.dictionary;
+    const vec = typeof reader.dictionaryVector === 'function'
+        ? reader.dictionaryVector(columnIndex)
+        : undefined;
+    if (vec) {
+        const out: string[] = new Array(vec.length);
+        for (let d = 0; d < vec.length; d++) {
+            const v = vec.get(d);
+            out[d] = v === null || v === undefined ? '' : String(v);
         }
+        return out;
     }
-    return {
-        missing,
-        compare: (a, b) => COLLATOR.compare(display[a], display[b]),
-    };
+    const need = new Set<number>();
+    for (let i = 0; i < codes.length; i++) if (cls[i] === 0) need.add(codes[i]);
+    const fetched = await reader.getLabels(columnIndex, [...need]);
+    const out: string[] = new Array(maxCode + 1).fill('');
+    for (const [k, v] of Object.entries(fetched)) out[Number(k)] = v;
+    return out;
+}
+
+const collators = new Map<string, Intl.Collator>();
+
+/** The comparator for a string order. Natural and Locale collators are
+ *  cached per (locale, numeric). */
+export function stringComparator(ctx: Pick<SortContext, 'stringOrder' | 'locale'>): (a: string, b: string) => number {
+    const order = ctx.stringOrder ?? 'natural';
+    if (order === 'c') return compareCodePoints;
+    const numeric = order === 'natural';
+    const id = `${ctx.locale ?? ''}|${numeric}`;
+    let c = collators.get(id);
+    if (!c) {
+        c = new Intl.Collator(ctx.locale, { sensitivity: 'variant', numeric });
+        collators.set(id, c);
+    }
+    return c.compare;
 }
 
 function isNullAt(data: any, row: number): boolean {
     const bm = data.nullBitmap;
-    if (!bm || bm.length === 0) return false;
-    const byteIdx = row >> 3;
+    if (!bm || bm.length === 0 || data.nullCount === 0) return false;
+    const bit = (data.offset ?? 0) + row;
+    const byteIdx = bit >> 3;
     if (byteIdx >= bm.length) return false;
-    return ((bm[byteIdx] >> (row & 7)) & 1) === 0;
+    return ((bm[byteIdx] >> (bit & 7)) & 1) === 0;
 }

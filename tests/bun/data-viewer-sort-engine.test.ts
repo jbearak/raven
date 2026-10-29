@@ -70,7 +70,7 @@ describe('computePermutation: numeric Int column', () => {
 });
 
 describe('computePermutation: Float with NA / NaN / ±Inf', () => {
-    test('asc: -Inf < 1.5 < +Inf, NA and NaN last in original order', async () => {
+    test('asc: -Inf < 1.5 < +Inf, then NaN, then NA', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         // y = [1.5, NA, NaN, +Inf, -Inf]
         const p = await computePermutation(
@@ -78,18 +78,19 @@ describe('computePermutation: Float with NA / NaN / ±Inf', () => {
             [{ columnIndex: 1, direction: 'asc' }],
             CTX_LABELS_ON,
         );
-        expect(Array.from(p)).toEqual([4, 0, 3, 1, 2]);
+        // NaN (row 2) just before NA (row 1), both after every value.
+        expect(Array.from(p)).toEqual([4, 0, 3, 2, 1]);
         await r.close();
     });
 
-    test('desc: +Inf > 1.5 > -Inf, NA and NaN still last in original order', async () => {
+    test('desc: +Inf > 1.5 > -Inf, then NaN, then NA (missing stays last)', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const p = await computePermutation(
             r,
             [{ columnIndex: 1, direction: 'desc' }],
             CTX_LABELS_ON,
         );
-        expect(Array.from(p)).toEqual([3, 0, 4, 1, 2]);
+        expect(Array.from(p)).toEqual([3, 0, 4, 2, 1]);
         await r.close();
     });
 });
