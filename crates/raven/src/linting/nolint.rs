@@ -203,10 +203,16 @@ fn find_marker(line: &str) -> Option<NolintMarker> {
     // `# raven:` / `@lsp-` markers share one grammar with the analyzer track,
     // so a spelling or position the analyzer rejects (e.g. a trailing
     // `x <- 1 # raven: ignore-next`) does not suppress lints either.
-    if let Some(marker) = crate::cross_file::directive::classify_r_suppression_marker(line) {
+    let (hash_idx, outer_body) = first_hash_body(line)?;
+    // Every `raven:` / `@lsp-` marker contains one of these literals; checking
+    // them first keeps the regex grammar off ordinary comment lines (this scan
+    // runs over every line of every linted file).
+    if (outer_body.contains("raven:") || outer_body.contains("@lsp-"))
+        && let Some(marker) =
+            crate::cross_file::directive::classify_suppression_marker(line, Some(&line[hash_idx..]))
+    {
         return Some(NolintMarker::from(marker));
     }
-    let (_, outer_body) = first_hash_body(line)?;
     if let Some(marker) = classify_nolint(outer_body) {
         return Some(marker);
     }

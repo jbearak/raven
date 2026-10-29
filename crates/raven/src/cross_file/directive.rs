@@ -194,12 +194,6 @@ pub(crate) fn classify_suppression_marker(
     None
 }
 
-/// [`classify_suppression_marker`] for an R source line, using the R comment
-/// scanner to find the comment region.
-pub(crate) fn classify_r_suppression_marker(line: &str) -> Option<SuppressionMarker> {
-    classify_suppression_marker(line, comment_region_outside_strings(line))
-}
-
 /// Insert a line→suppression mapping, merging with any existing entry so a line
 /// carrying two directives accumulates both (and `All` stays absorbing).
 fn insert_line_suppression(
