@@ -1763,6 +1763,14 @@ export function App({
         };
     }, [columns, display, formattedAt, scheduleMissingRowRequest, settings.missingValueStyle, theme, toolbar.labelsOn]);
 
+    // Glide caches the drawn header; repaint it when the missing-bar
+    // counts or sort glyphs change (row -1 addresses header cells).
+    useEffect(() => {
+        const damage: { cell: Item }[] = [];
+        for (let d = 0; d < display.count; d++) damage.push({ cell: [d, -1] });
+        gridRef.current?.updateCells(damage);
+    }, [display.count, nullCounts, sortByColumn]);
+
     /** Auto-fit `sources` to their header text and up to `sampleLimit`
      *  loaded rows (60–400 px). */
     const measureWidths = useCallback((sources: readonly number[], sampleLimit: number): Record<number, number> => {
@@ -2112,6 +2120,7 @@ export function App({
                     onItemHovered={onItemHovered}
                     onCellClicked={onCellClicked}
                     onCellActivated={onCellActivated}
+                    cellActivationBehavior="double-click"
                     experimental={glideExperimental}
                     gridSelection={gridSelection}
                     onGridSelectionChange={selection => {

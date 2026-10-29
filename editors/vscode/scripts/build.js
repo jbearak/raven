@@ -7,6 +7,8 @@ const sveltePlugin = require('esbuild-svelte').default ?? require('esbuild-svelt
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const sveltePreprocess = require('svelte-preprocess').default ?? require('svelte-preprocess');
 
+const { assertGlidePatched } = require('./check-glide-patch');
+
 const root = path.resolve(__dirname, '..');
 const dist = path.join(root, 'dist');
 const reactProductionDefine = { 'process.env.NODE_ENV': '"production"' };
@@ -120,6 +122,7 @@ function copyQuartoThemeBridge() {
 
 (async () => {
     try {
+        assertGlidePatched(root);
         await Promise.all([
             buildExtension(),
             buildSvelteWebview(

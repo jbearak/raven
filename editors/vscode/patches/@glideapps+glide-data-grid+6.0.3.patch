@@ -1,0 +1,193 @@
+diff --git a/node_modules/@glideapps/glide-data-grid/dist/cjs/data-editor/data-editor.js b/node_modules/@glideapps/glide-data-grid/dist/cjs/data-editor/data-editor.js
+index 081f3b3..61dfe69 100644
+--- a/node_modules/@glideapps/glide-data-grid/dist/cjs/data-editor/data-editor.js
++++ b/node_modules/@glideapps/glide-data-grid/dist/cjs/data-editor/data-editor.js
+@@ -1314,7 +1314,13 @@ const DataEditorImpl = (p, forwardedRef) => {
+             }
+             if (args.isEdge) {
+                 if (args.isDoubleClick === true) {
+-                    void normalSizeColumn(col);
++                    // raven patch: let the host auto-size from its own text.
++                    if (experimental?.onColumnAutoSize !== undefined) {
++                        experimental.onColumnAutoSize(col - rowMarkerOffset);
++                    }
++                    else {
++                        void normalSizeColumn(col);
++                    }
+                 }
+             }
+             else if (args.button === 0 && col === lastMouseDownCol && row === lastMouseDownRow) {
+@@ -1359,6 +1365,7 @@ const DataEditorImpl = (p, forwardedRef) => {
+         onHeaderClicked,
+         normalSizeColumn,
+         handleGroupHeaderSelection,
++        experimental,
+     ]);
+     const onMouseMoveImpl = React.useCallback((args) => {
+         const a = {
+diff --git a/node_modules/@glideapps/glide-data-grid/dist/cjs/internal/data-grid/data-grid.js b/node_modules/@glideapps/glide-data-grid/dist/cjs/internal/data-grid/data-grid.js
+index 412d81c..00672a3 100644
+--- a/node_modules/@glideapps/glide-data-grid/dist/cjs/internal/data-grid/data-grid.js
++++ b/node_modules/@glideapps/glide-data-grid/dist/cjs/internal/data-grid/data-grid.js
+@@ -1067,6 +1067,19 @@ const DataGrid = (p, forwardedRef) => {
+         if (!firstColAccessible && effectiveCols[0]?.sourceIndex === 0) {
+             effectiveCols = effectiveCols.slice(1);
+         }
++        // raven patch: host-supplied accessible names, row labels, and
++        // columns kept out of the accessibility tree.
++        const a11y = experimental?.accessibility;
++        const a11yHidden = (c) => a11y?.isColumnHidden?.(c) === true;
++        const a11yHiddenBefore = [];
++        let a11yHiddenCount = 0;
++        for (let i = 0; i < mappedColumns.length; i++) {
++            a11yHiddenBefore.push(a11yHiddenCount);
++            if (a11yHidden(i))
++                a11yHiddenCount++;
++        }
++        const a11yColIndex = (c) => c + 1 + colOffset - (a11yHiddenBefore[c] ?? 0);
++        effectiveCols = effectiveCols.filter(c => !a11yHidden(c.sourceIndex));
+         const [fCol, fRow] = selection.current?.cell ?? [];
+         const range = selection.current?.range;
+         const visibleCols = effectiveCols.map(c => c.sourceIndex);
+@@ -1078,14 +1091,14 @@ const DataGrid = (p, forwardedRef) => {
+             !(visibleCols.includes(fCol) && visibleRows.includes(fRow))) {
+             focusElement(null);
+         }
+-        return (React.createElement("table", { key: "access-tree", role: "grid", "aria-rowcount": rows + 1, "aria-multiselectable": "true", "aria-colcount": mappedColumns.length + colOffset },
++        return (React.createElement("table", { key: "access-tree", role: "grid", "aria-rowcount": rows + 1, "aria-multiselectable": "true", "aria-colcount": mappedColumns.length + colOffset - a11yHiddenCount },
+             React.createElement("thead", { role: "rowgroup" },
+-                React.createElement("tr", { role: "row", "aria-rowindex": 1 }, effectiveCols.map(c => (React.createElement("th", { role: "columnheader", "aria-selected": selection.columns.hasIndex(c.sourceIndex), "aria-colindex": c.sourceIndex + 1 + colOffset, tabIndex: -1, onFocus: e => {
++                React.createElement("tr", { role: "row", "aria-rowindex": 1 }, effectiveCols.map(c => (React.createElement("th", { role: "columnheader", "aria-selected": selection.columns.hasIndex(c.sourceIndex), "aria-colindex": a11yColIndex(c.sourceIndex), "aria-label": a11y?.columnLabel?.(c.sourceIndex), tabIndex: -1, onFocus: e => {
+                         if (e.target === focusRef.current)
+                             return;
+                         return onCellFocused?.([c.sourceIndex, -1]);
+                     }, key: c.sourceIndex }, c.title))))),
+-            React.createElement("tbody", { role: "rowgroup" }, visibleRows.map(row => (React.createElement("tr", { role: "row", "aria-selected": selection.rows.hasIndex(row), key: row, "aria-rowindex": row + 2 }, effectiveCols.map(c => {
++            React.createElement("tbody", { role: "rowgroup" }, visibleRows.map(row => (React.createElement("tr", { role: "row", "aria-selected": selection.rows.hasIndex(row), key: row, "aria-rowindex": row + 2, "aria-label": a11y?.rowLabel?.(row) }, effectiveCols.map(c => {
+                 const col = c.sourceIndex;
+                 const key = (0, render_state_provider_js_1.packColRowToNumber)(col, row);
+                 const focused = fCol === col && fRow === row;
+@@ -1097,7 +1110,7 @@ const DataGrid = (p, forwardedRef) => {
+                 const id = `glide-cell-${col}-${row}`;
+                 const location = [col, row];
+                 const cellContent = getCellContent(location, true);
+-                return (React.createElement("td", { key: key, role: "gridcell", "aria-colindex": col + 1 + colOffset, "aria-selected": selected, "aria-readonly": (0, data_grid_types_js_1.isInnerOnlyCell)(cellContent) || !(0, data_grid_types_js_1.isReadWriteCell)(cellContent), id: id, "data-testid": id, onClick: () => {
++                return (React.createElement("td", { key: key, role: "gridcell", "aria-colindex": a11yColIndex(col), "aria-selected": selected, "aria-readonly": (0, data_grid_types_js_1.isInnerOnlyCell)(cellContent) || !(0, data_grid_types_js_1.isReadWriteCell)(cellContent), id: id, "data-testid": id, onClick: () => {
+                         const canvas = canvasRef?.current;
+                         if (canvas === null || canvas === undefined)
+                             return;
+@@ -1140,6 +1153,7 @@ const DataGrid = (p, forwardedRef) => {
+         onKeyDown,
+         getBoundsForItem,
+         onCellFocused,
++        experimental,
+     ], 200);
+     const opacityX = freezeColumns === 0 || !fixedShadowX ? 0 : cellXOffset > freezeColumns ? 1 : (0, clamp_js_1.default)(-translateX / 100, 0, 1);
+     const absoluteOffsetY = -cellYOffset * 32 + translateY;
+diff --git a/node_modules/@glideapps/glide-data-grid/dist/dts/internal/data-grid/data-grid.d.ts b/node_modules/@glideapps/glide-data-grid/dist/dts/internal/data-grid/data-grid.d.ts
+index 2741797..5f43950 100644
+--- a/node_modules/@glideapps/glide-data-grid/dist/dts/internal/data-grid/data-grid.d.ts
++++ b/node_modules/@glideapps/glide-data-grid/dist/dts/internal/data-grid/data-grid.d.ts
+@@ -155,6 +155,16 @@ export interface DataGridProps {
+      * @experimental
+      */
+     readonly experimental: {
++        /** raven patch: accessible header names and row labels, and
++         *  columns excluded from the accessibility tree. */
++        readonly accessibility?: {
++            readonly isColumnHidden?: (col: number) => boolean;
++            readonly columnLabel?: (col: number) => string | undefined;
++            readonly rowLabel?: (row: number) => string | undefined;
++        };
++        /** raven patch: called instead of Glide's own measurement when a
++         *  column border is double-clicked. */
++        readonly onColumnAutoSize?: (col: number) => void;
+         readonly disableAccessibilityTree?: boolean;
+         readonly disableMinimumCellWidth?: boolean;
+         readonly paddingRight?: number;
+diff --git a/node_modules/@glideapps/glide-data-grid/dist/esm/data-editor/data-editor.js b/node_modules/@glideapps/glide-data-grid/dist/esm/data-editor/data-editor.js
+index ec05aa9..9b48304 100644
+--- a/node_modules/@glideapps/glide-data-grid/dist/esm/data-editor/data-editor.js
++++ b/node_modules/@glideapps/glide-data-grid/dist/esm/data-editor/data-editor.js
+@@ -1285,7 +1285,13 @@ const DataEditorImpl = (p, forwardedRef) => {
+             }
+             if (args.isEdge) {
+                 if (args.isDoubleClick === true) {
+-                    void normalSizeColumn(col);
++                    // raven patch: let the host auto-size from its own text.
++                    if (experimental?.onColumnAutoSize !== undefined) {
++                        experimental.onColumnAutoSize(col - rowMarkerOffset);
++                    }
++                    else {
++                        void normalSizeColumn(col);
++                    }
+                 }
+             }
+             else if (args.button === 0 && col === lastMouseDownCol && row === lastMouseDownRow) {
+@@ -1330,6 +1336,7 @@ const DataEditorImpl = (p, forwardedRef) => {
+         onHeaderClicked,
+         normalSizeColumn,
+         handleGroupHeaderSelection,
++        experimental,
+     ]);
+     const onMouseMoveImpl = React.useCallback((args) => {
+         const a = {
+diff --git a/node_modules/@glideapps/glide-data-grid/dist/esm/internal/data-grid/data-grid.js b/node_modules/@glideapps/glide-data-grid/dist/esm/internal/data-grid/data-grid.js
+index c32e94b..d751898 100644
+--- a/node_modules/@glideapps/glide-data-grid/dist/esm/internal/data-grid/data-grid.js
++++ b/node_modules/@glideapps/glide-data-grid/dist/esm/internal/data-grid/data-grid.js
+@@ -1040,6 +1040,19 @@ const DataGrid = (p, forwardedRef) => {
+         if (!firstColAccessible && effectiveCols[0]?.sourceIndex === 0) {
+             effectiveCols = effectiveCols.slice(1);
+         }
++        // raven patch: host-supplied accessible names, row labels, and
++        // columns kept out of the accessibility tree.
++        const a11y = experimental?.accessibility;
++        const a11yHidden = (c) => a11y?.isColumnHidden?.(c) === true;
++        const a11yHiddenBefore = [];
++        let a11yHiddenCount = 0;
++        for (let i = 0; i < mappedColumns.length; i++) {
++            a11yHiddenBefore.push(a11yHiddenCount);
++            if (a11yHidden(i))
++                a11yHiddenCount++;
++        }
++        const a11yColIndex = (c) => c + 1 + colOffset - (a11yHiddenBefore[c] ?? 0);
++        effectiveCols = effectiveCols.filter(c => !a11yHidden(c.sourceIndex));
+         const [fCol, fRow] = selection.current?.cell ?? [];
+         const range = selection.current?.range;
+         const visibleCols = effectiveCols.map(c => c.sourceIndex);
+@@ -1051,14 +1064,14 @@ const DataGrid = (p, forwardedRef) => {
+             !(visibleCols.includes(fCol) && visibleRows.includes(fRow))) {
+             focusElement(null);
+         }
+-        return (React.createElement("table", { key: "access-tree", role: "grid", "aria-rowcount": rows + 1, "aria-multiselectable": "true", "aria-colcount": mappedColumns.length + colOffset },
++        return (React.createElement("table", { key: "access-tree", role: "grid", "aria-rowcount": rows + 1, "aria-multiselectable": "true", "aria-colcount": mappedColumns.length + colOffset - a11yHiddenCount },
+             React.createElement("thead", { role: "rowgroup" },
+-                React.createElement("tr", { role: "row", "aria-rowindex": 1 }, effectiveCols.map(c => (React.createElement("th", { role: "columnheader", "aria-selected": selection.columns.hasIndex(c.sourceIndex), "aria-colindex": c.sourceIndex + 1 + colOffset, tabIndex: -1, onFocus: e => {
++                React.createElement("tr", { role: "row", "aria-rowindex": 1 }, effectiveCols.map(c => (React.createElement("th", { role: "columnheader", "aria-selected": selection.columns.hasIndex(c.sourceIndex), "aria-colindex": a11yColIndex(c.sourceIndex), "aria-label": a11y?.columnLabel?.(c.sourceIndex), tabIndex: -1, onFocus: e => {
+                         if (e.target === focusRef.current)
+                             return;
+                         return onCellFocused?.([c.sourceIndex, -1]);
+                     }, key: c.sourceIndex }, c.title))))),
+-            React.createElement("tbody", { role: "rowgroup" }, visibleRows.map(row => (React.createElement("tr", { role: "row", "aria-selected": selection.rows.hasIndex(row), key: row, "aria-rowindex": row + 2 }, effectiveCols.map(c => {
++            React.createElement("tbody", { role: "rowgroup" }, visibleRows.map(row => (React.createElement("tr", { role: "row", "aria-selected": selection.rows.hasIndex(row), key: row, "aria-rowindex": row + 2, "aria-label": a11y?.rowLabel?.(row) }, effectiveCols.map(c => {
+                 const col = c.sourceIndex;
+                 const key = packColRowToNumber(col, row);
+                 const focused = fCol === col && fRow === row;
+@@ -1070,7 +1083,7 @@ const DataGrid = (p, forwardedRef) => {
+                 const id = `glide-cell-${col}-${row}`;
+                 const location = [col, row];
+                 const cellContent = getCellContent(location, true);
+-                return (React.createElement("td", { key: key, role: "gridcell", "aria-colindex": col + 1 + colOffset, "aria-selected": selected, "aria-readonly": isInnerOnlyCell(cellContent) || !isReadWriteCell(cellContent), id: id, "data-testid": id, onClick: () => {
++                return (React.createElement("td", { key: key, role: "gridcell", "aria-colindex": a11yColIndex(col), "aria-selected": selected, "aria-readonly": isInnerOnlyCell(cellContent) || !isReadWriteCell(cellContent), id: id, "data-testid": id, onClick: () => {
+                         const canvas = canvasRef?.current;
+                         if (canvas === null || canvas === undefined)
+                             return;
+@@ -1113,6 +1126,7 @@ const DataGrid = (p, forwardedRef) => {
+         onKeyDown,
+         getBoundsForItem,
+         onCellFocused,
++        experimental,
+     ], 200);
+     const opacityX = freezeColumns === 0 || !fixedShadowX ? 0 : cellXOffset > freezeColumns ? 1 : clamp(-translateX / 100, 0, 1);
+     const absoluteOffsetY = -cellYOffset * 32 + translateY;
