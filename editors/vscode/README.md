@@ -79,7 +79,7 @@ If you work with Stata, Raven's sibling project [Sight](https://github.com/jbear
 
 ## Acknowledgements
 
-Raven builds on open-source work. It started as the language server extracted from [Ark](https://github.com/posit-dev/ark), [tree-sitter-r](https://github.com/r-lib/tree-sitter-r) parses your R code, its linter follows [lintr](https://github.com/r-lib/lintr), and its R grammars come from [vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax). The [acknowledgements](https://github.com/jbearak/raven#acknowledgements) list every project Raven draws on and what it takes from each.
+Raven builds on open-source work. It started as the language server extracted from [Ark](https://github.com/posit-dev/ark), [tree-sitter-r](https://github.com/r-lib/tree-sitter-r) parses your R code, its linter follows [lintr](https://github.com/r-lib/lintr), and its R grammars come from [vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax). The [acknowledgements](https://github.com/jbearak/raven#acknowledgements) describe the main projects Raven draws on and what it takes from each.
 
 ## License
 
