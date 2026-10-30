@@ -233,16 +233,33 @@ function predicateCode(
  * read alike. Rejects escapes the engines read differently (`\u0061` and
  * `\cX` are JS escapes but PCRE errors or differs; `\p`/`\k` are literal
  * letters in non-Unicode JS but properties/backrefs in PCRE; `\0` and other
- * octal forms) and `[^]` (JS "any character", a PCRE error).
+ * octal forms), `[]`/`[^]` (empty/any class in JS, a PCRE error), and
+ * POSIX bracket expressions such as `[[:alpha:]]` (PCRE-only).
  */
 export function pcreCompatible(pattern: string): boolean {
-    if (pattern.includes('[^]')) return false;
+    let inClass = false;
     for (let i = 0; i < pattern.length; i++) {
-        if (pattern[i] !== '\\') continue;
-        const next = pattern[i + 1];
-        if (next === undefined) return false;
-        if (!/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(next)) return false;
-        i++;
+        const c = pattern[i];
+        if (c === '\\') {
+            const next = pattern[i + 1];
+            if (next === undefined) return false;
+            if (!/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(next)) return false;
+            i++;
+            continue;
+        }
+        if (!inClass) {
+            if (c !== '[') continue;
+            inClass = true;
+            if (pattern[i + 1] === '^') i++;
+            // `[]` / `[^]`: an empty (or "any") class in JS, but in PCRE a
+            // leading `]` is a literal and the class runs on, or errors.
+            if (pattern[i + 1] === ']') return false;
+            continue;
+        }
+        // POSIX classes and collating elements (`[[:alpha:]]`, `[[.a.]]`,
+        // `[[=a=]]`) exist in PCRE only; JS reads them as literal characters.
+        if (c === '[' && /[:.=]/.test(pattern[i + 1] ?? '')) return false;
+        if (c === ']') inClass = false;
     }
     return true;
 }

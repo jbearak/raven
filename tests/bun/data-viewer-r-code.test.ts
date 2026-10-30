@@ -131,9 +131,9 @@ describe('generateRCode', () => {
     });
 
     test('pcreCompatible allows the shared subset only', () => {
-        for (const p of ['abc', '^a.*b$', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\s\\S\\w\\W'])
+        for (const p of ['abc', '^a.*b$', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\s\\S\\w\\W', '[^a-c]x', '[\\]]', 'a:b[x:y]'])
             expect([p, pcreCompatible(p)]).toEqual([p, true]);
-        for (const p of ['\\u0061', '\\cA', '[^]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\'])
+        for (const p of ['\\u0061', '\\cA', '[^]', '[]', 'a[]b', '[[:alpha:]]', '[a[:digit:]]', '[[.a.]]', '[[=e=]]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\'])
             expect([p, pcreCompatible(p)]).toEqual([p, false]);
     });
 
