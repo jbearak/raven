@@ -351,18 +351,22 @@ describe('WorkerEngine: thread lifecycles', () => {
     }, 30_000);
 
     test('a deadline overrun terminates the worker with a non-abort error', async () => {
-        const path = await catastrophicFixture();
-        engine = await start(path, 8);
-        const regex: FilterState = {
-            entries: [{ id: 'r', columnIndex: 1, predicate: { kind: 'strRegex', pattern: '^(a+)+$', caseSensitive: true }, enabled: true, includeMissing: false }],
-            labelsOnWhenFiltered: true,
-        };
-        const err = await engine.compute({ filter: regex }, { deadlineMs: 300 }).then(() => undefined, e => e);
+        // A 2M-row numeric sort can't finish in 1 ms on any machine, so
+        // the deadline fires deterministically. (A catastrophic regex
+        // depends on the engine's backtracking limits, which vary by
+        // runtime build.)
+        const dir = mkdtempSync(join(tmpdir(), 'raven-protocol-'));
+        const path = join(dir, 'big.arrow');
+        const n = 2_000_000;
+        const x = Float64Array.from({ length: n }, (_, i) => (i * 2_654_435_761) % 1_000_003);
+        await writeFile(path, tableToIPC(tableFromArrays({ x }), 'file'));
+        engine = await start(path, n);
+        const err = await engine.compute({ sort: SORT_X_ASC }, { deadlineMs: 1 }).then(() => undefined, e => e);
         expect(err).toBeInstanceOf(Error);
         expect(err.name).not.toBe('AbortError');
         // Still usable.
         const ok = await engine.compute({ sort: SORT_X_ASC });
-        expect(ok.perm!.length).toBe(8);
+        expect(ok.perm!.length).toBe(n);
         engine.discard(ok);
     }, 30_000);
 
