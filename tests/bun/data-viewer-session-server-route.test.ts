@@ -51,6 +51,22 @@ describe('POST /view-data', () => {
         });
     });
 
+    test('the expression and source kind ride along when present', async () => {
+        const fp = join(dvDir, 'sess-expr.arrow');
+        await writeFile(fp, 'pretend-arrow-bytes');
+        const events: RSessionEvent[] = [];
+        server.onEvent(e => events.push(e));
+        const r = await post({
+            sessionId: 'sess', panelName: 'cars', filePath: fp, nrow: 1,
+            expression: 'subset(mtcars, cyl > 4)', sourceKind: 'data.frame',
+        });
+        expect(r.status).toBe(200);
+        expect(events[0]).toMatchObject({
+            type: 'view-data-requested', panelName: 'cars',
+            expression: 'subset(mtcars, cyl > 4)', sourceKind: 'data.frame',
+        });
+    });
+
     test('invalid token returns 401', async () => {
         const fp = join(dvDir, 'x.arrow');
         await writeFile(fp, '');

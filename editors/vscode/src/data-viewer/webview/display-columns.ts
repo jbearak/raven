@@ -4,8 +4,10 @@
  *
  * Display column 0 is the synthetic **gutter**, a webview-only column
  * showing R row numbers; it has no source index and never reaches the
- * host. Display columns 1.. are the non-hidden source columns, with
- * rowname columns first (they are frozen with the gutter). Row windows
+ * host. Display columns 1.. are the non-hidden source columns: rowname
+ * columns first, then pinned columns in pin order (both frozen with the
+ * gutter), then the rest in schema order. Unpinning a column returns it
+ * to its schema position. Row windows
  * fetched from the host hold cells in `dataCols` order, so a display
  * column's cell is at position `display − 1` of a cached row.
  *
@@ -24,8 +26,8 @@ export const GUTTER_DISPLAY_INDEX = 0;
 export type DisplayColumns = {
     /** Source indices in display order (display index = position + 1). */
     readonly dataCols: readonly number[];
-    /** Leading display columns Glide freezes: the gutter plus any visible
-     *  rowname columns. */
+    /** Leading display columns Glide freezes: the gutter, the visible
+     *  rowname columns, and the visible pinned columns. */
     readonly freezeColumns: number;
     /** Total display columns, gutter included. */
     readonly count: number;
@@ -33,6 +35,8 @@ export type DisplayColumns = {
     readonly displayBySource: ReadonlyMap<number, number>;
     /** Source indices of visible rowname columns. */
     readonly rownameCols: readonly number[];
+    /** Source indices of visible pinned columns, in pin order. */
+    readonly pinnedCols: readonly number[];
     /** Source indices of every rowname column, hidden ones included:
      *  "Copy with row names" copies the frame's names even when the
      *  column is hidden. */
@@ -42,27 +46,54 @@ export type DisplayColumns = {
 export function buildDisplayColumns(
     columns: readonly ColumnSchema[],
     hiddenColumns: readonly number[],
+    pinnedColumns: readonly number[] = [],
 ): DisplayColumns {
     const hidden = new Set(hiddenColumns);
+    const pinnedCols = [...new Set(pinnedColumns)].filter(i =>
+        columns[i] !== undefined && !columns[i].isRowname && !hidden.has(i));
+    const pinned = new Set(pinnedCols);
     const rownameCols: number[] = [];
     const allRownameCols: number[] = [];
     const rest: number[] = [];
     for (let i = 0; i < columns.length; i++) {
         if (columns[i].isRowname) allRownameCols.push(i);
-        if (hidden.has(i)) continue;
+        if (hidden.has(i) || pinned.has(i)) continue;
         (columns[i].isRowname ? rownameCols : rest).push(i);
     }
-    const dataCols = [...rownameCols, ...rest];
+    const dataCols = [...rownameCols, ...pinnedCols, ...rest];
     const displayBySource = new Map<number, number>();
     dataCols.forEach((src, pos) => displayBySource.set(src, pos + 1));
     return {
         dataCols,
-        freezeColumns: 1 + rownameCols.length,
+        freezeColumns: 1 + rownameCols.length + pinnedCols.length,
         count: dataCols.length + 1,
         displayBySource,
         rownameCols,
+        pinnedCols,
         allRownameCols,
     };
+}
+
+/** True when source column `source` is pinned (hidden pins included). */
+export function isPinned(pinnedColumns: readonly number[] | undefined, source: number): boolean {
+    return pinnedColumns?.includes(source) ?? false;
+}
+
+/** `pinnedColumns` with `source` pinned last, or unpinned. */
+export function togglePinned(pinnedColumns: readonly number[] | undefined, source: number): number[] {
+    const pins = [...(pinnedColumns ?? [])];
+    const at = pins.indexOf(source);
+    if (at >= 0) pins.splice(at, 1);
+    else pins.push(source);
+    return pins;
+}
+
+/** Whether a frozen region of `frozenWidths` (gutter, rowname and pinned
+ *  column widths) fits in half of a `viewportPx`-wide grid. An unknown
+ *  viewport (0) always fits. */
+export function frozenFits(frozenWidths: readonly number[], viewportPx: number): boolean {
+    if (viewportPx <= 0) return true;
+    return frozenWidths.reduce((a, b) => a + b, 0) <= viewportPx * 0.5;
 }
 
 export function isGutter(displayIndex: number): boolean {

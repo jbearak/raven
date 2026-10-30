@@ -65,6 +65,8 @@ type Props = {
      *  without one, the R row numbers) prepended. */
     onCopyWithRowNames?: () => void;
     onHideColumn?: () => void;
+    /** Pin or unpin the column (column menus only); `pinned` says which. */
+    pin?: { pinned: boolean; onToggle: () => void };
     /** Open the column's value counts (column menus only). */
     onValueCounts?: () => void;
     onClose: () => void;
@@ -83,6 +85,7 @@ export function ColumnContextMenu({
     onCopy,
     onCopyWithRowNames,
     onHideColumn,
+    pin,
     onValueCounts,
     onClose,
     sort,
@@ -126,6 +129,11 @@ export function ColumnContextMenu({
             {onHideColumn && (
                 <button type="button" className="context-menu-item" onClick={onHideColumn} role="menuitem">
                     Hide column
+                </button>
+            )}
+            {pin && (
+                <button type="button" className="context-menu-item" onClick={pin.onToggle} role="menuitem">
+                    {pin.pinned ? 'Unpin column' : 'Pin column'}
                 </button>
             )}
             {onValueCounts && (

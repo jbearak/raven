@@ -24,6 +24,7 @@ import type { ComputeOptions, ComputeResult, TransformRequest } from './scan-cor
 import { TransformCoordinator } from './transform-coordinator';
 import type { Descriptor } from './transform-coordinator';
 import type { SortProgress } from './sort';
+import type { FindQuery } from './find';
 
 /** A computed transform, held as a candidate by the scan worker. Carries
  *  one registry reference: pass it to `coordinator.install` or
@@ -65,6 +66,9 @@ export interface DataEngine {
     valueCounts(
         columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal,
     ): Promise<ValueCounts>;
+    /** Find in grid: display positions under `perm` whose displayed text
+     *  contains the query (`find.ts`). */
+    find(query: FindQuery, perm: Uint32Array | undefined, signal: AbortSignal): Promise<Uint32Array>;
     /** True (once) if the scan worker restarted since the last call, so
      *  its key and rank caches are gone. */
     takeScanRestarted(): boolean;
@@ -149,6 +153,10 @@ export class LocalEngine implements DataEngine {
 
     valueCounts(columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal) {
         return this.scan.valueCounts(columnIndex, order, limit, signal);
+    }
+
+    find(query: FindQuery, perm: Uint32Array | undefined, signal: AbortSignal) {
+        return this.scan.find(query, perm, signal);
     }
 
     takeScanRestarted(): boolean { return false; }

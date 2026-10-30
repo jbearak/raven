@@ -1469,6 +1469,9 @@ body,
 /* Status line under the grid: exact visible row range and filter
    context. */
 .status-line {
+    display: flex;
+    gap: 16px;
+    justify-content: space-between;
     flex: 0 0 auto;
     padding: 2px 8px;
     border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
@@ -1581,6 +1584,109 @@ body,
     padding: 2px 8px 6px;
     color: var(--vscode-descriptionForeground, var(--dv-fb-fg));
     font-size: var(--dv-font-size-xs);
+}
+
+/* Status line: the selection summary sits on the right. */
+.status-line-range {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status-line-selection {
+    flex: 0 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The toolbar's ⋯ menu (workflow-menu.tsx), right-aligned under it. */
+.workflow-menu-anchor {
+    position: relative;
+    flex: 0 0 auto;
+}
+
+.workflow-menu {
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 220px;
+}
+
+.workflow-submenu-anchor {
+    position: relative;
+}
+
+/* Opens to the left: the menu hugs the panel's right edge. */
+.workflow-submenu {
+    top: -4px;
+    right: 100%;
+    min-width: 140px;
+}
+
+.workflow-menu .context-menu-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Find and go-to-row bars, docked between the toolbar and the grid. */
+.grid-bar {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 6px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    font-size: var(--dv-font-size-sm);
+}
+
+.grid-bar-input {
+    flex: 0 1 280px;
+    min-width: 120px;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+    border-radius: 3px;
+    background: var(--vscode-input-background, var(--vscode-editor-background, var(--dv-fb-bg)));
+    color: var(--vscode-input-foreground, var(--vscode-foreground, var(--dv-fb-fg)));
+    font: inherit;
+}
+
+.grid-bar-input:focus {
+    outline: 1px solid var(--vscode-focusBorder, var(--dv-fb-focus));
+    outline-offset: -1px;
+}
+
+.grid-bar-input[aria-invalid='true'] {
+    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, var(--dv-fb-error)));
+}
+
+.grid-bar-status {
+    min-width: 90px;
+    color: var(--vscode-descriptionForeground, inherit);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.grid-bar-button {
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+
+.grid-bar-button:hover:not(:disabled),
+.grid-bar-button:focus-visible {
+    border-color: var(--vscode-focusBorder, var(--dv-fb-focus));
+}
+
+.grid-bar-button:disabled {
+    opacity: 0.4;
+    cursor: default;
 }
 
 @media (forced-colors: active) {

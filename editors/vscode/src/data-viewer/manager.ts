@@ -40,9 +40,10 @@ export class DataViewerManager {
         await this.serializer.run(async () => {
             try {
                 const reader = await ArrowSliceReader.open(e.filePath);
+                const source = { expression: e.expression, sourceKind: e.sourceKind };
                 const existing = this.panels.get(e.panelName);
                 if (existing) {
-                    await existing.replace(reader, e.filePath);
+                    await existing.replace(reader, e.filePath, source);
                     existing.reveal();
                     return;
                 }
@@ -51,6 +52,7 @@ export class DataViewerManager {
                     this.store, this.toolbarStore, this.sortStore, this.filterStore, this.settings(),
                     this.extensionUri,
                     () => { this.panels.delete(e.panelName); },
+                    source,
                 );
                 this.panels.set(e.panelName, panel);
             } catch (err) {

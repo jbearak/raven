@@ -27,6 +27,12 @@ export type ViewDataEvent = {
      *  contained in the per-server allowed data-viewer directory. */
     filePath: string;
     nrow: number;
+    /** The deparsed expression passed to `View()`, untruncated (absent
+     *  past 64 KiB or from an older bootstrap). Copy as R code and
+     *  Refresh use it. */
+    expression?: string;
+    /** What `View()` received: `data.frame`, `matrix`, `list`, `vector`. */
+    sourceKind?: string;
 };
 
 export type DataViewerWarningEvent = {

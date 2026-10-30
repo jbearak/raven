@@ -47,7 +47,7 @@ import {
 } from '../profile';
 import type { Cell } from '../wire-format';
 import { TileCache, tileGeometry } from './tile-cache';
-import { StatusLine, createRangeStore } from './status-line';
+import { StatusLine, createRangeStore, createVersionStore } from './status-line';
 import { formatCell, type FormattedCell } from './cell-render';
 import { displayTypeTag, isRightAligned } from '../display-format';
 import {
@@ -56,11 +56,23 @@ import {
     clampToData,
     copyColumns,
     displayIndexOf,
+    frozenFits,
     isGutter,
+    isPinned,
     rowPosition,
     rRowNumber,
     sourceAt,
+    togglePinned,
 } from './display-columns';
+import { WorkflowMenu } from './workflow-menu';
+import { FindBar, GoToRowBar, type FindStatus } from './find-bar';
+import {
+    describeSelection,
+    formatStat,
+    summarizeSelection,
+    type CodeFlavorName,
+    type RowTarget,
+} from './workflow-model';
 import { rowHeightFor, useGridTheme, type GridTheme } from './grid-theme';
 import {
     drawDataHeader,
@@ -194,6 +206,8 @@ type GlideExperimental = NonNullable<DataEditorCoreProps['experimental']> & {
 /** Values longer than this open the cell-detail popover even when they
  *  fit the column. */
 const LONG_VALUE_CHARS = 80;
+/** Shortcut modifier shown in menus. */
+const MOD_LABEL = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl+';
 
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
@@ -499,6 +513,22 @@ export function App({
     // A real user change replaces `filter` with a new object (≠ this ref),
     // so it still persists normally. (#519)
     const lastHostFilterRef = useRef<FilterState | null>(null);
+    /** Find bar (Cmd/Ctrl+F) and go-to-row bar (Cmd/Ctrl+G). */
+    const [findOpen, setFindOpen] = useState(false);
+    const [findNonce, setFindNonce] = useState(0);
+    const [findStatus, setFindStatus] = useState<FindStatus>({ searching: false });
+    /** The live query and the request id of the latest find/step. */
+    const findQueryRef = useRef('');
+    const findRequestRef = useRef(0);
+    const [gotoOpen, setGotoOpen] = useState(false);
+    const [gotoNonce, setGotoNonce] = useState(0);
+    const [gotoMessage, setGotoMessage] = useState('');
+    const gotoRequestRef = useRef(0);
+    /** Bumped when rows arrive, so the status line's selection summary
+     *  can re-read loaded cells without rendering App. */
+    const rowsStore = useMemo(() => createVersionStore(), []);
+    const openFind = useCallback(() => { setGotoOpen(false); setFindOpen(true); setFindNonce(n => n + 1); }, []);
+    const openGoto = useCallback(() => { setFindOpen(false); setGotoOpen(true); setGotoNonce(n => n + 1); setGotoMessage(''); }, []);
     const [filterEditor, setFilterEditor] = useState<{
         entry?: FilterEntry;
         columnIndex?: number;
@@ -516,8 +546,8 @@ export function App({
      *  gutter). `visibleCols` is the data columns in display order, which
      *  is also the order of cells in fetched rows. */
     const display = useMemo(
-        () => buildDisplayColumns(columns, layout.hiddenColumns),
-        [columns, layout.hiddenColumns],
+        () => buildDisplayColumns(columns, layout.hiddenColumns, layout.pinnedColumns),
+        [columns, layout.hiddenColumns, layout.pinnedColumns],
     );
     const visibleCols = display.dataCols;
     /** Frozen data columns (rownames), always fetched with the viewport. */
@@ -765,6 +795,7 @@ export function App({
             layout: {
                 columnWidths: { ...nextLayout.columnWidths },
                 hiddenColumns: [...nextLayout.hiddenColumns],
+                ...(nextLayout.pinnedColumns?.length ? { pinnedColumns: [...nextLayout.pinnedColumns] } : {}),
             },
         });
     }, [panelGeneration, schemaHash, vscode]);
@@ -1058,8 +1089,9 @@ export function App({
         }
         if (damageList.length > 0) gridRef.current?.updateCells(damageList);
         onRowsArrivedRef.current();
+        rowsStore.emit();
         postLifecycle('rows');
-    }, [postLifecycle, requestRows]);
+    }, [postLifecycle, requestRows, rowsStore]);
 
     const applyLabels = useCallback((m: Extract<ExtensionToWebview, { type: 'labels' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current) return;
@@ -1538,18 +1570,17 @@ export function App({
         applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
         applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
         handleTestKey, scrollToFraction, showCopyToast,
+        applyFindResult: (_m: Extract<ExtensionToWebview, { type: 'findResult' }>) => {},
+        applyRowPosition: (_m: Extract<ExtensionToWebview, { type: 'rowPosition' }>) => {},
+        showNotice: (_ok: boolean, _message: string) => {},
     });
-    handlersRef.current = {
-        applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
-        applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
-        handleTestKey, scrollToFraction, showCopyToast,
-    };
     useEffect(() => {
         const onMessage = (event: MessageEvent<ExtensionToWebview>) => {
             const {
                 applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
                 applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
                 handleTestKey, scrollToFraction, showCopyToast,
+                applyFindResult, applyRowPosition, showNotice,
             } = handlersRef.current;
             const m = event.data;
             if (!m || typeof m !== 'object') return;
@@ -1662,6 +1693,16 @@ export function App({
                     return;
                 case 'testScrollToFraction':
                     scrollToFraction(m.fraction);
+                    return;
+                case 'findResult':
+                    applyFindResult(m);
+                    return;
+                case 'rowPosition':
+                    applyRowPosition(m);
+                    return;
+                case 'notice':
+                    if (m.panelGeneration !== panelGenerationRef.current) return;
+                    showNotice(m.ok, m.message);
                     return;
                 case 'error':
                     showCopyToast('error', m.message);
@@ -1934,6 +1975,18 @@ export function App({
             }
             const meta = event.metaKey || event.ctrlKey;
             if (!meta) return;
+            if (!event.shiftKey && !event.altKey && (event.key === 'f' || event.key === 'F')) {
+                event.preventDefault();
+                openFind();
+                return;
+            }
+            if (!event.shiftKey && !event.altKey && (event.key === 'g' || event.key === 'G')) {
+                event.preventDefault();
+                openGoto();
+                return;
+            }
+            // Select-all and copy stay with the find and go-to inputs.
+            if (document.activeElement?.closest?.('.grid-bar')) return;
             if (event.key === 'a' || event.key === 'A') {
                 event.preventDefault();
                 const next = createAllColumnsSelection(display.count, display.freezeColumns);
@@ -1958,6 +2011,8 @@ export function App({
         gridSelection,
         onClearAllFilters,
         openFilterEditor,
+        openFind,
+        openGoto,
         postLifecycle,
         sortColumn,
     ]);
@@ -2558,6 +2613,230 @@ export function App({
         jumpToColumn(source);
     }, [display, jumpToColumn]);
 
+    /** Show a short notice in the toast slot, cleared after 2.5 s. */
+    const showNotice = useCallback((ok: boolean, message: string) => {
+        showCopyToast(ok ? 'copied' : 'error', message);
+        copyStatusClearTimerRef.current = window.setTimeout(() => {
+            copyStatusClearTimerRef.current = null;
+            copyStatusRef.current = '';
+            setCopyStatus('');
+            setCopyStatusMsg('');
+        }, 2500);
+    }, [showCopyToast]);
+
+    /** Pin or unpin a column. Pinning is refused when the frozen region
+     *  (gutter, row names, pins) would pass half the grid's width. */
+    const togglePin = useCallback((source: number) => {
+        const pinned = isPinned(layout.pinnedColumns, source);
+        if (!pinned) {
+            const frozen = gridColumns.slice(0, display.freezeColumns).map(c => c.width);
+            const width = allGridColumns[source]?.width ?? 0;
+            if (!frozenFits([...frozen, width], shellWidth)) {
+                showNotice(false, `Can't pin ${columns[source]?.name ?? 'this column'}: pinned columns can take at most half the view`);
+                return;
+            }
+        }
+        const nextLayout = { ...layout, pinnedColumns: togglePinned(layout.pinnedColumns, source) };
+        setLayout(nextLayout);
+        clearRows();
+        setGridSelection(createEmptySelection());
+        persistLayout(nextLayout);
+        window.setTimeout(() => postLifecycle('columns'), 0);
+    }, [allGridColumns, clearRows, columns, display.freezeColumns, gridColumns, layout, persistLayout, postLifecycle, shellWidth, showNotice]);
+
+    /** Select display row `row` (in the focused column, else the first
+     *  data column) and scroll it to the middle of the view. */
+    const goToPosition = useCallback((row: number, event: string) => {
+        if (row < 0 || row >= effectiveNrow || visibleCols.length === 0) return;
+        const col = clampToData(display, gridSelection.current?.cell[0] ?? display.freezeColumns);
+        const next = createCellSelection(col, row);
+        setGridSelection(next);
+        const height = estimatedViewportRowCount();
+        gridRef.current?.scrollTo(col, row, 'both', 0, 0, { vAlign: 'center' });
+        scrollToViewport(viewportForStart(row - Math.floor(height / 2)), event, next);
+    }, [display, effectiveNrow, estimatedViewportRowCount, gridSelection, scrollToViewport, viewportForStart, visibleCols.length]);
+
+    /** The row find and go-to start from: the selection, else the top. */
+    const currentRow = useCallback((): number =>
+        gridSelection.current?.cell[1] ?? gridSelection.rows.first() ?? visibleRangeRef.current.start,
+    [gridSelection]);
+
+    const runFind = useCallback((query: string) => {
+        findQueryRef.current = query;
+        const requestId = nextRequestId();
+        findRequestRef.current = requestId;
+        if (query === '') {
+            vscode.postMessage({ type: 'cancelFind', panelGeneration });
+            setFindStatus({ searching: false });
+            return;
+        }
+        setFindStatus({ searching: true });
+        vscode.postMessage({
+            type: 'find',
+            panelGeneration,
+            requestId,
+            query,
+            columns: [...visibleCols],
+            labelsOn: toolbar.labelsOn,
+            formatOn: toolbar.formatOn,
+            digits: toolbar.digits,
+            from: currentRow(),
+            ...(shownTransformGenRef.current !== undefined
+                ? { transformGeneration: shownTransformGenRef.current } : {}),
+        });
+    }, [currentRow, nextRequestId, panelGeneration, toolbar, visibleCols, vscode]);
+
+    const stepFind = useCallback((direction: 1 | -1) => {
+        if (!findStatus.count) return;
+        const requestId = nextRequestId();
+        findRequestRef.current = requestId;
+        vscode.postMessage({ type: 'findStep', panelGeneration, requestId, from: currentRow(), direction });
+    }, [currentRow, findStatus.count, nextRequestId, panelGeneration, vscode]);
+
+    const cancelFind = useCallback(() => {
+        findRequestRef.current = nextRequestId();
+        vscode.postMessage({ type: 'cancelFind', panelGeneration });
+        setFindStatus({ searching: false });
+    }, [nextRequestId, panelGeneration, vscode]);
+
+    const closeFind = useCallback(() => {
+        cancelFind();
+        findQueryRef.current = '';
+        setFindOpen(false);
+        gridRef.current?.focus();
+    }, [cancelFind]);
+
+    const applyFindResult = useCallback((m: Extract<ExtensionToWebview, { type: 'findResult' }>) => {
+        if (m.panelGeneration !== panelGenerationRef.current || m.requestId !== findRequestRef.current) return;
+        if (m.transformGeneration !== shownTransformGenRef.current) {
+            // The view changed under the search: search again.
+            if (findQueryRef.current) runFind(findQueryRef.current);
+            return;
+        }
+        setFindStatus({ searching: false, count: m.count, index: m.index, error: m.error });
+        if (m.position >= 0) goToPosition(m.position, 'find');
+    }, [goToPosition, runFind]);
+
+    // A new sort or filter reorders the rows: re-run an open search so
+    // its positions match the grid.
+    useEffect(() => {
+        if (findOpen && findQueryRef.current) runFind(findQueryRef.current);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [sort, nrowFiltered, filter, toolbar.labelsOn, toolbar.formatOn, toolbar.digits, layout.hiddenColumns]);
+
+    const goToRow = useCallback((target: RowTarget) => {
+        const permuted = sort.keys.length > 0 || nrowFiltered !== undefined;
+        if (target.kind === 'position') {
+            if (target.n > effectiveNrow) {
+                setGotoMessage(`Only ${effectiveNrow.toLocaleString('en-US')} rows are shown`);
+                return;
+            }
+            setGotoMessage('');
+            goToPosition(target.n - 1, 'goto-row');
+            return;
+        }
+        if (!permuted) {
+            if (target.n > nrow) {
+                setGotoMessage(`The data has ${nrow.toLocaleString('en-US')} rows`);
+                return;
+            }
+            setGotoMessage('');
+            goToPosition(target.n - 1, 'goto-row');
+            return;
+        }
+        const requestId = nextRequestId();
+        gotoRequestRef.current = requestId;
+        setGotoMessage('');
+        vscode.postMessage({
+            type: 'goToRow',
+            panelGeneration,
+            requestId,
+            rowNumber: target.n,
+            ...(shownTransformGenRef.current !== undefined
+                ? { transformGeneration: shownTransformGenRef.current } : {}),
+        });
+    }, [effectiveNrow, goToPosition, nextRequestId, nrow, nrowFiltered, panelGeneration, sort.keys.length, vscode]);
+
+    const applyRowPosition = useCallback((m: Extract<ExtensionToWebview, { type: 'rowPosition' }>) => {
+        if (m.panelGeneration !== panelGenerationRef.current || m.requestId !== gotoRequestRef.current) return;
+        // Resolved under a generation that is no longer on screen (a sort or
+        // filter committed while the request travelled): ask again under
+        // the current one rather than select the wrong R row.
+        if (m.transformGeneration !== shownTransformGenRef.current) {
+            const requestId = nextRequestId();
+            gotoRequestRef.current = requestId;
+            vscode.postMessage({
+                type: 'goToRow',
+                panelGeneration: panelGenerationRef.current,
+                requestId,
+                rowNumber: m.rowNumber,
+                ...(shownTransformGenRef.current !== undefined
+                    ? { transformGeneration: shownTransformGenRef.current } : {}),
+            });
+            return;
+        }
+        if (m.position < 0) {
+            setGotoMessage(m.rowNumber > nrow
+                ? `The data has ${nrow.toLocaleString('en-US')} rows`
+                : `Row ${m.rowNumber.toLocaleString('en-US')} is filtered out`);
+            return;
+        }
+        goToPosition(m.position, 'goto-row');
+    }, [goToPosition, nextRequestId, nrow, vscode]);
+
+    const copyAsCode = useCallback((flavor: CodeFlavorName) => {
+        vscode.postMessage({
+            type: 'copyAsCode',
+            panelGeneration,
+            requestId: nextRequestId(),
+            flavor,
+            hiddenColumns: [...layout.hiddenColumns],
+        });
+    }, [layout.hiddenColumns, nextRequestId, panelGeneration, vscode]);
+
+
+    /** The selection summary for the status line, read from loaded tiles. */
+    const selectionText = useCallback((): string => {
+        let rows: { start: number; end: number } | undefined;
+        let cols: number[] = [];
+        if (gridSelection.current) {
+            const r = gridSelection.current.range;
+            rows = { start: r.y, end: Math.min(effectiveNrow, r.y + r.height) };
+            for (let d = r.x; d < r.x + r.width; d++) if (sourceAt(display, d) !== undefined) cols.push(d);
+        } else if (gridSelection.columns.length > 0) {
+            rows = { start: 0, end: effectiveNrow };
+            cols = gridSelection.columns.toArray().filter(d => sourceAt(display, d) !== undefined);
+        } else if (gridSelection.rows.length > 0) {
+            const rs = gridSelection.rows.toArray();
+            rows = { start: Math.min(...rs), end: Math.max(...rs) + 1 };
+            if (rows.end - rows.start !== rs.length) return `${(rs.length * visibleCols.length).toLocaleString('en-US')} cells`;
+            cols = visibleCols.map((_, i) => i + 1);
+        }
+        if (!rows) return '';
+        const cache = tileCacheRef.current;
+        const summary = summarizeSelection(
+            rows,
+            cols,
+            d => {
+                const src = sourceAt(display, d);
+                const col = src === undefined ? undefined : columns[src];
+                if (!col) return false;
+                const t = col.arrowType;
+                return (t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float'))
+                    && !(toolbar.labelsOn && col.valueLabels);
+            },
+            (d, row) => cache.cell(row, rowPosition(d)),
+        );
+        return describeSelection(summary, formatStat);
+    }, [columns, display, effectiveNrow, gridSelection, toolbar.labelsOn, visibleCols]);
+
+    handlersRef.current = {
+        applyCopyDone, applyFilterApplied, applyFilterStatus, applyHistogram,
+        applyInitOrReplace, applyLabels, applyRows, applySortApplied, applySortStatus,
+        handleTestKey, scrollToFraction, showCopyToast,
+        applyFindResult, applyRowPosition, showNotice,
+    };
+
     const onSidebarVisible = useCallback((sources: number[]) => {
         sidebarVisibleRef.current = sources;
         scheduleProfileInterest();
@@ -2688,6 +2967,13 @@ export function App({
                             )}
                         </button>
                     </div>
+                    <WorkflowMenu
+                        mod={MOD_LABEL}
+                        onFind={openFind}
+                        onGoToRow={openGoto}
+                        onCopyCode={copyAsCode}
+                        onRefresh={() => vscode.postMessage({ type: 'refresh', panelGeneration })}
+                    />
                 </div>
             </div>
             {restoreMessage && (
@@ -2703,6 +2989,24 @@ export function App({
                         </button>
                     )}
                 </div>
+            )}
+            {findOpen && (
+                <FindBar
+                    status={findStatus}
+                    focusNonce={findNonce}
+                    onQuery={runFind}
+                    onStep={stepFind}
+                    onCancel={cancelFind}
+                    onClose={closeFind}
+                />
+            )}
+            {gotoOpen && (
+                <GoToRowBar
+                    message={gotoMessage}
+                    focusNonce={gotoNonce}
+                    onGo={goToRow}
+                    onClose={() => { setGotoOpen(false); gridRef.current?.focus(); }}
+                />
             )}
             <div className="data-viewer-body">
             <div
@@ -2846,6 +3150,16 @@ export function App({
                                 updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, contextMenu.columnIndex!));
                                 setContextMenu(null);
                             }}
+                        pin={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
+                            && !columns[contextMenu.columnIndex]?.isRowname
+                            ? {
+                                pinned: isPinned(layout.pinnedColumns, contextMenu.columnIndex),
+                                onToggle: () => {
+                                    togglePin(contextMenu.columnIndex!);
+                                    setContextMenu(null);
+                                },
+                            }
+                            : undefined}
                         onValueCounts={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
                             ? () => {
                                 requestValueCounts(contextMenu.columnIndex!, 'desc', contextMenu.leftPx, contextMenu.topPx);
@@ -3039,6 +3353,8 @@ export function App({
                 ncol={columns.length}
                 nrowFiltered={nrowFiltered}
                 loading={loading}
+                rowsStore={rowsStore}
+                selectionText={selectionText}
             />
             {copyStatus && <div className={`toast toast-${copyStatus}`}>{copyStatusMsg}</div>}
         </div>

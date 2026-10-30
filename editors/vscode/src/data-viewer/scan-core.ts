@@ -45,6 +45,8 @@ import { computeProfile, countValues, valueCountsFrom } from './profile-engine';
 import type { CountSummary } from './profile-engine';
 import type { ColumnProfile, ValueCounts } from './profile';
 import { allocPerm, MemoryCounter, sharePerm } from './perm-buffer';
+import { findSourceRows, toDisplayPositions } from './find';
+import type { FindQuery } from './find';
 
 /** Everything that determines an effective permutation. */
 export type TransformSpec = {
@@ -107,6 +109,8 @@ export class ScanCore {
     private readonly profiles = new Map<number, ColumnProfile>();
     private readonly histograms = new Map<number, HistogramBin[]>();
     private readonly countSummaries = new Map<number, CountSummary>();
+    /** The last find's query and source-row matches, for refinement. */
+    private lastFind: { key: string; query: string; rows: Uint32Array } | undefined;
     /** Times a profile scan waited at the priority gate (tests). */
     profilePauses = 0;
 
@@ -316,6 +320,22 @@ export class ScanCore {
         while (this.countSummaries.size > COUNT_CACHE_ENTRIES) {
             this.countSummaries.delete(this.countSummaries.keys().next().value as number);
         }
+    }
+
+    /** Find in grid (`find.ts`): the display positions under `perm`
+     *  whose displayed text contains the query. A query that extends the
+     *  previous one (same columns and display options) searches only the
+     *  previous matches. */
+    find(q: FindQuery, perm: Uint32Array | undefined, signal?: AbortSignal): Promise<Uint32Array> {
+        return this.urgent(async () => {
+            const key = JSON.stringify([q.columns, q.labelsOn, q.formatOn, q.digits]);
+            const needle = q.query.toLowerCase();
+            const prev = this.lastFind;
+            const within = prev && prev.key === key && needle.includes(prev.query) ? prev.rows : undefined;
+            const rows = await findSourceRows(this.reader, q, within, signal);
+            this.lastFind = { key, query: needle, rows };
+            return toDisplayPositions(rows, perm, this.reader.nrow);
+        });
     }
 
     /** An identity-free empty permutation (tests). */
