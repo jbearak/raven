@@ -17,7 +17,7 @@ import { describe, test, expect } from 'bun:test';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
-import { computePermutation } from '../../editors/vscode/src/data-viewer/sort';
+import { computePermutation, SortKeyCache } from '../../editors/vscode/src/data-viewer/sort';
 import type { SortKey } from '../../editors/vscode/src/data-viewer/messages';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -438,3 +438,27 @@ describe('computePermutation: keys with unused order are ignored', () => {
 
 const _typecheck: SortKey = { columnIndex: 0, direction: 'asc' };
 void _typecheck;
+
+describe('SortKeyCache is byte-bounded, least recently used first', () => {
+    // 100 rows of a numeric key ≈ 900 bytes (hi + lo + cls).
+    const key = () => ({ hi: new Uint32Array(100), lo: new Uint32Array(100), cls: new Uint8Array(100) }) as any;
+    test('evicts the oldest entry past the budget; get() refreshes recency', () => {
+        const c = new SortKeyCache(2_000);
+        c.set('a', key());
+        c.set('b', key());
+        expect(c.bytes).toBe(1_800);
+        c.get('a');            // a is now most recent
+        c.set('c', key());     // over budget: evicts b, not a
+        expect(c.has('a')).toBe(true);
+        expect(c.has('b')).toBe(false);
+        expect(c.has('c')).toBe(true);
+        expect(c.bytes).toBeLessThanOrEqual(2_000);
+    });
+    test('an entry larger than the budget is still held while it is the newest', () => {
+        const c = new SortKeyCache(500);
+        c.set('big', key());
+        expect(c.has('big')).toBe(true);
+        c.set('next', key());
+        expect(c.has('big')).toBe(false);
+    });
+});

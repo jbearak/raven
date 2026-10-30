@@ -83,21 +83,43 @@ export type SortOptions = {
 
 /** Cached encoded keys, keyed by column and by whatever changes the
  *  key's meaning (labels, string order, locale). Owned by one reader. */
+/**
+ * Encoded sort keys per (column, order, locale), least recently used first,
+ * bounded by bytes: a numeric key costs ~9 bytes per row, so an unbounded
+ * cache would hold ~90 MB per sorted column of a 10M-row frame for the
+ * worker's lifetime. A sort already holds references to the keys it is
+ * using, so evicting them mid-sort is harmless.
+ */
 export class SortKeyCache {
+    static readonly DEFAULT_MAX_BYTES = 512 * 1024 * 1024;
     private readonly map = new Map<string, EncodedKey>();
-    get(k: string): EncodedKey | undefined { return this.map.get(k); }
-    set(k: string, v: EncodedKey): void { this.map.set(k, v); }
+    private total = 0;
+    constructor(private readonly maxBytes = SortKeyCache.DEFAULT_MAX_BYTES) {}
+    get(k: string): EncodedKey | undefined {
+        const v = this.map.get(k);
+        if (v) { this.map.delete(k); this.map.set(k, v); }
+        return v;
+    }
+    set(k: string, v: EncodedKey): void {
+        const prev = this.map.get(k);
+        if (prev) { this.total -= keyBytes(prev); this.map.delete(k); }
+        this.map.set(k, v);
+        this.total += keyBytes(v);
+        for (const [old, ov] of this.map) {
+            if (this.total <= this.maxBytes || old === k) break;
+            this.map.delete(old);
+            this.total -= keyBytes(ov);
+        }
+    }
     has(k: string): boolean { return this.map.has(k); }
-    clear(): void { this.map.clear(); }
+    clear(): void { this.map.clear(); this.total = 0; }
     get size(): number { return this.map.size; }
     /** Approximate bytes held, for the memory counter and bench. */
-    get bytes(): number {
-        let b = 0;
-        for (const k of this.map.values()) {
-            b += k.hi.byteLength + (k.lo?.byteLength ?? 0) + k.cls.byteLength;
-        }
-        return b;
-    }
+    get bytes(): number { return this.total; }
+}
+
+function keyBytes(k: EncodedKey): number {
+    return k.hi.byteLength + (k.lo?.byteLength ?? 0) + k.cls.byteLength;
 }
 
 /**

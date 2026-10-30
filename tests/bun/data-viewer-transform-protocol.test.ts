@@ -18,6 +18,7 @@ import { TransformCoordinator } from '../../editors/vscode/src/data-viewer/trans
 import type { Descriptor, ReaderPort, ScanPort } from '../../editors/vscode/src/data-viewer/transform-coordinator';
 import { LocalEngine } from '../../editors/vscode/src/data-viewer/engine';
 import { WorkerEngine } from '../../editors/vscode/src/data-viewer/worker-engine';
+import { isAbortError } from '../../editors/vscode/src/data-viewer/abort';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import type { FilterState, SortState } from '../../editors/vscode/src/data-viewer/messages';
 
@@ -371,7 +372,11 @@ describe('WorkerEngine: thread lifecycles', () => {
         await engine.coordinator.install(f);
         const p = engine.compute({ sort: SORT_X_DESC });
         await engine.scan.crashForTest();
-        await p.then(() => undefined, () => undefined);
+        // A crash is not a cancel: the panel must take its rollback and
+        // warning path, which it skips for AbortError.
+        const err = await p.then(() => undefined, (e: Error) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(isAbortError(err)).toBe(false);
         const next = await engine.compute({ sort: SORT_X_DESC });
         expect(Array.from(next.perm!)).toEqual([4, 3, 2, 1]);
         engine.discard(next);

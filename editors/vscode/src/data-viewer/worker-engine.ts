@@ -51,6 +51,13 @@ type Pending = {
     reissue: boolean;
 };
 
+/** A request lost to an unexpected thread exit (crash, OOM). */
+function restartError(message: string): Error {
+    const e = new Error(message);
+    e.name = 'WorkerRestartError';
+    return e;
+}
+
 function abortError(message: string): Error {
     const e = new Error(message);
     e.name = 'AbortError';
@@ -134,7 +141,9 @@ class ThreadClient {
         const toReissue: Pending[] = [];
         for (const p of waiting) {
             if (reissueAll || p.reissue) toReissue.push(p);
-            else p.reject(abortError(`${this.name} thread restarted`));
+            // Not an AbortError: the panel treats those as a user cancel and
+            // skips its rollback and warning paths, which a crash needs.
+            else p.reject(restartError(`${this.name} thread restarted`));
         }
         const seeded = (async () => {
             await this.started;

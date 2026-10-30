@@ -454,6 +454,32 @@ describe('DataViewerPanel: setSort → sortApplied round-trip', () => {
         expect(fakeWebview.posted.filter(m => m.type === 'error')).toEqual([]);
     });
 
+    test('a rollback keeps the previous sort\'s string order', async () => {
+        const { fakeWebview, reader } = await setupPanel();
+        fakeWebview.deliverFromWebview({ type: 'webviewReady' });
+        await flush();
+        const gen = (fakeWebview.posted.find(m => m.type === 'init') as any).panelGeneration;
+        fakeWebview.deliverFromWebview({
+            type: 'setSort', panelGeneration: gen, requestId: 21,
+            keys: [{ columnIndex: 0, direction: 'desc' }], stringOrder: 'c',
+            labelsOn: true, formatOn: true, digits: 3,
+        });
+        await flush();
+        const first = fakeWebview.posted.find(m => m.type === 'sortApplied' && m.requestId === 21) as any;
+        expect(first.sort.stringOrder).toBe('c');
+        (reader as any).getBatch = () => { throw new Error('boom'); };
+        fakeWebview.deliverFromWebview({
+            type: 'setSort', panelGeneration: gen, requestId: 22,
+            keys: [{ columnIndex: 1, direction: 'asc' }],
+            labelsOn: true, formatOn: true, digits: 3,
+        });
+        await flush();
+        const rollback = fakeWebview.posted.find(m => m.type === 'sortApplied' && m.requestId === 22) as any;
+        expect(rollback.rollback).toBe(true);
+        expect(rollback.sort.keys).toEqual([{ columnIndex: 0, direction: 'desc' }]);
+        expect(rollback.sort.stringOrder).toBe('c');
+    });
+
     test('setSort read failure rolls back to the previous non-empty sort', async () => {
         const { fakeWebview, reader } = await setupPanel();
 

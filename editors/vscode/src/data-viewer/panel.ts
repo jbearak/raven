@@ -98,6 +98,7 @@ function cloneSortState(sort: SortState): SortState {
     return {
         keys: sort.keys.map(k => ({ ...k })),
         labelsOnWhenSorted: sort.labelsOnWhenSorted,
+        ...(sort.stringOrder ? { stringOrder: sort.stringOrder } : {}),
     };
 }
 
