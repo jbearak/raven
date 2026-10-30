@@ -8,6 +8,7 @@
  * view. Each statistic says whether it is exact; estimates print with
  * `≈`. **Distinct** counts observed values, NA excluded.
  */
+import type { ColumnSchema } from './arrow-reader';
 import type { HistogramBin } from './messages';
 import type { Cell } from './wire-format';
 
@@ -120,3 +121,15 @@ export const RESERVOIR_SIZE = 100_000;
 export const SPACE_SAVING_COUNTERS = 1_000;
 /** Most entries a value-counts reply carries. */
 export const VALUE_COUNTS_LIMIT = 1_000;
+
+/** How a column is profiled, from its schema. */
+export function profileKind(col: ColumnSchema): ProfileKind {
+    const t = col.arrowType;
+    const numeric = t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float');
+    if (t.startsWith('Dictionary')) return 'factor';
+    if (col.valueLabels && (numeric || t === 'Utf8' || t === 'LargeUtf8')) return 'labelled';
+    if (numeric) return 'numeric';
+    if (t === 'Bool') return 'logical';
+    if (t.startsWith('Date') || t.startsWith('Timestamp')) return 'date';
+    return 'character';
+}

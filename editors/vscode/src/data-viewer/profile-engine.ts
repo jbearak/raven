@@ -42,6 +42,7 @@ import type {
     ValueCounts,
 } from './profile';
 import {
+    profileKind,
     EXACT_DISTINCT_CAP,
     PROFILE_BINS,
     PROFILE_LEVELS_N,
@@ -100,18 +101,6 @@ export type ProfileResult = {
     histogram50?: HistogramBin[];
     counts?: CountSummary;
 };
-
-/** How a column is profiled, from its schema. */
-export function profileKind(col: ColumnSchema): ProfileKind {
-    const t = col.arrowType;
-    const numeric = t.startsWith('Int') || t.startsWith('Uint') || t.startsWith('Float');
-    if (t.startsWith('Dictionary')) return 'factor';
-    if (col.valueLabels && (numeric || t === 'Utf8' || t === 'LargeUtf8')) return 'labelled';
-    if (numeric) return 'numeric';
-    if (t === 'Bool') return 'logical';
-    if (t.startsWith('Date') || t.startsWith('Timestamp')) return 'date';
-    return 'character';
-}
 
 /** Compute one column's profile. */
 export async function computeProfile(

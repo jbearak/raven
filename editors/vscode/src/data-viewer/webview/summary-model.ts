@@ -146,9 +146,30 @@ export function barSlot(rect: BandRect, n: number, i: number): { x: number; widt
 
 /** The bar (bin or top value) under canvas x, or undefined. */
 export function chartIndexAt(chart: BandChart, rect: BandRect, x: number): number | undefined {
-    const n = chart.kind === 'histogram' ? chart.bins.length : chart.kind === 'bars' ? chart.values.length : 0;
-    if (n === 0 || x < rect.x || x > rect.x + rect.width) return undefined;
-    return Math.min(n - 1, Math.max(0, Math.floor(((x - rect.x) / rect.width) * n)));
+    const used = chart.kind === 'histogram' ? chart.bins.length : chart.kind === 'bars' ? chart.values.length : 0;
+    const n = chartSlots(chart);
+    if (used === 0 || x < rect.x || x > rect.x + rect.width) return undefined;
+    const i = Math.min(n - 1, Math.max(0, Math.floor(((x - rect.x) / rect.width) * n)));
+    return i < used ? i : undefined;
+}
+
+/** Widest top-value bar slot. */
+const BAR_SLOT_MAX_PX = 16;
+
+/** The part of the chart rect the bars use: histograms fill it; top
+ *  values use at most {@link BAR_SLOT_MAX_PX} per slot, left-aligned. */
+export function chartArea(chart: BandChart, rect: BandRect): BandRect {
+    if (chart.kind !== 'bars') return rect;
+    return { ...rect, width: Math.min(rect.width, chartSlots(chart) * BAR_SLOT_MAX_PX) };
+}
+
+/** Bar slots across the chart: one per bin, or {@link BAND_TOP_N} for
+ *  top values (fewer values leave empty slots, so bar widths are the
+ *  same in every column). */
+export function chartSlots(chart: BandChart): number {
+    if (chart.kind === 'histogram') return chart.bins.length;
+    if (chart.kind === 'bars') return Math.max(chart.values.length, BAND_TOP_N);
+    return 0;
 }
 
 /** Which bin or bar a band point hits, given the band and its text width. */
@@ -159,7 +180,7 @@ export function bandHit(p: ColumnProfile, band: BandRect, textWidth: number, x: 
     const chart = bandChart(p);
     const { chart: rect } = bandGeometry(band, textWidth);
     if (!rect) return undefined;
-    const index = chartIndexAt(chart, rect, x);
+    const index = chartIndexAt(chart, chartArea(chart, rect), x);
     if (index === undefined) return undefined;
     if (chart.kind === 'histogram') return { kind: 'bin', index };
     if (chart.kind === 'bars') return { kind: 'bar', index };

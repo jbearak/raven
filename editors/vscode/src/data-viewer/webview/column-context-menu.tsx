@@ -65,6 +65,8 @@ type Props = {
      *  without one, the R row numbers) prepended. */
     onCopyWithRowNames?: () => void;
     onHideColumn?: () => void;
+    /** Open the column's value counts (column menus only). */
+    onValueCounts?: () => void;
     onClose: () => void;
     /** Only present for column context menus. */
     sort?: SortMenuProps;
@@ -81,6 +83,7 @@ export function ColumnContextMenu({
     onCopy,
     onCopyWithRowNames,
     onHideColumn,
+    onValueCounts,
     onClose,
     sort,
     filter,
@@ -123,6 +126,11 @@ export function ColumnContextMenu({
             {onHideColumn && (
                 <button type="button" className="context-menu-item" onClick={onHideColumn} role="menuitem">
                     Hide column
+                </button>
+            )}
+            {onValueCounts && (
+                <button type="button" className="context-menu-item" onClick={onValueCounts} role="menuitem">
+                    Value counts…
                 </button>
             )}
             {sort && (
