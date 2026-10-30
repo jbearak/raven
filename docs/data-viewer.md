@@ -80,12 +80,12 @@ Each column header has up to three lines and a thin bar along its bottom edge:
 ## Toolbar
 
 ```text
-32 × 11   Sort: mpg ▲ cyl ▼ ✕   Filter: cyl ∈ {6,8} ✕    [Σ] [Labels] [Format] [3 ▾] [Columns 2]
+32 × 11   Sort: mpg ▲ cyl ▼ ✕   Filter: cyl ∈ {6,8} ✕    [Σ] [Labels] [Format] [3 ▾] [Columns 2] [⋯]
 …grid…
-rows 1–20 of 12 (filtered from 32) · 11 cols
+rows 1–20 of 12 (filtered from 32) · 11 cols                 6 cells · Σ 120.4 · mean 20.07
 ```
 
-The left end of the toolbar shows the frame's shape, rows × columns, or `12 of 32 rows × 11` while a filter is active. The status line under the grid shows the exact range of rows on screen and the filter context.
+The left end of the toolbar shows the frame's shape, rows × columns, or `12 of 32 rows × 11` while a filter is active. The status line under the grid shows the exact range of rows on screen and the filter context, and, on the right, a summary of the selection (see [Selection and copy](#selection-and-copy)). The ⋯ button holds [Find](#find), [Go to row](#go-to-row), [Copy as R code](#copy-as-r-code), and [Refresh](#refresh).
 
 The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Σ, Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
 
@@ -131,6 +131,12 @@ The Columns button opens a sidebar at the right of the grid with one row per col
 
 Hidden and shown columns are remembered for the panel name and the data's column layout, so the same `View(mtcars)` opened tomorrow keeps the layout.
 
+### Pinned columns
+
+Right-click a column header and choose Pin column to keep it in place when you scroll right. Pinned columns sit after the row numbers and any `rowname` column, in the order you pinned them. Choose Unpin column to put a column back where it was. Pins are remembered with the widths and hidden columns.
+
+The row numbers, `rowname` column, and pinned columns together take at most half the panel's width. When pinning another column would pass that, Raven doesn't pin it and says why; unpin a column or narrow one first.
+
 Columns start wide enough for their name, type, label, and first loaded values, up to 400 px. Drag a header border to resize (40 to 3,200 px), or double-click it to fit the loaded values; dragged widths are remembered with the layout. Frames whose row names became a `rowname` column count as a new column layout, so their saved widths, hidden columns, sort, and filters reset once after updating Raven.
 
 ### Selection and copy
@@ -144,8 +150,9 @@ Columns start wide enough for their name, type, label, and first loaded values, 
 - Row numbers and the `rowname` column aren't copied. Choose Copy with row names from the right-click menu to include the `rowname` column, or, for a frame without one, the R row numbers.
 - Double-click a cell, or press `Enter`, to see a long or cut-off value in full (up to 64 KiB) with a Copy button.
 - Right-click a cell or column header for a Copy menu that copies the current selection. Right-clicking a column header always selects just that column first. Right-clicking a cell outside the selection selects it first; right-clicking a cell inside the selection keeps the selection.
-- The column-header menu also offers Hide column and [Value counts](#value-counts), plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
+- The column-header menu also offers Hide column, [Pin column](#pinned-columns), and [Value counts](#value-counts), plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
 - Copying is capped at 5,000,000 cells. Over the cap, the panel shows a message and doesn't copy.
+- The status line sums up the selection. With numbers loaded on screen, it reads like `6 cells · 1 NA · Σ 120.4 · mean 20.07`: the cell count, the missing numeric cells (`NA` and `NaN`), and the sum and mean of the rest. Text and label columns count toward the cells but not the sum. A selection over more than 100,000 cells, or one that reaches rows not loaded yet, shows only the cell count.
 
 <a id="keyboard-shortcuts"></a>
 
@@ -161,6 +168,8 @@ Columns start wide enough for their name, type, label, and first loaded values, 
 | `PageDown` | Scroll one screen down. |
 | `Cmd/Ctrl+A` | Select all rows across visible columns. |
 | `Cmd/Ctrl+C` | Copy the current selection as tab-separated text. |
+| `Cmd/Ctrl+F` | [Find](#find) in the visible columns. |
+| `Cmd/Ctrl+G` | [Go to row](#go-to-row). |
 | `Enter` | Show the focused cell's full value when it's long or cut off. |
 | `Shift+Alt+A` | Sort the focused column ascending. |
 | `Shift+Alt+D` | Sort the focused column descending. |
@@ -352,6 +361,61 @@ Most numbers in a summary are exact. On very large or very varied columns, a few
 Right-click a column header and choose Value counts… to list the column's values with their count, share of rows with a value, and a bar, most common first. Check Rarest first to reverse the order; it's available when every count is exact.
 
 Click values to select them, then click Filter to keep only the rows with those values. This replaces any filter already on the column. For a date column, pick one date.
+
+## Find, go to row, and R code
+
+### Find
+
+Press `Cmd/Ctrl+F` in the panel, or choose Find… from ⋯, and type. Raven searches the text the grid shows in the visible columns, so with Labels on it finds labels, with Format on it finds rounded numbers, and `NA` finds missing cells. Case doesn't matter.
+
+- The first match at or below the selected row is selected and scrolled into view. The bar shows which match it is and how many there are, such as `3 of 120`.
+- `Enter` or ↓ goes to the next match, `Shift+Enter` or ↑ to the previous one; both wrap around. Matches run top to bottom in the grid's current order.
+- Typing more letters searches only the rows that already matched, so a long search narrows quickly.
+- The search runs in the background on large data; Cancel stops it. Sorting, filtering, or changing Labels, Format, or the visible columns searches again.
+- `Escape` closes the bar.
+
+### Go to row
+
+Press `Cmd/Ctrl+G`, or choose Go to row… from ⋯, then type a row number and press `Enter`.
+
+- A plain number is the R row number, the one in the gutter and in `df[i, ]`: `120` goes to row 120 wherever a sort put it. If a filter hides that row, the bar says so.
+- `#` and a number counts rows as they're shown: `#1` is the top row and `#120` the 120th from the top, whatever its R row number.
+
+### Copy as R code
+
+Choose Copy as R code (dplyr) from ⋯, or base R or data.table from the Copy as R code submenu. Raven copies R code that rebuilds the view from the expression you passed to `View()`: the filters, the sort, and the hidden columns.
+
+```r
+# mtcars as shown in Raven's data viewer
+# Requires R >= 4.1 (|>), dplyr >= 1.1.0
+
+library(dplyr)
+
+mtcars |>
+  filter(
+    cyl %in% c(6, 8),
+    mpg > 20
+  ) |>
+  arrange(desc(mpg), is.na(mpg) & !is.nan(mpg)) |>
+  select(-c(disp, hp))
+```
+
+The code returns the same rows in the same order as the grid:
+
+- Missing values are handled as the viewer handles them. A filter drops `NA` (and `NaN` in numbers) unless you checked "Include missing", which the code writes as `is.na(x) | …`.
+- Filters on factor and labelled columns use labels when Labels was on and codes or values when it was off, as in the viewer.
+- Missing values sort last in both directions, with `NaN` before `NA`. dplyr and base R otherwise mix the two, so a sort on a column that might hold `NaN` adds an `is.na(x) & !is.nan(x)` term. Once a column's summary shows it has no `NaN`, the term is left out.
+- Text sorts follow the [text order](#text-order): C becomes `.locale = "C"`, Locale becomes `.locale` with your VS Code display language, and Natural becomes `stringr::str_rank(x, locale = …, numeric = TRUE)`. Natural and Locale use the same collation library (ICU) in R and in the viewer, but R and VS Code can ship different versions of it, which can order rare characters differently; the code says so in a comment.
+- A frame's row names become a `rowname` column with `tibble::rownames_to_column()` (dplyr) or `keep.rownames` (data.table) when a filter or sort uses them; base R uses `rownames()`.
+- The comment at the top names the packages the code needs.
+
+Copy as R code works for data frames and matrices. Raven needs the expression you passed to `View()`, so a panel opened before updating Raven, or from an expression longer than 64 KiB, can't produce code until you call `View()` again. A filter Raven can't write faithfully (for example, a value list on a date column) is left out and named in a comment rather than approximated.
+
+### Refresh
+
+The data in a panel is a copy taken when you called `View()`. To see new values, choose Refresh… from ⋯. Raven shows the `View()` call it will run and asks first, because running the expression again repeats anything it does, such as reading a file. After you confirm, it runs the call in the R console.
+
+If the new data has the same columns (same names and types, in the same order), the sort, filters, widths, hidden columns, and pins stay. If the columns changed, the panel opens like a new one. A panel opened with a title, as in `View(df, "Survey")`, refreshes into the same panel.
 
 ## Troubleshooting
 
