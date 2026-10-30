@@ -1,8 +1,7 @@
 // Mechanical style rules for the user docs (design §2, §3.5, §5.3, §7).
 // Rules apply by page class: guide pages, reference pages (from
 // docs/user-pages.json `kind`), and the two READMEs. Legal text in the
-// READMEs' Provenance and License sections is exempt from the voice and
-// source-path rules.
+// READMEs' License sections is exempt from the voice and source-path rules.
 
 import { describe, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
@@ -20,7 +19,7 @@ const sitePages = new Set([...userPagePaths(manifest), "docs/README.md", "docs"]
 const MAX_PARAGRAPH_WORDS = 150;
 const TARGET_CELL_WORDS = 40;
 const GUIDE_TAIL = ["Settings", "Limitations", "Details", "See also"];
-const LEGAL_SECTIONS = new Set(["Provenance", "License"]);
+const LEGAL_SECTIONS = new Set(["License"]);
 
 /** Text with inline code spans and double-quoted passages removed. */
 function proseOnly(line: string): string {
