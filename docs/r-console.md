@@ -75,7 +75,7 @@ Code you send from the editor (Run Line or Selection, Run Chunk, Source File, an
 
 ### Debugging
 
-Raven's console includes a debugger for VS Code: breakpoints, stepping, the call stack, variables and the Debug Console, attached automatically when R stops. An uncaught error in code from a file also prints a [traceback](debugger.md#tracebacks) with clickable file locations, and warnings from your files say [where they came from](debugger.md#where-warnings-came-from). See [Debugger](debugger.md).
+Raven's console includes a debugger for VS Code: breakpoints, stepping, the call stack, variables and the Debug Console, attached automatically when R stops. An uncaught error in code from a file also prints a [traceback](debugger.md#tracebacks) with clickable file locations that you can [open in the debugger](debugger.md#inspect-the-last-error) afterwards, and warnings from your files say [where they came from](debugger.md#where-warnings-came-from). See [Debugger](debugger.md).
 
 ### Outside VS Code
 

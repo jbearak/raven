@@ -116,6 +116,19 @@ Traceback:
 
 Ctrl+click (Cmd+click on macOS) a location to open it. Frames without a file location, such as base R and installed packages, are left out, and so is the whole traceback when none of the code came from a file: a typo at the prompt still prints only R's error message. Errors you catch, and errors you end with Stop while the debugger is stopped on them, print no traceback.
 
+### Inspect the last error
+
+You don't have to rerun anything to look inside an error that has already happened. Run Raven: Inspect Last Error, and the debugger opens on the last error that printed a traceback, with its call stack, the variables of each function as they were when it failed, and the Debug Console running in any frame you select. When an editor is connected, the traceback ends with a reminder:
+
+```
+Traceback:
+  inner(y) at /home/me/project/R/clean.R:2
+  outer("a") at /home/me/project/R/clean.R:5
+Inspect it: run Raven: Inspect Last Error
+```
+
+The code has already stopped running, so there is nothing to step through: Continue, any step, or Stop ends the inspection and returns you to the prompt. You can inspect the same error again until a newer error with a traceback replaces it. Like R's own `dump.frames()` and `debugger()`, this keeps that error's frames, and every object in them, in memory until then; and they are the live environments, not copies, so changing a variable there changes it for anything else that still uses that environment. An error at the top level, outside any function, has no frames to keep.
+
 ### Where warnings came from
 
 R's deferred warnings name the call that raised them, but not where it is. When a warning comes from code in a file, the console adds the line under R's warning block:

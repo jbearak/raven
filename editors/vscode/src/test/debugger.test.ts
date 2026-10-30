@@ -124,6 +124,37 @@ suite('Raven R debugger (end to end)', function () {
         await ended;
     });
 
+    test('Inspect Last Error reopens an error after it reached the prompt', async () => {
+        const file = path.join(dir, 'p.R');
+        fs.writeFileSync(file, 'p <- function(x) {\n  q <- x * 3\n  stop("late")\n}\np(2)\n');
+        const editor = await open_at(file, 0);
+        editor.selection = new vscode.Selection(0, 0, 3, 1);
+        await vscode.commands.executeCommand('raven.runLineOrSelection');
+        await sleep(3000);
+        // It stops on the error; Continue lets it reach the prompt.
+        let mark = sent.length;
+        await open_at(file, 4);
+        await vscode.commands.executeCommand('raven.runLineOrSelection');
+        await stopped_after(mark);
+        let ended = session_ended();
+        await vscode.commands.executeCommand('workbench.action.debug.continue');
+        await ended;
+        await sleep(1000);
+        mark = sent.length;
+        await vscode.commands.executeCommand('raven.debugger.inspectLastError');
+        const stop = await stopped_after(mark);
+        assert.strictEqual(stop.body?.reason, 'exception');
+        const session = await until('a session', () => vscode.debug.activeDebugSession);
+        const frame = await top_frame(session);
+        assert.strictEqual(frame.name, 'p');
+        assert.strictEqual(frame.line, 3);
+        const ev = await session.customRequest('evaluate', { expression: 'q', frameId: frame.id, context: 'repl' });
+        assert.match(ev.result, /6/);
+        ended = session_ended();
+        await vscode.commands.executeCommand('workbench.action.debug.continue');
+        await ended;
+    });
+
     test('a breakpoint in code run from the editor attaches, inspects, and continues', async () => {
         const file = path.join(dir, 'f.R');
         fs.writeFileSync(file, 'f <- function(x) {\n  y <- x + 1\n  y * 2\n}\nf(1)\n');

@@ -423,9 +423,17 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             depth <- sys.nframe()
             n <- depth - 1L
             if (!is.null(state$cut)) n <- min(n, state$cut)
-            calls <- if (n > 0) sys.calls()[seq_len(n)] else list()
-            frames <- if (n > 0) sys.frames()[seq_len(n)] else list()
-            funs <- if (n > 0) lapply(seq_len(n), function(i) sys.function(i)) else list()
+            all_calls <- sys.calls()
+            d <- state$dump
+            if (!is.null(d)) {
+                # Inspecting the last error: its saved stack, not the live
+                # one (which is the inspect call's).
+                n <- d$k
+                all_calls <- d$calls
+            }
+            calls <- if (n > 0) all_calls[seq_len(n)] else list()
+            frames <- if (!is.null(d)) d$frames else if (n > 0) sys.frames()[seq_len(n)] else list()
+            funs <- if (!is.null(d)) d$funs else if (n > 0) lapply(seq_len(n), function(i) sys.function(i)) else list()
             hidden <- vapply(funs, function(f) {
                 identical(environment(f), here) || identical(f, state$hook)
             }, TRUE)
@@ -441,12 +449,12 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 if (hidden[[i]]) next
                 loc <- if (i < n) {
                     srcref_loc(attr(calls[[i + 1L]], "srcref"))
-                } else if (!is.null(state$cut) && n < length(sys.calls())) {
+                } else if ((!is.null(state$cut) || !is.null(d)) && n < length(all_calls)) {
                     # An exception or pause stop: the top frame is where the
                     # condition was signalled; the call it was running then
                     # (`stop(...)`) has the line. Some R versions report no
                     # current srcref for the browser opened there.
-                    srcref_loc(attr(sys.calls()[[n + 1L]], "srcref"))
+                    srcref_loc(attr(all_calls[[n + 1L]], "srcref"))
                 }
                 f <- funs[[i]]
                 # A function with no srcref (base R, an installed package)
@@ -851,9 +859,30 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     take_traceback <- function(reset) {
         cand <- state$err_cand
         state$err_cand <- NULL
-        if (is.null(cand) || !reset) return("[]")
-        if (nzchar(cand$msg) && !grepl(substr(cand$msg, 1L, 200L), geterrmessage(), fixed = TRUE)) return("[]")
-        jarr(jstr(cand$lines))
+        if (is.null(cand) || !reset) return("{}")
+        if (nzchar(cand$msg) && !grepl(substr(cand$msg, 1L, 200L), geterrmessage(), fixed = TRUE)) return("{}")
+        # The printed error is the one Inspect Last Error opens (or none).
+        state$last_dump <- cand$dump
+        rpc("last_error", if (is.null(cand$dump)) "0" else "1")
+        jobj(lines = jarr(jstr(cand$lines)), inspect = if (is.null(cand$dump)) "false" else "true")
+    }
+    # Inspect Last Error (`.raven_dbg_inspect()`, fed as hidden input at a
+    # top-level prompt): a browser in the innermost saved frame, with the
+    # saved stack standing in for the live one (env$capture). Nothing runs
+    # on: stepping continues, and Continue or Stop leaves it. The frames are
+    # live environments, kept until the next printed error replaces them.
+    env$inspect <- function() {
+        d <- state$last_dump
+        if (is.null(d)) return(invisible())
+        state$dump <- d
+        rpc("inspecting", "1")
+        on.exit({
+            state$dump <- NULL
+            rpc("inspecting", "0")
+        }, add = TRUE)
+        rpc("exception", "error", d$detail)
+        base::eval(quote(base::browser()), d$frames[[d$k]])
+        invisible()
     }
     env$at_prompt <- function(top, reset = "FALSE") internal(tryCatch({
         if (!is.null(state$jit_saved)) {
@@ -1193,9 +1222,33 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     error_candidate <- function(cnd) internal(tryCatch({
         if (identical(rpc("at_browser"), "1") || !from_file()) return(NULL)
         lines <- error_traceback()
-        if (is.null(lines)) NULL
-        else list(lines = lines, msg = tryCatch(conditionMessage(cnd), error = function(e) ""))
+        if (is.null(lines)) return(NULL)
+        msg <- tryCatch(conditionMessage(cnd), error = function(e) "")
+        list(lines = lines, msg = msg, dump = error_dump(cnd, msg))
     }, error = function(e) NULL))
+    # The frames of the error, for Inspect Last Error: everything below the
+    # handler, up to the innermost frame with source (as an exception stop
+    # opens there). NULL for an error at top level, which leaves nothing to
+    # inspect but the global environment.
+    error_dump <- function(cnd, msg) {
+        top <- 0L
+        for (i in seq_len(sys.nframe())) {
+            if (identical(environment(sys.function(i)), here)) break
+            top <- i
+        }
+        k <- 0L
+        for (i in rev(seq_len(top))) {
+            if (!is.null(attr(sys.function(i), "srcref"))) {
+                k <- i
+                break
+            }
+        }
+        if (k == 0L) return(NULL)
+        call <- tryCatch(paste(deparse(conditionCall(cnd), nlines = 1L), collapse = ""), error = function(e) "")
+        list(k = k, calls = sys.calls()[seq_len(min(k + 1L, top))],
+             frames = lapply(seq_len(k), sys.frame), funs = lapply(seq_len(k), sys.function),
+             detail = paste(class(cnd)[[1L]], msg, call, sep = US))
+    }
     # Every error and interrupt replaces the candidate. It is set only once
     # stop_or_pass() returns: Stop (`Q`) at an exception stop unwinds past
     # here, leaving none, as R then prints no error.
@@ -1288,6 +1341,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
             options(raven.debug_hook = hook)
             .Call(N$base_bind, ".raven_dbg_capture", env$capture)
             .Call(N$base_bind, ".ark_annotate_source", env$ark_annotate_source)
+            .Call(N$base_bind, ".raven_dbg_inspect", env$inspect)
         }, error = function(e) NULL))
         if (!isTRUE(state$handlers) && sys.nframe() == 1L) {
             old <- globalCallingHandlers(NULL)

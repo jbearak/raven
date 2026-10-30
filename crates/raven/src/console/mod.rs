@@ -1050,7 +1050,9 @@ fn finish_request() {
 
 fn read_new_input(prompt: &str, kind: PromptKind, cap: usize, depth: u32) -> Option<String> {
     ipc::R_BUSY.store(false, Ordering::Relaxed);
+    dap::set_idle_top_level(kind == PromptKind::TopLevel && depth == 1);
     let result = read_new_input_from(prompt, kind, cap, depth);
+    dap::set_idle_top_level(false);
     if result.is_some() {
         // R runs again (also after a `readline()` answer): socket interrupts
         // apply from here.
@@ -1139,9 +1141,11 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
                 // `q()` exits the process without dropping the editor, so
                 // history is written after every submission.
                 let _ = ed.sync_history();
-                if kind == PromptKind::Browser {
-                    dap::on_user_line(&text);
-                }
+                let text = if kind == PromptKind::Browser {
+                    dap::on_user_line(&text).unwrap_or(text)
+                } else {
+                    text
+                };
                 with_state(|s| {
                     s.pending = split_submission(&text);
                     s.echo = false;
@@ -1170,6 +1174,17 @@ fn edit_loop(ed: &mut Reedline, prompt: &str, kind: PromptKind, cap: usize) -> O
                     ed.run_edit_commands(&[EditCommand::Clear]);
                     echo_line(prompt, kind, &cmd);
                     return Some(format!("{cmd}\n"));
+                }
+                // Inspect Last Error, asked for from the editor.
+                if kind == PromptKind::TopLevel
+                    && let Some(hidden) = dap::take_inspect()
+                {
+                    if !buf.is_empty() {
+                        let pos = ed.current_insertion_point();
+                        with_state(|s| s.stash = Some((buf, pos)));
+                    }
+                    ed.run_edit_commands(&[EditCommand::Clear]);
+                    return Some(hidden);
                 }
                 let indent = with_state(|s| s.indent.take()).flatten();
                 if let Some(indent) = indent {
