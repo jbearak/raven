@@ -3,11 +3,37 @@
  * above the grid. Both are DOM inputs; Escape closes them and returns
  * focus to the grid.
  */
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { describeFindCount, parseRowTarget, type RowTarget } from './workflow-model';
 
 /** Typing pauses this long before a search starts. */
 const FIND_DEBOUNCE_MS = 200;
+/** How long a bar reclaims focus after opening. */
+const FOCUS_HOLD_MS = 400;
+
+/**
+ * Focus (and select) `ref`'s input whenever `nonce` changes, and keep
+ * reclaiming it for {@link FOCUS_HOLD_MS}: opening a bar shrinks the grid,
+ * and Glide refocuses its canvas and accessibility table during that
+ * relayout, which would swallow the first keystrokes. Typing in the input
+ * ends the hold.
+ */
+function useHeldFocus(ref: React.RefObject<HTMLInputElement>, nonce: number): () => void {
+    const holdRef = useRef(0);
+    useEffect(() => {
+        const until = Date.now() + FOCUS_HOLD_MS;
+        holdRef.current = until;
+        ref.current?.focus();
+        ref.current?.select();
+        const timer = window.setInterval(() => {
+            const el = ref.current;
+            if (!el || holdRef.current !== until || Date.now() > until) { window.clearInterval(timer); return; }
+            if (document.activeElement !== el) el.focus();
+        }, 25);
+        return () => window.clearInterval(timer);
+    }, [nonce, ref]);
+    return () => { holdRef.current = 0; };
+}
 
 export type FindStatus = { searching: boolean; count?: number; index?: number; error?: string };
 
@@ -24,10 +50,7 @@ export function FindBar({ status, focusNonce, onQuery, onStep, onCancel, onClose
     const inputRef = useRef<HTMLInputElement>(null);
     const timerRef = useRef<number | null>(null);
     const sentRef = useRef('');
-    useEffect(() => {
-        inputRef.current?.focus();
-        inputRef.current?.select();
-    }, [focusNonce]);
+    const releaseFocus = useHeldFocus(inputRef, focusNonce);
     useEffect(() => () => {
         if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     }, []);
@@ -37,6 +60,7 @@ export function FindBar({ status, focusNonce, onQuery, onStep, onCancel, onClose
         onQuery(q);
     };
     const onChange = (q: string) => {
+        releaseFocus();
         setQuery(q);
         if (timerRef.current !== null) window.clearTimeout(timerRef.current);
         timerRef.current = window.setTimeout(() => send(q), FIND_DEBOUNCE_MS);
@@ -106,10 +130,7 @@ export function GoToRowBar({ message, focusNonce, onGo, onClose }: {
     const [value, setValue] = useState('');
     const [invalid, setInvalid] = useState(false);
     const inputRef = useRef<HTMLInputElement>(null);
-    useEffect(() => {
-        inputRef.current?.focus();
-        inputRef.current?.select();
-    }, [focusNonce]);
+    const releaseFocus = useHeldFocus(inputRef, focusNonce);
     return (
         <div className="grid-bar goto-bar">
             <input
@@ -122,7 +143,7 @@ export function GoToRowBar({ message, focusNonce, onGo, onClose }: {
                 aria-label="Go to row: R row number, or # and a display position"
                 aria-invalid={invalid}
                 spellCheck={false}
-                onChange={e => { setValue(e.target.value); setInvalid(false); }}
+                onChange={e => { releaseFocus(); setValue(e.target.value); setInvalid(false); }}
                 onKeyDown={e => {
                     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); return; }
                     if (e.key === 'Enter') {

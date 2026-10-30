@@ -7,8 +7,9 @@
  * picks the VS Code theme kind, `?filter=1` applies a filter, `?sort=1`
  * a two-key sort, `?empty=1` a filter that matches nothing,
  * `?sidebar=1` opens the Columns sidebar with `mpg` expanded,
- * `?summaries=0` turns the Σ band off. Profiles and value counts are
- * computed here from the fixture.
+ * `?summaries=0` turns the Σ band off, `?pin=3,5` pins those columns.
+ * Profiles, value counts, find and go-to-row replies are computed here
+ * from the fixture.
  *
  * Built to `dist-test/` by `bun run bundle:webview-test`; never shipped.
  */
@@ -229,12 +230,18 @@ const filter = filtered
     }
     : { entries: [], labelsOnWhenFiltered: true };
 
+/** The last find's display positions. */
+let matches: number[] = [];
+
 const vscode = {
     postMessage(msg: WebviewToExtension) {
         if (msg.type === 'webviewReady') {
             post({
                 type: 'init', panelGeneration: 1, nrow, columns,
-                layout: { columnWidths: {}, hiddenColumns: [] },
+                layout: {
+                    columnWidths: {}, hiddenColumns: [],
+                    ...(params.get('pin') ? { pinnedColumns: params.get('pin')!.split(',').map(Number) } : {}),
+                },
                 toolbar: { labelsOn: true, formatOn: true, digits: 3, ...(params.get('summaries') === '0' ? { summariesOn: false } : {}) },
                 settings: { missingValueStyle: (params.get('missing') as 'foreground' | 'background' | 'none') ?? 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true },
                 dictionaries: { 5: ['Europe', 'Japan', 'USA'] }, schemaHash: 'preview', sort, filter,
@@ -277,6 +284,26 @@ const vscode = {
                     distinct: p.distinct, present: p.rows - p.na - p.nan, na: p.na, order: msg.order,
                 },
             });
+        } else if (msg.type === 'find') {
+            const q = msg.query.toLowerCase();
+            matches = [];
+            perm.forEach((r, pos) => {
+                if (msg.columns.some(c => {
+                    const v = cellFor(c, r);
+                    return v !== null && typeof v !== 'object' && String(v).toLowerCase().includes(q);
+                })) matches.push(pos);
+            });
+            const index = matches.findIndex(p => p >= msg.from);
+            const i = index < 0 ? (matches.length ? 0 : -1) : index;
+            setTimeout(() => post({
+                type: 'findResult', panelGeneration: 1, requestId: msg.requestId, count: matches.length,
+                position: i >= 0 ? matches[i] : -1, index: i, transformGeneration: msg.transformGeneration,
+            }), 150);
+        } else if (msg.type === 'findStep') {
+            const n = matches.length;
+            let i = msg.direction > 0 ? matches.findIndex(p => p > msg.from) : n - 1 - [...matches].reverse().findIndex(p => p < msg.from);
+            if (i < 0 || i >= n) i = msg.direction > 0 ? 0 : n - 1;
+            post({ type: 'findResult', panelGeneration: 1, requestId: msg.requestId, count: n, position: matches[i] ?? -1, index: i });
         } else if (msg.type === 'getCellDetail') {
             const v = cellFor(msg.columnIndex, perm[msg.row]);
             post({ type: 'cellDetail', panelGeneration: 1, requestId: msg.requestId, text: typeof v === 'string' ? v : null, truncated: false });

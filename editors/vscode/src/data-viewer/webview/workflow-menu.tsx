@@ -70,7 +70,7 @@ export function WorkflowMenu({ onFind, onGoToRow, onCopyCode, onRefresh, mod }: 
                             role="menuitem"
                             aria-haspopup="menu"
                             aria-expanded={submenu}
-                            onClick={() => setSubmenu(s => !s)}
+                            onClick={() => setSubmenu(true)}
                             onKeyDown={e => { if (e.key === 'ArrowRight') { e.preventDefault(); setSubmenu(true); } }}
                         >
                             Copy as R code
