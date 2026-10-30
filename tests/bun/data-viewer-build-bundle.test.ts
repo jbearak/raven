@@ -37,7 +37,9 @@ describe('data viewer build bundle', () => {
         () => {
             expect(existsSync(data_viewer_bundle)).toBe(true);
             // ~423 KB before column summaries; the band, the Columns
-            // sidebar and value counts add ~28 KB.
+            // sidebar and value counts add ~28 KB; the workflow (⋯ menu,
+            // find and go-to bars, pins, selection summary) ~13 KB, to
+            // ~464 KB. Copy as R code is generated on the host.
             expect(statSync(data_viewer_bundle).size).toBeLessThan(480_000);
 
             const bundle = readFileSync(data_viewer_bundle, 'utf8');

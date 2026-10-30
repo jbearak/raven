@@ -10,10 +10,13 @@ import {
     copyColumns,
     displayIndexOf,
     firstDataDisplayIndex,
+    frozenFits,
     isGutter,
+    isPinned,
     rowPosition,
     rRowNumber,
     sourceAt,
+    togglePinned,
 } from '../../editors/vscode/src/data-viewer/webview/display-columns';
 import { TileCache } from '../../editors/vscode/src/data-viewer/webview/tile-cache';
 import { composeEffectivePermutation } from '../../editors/vscode/src/data-viewer/effective-permutation';
@@ -114,5 +117,51 @@ describe('gutter R row numbers', () => {
         // The host returns originalRowIndices = effective[start..end).
         cache.putBlock(0, 0, [[1], [2], [3]], Array.from(effective), 3, 1);
         expect([0, 1, 2].map(r => rRowNumber(r, cache.originalRowIndex(r)))).toEqual([5, 3, 1]);
+    });
+});
+
+describe('pins', () => {
+    test('pinned columns freeze after the rownames, in pin order; the rest keep schema order', () => {
+        const dc = buildDisplayColumns(withRownames, [], [3, 1]);
+        expect(dc.dataCols).toEqual([0, 3, 1, 2]);
+        expect(dc.pinnedCols).toEqual([3, 1]);
+        expect(dc.freezeColumns).toBe(4);
+        expect(displayIndexOf(dc, 3)).toBe(2);
+        expect(sourceAt(dc, 3)).toBe(1);
+    });
+
+    test('unpinning restores the schema position', () => {
+        const pins = togglePinned([3, 1], 3);
+        expect(pins).toEqual([1]);
+        expect(buildDisplayColumns(withRownames, [], pins).dataCols).toEqual([0, 1, 2, 3]);
+        expect(togglePinned(pins, 2)).toEqual([1, 2]);
+        expect(isPinned([1, 2], 2)).toBe(true);
+        expect(isPinned(undefined, 2)).toBe(false);
+    });
+
+    test('a hidden pin is neither shown nor frozen, and stays pinned', () => {
+        const dc = buildDisplayColumns(plain, [1], [1, 2]);
+        expect(dc.dataCols).toEqual([2, 0]);
+        expect(dc.freezeColumns).toBe(2);
+        expect(buildDisplayColumns(plain, [], [1, 2]).dataCols).toEqual([1, 2, 0]);
+    });
+
+    test('rowname columns and unknown indices are never pinned', () => {
+        const dc = buildDisplayColumns(withRownames, [], [0, 9, 2]);
+        expect(dc.pinnedCols).toEqual([2]);
+        expect(dc.dataCols).toEqual([0, 2, 1, 3]);
+    });
+
+    test('copy and selection go through the mapping with pins', () => {
+        const dc = buildDisplayColumns(withRownames, [], [3]);
+        // Display 2 is the pinned disp; copy keeps display order.
+        expect(copyColumns(dc, [3, 2], false)).toEqual([3, 1]);
+        expect(allCopyColumns(dc, true)).toEqual([0, 3, 1, 2]);
+    });
+
+    test('the frozen region may take at most half the viewport', () => {
+        expect(frozenFits([60, 200, 140], 800)).toBe(true);
+        expect(frozenFits([60, 200, 141], 800)).toBe(false);
+        expect(frozenFits([60, 2000], 0)).toBe(true);
     });
 });
