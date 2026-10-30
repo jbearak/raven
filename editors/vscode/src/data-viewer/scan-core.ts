@@ -22,6 +22,15 @@
  * under an active filter sorts only the survivors (#328), and clearing the
  * filter later re-sorts all rows from cached keys without reading the
  * file. Termination discards both caches with the worker.
+ *
+ * Profiles ({@link profile}, `profile-engine.ts`) run at the lowest
+ * priority. Between record batches a profile scan waits while any
+ * viewport read is in flight (the host counts them in the shared
+ * `priority` cell) or any sort, filter, histogram or null-count scan is
+ * running here, so a profile never delays the grid or a transform. The
+ * host runs one profile at a time (`profile-scheduler.ts`). Profiles,
+ * the 50-bin histograms their second pass produces, and their value
+ * counts are cached per column for this reader.
  */
 import type { ArrowSliceReader } from './arrow-reader';
 import type { FilterEntry, FilterState, HistogramBin, SortState } from './messages';
@@ -31,7 +40,10 @@ import type { SortContext, SortProgress } from './sort';
 import { computeEntryMask, maskToIndices } from './filter';
 import type { FilterContext } from './filter';
 import { computeHistogramForColumn } from './histograms';
-import { isAbortError } from './abort';
+import { isAbortError, throwIfAborted } from './abort';
+import { computeProfile, countValues, valueCountsFrom } from './profile-engine';
+import type { CountSummary } from './profile-engine';
+import type { ColumnProfile, ValueCounts } from './profile';
 import { allocPerm, MemoryCounter, sharePerm } from './perm-buffer';
 
 /** Everything that determines an effective permutation. */
@@ -79,6 +91,10 @@ export const EMPTY_SPEC: TransformSpec = {
 
 /** Masks kept per entry; each is `nrow` bytes. */
 const MASK_CACHE_ENTRIES = 16;
+/** Value-count summaries kept (each up to 100k entries). */
+const COUNT_CACHE_ENTRIES = 8;
+/** How often a paused profile re-checks the priority gate. */
+const PAUSE_POLL_MS = 2;
 
 export class ScanCore {
     readonly keys = new SortKeyCache();
@@ -86,11 +102,48 @@ export class ScanCore {
     private survivors: { key: string; rows: Uint32Array | undefined } | undefined;
     private committedState: { gen: number; spec: TransformSpec } = { gen: 0, spec: EMPTY_SPEC };
     private readonly candidates = new Map<number, TransformSpec>();
+    /** Sorts, filters, histograms and null-count scans running here. */
+    private highPriority = 0;
+    private readonly profiles = new Map<number, ColumnProfile>();
+    private readonly histograms = new Map<number, HistogramBin[]>();
+    private readonly countSummaries = new Map<number, CountSummary>();
+    /** Times a profile scan waited at the priority gate (tests). */
+    profilePauses = 0;
 
+    /**
+     * @param priority  shared cell the host increments while a viewport
+     *                  read is in flight; profiles wait while it's non-zero.
+     */
     constructor(
         readonly reader: ArrowSliceReader,
         readonly counter: MemoryCounter,
+        private readonly priority?: Int32Array,
     ) {}
+
+    /** Run higher-priority work: profiles pause while it runs. */
+    private async urgent<T>(fn: () => Promise<T>): Promise<T> {
+        this.highPriority++;
+        try {
+            return await fn();
+        } finally {
+            this.highPriority--;
+        }
+    }
+
+    /** True while a profile scan must wait. */
+    get profileGateClosed(): boolean {
+        return this.highPriority > 0 || (this.priority !== undefined && Atomics.load(this.priority, 0) > 0);
+    }
+
+    private pauseFor(signal?: AbortSignal): () => Promise<void> {
+        return async () => {
+            while (this.profileGateClosed) {
+                this.profilePauses++;
+                throwIfAborted(signal);
+                await new Promise(r => setTimeout(r, PAUSE_POLL_MS));
+            }
+        };
+    }
 
     get committed(): { gen: number; spec: TransformSpec } { return this.committedState; }
     get candidateGenerations(): number[] { return [...this.candidates.keys()]; }
@@ -115,7 +168,11 @@ export class ScanCore {
 
     /** Compute the effective permutation for `req` (omitted components
      *  from the committed spec) and stage it as candidate `gen`. */
-    async compute(gen: number, req: TransformRequest, opts: ComputeOptions = {}): Promise<ComputeResult> {
+    compute(gen: number, req: TransformRequest, opts: ComputeOptions = {}): Promise<ComputeResult> {
+        return this.urgent(() => this.compute0(gen, req, opts));
+    }
+
+    private async compute0(gen: number, req: TransformRequest, opts: ComputeOptions): Promise<ComputeResult> {
         const base = this.committedState.spec;
         const spec: TransformSpec = {
             sort: req.sort ?? base.sort,
@@ -205,14 +262,60 @@ export class ScanCore {
         signal: AbortSignal | undefined,
         onProgress: (counts: Float64Array) => void,
     ): Promise<Float64Array> {
-        return this.reader.nullCounts({
+        return this.urgent(() => this.reader.nullCounts({
             signal,
             onProgress: (_done, _total, counts) => onProgress(counts),
-        });
+        }));
     }
 
-    histogram(columnIndex: number, signal?: AbortSignal): Promise<HistogramBin[]> {
-        return computeHistogramForColumn(this.reader, columnIndex, { signal });
+    /** The 50-bin popover histogram, from the cache a profile filled when
+     *  there is one. */
+    async histogram(columnIndex: number, signal?: AbortSignal): Promise<HistogramBin[]> {
+        const hit = this.histograms.get(columnIndex);
+        if (hit) return hit;
+        const bins = await this.urgent(() => computeHistogramForColumn(this.reader, columnIndex, { signal }));
+        this.histograms.set(columnIndex, bins);
+        return bins;
+    }
+
+    /** One column's profile (cached), at the lowest priority. */
+    async profile(columnIndex: number, signal?: AbortSignal): Promise<ColumnProfile> {
+        const hit = this.profiles.get(columnIndex);
+        if (hit) return hit;
+        const col = this.reader.schema.columns[columnIndex];
+        const r = await computeProfile(this.reader, columnIndex, {
+            signal,
+            pause: this.pauseFor(signal),
+            sortKey: col ? this.keys.get(`${columnIndex}:number`) : undefined,
+        });
+        this.profiles.set(columnIndex, r.profile);
+        if (r.histogram50 && !this.histograms.has(columnIndex)) this.histograms.set(columnIndex, r.histogram50);
+        if (r.counts) this.rememberCounts(r.counts);
+        return r.profile;
+    }
+
+    /** Value counts for one column, from the profile's count summary when
+     *  cached, else a counting scan at profile priority. */
+    async valueCounts(
+        columnIndex: number,
+        order: 'desc' | 'asc',
+        limit: number,
+        signal?: AbortSignal,
+    ): Promise<ValueCounts> {
+        let s = this.countSummaries.get(columnIndex);
+        if (!s) {
+            s = await countValues(this.reader, columnIndex, { signal, pause: this.pauseFor(signal) });
+            this.rememberCounts(s);
+        }
+        return valueCountsFrom(s, order, limit);
+    }
+
+    private rememberCounts(s: CountSummary): void {
+        this.countSummaries.delete(s.columnIndex);
+        this.countSummaries.set(s.columnIndex, s);
+        while (this.countSummaries.size > COUNT_CACHE_ENTRIES) {
+            this.countSummaries.delete(this.countSummaries.keys().next().value as number);
+        }
     }
 
     /** An identity-free empty permutation (tests). */

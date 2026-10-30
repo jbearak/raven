@@ -28,8 +28,11 @@ import {
     WebviewToExtension,
 } from './messages';
 import { composeEffectivePermutation } from './effective-permutation';
-import { isAbortError } from './abort';
+import { isAbortError, isInterruption } from './abort';
 import { isNumericArrowType } from './histograms';
+import { ProfileScheduler } from './profile-scheduler';
+import { VALUE_COUNTS_LIMIT } from './profile';
+import type { ValueCounts } from './profile';
 import { LocalEngine } from './engine';
 import type { ComputedTransform, DataEngine } from './engine';
 import { WorkerEngine } from './worker-engine';
@@ -286,6 +289,9 @@ export class DataViewerPanel {
      *  Dictionaries go out once per webview and dataset; a repaint of the
      *  same data omits them. Reset when the webview reloads. */
     private dictionariesSentFor: ArrowSliceReader | undefined;
+    /** Column profiles for the current engine's reader (summary band,
+     *  sidebar); replaced with the engine. */
+    private profileScheduler: ProfileScheduler | undefined;
 
     private constructor(
         panelName: string,
@@ -304,6 +310,10 @@ export class DataViewerPanel {
         this.reader = reader;
         this.filePath = filePath;
         this.webviewPanel.onDidDispose(() => { void this.dispose(); });
+        // Profiles run only while someone can see them.
+        this.webviewPanel.onDidChangeViewState?.(e => {
+            this.profileScheduler?.setActive(e.webviewPanel.visible);
+        });
         this.webviewPanel.webview.onDidReceiveMessage(
             (m: WebviewToExtension) => { void this.handle(m); },
         );
@@ -374,6 +384,29 @@ export class DataViewerPanel {
         this.engineValue = engine;
         engine.coordinator.adoptionRequired = this.adoptsTransforms === true;
         engine.coordinator.onAdoptionTimeout = (gen) => { void this.onAdoptionLost(gen); };
+        this.profileScheduler?.dispose();
+        const ncol = this.reader.schema.columns.length;
+        this.profileScheduler = new ProfileScheduler(
+            (ci, signal) => {
+                // panel.ts is the trust boundary: only profile real columns.
+                if (ci >= ncol) return Promise.reject(new Error(`no column ${ci}`));
+                return engine.profile(ci, signal);
+            },
+            updates => {
+                if (this.disposed) return;
+                const msg: ExtensionToWebview = {
+                    type: 'profiles',
+                    panelGeneration: this.generation,
+                    updates,
+                };
+                void this.webviewPanel.webview.postMessage(msg);
+            },
+            // Interrupted, not failed: a cancel or a worker restart (a
+            // regex cancel or a deadline terminates the scan worker) is
+            // retried under the scheduler's bounded policy.
+            isInterruption,
+        );
+        if (this.webviewPanel.visible === false) this.profileScheduler.setActive(false);
     }
 
     /** An `adopted` ack never came: log it, then treat the webview as
@@ -837,6 +870,9 @@ export class DataViewerPanel {
             loadedLayoutHidden: this.layout.hiddenColumns,
             loadedToolbar: activeToolbar,
         });
+        // The webview drops its profiles on every init/replace and
+        // re-sends its interest.
+        this.profileScheduler?.resetClient();
         await this.webviewPanel.webview.postMessage(msg);
         this.dictionariesSentFor = this.reader;
         this.recordSortSnapshot(0);
@@ -1648,6 +1684,41 @@ export class DataViewerPanel {
                 await this.webviewPanel.webview.postMessage(reply);
                 return;
             }
+            case 'setProfileInterest': {
+                if (!Array.isArray(m.columns)) return;
+                this.profileScheduler?.setInterest(m.columns.slice(0, 4096));
+                return;
+            }
+            case 'getValueCounts': {
+                const reader = this.reader;
+                const ci = m.columnIndex;
+                const reply = (body: { result?: ValueCounts; error?: string }) => {
+                    if (this.disposed || gen !== this.generation || reader !== this.reader) return;
+                    const msg: ExtensionToWebview = {
+                        type: 'valueCounts', panelGeneration: gen, requestId: m.requestId, columnIndex: ci, ...body,
+                    };
+                    void this.webviewPanel.webview.postMessage(msg);
+                };
+                if (!Number.isInteger(ci) || ci < 0 || ci >= reader.schema.columns.length) {
+                    reply({ error: `no column ${ci}` });
+                    return;
+                }
+                const abort = new AbortController();
+                this.histogramAborts.add(abort);
+                try {
+                    const result = await this.engine.valueCounts(
+                        ci, m.order === 'asc' ? 'asc' : 'desc', VALUE_COUNTS_LIMIT, abort.signal,
+                    );
+                    reply({ result });
+                } catch (err) {
+                    if (!abort.signal.aborted && !isAbortError(err)) {
+                        reply({ error: err instanceof Error ? err.message : String(err) });
+                    }
+                } finally {
+                    this.histogramAborts.delete(abort);
+                }
+                return;
+            }
             case 'getHistogram': {
                 const reader = this.reader;
                 const ci = m.columnIndex;
@@ -2289,6 +2360,7 @@ export class DataViewerPanel {
         if (this.disposed) return;
         this.disposed = true;
         this.nullCountAbort?.abort();
+        this.profileScheduler?.dispose();
         this.abortInteractiveTransforms();
         this.abortAndClearRestore();
         this.trace('dispose', {});

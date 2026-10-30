@@ -1,6 +1,7 @@
 /**
  * Scan worker entry: all full-column work — sort keys and permutations,
- * filters, histograms, and the header null-count scan (`scan-core.ts`).
+ * filters, histograms, the header null-count scan, and column profiles
+ * and value counts at the lowest priority (`scan-core.ts`).
  * A busy worker can't read messages, so cancellation reaches it through
  * each request's shared flag, checked between batches and every 65,536
  * comparisons; a regex filter or a deadline overrun is cancelled by the
@@ -20,7 +21,11 @@ const post = (m: ThreadReply) => port.postMessage(m);
 async function main(): Promise<void> {
     let core: ScanCore;
     try {
-        core = new ScanCore(await ArrowSliceReader.open(init.filePath), new MemoryCounter(init.counter));
+        core = new ScanCore(
+            await ArrowSliceReader.open(init.filePath),
+            new MemoryCounter(init.counter),
+            init.priority ? new Int32Array(init.priority) : undefined,
+        );
     } catch (err) {
         post({ type: 'openFailed', error: errorPayload(err).message });
         return;
@@ -66,6 +71,12 @@ async function handle(core: ScanCore, m: ScanRequest): Promise<void> {
             }
             case 'histogram':
                 value = await core.histogram(m.columnIndex, sharedSignal(m.cancel));
+                break;
+            case 'profile':
+                value = await core.profile(m.columnIndex, sharedSignal(m.cancel));
+                break;
+            case 'valueCounts':
+                value = await core.valueCounts(m.columnIndex, m.order, m.limit, sharedSignal(m.cancel));
                 break;
         }
         post({ type: 'reply', id: m.id, ok: true, value });

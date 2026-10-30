@@ -11,6 +11,7 @@
 import type { Cell } from './wire-format';
 import type { ColumnSchema } from './arrow-reader';
 import type { ToolbarState } from './toolbar-state';
+import type { ProfileUpdate, ValueCounts } from './profile';
 
 export type Layout = {
     /** Per-column pixel widths, keyed by the column's index in the
@@ -75,7 +76,13 @@ export type FilterPredicate =
     | { kind: 'isEmpty' }
     | { kind: 'isNotEmpty' }
     | { kind: 'numCompare'; op: '=' | '!=' | '<' | '<=' | '>' | '>='; value: number }
-    | { kind: 'numBetween'; lo: number; hi: number; inclusive: boolean }
+    | {
+        kind: 'numBetween'; lo: number; hi: number; inclusive: boolean;
+        /** Overrides `inclusive` for the upper bound only, so a histogram
+         *  bin `[lo, hi)` (or the closed last bin) filters to exactly the
+         *  rows it counts. Absent ⇔ the upper bound follows `inclusive`. */
+        upperInclusive?: boolean;
+    }
     | { kind: 'numNotBetween'; lo: number; hi: number; inclusive: boolean }
     | { kind: 'setIn'; values: (string | number)[] }
     | { kind: 'setNotIn'; values: (string | number)[] }
@@ -301,6 +308,22 @@ export type ExtensionToWebview =
         done: boolean;
     }
     | {
+        /** Column profile states (summary band, sidebar), see
+         *  `profile-scheduler.ts`. `null` drops a pending column. */
+        type: 'profiles';
+        panelGeneration: number;
+        updates: ProfileUpdate[];
+    }
+    | {
+        /** Reply to `getValueCounts`: the counts, or why they failed. */
+        type: 'valueCounts';
+        panelGeneration: number;
+        requestId: number;
+        columnIndex: number;
+        result?: ValueCounts;
+        error?: string;
+    }
+    | {
         /** Full value of one cell for the cell-detail popover. */
         type: 'cellDetail';
         panelGeneration: number;
@@ -422,6 +445,23 @@ export type WebviewToExtension =
         panelGeneration: number;
         requestId: number;
         columnIndex: number;
+    }
+    | {
+        /** The columns the webview wants profiled (on screen in the band,
+         *  in the sidebar, or open in value counts), most wanted first,
+         *  excluding profiles it already holds. Replaces the previous set;
+         *  an empty list stops profiling. */
+        type: 'setProfileInterest';
+        panelGeneration: number;
+        columns: number[];
+    }
+    | {
+        /** Value counts for one column (the frequency popover). */
+        type: 'getValueCounts';
+        panelGeneration: number;
+        requestId: number;
+        columnIndex: number;
+        order: 'desc' | 'asc';
     }
     | {
         type: 'saveLayout';

@@ -5,7 +5,10 @@
  * borders) and for theme screenshots. Open `grid-preview.html` from
  * `dist-test/grid-preview/` in a browser; `?theme=light|dark|hc|hcl`
  * picks the VS Code theme kind, `?filter=1` applies a filter, `?sort=1`
- * a two-key sort, `?empty=1` a filter that matches nothing.
+ * a two-key sort, `?empty=1` a filter that matches nothing,
+ * `?sidebar=1` opens the Columns sidebar with `mpg` expanded,
+ * `?summaries=0` turns the Σ band off. Profiles and value counts are
+ * computed here from the fixture.
  *
  * Built to `dist-test/` by `bun run bundle:webview-test`; never shipped.
  */
@@ -17,6 +20,9 @@ import { App } from '../App';
 import type { ColumnSchema } from '../../arrow-reader';
 import type { ExtensionToWebview, WebviewToExtension } from '../../messages';
 import { encodeTimestampMicros, type Cell } from '../../wire-format';
+import { binEdges, binIndex, binsFrom } from '../../histograms';
+import { profileKind, type ColumnProfile, type CountedEntry } from '../../profile';
+import { quantileType7 } from '../../sketches';
 
 const params = new URLSearchParams(location.search);
 
@@ -134,6 +140,76 @@ const nullCounts = columns.map((_, c) => {
     return n;
 });
 
+/** A column's value as a number in the profile's domain, or null/NaN. */
+function numberOf(cell: Cell): number | null {
+    if (cell === null) return null;
+    if (typeof cell === 'number') return cell;
+    if (typeof cell === 'object' && cell._ === 'nan') return NaN;
+    if (typeof cell === 'object' && cell._ === 'ts') return cell.ms * 1000 + cell.us;
+    return null;
+}
+
+/** The profile the scan worker would compute, from the fixture. */
+function previewProfile(c: number): ColumnProfile {
+    const col = columns[c];
+    const kind = profileKind(col);
+    const cells = Array.from({ length: nrow }, (_, r) => cellFor(c, r));
+    const na = cells.filter(x => x === null).length;
+    const base = { columnIndex: c, kind, rows: nrow, na, nan: 0 };
+    const counted = (key: (x: Cell) => string | number | boolean, label?: (k: string | number | boolean) => string | undefined): CountedEntry[] => {
+        const m = new Map<string | number | boolean, number>();
+        for (const x of cells) if (x !== null) m.set(key(x), (m.get(key(x)) ?? 0) + 1);
+        return [...m].map(([value, count]) => ({ value, count, error: 0, ...(label?.(value) !== undefined ? { label: label(value) } : {}) }))
+            .sort((a, b) => b.count - a.count);
+    };
+    if (kind === 'numeric' || kind === 'date') {
+        const all = cells.map(numberOf).filter((x): x is number => x !== null);
+        const nan = all.filter(x => Number.isNaN(x)).length;
+        const v = all.filter(x => !Number.isNaN(x)).sort((a, b) => a - b);
+        const edges = binEdges(v[0], v[v.length - 1], 20);
+        const counts = new Float64Array(20);
+        for (const x of v) counts[binIndex(x, edges)]++;
+        const mean = v.reduce((a, x) => a + x, 0) / v.length;
+        const sd = Math.sqrt(v.reduce((a, x) => a + (x - mean) ** 2, 0) / (v.length - 1));
+        const cellAt = (x: number): Cell => (kind === 'date' ? encodeTimestampMicros(BigInt(x)) : x);
+        return {
+            ...base, nan, distinct: { value: new Set(v).size, exact: true },
+            min: cellAt(v[0]), max: cellAt(v[v.length - 1]), histogram: binsFrom(edges, counts),
+            ...(kind === 'numeric' ? {
+                mean, sd, infinite: 0,
+                quantiles: { p25: quantileType7(v, 0.25), p50: quantileType7(v, 0.5), p75: quantileType7(v, 0.75), exact: true },
+            } : { timeZone: col.timeZone }),
+        };
+    }
+    if (kind === 'logical') {
+        const t = cells.filter(x => x === true).length;
+        const f = cells.filter(x => x === false).length;
+        const top = counted(x => x as boolean);
+        return { ...base, distinct: { value: top.length, exact: true }, trueCount: t, falseCount: f, top: { values: top, exact: true, approximateOrder: false } };
+    }
+    if (kind === 'factor' || kind === 'labelled') {
+        const dict = col.dictionary;
+        const top = counted(x => x as number, k => dict ? dict[k as number] : col.valueLabels?.[String(k)]);
+        const declared = dict ? dict.length : Object.keys(col.valueLabels ?? {}).length;
+        const levelKeys = dict ? dict.map((_, i) => i) : Object.keys(col.valueLabels ?? {}).map(Number);
+        const levels = levelKeys.map(k => ({
+            value: k, label: dict ? dict[k] : col.valueLabels?.[String(k)], count: top.find(e => e.value === k)?.count ?? 0, error: 0,
+        }));
+        return {
+            ...base, distinct: { value: top.length, exact: true },
+            top: { values: top.slice(0, 10), exact: true, approximateOrder: false },
+            levels: { declared, used: top.length, counts: levels },
+        };
+    }
+    const strs = cells.filter((x): x is string => typeof x === 'string');
+    const top = counted(x => String(x));
+    return {
+        ...base, distinct: { value: top.length, exact: true }, emptyStrings: strs.filter(x => x === '').length,
+        minLength: Math.min(...strs.map(x => x.length)), maxLength: Math.max(...strs.map(x => x.length)),
+        top: { values: top.slice(0, 10), exact: true, approximateOrder: false },
+    };
+}
+
 function post(msg: ExtensionToWebview): void {
     setTimeout(() => window.dispatchEvent(new MessageEvent('message', { data: msg })), 0);
 }
@@ -159,7 +235,7 @@ const vscode = {
             post({
                 type: 'init', panelGeneration: 1, nrow, columns,
                 layout: { columnWidths: {}, hiddenColumns: [] },
-                toolbar: { labelsOn: true, formatOn: true, digits: 3 },
+                toolbar: { labelsOn: true, formatOn: true, digits: 3, ...(params.get('summaries') === '0' ? { summariesOn: false } : {}) },
                 settings: { missingValueStyle: (params.get('missing') as 'foreground' | 'background' | 'none') ?? 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true },
                 dictionaries: { 5: ['Europe', 'Japan', 'USA'] }, schemaHash: 'preview', sort, filter,
             });
@@ -180,6 +256,27 @@ const vscode = {
                 type: 'rows', panelGeneration: 1, requestId: msg.requestId, viewportGeneration: msg.viewportGeneration,
                 start: msg.start, end, rows, stale: false, ...(permuted ? { originalRowIndices: original } : {}),
             });
+        } else if (msg.type === 'setProfileInterest') {
+            // Loading first, then the profiles a moment later, as the
+            // scan worker would.
+            post({ type: 'profiles', panelGeneration: 1, updates: msg.columns.map(c => [c, { state: 'loading' }]) });
+            setTimeout(() => post({
+                type: 'profiles', panelGeneration: 1,
+                updates: msg.columns.map(c => (c === 6 && params.get('fail')
+                    ? [c, { state: 'failed', error: 'could not decode batch 3' }]
+                    : [c, { state: 'ready', profile: previewProfile(c) }])),
+            }), 400);
+        } else if (msg.type === 'getValueCounts') {
+            const p = previewProfile(msg.columnIndex);
+            const entries = [...(p.top?.values ?? [])];
+            if (msg.order === 'asc') entries.reverse();
+            post({
+                type: 'valueCounts', panelGeneration: 1, requestId: msg.requestId, columnIndex: msg.columnIndex,
+                result: {
+                    columnIndex: msg.columnIndex, entries, exact: true, approximateOrder: false,
+                    distinct: p.distinct, present: p.rows - p.na - p.nan, na: p.na, order: msg.order,
+                },
+            });
         } else if (msg.type === 'getCellDetail') {
             const v = cellFor(msg.columnIndex, perm[msg.row]);
             post({ type: 'cellDetail', panelGeneration: 1, requestId: msg.requestId, text: typeof v === 'string' ? v : null, truncated: false });
@@ -191,3 +288,13 @@ const vscode = {
 const container = document.getElementById('root');
 if (!container) throw new Error('grid preview root not found');
 createRoot(container).render(<App vscode={vscode} />);
+
+if (params.get('sidebar')) {
+    // Open the sidebar and expand `mpg`, for screenshots.
+    setTimeout(() => {
+        (document.querySelector('[aria-controls="columns-sidebar"]') as HTMLButtonElement | null)?.click();
+        setTimeout(() => {
+            (document.querySelector('#columns-sidebar-row-1 .columns-sidebar-disclosure') as HTMLButtonElement | null)?.click();
+        }, 300);
+    }, 600);
+}

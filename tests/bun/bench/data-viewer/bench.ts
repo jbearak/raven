@@ -17,6 +17,7 @@
 //   --baseline <file>      compare medians against a previous report
 //   --threshold 0.15       regression threshold on the median ratio
 //   --fail-on-regression   exit 1 when a regression repeats on a re-run
+//   --metrics a,b          only these measures (default all)
 //   --src <dir>            data-viewer sources to measure (default the
 //                          working tree; point at a copy of an older
 //                          revision to measure "before")
@@ -32,6 +33,13 @@
 // the 64 × 32 sorted gather through the reader thread, and the commit
 // protocol's prepare/commit round trip. Their `max_block_ms` is the
 // extension host's event loop while the worker computes.
+//
+// Profiles (Phase 4): `profile_numeric` is one numeric column's full
+// profile in process (budget < 400 ms on A); `worker_profile_numeric`
+// the same through a fresh scan worker; `worker_getrows_during_profile`
+// times viewport reads through the reader thread while profiles of every
+// column run in the scan worker (compare with
+// `reader_thread_unsorted_256x32`: profiles must not stall reads).
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -59,6 +67,7 @@ const SORT_SAMPLES = Number(arg('sort-samples', '3'));
 const DIR = arg('dir', join(tmpdir(), 'raven-dv-bench')) as string;
 const SRC = resolve(arg('src', join(import.meta.dir, '../../../../editors/vscode/src/data-viewer')) as string);
 const THRESHOLD = Number(arg('threshold', '0.15'));
+const METRICS = arg('metrics')?.split(',').map(s => s.trim());
 
 const readerMod = await import(join(SRC, 'arrow-reader.ts'));
 const sortMod = await import(join(SRC, 'sort.ts'));
@@ -69,6 +78,9 @@ const effMod = existsSync(join(SRC, 'effective-permutation.ts'))
 const { ArrowSliceReader } = readerMod;
 const workerMod = existsSync(join(SRC, 'worker-engine.ts'))
     ? await import(join(SRC, 'worker-engine.ts'))
+    : undefined;
+const profileMod = existsSync(join(SRC, 'profile-engine.ts'))
+    ? await import(join(SRC, 'profile-engine.ts'))
     : undefined;
 const CTX = { labelsOn: true, formatOn: true, digits: 3 };
 
@@ -209,6 +221,11 @@ async function measuresFor(fx: FixtureInfo): Promise<{ measures: Measures; teard
                 reader, [{ columnIndex: fx.stringColumn!, direction: 'asc' }], CTX);
         });
     }
+    if (profileMod) {
+        measures.profile_numeric = () => measure(SAMPLES, async () => {
+            await profileMod.computeProfile(reader, fx.numericColumn, { signal: new AbortController().signal });
+        });
+    }
     if (workerMod) Object.assign(measures, workerMeasures(fx, firstCols, gatherCols));
     if (typeof reader.nullCounts === 'function') {
         measures.null_count_scan = () => measure(SAMPLES, async () => {
@@ -302,6 +319,36 @@ function workerMeasures(fx: FixtureInfo, firstCols: number[], gatherCols: number
             await e.dispose();
         }
     };
+    if (profileMod) {
+        out.worker_profile_numeric = () => measureEach(SAMPLES, startEngine, async e => {
+            await e.profile(fx.numericColumn, new AbortController().signal);
+        }, stopEngine);
+        out.worker_getrows_during_profile = async () => {
+            const e = await startEngine();
+            const ac = new AbortController();
+            let profiling = true;
+            let profiled = 0;
+            const all = (async () => {
+                for (let c = 0; c < fx.ncol && !ac.signal.aborted; c++) {
+                    await e.profile(c, ac.signal).catch(() => undefined);
+                    profiled++;
+                }
+                profiling = false;
+            })();
+            try {
+                const m = await measure(SAMPLES, async i => {
+                    const start = startFor(i, fx.nrow, 256);
+                    await e.getRows({ start, end: start + 256, columns: firstCols, viewportGeneration: i + 2 }, 0);
+                });
+                console.error(`[bench] ${fx.name}: profiles still running after the samples: ${profiling} (${profiled} done)`);
+                return m;
+            } finally {
+                ac.abort();
+                await all;
+                await e.dispose();
+            }
+        };
+    }
     out.commit_protocol_round_trip = async () => {
         const e = await sharedEngine();
         const m = await measure(SAMPLES, async () => {
@@ -400,6 +447,7 @@ async function run(only?: Record<string, string[]>): Promise<Report> {
         results[name] = {};
         for (const [metric, fn] of Object.entries(measures)) {
             if (only && !only[name].includes(metric)) continue;
+            if (METRICS && !METRICS.includes(metric)) continue;
             results[name][metric] = await fn();
             console.error(`[bench] ${name}.${metric}: ${JSON.stringify(results[name][metric])}`);
         }

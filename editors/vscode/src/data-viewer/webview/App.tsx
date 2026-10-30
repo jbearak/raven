@@ -38,6 +38,13 @@ import {
     type WebviewToExtension,
 } from '../messages';
 import type { ToolbarState } from '../toolbar-state';
+import {
+    profileKind,
+    type CountedEntry,
+    type ProfileState,
+    type ProfileUpdate,
+    type ValueCounts,
+} from '../profile';
 import type { Cell } from '../wire-format';
 import { TileCache, tileGeometry } from './tile-cache';
 import { StatusLine, createRangeStore } from './status-line';
@@ -93,7 +100,23 @@ import {
     showAllColumns,
     toggleColumnHidden,
 } from './column-visibility-model';
-import { ColumnVisibilityPopover } from './column-visibility-popover';
+import { ColumnsSidebar, SIDEBAR_DEFAULT_PX } from './columns-sidebar';
+import { ValueCountsPopover, formatEntry } from './value-counts-popover';
+import { bandFont, bandRect, type BandColors } from './summary-band';
+import {
+    bandChart,
+    bandGeometry,
+    bandHit,
+    bandText,
+    brushedTotal,
+    brushPredicate,
+    chartIndexAt,
+    entryCell,
+    formatCount,
+    formatEstimate,
+    profileStateText,
+    setFilterFor,
+} from './summary-model';
 import { ColumnContextMenu } from './column-context-menu';
 import { ToolbarSortStrip } from './sort-strip';
 import { FilterStrip } from './filter-strip';
@@ -175,6 +198,29 @@ const LONG_VALUE_CHARS = 80;
 const EMPTY_LAYOUT: Layout = { columnWidths: {}, hiddenColumns: [] };
 const EMPTY_TOOLBAR: ToolbarState = { labelsOn: true, formatOn: true, digits: 3 };
 const DEFAULT_SETTINGS: Settings = { missingValueStyle: 'foreground', defaultDigits: 3, persistSort: true, persistFilters: true };
+
+/** The summary band defaults on up to this many columns and rows. */
+const SUMMARY_DEFAULT_MAX_COLS = 200;
+const SUMMARY_DEFAULT_MAX_ROWS = 1_000_000;
+/** Delay before a changed profile interest is posted (coalesces scroll). */
+const PROFILE_INTEREST_DEBOUNCE_MS = 120;
+/** The band tooltip sits this far below the band's top. */
+const BAND_TIP_OFFSET = 26;
+
+type ValueCountsState = {
+    source: number;
+    leftPx: number;
+    topPx: number;
+    order: 'desc' | 'asc';
+    requestId: number;
+    result?: ValueCounts;
+    error?: string;
+};
+
+function newFilterId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    return `f-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 /** Delay before the saved-sort/filter restore banner appears (#519). A
  *  restore that finishes faster than this never flashes the message; only a
@@ -266,6 +312,19 @@ function makeTextMeasure(ctx: CanvasRenderingContext2D | null, theme: GridTheme)
         label: at(`italic ${Math.round(fs * 0.92)}px ${family}`),
         cell: at(`${fs}px ${family}`),
     };
+}
+
+/** Apply the host's profile state changes (`null` drops a column). */
+function applyProfileUpdates(
+    prev: Record<number, ProfileState>,
+    updates: readonly ProfileUpdate[],
+): Record<number, ProfileState> {
+    const next = { ...prev };
+    for (const [c, state] of updates) {
+        if (state === null) delete next[c];
+        else next[c] = state;
+    }
+    return next;
 }
 
 function sameColumns(a: readonly ColumnSchema[], b: readonly ColumnSchema[]): boolean {
@@ -361,7 +420,29 @@ export function App({
     const [viewEpoch, setViewEpoch] = useState(0);
     const [gridSelection, setGridSelection] = useState<GridSelection>(createEmptySelection);
     const [resolvedLabels, setResolvedLabels] = useState<Record<number, Record<number, string>>>({});
-    const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
+    /** The Columns sidebar (replaces the old Columns popover). */
+    const [sidebarOpen, setSidebarOpen] = useState(false);
+    const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_PX);
+    const [sidebarFocus, setSidebarFocus] = useState<{ source: number; nonce: number } | null>(null);
+    /** Sidebar rows on screen (and the expanded one), for profiling. */
+    const sidebarVisibleRef = useRef<number[]>([]);
+    /** Column profiles by source column: loading, ready or failed. */
+    const [profiles, setProfiles] = useState<Record<number, ProfileState>>({});
+    const profilesRef = useRef(profiles);
+    profilesRef.current = profiles;
+    const [valueCounts, setValueCounts] = useState<ValueCountsState | null>(null);
+    const valueCountsRef = useRef(valueCounts);
+    valueCountsRef.current = valueCounts;
+    /** The header under the pointer (client-coordinate bounds), for the
+     *  summary band's clicks and tooltip. */
+    const hoverHeaderRef = useRef<{ displayCol: number; bounds: Rectangle } | null>(null);
+    /** A histogram brush in progress, drawn by drawHeader. */
+    const brushRef = useRef<{ source: number; displayCol: number; from: number; to: number } | null>(null);
+    /** The last clicked bin, for Shift-click ranges. */
+    const brushAnchorRef = useRef<{ source: number; index: number } | null>(null);
+    const interestTimerRef = useRef<number | null>(null);
+    const lastInterestRef = useRef('');
+    const pendingJumpRef = useRef<number | null>(null);
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
     const [headerTooltip, setHeaderTooltip] = useState<HeaderTooltipState | null>(null);
     const [cellDetail, setCellDetail] = useState<CellDetailState | null>(null);
@@ -463,10 +544,21 @@ export function App({
         return makeTextMeasure(measureCanvasRef.current?.getContext('2d') ?? null, theme);
     }, [theme]);
     const anyVariableLabel = useMemo(() => columns.some(c => !!c.variableLabel), [columns]);
+    /** The Σ band: the user's choice, else on for frames up to 200
+     *  columns and 1M rows. Off, it never requests profiles. */
+    const summariesOn = toolbar.summariesOn
+        ?? (columns.length <= SUMMARY_DEFAULT_MAX_COLS && nrow <= SUMMARY_DEFAULT_MAX_ROWS);
     const hMetrics = useMemo(
-        () => headerMetrics(theme.fontSizePx, anyVariableLabel),
-        [anyVariableLabel, theme.fontSizePx],
+        () => headerMetrics(theme.fontSizePx, anyVariableLabel, summariesOn),
+        [anyVariableLabel, summariesOn, theme.fontSizePx],
     );
+    const bandColors = useMemo((): BandColors => ({
+        fg: theme.descriptionFg,
+        accent: vscodeTheme.accentColor ?? theme.descriptionFg,
+        missing: theme.missingColor,
+        fontFamily: theme.fontFamily,
+        fontPx: Math.round(theme.fontSizePx * 0.8),
+    }), [theme.descriptionFg, theme.fontFamily, theme.fontSizePx, theme.missingColor, vscodeTheme.accentColor]);
     const gutterTitle = gutterHeaderText(nrow, nrowFiltered);
     const gutterPx = gutterWidth(nrow, t => textMeasure.cell(t), gutterTitle);
     /** Gutter, then the data columns. Frozen rowname columns shrink so
@@ -538,7 +630,7 @@ export function App({
     // (getCellContent, requestRows, the message listener).
     const live = useRef({
         effectiveNrow: 0, visibleCols: [] as readonly number[], panelGeneration: 0, schemaHash: '',
-        permuted: false,
+        permuted: false, summariesOn: false, frozenData: 0, ncol: 0,
     });
     live.current = {
         effectiveNrow: nrowFiltered ?? nrow,
@@ -546,7 +638,39 @@ export function App({
         panelGeneration,
         schemaHash,
         permuted: sort.keys.length > 0 || nrowFiltered !== undefined,
+        summariesOn,
+        frozenData: display.freezeColumns - 1,
+        ncol: columns.length,
     };
+    /** Post the columns to profile (`profile-scheduler.ts`): the band's
+     *  columns on screen while it's on, and the sidebar's rows, minus
+     *  profiles already held; nothing while the webview is hidden.
+     *  Debounced and read from refs, so scrolling never renders App. */
+    const scheduleProfileInterest = useCallback(() => {
+        if (interestTimerRef.current !== null) return;
+        interestTimerRef.current = window.setTimeout(() => {
+            interestTimerRef.current = null;
+            const l = live.current;
+            if (!l.panelGeneration || l.ncol === 0) return;
+            const want: number[] = [];
+            if (document.visibilityState !== 'hidden') {
+                if (l.summariesOn) {
+                    for (let p = 0; p < l.frozenData; p++) want.push(l.visibleCols[p]);
+                    const r = visibleColRangeRef.current;
+                    const end = Math.min(l.visibleCols.length, r.end);
+                    for (let p = Math.max(l.frozenData, r.start); p < end; p++) want.push(l.visibleCols[p]);
+                }
+                want.push(...sidebarVisibleRef.current);
+            }
+            const have = profilesRef.current;
+            const cols = [...new Set(want)].filter(c =>
+                c !== undefined && (have[c] === undefined || have[c].state === 'loading'));
+            const key = `${l.panelGeneration}|${cols.join(',')}`;
+            if (key === lastInterestRef.current) return;
+            lastInterestRef.current = key;
+            vscode.postMessage({ type: 'setProfileInterest', panelGeneration: l.panelGeneration, columns: cols });
+        }, PROFILE_INTEREST_DEBOUNCE_MS);
+    }, [vscode]);
     const persistedRef = useRef<() => PersistedState>(() => ({} as PersistedState));
     persistedRef.current = () => ({
         panelGeneration,
@@ -846,6 +970,13 @@ export function App({
         // replace; the webview now matches that, refetching lazily on demand.
         setHistograms({});
         histogramRequestedRef.current.clear();
+        // Profiles are per host reader; the host forgets what this client
+        // holds on every init/replace, so start over and re-send interest.
+        setProfiles({});
+        lastInterestRef.current = '';
+        setValueCounts(null);
+        brushRef.current = null;
+        brushAnchorRef.current = null;
         setFilterPending(false);
         setNrowFiltered(undefined);
         setLoading(false);
@@ -1497,6 +1628,17 @@ export function App({
                     if (m.panelGeneration !== panelGenerationRef.current) return;
                     setNullCounts({ counts: m.counts, done: m.done });
                     return;
+                case 'profiles':
+                    if (m.panelGeneration !== panelGenerationRef.current) return;
+                    setProfiles(prev => applyProfileUpdates(prev, m.updates));
+                    return;
+                case 'valueCounts': {
+                    if (m.panelGeneration !== panelGenerationRef.current) return;
+                    const open = valueCountsRef.current;
+                    if (!open || open.requestId !== m.requestId) return;
+                    setValueCounts({ ...open, result: m.result, error: m.result ? undefined : m.error ?? 'failed' });
+                    return;
+                }
                 case 'cellDetail':
                     if (m.panelGeneration !== panelGenerationRef.current) return;
                     setCellDetail(prev => (prev && prev.requestId === m.requestId
@@ -1773,6 +1915,15 @@ export function App({
                     }
                     return;
                 }
+                if (event.code === 'KeyS' || event.key === 'S') {
+                    // Open the Columns sidebar on the focused column's row.
+                    event.preventDefault();
+                    const focused = gridSelection.current?.cell[0] ?? gridSelection.columns.first();
+                    const sourceIndex = focused !== undefined ? sourceAt(display, focused) : undefined;
+                    setSidebarOpen(true);
+                    if (sourceIndex !== undefined) setSidebarFocus({ source: sourceIndex, nonce: Date.now() });
+                    return;
+                }
                 if (event.key === 'X' || event.code === 'KeyX') {
                     event.preventDefault();
                     const focused = gridSelection.current?.cell[0];
@@ -1851,8 +2002,16 @@ export function App({
             showPriorityBadge,
             missingInfo(sourceIndex),
             padding,
+            summariesOn
+                ? {
+                    state: profiles[sourceIndex],
+                    colors: bandColors,
+                    brush: brushRef.current?.source === sourceIndex
+                        ? [brushRef.current.from, brushRef.current.to] : undefined,
+                }
+                : undefined,
         );
-    }, [columns, display, gutterTitle, hMetrics, missingInfo, showPriorityBadge, sortByColumn, theme]);
+    }, [bandColors, columns, display, gutterTitle, hMetrics, missingInfo, profiles, showPriorityBadge, sortByColumn, summariesOn, theme]);
 
     /** Format the cell at a display location; undefined when not loaded. */
     const formattedAt = useCallback((displayCol: number, row: number): FormattedCell | undefined => {
@@ -1985,7 +2144,22 @@ export function App({
         const damage: { cell: Item }[] = [];
         for (let d = 0; d < display.count; d++) damage.push({ cell: [d, -1] });
         gridRef.current?.updateCells(damage);
-    }, [display.count, nullCounts, sortByColumn]);
+    }, [display.count, nullCounts, profiles, sortByColumn, summariesOn]);
+
+    // Profile interest follows the band, the sidebar and the visibility
+    // of the webview.
+    useEffect(() => {
+        scheduleProfileInterest();
+    }, [panelGeneration, profiles, scheduleProfileInterest, sidebarOpen, summariesOn, visibleCols]);
+    useEffect(() => {
+        const onVisibility = () => scheduleProfileInterest();
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibility);
+            if (interestTimerRef.current !== null) clearTimeout(interestTimerRef.current);
+            interestTimerRef.current = null;
+        };
+    }, [scheduleProfileInterest]);
 
     /** Auto-fit `sources` to their header text and up to `sampleLimit`
      *  loaded rows (60–400 px). */
@@ -2148,14 +2322,19 @@ export function App({
                 setHeaderTooltip(null);
                 return;
             }
+            hoverHeaderRef.current = { displayCol, bounds: args.bounds };
             const point = toGridShellPoint(args.bounds.x, args.bounds.y + args.bounds.height);
+            const lines = headerTooltipLines(col, missingInfo(sourceIndex));
+            const summary = summariesOn ? profileStateText(profiles[sourceIndex]) : undefined;
+            if (summary) lines.push(summary);
             setHeaderTooltip({
-                text: headerTooltipLines(col, missingInfo(sourceIndex)).join('\n'),
+                text: lines.join('\n'),
                 leftPx: point.leftPx,
                 topPx: point.topPx,
             });
             return;
         }
+        hoverHeaderRef.current = null;
         if (args.kind === 'cell') {
             // Cell detail on hover: the full value of a `###` number, a
             // timestamp's UTC offset, or the raw seconds of an
@@ -2179,7 +2358,135 @@ export function App({
             }
         }
         setHeaderTooltip(null);
-    }, [columns, display, formattedAt, gridColumns, isNumericColumn, missingInfo, numericOverflows, setHoverRow, toGridShellPoint]);
+    }, [columns, display, formattedAt, gridColumns, isNumericColumn, missingInfo, numericOverflows, profiles, setHoverRow, summariesOn, toGridShellPoint]);
+
+    /** The summary band under a client point, via the hovered header:
+     *  its column, profile, client-space band rect, and what it hits. */
+    const bandAt = useCallback((clientX: number, clientY: number) => {
+        const h = hoverHeaderRef.current;
+        if (!summariesOn || !h || hMetrics.bandY === undefined) return undefined;
+        const b = h.bounds;
+        if (clientX < b.x || clientX > b.x + b.width || clientY < b.y || clientY > b.y + b.height) return undefined;
+        const source = sourceAt(display, h.displayCol);
+        if (source === undefined) return undefined;
+        const band = bandRect(b, hMetrics.bandY, vscodeTheme.cellHorizontalPadding ?? 8);
+        if (clientY < band.y || clientY > band.y + band.height) return undefined;
+        const state = profiles[source];
+        const profile = state?.state === 'ready' ? state.profile : undefined;
+        let textWidth = 0;
+        if (profile) {
+            const ctx = measureCanvasRef.current?.getContext('2d');
+            if (ctx) {
+                ctx.font = bandFont(bandColors);
+                textWidth = ctx.measureText(bandText(profile)).width;
+            }
+        }
+        const hit = profile ? bandHit(profile, band, textWidth, clientX, clientY) : undefined;
+        return { source, displayCol: h.displayCol, state, profile, band, textWidth, hit };
+    }, [bandColors, display, hMetrics.bandY, profiles, summariesOn, vscodeTheme.cellHorizontalPadding]);
+
+    /** Replace `source`'s filter with `predicate` (one filter per column). */
+    const applyColumnFilter = useCallback((source: number, predicate: FilterEntry['predicate']) => {
+        const others = filterEntriesForRequest().filter(e => e.columnIndex !== source);
+        applyFilters([...others, {
+            id: newFilterId(), columnIndex: source, predicate, enabled: true, includeMissing: false,
+        }]);
+    }, [applyFilters, filterEntriesForRequest]);
+
+    const repaintHeader = useCallback((displayCol: number) => {
+        gridRef.current?.updateCells([{ cell: [displayCol, -1] }]);
+    }, []);
+
+    /** Band clicks: a bin filters to it, a drag or Shift-click to a range
+     *  of bins; a top-value bar seeds a set filter. Captured before Glide
+     *  so a band click never starts a column selection. */
+    const onBandPointerDown = useCallback((e: React.PointerEvent) => {
+        if (e.button !== 0) return;
+        const at = bandAt(e.clientX, e.clientY);
+        if (!at?.hit || !at.profile) return;
+        const { source, displayCol, profile, band, textWidth } = at;
+        const col = columns[source];
+        if (!col) return;
+        const chart = bandChart(profile);
+        if (at.hit.kind === 'bar' && chart.kind === 'bars') {
+            e.stopPropagation();
+            e.preventDefault();
+            const entry = chart.values[at.hit.index];
+            const predicate = entry && setFilterFor(col, profile.kind, [entry], toolbar.labelsOn);
+            if (predicate) applyColumnFilter(source, predicate);
+            return;
+        }
+        if (at.hit.kind !== 'bin' || chart.kind !== 'histogram' || !chart.brushable) return;
+        e.stopPropagation();
+        e.preventDefault();
+        const bins = chart.bins;
+        const anchor = brushAnchorRef.current;
+        if (e.shiftKey && anchor?.source === source) {
+            applyColumnFilter(source, brushPredicate(bins, anchor.index, at.hit.index));
+            return;
+        }
+        const chartRect = bandGeometry(band, textWidth).chart!;
+        brushRef.current = { source, displayCol, from: at.hit.index, to: at.hit.index };
+        repaintHeader(displayCol);
+        const onMove = (ev: PointerEvent) => {
+            const br = brushRef.current;
+            if (!br) return;
+            const x = Math.max(chartRect.x, Math.min(chartRect.x + chartRect.width - 0.01, ev.clientX));
+            const i = chartIndexAt(chart, chartRect, x);
+            if (i !== undefined && i !== br.to) {
+                br.to = i;
+                repaintHeader(displayCol);
+            }
+        };
+        const onUp = () => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            const br = brushRef.current;
+            brushRef.current = null;
+            repaintHeader(displayCol);
+            if (!br) return;
+            brushAnchorRef.current = { source, index: br.from };
+            applyColumnFilter(source, brushPredicate(bins, br.from, br.to));
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+    }, [applyColumnFilter, bandAt, columns, repaintHeader, toolbar.labelsOn]);
+
+    /** Band tooltip: the bin or value under the pointer, or the failure. */
+    const bandTipRef = useRef<string | null>(null);
+    const onBandPointerMove = useCallback((e: React.PointerEvent) => {
+        const at = bandAt(e.clientX, e.clientY);
+        let text: string | undefined;
+        if (at?.state?.state === 'failed') text = `Summary failed: ${at.state.error}`;
+        else if (at?.state?.state === 'loading') text = 'Summary: computing…';
+        else if (at?.profile && at.hit) {
+            const chart = bandChart(at.profile);
+            const col = columns[at.source];
+            if (chart.kind === 'histogram') {
+                const bin = chart.bins[at.hit.index];
+                const last = at.hit.index === chart.bins.length - 1;
+                const range = at.profile.kind === 'numeric'
+                    ? `[${Number(bin.lo.toPrecision(6))}, ${Number(bin.hi.toPrecision(6))}${last ? ']' : ')'}`
+                    : `bin ${at.hit.index + 1} of ${chart.bins.length}`;
+                text = `${range}: ${formatCount(brushedTotal(chart.bins, at.hit.index, at.hit.index))} rows`
+                    + (chart.brushable ? '\nClick to filter; drag or Shift-click for a range' : '');
+            } else if (chart.kind === 'bars' && col) {
+                const entry = chart.values[at.hit.index];
+                const label = formatEntry(entry, at.profile.kind, toolbar.labelsOn,
+                    cell => formatCell(cell, col, dictionaries[at.source], {
+                        labelsOn: toolbar.labelsOn, formatOn: toolbar.formatOn, digits: toolbar.digits, alignPad: false,
+                    }).text,
+                    v => entryCell(col, at.profile!.kind, v));
+                const count = at.profile.top?.exact ? formatCount(entry.count) : `≈ ${formatCount(entry.count)} ± ${formatCount(entry.error)}`;
+                text = `${label}: ${count}\nClick to filter to this value`;
+            }
+        }
+        if ((text ?? null) === bandTipRef.current) return;
+        bandTipRef.current = text ?? null;
+        if (!text) return;
+        const point = toGridShellPoint(e.clientX, (at?.band.y ?? e.clientY) + BAND_TIP_OFFSET);
+        setHeaderTooltip({ text, leftPx: point.leftPx, topPx: point.topPx });
+    }, [bandAt, columns, dictionaries, toGridShellPoint, toolbar.digits, toolbar.formatOn, toolbar.labelsOn]);
 
     /** Hooks read by the Glide accessibility patch: header names carry
      *  name, type, label, NA share and sort state; rows carry the R row
@@ -2191,12 +2498,14 @@ export function App({
                 const sourceIndex = sourceAt(display, col);
                 const c = sourceIndex === undefined ? undefined : columns[sourceIndex];
                 if (!c || sourceIndex === undefined) return undefined;
-                return headerAccessibleName(c, sortByColumn.get(sourceIndex), showPriorityBadge, missingInfo(sourceIndex));
+                const st = profiles[sourceIndex];
+                const distinct = st?.state === 'ready' ? formatEstimate(st.profile.distinct) : undefined;
+                return headerAccessibleName(c, sortByColumn.get(sourceIndex), showPriorityBadge, missingInfo(sourceIndex), distinct);
             },
             rowLabel: row => `row ${rRowNumber(row, tileCacheRef.current.originalRowIndex(row)).toLocaleString('en-US')}`,
         },
         onColumnAutoSize: autoSizeColumn,
-    }), [autoSizeColumn, columns, display, missingInfo, showPriorityBadge, sortByColumn]);
+    }), [autoSizeColumn, columns, display, missingInfo, profiles, showPriorityBadge, sortByColumn]);
 
     /** Scrolling: update the viewport ref (and the status line), request
      *  missing tiles, report the range. No React state changes here. */
@@ -2215,7 +2524,8 @@ export function App({
         setVisibleRange(viewport);
         requestRows(paddedRange(range.y, range.height, total, OVERSCAN_ROWS));
         postLifecycleRef.current('visible', viewport);
-    }, [requestRows, setVisibleRange]);
+        scheduleProfileInterest();
+    }, [requestRows, scheduleProfileInterest, setVisibleRange]);
 
     const updateHiddenColumns = useCallback((hiddenColumns: number[]) => {
         const nextLayout = { ...layout, hiddenColumns };
@@ -2225,6 +2535,50 @@ export function App({
         persistLayout(nextLayout);
         window.setTimeout(() => postLifecycle('columns'), 0);
     }, [clearRows, layout, persistLayout, postLifecycle]);
+
+    /** Scroll the grid to a column and select it (the sidebar's jump).
+     *  A hidden column is shown first. */
+    const jumpToColumn = useCallback((source: number) => {
+        const d = displayIndexOf(display, source);
+        if (d < 0) {
+            if (!layout.hiddenColumns.includes(source)) return;
+            pendingJumpRef.current = source;
+            updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, source));
+            return;
+        }
+        gridRef.current?.scrollTo(d, visibleRangeRef.current.start, 'horizontal');
+        const next = createColumnSelection(d);
+        setGridSelection(next);
+        postLifecycle('sidebar-jump', visibleRangeRef.current, next);
+    }, [display, layout.hiddenColumns, postLifecycle, updateHiddenColumns]);
+    useEffect(() => {
+        const source = pendingJumpRef.current;
+        if (source === null || displayIndexOf(display, source) < 0) return;
+        pendingJumpRef.current = null;
+        jumpToColumn(source);
+    }, [display, jumpToColumn]);
+
+    const onSidebarVisible = useCallback((sources: number[]) => {
+        sidebarVisibleRef.current = sources;
+        scheduleProfileInterest();
+    }, [scheduleProfileInterest]);
+
+    const formatValue = useCallback((source: number, cell: Cell): string => formatCell(cell, columns[source], dictionaries[source], {
+        labelsOn: toolbar.labelsOn, formatOn: toolbar.formatOn, digits: toolbar.digits, alignPad: false,
+    }).text, [columns, dictionaries, toolbar.digits, toolbar.formatOn, toolbar.labelsOn]);
+
+    const requestValueCounts = useCallback((source: number, order: 'desc' | 'asc', leftPx: number, topPx: number) => {
+        const requestId = nextRequestId();
+        setValueCounts({ source, order, leftPx, topPx, requestId });
+        vscode.postMessage({ type: 'getValueCounts', panelGeneration, requestId, columnIndex: source, order });
+    }, [nextRequestId, panelGeneration, vscode]);
+
+    /** The grid's focused column (cell cursor, else the first selected
+     *  column), as a source index. */
+    const focusedSource = useMemo(() => {
+        const d = gridSelection.current?.cell[0] ?? gridSelection.columns.first();
+        return d === undefined ? undefined : sourceAt(display, d);
+    }, [display, gridSelection]);
 
     return (
         <div className="data-viewer-root">
@@ -2276,6 +2630,15 @@ export function App({
                        labelled / Float). When no column in the dataset is
                        affected, the control can never do anything, so hide it
                        rather than show a permanently-greyed button. */}
+                    <button
+                        type="button"
+                        className={summariesOn ? 'toggle active' : 'toggle'}
+                        aria-pressed={summariesOn}
+                        title="Column summaries in the header (all rows)"
+                        onClick={() => setToolbar(t => ({ ...t, summariesOn: !summariesOn }))}
+                    >
+                        Σ
+                    </button>
                     {labelsHaveEffect && (
                         <button
                             type="button"
@@ -2314,24 +2677,16 @@ export function App({
                     <div className="columns-popover-anchor">
                         <button
                             type="button"
-                            className={columnsPopoverOpen ? 'toggle active' : 'toggle'}
-                            onClick={() => setColumnsPopoverOpen(open => !open)}
+                            className={sidebarOpen ? 'toggle active' : 'toggle'}
+                            aria-pressed={sidebarOpen}
+                            aria-controls="columns-sidebar"
+                            onClick={() => setSidebarOpen(open => !open)}
                         >
                             Columns
                             {layout.hiddenColumns.length > 0 && (
                                 <span className="hidden-count-badge">{layout.hiddenColumns.length}</span>
                             )}
                         </button>
-                        {columnsPopoverOpen && (
-                            <ColumnVisibilityPopover
-                                columns={columns}
-                                hiddenColumns={layout.hiddenColumns}
-                                onToggle={index => updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, index))}
-                                onShowAll={() => updateHiddenColumns(showAllColumns())}
-                                onHideAll={() => updateHiddenColumns(hideAllColumns(columns))}
-                                onClose={() => setColumnsPopoverOpen(false)}
-                            />
-                        )}
                     </div>
                 </div>
             </div>
@@ -2349,7 +2704,13 @@ export function App({
                     )}
                 </div>
             )}
-            <div className="grid-shell" ref={gridShellRef}>
+            <div className="data-viewer-body">
+            <div
+                className="grid-shell"
+                ref={gridShellRef}
+                onPointerDownCapture={onBandPointerDown}
+                onPointerMove={summariesOn ? onBandPointerMove : undefined}
+            >
                 <DataEditor
                     ref={gridRef}
                     renderers={DATA_VIEWER_RENDERERS}
@@ -2485,6 +2846,12 @@ export function App({
                                 updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, contextMenu.columnIndex!));
                                 setContextMenu(null);
                             }}
+                        onValueCounts={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
+                            ? () => {
+                                requestValueCounts(contextMenu.columnIndex!, 'desc', contextMenu.leftPx, contextMenu.topPx);
+                                setContextMenu(null);
+                            }
+                            : undefined}
                         onClose={() => setContextMenu(null)}
                         sort={contextMenu.kind === 'column' && contextMenu.columnIndex !== undefined
                             ? {
@@ -2616,6 +2983,55 @@ export function App({
                         {headerTooltip.text}
                     </div>
                 )}
+                {valueCounts && columns[valueCounts.source] && (() => {
+                    const col = columns[valueCounts.source];
+                    const kind = profileKind(col);
+                    return (
+                        <ValueCountsPopover
+                            key={valueCounts.source}
+                            column={col}
+                            kind={kind}
+                            result={valueCounts.result}
+                            error={valueCounts.error}
+                            order={valueCounts.order}
+                            leftPx={valueCounts.leftPx}
+                            topPx={valueCounts.topPx}
+                            format={(entry: CountedEntry) => formatEntry(entry, kind, toolbar.labelsOn,
+                                cell => formatValue(valueCounts.source, cell),
+                                v => entryCell(col, kind, v))}
+                            onOrder={order => requestValueCounts(valueCounts.source, order, valueCounts.leftPx, valueCounts.topPx)}
+                            onApply={entries => {
+                                const predicate = setFilterFor(col, kind, entries, toolbar.labelsOn);
+                                if (predicate) applyColumnFilter(valueCounts.source, predicate);
+                                setValueCounts(null);
+                            }}
+                            onClose={() => setValueCounts(null)}
+                        />
+                    );
+                })()}
+            </div>
+            {sidebarOpen && (
+                <div id="columns-sidebar" className="columns-sidebar-host">
+                    <ColumnsSidebar
+                        columns={columns}
+                        hiddenColumns={layout.hiddenColumns}
+                        profiles={profiles}
+                        missing={source => nullCounts?.done ? nullCounts.counts[source] : undefined}
+                        nrow={nrow}
+                        width={sidebarWidth}
+                        formatValue={formatValue}
+                        focusRequest={sidebarFocus}
+                        selectedSource={focusedSource}
+                        onToggle={index => updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, index))}
+                        onShowAll={() => updateHiddenColumns(showAllColumns())}
+                        onHideAll={() => updateHiddenColumns(hideAllColumns(columns))}
+                        onJump={jumpToColumn}
+                        onResize={setSidebarWidth}
+                        onVisibleChange={onSidebarVisible}
+                        onClose={() => { setSidebarOpen(false); gridRef.current?.focus(); }}
+                    />
+                </div>
+            )}
             </div>
             <StatusLine
                 store={rangeStore}

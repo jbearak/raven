@@ -265,7 +265,7 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
                             <input
                                 type="checkbox"
                                 checked={numBetween.inclusive}
-                                onChange={e => setNumBetween(s => ({ ...s, inclusive: e.target.checked }))}
+                                onChange={e => setNumBetween(s => ({ lo: s.lo, hi: s.hi, inclusive: e.target.checked }))}
                             />
                             Inclusive (≤, ≥)
                         </label>
@@ -274,7 +274,7 @@ export function FilterPopover({ column, columnIndex, histogram, initial, onApply
                                 bins={histogram}
                                 lo={histoValid ? histoLo : histoDMin}
                                 hi={histoValid ? histoHi : histoDMax}
-                                onChange={(lo, hi) => setNumBetween(s => ({ ...s, lo: String(lo), hi: String(hi) }))}
+                                onChange={(lo, hi) => setNumBetween(s => ({ lo: String(lo), hi: String(hi), inclusive: s.inclusive }))}
                             />
                         )}
                     </>

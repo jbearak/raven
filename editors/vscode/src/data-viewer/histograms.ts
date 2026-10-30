@@ -21,6 +21,14 @@
  * the result per reader). `computeNumericHistograms` (all columns at once)
  * remains for tests and any future eager use. RSS is bounded by the bin
  * array (50 × 24 bytes per numeric column), not by row count.
+ *
+ * Bins are `[lo, hi)` except the last, `[lo, hi]`, and a value's bin is
+ * decided by comparing it with the edges it will be filtered against
+ * ({@link binIndex}), not by the division alone, so a filter
+ * `lo <= x < hi` built from bins selects exactly the rows they count.
+ * Column profiles (`profile-engine.ts`) bin with the same helpers and
+ * fill the scan worker's histogram cache, so a profiled column's filter
+ * popover needs no scan.
  */
 
 import type { ArrowSliceReader } from './arrow-reader';
@@ -28,7 +36,38 @@ import type { HistogramBin } from './messages';
 import { iterateBatches } from './batch-iter';
 import { throwIfAborted } from './abort';
 
-const BIN_COUNT = 50;
+export const BIN_COUNT = 50;
+
+/** `n + 1` edges of `n` uniform bins over `[min, max]`; the last edge is
+ *  `max` itself. */
+export function binEdges(min: number, max: number, n: number): Float64Array {
+    const width = (max - min) / n;
+    const edges = new Float64Array(n + 1);
+    for (let i = 0; i < n; i++) edges[i] = min + i * width;
+    edges[n] = max;
+    return edges;
+}
+
+/** The bin of finite `x` in `[edges[0], edges[n]]`: `edges[i] <= x <
+ *  edges[i + 1]`, or the last bin for `x == edges[n]`. */
+export function binIndex(x: number, edges: Float64Array): number {
+    const n = edges.length - 1;
+    const min = edges[0];
+    let idx = Math.floor(((x - min) / (edges[n] - min)) * n);
+    if (idx >= n) idx = n - 1;
+    if (idx < 0) idx = 0;
+    while (idx > 0 && x < edges[idx]) idx--;
+    while (idx < n - 1 && x >= edges[idx + 1]) idx++;
+    return idx;
+}
+
+/** Bins from edges and counts. */
+export function binsFrom(edges: Float64Array, counts: ArrayLike<number>): HistogramBin[] {
+    const n = edges.length - 1;
+    const bins: HistogramBin[] = new Array(n);
+    for (let i = 0; i < n; i++) bins[i] = { lo: edges[i], hi: edges[i + 1], count: counts[i] };
+    return bins;
+}
 
 /** True for the Arrow types that produce a numeric histogram (the same
  *  types `colKind` classifies as `numeric` / `labelledNumeric`). The host
@@ -88,12 +127,8 @@ export async function computeHistogramForColumn(
         return [{ lo: min, hi: max, count }];
     }
 
-    const width = (max - min) / BIN_COUNT;
-    const bins: HistogramBin[] = new Array(BIN_COUNT);
-    for (let i = 0; i < BIN_COUNT; i++) {
-        bins[i] = { lo: min + i * width, hi: min + (i + 1) * width, count: 0 };
-    }
-    bins[BIN_COUNT - 1].hi = max;
+    const edges = binEdges(min, max, BIN_COUNT);
+    const counts = new Float64Array(BIN_COUNT);
 
     for await (const { batch, length } of iterateBatches(reader, [columnIndex], signal)) {
         const child = batch.getChildAt(columnIndex);
@@ -102,12 +137,10 @@ export async function computeHistogramForColumn(
             if (v === null || v === undefined) continue;
             const x = typeof v === 'bigint' ? Number(v) : (v as number);
             if (!Number.isFinite(x)) continue;
-            let idx = Math.floor((x - min) / width);
-            if (idx >= BIN_COUNT) idx = BIN_COUNT - 1;
-            if (idx < 0) idx = 0;
-            bins[idx].count++;
+            counts[binIndex(x, edges)]++;
         }
     }
+    const bins = binsFrom(edges, counts);
     throwIfAborted(signal);
     return bins;
 }

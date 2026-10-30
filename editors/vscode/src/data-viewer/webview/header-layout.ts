@@ -5,6 +5,7 @@
  *   │ mpg                ▲2│  name (600 weight); sort glyph in a reserved slot
  *   │ <dbl>                │  type tag, description color, ×0.85 size
  *   │ Miles per gallon     │  variable label, italic; only when any column has one
+ *   │ ▁▂▅█▆▃▁  12% NA · 31 │  summary band (Σ toggle), see `summary-band.ts`
  *   └──────────────────────┘
  *     ▔▔▔▔ missing bar (2 px), proportional to the NA share
  *
@@ -18,6 +19,9 @@
 import type { ColumnSchema } from '../arrow-reader';
 import { describeTypeTag, displayTypeTag } from '../display-format';
 import { fitLeadingText } from './grid-model';
+import type { ProfileState } from '../profile';
+import { BAND_PX } from './summary-model';
+import { bandRect, drawSummaryBand, type BandColors } from './summary-band';
 
 /** Width reserved at the right edge for the sort glyph and priority. */
 export const SORT_SLOT_PX = 18;
@@ -29,14 +33,17 @@ export type HeaderMetrics = {
     nameY: number;
     tagY: number;
     labelY: number | undefined;
+    /** Top of the summary band, when the band is on. */
+    bandY: number | undefined;
     nameFontPx: number;
     tagFontPx: number;
     labelFontPx: number;
 };
 
 /** Slot positions (baselines are vertical centers) for a header drawn at
- *  `fontSizePx`, with a label line only when `withLabels`. */
-export function headerMetrics(fontSizePx: number, withLabels: boolean): HeaderMetrics {
+ *  `fontSizePx`, with a label line only when `withLabels` and the summary
+ *  band only when `withBand`. */
+export function headerMetrics(fontSizePx: number, withLabels: boolean, withBand = false): HeaderMetrics {
     const nameFontPx = fontSizePx;
     const tagFontPx = Math.round(fontSizePx * 0.85);
     const labelFontPx = Math.round(fontSizePx * 0.92);
@@ -47,8 +54,10 @@ export function headerMetrics(fontSizePx: number, withLabels: boolean): HeaderMe
     const nameY = top + nameLine / 2;
     const tagY = top + nameLine + tagLine / 2;
     const labelY = withLabels ? top + nameLine + tagLine + labelLine / 2 : undefined;
-    const height = top + nameLine + tagLine + (withLabels ? labelLine : 0) + 4 + MISSING_BAR_PX;
-    return { height, nameY, tagY, labelY, nameFontPx, tagFontPx, labelFontPx };
+    const textBottom = top + nameLine + tagLine + (withLabels ? labelLine : 0);
+    const bandY = withBand ? textBottom + 2 : undefined;
+    const height = textBottom + (withBand ? BAND_PX : 0) + 4 + MISSING_BAR_PX;
+    return { height, nameY, tagY, labelY, bandY, nameFontPx, tagFontPx, labelFontPx };
 }
 
 /** NA state of a column for the missing bar: `undefined` before the
@@ -76,6 +85,14 @@ function ellipsize(ctx: CanvasRenderingContext2D, text: string, maxWidth: number
     return fitLeadingText(text, maxWidth, t => ctx.measureText(t).width, '…').text;
 }
 
+/** What the summary band draws for one header. */
+export type HeaderBand = {
+    state: ProfileState | undefined;
+    colors: BandColors;
+    /** Bins being brushed, while a drag is in progress. */
+    brush?: [number, number];
+};
+
 export function drawDataHeader(
     ctx: CanvasRenderingContext2D,
     rect: HeaderRect,
@@ -86,6 +103,7 @@ export function drawDataHeader(
     showPriority: boolean,
     missing: MissingInfo,
     padding: number,
+    band?: HeaderBand,
 ): void {
     const x = rect.x + padding;
     const textWidth = rect.width - padding * 2 - SORT_SLOT_PX;
@@ -110,6 +128,9 @@ export function drawDataHeader(
     }
 
     if (sort) drawSortGlyph(ctx, rect, metrics, colors, sort, showPriority);
+    if (band && metrics.bandY !== undefined) {
+        drawSummaryBand(ctx, bandRect(rect, metrics.bandY, padding), band.state, band.colors, band.brush);
+    }
     drawMissingBar(ctx, rect, colors.missing, missing);
     ctx.restore();
 }
@@ -188,11 +209,13 @@ export function headerAccessibleName(
     sort: SortGlyph | undefined,
     showPriority: boolean,
     missing: MissingInfo,
+    distinct?: string,
 ): string {
     const parts = [col.name, describeTypeTag(displayTypeTag(col))];
     if (col.variableLabel) parts.push(col.variableLabel);
     const share = formatMissingShare(missing);
     if (share) parts.push(share);
+    if (distinct) parts.push(`${distinct} distinct`);
     if (sort) {
         parts.push(`sorted ${sort.direction === 'asc' ? 'ascending' : 'descending'}`);
         if (showPriority) parts.push(`priority ${sort.priority}`);

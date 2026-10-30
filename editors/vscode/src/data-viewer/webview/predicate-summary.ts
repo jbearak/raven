@@ -12,6 +12,12 @@ import type { FilterPredicate } from '../messages';
 
 const SET_TRUNC_AT = 4;
 
+/** A bin edge for a chip: 6 significant digits (the filter keeps the
+ *  exact edge). */
+function short(x: number): string {
+    return String(Number(x.toPrecision(6)));
+}
+
 export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): string {
     const n = col.name;
     switch (p.kind) {
@@ -19,6 +25,10 @@ export function summarizePredicate(p: FilterPredicate, col: ColumnSchema): strin
         case 'isNotEmpty': return `${n} is not empty`;
         case 'numCompare': return `${n} ${numOp(p.op)} ${p.value}`;
         case 'numBetween':
+            if (p.upperInclusive !== undefined && p.upperInclusive !== p.inclusive) {
+                // A histogram brush: half-open interval notation.
+                return `${n} ∈ ${p.inclusive ? '[' : '('}${short(p.lo)}, ${short(p.hi)}${p.upperInclusive ? ']' : ')'}`;
+            }
             return p.inclusive ? `${n} ${p.lo}–${p.hi}` : `${n} (${p.lo}, ${p.hi})`;
         case 'numNotBetween':
             return p.inclusive ? `${n} not in ${p.lo}–${p.hi}` : `${n} not in (${p.lo}, ${p.hi})`;

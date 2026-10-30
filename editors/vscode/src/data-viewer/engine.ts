@@ -16,6 +16,7 @@
  */
 import type { ArrowSliceReader, GetRowsRequest, GetRowsResponse } from './arrow-reader';
 import type { HistogramBin } from './messages';
+import type { ColumnProfile, ValueCounts } from './profile';
 import { MemoryCounter, PermRegistry } from './perm-buffer';
 import { ReaderCore } from './reader-core';
 import { ScanCore } from './scan-core';
@@ -58,6 +59,12 @@ export interface DataEngine {
     ): Promise<{ text: string | null; truncated: boolean }>;
     nullCounts(signal: AbortSignal, onProgress: (counts: ArrayLike<number>) => void): Promise<ArrayLike<number>>;
     histogram(columnIndex: number, signal: AbortSignal): Promise<HistogramBin[]>;
+    /** One column's profile, at the lowest priority: it pauses while
+     *  viewport reads or other scans run. */
+    profile(columnIndex: number, signal: AbortSignal): Promise<ColumnProfile>;
+    valueCounts(
+        columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal,
+    ): Promise<ValueCounts>;
     /** True (once) if the scan worker restarted since the last call, so
      *  its key and rank caches are gone. */
     takeScanRestarted(): boolean;
@@ -73,9 +80,11 @@ export class LocalEngine implements DataEngine {
     readonly coordinator: TransformCoordinator;
     readonly scan: ScanCore;
     readonly readerCore: ReaderCore;
+    /** Viewport reads in flight (profiles pause while non-zero). */
+    readonly priority = new Int32Array(1);
 
     constructor(reader: ArrowSliceReader) {
-        this.scan = new ScanCore(reader, this.counter);
+        this.scan = new ScanCore(reader, this.counter, this.priority);
         this.readerCore = new ReaderCore(reader);
         const core = this.readerCore;
         const scan = this.scan;
@@ -113,8 +122,13 @@ export class LocalEngine implements DataEngine {
         this.coordinator.registry.release(t.perm);
     }
 
-    getRows(req: ViewportRequest, gen: number | undefined): Promise<GetRowsResponse> {
-        return this.readerCore.getRows(req, gen);
+    async getRows(req: ViewportRequest, gen: number | undefined): Promise<GetRowsResponse> {
+        this.priority[0]++;
+        try {
+            return await this.readerCore.getRows(req, gen);
+        } finally {
+            this.priority[0]--;
+        }
     }
 
     getCellText(row: number, columnIndex: number, maxBytes: number, gen: number | undefined) {
@@ -127,6 +141,14 @@ export class LocalEngine implements DataEngine {
 
     histogram(columnIndex: number, signal: AbortSignal) {
         return this.scan.histogram(columnIndex, signal);
+    }
+
+    profile(columnIndex: number, signal: AbortSignal) {
+        return this.scan.profile(columnIndex, signal);
+    }
+
+    valueCounts(columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal) {
+        return this.scan.valueCounts(columnIndex, order, limit, signal);
     }
 
     takeScanRestarted(): boolean { return false; }

@@ -36,7 +36,9 @@ describe('data viewer build bundle', () => {
         'uses production React and stays below the data-viewer size budget',
         () => {
             expect(existsSync(data_viewer_bundle)).toBe(true);
-            expect(statSync(data_viewer_bundle).size).toBeLessThan(450_000);
+            // ~423 KB before column summaries; the band, the Columns
+            // sidebar and value counts add ~28 KB.
+            expect(statSync(data_viewer_bundle).size).toBeLessThan(480_000);
 
             const bundle = readFileSync(data_viewer_bundle, 'utf8');
             expect(bundle).not.toContain('react-dom.development');
