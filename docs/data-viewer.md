@@ -60,6 +60,7 @@ Each column header has up to three lines and a thin bar along its bottom edge:
 │ mpg                ▲2│  column name; sort direction and priority at the right
 │ <dbl>                │  type
 │ Miles per gallon     │  variable label
+│ ▁▂▅█▆▃▁  3% NA · 25  │  summary band (Σ), see Column summaries
 └──────────────────────┘
   ▔▔▔▔                    share of NA values
 ```
@@ -67,6 +68,7 @@ Each column header has up to three lines and a thin bar along its bottom edge:
 - The **type** line uses the same short tags as tibble: `<int>`, `<dbl>`, `<chr>`, `<lgl>`, `<fct>`, `<ord>`, `<date>`, `<dttm>`, `<drtn>`, `<cpl>`, and `<list>`. Columns with value labels add `+lbl` (`<dbl+lbl>`). A date-time column names the time zone its values are shown in (`<dttm America/New_York>`), and a duration names its unit (`<drtn secs>`).
 - The **label** line shows the variable label (`attr(col, "label")`). It appears only when at least one column has a label, and the Labels toggle doesn't hide it.
 - The **missing bar** fills in proportion to the column's share of NA values. Raven counts them in the background after the grid first appears; until the count is done, the bar is dashed.
+- The **summary band** appears while the Σ toggle is on. See [Column summaries](#column-summaries).
 - Long names and labels end in `…`. Hover over a header for the full name and label, the R class, the source display format, the exact NA count and share, and the first few value labels.
 
 ## Missing values and row numbers
@@ -78,14 +80,14 @@ Each column header has up to three lines and a thin bar along its bottom edge:
 ## Toolbar
 
 ```text
-32 × 11   Sort: mpg ▲ cyl ▼ ✕   Filter: cyl ∈ {6,8} ✕        [Labels] [Format] [3 ▾] [Columns 2]
+32 × 11   Sort: mpg ▲ cyl ▼ ✕   Filter: cyl ∈ {6,8} ✕    [Σ] [Labels] [Format] [3 ▾] [Columns 2]
 …grid…
 rows 1–20 of 12 (filtered from 32) · 11 cols
 ```
 
 The left end of the toolbar shows the frame's shape, rows × columns, or `12 of 32 rows × 11` while a filter is active. The status line under the grid shows the exact range of rows on screen and the filter context.
 
-The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
+The Sort and Filter strips are hidden when no sort or filter is active. When the panel is too narrow for the strips beside the buttons, the strips move to a second row so Σ, Labels, Format, and Columns stay reachable. Each strip scrolls horizontally on its own row if its chips still overflow. The toolbar doesn't flicker between one and two rows as you resize the panel across that width.
 
 Each toggle is filled when active; click to flip it. The Labels and Format buttons (and the digits dropdown) are hidden when no column in the data would be affected. For example, an all-integer matrix hides all three, while a frame with only factors hides Format and digits but keeps Labels. The badge on Columns counts the hidden columns and is absent when none are hidden.
 
@@ -114,9 +116,20 @@ When a column carries a display format from Stata, SPSS, or SAS (`haven` keeps i
 
 Dates print as `2024-03-01`, and date-times as `2024-03-01 09:00:00` in the column's own time zone (its `tzone` attribute), or the R session's zone when it has none. Hover over a date-time for the UTC offset in effect at that moment, so the two 01:30s on the night clocks fall back are told apart. Fractional seconds show 0, 3, or 6 digits, chosen once per column so the width doesn't change as you scroll. Years before 1 and after 9999 print as R prints them (`-044`, `10000`). A value too far from 1970 for the viewer to show reads `<out of range>`; hover for its raw seconds. If a time zone name isn't recognized, values show in UTC and the type line says so.
 
-### Columns popover
+<a id="columns-popover"></a>
 
-The Columns ▾ button opens a popover with one checkbox per column. Hidden and shown columns are remembered for the panel name and the data's column layout, so the same `View(mtcars)` opened tomorrow keeps the layout.
+### Columns sidebar
+
+The Columns button opens a sidebar at the right of the grid with one row per column: a checkbox to show or hide it, its name, type, and label, a bar and percentage for its missing values, its distinct count, and a small chart of its values (the same chart as the [summary band](#column-summaries)).
+
+- Type in the search box to find columns by name or label. The Sort menu orders the list by position, name, type, % missing, or distinct count; the arrow button flips the order.
+- Click a row to scroll the grid to that column and select it. Clicking a hidden column's row shows it first.
+- Click the ▸ at the start of a row, or press `→`, to see the column's summary. See [What a summary shows](#what-a-summary-shows).
+- Show all and Hide all change every column at once.
+- Drag the sidebar's left edge to resize it (260 px to start). It lists thousands of columns without slowing down, because only the rows on screen are drawn.
+- With the list focused, `↑` and `↓` move between rows, `Enter` jumps to the column, `Space` shows or hides it, and `Escape` closes the sidebar. `Shift+Alt+S` in the grid opens the sidebar on the focused column's row.
+
+Hidden and shown columns are remembered for the panel name and the data's column layout, so the same `View(mtcars)` opened tomorrow keeps the layout.
 
 Columns start wide enough for their name, type, label, and first loaded values, up to 400 px. Drag a header border to resize (40 to 3,200 px), or double-click it to fit the loaded values; dragged widths are remembered with the layout. Frames whose row names became a `rowname` column count as a new column layout, so their saved widths, hidden columns, sort, and filters reset once after updating Raven.
 
@@ -131,7 +144,7 @@ Columns start wide enough for their name, type, label, and first loaded values, 
 - Row numbers and the `rowname` column aren't copied. Choose Copy with row names from the right-click menu to include the `rowname` column, or, for a frame without one, the R row numbers.
 - Double-click a cell, or press `Enter`, to see a long or cut-off value in full (up to 64 KiB) with a Copy button.
 - Right-click a cell or column header for a Copy menu that copies the current selection. Right-clicking a column header always selects just that column first. Right-clicking a cell outside the selection selects it first; right-clicking a cell inside the selection keeps the selection.
-- The column-header menu also offers Hide column, plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
+- The column-header menu also offers Hide column and [Value counts](#value-counts), plus the items described under [Sorting](#sorting) and [Filtering](#filtering). The default Cut/Copy/Paste menu is turned off elsewhere in the panel.
 - Copying is capped at 5,000,000 cells. Over the cap, the panel shows a message and doesn't copy.
 
 <a id="keyboard-shortcuts"></a>
@@ -152,6 +165,7 @@ Columns start wide enough for their name, type, label, and first loaded values, 
 | `Shift+Alt+A` | Sort the focused column ascending. |
 | `Shift+Alt+D` | Sort the focused column descending. |
 | `Shift+Alt+0` | Clear all sorts. |
+| `Shift+Alt+S` | Open the Columns sidebar on the focused column. |
 
 ## Sorting
 
@@ -286,6 +300,58 @@ Active filters are remembered for the panel name and the data's column layout, a
 | `Shift+Alt+9` | Clear all active filters. |
 | `Enter` (in editor) | Apply the filter and close the editor. |
 | `Escape` (in editor) | Cancel without applying. |
+
+## Column summaries
+
+Every column can show a summary of its values: a small chart in the header, and the numbers behind it in the Columns sidebar. Summaries always describe all the rows of the data, not the rows a filter leaves, and the tooltip says so ("Summary of all 32 rows").
+
+### Summary band
+
+The Σ button adds a band under each header. It's on by default for data with up to 200 columns and up to 1,000,000 rows, and off for anything larger. Click Σ to turn it on or off; the choice is remembered with the other toolbar toggles.
+
+```text
+mpg  <dbl>   ▁▂▅█▆▃▁  3% NA · 25       numbers, dates, date-times: a 20-bar histogram
+origin <fct> █ ▆ ▃    0% NA · 3        factors, labelled and text columns: the 5 most common values
+am  <lgl>    ████▒▒▒  5% NA · 2        logicals: TRUE, FALSE and NA shares
+```
+
+After the chart, the band shows the share of missing values (`NA` and `NaN`) and the number of distinct values. A summary appears a moment after its column comes into view, while a faint placeholder marks the ones still being computed. Raven summarizes only the columns on screen, one at a time, and only while the panel is visible; scrolling and sorting never wait for a summary. A summary that can't be computed shows `—`, and its tooltip gives the reason.
+
+Hover over a bar to see the range or value it counts and how many rows it holds.
+
+### Filter from the band
+
+- Click a histogram bar to filter to the rows in it. Drag across bars, or click one and Shift-click another, to filter to the range they cover.
+- Each bar counts values from its lower edge up to, but not including, its upper edge; the last bar includes its upper edge. The filter uses the same edges, so the number of rows it keeps equals the bars' total. The chip reads like `mpg ∈ [15.2, 19.4)`, and you can edit it like any other filter.
+- Click one of the most-common-value bars to filter to that value.
+- Date and date-time histograms don't filter when clicked; use the column's filter instead.
+
+### What a summary shows
+
+Expand a column in the Columns sidebar to see its summary:
+
+- **Numbers**: rows with a value, NA, NaN, distinct count, minimum, 25th percentile, median, mean, 75th percentile, maximum, and standard deviation. Percentiles use R's default `quantile()` method.
+- **Factors and labelled columns**: how many of the declared levels or labels occur ("31 of 32 used", since unused levels are common after subsetting), and the count and share of each level, for up to 24 levels.
+- **Text**: distinct count, empty strings, shortest and longest length in characters, and the 5 most common values.
+- **Logicals**: TRUE, FALSE, and NA counts.
+- **Dates and date-times**: earliest, latest, and the time zone.
+
+Distinct counts leave out `NA` and `NaN`, as `length(unique(x[!is.na(x)]))` does in R.
+
+### Exact and estimated values
+
+Most numbers in a summary are exact. On very large or very varied columns, a few are estimated so the summary stays fast, and every estimate starts with `≈`:
+
+- Counts of NA and NaN, minimum, maximum, mean, standard deviation, and the histogram are always exact.
+- Percentiles are exact up to 100,000 values, or once the column has been sorted in this panel. Beyond that they come from a random sample of 100,000 values.
+- Distinct counts are exact for factors, and for other columns up to 100,000 distinct values. Beyond that they're estimated, usually within 1 to 2%.
+- Most-common values have exact counts up to 100,000 distinct values. Beyond that, each count shows how far off it can be, as `≈ 4,210 ± 12`. When those margins mean two values could be in either order, the list says "approximate order".
+
+### Value counts
+
+Right-click a column header and choose Value counts… to list the column's values with their count, share of rows with a value, and a bar, most common first. Check Rarest first to reverse the order; it's available when every count is exact.
+
+Click values to select them, then click Filter to keep only the rows with those values. This replaces any filter already on the column. For a date column, pick one date.
 
 ## Troubleshooting
 
