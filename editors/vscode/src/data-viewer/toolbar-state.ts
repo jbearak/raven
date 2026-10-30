@@ -5,12 +5,14 @@
  * schemaHash` so two unrelated `View(df)` calls under the same panel name
  * don't collide, and bounded by `cap` with LRU eviction.
  *
- * Stores `labelsOn`, `formatOn`, `digits` so a fresh `View(x)` call
- * restores the user's prior toggle state for the same dataset shape
- * (column names + Arrow types in declared order).
+ * Stores `labelsOn`, `formatOn`, `digits`, and the sort menu's string
+ * order so a fresh `View(x)` call restores the user's prior toggle state
+ * for the same dataset shape (column names + Arrow types in declared
+ * order).
  */
 
 import type { Memento } from './layout-state';
+import type { StringOrder } from './messages';
 
 const PREFIX = 'raven.dataViewer.toolbar::';
 const ORDER_KEY = 'raven.dataViewer.toolbarOrder';
@@ -19,6 +21,9 @@ export type ToolbarState = {
     labelsOn: boolean;
     formatOn: boolean;
     digits: number;
+    /** String order chosen in the sort menu, used by the next sort.
+     *  Absent ⇔ `natural`. */
+    sortOrder?: StringOrder;
 };
 
 export class ToolbarStateStore {

@@ -41,6 +41,29 @@ async function buildExtension() {
 }
 
 /**
+ * Build the data viewer's two worker_threads entries: the reader thread
+ * (viewport reads) and the scan worker (sort, filter, null counts). They
+ * run where the extension host runs (local, remote, WSL) and are resolved
+ * from `extensionUri`, so they ship in `dist/` beside `extension.js`.
+ */
+async function buildDataViewerThreads() {
+    const threads = path.join(root, 'src', 'data-viewer', 'threads');
+    await Promise.all([
+        ['reader-thread.ts', 'data-viewer-reader.js'],
+        ['scan-worker.ts', 'data-viewer-worker.js'],
+    ].map(([entry, out]) => esbuild.build({
+        entryPoints: [path.join(threads, entry)],
+        bundle: true,
+        platform: 'node',
+        target: 'node18',
+        format: 'cjs',
+        sourcemap: true,
+        outfile: path.join(dist, out),
+        logLevel: 'info',
+    })));
+}
+
+/**
  * Build a Svelte webview bundle.
  *
  * @param {string} name   - Output directory name under dist/webviews/ (e.g. 'plot-viewer').
@@ -125,6 +148,7 @@ function copyQuartoThemeBridge() {
         assertGlidePatched(root);
         await Promise.all([
             buildExtension(),
+            buildDataViewerThreads(),
             buildSvelteWebview(
                 'plot-viewer',
                 path.join(root, 'src', 'plot', 'webview', 'main.ts'),

@@ -44,3 +44,51 @@ describe('data viewer build bundle', () => {
         },
     );
 });
+
+describe('data viewer worker threads in dist', () => {
+    const vscode_dir = join(__dirname, '..', '..', 'editors', 'vscode');
+    const have_node_modules = existsSync(join(vscode_dir, 'node_modules'));
+    const dist = join(vscode_dir, 'dist');
+    const threads = ['data-viewer-reader.js', 'data-viewer-worker.js'];
+
+    test('the build script bundles both thread entries into dist/', () => {
+        const build = readFileSync(join(vscode_dir, 'scripts', 'build.js'), 'utf8');
+        expect(build).toContain('buildDataViewerThreads()');
+        for (const t of threads) expect(build).toContain(`'${t}'`);
+    });
+
+    test('.vscodeignore keeps the thread bundles in the VSIX', () => {
+        const ignore = readFileSync(join(vscode_dir, '.vscodeignore'), 'utf8')
+            .split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        // dist/ ships except the explicitly excluded subtrees; none of them
+        // may cover the thread bundles.
+        for (const rule of ignore) {
+            for (const t of threads) {
+                const glob = new Bun.Glob(rule);
+                expect(glob.match(`dist/${t}`)).toBe(false);
+            }
+        }
+    });
+
+    test.skipIf(!have_node_modules)('both bundles exist after the build and run as workers', async () => {
+        for (const t of threads) expect(existsSync(join(dist, t))).toBe(true);
+        const { WorkerEngine } = await import('../../editors/vscode/src/data-viewer/worker-engine');
+        const fixture = join(vscode_dir, 'test-fixtures', 'data-viewer', 'tiny.arrow');
+        const engine = await WorkerEngine.start({
+            filePath: fixture,
+            nrow: 5,
+            readerScript: join(dist, 'data-viewer-reader.js'),
+            scanScript: join(dist, 'data-viewer-worker.js'),
+        });
+        try {
+            const t = await engine.compute({
+                sort: { keys: [{ columnIndex: 0, direction: 'desc' }], labelsOnWhenSorted: true },
+            });
+            expect(await engine.coordinator.install(t)).toBe(true);
+            const rows = await engine.getRows({ start: 0, end: 5, columns: [0], viewportGeneration: 1 }, t.gen);
+            expect(rows.rows.map(r => r[0])).toEqual([5, 4, 3, 2, 1]);
+        } finally {
+            await engine.dispose();
+        }
+    }, 30_000);
+});

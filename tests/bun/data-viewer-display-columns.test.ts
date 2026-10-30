@@ -15,7 +15,7 @@ import {
     rRowNumber,
     sourceAt,
 } from '../../editors/vscode/src/data-viewer/webview/display-columns';
-import { RowCache } from '../../editors/vscode/src/data-viewer/webview/row-cache';
+import { TileCache } from '../../editors/vscode/src/data-viewer/webview/tile-cache';
 import { composeEffectivePermutation } from '../../editors/vscode/src/data-viewer/effective-permutation';
 
 const col = (name: string, extra: Partial<ColumnSchema> = {}): ColumnSchema =>
@@ -98,10 +98,10 @@ describe('copy columns', () => {
 
 describe('gutter R row numbers', () => {
     test('natural order: display position + 1', () => {
-        const cache = new RowCache(1000);
-        cache.put(10, 12, [[1], [2]]);
-        expect(rRowNumber(10, cache.getOriginalRowIndex(10))).toBe(11);
-        expect(rRowNumber(11, cache.getOriginalRowIndex(11))).toBe(12);
+        const cache = new TileCache({ rowsPerTile: 2, colsPerTile: 32 });
+        cache.putBlock(10, 0, [[1], [2]], undefined, 100, 1);
+        expect(rRowNumber(10, cache.originalRowIndex(10))).toBe(11);
+        expect(rRowNumber(11, cache.originalRowIndex(11))).toBe(12);
     });
 
     test('after sort + filter the gutter shows the original row, not the position', () => {
@@ -110,9 +110,9 @@ describe('gutter R row numbers', () => {
         const filtered = Uint32Array.from([0, 2, 4]);
         const effective = composeEffectivePermutation(sortPerm, filtered, 6)!;
         expect(Array.from(effective)).toEqual([4, 2, 0]);
-        const cache = new RowCache(1000);
+        const cache = new TileCache({ rowsPerTile: 64, colsPerTile: 32 });
         // The host returns originalRowIndices = effective[start..end).
-        cache.put(0, 3, [[1], [2], [3]], Array.from(effective));
-        expect([0, 1, 2].map(r => rRowNumber(r, cache.getOriginalRowIndex(r)))).toEqual([5, 3, 1]);
+        cache.putBlock(0, 0, [[1], [2], [3]], Array.from(effective), 3, 1);
+        expect([0, 1, 2].map(r => rRowNumber(r, cache.originalRowIndex(r)))).toEqual([5, 3, 1]);
     });
 });

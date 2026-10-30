@@ -28,7 +28,16 @@ export type Settings = {
     defaultDigits: number;
     persistSort: boolean;
     persistFilters: boolean;
+    /** VS Code's UI language (`vscode.env.language`), the explicit locale
+     *  for Natural and Locale string sorts. Absent in tests. */
+    uiLocale?: string;
 };
+
+/** How string keys sort. `natural`: the UI locale's collator with
+ *  numeric digit runs (`file_2` before `file_10`), the default.
+ *  `locale`: the same collator without numeric runs. `c`: Unicode code
+ *  point order, as `sort(method = "radix")` and `dplyr::arrange()`. */
+export type StringOrder = 'natural' | 'locale' | 'c';
 
 /** A single sort key. Priority is the position in the SortState.keys array
  *  — index 0 is the primary key, index 1 the secondary, etc. */
@@ -48,6 +57,8 @@ export type SortState = {
      *  schema-hash equality plus column-name equality is not evidence of
      *  same values. */
     labelsOnWhenSorted: boolean;
+    /** String order the sort was built with. Absent ⇔ `natural`. */
+    stringOrder?: StringOrder;
 };
 
 export const EMPTY_SORT: SortState = {
@@ -128,7 +139,9 @@ export type ExtensionToWebview =
         layout: Layout;
         toolbar: ToolbarState;
         settings: Settings;
-        dictionaries: Record<number, string[]>;
+        /** Shipped dictionaries by column. Sent once per webview and
+         *  dataset; omitted when the webview already has them. */
+        dictionaries?: Record<number, string[]>;
         /** schemaHash for the active dataset. Echoed back by saveLayout
          *  / saveToolbar / saveSort so the host stores under the hash
          *  that was current when the user toggled, even if a later
@@ -142,6 +155,9 @@ export type ExtensionToWebview =
          *  none. Webview reflects this in the chip strip without firing
          *  the apply-pulse animation. */
         filter: FilterState;
+        /** Transform generation this paint shows. The webview tags reader
+         *  requests with it and acks it with `adopted`. */
+        transformGeneration?: number;
     }
     | {
         type: 'rows';
@@ -174,13 +190,16 @@ export type ExtensionToWebview =
         columns: ColumnSchema[];
         layout: Layout;
         toolbar: ToolbarState;
-        dictionaries: Record<number, string[]>;
+        /** See `init`. */
+        dictionaries?: Record<number, string[]>;
         schemaHash: string;
         sort: SortState;
         /** Filter state restored from persistence, or EMPTY_FILTER if
          *  none. Webview reflects this in the chip strip without firing
          *  the apply-pulse animation. */
         filter: FilterState;
+        /** See `init`. */
+        transformGeneration?: number;
     }
     | {
         /** On-demand numeric histogram for a single column, sent in
@@ -214,6 +233,8 @@ export type ExtensionToWebview =
         rollback?: boolean;
         /** Optional failure text carried by a rollback response. */
         error?: string;
+        /** Transform generation this announcement shows (see `init`). */
+        transformGeneration?: number;
     }
     | {
         /** Lifecycle ping driving the toolbar "Sorting…" progress pill.
@@ -222,6 +243,12 @@ export type ExtensionToWebview =
         panelGeneration: number;
         requestId: number;
         state: 'pending' | 'idle';
+        /** Set on a `pending` re-post once a Natural or Locale sort has
+         *  run past 3 s: the pill offers "Switch to C order". */
+        slow?: boolean;
+        /** Set when the scan worker restarted and is rebuilding its key
+         *  and rank caches. */
+        rebuildingKeys?: boolean;
     }
     | {
         /** Filter index has been (re)built. Webview updates the filter
@@ -241,6 +268,8 @@ export type ExtensionToWebview =
         rollback?: boolean;
         /** Optional failure text carried by a rollback response. */
         error?: string;
+        /** Transform generation this announcement shows (see `init`). */
+        transformGeneration?: number;
     }
     | {
         type: 'filterStatus';
@@ -320,6 +349,19 @@ export type ExtensionToWebview =
 export type WebviewToExtension =
     | {
         type: 'webviewReady';
+        /** True when the webview tags reader requests with the transform
+         *  generation it shows and acks announcements with `adopted`. The
+         *  host only waits for adoption from such a webview. */
+        adoptsTransforms?: boolean;
+    }
+    | {
+        /** The webview processed the announcement of transform generation
+         *  `transformGeneration` (dropped older tiles and switched its
+         *  requests to it). Sent on processing, not on the next draw, so a
+         *  hidden panel acks too. */
+        type: 'adopted';
+        panelGeneration: number;
+        transformGeneration: number;
     }
     | {
         type: 'lifecycle';
@@ -361,6 +403,8 @@ export type WebviewToExtension =
          *  in `columns` order; the reply echoes the range. Omitted ⇔ all
          *  of `columns`. */
         columnRange?: { start: number; end: number };
+        /** Transform generation the webview is showing. */
+        transformGeneration?: number;
     }
     | {
         type: 'getLabels';
@@ -409,6 +453,8 @@ export type WebviewToExtension =
         /** "Copy with row names" on a frame without a rowname column:
          *  prepend each row's 1-based R row number. */
         rowNumbers?: boolean;
+        /** Transform generation the webview is showing. */
+        transformGeneration?: number;
     }
     | {
         /** Fetch one cell's untruncated value (capped at 64 KiB) for the
@@ -418,6 +464,8 @@ export type WebviewToExtension =
         requestId: number;
         row: number;
         columnIndex: number;
+        /** Transform generation the webview is showing. */
+        transformGeneration?: number;
     }
     | {
         /** Write text the webview already has to the clipboard (the
@@ -444,6 +492,8 @@ export type WebviewToExtension =
         labelsOn: boolean;
         formatOn: boolean;
         digits: number;
+        /** String order for string and label keys. Absent ⇔ `natural`. */
+        stringOrder?: StringOrder;
     }
     | {
         /** Debounced persistence of the active sort, mirroring

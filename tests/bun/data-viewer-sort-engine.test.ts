@@ -17,7 +17,7 @@ import { describe, test, expect } from 'bun:test';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
-import { computePermutation } from '../../editors/vscode/src/data-viewer/sort';
+import { computePermutation, SortKeyCache } from '../../editors/vscode/src/data-viewer/sort';
 import type { SortKey } from '../../editors/vscode/src/data-viewer/messages';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -70,7 +70,7 @@ describe('computePermutation: numeric Int column', () => {
 });
 
 describe('computePermutation: Float with NA / NaN / ±Inf', () => {
-    test('asc: -Inf < 1.5 < +Inf, NA and NaN last in original order', async () => {
+    test('asc: -Inf < 1.5 < +Inf, then NaN, then NA', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         // y = [1.5, NA, NaN, +Inf, -Inf]
         const p = await computePermutation(
@@ -78,18 +78,19 @@ describe('computePermutation: Float with NA / NaN / ±Inf', () => {
             [{ columnIndex: 1, direction: 'asc' }],
             CTX_LABELS_ON,
         );
-        expect(Array.from(p)).toEqual([4, 0, 3, 1, 2]);
+        // NaN (row 2) just before NA (row 1), both after every value.
+        expect(Array.from(p)).toEqual([4, 0, 3, 2, 1]);
         await r.close();
     });
 
-    test('desc: +Inf > 1.5 > -Inf, NA and NaN still last in original order', async () => {
+    test('desc: +Inf > 1.5 > -Inf, then NaN, then NA (missing stays last)', async () => {
         const r = await ArrowSliceReader.open(FIX('tiny.arrow'));
         const p = await computePermutation(
             r,
             [{ columnIndex: 1, direction: 'desc' }],
             CTX_LABELS_ON,
         );
-        expect(Array.from(p)).toEqual([3, 0, 4, 1, 2]);
+        expect(Array.from(p)).toEqual([3, 0, 4, 2, 1]);
         await r.close();
     });
 });
@@ -437,3 +438,27 @@ describe('computePermutation: keys with unused order are ignored', () => {
 
 const _typecheck: SortKey = { columnIndex: 0, direction: 'asc' };
 void _typecheck;
+
+describe('SortKeyCache is byte-bounded, least recently used first', () => {
+    // 100 rows of a numeric key ≈ 900 bytes (hi + lo + cls).
+    const key = () => ({ hi: new Uint32Array(100), lo: new Uint32Array(100), cls: new Uint8Array(100) }) as any;
+    test('evicts the oldest entry past the budget; get() refreshes recency', () => {
+        const c = new SortKeyCache(2_000);
+        c.set('a', key());
+        c.set('b', key());
+        expect(c.bytes).toBe(1_800);
+        c.get('a');            // a is now most recent
+        c.set('c', key());     // over budget: evicts b, not a
+        expect(c.has('a')).toBe(true);
+        expect(c.has('b')).toBe(false);
+        expect(c.has('c')).toBe(true);
+        expect(c.bytes).toBeLessThanOrEqual(2_000);
+    });
+    test('an entry larger than the budget is still held while it is the newest', () => {
+        const c = new SortKeyCache(500);
+        c.set('big', key());
+        expect(c.has('big')).toBe(true);
+        c.set('next', key());
+        expect(c.has('big')).toBe(false);
+    });
+});

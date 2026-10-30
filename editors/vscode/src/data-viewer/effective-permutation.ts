@@ -1,20 +1,16 @@
 /**
- * Composition of the sort permutation and the filter's surviving rows
- * into the single row order the reader serves.
+ * Composition of a sort permutation and a filter's surviving rows into
+ * the single row order the reader serves.
  *
  * Both inputs are over the ORIGINAL frame: `permutation` (when present)
  * orders all `nrow` rows; `filteredIndices` (when present) lists the
  * surviving rows in original order. The composition keeps the sort's
- * order restricted to the survivors. It costs O(nrow) time and an
- * `nrow`-byte mask, so the panel computes it once per sort/filter change
- * and caches it (see `DataViewerPanel.effectivePermutation`), never per
- * `getRows` or copy.
+ * order restricted to the survivors, in O(nrow) time and an `nrow`-byte
+ * mask.
  *
- * Sorting only the survivors (#328) is deliberately not done here: the
- * panel keeps sort and filter as independent full-frame results so that
- * changing or clearing either one never re-runs the other. That needs
- * per-column sort keys cached over all rows, which arrive with the scan
- * worker (F4).
+ * The scan worker doesn't use this: it sorts only the survivors from its
+ * cached keys (#328, `scan-core.ts`). The panel uses it only to install a
+ * descriptor of state the worker didn't compute (`descriptorFromHostState`).
  */
 export function composeEffectivePermutation(
     permutation: Uint32Array | undefined,

@@ -42,6 +42,16 @@ export function ToolbarSortStrip({ sort, columns, onChange, onClearAll }: Props)
                     />
                 ))}
             </div>
+            {sort.stringOrder && sort.stringOrder !== 'natural' && (
+                <span
+                    className="sort-order-chip"
+                    title={sort.stringOrder === 'c'
+                        ? 'Text sorts in C (code point) order'
+                        : "Text sorts in your UI language's order"}
+                >
+                    {sort.stringOrder === 'c' ? 'C' : 'Locale'}
+                </span>
+            )}
             <button
                 type="button"
                 className="sort-strip-clear"

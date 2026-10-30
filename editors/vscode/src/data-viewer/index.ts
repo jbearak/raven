@@ -36,6 +36,8 @@ export function registerDataViewer(
             defaultDigits: cfg.get<number>('defaultDigits', 3),
             persistSort: cfg.get<boolean>('persistSort', true),
             persistFilters: cfg.get<boolean>('persistFilters', true),
+            // The explicit locale for Natural and Locale string sorts.
+            uiLocale: vscode.env.language,
         };
     };
 
