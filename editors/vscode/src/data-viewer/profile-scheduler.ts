@@ -49,6 +49,9 @@ export class ProfileScheduler {
 
     get runningColumn(): number | undefined { return this.running?.columnIndex; }
 
+    /** A finished profile (ready or failed), if any. */
+    resultFor(columnIndex: number): ProfileState | undefined { return this.results.get(columnIndex); }
+
     /** The columns the client wants profiled, most wanted first. */
     setInterest(columns: readonly number[]): void {
         if (this.disposed) return;

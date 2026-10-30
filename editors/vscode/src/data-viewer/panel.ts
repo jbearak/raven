@@ -48,6 +48,9 @@ import { SortStateStore } from './sort-state';
 import { FilterStateStore } from './filter-state';
 import { build_csp } from './csp';
 import { prependRowNumbers, render_tsv, ResolvedLabels } from './tsv';
+import { generateRCode, rString } from './r-code';
+import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
+import { get_send_options, send_code } from '../send-to-r/send-code';
 import { applyViewerTabIcon } from '../viewer-tab-icon';
 
 let dataViewerTraceOutput: vscode.OutputChannel | undefined;
@@ -70,6 +73,17 @@ type FilterSnapshot = {
 const TRANSFORM_DEADLINE_MS = 10 * 60 * 1000;
 /** Natural and Locale sorts running past this offer "Switch to C order". */
 const SLOW_SORT_MS = 3000;
+
+/** What `View()` was called with: the deparsed expression and the kind
+ *  of object (see `ViewDataEvent`). Copy as R code and Refresh use it. */
+export type ViewSource = {
+    expression?: string;
+    sourceKind?: string;
+};
+
+/** A refresh carries the current sort and filter to the re-run when the
+ *  schema hash still matches; past this it lapses. */
+const REFRESH_CARRY_MS = 10 * 60 * 1000;
 
 /** Engine factory: the worker engine when its bundles are on disk, else
  *  the in-process engine (headless tests). */
@@ -292,6 +306,16 @@ export class DataViewerPanel {
     /** Column profiles for the current engine's reader (summary band,
      *  sidebar); replaced with the engine. */
     private profileScheduler: ProfileScheduler | undefined;
+    /** The `View()` call behind the current dataset. */
+    private source: ViewSource = {};
+    /** Set when the user confirms Refresh: the sort and filter to carry to
+     *  the re-run's dataset if its schema hash matches, whatever the
+     *  persistence settings say. Consumed by the next paint. */
+    private refreshCarry: { hash: string; sort: SortState; filter: FilterState; at: number } | undefined;
+    /** The running find, and the last find's matches (display positions
+     *  in `findGeneration`'s order). */
+    private findAbort: AbortController | null = null;
+    private findMatches: { positions: Uint32Array; transformGeneration: number | undefined } | undefined;
 
     private constructor(
         panelName: string,
@@ -343,6 +367,7 @@ export class DataViewerPanel {
         settings: Settings,
         extensionUri: vscode.Uri,
         disposeHook: () => void,
+        source: ViewSource = {},
     ): Promise<DataViewerPanel> {
         const webviewPanel = vscode.window.createWebviewPanel(
             'raven.dataViewer',
@@ -362,6 +387,7 @@ export class DataViewerPanel {
             panelName, webviewPanel, reader, filePath,
             store, toolbarStore, sortStore, filterStore, settings, disposeHook,
         );
+        panel.source = source;
         panel.engineFactory = workerEngineFactory(extensionUri, line => panel.log(line));
         panel.setEngine(panel.engineFactory
             ? await panel.engineFactory(reader, filePath)
@@ -438,13 +464,15 @@ export class DataViewerPanel {
      *  cleaning up the new reader/file (dispose() can't see them yet). If it
      *  happens after the swap, dispose() closes the new reader and unlinks
      *  the new path, but the old reader/file is still ours to clean up. */
-    async replace(reader: ArrowSliceReader, filePath: string): Promise<void> {
+    async replace(reader: ArrowSliceReader, filePath: string, source: ViewSource = {}): Promise<void> {
         if (this.disposed) {
             await reader.close().catch(() => undefined);
             try { await fs.unlink(filePath); } catch { /* ignore */ }
             return;
         }
         this.generation += 1;
+        this.source = source;
+        this.cancelFind();
         // Abort any in-flight restore from the previous dataset. The
         // generation bump above makes it bail *stale* (prefs intact); the
         // abort frees the serialized send chain so sendReplace below isn't
@@ -507,6 +535,199 @@ export class DataViewerPanel {
     }
 
     reveal(): void { this.webviewPanel.reveal(); }
+
+    /** The refresh carry for `hash`, consumed; a carry for another schema
+     *  or past its lifetime is dropped. */
+    private takeRefreshCarry(hash: string): { sort: SortState; filter: FilterState } | undefined {
+        const c = this.refreshCarry;
+        this.refreshCarry = undefined;
+        if (!c || c.hash !== hash || Date.now() - c.at > REFRESH_CARRY_MS) return undefined;
+        return { sort: c.sort, filter: c.filter };
+    }
+
+    /** Stop a running find and forget the last matches. */
+    private cancelFind(): void {
+        this.findAbort?.abort();
+        this.findAbort = null;
+        this.findMatches = undefined;
+    }
+
+    /** The match to select: the first at or after `from` (`direction` 0),
+     *  or the next after / previous before it, wrapping. */
+    private pickMatch(positions: Uint32Array, from: number, direction: 0 | 1 | -1): number {
+        const n = positions.length;
+        if (n === 0) return -1;
+        // First index with positions[i] >= target.
+        const lowerBound = (target: number): number => {
+            let lo = 0, hi = n;
+            while (lo < hi) {
+                const mid = (lo + hi) >>> 1;
+                if (positions[mid] < target) lo = mid + 1; else hi = mid;
+            }
+            return lo;
+        };
+        if (direction === -1) {
+            const i = lowerBound(from) - 1;
+            return i >= 0 ? i : n - 1;
+        }
+        const i = lowerBound(direction === 1 ? from + 1 : Math.max(0, from));
+        return i < n ? i : 0;
+    }
+
+    private async handleFind(m: Extract<WebviewToExtension, { type: 'find' }>, gen: number): Promise<void> {
+        this.cancelFind();
+        if (m.query === '') return;
+        const abort = new AbortController();
+        this.findAbort = abort;
+        const reader = this.reader;
+        const perm = this.coordinator.permFor(m.transformGeneration);
+        const reply = (r: Omit<Extract<ExtensionToWebview, { type: 'findResult' }>, 'type' | 'panelGeneration' | 'requestId'>) =>
+            this.webviewPanel.webview.postMessage({
+                type: 'findResult', panelGeneration: gen, requestId: m.requestId, ...r,
+            } satisfies ExtensionToWebview);
+        if (perm === null) {
+            await reply({ count: 0, position: -1, index: -1, error: 'The view changed; search again.' });
+            return;
+        }
+        let positions: Uint32Array;
+        try {
+            positions = await this.engine.find({
+                query: m.query,
+                columns: m.columns.filter(c => Number.isInteger(c) && c >= 0 && c < reader.schema.columns.length),
+                labelsOn: m.labelsOn,
+                formatOn: m.formatOn,
+                digits: m.digits,
+            }, perm, abort.signal);
+        } catch (err) {
+            if (isAbortError(err) || abort.signal.aborted) return;
+            if (gen !== this.generation || reader !== this.reader) return;
+            await reply({ count: 0, position: -1, index: -1, error: err instanceof Error ? err.message : String(err) });
+            return;
+        }
+        if (abort.signal.aborted || gen !== this.generation || reader !== this.reader) return;
+        this.findAbort = null;
+        this.findMatches = { positions, transformGeneration: m.transformGeneration };
+        const index = this.pickMatch(positions, m.from, 0);
+        await reply({
+            count: positions.length,
+            position: index >= 0 ? positions[index] : -1,
+            index,
+            transformGeneration: m.transformGeneration,
+        });
+    }
+
+    private async handleFindStep(m: Extract<WebviewToExtension, { type: 'findStep' }>, gen: number): Promise<void> {
+        const found = this.findMatches;
+        if (!found) return;
+        const index = this.pickMatch(found.positions, m.from, m.direction);
+        await this.webviewPanel.webview.postMessage({
+            type: 'findResult',
+            panelGeneration: gen,
+            requestId: m.requestId,
+            count: found.positions.length,
+            position: index >= 0 ? found.positions[index] : -1,
+            index,
+            transformGeneration: found.transformGeneration,
+        } satisfies ExtensionToWebview);
+    }
+
+    /** Display row of R row `rowNumber` under the generation on screen. */
+    private async handleGoToRow(m: Extract<WebviewToExtension, { type: 'goToRow' }>, gen: number): Promise<void> {
+        const nrow = this.reader.nrow;
+        const target = m.rowNumber - 1;
+        let position = -1;
+        if (Number.isInteger(target) && target >= 0 && target < nrow) {
+            const perm = this.coordinator.permFor(m.transformGeneration);
+            if (perm === undefined) position = target;
+            else if (perm !== null) position = perm.indexOf(target);
+        }
+        await this.webviewPanel.webview.postMessage({
+            type: 'rowPosition', panelGeneration: gen, requestId: m.requestId, rowNumber: m.rowNumber, position,
+        } satisfies ExtensionToWebview);
+    }
+
+    /** NaN-free columns, from profiles already computed. */
+    private knownNoNaN(columnIndex: number): boolean {
+        const p = this.profileScheduler?.resultFor(columnIndex);
+        return p?.state === 'ready' && p.profile.nan === 0;
+    }
+
+    private async handleCopyAsCode(m: Extract<WebviewToExtension, { type: 'copyAsCode' }>, gen: number): Promise<void> {
+        const result = generateRCode({
+            expression: this.source.expression ?? '',
+            sourceKind: this.source.sourceKind,
+            columns: this.reader.schema.columns,
+            sort: this.sort,
+            filter: this.filter,
+            hiddenColumns: m.hiddenColumns,
+            locale: this.settings.uiLocale ?? 'en',
+            noNaN: c => this.knownNoNaN(c),
+        }, m.flavor);
+        let ok = false;
+        let error: string | undefined;
+        if ('code' in result) {
+            try {
+                await vscode.env.clipboard.writeText(result.code);
+                ok = true;
+            } catch (err) {
+                error = err instanceof Error ? err.message : String(err);
+            }
+        } else {
+            error = result.error;
+        }
+        if (gen !== this.generation) return;
+        const flavor = m.flavor === 'base' ? 'base R' : m.flavor;
+        await this.webviewPanel.webview.postMessage({
+            type: 'notice',
+            panelGeneration: gen,
+            ok,
+            message: ok ? `Copied as R code (${flavor})` : (error ?? 'Copy failed'),
+        } satisfies ExtensionToWebview);
+    }
+
+    /** The `View()` call Refresh re-runs: the expression, with the panel
+     *  title when it differs (so the re-run lands in this panel). */
+    refreshCall(): string | undefined {
+        const expr = this.source.expression;
+        if (!expr) return undefined;
+        // Without a title, View() names the panel after the expression
+        // (truncated past 256 bytes), so a re-run lands here either way.
+        const untitled = expr === this.panelName || Buffer.byteLength(expr, 'utf8') > 256;
+        return untitled ? `View(${expr})` : `View(${expr}, title = ${rString(this.panelName)})`;
+    }
+
+    /** Show the `View()` call and ask before re-running it in the R
+     *  console: the expression is evaluated again and can have side
+     *  effects. On confirm, the current sort and filter carry over when
+     *  the schema still matches (widths, pins and toolbar persist per
+     *  schema anyway). */
+    private async handleRefresh(gen: number): Promise<void> {
+        const call = this.refreshCall();
+        if (!call) {
+            void vscode.window.showInformationMessage(
+                'Raven data viewer: this view has no View() expression to re-run; call View() again from the console.',
+            );
+            return;
+        }
+        const choice = await vscode.window.showWarningMessage(
+            `Re-run ${call.length > 120 ? `${call.slice(0, 117)}…` : call} in the R console?`,
+            {
+                modal: true,
+                detail: `${call}\n\nThe expression is evaluated again, so anything it does (reading files, `
+                    + 'changing variables) happens again. Sort, filter, widths and pins are kept when the columns are unchanged.',
+            },
+            'Re-run',
+        );
+        if (choice !== 'Re-run' || this.disposed || gen !== this.generation) return;
+        this.refreshCarry = {
+            hash: this.currentSchemaHash(),
+            sort: cloneSortState(this.sort),
+            filter: cloneFilterState(this.filter),
+            at: Date.now(),
+        };
+        const terminal = await get_or_create_r_terminal();
+        send_code(terminal, call, get_send_options());
+    }
 
     private defaultToolbar(): ToolbarState {
         return {
@@ -688,8 +909,13 @@ export class DataViewerPanel {
         // order instead of re-restoring what the user just cancelled; the
         // in-flight forget completes the durable clear.
         const forgetting = this.pendingForgetHashes.has(layoutHash);
-        const sortToRestore = forgetting ? undefined : savedSort;
-        const filterToRestore = forgetting ? undefined : savedFilter;
+        // A confirmed Refresh keeps the sort and filter shown before it
+        // when the re-run has the same schema, even with persistence off.
+        const carry = this.takeRefreshCarry(layoutHash);
+        const sortToRestore = forgetting ? undefined
+            : carry ? (carry.sort.keys.length > 0 ? carry.sort : undefined) : savedSort;
+        const filterToRestore = forgetting ? undefined
+            : carry ? (carry.filter.entries.length > 0 ? carry.filter : undefined) : savedFilter;
 
         // Begin a cancellable restore if saved prefs apply. `myAbort`
         // identifies this restore's controller; cancellation is read from
@@ -1831,6 +2057,30 @@ export class DataViewerPanel {
             }
             case 'copyText': {
                 await vscode.env.clipboard.writeText(m.text);
+                return;
+            }
+            case 'find': {
+                await this.handleFind(m, gen);
+                return;
+            }
+            case 'findStep': {
+                await this.handleFindStep(m, gen);
+                return;
+            }
+            case 'cancelFind': {
+                this.cancelFind();
+                return;
+            }
+            case 'goToRow': {
+                await this.handleGoToRow(m, gen);
+                return;
+            }
+            case 'copyAsCode': {
+                await this.handleCopyAsCode(m, gen);
+                return;
+            }
+            case 'refresh': {
+                await this.handleRefresh(gen);
                 return;
             }
             case 'setSort': {

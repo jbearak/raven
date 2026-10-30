@@ -9,6 +9,7 @@
 import type { GenerationSeed } from '../reader-core';
 import type { TransformRequest, TransformSpec } from '../scan-core';
 import type { ViewportRequest } from '../engine';
+import type { FindQuery } from '../find';
 
 /** `workerData` for both threads. */
 export type ThreadInit = {
@@ -42,6 +43,10 @@ export type ScanRequest =
     | {
         id: number; op: 'valueCounts'; columnIndex: number; order: 'desc' | 'asc';
         limit: number; cancel: SharedArrayBuffer;
+    }
+    | {
+        id: number; op: 'find'; query: FindQuery; perm: Uint32Array | undefined;
+        cancel: SharedArrayBuffer;
     }
     | { op: 'commit'; gen: number; spec: TransformSpec }
     | { op: 'abort'; gen: number };

@@ -22,6 +22,10 @@ export type Layout = {
     columnWidths: Record<number, number>;
     /** Hidden column indices. */
     hiddenColumns: number[];
+    /** Pinned column indices, in pin order. Pinned columns are frozen
+     *  after the rowname columns (`webview/display-columns.ts`); absent ⇔
+     *  none. */
+    pinnedColumns?: number[];
 };
 
 export type Settings = {
@@ -340,6 +344,36 @@ export type ExtensionToWebview =
         error?: string;
     }
     | {
+        /** Reply to `find` / `findStep`: how many rows match and the
+         *  match to select. `position` is a display row, `index` its
+         *  0-based rank among the matches; both -1 with no match. */
+        type: 'findResult';
+        panelGeneration: number;
+        requestId: number;
+        count: number;
+        position: number;
+        index: number;
+        /** The transform generation the positions are in. */
+        transformGeneration?: number;
+        error?: string;
+    }
+    | {
+        /** Reply to `goToRow`: the display row of R row `rowNumber`, or
+         *  -1 when no such row is shown (filtered out or out of range). */
+        type: 'rowPosition';
+        panelGeneration: number;
+        requestId: number;
+        rowNumber: number;
+        position: number;
+    }
+    | {
+        /** A short notice for the toast slot (Copy as R code, pins). */
+        type: 'notice';
+        panelGeneration: number;
+        message: string;
+        ok: boolean;
+    }
+    | {
         type: 'error';
         panelGeneration: number;
         message: string;
@@ -564,6 +598,60 @@ export type WebviewToExtension =
         panelGeneration: number;
         schemaHash: string;
         filter: FilterState;
+    }
+    | {
+        /** Find in grid: search the displayed text of `columns` (the
+         *  visible ones) and reply with the first match at or after
+         *  display row `from` (`findResult`). Supersedes any running find;
+         *  an empty query cancels. */
+        type: 'find';
+        panelGeneration: number;
+        requestId: number;
+        query: string;
+        columns: number[];
+        labelsOn: boolean;
+        formatOn: boolean;
+        digits: number;
+        from: number;
+        /** Transform generation the webview is showing. */
+        transformGeneration?: number;
+    }
+    | {
+        /** Next (1) or previous (-1) match of the last find, relative to
+         *  display row `from`, wrapping around. */
+        type: 'findStep';
+        panelGeneration: number;
+        requestId: number;
+        from: number;
+        direction: 1 | -1;
+    }
+    | {
+        /** Stop a running find and forget its matches. */
+        type: 'cancelFind';
+        panelGeneration: number;
+    }
+    | {
+        /** Go to R row number `rowNumber` (1-based original index). */
+        type: 'goToRow';
+        panelGeneration: number;
+        requestId: number;
+        rowNumber: number;
+        transformGeneration?: number;
+    }
+    | {
+        /** Copy the current filters, sort and hidden columns as R code
+         *  (`r-code.ts`) to the clipboard. */
+        type: 'copyAsCode';
+        panelGeneration: number;
+        requestId: number;
+        flavor: 'dplyr' | 'base' | 'data.table';
+        hiddenColumns: number[];
+    }
+    | {
+        /** Re-run the `View()` expression in the R console, after the
+         *  user confirms. */
+        type: 'refresh';
+        panelGeneration: number;
     }
     | {
         /** Asks the host to abandon the in-progress restore of a saved

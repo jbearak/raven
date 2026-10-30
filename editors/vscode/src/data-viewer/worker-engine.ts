@@ -23,6 +23,7 @@ import { Worker } from 'node:worker_threads';
 import type { GetRowsResponse } from './arrow-reader';
 import type { HistogramBin } from './messages';
 import type { ColumnProfile, ValueCounts } from './profile';
+import type { FindQuery } from './find';
 import { MemoryCounter, PermRegistry } from './perm-buffer';
 import type { ComputeResult, TransformRequest } from './scan-core';
 import { TransformCoordinator } from './transform-coordinator';
@@ -407,6 +408,10 @@ export class WorkerEngine implements DataEngine {
 
     valueCounts(columnIndex: number, order: 'desc' | 'asc', limit: number, signal: AbortSignal): Promise<ValueCounts> {
         return this.cancellable<ValueCounts>({ op: 'valueCounts', columnIndex, order, limit }, signal);
+    }
+
+    find(query: FindQuery, perm: Uint32Array | undefined, signal: AbortSignal): Promise<Uint32Array> {
+        return this.cancellable<Uint32Array>({ op: 'find', query, perm }, signal);
     }
 
     takeScanRestarted(): boolean {

@@ -78,6 +78,9 @@ async function handle(core: ScanCore, m: ScanRequest): Promise<void> {
             case 'valueCounts':
                 value = await core.valueCounts(m.columnIndex, m.order, m.limit, sharedSignal(m.cancel));
                 break;
+            case 'find':
+                value = await core.find(m.query, m.perm, sharedSignal(m.cancel));
+                break;
         }
         post({ type: 'reply', id: m.id, ok: true, value });
     } catch (err) {

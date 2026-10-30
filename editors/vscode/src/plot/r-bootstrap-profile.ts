@@ -509,6 +509,11 @@ local({
             }
             s
         }
+        # The expression itself, untruncated (Copy as R code and Refresh
+        # re-evaluate it). Omitted past 64 KiB.
+        expr_text <- tryCatch(deparse1(substitute(x), collapse = " "),
+                              error = function(e) "")
+        if (nchar(expr_text, type = "bytes") > 65536L) expr_text <- ""
 
         # Type dispatch: matrix and data.frame are tested first (a
         # data.frame is also a list). Then an atomic / factor /
@@ -523,6 +528,10 @@ local({
         # >2-D array (a dimensionality error). Anything else errors with
         # the Positron-style class message.
         rowname_col <- NULL
+        source_kind <- if (is.matrix(x)) "matrix"
+            else if (is.data.frame(x)) "data.frame"
+            else if (is.list(x)) "list"
+            else "vector"
         df <- if (is.matrix(x)) {
             d <- as.data.frame(x, stringsAsFactors = FALSE)
             rownames(d) <- NULL
@@ -618,6 +627,8 @@ local({
             "{",
             "\\"sessionId\\":", .raven_json_str(.raven_session_id), ",",
             "\\"panelName\\":", .raven_json_str(panel_name), ",",
+            "\\"expression\\":", .raven_json_str(expr_text), ",",
+            "\\"sourceKind\\":", .raven_json_str(source_kind), ",",
             "\\"filePath\\":", .raven_json_str(path), ",",
             "\\"nrow\\":", as.character(nr),
             "}"

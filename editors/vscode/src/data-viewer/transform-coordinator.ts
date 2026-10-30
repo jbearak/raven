@@ -185,6 +185,16 @@ export class TransformCoordinator {
         this.finishAwaiting(() => this.reader.adopted(gen));
     }
 
+    /** The effective permutation of committed generation `gen` (the
+     *  committed one, or the retained N−1 during an adoption interval);
+     *  `undefined` ⇔ natural order; `null` ⇔ `gen` isn't live. An
+     *  undefined `gen` names the committed generation. */
+    permFor(gen: number | undefined): Uint32Array | undefined | null {
+        if (gen === undefined || gen === this.committedDesc.gen) return this.committedDesc.perm;
+        if (this.retained && gen === this.retained.gen) return this.retained.perm;
+        return null;
+    }
+
     /** Release every pending adoption: reload, dispose, re-seed. */
     releaseAdoptions(): void {
         this.finishAwaiting(() => this.reader.releaseAdoptions());

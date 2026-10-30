@@ -26,18 +26,21 @@ export type BatchSlice = { batch: ScanBatch; start: number; length: number };
 
 /** Async iterator over a reader's record batches with their starting
  *  row index, reading only `columns`. See the module doc for the
- *  `signal` semantics. */
+ *  `signal` semantics. `want(start, end)`, when given, skips batches
+ *  (rows `[start, end)`) it rejects without reading them. */
 export async function* iterateBatches(
     reader: ArrowSliceReader,
     columns: readonly number[],
     signal?: AbortSignal,
+    want?: (start: number, end: number) => boolean,
 ): AsyncGenerator<BatchSlice> {
     const numBatches = reader.batchStarts.length - 1;
     for (let bi = 0; bi < numBatches; bi++) {
         throwIfAborted(signal);
-        const batch = await readerGetBatch(reader, bi, columns);
         const start = reader.batchStarts[bi];
         const length = reader.batchStarts[bi + 1] - start;
+        if (want && !want(start, start + length)) continue;
+        const batch = await readerGetBatch(reader, bi, columns);
         yield { batch, start, length };
         if (signal) await yieldToEventLoop();
     }

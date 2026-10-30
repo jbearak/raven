@@ -184,6 +184,8 @@ export class RSessionServer {
         const panelName = typeof b.panelName === 'string' ? b.panelName : '';
         const filePath = typeof b.filePath === 'string' ? b.filePath : '';
         const nrow = typeof b.nrow === 'number' ? b.nrow : NaN;
+        const expression = typeof b.expression === 'string' && b.expression ? b.expression : undefined;
+        const sourceKind = typeof b.sourceKind === 'string' && b.sourceKind ? b.sourceKind : undefined;
         if (!sessionId || !panelName || !filePath
             || !Number.isInteger(nrow) || nrow < 0) {
             res.writeHead(400).end();
@@ -217,6 +219,8 @@ export class RSessionServer {
             panelName,
             filePath: canonical,
             nrow,
+            ...(expression !== undefined ? { expression } : {}),
+            ...(sourceKind !== undefined ? { sourceKind } : {}),
         });
         res.writeHead(200).end();
     }
