@@ -171,11 +171,12 @@ export function sortKeyId(schema: ColumnSchema, columnIndex: number, ctx: SortCo
     }
 }
 
-type KeyKind =
+export type KeyKind =
     | 'dictLabel' | 'dictCode' | 'valueLabel'
     | 'int64' | 'uint64' | 'timestamp' | 'number' | 'string';
 
-function keyKind(schema: ColumnSchema, ctx: SortContext): KeyKind {
+/** What a column sorts by under `ctx` (Copy as R code mirrors it). */
+export function keyKind(schema: ColumnSchema, ctx: Pick<SortContext, 'labelsOn'>): KeyKind {
     const t = schema.arrowType;
     if (t.startsWith('Dictionary')) return ctx.labelsOn ? 'dictLabel' : 'dictCode';
     // Value-labelled columns (haven_labelled, foreign::value.labels,
