@@ -15,7 +15,7 @@ import { WorkerEngine } from '../../editors/vscode/src/data-viewer/worker-engine
 import { ProfileScheduler } from '../../editors/vscode/src/data-viewer/profile-scheduler';
 import type { ProfileUpdate } from '../../editors/vscode/src/data-viewer/profile-scheduler';
 import type { ColumnProfile } from '../../editors/vscode/src/data-viewer/profile';
-import { isAbortError } from '../../editors/vscode/src/data-viewer/abort';
+import { isAbortError, isInterruption } from '../../editors/vscode/src/data-viewer/abort';
 import { hash01, writeArrowFixture } from './_helpers/arrow-fixture-writer';
 
 const DIR = mkdtempSync(join(tmpdir(), 'raven-dv-sched-'));
@@ -116,13 +116,15 @@ describe('ProfileScheduler', () => {
         expect(runs.length).toBe(1);
     });
 
-    test('an abort it did not ask for (worker restart) is retried, then failed', async () => {
+    test('a worker restart it did not ask for is retried, then failed', async () => {
         const { runs, run } = fakeRunner();
-        const s = new ProfileScheduler(run, () => {}, isAbortError);
+        // The panel's predicate, with the error a restarted ThreadClient
+        // actually rejects with (worker-engine.ts restartError).
+        const s = new ProfileScheduler(run, () => {}, isInterruption);
         s.setInterest([0]);
         for (let i = 0; i < 3; i++) {
             const e = new Error('scan thread restarted');
-            e.name = 'AbortError';
+            e.name = 'WorkerRestartError';
             runs[i].reject(e);
             await tick();
         }

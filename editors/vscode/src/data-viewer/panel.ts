@@ -28,7 +28,7 @@ import {
     WebviewToExtension,
 } from './messages';
 import { composeEffectivePermutation } from './effective-permutation';
-import { isAbortError } from './abort';
+import { isAbortError, isInterruption } from './abort';
 import { isNumericArrowType } from './histograms';
 import { ProfileScheduler } from './profile-scheduler';
 import { VALUE_COUNTS_LIMIT } from './profile';
@@ -401,7 +401,10 @@ export class DataViewerPanel {
                 };
                 void this.webviewPanel.webview.postMessage(msg);
             },
-            isAbortError,
+            // Interrupted, not failed: a cancel or a worker restart (a
+            // regex cancel or a deadline terminates the scan worker) is
+            // retried under the scheduler's bounded policy.
+            isInterruption,
         );
         if (this.webviewPanel.visible === false) this.profileScheduler.setActive(false);
     }

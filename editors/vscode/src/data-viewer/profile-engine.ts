@@ -169,6 +169,7 @@ async function profileNumeric(
     const wantTop = kind === 'labelled';
     let ss: SpaceSaving<number> | undefined;
     const reservoir = new Reservoir(opts.reservoirSize ?? RESERVOIR_SIZE);
+    const declared = kind === 'labelled' ? declaredCounter(col) : undefined;
     let na = 0, nan = 0, posInf = 0, negInf = 0, finite = 0;
     let min = Infinity, max = -Infinity, fmin = Infinity, fmax = -Infinity;
     let rawMin: number | bigint | undefined, rawMax: number | bigint | undefined;
@@ -197,6 +198,7 @@ async function profileNumeric(
                 if (x > fmax) fmax = x;
             }
             reservoir.add(x);
+            if (declared) countDeclared(declared, String(x));
             if (hll === undefined) {
                 if (counter.add(x)) continue;
                 // Overflow: seed the sketches from the exact counts so far.
@@ -319,7 +321,7 @@ async function profileNumeric(
     }
     if (kind === 'labelled') {
         if (counts) profile.top = topFrom(counts);
-        profile.levels = labelledLevels(col, counts);
+        profile.levels = labelledLevels(col, declared!);
     }
     return { profile, histogram50: domain === 'number' ? histogram50 : undefined, counts };
 }
@@ -553,6 +555,7 @@ async function profileCharacter(
     let exact: Map<string, number> | undefined = new Map();
     let hll: HyperLogLog | undefined;
     let ss: SpaceSaving<string> | undefined;
+    const declared = kind === 'labelled' ? declaredCounter(col) : undefined;
     let na = 0, empty = 0;
     let minLen = Infinity, maxLen = -Infinity;
     await scan(reader, columnIndex, opts, (child, length) => {
@@ -561,6 +564,7 @@ async function profileCharacter(
             if (v === null || v === undefined) { na++; continue; }
             const s = typeof v === 'string' ? v : typeof v === 'bigint' ? v.toString() : String(v);
             if (s === '') empty++;
+            if (declared) countDeclared(declared, s);
             const len = codePointLength(s);
             if (len < minLen) minLen = len;
             if (len > maxLen) maxLen = len;
@@ -609,7 +613,7 @@ async function profileCharacter(
         emptyStrings: empty,
         ...(present > 0 ? { minLength: minLen, maxLength: maxLen } : {}),
     };
-    if (kind === 'labelled') profile.levels = labelledLevels(col, summary);
+    if (kind === 'labelled') profile.levels = labelledLevels(col, declared!);
     return { profile, counts: summary };
 }
 
@@ -640,23 +644,33 @@ export function topFrom(s: CountSummary): TopValues {
     };
 }
 
+/** Exact per-row counts of a column's declared label values, kept beside
+ *  the distinct-value summary: past the exact cap that summary is
+ *  Space-Saving, which can't say how often an unmonitored label occurs.
+ *  The declared set is finite, so these stay exact. */
+function declaredCounter(col: ColumnSchema): Map<string, number> {
+    return new Map(Object.keys(col.valueLabels ?? {}).map(k => [k, 0]));
+}
+
+function countDeclared(declared: Map<string, number>, key: string): void {
+    const c = declared.get(key);
+    if (c !== undefined) declared.set(key, c + 1);
+}
+
 /** Declared value labels (sorted by value, as the filter popover lists
- *  them) with their counts. */
-function labelledLevels(col: ColumnSchema, s: CountSummary | undefined): ColumnProfile['levels'] {
+ *  them) with their exact counts. */
+function labelledLevels(col: ColumnSchema, declared: Map<string, number>): ColumnProfile['levels'] {
     const vl = col.valueLabels ?? {};
     const numeric = !col.arrowType.startsWith('Utf8') && !col.arrowType.startsWith('LargeUtf8');
     const keys = Object.keys(vl);
     const ordered = numeric
         ? keys.map(k => ({ k, v: Number(k) as string | number })).sort((a, b) => (a.v as number) - (b.v as number))
         : keys.map(k => ({ k, v: k as string | number }));
-    const byValue = new Map<string, CountedEntry>();
-    for (const e of s?.entries ?? []) byValue.set(String(e.value), e);
     let used = 0;
-    for (const { k } of ordered) if (byValue.has(k)) used++;
-    const counts = ordered.slice(0, PROFILE_LEVELS_N).map(({ k, v }) => {
-        const e = byValue.get(k);
-        return { value: v, label: vl[k], count: e?.count ?? 0, error: e?.error ?? 0 };
-    });
+    for (const { k } of ordered) if ((declared.get(k) ?? 0) > 0) used++;
+    const counts = ordered.slice(0, PROFILE_LEVELS_N).map(({ k, v }) => (
+        { value: v, label: vl[k], count: declared.get(k) ?? 0, error: 0 }
+    ));
     return { declared: keys.length, used, counts };
 }
 

@@ -223,6 +223,28 @@ describe('profile engine', () => {
         await r.close();
     });
 
+    test('labelled numeric past the cap: declared-label counts stay exact', async () => {
+        // Label 3 occurs once, early; thousands of distinct unlabelled
+        // values after it push it out of Space-Saving's counters.
+        const n = 6_000;
+        const gen = (i: number) => (i === 5 ? 3 : i % 3 === 0 ? 1 : i % 3 === 1 ? 2 : 10_000 + i);
+        const lp = fixture('labelled-cap.arrow', n, [{
+            name: 'v', kind: 'dbl', gen,
+            fieldMd: { 'raven.value_labels': JSON.stringify({ 1: 'one', 2: 'two', 3: 'three', 4: 'four' }) },
+        }]);
+        const expected = { 1: 0, 2: 0, 3: 0, 4: 0 } as Record<number, number>;
+        for (let i = 0; i < n; i++) { const v = gen(i); if (v in expected) expected[v]++; }
+        const r = await ArrowSliceReader.open(lp);
+        const { profile: p } = await computeProfile(r, 0, { exactCap: 10 });
+        expect(p.kind).toBe('labelled');
+        expect(p.distinct.exact).toBe(false);
+        expect(p.levels!.counts.map(e => [e.value, e.count, e.error])).toEqual([
+            [1, expected[1], 0], [2, expected[2], 0], [3, 1, 0], [4, 0, 0],
+        ]);
+        expect(p.levels!.used).toBe(3);
+        await r.close();
+    });
+
     test('character past the cap: HLL distinct and Space-Saving top values, marked ≈', async () => {
         const r = await ArrowSliceReader.open(path);
         const { profile: p, counts } = await computeProfile(r, 1, { exactCap: 10 });

@@ -48,3 +48,16 @@ export function isAbortError(err: unknown): boolean {
         && err !== null
         && (err as { name?: unknown }).name === 'AbortError';
 }
+
+/** A request lost to an unexpected worker-thread exit (see
+ *  `worker-engine.ts`): not a user cancel, but safe to retry. */
+export function isWorkerRestartError(err: unknown): boolean {
+    return typeof err === 'object'
+        && err !== null
+        && (err as { name?: unknown }).name === 'WorkerRestartError';
+}
+
+/** Interrupted rather than failed: a cancel, or a worker restart. */
+export function isInterruption(err: unknown): boolean {
+    return isAbortError(err) || isWorkerRestartError(err);
+}
