@@ -247,3 +247,59 @@ describe.skipIf(!READY)('Copy as R code round trip (real R)', () => {
         }
     }
 });
+
+// Row names: the viewer shows them as a `rowname` column; dplyr and
+// data.table materialize it, base R reads rownames().
+describe.skipIf(!READY)('Copy as R code round trip: row names (real R)', () => {
+    const results = new Map<string, string>();
+    let wantDesc: number[] = [];
+    let wantFiltered: number[] = [];
+    beforeAll(async () => {
+        const tmp = mkdtempSync(join(tmpdir(), 'raven-dv-rcode-rn-'));
+        const rds = join(tmp, 'm.rds');
+        const w = await runR(`m <- mtcars[1:16, 1:3]\nm$id <- seq_len(nrow(m))\nsaveRDS(m, ${JSON.stringify(rds)})\nView(m)\n`);
+        const files = readdirSync(w.dir).filter(f => f.endsWith('.arrow'));
+        const rd = await ArrowSliceReader.open(join(w.dir, files[0]));
+        const cols = rd.schema.columns;
+        const rn = cols.findIndex(c => c.isRowname);
+        const cyl = cols.findIndex(c => c.name === 'cyl');
+        expect(rn).toBe(0);
+        const entries: FilterEntry[] = [{ id: 'a', columnIndex: rn, predicate: { kind: 'strStartsWith', value: 'Merc', caseSensitive: true }, enabled: true, includeMissing: false }];
+        const keys: SortKey[] = [{ columnIndex: cyl, direction: 'desc' }, { columnIndex: rn, direction: 'desc' }];
+        const ctx = { labelsOn: true, formatOn: true, digits: 3 };
+        const rows = await computeFilteredIndices(rd, { entries, labelsOnWhenFiltered: true }, ctx);
+        wantFiltered = Array.from(await computePermutation(rd, keys, { ...ctx, stringOrder: 'c', locale: LOCALE }, { rows }), r => r + 1);
+        wantDesc = Array.from(await computePermutation(rd, [keys[1]], { ...ctx, stringOrder: 'c', locale: LOCALE }), r => r + 1);
+        const script = [
+            'suppressPackageStartupMessages({ library(dplyr); library(data.table) })',
+            `m <- readRDS(${JSON.stringify(rds)})`,
+        ];
+        for (const flavor of FLAVORS) {
+            for (const [name, f, k] of [['filtered', entries, keys], ['desc', [], [keys[1]]]] as const) {
+                const res = generateRCode({
+                    expression: 'm', sourceKind: 'data.frame', columns: cols,
+                    sort: { keys: [...k], labelsOnWhenSorted: true, stringOrder: 'c' },
+                    filter: { entries: [...f], labelsOnWhenFiltered: true },
+                    hiddenColumns: [], locale: LOCALE,
+                }, flavor);
+                if ('error' in res) throw new Error(res.error);
+                script.push(`local({ out <- tryCatch({ out <- {\n${res.code}\n}; out }, error = function(e) { cat("@@${flavor}|${name}\tERROR: ", conditionMessage(e), "\n", sep = ""); NULL }); if (!is.null(out)) cat("@@${flavor}|${name}\t", paste(out[["id"]], collapse = ","), "\n", sep = "") })`);
+            }
+        }
+        const scriptPath = join(tmp, 'rn.R');
+        writeFileSync(scriptPath, script.join('\n'), 'utf8');
+        const r = await runR(`source(${JSON.stringify(scriptPath)}, encoding = "UTF-8")`);
+        for (const line of r.stdout.split('\n')) {
+            const m = /^@@(.*?)\t(.*)$/.exec(line);
+            if (m) results.set(m[1], m[2]);
+        }
+        await rd.close();
+    }, 120_000);
+
+    for (const flavor of FLAVORS) {
+        test(`${flavor}: filter and sort on row names`, () => {
+            expect(results.get(`${flavor}|filtered`)).toBe(wantFiltered.join(','));
+            expect(results.get(`${flavor}|desc`)).toBe(wantDesc.join(','));
+        });
+    }
+});
