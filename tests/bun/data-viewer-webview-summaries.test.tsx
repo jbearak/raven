@@ -232,6 +232,20 @@ describe('Columns sidebar', () => {
         expect(boxes()).toEqual([false, false, false, false]);
     });
 
+    test('clicking a hidden column\'s row shows it, then jumps to it', async () => {
+        const { posted } = await renderApp();
+        await send(init({ layout: { columnWidths: {}, hiddenColumns: [1] } }));
+        openSidebar();
+        const boxes = () => [...document.querySelectorAll('.columns-sidebar-row input[type=checkbox]')].map(b => (b as HTMLInputElement).checked);
+        expect(boxes()[1]).toBe(false);
+        posted.length = 0;
+        const cylRow = document.getElementById('columns-sidebar-row-1')!;
+        await act(async () => { cylRow.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+        await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+        expect(boxes()[1]).toBe(true);
+        expect(posted.some(m => m.type === 'lifecycle' && m.event === 'sidebar-jump')).toBe(true);
+    });
+
     test('pure: sidebarRows sorts unknowns last and keeps position ties', () => {
         const info = (i: number) => ({ missing: [0.5, undefined, 0.1, 0.1][i], distinct: undefined });
         expect(sidebarRows(columns as any, info, '', 'missing')).toEqual([2, 3, 0, 1]);

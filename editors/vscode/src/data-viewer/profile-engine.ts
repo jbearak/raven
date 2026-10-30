@@ -149,7 +149,8 @@ type NumericDomain = 'number' | 'day' | 'day-ms' | 'micros';
 
 function numericDomain(t: string): NumericDomain {
     if (t.startsWith('Timestamp')) return 'micros';
-    if (t === 'Date64' || t.startsWith('Date<MILLI')) return 'day-ms';
+    // apache-arrow names these `Date64<MILLISECOND>` (and `Date32<DAY>`).
+    if (t.startsWith('Date64')) return 'day-ms';
     if (t.startsWith('Date')) return 'day';
     return 'number';
 }

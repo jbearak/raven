@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DateMillisecond, Table, tableToIPC, vectorFromArray } from 'apache-arrow';
 import { ArrowSliceReader } from '../../editors/vscode/src/data-viewer/arrow-reader';
 import {
     computeProfile,
@@ -220,6 +221,20 @@ describe('profile engine', () => {
         expect(p.top!.values[0]).toEqual({ value: best[0], count: best[1], error: 0 });
         expect(p.top!.exact).toBe(true);
         expect(p.top!.approximateOrder).toBe(false);
+        await r.close();
+    });
+
+    test('Date64 (millisecond) dates profile as dates, not day counts', async () => {
+        const days = [19_000, 19_123, 19_400, 19_001];
+        const t = new Table({ d: vectorFromArray(days.map(v => new Date(v * 86_400_000)), new DateMillisecond()) });
+        const p64 = join(DIR, 'date64.arrow');
+        writeFileSync(p64, tableToIPC(t, 'file'));
+        const r = await ArrowSliceReader.open(p64);
+        expect(r.schema.columns[0].arrowType).toBe('Date64<MILLISECOND>');
+        const { profile: dt } = await computeProfile(r, 0);
+        expect(dt.kind).toBe('date');
+        expect(dt.min).toEqual({ _: 'date', v: '2022-01-08' });
+        expect(dt.max).toEqual({ _: 'date', v: '2023-02-12' });
         await r.close();
     });
 

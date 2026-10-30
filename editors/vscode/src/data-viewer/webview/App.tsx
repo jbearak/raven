@@ -2540,7 +2540,7 @@ export function App({
      *  A hidden column is shown first. */
     const jumpToColumn = useCallback((source: number) => {
         const d = displayIndexOf(display, source);
-        if (d === undefined) {
+        if (d < 0) {
             if (!layout.hiddenColumns.includes(source)) return;
             pendingJumpRef.current = source;
             updateHiddenColumns(toggleColumnHidden(layout.hiddenColumns, source));
@@ -2553,7 +2553,7 @@ export function App({
     }, [display, layout.hiddenColumns, postLifecycle, updateHiddenColumns]);
     useEffect(() => {
         const source = pendingJumpRef.current;
-        if (source === null || displayIndexOf(display, source) === undefined) return;
+        if (source === null || displayIndexOf(display, source) < 0) return;
         pendingJumpRef.current = null;
         jumpToColumn(source);
     }, [display, jumpToColumn]);
