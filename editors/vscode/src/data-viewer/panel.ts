@@ -643,6 +643,7 @@ export class DataViewerPanel {
         }
         await this.webviewPanel.webview.postMessage({
             type: 'rowPosition', panelGeneration: gen, requestId: m.requestId, rowNumber: m.rowNumber, position,
+            ...(m.transformGeneration !== undefined ? { transformGeneration: m.transformGeneration } : {}),
         } satisfies ExtensionToWebview);
     }
 

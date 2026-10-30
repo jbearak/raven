@@ -365,6 +365,9 @@ export type ExtensionToWebview =
         requestId: number;
         rowNumber: number;
         position: number;
+        /** The transform generation `position` was resolved under (the one
+         *  the request named); the webview re-asks if it now shows another. */
+        transformGeneration?: number;
     }
     | {
         /** A short notice for the toast slot (Copy as R code, pins). */

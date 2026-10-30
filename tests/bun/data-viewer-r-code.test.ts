@@ -2,7 +2,7 @@
 // data-viewer-r-code-roundtrip.test.ts).
 import { describe, expect, test } from 'bun:test';
 import type { ColumnSchema } from '../../editors/vscode/src/data-viewer/arrow-reader';
-import { generateRCode, rName, rNumber, rString } from '../../editors/vscode/src/data-viewer/r-code';
+import { generateRCode, pcreCompatible, rName, rNumber, rString } from '../../editors/vscode/src/data-viewer/r-code';
 import { EMPTY_FILTER, EMPTY_SORT } from '../../editors/vscode/src/data-viewer/messages';
 
 function col(name: string, arrowType: string, extra: Partial<ColumnSchema> = {}): ColumnSchema {
@@ -115,6 +115,26 @@ describe('generateRCode', () => {
         const cols = [...COLS, col('mpg', 'Float64')];
         const r = gen({ columns: cols, hiddenColumns: [4] });
         expect('code' in r && r.code).toContain('select(-4)');
+    });
+
+    test('regex filters are written only when JS and PCRE read the pattern alike', () => {
+        const regex = (pattern: string) => gen({
+            filter: { entries: [{ id: 'r', columnIndex: 3, predicate: { kind: 'strRegex', pattern, caseSensitive: true }, enabled: true, includeMissing: false }], labelsOnWhenFiltered: true },
+        });
+        const ok = regex('^file_\\d+\\.csv$');
+        expect('code' in ok && ok.code).toContain('grepl("^file_\\\\d+\\\\.csv$"');
+        for (const pattern of ['\\u0061', '\\x{61}a\\cJ', '[^]', '\\p{L}', '\\k', '\\0', '\\v']) {
+            const r = regex(pattern);
+            expect([pattern, 'code' in r && r.code.includes('grepl(')]).toEqual([pattern, false]);
+            expect('code' in r && r.code).toContain('# Not translated: filter on my name (strRegex)');
+        }
+    });
+
+    test('pcreCompatible allows the shared subset only', () => {
+        for (const p of ['abc', '^a.*b$', '[a-z]+\\d{2,3}', '(foo|bar)\\b', 'a\\.b\\/c\\-d', '\\s\\S\\w\\W'])
+            expect([p, pcreCompatible(p)]).toEqual([p, true]);
+        for (const p of ['\\u0061', '\\cA', '[^]', '\\p{L}', '\\1\\0', '\\v', 'trailing\\'])
+            expect([p, pcreCompatible(p)]).toEqual([p, false]);
     });
 
     test('untranslatable filters are named in a comment, not approximated', () => {

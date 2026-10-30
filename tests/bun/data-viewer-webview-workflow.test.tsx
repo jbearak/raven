@@ -257,13 +257,39 @@ describe('go to row', () => {
         pressIn(input, 'Enter');
         const req = posted.find(m => m.type === 'goToRow');
         expect(req).toMatchObject({ rowNumber: 10, transformGeneration: 1 });
-        await send({ type: 'rowPosition', panelGeneration: 1, requestId: req.requestId, rowNumber: 10, position: -1 });
+        await send({ type: 'rowPosition', panelGeneration: 1, requestId: req.requestId, rowNumber: 10, position: -1, transformGeneration: 1 });
         expect(document.querySelector('.goto-bar .grid-bar-status')?.textContent).toBe('Row 10 is filtered out');
         setInput(input, '10');
         pressIn(input, 'Enter');
         const req2 = [...posted].reverse().find(m => m.type === 'goToRow');
-        await send({ type: 'rowPosition', panelGeneration: 1, requestId: req2.requestId, rowNumber: 10, position: 77 });
+        await send({ type: 'rowPosition', panelGeneration: 1, requestId: req2.requestId, rowNumber: 10, position: 77, transformGeneration: 1 });
         expect([...posted].reverse().find(m => m.type === 'lifecycle')?.focusCell).toEqual({ row: 77, col: 0 });
+    });
+});
+
+describe('go to row across a commit', () => {
+    test('a reply resolved under a generation no longer on screen is re-asked, not applied', async () => {
+        const { posted } = await renderApp();
+        await send(init({ sort: { keys: [{ columnIndex: 0, direction: 'desc' }], labelsOnWhenSorted: true } }));
+        key('g', { meta: true });
+        const input = document.querySelector('.goto-bar input') as HTMLInputElement;
+        setInput(input, '10');
+        pressIn(input, 'Enter');
+        const req = [...posted].reverse().find(m => m.type === 'goToRow');
+        expect(req.transformGeneration).toBe(1);
+        // A new sort commits and is adopted while the request travels.
+        await send({
+            type: 'sortApplied', panelGeneration: 1, requestId: 99,
+            sort: { keys: [{ columnIndex: 0, direction: 'asc' }], labelsOnWhenSorted: true },
+            fromPersistence: false, transformGeneration: 2,
+        });
+        posted.length = 0;
+        await send({ type: 'rowPosition', panelGeneration: 1, requestId: req.requestId, rowNumber: 10, position: 77, transformGeneration: 1 });
+        expect(posted.some(m => m.type === 'lifecycle' && m.focusCell?.row === 77)).toBe(false);
+        const again = posted.find(m => m.type === 'goToRow');
+        expect(again).toMatchObject({ rowNumber: 10, transformGeneration: 2 });
+        await send({ type: 'rowPosition', panelGeneration: 1, requestId: again.requestId, rowNumber: 10, position: 5, transformGeneration: 2 });
+        expect([...posted].reverse().find(m => m.type === 'lifecycle')?.focusCell).toEqual({ row: 5, col: 0 });
     });
 });
 

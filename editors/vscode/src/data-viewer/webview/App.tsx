@@ -2759,6 +2759,22 @@ export function App({
 
     const applyRowPosition = useCallback((m: Extract<ExtensionToWebview, { type: 'rowPosition' }>) => {
         if (m.panelGeneration !== panelGenerationRef.current || m.requestId !== gotoRequestRef.current) return;
+        // Resolved under a generation that is no longer on screen (a sort or
+        // filter committed while the request travelled): ask again under
+        // the current one rather than select the wrong R row.
+        if (m.transformGeneration !== shownTransformGenRef.current) {
+            const requestId = nextRequestId();
+            gotoRequestRef.current = requestId;
+            vscode.postMessage({
+                type: 'goToRow',
+                panelGeneration: panelGenerationRef.current,
+                requestId,
+                rowNumber: m.rowNumber,
+                ...(shownTransformGenRef.current !== undefined
+                    ? { transformGeneration: shownTransformGenRef.current } : {}),
+            });
+            return;
+        }
         if (m.position < 0) {
             setGotoMessage(m.rowNumber > nrow
                 ? `The data has ${nrow.toLocaleString('en-US')} rows`
@@ -2766,7 +2782,7 @@ export function App({
             return;
         }
         goToPosition(m.position, 'goto-row');
-    }, [goToPosition, nrow]);
+    }, [goToPosition, nextRequestId, nrow, vscode]);
 
     const copyAsCode = useCallback((flavor: CodeFlavorName) => {
         vscode.postMessage({

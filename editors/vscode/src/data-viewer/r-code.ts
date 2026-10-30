@@ -203,6 +203,10 @@ function predicateCode(
             return { code: `${fn}(${hay}, ${rString(needle)})`, trueOnNA: false };
         }
         case 'strRegex':
+            // Only patterns that mean the same in the viewer's JavaScript
+            // RegExp (no `u` flag) and in PCRE; anything else is left out
+            // with a "Not translated" comment rather than run differently.
+            if (!pcreCompatible(p.pattern)) return null;
             return {
                 code: `grepl(${rString(p.pattern)}, ${str}, perl = TRUE${p.caseSensitive ? '' : ', ignore.case = TRUE'})`,
                 trueOnNA: false,
@@ -220,6 +224,27 @@ function predicateCode(
                 : { code: `!${set}`, trueOnNA: true };
         }
     }
+}
+
+/**
+ * Whether a JavaScript (non-Unicode-mode) regex pattern means the same in
+ * PCRE (`grepl(perl = TRUE)`). Allows the common subset: literals, classes,
+ * groups, alternation, quantifiers, anchors, and the escapes both engines
+ * read alike. Rejects escapes the engines read differently (`\u0061` and
+ * `\cX` are JS escapes but PCRE errors or differs; `\p`/`\k` are literal
+ * letters in non-Unicode JS but properties/backrefs in PCRE; `\0` and other
+ * octal forms) and `[^]` (JS "any character", a PCRE error).
+ */
+export function pcreCompatible(pattern: string): boolean {
+    if (pattern.includes('[^]')) return false;
+    for (let i = 0; i < pattern.length; i++) {
+        if (pattern[i] !== '\\') continue;
+        const next = pattern[i + 1];
+        if (next === undefined) return false;
+        if (!/[dDwWsSbBntrf.*+?()[\]{}|^$\\/\-]/.test(next)) return false;
+        i++;
+    }
+    return true;
 }
 
 /** `<x> %in% c(...)` for a set filter, routed as `filter.ts` routes it. */
