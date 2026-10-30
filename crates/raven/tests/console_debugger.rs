@@ -1711,3 +1711,72 @@ fn error_and_warning_filters_stop_in_code_from_files_only() {
         d.session_ended();
     }
 }
+
+#[test]
+fn uncaught_errors_in_file_code_print_a_traceback() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let a = c.write_file(
+        "a.R",
+        "inner <- function(x) {\n  log(x)\n}\nouter <- function(y) {\n  inner(y)\n}\nsig <- function() {\n  signalCondition(simpleError(\"sig\"))\n  1\n}\nodd <- function() {\n  stop(\"one\\x1etwo\\nthree\")\n}\n",
+    );
+    let b = c.write_file("b.R", "outer('a')\n");
+    let tracebacks = |c: &Console| c.text().matches("Traceback:").count();
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": []}));
+    d.req("configurationDone", json!({}));
+    c.send(&std::fs::read_to_string(&a).unwrap(), Some(&a));
+    c.expect("> ");
+
+    // From a file: every frame with its line, then the top-level line.
+    c.send("outer('a')", Some(&b));
+    c.expect("Traceback:");
+    c.expect(&format!("inner(y) at {a}:2"));
+    c.expect(&format!("outer(\"a\") at {a}:5"));
+    c.expect(&format!("<top level> at {b}:1"));
+
+    // Typed at the prompt, calling file code: the file frames only.
+    c.type_line("outer('b')");
+    c.expect(&format!("outer(\"b\") at {a}:5"));
+    assert_eq!(tracebacks(&c), 2);
+
+    // Nothing for a typo, a caught error, or a signal that ends nothing.
+    c.type_line("log('typo')");
+    c.expect("Error in log(\"typo\")");
+    c.type_line("tryCatch(outer('c'), error = function(e) 'caught')");
+    c.expect("\"caught\"");
+    c.type_line("sig()");
+    c.expect("[1] 1");
+    c.type_line("cat('marker', '\\n')");
+    c.expect("marker ");
+    assert_eq!(tracebacks(&c), 2);
+
+    // A message with a field separator and a newline doesn't garble it.
+    c.type_line("odd()");
+    c.expect(&format!("odd() at {a}:12"));
+    assert_eq!(tracebacks(&c), 3);
+
+    // After a stop: Continue prints it; Stop (Q) prints no error and none.
+    d.req("setExceptionBreakpoints", json!({"filters": ["error"]}));
+    let m = d.mark();
+    c.type_line("outer('d')");
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect("outer(\"d\") at");
+    assert_eq!(tracebacks(&c), 4);
+    let m = d.mark();
+    c.type_line("outer('e')");
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("terminate", json!({}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.type_line("cat('after stop', '\\n')");
+    c.expect("after stop ");
+    assert_eq!(tracebacks(&c), 4);
+}

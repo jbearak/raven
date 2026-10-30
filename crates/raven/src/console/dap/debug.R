@@ -841,7 +841,20 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         "ok"
     }, error = function(e) "err"))
-    env$at_prompt <- function(top) internal(tryCatch({
+    # The traceback to print at this top-level prompt (a JSON array), and
+    # the candidate is gone either way. Printed only when R reset the console
+    # since the last prompt (an uncaught error or interrupt; an interrupt
+    # already cleared the candidate) and R's last error message is this one:
+    # signalCondition() of an error object reaches the handler but needn't
+    # end anything. When in doubt, nothing is printed.
+    take_traceback <- function(reset) {
+        cand <- state$err_cand
+        state$err_cand <- NULL
+        if (is.null(cand) || !reset) return("[]")
+        if (nzchar(cand$msg) && !grepl(substr(cand$msg, 1L, 200L), geterrmessage(), fixed = TRUE)) return("[]")
+        jarr(jstr(cand$lines))
+    }
+    env$at_prompt <- function(top, reset = "FALSE") internal(tryCatch({
         if (!is.null(state$jit_saved)) {
             if (identical(compiler::enableJIT(-1L), 0L)) compiler::enableJIT(state$jit_saved)
             state$jit_saved <- NULL
@@ -853,7 +866,8 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
                 state$nl_saved <- NULL
             }
             st <- fbp_status()
-            return(paste0(masked_names(), "\x1e", paste(ifelse(nzchar(st), "0", "1"), collapse = "")))
+            return(paste0(masked_names(), "\x1e", paste(ifelse(nzchar(st), "0", "1"), collapse = ""),
+                          "\x1e", take_traceback(isTRUE(as.logical(reset)))))
         }
         ""
     }, error = function(e) ""))
@@ -1149,8 +1163,50 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         }
         NULL
     }
+    # ---- traceback (printed at the next top-level prompt) ---------------------
+    # An absolute file location, or NULL: a relative name with no srcfile$wd
+    # can't be resolved against the terminal's directory.
+    abs_loc <- function(sr) {
+        if (!file_srcref(sr)) return(NULL)
+        loc <- srcref_loc(sr)
+        if (grepl("^([A-Za-z]:)?[/\\\\]", loc[[1L]])) loc else NULL
+    }
+    # The stack as the traceback shows it, innermost first: each frame with
+    # the line in it that called the next one (as the debugger's call stack
+    # does), keeping only lines in files. NULL when no line is in a file.
+    error_traceback <- function() {
+        out <- character()
+        for (j in rev(seq_len(sys.nframe()))) {
+            if (identical(environment(sys.function(j)), here)) next
+            if (j > 1L && identical(environment(sys.function(j - 1L)), here)) next
+            loc <- abs_loc(attr(sys.call(j), "srcref"))
+            if (is.null(loc)) next
+            who <- if (j == 1L) "<top level>"
+                   else trunc_str(paste(deparse(sys.call(j - 1L), nlines = 1L), collapse = ""), 60L)
+            out <- c(out, paste0(who, " at ", loc[[1L]], ":", loc[[2L]]))
+        }
+        if (length(out)) out else NULL
+    }
+    # The candidate traceback for the error being signalled, or NULL. It is
+    # printed only if the error really ends at the prompt; see at_prompt.
+    error_candidate <- function(cnd) internal(tryCatch({
+        if (identical(rpc("at_browser"), "1") || !from_file()) return(NULL)
+        lines <- error_traceback()
+        if (is.null(lines)) NULL
+        else list(lines = lines, msg = tryCatch(conditionMessage(cnd), error = function(e) ""))
+    }, error = function(e) NULL))
+    # Every error and interrupt replaces the candidate. It is set only once
+    # stop_or_pass() returns: Stop (`Q`) at an exception stop unwinds past
+    # here, leaving none, as R then prints no error.
     on_condition <- function(cnd) {
         if (isTRUE(state$internal)) return(invisible(NULL))
+        if (inherits(cnd, "error") || inherits(cnd, "interrupt")) state$err_cand <- NULL
+        cand <- if (inherits(cnd, "error")) error_candidate(cnd)
+        stop_or_pass(cnd)
+        if (!is.null(cand)) state$err_cand <- cand
+        invisible(NULL)
+    }
+    stop_or_pass <- function(cnd) {
         kind <- if (inherits(cnd, "interrupt")) "interrupt" else if (inherits(cnd, "error")) "error"
                 else if (inherits(cnd, "warning")) "warning" else return(invisible(NULL))
         taken <- if (kind == "interrupt") rpc("take_pause") else ""

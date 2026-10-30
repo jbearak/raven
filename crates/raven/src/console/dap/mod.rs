@@ -1108,6 +1108,13 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 String::new()
             }
         }
+        "at_browser" => {
+            if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) {
+                "1".into()
+            } else {
+                String::new()
+            }
+        }
         // At a browser prompt (stopped, not resumed) the condition comes from
         // what the user typed there; R is already stopped, so don't nest.
         "filters" if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) => String::new(),
@@ -1541,6 +1548,36 @@ pub fn on_program_finished() {
     }
 }
 
+/// R reset the console (an uncaught error or an interrupt) since the last
+/// top-level prompt: one of the conditions for printing a traceback.
+static RESET_SINCE_PROMPT: AtomicBool = AtomicBool::new(false);
+
+/// Called from the console's `ResetConsole` callback.
+pub fn note_reset() {
+    RESET_SINCE_PROMPT.store(true, Ordering::SeqCst);
+}
+
+/// Most traceback lines printed; the rest are counted.
+const TRACEBACK_LINES: usize = 8;
+
+/// Print the traceback `at_prompt` returned (a JSON array of lines, each
+/// `call at /abs/file.R:12`, innermost first), dim, after R's error message.
+/// VS Code's terminal links the `path:line` itself.
+fn print_traceback(json: &str) {
+    let lines: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+    if lines.is_empty() {
+        return;
+    }
+    let mut text = String::from("Traceback:\n");
+    for l in lines.iter().take(TRACEBACK_LINES) {
+        text.push_str(&format!("  {l}\n"));
+    }
+    if lines.len() > TRACEBACK_LINES {
+        text.push_str(&format!("  … {} more\n", lines.len() - TRACEBACK_LINES));
+    }
+    super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
+}
+
 fn on_top_level(more: bool) -> Option<String> {
     release_held(true);
     // A pause or Stop that arrived as R finished on its own must not change
@@ -1549,9 +1586,16 @@ fn on_top_level(more: bool) -> Option<String> {
         h.pause.store(false, Ordering::SeqCst);
         h.abort.store(false, Ordering::SeqCst);
     }
-    let reply = call_helper("at_prompt", &["TRUE"]).unwrap_or_default();
-    let (masked, bound) = reply.split_once('\x1e').unwrap_or((reply.as_str(), ""));
-    let (masked, bound) = (masked.to_string(), bound.to_string());
+    let reset = if RESET_SINCE_PROMPT.swap(false, Ordering::SeqCst) {
+        "TRUE"
+    } else {
+        "FALSE"
+    };
+    let reply = call_helper("at_prompt", &["TRUE", reset]).unwrap_or_default();
+    let mut fields = reply.splitn(3, '\x1e');
+    let masked = fields.next().unwrap_or("").to_string();
+    let bound = fields.next().unwrap_or("").to_string();
+    print_traceback(fields.next().unwrap_or("[]"));
     report_function_breakpoints(&bound);
     let changed = with_r(|r| {
         r.jit_off = false;
