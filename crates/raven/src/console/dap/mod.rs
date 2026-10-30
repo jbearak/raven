@@ -254,6 +254,8 @@ struct RState {
     /// The one-shot step probe fired: the next stop is a step (§4).
     pending_step: bool,
     pending_exception: Option<(String, String)>,
+    /// R recorded a warning's location that isn't printed yet.
+    warnings_pending: bool,
     step_next_segment: bool,
     /// One-shot step probe armed for the segment being fed.
     step_probe_armed: bool,
@@ -337,6 +339,7 @@ pub fn init(
         "on_stop",
         "on_resume",
         "at_prompt",
+        "take_warnings",
     ] {
         let c = CString::new(format!("get(\"{name}\", envir = environment())")).expect("name");
         let mut out: Sexp = std::ptr::null_mut();
@@ -386,6 +389,7 @@ pub fn init(
             pending_hit: None,
             pending_step: false,
             pending_exception: None,
+            warnings_pending: false,
             step_next_segment: false,
             step_probe_armed: false,
             plans: HashMap::new(),
@@ -1108,6 +1112,10 @@ fn rpc_impl(op: &str, a: &str, b: &str) -> String {
                 String::new()
             }
         }
+        "warnings_pending" => {
+            with_r(|r| r.warnings_pending = true);
+            String::new()
+        }
         "at_browser" => {
             if with_r(|r| r.stopped && !r.resumed).unwrap_or(false) {
                 "1".into()
@@ -1445,6 +1453,7 @@ pub fn on_repl_prompt(level: u32, more: bool) -> Option<String> {
     if with_r(|r| std::mem::take(&mut r.jit_off)).unwrap_or(false) && level > 0 {
         let _ = call_helper("at_prompt", &["FALSE"]);
     }
+    print_warning_locations(level == 0);
     if level == 0 {
         return on_top_level(more);
     }
@@ -1555,6 +1564,25 @@ static RESET_SINCE_PROMPT: AtomicBool = AtomicBool::new(false);
 /// Called from the console's `ResetConsole` callback.
 pub fn note_reset() {
     RESET_SINCE_PROMPT.store(true, Ordering::SeqCst);
+}
+
+/// After R printed its warnings: where each came from, if R recorded any
+/// warning since the last top-level prompt (see `take_warnings`).
+fn print_warning_locations(top: bool) {
+    if !with_r(|r| r.warnings_pending).unwrap_or(false) {
+        return;
+    }
+    let json = call_helper("take_warnings", &[if top { "TRUE" } else { "FALSE" }]);
+    let Some(json) = json.filter(|j| !j.is_empty()) else {
+        return;
+    };
+    with_r(|r| r.warnings_pending = false);
+    let lines: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+    if lines.is_empty() {
+        return;
+    }
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    super::output::get().write(format!("\x1b[2m{text}\x1b[0m").as_bytes(), 1);
 }
 
 /// Most traceback lines printed; the rest are counted.

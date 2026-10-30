@@ -27,6 +27,7 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
         rdebug = sym("raven_dbg_rdebug"),
         altrep_class = sym("raven_dbg_altrep_class"),
         nrow = sym("raven_dbg_nrow"),
+        same = sym("raven_dbg_same"),
         set_rdebug = sym("raven_dbg_set_rdebug"),
         base_bind = sym("raven_dbg_base_bind")
     )
@@ -1198,8 +1199,56 @@ base::local(envir = base::new.env(parent = base::baseenv()), {
     # Every error and interrupt replaces the candidate. It is set only once
     # stop_or_pass() returns: Stop (`Q`) at an exception stop unwinds past
     # here, leaving none, as R then prints no error.
+    # ---- warning locations ----------------------------------------------------
+    # Each warning R will collect (warn = 0; ones a handler muffles never get
+    # here) is recorded with the innermost line in a file on the stack, in
+    # order, so the console can number them as R does. A warning signalled at
+    # a Browse> prompt joins the same block, so it gets a placeholder. Past
+    # ten, R prints only a count, so recording stops at eleven.
+    record_warning <- function(cnd) internal(tryCatch({
+        w <- state$warns
+        if (length(w) > 10L || !identical(as.numeric(getOption("warn", 0)), 0)) return(NULL)
+        if (!length(w)) state$warns_lw <- get0("last.warning", envir = baseenv(), inherits = FALSE)
+        loc <- NA_character_
+        if (!identical(rpc("at_browser"), "1")) {
+            for (i in rev(seq_len(sys.nframe()))) {
+                if (identical(environment(sys.function(i)), here)) next
+                l <- abs_loc(attr(sys.call(i), "srcref"))
+                if (!is.null(l)) {
+                    loc <- paste0(l[[1L]], ":", l[[2L]])
+                    break
+                }
+            }
+        }
+        state$warns <- c(w, list(list(msg = conditionMessage(cnd), loc = loc)))
+        if (!length(w)) rpc("warnings_pending")
+    }, error = function(e) NULL))
+    # Lines naming where each warning R just printed came from (a JSON
+    # array), once R's own record matches the recorded ones: `last.warning`
+    # is a new object (R assigns one each time it prints the block), with
+    # the same count, each message a prefix of the other (R truncates long
+    # ones, adding " [... truncated]"). At the top-level prompt the record is
+    # dropped either way; at a Browse> prompt it waits for R to print.
+    env$take_warnings <- function(top) internal(tryCatch({
+        w <- state$warns
+        top <- isTRUE(as.logical(top))
+        lw <- get0("last.warning", envir = baseenv(), inherits = FALSE)
+        same <- length(w) && length(w) <= 10L && length(lw) == length(w) &&
+            !isTRUE(.Call(N$same, lw, state$warns_lw)) &&
+            all(mapply(function(a, b) startsWith(a, b) || startsWith(b, a), sub(" [... truncated]", "", names(lw), fixed = TRUE),
+                       vapply(w, function(e) e$msg, "")))
+        if (!same && !top) return("")
+        state$warns <- NULL
+        state$warns_lw <- NULL
+        locs <- vapply(w, function(e) e$loc, "")
+        if (!same || all(is.na(locs))) return("[]")
+        lines <- if (length(w) == 1L) paste0("  at ", locs)
+                 else c("Warning locations:", paste0("  ", seq_along(locs), ": ", ifelse(is.na(locs), "(no file)", locs)))
+        jarr(jstr(lines))
+    }, error = function(e) { state$warns <- NULL; "[]" }))
     on_condition <- function(cnd) {
         if (isTRUE(state$internal)) return(invisible(NULL))
+        if (inherits(cnd, "warning")) record_warning(cnd)
         if (inherits(cnd, "error") || inherits(cnd, "interrupt")) state$err_cand <- NULL
         cand <- if (inherits(cnd, "error")) error_candidate(cnd)
         stop_or_pass(cnd)

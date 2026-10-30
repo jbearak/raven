@@ -1780,3 +1780,94 @@ fn uncaught_errors_in_file_code_print_a_traceback() {
     c.expect("after stop ");
     assert_eq!(tracebacks(&c), 4);
 }
+
+#[test]
+fn warnings_from_file_code_name_their_lines() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let w = c.write_file(
+        "w.R",
+        "one <- function() {\n  log(-1)\n}\ntwo <- function() {\n  warning(strrep(\"x\", 1500))\n  sqrt(-1)\n}\nboth <- function() {\n  one()\n  two()\n  as.integer(\"z\")\n}\nmany <- function() {\n  for (i in 1:20) warning(\"w\", i)\n}\nstopper <- function() {\n  log(-1)\n  y <- 1\n  y\n}\n",
+    );
+    let mut d = Dap::connect(&c);
+    d.req("setExceptionBreakpoints", json!({"filters": []}));
+    d.req("configurationDone", json!({}));
+    c.send(&std::fs::read_to_string(&w).unwrap(), Some(&w));
+    c.expect("> ");
+
+    // One warning: its line under R's message.
+    c.type_line("one()");
+    c.expect("NaNs produced");
+    c.expect(&format!("  at {w}:2"));
+    // Again: R's record is equal to the last one, but new.
+    c.type_line("one()");
+    let deadline = Instant::now() + TIMEOUT;
+    while c.text().matches(&format!("  at {w}:2")).count() < 2 {
+        assert!(Instant::now() < deadline, "second warning has no location");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Several, numbered as R numbers them, including a message R
+    // truncates and a warning from base code called at the prompt's level.
+    c.type_line("both()");
+    c.expect("Warning locations:");
+    c.expect(&format!("  1: {w}:2"));
+    c.expect(&format!("  2: {w}:5"));
+    c.expect(&format!("  3: {w}:6"));
+    c.expect(&format!("  4: {w}:11"));
+    c.type_line("{ one(); as.integer('q') }");
+    c.expect("  2: (no file)");
+
+    // Typed at the prompt, muffled, printed at once, or too many to list:
+    // nothing.
+    let count = |c: &Console| c.text().matches(&format!("{w}:")).count();
+    let before = count(&c);
+    c.type_line("as.integer('typed')");
+    c.expect("NAs introduced by coercion");
+    c.type_line("suppressWarnings(one())");
+    c.type_line("local({ op <- options(warn = 1); on.exit(options(op)); one() })");
+    c.type_line("many()");
+    c.expect("There were 20 warnings");
+    c.type_line("cat('done', '\\n')");
+    c.expect("done ");
+    assert_eq!(count(&c), before);
+
+    // A warning before a breakpoint: R prints it as the browser opens.
+    d.req(
+        "setBreakpoints",
+        json!({"source": {"path": w}, "breakpoints": [{"line": 18}]}),
+    );
+    c.send(&std::fs::read_to_string(&w).unwrap(), Some(&w));
+    std::thread::sleep(Duration::from_millis(300));
+    let m = d.mark();
+    c.type_line("stopper()");
+    d.event("stopped", m);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+    c.expect(&format!("  at {w}:17"));
+
+    // One typed at Browse> while stopped is its own block, with no file.
+    let m = d.mark();
+    c.type_line("stopper()");
+    d.event("stopped", m);
+    let at17 = format!("  at {w}:17");
+    let deadline = Instant::now() + TIMEOUT;
+    while c.text().matches(&at17).count() < 2 {
+        assert!(Instant::now() < deadline, "no location at the second stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let no_file = c.text().matches("(no file)").count();
+    c.type_line("log(-2)");
+    c.expect("In log(-2)");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(c.text().matches(&at17).count(), 2);
+    assert_eq!(c.text().matches("(no file)").count(), no_file);
+    let m = d.mark();
+    d.req("continue", json!({"threadId": 1}));
+    d.event("terminated", m);
+    d.session_ended();
+}
