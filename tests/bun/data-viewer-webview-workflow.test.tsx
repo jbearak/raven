@@ -323,6 +323,41 @@ describe('pins', () => {
     });
 });
 
+describe('sort text by', () => {
+    test('the column menu tucks the text orders into a submenu with examples and Explain…', async () => {
+        const { ColumnContextMenu } = await import('../../editors/vscode/src/data-viewer/webview/column-context-menu');
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const root = createRoot(container);
+        roots.push(root);
+        const picked: string[] = [];
+        let explained = 0;
+        act(() => {
+            root.render(<ColumnContextMenu leftPx={0} topPx={0} onCopy={() => {}} onClose={() => {}}
+                sort={{
+                    activeDirection: 'none', anySorted: false, otherColumnsSorted: false,
+                    onSort: () => {}, onAddToSort: () => {}, onClearColumn: () => {}, onClearAll: () => {},
+                    stringOrder: 'natural', onStringOrder: o => { picked.push(o); },
+                    onExplainStringOrder: () => { explained++; },
+                }} />);
+        });
+        const radios = () => [...document.querySelectorAll('[role="menuitemradio"]')] as HTMLButtonElement[];
+        expect(radios()).toHaveLength(0);
+        const trigger = [...document.querySelectorAll('.context-menu-item')]
+            .find(e => e.textContent?.startsWith('Sort text by')) as HTMLButtonElement;
+        act(() => { trigger.click(); });
+        expect(radios().map(e => e.textContent)).toEqual([
+            '✓Naturalfile2, file10', 'Alphabeticalfile10, file2', 'As dplyr (fast)Z, a',
+        ]);
+        act(() => { radios()[2].click(); });
+        expect(picked).toEqual(['c']);
+        const explain = [...document.querySelectorAll('.context-menu-item')]
+            .find(e => e.textContent === 'Explain…') as HTMLButtonElement;
+        act(() => { explain.click(); });
+        expect(explained).toBe(1);
+    });
+});
+
 describe('selection summary', () => {
     test('a selection over loaded numeric cells shows count, NA, sum and mean; App does not render on scroll', async () => {
         const { posted, renders } = await renderApp();

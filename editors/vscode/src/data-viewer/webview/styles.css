@@ -866,7 +866,9 @@ body,
     outline: none;
 }
 
-.context-menu-item[role^='menuitemcheckbox'] {
+.context-menu-item[role^='menuitemcheckbox'],
+.context-menu-item[role='menuitemradio'],
+.context-menu-item.context-submenu-trigger {
     display: grid;
     grid-template-columns: 14px 1fr auto;
     align-items: center;
@@ -893,11 +895,21 @@ body,
     background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
 }
 
-/* "Text order" group label in the column menu. */
-.context-menu-heading {
-    padding: 2px 10px 2px 28px;
-    color: var(--vscode-descriptionForeground, inherit);
-    font-size: var(--dv-font-size-xs);
+/* The column menu's "Sort text by" submenu: opens to the right, or to
+   the left (.flip) when the right would overflow the panel. */
+.context-submenu-anchor {
+    position: relative;
+}
+
+.context-submenu {
+    top: -4px;
+    left: 100%;
+    min-width: 200px;
+}
+
+.context-submenu.flip {
+    right: 100%;
+    left: auto;
 }
 
 .sort-strip {
@@ -1028,7 +1040,7 @@ body,
     opacity: 1;
 }
 
-/* "C" / "Locale" when text keys don't sort in the default Natural order. */
+/* "Alphabetical" / "As dplyr" when text keys don't sort in the default Natural order. */
 .sort-order-chip {
     flex: 0 0 auto;
     padding: 0 6px;

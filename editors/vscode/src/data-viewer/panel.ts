@@ -71,6 +71,9 @@ type FilterSnapshot = {
 
 /** A task running past this is stopped by terminating the scan worker. */
 const TRANSFORM_DEADLINE_MS = 10 * 60 * 1000;
+/** The data viewer's user docs; `openHelp` topics are anchors in it. */
+const DATA_VIEWER_DOCS_URL = 'https://github.com/jbearak/raven/blob/main/docs/data-viewer.md';
+
 /** Natural and Locale sorts running past this offer "Switch to C order". */
 const SLOW_SORT_MS = 3000;
 
@@ -2082,6 +2085,10 @@ export class DataViewerPanel {
             }
             case 'refresh': {
                 await this.handleRefresh(gen);
+                return;
+            }
+            case 'openHelp': {
+                await vscode.env.openExternal(vscode.Uri.parse(`${DATA_VIEWER_DOCS_URL}#${m.topic}`));
                 return;
             }
             case 'setSort': {

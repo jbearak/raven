@@ -184,7 +184,7 @@ Right-click a column header to sort. The menu offers:
 - Add ascending to sort and Add descending to sort, when another column is already sorted. These add this column as the next key. Holding Shift while choosing Sort ascending or Sort descending does the same.
 - Clear sort on this column, when this column is sorted.
 - Clear all sorts, when any sort is active.
-- Text order: Natural, Locale, or C, for how text and labels sort (see [Text order](#text-order)).
+- Sort text by: Natural, Alphabetical, or As dplyr (fast), for how text and labels sort (see [Text order](#text-order)). Explain… at the bottom of the submenu opens that section.
 
 A sorted column shows a thin triangle at the right edge of its header: ▲ for ascending, ▼ for descending. When more than one column is sorted, each sorted header also shows a small priority badge (1, 2, 3 …) so you can see which key comes first.
 
@@ -198,15 +198,15 @@ While Raven sorts a large frame, a `Sorting…` pill appears beside the chips. I
 
 ### Text order
 
-Text columns, and labelled columns sorted by label, sort in one of three orders. Pick one under Text order in the column header menu. The panel remembers your choice for the panel name and the data's column layout, and the next sort uses it.
+Text columns, and labelled columns sorted by label, sort in one of three orders. Pick one under Sort text by in the column header menu. Each item shows a short example of its order. The panel remembers your choice for the panel name and the data's column layout, and the next sort uses it.
 
 | Order | Sorts like | Example |
 |---|---|---|
 | Natural (default) | Your VS Code display language's collation, with runs of digits compared as numbers | `a`, `A`, `file_2`, `file_10` |
-| Locale | Your VS Code display language's collation, character by character | `a`, `A`, `file_10`, `file_2` |
-| C | Unicode code points, as `dplyr::arrange()` (dplyr 1.1.0 and later) and `sort(method = "radix")` | `A`, `a`, `file_10`, `file_2` |
+| Alphabetical | Your VS Code display language's collation, character by character | `a`, `A`, `file_10`, `file_2` |
+| As dplyr (fast) | Unicode code points, with every uppercase letter before every lowercase one, as `dplyr::arrange()` (dplyr 1.1.0 and later) and `sort(method = "radix")` | `A`, `a`, `file_10`, `file_2` |
 
-When the order isn't Natural, the Sort strip shows a `C` or `Locale` chip. Natural and Locale compare every distinct value with a collator, which can take tens of seconds on a column with a million distinct values. When such a sort runs past 3 seconds, the `Sorting…` pill offers Switch to C order (fast, as dplyr), which re-sorts in C order instead. Text that the collator treats as equal, such as an accented letter typed as one character or as a letter plus a combining accent, ties and keeps its original row order.
+When the order isn't Natural, the Sort strip shows an `Alphabetical` or `As dplyr` chip. Natural and Alphabetical compare every distinct value with a collator, which can take tens of seconds on a column with a million distinct values. When such a sort runs past 3 seconds, the `Sorting…` pill offers Switch to dplyr order (fast), which re-sorts in As dplyr order instead. Text that the collator treats as equal, such as an accented letter typed as one character or as a letter plus a combining accent, ties and keeps its original row order.
 
 <a id="na--nan"></a>
 
@@ -405,7 +405,7 @@ The code returns the same rows in the same order as the grid:
 - Missing values are handled as the viewer handles them. A filter drops `NA` (and `NaN` in numbers) unless you checked "Include missing", which the code writes as `is.na(x) | …`.
 - Filters on factor and labelled columns use labels when Labels was on and codes or values when it was off, as in the viewer.
 - Missing values sort last in both directions, with `NaN` before `NA`. dplyr and base R otherwise mix the two, so a sort on a column that might hold `NaN` adds an `is.na(x) & !is.nan(x)` term. Once a column's summary shows it has no `NaN`, the term is left out.
-- Text sorts follow the [text order](#text-order): C becomes `.locale = "C"`, Locale becomes `.locale` with your VS Code display language, and Natural becomes `stringr::str_rank(x, locale = …, numeric = TRUE)`. Natural and Locale use the same collation library (ICU) in R and in the viewer, but R and VS Code can ship different versions of it, which can order rare characters differently; the code says so in a comment.
+- Text sorts follow the [text order](#text-order): As dplyr becomes `.locale = "C"`, Alphabetical becomes `.locale` with your VS Code display language, and Natural becomes `stringr::str_rank(x, locale = …, numeric = TRUE)`. Natural and Alphabetical use the same collation library (ICU) in R and in the viewer, but R and VS Code can ship different versions of it, which can order rare characters differently; the code says so in a comment.
 - A frame's row names become a `rowname` column with `tibble::rownames_to_column()` (dplyr) or `keep.rownames` (data.table) when a filter or sort uses them; base R uses `rownames()`.
 - The comment at the top names the packages the code needs.
 

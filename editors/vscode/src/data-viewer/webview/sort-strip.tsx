@@ -14,6 +14,7 @@ import { useLayoutEffect, useRef, useState } from 'react';
 import type { ColumnSchema } from '../arrow-reader';
 import type { SortKey, SortState } from '../messages';
 import { useDismiss } from './use-dismiss';
+import { STRING_ORDERS } from './column-context-menu';
 
 type Props = {
     sort: SortState;
@@ -26,6 +27,9 @@ type Props = {
 
 export function ToolbarSortStrip({ sort, columns, onChange, onClearAll }: Props) {
     if (sort.keys.length === 0) return null;
+    const textOrder = sort.stringOrder && sort.stringOrder !== 'natural'
+        ? STRING_ORDERS.find(o => o.order === sort.stringOrder)
+        : undefined;
     return (
         <div className="sort-strip" role="group" aria-label="Active sort keys">
             <span className="sort-strip-label">Sort:</span>
@@ -42,14 +46,9 @@ export function ToolbarSortStrip({ sort, columns, onChange, onClearAll }: Props)
                     />
                 ))}
             </div>
-            {sort.stringOrder && sort.stringOrder !== 'natural' && (
-                <span
-                    className="sort-order-chip"
-                    title={sort.stringOrder === 'c'
-                        ? 'Text sorts in C (code point) order'
-                        : "Text sorts in your UI language's order"}
-                >
-                    {sort.stringOrder === 'c' ? 'C' : 'Locale'}
+            {textOrder && (
+                <span className="sort-order-chip" title={`Text sort order: ${textOrder.label}. ${textOrder.title}`}>
+                    {textOrder.chip}
                 </span>
             )}
             <button

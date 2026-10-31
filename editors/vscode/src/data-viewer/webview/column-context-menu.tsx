@@ -1,12 +1,24 @@
-import { useEffect, useRef, type MouseEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from 'react';
 import type { StringOrder } from '../messages';
 import { useDismiss } from './use-dismiss';
 
-/** Menu labels for the string orders, in menu order. */
-export const STRING_ORDER_LABELS: [StringOrder, string, string][] = [
-    ['natural', 'Natural', 'Locale order, with digit runs as numbers (file_2 before file_10)'],
-    ['locale', 'Locale', "Your UI language's collation"],
-    ['c', 'C', 'Code point order, as dplyr::arrange() and sort(method = "radix")'],
+/** The string orders as the "Sort text by" submenu shows them, in menu
+ *  order. `label` is the menu item, `chip` the Sort strip's reminder,
+ *  `example` a two-value order shown beside the item, `title` its
+ *  tooltip. */
+export const STRING_ORDERS: { order: StringOrder; label: string; chip: string; example: string; title: string }[] = [
+    {
+        order: 'natural', label: 'Natural', chip: 'Natural', example: 'file2, file10',
+        title: 'Alphabetical in your VS Code display language, with runs of digits compared as numbers',
+    },
+    {
+        order: 'locale', label: 'Alphabetical', chip: 'Alphabetical', example: 'file10, file2',
+        title: 'Alphabetical in your VS Code display language, one character at a time',
+    },
+    {
+        order: 'c', label: 'As dplyr (fast)', chip: 'As dplyr', example: 'Z, a',
+        title: 'Unicode code point order (uppercase before lowercase), as dplyr::arrange() and sort(method = "radix")',
+    },
 ];
 
 /** Sort-related slice of context-menu props. Always supplied when the
@@ -39,6 +51,8 @@ export type SortMenuProps = {
     /** String order for text and label keys, remembered per panel. */
     stringOrder: StringOrder;
     onStringOrder: (order: StringOrder) => void;
+    /** Open the docs' explanation of the string orders. */
+    onExplainStringOrder: () => void;
 };
 
 /** Filter-related slice of context-menu props. Always supplied when the
@@ -225,21 +239,7 @@ export function ColumnContextMenu({
                         </button>
                     )}
                     <div className="context-menu-divider" role="separator" />
-                    <div className="context-menu-heading" role="presentation">Text order</div>
-                    {STRING_ORDER_LABELS.map(([order, label, title]) => (
-                        <button
-                            key={order}
-                            type="button"
-                            className={sort.stringOrder === order ? 'context-menu-item active' : 'context-menu-item'}
-                            onClick={() => sort.onStringOrder(order)}
-                            role="menuitemradio"
-                            aria-checked={sort.stringOrder === order}
-                            title={title}
-                        >
-                            <span className="context-menu-check">{sort.stringOrder === order ? '✓' : ''}</span>
-                            {label}
-                        </button>
-                    ))}
+                    <SortTextBySubmenu sort={sort} />
                 </>
             )}
             {filter && (
@@ -276,6 +276,84 @@ export function ColumnContextMenu({
                         </button>
                     )}
                 </>
+            )}
+        </div>
+    );
+}
+
+/** "Sort text by ▸": the string orders, then Explain…. Opens on hover,
+ *  click, or ArrowRight, to the right unless that would overflow the
+ *  panel. */
+function SortTextBySubmenu({ sort }: { sort: SortMenuProps }) {
+    const [open, setOpen] = useState(false);
+    const [flip, setFlip] = useState(false);
+    const submenuRef = useRef<HTMLDivElement>(null);
+
+    useLayoutEffect(() => {
+        const el = submenuRef.current;
+        if (!open || !el) return;
+        // The panel the column menu is positioned in.
+        const menu = el.parentElement?.closest<HTMLElement>('.context-menu');
+        const bounds = (menu?.offsetParent ?? document.documentElement).getBoundingClientRect();
+        const rect = el.getBoundingClientRect();
+        setFlip(rect.right > bounds.right - MARGIN_PX);
+        // Lift it to stay inside a short pane, as the parent menu does.
+        const overflow = rect.bottom - (bounds.bottom - MARGIN_PX);
+        if (overflow > 0) el.style.top = `${el.offsetTop - overflow}px`;
+    }, [open]);
+
+    return (
+        <div
+            className="context-submenu-anchor"
+            onMouseEnter={() => setOpen(true)}
+            onMouseLeave={() => { setOpen(false); setFlip(false); }}
+        >
+            <button
+                type="button"
+                className="context-menu-item context-submenu-trigger"
+                role="menuitem"
+                aria-haspopup="menu"
+                aria-expanded={open}
+                onClick={() => setOpen(true)}
+                onKeyDown={e => { if (e.key === 'ArrowRight') { e.preventDefault(); setOpen(true); } }}
+            >
+                <span className="context-menu-check" />
+                Sort text by
+                <span className="context-menu-shortcut">▸</span>
+            </button>
+            {open && (
+                <div
+                    ref={submenuRef}
+                    className={flip ? 'context-menu context-submenu flip' : 'context-menu context-submenu'}
+                    role="menu"
+                    onKeyDown={e => { if (e.key === 'ArrowLeft') { e.stopPropagation(); setOpen(false); } }}
+                >
+                    {STRING_ORDERS.map(({ order, label, example, title }) => (
+                        <button
+                            key={order}
+                            type="button"
+                            className={sort.stringOrder === order ? 'context-menu-item active' : 'context-menu-item'}
+                            onClick={() => sort.onStringOrder(order)}
+                            role="menuitemradio"
+                            aria-checked={sort.stringOrder === order}
+                            title={title}
+                        >
+                            <span className="context-menu-check">{sort.stringOrder === order ? '✓' : ''}</span>
+                            {label}
+                            <span className="context-menu-shortcut">{example}</span>
+                        </button>
+                    ))}
+                    <div className="context-menu-divider" role="separator" />
+                    <button
+                        type="button"
+                        className="context-menu-item context-submenu-trigger"
+                        onClick={sort.onExplainStringOrder}
+                        role="menuitem"
+                    >
+                        <span className="context-menu-check" />
+                        Explain…
+                    </button>
+                </div>
             )}
         </div>
     );

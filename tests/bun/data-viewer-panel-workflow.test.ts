@@ -18,6 +18,7 @@ let infos: string[] = [];
 let modalAnswer: string | undefined;
 let modals: { msg: string; detail?: string }[] = [];
 let sent: string[] = [];
+let opened: string[] = [];
 
 class MemKV {
     private m = new Map<string, unknown>();
@@ -66,6 +67,7 @@ afterEach(async () => {
     infos = [];
     modals = [];
     sent = [];
+    opened = [];
     modalAnswer = undefined;
     mock.restore();
 });
@@ -83,8 +85,11 @@ async function setup(opts: { savedSort?: any; savedFilter?: any; source?: any; p
             showInformationMessage: (msg: string) => { infos.push(msg); return Promise.resolve(undefined); },
         },
         workspace: { getConfiguration: () => ({ get: (_k: string, d?: unknown) => d }) },
-        env: { clipboard: { writeText: async (t: string) => { clipboard.push(t); } } },
-        Uri: { joinPath: (base: any, ...parts: string[]) => ({ fsPath: [base?.fsPath ?? '', ...parts].join('/') }) },
+        env: {
+            clipboard: { writeText: async (t: string) => { clipboard.push(t); } },
+            openExternal: async (u: { toString(): string }) => { opened.push(u.toString()); return true; },
+        },
+        Uri: { parse: (s: string) => ({ toString: () => s }), joinPath: (base: any, ...parts: string[]) => ({ fsPath: [base?.fsPath ?? '', ...parts].join('/') }) },
         ViewColumn: { Active: -1 },
     }));
     mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
@@ -214,6 +219,16 @@ describe('find', () => {
         wv.deliver({ type: 'findStep', panelGeneration: gen, requestId: 22, from: 0, direction: 1 });
         await flush();
         expect(wv.posted.filter(m => m.type === 'findResult')).toHaveLength(1);
+    });
+});
+
+describe('help', () => {
+    test('openHelp opens the named section of the data viewer docs', async () => {
+        const { wv } = await setup();
+        const gen = await ready(wv);
+        wv.deliver({ type: 'openHelp', panelGeneration: gen, topic: 'text-order' });
+        await flush();
+        expect(opened).toEqual(['https://github.com/jbearak/raven/blob/main/docs/data-viewer.md#text-order']);
     });
 });
 
