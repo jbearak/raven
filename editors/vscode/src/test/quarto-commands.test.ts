@@ -102,8 +102,8 @@ suite('Quarto command preflight', () => {
             assert.strictEqual(result, null);
             assert.deepStrictEqual(messages, [
                 'Raven: Quarto Preview is disabled by your ' +
-                '`raven.rConsole.activation` setting (or because REditorSupport / ' +
-                'Positron is active).',
+                '`raven.rConsole.activation` setting (or because Raven is running ' +
+                'in Positron).',
             ]);
         } finally {
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;

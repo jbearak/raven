@@ -12,7 +12,7 @@ View(mtcars)
 
 The data frame opens in a grid beside your editor. Raven writes it once to an Apache Arrow file on disk, and the grid reads only the rows you can see, so scrolling stays responsive on multi-million-row frames and paging never waits on R. Value labels from Stata and SPSS imports show as labels, not codes (see [Labels](#labels)). For how this compares with other R data viewers, see [Comparison: Data viewer](comparison.md#data-viewer).
 
-The data viewer works only when Raven's R console is active, which by default it isn't when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
+The data viewer works only when Raven's R console is active, which by default it isn't in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
 ## Requirements
 
@@ -413,7 +413,7 @@ Copy as R code works for data frames and matrices. Raven needs the expression yo
 
 ### Refresh
 
-The data in a panel is a copy taken when you called `View()`. To see new values, choose Refresh… from ⋯. Raven shows the `View()` call it will run and asks first, because running the expression again repeats anything it does, such as reading a file. After you confirm, it runs the call in the R console.
+The data in a panel is a copy taken when you called `View()`. To see new values, choose Refresh… from ⋯. Raven shows the `View()` call it will run and asks first, because running the expression again repeats anything it does, such as reading a file. After you confirm, it runs the call in the R session that opened the view. If that session has ended, Raven says so; run `View()` again from your current session.
 
 If the new data has the same columns (same names and types, in the same order), the sort, filters, widths, hidden columns, and pins stay. If the columns changed, the panel opens like a new one. A panel opened with a title, as in `View(df, "Survey")`, refreshes into the same panel.
 

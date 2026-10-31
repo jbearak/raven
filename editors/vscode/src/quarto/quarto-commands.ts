@@ -237,8 +237,8 @@ async function ensureRConsoleEnabled(
 
     await vscode.window.showInformationMessage(
         `Raven: Quarto ${label} is disabled by your ` +
-        '`raven.rConsole.activation` setting (or because REditorSupport / ' +
-        'Positron is active).',
+        '`raven.rConsole.activation` setting (or because Raven is running ' +
+        'in Positron).',
     );
     return false;
 }

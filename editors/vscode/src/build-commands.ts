@@ -2,12 +2,15 @@ import * as vscode from 'vscode';
 import {
     build_r_terminal_launch,
     forget_console_terminal,
-    get_or_create_r_terminal,
+    get_or_create_terminal_for,
     register_console_terminal,
     resolve_program,
-    send_code,
-    get_send_options,
+    terminal_program_now,
+    terminal_program_of,
 } from './send-to-r';
+import type { TerminalProgram } from './send-to-r/console-choice';
+import { deliver_to_target, send_to_r_console, with_send_queue } from './send-to-r/console-send';
+import { resolve_send_target } from './send-to-r/r-terminal-manager';
 
 /**
  * "Raven Build:" commands — wrappers around the standard devtools workflows
@@ -103,6 +106,9 @@ export function get_package_path_arg(): string {
 
 const TASKS_TERMINAL_NAME = 'R: Package Tasks';
 let tasks_terminal: vscode.Terminal | null = null;
+// The program `tasks_terminal` runs, so a setting change that doesn't change
+// it keeps the terminal.
+let tasks_program: TerminalProgram | null = null;
 // Shared in-flight promise so two tasks-group commands fired in quick
 // succession (e.g. Test Package immediately followed by Check Package)
 // don't both pass the `tasks_terminal` null check around the
@@ -118,7 +124,8 @@ function handle_tasks_terminal_closed(terminal: vscode.Terminal): void {
 }
 
 async function create_tasks_terminal(): Promise<vscode.Terminal> {
-    const launch = build_r_terminal_launch(await resolve_program());
+    const program = await resolve_program();
+    const launch = build_r_terminal_launch(program);
     const terminal = vscode.window.createTerminal({
         name: TASKS_TERMINAL_NAME,
         shellPath: launch.shellPath,
@@ -133,6 +140,7 @@ async function create_tasks_terminal(): Promise<vscode.Terminal> {
     // the next call should launch a fresh one with the updated program.
     if (tasks_creation_in_flight !== null) {
         tasks_terminal = terminal;
+        tasks_program = program;
     }
     return terminal;
 }
@@ -154,11 +162,12 @@ export async function get_or_create_tasks_terminal(): Promise<vscode.Terminal> {
 }
 
 async function run_simple(code: string, target: 'r-console' | 'tasks'): Promise<void> {
-    const terminal = target === 'r-console'
-        ? await get_or_create_r_terminal()
-        : await get_or_create_tasks_terminal();
-    terminal.show(true);
-    send_code(terminal, code, get_send_options());
+    if (target === 'r-console') {
+        await send_to_r_console(code);
+        return;
+    }
+    const terminal = await get_or_create_tasks_terminal();
+    await deliver_to_target({ kind: 'terminal', terminal }, code);
 }
 
 /**
@@ -176,10 +185,32 @@ async function run_simple(code: string, target: 'r-console' | 'tasks'): Promise<
 async function run_install_and_restart(
     context: vscode.ExtensionContext,
 ): Promise<void> {
-    const terminal = await get_or_create_r_terminal();
-    terminal.show(true);
+    await with_send_queue(async () => {
+        const target = await resolve_send_target();
+        if (!target) return;
+        const pkg_arg = get_package_path_arg();
+        if (target.kind === 'vscode-r') {
+            // Raven can't restart vscode-R's session, and the terminal API
+            // can't see when the install finishes, so send only the install
+            // and say what's left to do without claiming it succeeded.
+            if (await deliver_to_target(target, `devtools::install(${pkg_arg})`)) {
+                void vscode.window.showInformationMessage(
+                    "Raven: sent devtools::install() to vscode-R's terminal. When it finishes, restart R there to load the new version.",
+                );
+            }
+            return;
+        }
+        await install_and_restart_in(context, target.terminal, pkg_arg);
+    });
+}
 
-    const pkg_arg = get_package_path_arg();
+async function install_and_restart_in(
+    context: vscode.ExtensionContext,
+    terminal: vscode.Terminal,
+    pkg_arg: string,
+): Promise<void> {
+    const program = terminal_program_of(terminal);
+
     const code = [
         'local({',
         `  status <- tryCatch({ devtools::install(${pkg_arg}); "ok" },`,
@@ -199,11 +230,11 @@ async function run_install_and_restart(
         restart_listener.dispose();
         // Recreate so the user's next Send-to-R / Build command lands in a
         // fresh R session loaded with the newly installed package.
-        void get_or_create_r_terminal();
+        if (program) void get_or_create_terminal_for(program);
     });
     context.subscriptions.push(restart_listener);
 
-    send_code(terminal, code, get_send_options());
+    await deliver_to_target({ kind: 'terminal', terminal }, code);
 }
 
 async function run_build_command(
@@ -232,8 +263,12 @@ export function register_build_commands(context: vscode.ExtensionContext): void 
         // existing terminal keeps running so the user can read scrollback;
         // they close it themselves when they're done with it.
         vscode.workspace.onDidChangeConfiguration((event) => {
-            if (event.affectsConfiguration('raven.rTerminal.program')) {
+            if (
+                event.affectsConfiguration('raven.rTerminal.program')
+                && terminal_program_now() !== tasks_program
+            ) {
                 tasks_terminal = null;
+                tasks_program = null;
                 tasks_creation_in_flight = null;
             }
         }),
@@ -243,5 +278,6 @@ export function register_build_commands(context: vscode.ExtensionContext): void 
 /** Reset the tasks-terminal slot. Tests only. */
 export function _reset_tasks_terminal_for_test(): void {
     tasks_terminal = null;
+    tasks_program = null;
     tasks_creation_in_flight = null;
 }

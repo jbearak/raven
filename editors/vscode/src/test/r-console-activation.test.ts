@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
+    detectAutoDisableReason,
     isPositron,
     readRConsoleActivation,
     resolveRConsoleActivation,
@@ -45,15 +46,13 @@ suite('Raven R-console activation', () => {
         assert.strictEqual(resolveRConsoleActivation('disabled'), 'disabled');
     });
 
-    test('"auto" resolves based on REditorSupport / Positron presence', () => {
+    test('"auto" steps aside only in Positron, not for vscode-R', () => {
         // We can't fully control the test environment, but we can assert the
-        // resolution is consistent with the detection helpers.
+        // resolution is consistent with the detection helper.
         const resolved = resolveRConsoleActivation('auto');
-        const reditor = vscode.extensions.getExtension('REditorSupport.r') !== undefined;
-        const positron = isPositron();
-        const expected: 'enabled' | 'disabled' =
-            reditor || positron ? 'disabled' : 'enabled';
-        assert.strictEqual(resolved, expected);
+        assert.strictEqual(resolved, isPositron() ? 'disabled' : 'enabled');
+        assert.strictEqual(detectAutoDisableReason('Visual Studio Code'), null);
+        assert.strictEqual(detectAutoDisableReason('Positron'), 'positron');
     });
 
     test('isPositron is case-insensitive on the appName substring', () => {

@@ -207,7 +207,7 @@ The language server provides the code intelligence in any editor. The rest comes
 | [R Markdown preview and export](knit.md) | No | Yes |
 | [Quarto preview and render](quarto.md) | No | Yes |
 
-In VS Code, the R console, viewers, and R Markdown preview step aside by default when vscode-R or Positron is active. [Coexistence](coexistence.md) has the details.
+In VS Code, the R console, viewers, and R Markdown preview step aside by default in Positron. Next to vscode-R they stay on, and Raven asks which console to send code to. [Coexistence](coexistence.md) has the details.
 
 ## AI coding agents
 

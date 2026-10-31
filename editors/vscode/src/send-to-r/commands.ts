@@ -4,8 +4,9 @@ import {
     get_upward_bounds,
     get_downward_bounds,
 } from './statement-detector';
-import { get_or_create_r_terminal } from './r-terminal-manager';
+import { choose_r_console } from './r-terminal-manager';
 import { send_code, get_send_options, location_in } from './send-code';
+import { send_to_r_console } from './console-send';
 import type { SendLocation } from './console-ipc';
 
 type SendMode = 'statement' | 'upward' | 'downward' | 'file';
@@ -87,16 +88,12 @@ async function handle_send(mode: SendMode): Promise<void> {
     if (!payload) return;
     const { code, advance_to_line, location } = payload;
 
-    const terminal = await get_or_create_r_terminal();
-    terminal.show(true);
+    const sent = await send_to_r_console(code, {
+        how: mode === 'file' ? 'text' : 'code',
+        location,
+    });
 
-    if (mode === 'file') {
-        terminal.sendText(code);
-    } else {
-        send_code(terminal, code, get_send_options(), location);
-    }
-
-    if (advance_to_line !== null) {
+    if (sent && advance_to_line !== null) {
         advance_cursor(editor, advance_to_line);
     }
 }
@@ -143,6 +140,10 @@ export function register_send_to_r_commands(
             vscode.commands.registerCommand(id, () => handle_send(mode))
         );
     }
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.chooseRConsole', () => choose_r_console()),
+    );
 
     // Terminal submenu: send to active terminal using the configured send method.
     const terminal_commands: Array<[string, SendMode]> = [

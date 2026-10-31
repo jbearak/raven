@@ -27,14 +27,14 @@ RStudio-style `# Section ----` comments become entries in the [document outline]
 
 ## From vscode-R
 
-Keep vscode-R installed if you like it. Raven's language server runs next to vscode-R's, and Raven's own console and viewers stay off while vscode-R is enabled, so nothing you rely on changes.
+Keep vscode-R installed if you like it. Raven's language server runs next to vscode-R's. The first time you send code, Raven asks which console to use; pick vscode-R to keep its terminal and viewers.
 
 Two vscode-R settings let you trim the overlap:
 
 - To have only Raven's completions and navigation, set `r.lsp.enabled` to `false`.
 - To keep vscode-R's language server but drop its lintr diagnostics, set `r.lsp.diagnostics` to `false`.
 
-If you later want Raven's console instead of vscode-R's, set `raven.rConsole.activation` to `"enabled"`. [Using Raven with other R tools](coexistence.md#run-raven-next-to-vscode-r) covers every combination.
+To switch later, run **Raven: Choose R Console**. If vscode-R's `Cmd+Enter` binding wins over Raven's, see [Cmd+Enter next to vscode-R](coexistence.md#cmdenter-next-to-vscode-r). [Using Raven with other R tools](coexistence.md#run-raven-next-to-vscode-r) covers every combination.
 
 ## From Positron
 

@@ -24,7 +24,7 @@ summary(fit)   # `fit` resolves to the chunk above; hover and go-to-definition w
 
 Each chunk gets a faint background tint that makes chunks easy to scan. In regular Markdown files, fenced blocks tagged `r` or `R` get a Run Chunk CodeLens too.
 
-Chunk navigation, highlighting, cell mode, the run commands, and the CodeLens buttons are part of Raven's R-session features, so by default they step aside when REditorSupport or Positron handles chunks; see [Coexistence](coexistence.md#what-steps-aside-and-what-doesnt). The run commands and CodeLens also need Raven's R console, because they create or reuse the R terminal Raven manages.
+Chunk navigation, highlighting, cell mode, the run commands, and the CodeLens buttons are part of Raven's R-session features, so by default they step aside in Positron, which handles chunks itself; see [Coexistence](coexistence.md#what-steps-aside-and-what-doesnt). The run commands and CodeLens also need Raven's R console, because they send to the console you chose and open it if needed.
 
 ## Chunk forms
 

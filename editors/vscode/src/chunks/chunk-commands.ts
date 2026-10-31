@@ -13,7 +13,7 @@ import {
     previous_runnable_chunk,
     Chunk,
 } from './chunk-detector';
-import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
+import { send_to_r_console } from '../send-to-r/console-send';
 import { send_code, get_send_options } from '../send-to-r/send-code';
 
 export type RunMode =
@@ -99,30 +99,27 @@ function combined_location(
  */
 type TerminalTarget = 'managed' | 'active';
 
-async function resolve_target_terminal(
-    target: TerminalTarget,
-): Promise<vscode.Terminal | null> {
-    if (target === 'managed') {
-        return get_or_create_r_terminal();
-    }
-    const active = vscode.window.activeTerminal;
-    if (!active) {
-        vscode.window.showErrorMessage('No active terminal. Open a terminal first.');
-        return null;
-    }
-    return active;
-}
-
-async function send_to_r(code: string, target: TerminalTarget, location?: SendLocation): Promise<void> {
-    if (code.trim().length === 0) return;
+/**
+ * Sends `code` and reports whether it was sent. False when the user cancelled
+ * the console picker (or there was nowhere to send), so the `*AndMove` modes
+ * leave the cursor alone.
+ */
+async function send_to_r(code: string, target: TerminalTarget, location?: SendLocation): Promise<boolean> {
+    if (code.trim().length === 0) return false;
     try {
-        const terminal = await resolve_target_terminal(target);
-        if (!terminal) return;
-        terminal.show(true);
-        send_code(terminal, code, get_send_options(), location);
+        if (target === 'managed') return await send_to_r_console(code, { location });
+        const active = vscode.window.activeTerminal;
+        if (!active) {
+            vscode.window.showErrorMessage('No active terminal. Open a terminal first.');
+            return false;
+        }
+        active.show(true);
+        send_code(active, code, get_send_options(), location);
+        return true;
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         vscode.window.showErrorMessage(`Raven: failed to send chunk to R — ${message}`);
+        return false;
     }
 }
 
@@ -239,8 +236,8 @@ async function run_chunk_at(
             if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
             return;
         }
-        await send_to_r(code, target, chunk_location(document, previous));
-        if (mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
+        const sent = await send_to_r(code, target, chunk_location(document, previous));
+        if (sent && mode === 'previousAndMove' && editor) place_cursor_in_chunk(editor, previous);
         return;
     }
 
@@ -256,8 +253,8 @@ async function run_chunk_at(
             if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
             return;
         }
-        await send_to_r(code, target, chunk_location(document, next));
-        if (mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
+        const sent = await send_to_r(code, target, chunk_location(document, next));
+        if (sent && mode === 'nextAndMove' && editor) place_cursor_in_chunk(editor, next);
         return;
     }
 
@@ -292,8 +289,8 @@ async function run_chunk_at(
         if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
         return;
     }
-    await send_to_r(code, target, chunk_location(document, current));
-    if (mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
+    const sent = await send_to_r(code, target, chunk_location(document, current));
+    if (sent && mode === 'currentAndMove' && editor) move_cursor_to_next_chunk(editor, chunks, current);
 }
 
 async function run_chunk(mode: RunMode, target: TerminalTarget = 'managed'): Promise<void> {

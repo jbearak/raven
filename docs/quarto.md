@@ -16,9 +16,9 @@ Raven runs the Quarto CLI directly, so the Quarto VS Code extension isn't requir
 
 ## When to use these commands
 
-The Quarto extension's buttons for running R cells send code through REditorSupport, not to Raven's console. Raven's chunk controls together with Quarto Preview and Render give you a complete R-focused `.qmd` workflow when Raven's console owns the R session, without REditorSupport or the Quarto extension. See [Coexistence with the Quarto extension](coexistence.md#coexistence-with-the-quarto-extension) for how the two extensions interact.
+The Quarto extension's buttons for running R cells send code through REditorSupport, not to Raven's console. Raven's chunk controls together with Quarto Preview and Render give you a complete R-focused `.qmd` workflow without REditorSupport or the Quarto extension. See [Coexistence with the Quarto extension](coexistence.md#coexistence-with-the-quarto-extension) for how the two extensions interact.
 
-Quarto Preview and Render are R-session features, so by default they step aside when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
+Quarto Preview and Render are R-session features, so by default they step aside in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
 You'll find the commands in the Command Palette and, for `.qmd` files, in the editor-title Send to R (▶) menu. A preview button in the editor title bar starts Quarto Preview directly, as does `Shift+Cmd+Enter` (`Shift+Ctrl+Enter` on Windows/Linux). In `.Rmd` / `.Rmarkdown` files, the same button and shortcut run [Knit Preview](knit.md), so one preview action covers both formats. To remove the button, right-click the editor toolbar and choose Hide.
 

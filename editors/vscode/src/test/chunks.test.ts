@@ -166,17 +166,17 @@ interface TerminalStub {
 }
 
 /**
- * Names the bundled R terminal uses today (`r-terminal-manager.ts`
- * `TERMINAL_NAME`). We dispose any pre-existing terminal with this name
+ * Names the bundled R terminals use for Raven's console and plain R
+ * (`console-choice.ts` `terminal_name_for`). We dispose any pre-existing terminal with these names
  * before installing the recording stub so the bundled extension's
  * module-level cache doesn't hold a real terminal created by an earlier
  * test suite (e.g. the data-viewer smoke tests).
  */
-const RAVEN_R_TERMINAL_NAME = 'R (Raven)';
+const RAVEN_R_TERMINAL_NAMES = ['R', 'R (plain)'];
 
 async function dispose_any_cached_r_terminal(): Promise<void> {
     const stale = vscode.window.terminals.filter(
-        (t) => t.name === RAVEN_R_TERMINAL_NAME,
+        (t) => RAVEN_R_TERMINAL_NAMES.includes(t.name),
     );
     if (stale.length === 0) return;
     for (const t of stale) {
@@ -269,10 +269,15 @@ async function poll_for_lenses(
 }
 
 suite('chunk commands: registration and behavior', () => {
+    let original_program: string | undefined;
+
     // These tests capture what is typed into a stubbed terminal, so they run
     // against plain R: Raven's console takes code over a socket instead, and a
     // stub never opens one (sends would wait for it to start listening).
     suiteSetup(async () => {
+        original_program = vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .inspect<string>('program')?.globalValue;
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
             .update('program', 'R', vscode.ConfigurationTarget.Global);
@@ -285,7 +290,7 @@ suite('chunk commands: registration and behavior', () => {
         TEMP_FIXTURE_FILES.length = 0;
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
-            .update('program', undefined, vscode.ConfigurationTarget.Global);
+            .update('program', original_program, vscode.ConfigurationTarget.Global);
     });
 
     test('every chunk command is registered in VS Code', async () => {

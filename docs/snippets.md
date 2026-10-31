@@ -126,7 +126,7 @@ In `.Rmd` and `.qmd` files, Raven adds chunk and document snippets. Their prefix
 | `incgraphics` | `knitr::include_graphics("path/to/img.png")` | The same |
 | `inliner` | An inline R expression, `` `r expr` `` | The same |
 
-Inside R chunks of `.Rmd` and `.qmd` files, the [R snippets](#r-snippets) above are also offered, but only while Raven's R console features are active. Prefixes such as `if` and `for` would otherwise collide with REditorSupport's snippets in R chunks. [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting) explains when the console features are active. In `.R` files the R snippets are always available.
+Inside R chunks of `.Rmd` and `.qmd` files, the [R snippets](#r-snippets) above are also offered, but only while Raven's R console features are active. Next to REditorSupport they are active by default, so its snippets with the same prefixes, such as `if` and `for`, may appear next to Raven's in R chunks. [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting) explains when the console features are active. In `.R` files the R snippets are always available.
 
 ## Sort or hide snippets
 

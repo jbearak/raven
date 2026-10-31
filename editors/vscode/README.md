@@ -1,6 +1,6 @@
 # Raven
 
-Raven finds undefined variables and broken `source()` chains in R code, across files and as you type, without running your code. The same analysis drives completion, go to definition, find references, and hover. The extension also brings an R console, a debugger, plot, data, and help viewers, and R Markdown and Quarto preview, which step aside if you already use vscode-R or Positron.
+Raven finds undefined variables and broken `source()` chains in R code, across files and as you type, without running your code. The same analysis drives completion, go to definition, find references, and hover. The extension also brings an R console, a debugger, plot, data, and help viewers, and R Markdown and Quarto preview, which step aside in Positron.
 
 Here, `analysis.R` sources `helpers.R`, which defines `clean_names()`:
 
@@ -66,7 +66,7 @@ Open a folder with R files. Raven starts automatically and needs nothing else in
 <a id="coexistence-with-vscode-r-and-positron"></a>
 ## Works with vscode-R and Positron
 
-Raven adds to the tools you already use. Its language server runs alongside vscode-R's; set `r.lsp.enabled` to `false` if you'd rather have only Raven's completions. Raven's console and viewers stay off while vscode-R is enabled or you're in Positron, controlled by `raven.rConsole.activation`. [Using Raven with other R tools](https://github.com/jbearak/raven/blob/main/docs/coexistence.md) explains each combination, and [How Raven compares](https://github.com/jbearak/raven/blob/main/docs/comparison.md) covers the differences.
+Raven adds to the tools you already use. Its language server runs alongside vscode-R's; set `r.lsp.enabled` to `false` if you'd rather have only Raven's completions. Raven's console runs next to vscode-R's, and Raven asks which one to send code to. In Positron, Raven's console and viewers stay off, controlled by `raven.rConsole.activation`. [Using Raven with other R tools](https://github.com/jbearak/raven/blob/main/docs/coexistence.md) explains each combination, and [How Raven compares](https://github.com/jbearak/raven/blob/main/docs/comparison.md) covers the differences.
 
 Raven's [style lints](https://github.com/jbearak/raven/blob/main/docs/linting.md) are opt-in and cover a subset of lintr's rules ([what's not covered](https://github.com/jbearak/raven/blob/main/docs/linting.md#gaps-vs-lintr)).
 
