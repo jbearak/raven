@@ -2,13 +2,13 @@
 
 [Docs](README.md) › Understanding Raven
 
-Raven's language server runs next to any other R tool, and its R console and viewers turn themselves off by default when vscode-R or Positron already provides them. <a id="coexistence-with-other-r-extensions"></a>
+Raven's language server runs next to any other R tool. Its R console and viewers run next to vscode-R too, and Raven asks which console to send code to. In Positron, which has its own console, they turn themselves off by default. <a id="coexistence-with-other-r-extensions"></a>
 
 | You run | Raven's language server and help viewer | Raven's R console, viewers, chunk and preview commands |
 |---|---|---|
 | VS Code with Raven only | On | On |
 | VS Code with Raven and the Quarto extension | On | On |
-| VS Code with Raven and vscode-R (REditorSupport) enabled | On | Off by default |
+| VS Code with Raven and vscode-R (REditorSupport) enabled | On | On; you choose the console when you first send code |
 | Positron with Raven | On | Off by default |
 | Any of the above, with `raven.rConsole.activation` set to `"enabled"` | On | On |
 | Any of the above, with `raven.rConsole.activation` set to `"disabled"` | On | Off |
@@ -16,11 +16,13 @@ Raven's language server runs next to any other R tool, and its R console and vie
 
 ## Why Raven's console stepped aside
 
-If you saw a notification saying Raven left its R console, plot viewer, and data viewer turned off, Raven found the vscode-R (REditorSupport) extension enabled, or found it was running inside Positron. Both already give you an R session in the editor, so under the default `raven.rConsole.activation` value, `"auto"`, Raven doesn't add a second one. Its completions, diagnostics, and navigation work either way.
+If you saw a notification saying Raven left its R console, plot viewer, and data viewer turned off, Raven found it was running inside Positron. Positron already gives you an R session, so under the default `raven.rConsole.activation` value, `"auto"`, Raven doesn't add a second one. Its completions, diagnostics, and navigation work either way.
 
 The notification appears once and offers three choices: **Learn more** opens this page, **Open setting** jumps to `raven.rConsole.activation`, and **Don't show again** silences it.
 
 To use Raven's console anyway, set `raven.rConsole.activation` to `"enabled"` and reload the window. [Who benefits from Raven's R console](#who-benefits-from-ravens-r-console) helps you decide.
+
+With vscode-R installed, Raven's console stays on. A one-time notification says so: "Raven's R console now runs alongside vscode-R. When you first send code, Raven asks which console to use, unless raven.rTerminal.program names one." See [Run Raven next to vscode-R](#run-raven-next-to-vscode-r).
 
 ## The `raven.rConsole.activation` setting
 
@@ -28,13 +30,13 @@ This setting decides whether Raven's R-session features activate. It is the only
 
 | Value | What Raven does |
 |---|---|
-| `"auto"` (default) | Activates the R-session features unless the vscode-R (REditorSupport) extension is installed and enabled, or VS Code is running as Positron. |
-| `"enabled"` | Always activates them, even next to another R extension. |
-| `"disabled"` | Never activates them, even when no other R extension is present. |
+| `"auto"` (default) | Activates the R-session features unless VS Code is running as Positron. vscode-R doesn't turn them off. |
+| `"enabled"` | Always activates them, including in Positron. |
+| `"disabled"` | Never activates them. |
 
-Raven doesn't start or stop these features mid-session. When you change the setting, or when enabling or disabling vscode-R changes what `"auto"` resolves to, Raven asks you to reload the window. With `"enabled"` or `"disabled"`, enabling or disabling vscode-R changes nothing.
+Raven doesn't start or stop these features mid-session. When you change the setting, Raven asks you to reload the window.
 
-With `"enabled"` and vscode-R also enabled, both extensions' R consoles are available. `Cmd+Enter` / `Ctrl+Enter` can be bound to only one extension's send command; use VS Code's keybinding editor to choose which.
+The setting decides whether Raven's console exists at all. Which console your code goes to is a separate choice; see [Choose a console](r-console.md#choosing-the-r-program).
 
 ### What steps aside and what doesn't
 
@@ -68,7 +70,7 @@ You would likely benefit if you:
 - work with labelled data. Raven's data viewer reads variable and value labels from `haven` imports of Stata and SPSS files and shows value labels instead of the underlying codes.
 - want a themeable `.Rmd` / `.Rmarkdown` preview. Knit Preview renders through VS Code's built-in Markdown pipeline, and its **Apply VS Code theme** toggle recolors prose, syntax highlighting, and plots to match your editor theme.
 
-You would lose something if you rely on vscode-R's workspace viewer, its htmlwidget and Shiny viewer, or `View()` on lists and environments. Raven has no equivalents; its data viewer handles only data frames and matrices.
+You would lose something if you rely on vscode-R's workspace viewer, its htmlwidget and Shiny viewer, or `View()` on lists and environments. Raven has no equivalents; its data viewer handles only data frames and matrices. Those viewers work only with vscode-R's R terminal, so choose vscode-R as your console if you need them.
 
 See [How Raven compares: R session integration](comparison.md#r-session-integration) and [Limitations](limitations.md).
 
@@ -81,7 +83,10 @@ See [How Raven compares: R session integration](comparison.md#r-session-integrat
 | vscode-R's language server without its lintr style diagnostics | Set `"r.lsp.diagnostics": false`. You keep Raven's syntax and scope diagnostics. |
 | Raven's style lints instead of lintr | Turn off vscode-R's diagnostics as above, then set `raven.linting.enabled` to `true`. See [Linting](linting.md). |
 | Both linters on the same project, on purpose | Set `raven.linting.enabled` to `true`. |
-| Raven's R console too | Set `raven.rConsole.activation` to `"enabled"`. |
+| Send code to vscode-R's R terminal | Pick **vscode-R** when Raven asks, or set `raven.rTerminal.program` to `"vscode-R"`. |
+| Send code to Raven's R console | Pick **Raven's R console** when Raven asks, or set `raven.rTerminal.program` to `"raven"`. See also [Cmd+Enter next to vscode-R](#cmdenter-next-to-vscode-r). |
+| Hide Raven's chunk CodeLens row in `.Rmd` files | Set `raven.chunks.codeLens.commands` to `[]`. Both extensions otherwise show a row. |
+| No Raven console at all | Set `raven.rConsole.activation` to `"disabled"`. |
 
 To turn off vscode-R's language server, add this to your VS Code settings:
 
@@ -90,6 +95,26 @@ To turn off vscode-R's language server, add this to your VS Code settings:
   "r.lsp.enabled": false
 }
 ```
+
+### Cmd+Enter next to vscode-R
+
+Raven and vscode-R both bind `Cmd+Enter` (`Ctrl+Enter` on Windows and Linux) in R files, and VS Code decides which extension's binding wins. Neither extension can change that. If vscode-R's wins, `Cmd+Enter` sends straight to vscode-R's terminal and Raven's menu never appears. Raven's `▶` menu, CodeLens buttons, and Command Palette commands still ask.
+
+To make `Cmd+Enter` run Raven's command, add a user keybinding. User keybindings win over extension ones. Open **Preferences: Open Keyboard Shortcuts (JSON)** and add:
+
+```json
+[
+  {
+    "key": "cmd+enter",
+    "command": "raven.runLineOrSelection",
+    "when": "editorTextFocus && editorLangId == r"
+  }
+]
+```
+
+Use `ctrl+enter` on Windows and Linux. For R Markdown and Quarto files, add entries with `editorLangId == rmd` or `editorLangId == quarto`.
+
+Raven still sends to whichever console you chose, so with this binding `Cmd+Enter` can reach vscode-R's terminal through Raven. Raven's plot viewer, data viewer, and debugger work only in terminals Raven opens; `plot()` and `View()` in vscode-R's terminal go to vscode-R's viewers.
 
 ### Language servers: Raven alone vs. both
 
@@ -111,10 +136,10 @@ Raven's language server and help viewer activate in Positron as in VS Code. Unde
 
 ## Run Raven next to the Quarto extension
 
-If the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed and Raven's R console is active, every R chunk in a `.qmd` file shows two CodeLens rows: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · ↘ Run Next Chunk · ↥ Run Above**, configurable with `raven.chunks.codeLens.commands`). Under `"auto"`, this happens when you have Quarto but not vscode-R, or when you set `raven.rConsole.activation` to `"enabled"` next to vscode-R.
+If the [Quarto extension](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) is installed and Raven's R console is active, every R chunk in a `.qmd` file shows two CodeLens rows: Quarto's (**Run Cell · Run Next Cell · Run Above**) and Raven's (**▷ Run Chunk · ↘ Run Next Chunk · ↥ Run Above**, configurable with `raven.chunks.codeLens.commands`). Under `"auto"`, this happens in VS Code with or without vscode-R.
 
-- **Without vscode-R**, Quarto's row says "Executing r cells requires the R extension" and does nothing. Raven's row works: **▷ Run Chunk** sends the chunk to Raven's R terminal.
-- **With vscode-R and `raven.rConsole.activation` set to `"enabled"`**, both rows work. Quarto's sends to vscode-R; Raven's runs the chunk in Raven's terminal.
+- **Without vscode-R**, Quarto's row says "Executing r cells requires the R extension" and does nothing. Raven's row works: **▷ Run Chunk** sends the chunk to the console you chose.
+- **With vscode-R**, both rows work. Quarto's sends to vscode-R; Raven's sends the chunk to the console you chose.
 
 VS Code doesn't let one extension hide another's CodeLens, and Quarto checks for vscode-R by extension ID, so Raven can't fix the duplicate row from its side.
 
@@ -149,6 +174,7 @@ The override replaces only the keys it lists.
 | Setting | What it controls |
 |---|---|
 | `raven.rConsole.activation` | Whether Raven's R console, viewers, chunk commands, and preview commands activate. |
+| `raven.rTerminal.program` | Which console Raven sends code to, or `"ask"` to choose each session. |
 | `raven.linting.enabled` | Whether Raven's style lints run, and whether `"auto"` defers to vscode-R or Positron. |
 | `raven.chunks.codeLens.commands` | Which run commands appear in Raven's chunk CodeLens row. |
 | `raven.rmdKnit.enabled` | Whether Knit Preview is available, together with the console activation. |

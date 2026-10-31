@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
-import { get_or_create_r_terminal } from './r-terminal-manager';
-import { send_code, get_send_options } from './send-code';
+import { send_to_r_console } from './console-send';
 
 export interface InspectionCommand {
     id: string;
@@ -81,18 +80,12 @@ export function register_inspection_commands(
                     return;
                 }
                 const code = cmd.wrap(target);
-                const terminal = await get_or_create_r_terminal();
-                terminal.show(true);
                 // Single-line wrapped expressions are always pasted directly:
                 // routing them through send_code would let `tempfile` mode
                 // write a one-liner like `nrow(x)` to disk, which is silly.
                 // Multi-line wrapped expressions (from a multi-line selection)
                 // honor the user's raven.sendToR.sendMethod setting.
-                if (code.includes('\n')) {
-                    send_code(terminal, code, get_send_options());
-                } else {
-                    terminal.sendText(code);
-                }
+                await send_to_r_console(code, { how: code.includes('\n') ? 'code' : 'text' });
             })
         );
     }

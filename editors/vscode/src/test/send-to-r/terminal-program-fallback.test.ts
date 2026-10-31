@@ -39,6 +39,13 @@ suite('rTerminal.program shell-validated fallback', () => {
     let warnings: { message: string; items: string[] }[] = [];
     let warning_response: string | undefined = undefined;
     let validator_calls: string[] = [];
+    let original_program: string | undefined;
+
+    suiteSetup(() => {
+        original_program = vscode.workspace
+            .getConfiguration('raven.rTerminal')
+            .inspect<string>('program')?.globalValue;
+    });
 
     setup(async () => {
         warnings = [];
@@ -66,7 +73,7 @@ suite('rTerminal.program shell-validated fallback', () => {
         _set_extension_context_for_test(null);
         await vscode.workspace
             .getConfiguration('raven.rTerminal')
-            .update('program', undefined, vscode.ConfigurationTarget.Global);
+            .update('program', original_program, vscode.ConfigurationTarget.Global);
     });
 
     test('R configured: returns R, no validation, no prompt', async () => {

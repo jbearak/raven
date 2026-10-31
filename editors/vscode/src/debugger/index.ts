@@ -10,7 +10,7 @@ import {
     send_debug_program,
 } from '../send-to-r/console-ipc';
 import { socket_endpoint } from '../send-to-r/console-endpoint';
-import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
+import { get_or_create_raven_console } from '../send-to-r/r-terminal-manager';
 
 /**
  * VS Code side of Raven's R debugger. The debug adapter itself runs inside
@@ -304,7 +304,7 @@ async function choose_console(): Promise<string | undefined> {
     if (from_active) return from_active;
     const live = live_console_sockets();
     if (live.length > 0) return live[live.length - 1][1];
-    const terminal = await get_or_create_r_terminal();
+    const terminal = await get_or_create_raven_console();
     terminal.show(true);
     return console_socket_of(terminal);
 }
@@ -399,7 +399,7 @@ const configuration_provider: vscode.DebugConfigurationProvider = {
             const ipc = await choose_console();
             if (!ipc) {
                 void vscode.window.showErrorMessage(
-                    "Raven: the R debugger needs Raven's R console (raven.rTerminal.program = \"raven\").",
+                    "Raven: the R debugger needs Raven's R console, and it couldn't open one.",
                 );
                 return undefined;
             }

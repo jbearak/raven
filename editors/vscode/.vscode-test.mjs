@@ -1,5 +1,5 @@
 import { defineConfig } from '@vscode/test-cli';
-import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +12,15 @@ import { fileURLToPath } from 'node:url';
 // the test runner's PID so concurrent runs get isolated dirs and stale
 // state from earlier runs doesn't leak in.
 const userDataDir = join(tmpdir(), `raven-vscode-test-ud-${process.pid}`);
-mkdirSync(userDataDir, { recursive: true });
+mkdirSync(join(userDataDir, 'User'), { recursive: true });
+// `raven.rTerminal.program` defaults to `ask`, which opens a quick pick on
+// the first send and would stall every suite that sends code. Pin Raven's
+// console at the user level; suites that change it restore this value, and
+// `send-to-r/console-picker.test.ts` covers `ask`.
+writeFileSync(
+    join(userDataDir, 'User', 'settings.json'),
+    JSON.stringify({ 'raven.rTerminal.program': 'raven' }, null, 4),
+);
 
 // The getting-started suite opens a temp copy of the tutorial's files, outside
 // the repo, so no raven.toml or .lintr above it (such as the shared fixtures'

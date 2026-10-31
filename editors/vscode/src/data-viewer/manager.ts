@@ -40,7 +40,7 @@ export class DataViewerManager {
         await this.serializer.run(async () => {
             try {
                 const reader = await ArrowSliceReader.open(e.filePath);
-                const source = { expression: e.expression, sourceKind: e.sourceKind };
+                const source = { expression: e.expression, sourceKind: e.sourceKind, sessionId: e.sessionId };
                 const existing = this.panels.get(e.panelName);
                 if (existing) {
                     await existing.replace(reader, e.filePath, source);

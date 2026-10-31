@@ -49,7 +49,7 @@ import { FilterStateStore } from './filter-state';
 import { build_csp } from './csp';
 import { prependRowNumbers, render_tsv, ResolvedLabels } from './tsv';
 import { generateRCode, rString } from './r-code';
-import { get_or_create_r_terminal } from '../send-to-r/r-terminal-manager';
+import { terminal_for_session } from '../send-to-r/r-terminal-manager';
 import { get_send_options, send_code } from '../send-to-r/send-code';
 import { applyViewerTabIcon } from '../viewer-tab-icon';
 
@@ -82,6 +82,10 @@ const SLOW_SORT_MS = 3000;
 export type ViewSource = {
     expression?: string;
     sourceKind?: string;
+    /** The R session that called `View()`; Refresh re-runs it there. Set
+     *  with the data on every replacement, since a same-name `View()` from
+     *  another session takes the panel over. */
+    sessionId?: string;
 };
 
 /** A refresh carries the current sort and filter to the re-run when the
@@ -713,6 +717,10 @@ export class DataViewerPanel {
             );
             return;
         }
+        if (!this.originTerminal()) {
+            this.reportOriginEnded();
+            return;
+        }
         const choice = await vscode.window.showWarningMessage(
             `Re-run ${call.length > 120 ? `${call.slice(0, 117)}…` : call} in the R console?`,
             {
@@ -723,14 +731,32 @@ export class DataViewerPanel {
             'Re-run',
         );
         if (choice !== 'Re-run' || this.disposed || gen !== this.generation) return;
+        // Re-run only in the session that made this view: elsewhere the
+        // expression may not exist or may mean something else.
+        const terminal = this.originTerminal();
+        if (!terminal) {
+            this.reportOriginEnded();
+            return;
+        }
         this.refreshCarry = {
             hash: this.currentSchemaHash(),
             sort: cloneSortState(this.sort),
             filter: cloneFilterState(this.filter),
             at: Date.now(),
         };
-        const terminal = await get_or_create_r_terminal();
         send_code(terminal, call, get_send_options());
+    }
+
+    /** The live terminal running the R session that called `View()`. */
+    private originTerminal(): vscode.Terminal | undefined {
+        const session = this.source.sessionId;
+        return session ? terminal_for_session(session) : undefined;
+    }
+
+    private reportOriginEnded(): void {
+        void vscode.window.showInformationMessage(
+            'Raven data viewer: the R session that opened this view has ended. Run View() again.',
+        );
     }
 
     private defaultToolbar(): ToolbarState {

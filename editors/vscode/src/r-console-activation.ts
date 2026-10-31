@@ -6,20 +6,22 @@ import * as vscode from 'vscode';
  * `raven.rConsole.activation` controls whether Raven activates its
  * R-session features (R console, plot viewer, data viewer). The help
  * viewer is unaffected. The default `"auto"` resolves to `"disabled"`
- * when the REditorSupport (R) extension is enabled or VS Code is
- * running as Positron, so Raven steps aside in environments where the
- * user already has R-session integration. See
- * docs/coexistence.md for the rationale.
+ * when VS Code is running as Positron, which has its own R console.
+ * vscode-R (REditorSupport) no longer turns them off: when the user sends
+ * code, Raven asks which console to use and offers vscode-R's terminal as
+ * one choice (see `send-to-r/console-picker.ts`). See docs/coexistence.md.
  */
 
 export type RConsoleActivation = 'enabled' | 'disabled' | 'auto';
 export type RConsoleResolved = 'enabled' | 'disabled';
 
 /** Why `auto` resolved to `disabled`, or `null` when it resolved to `enabled`. */
-export type AutoDisableReason = 'reditorsupport' | 'positron' | null;
+export type AutoDisableReason = 'positron' | null;
 
 const REDITORSUPPORT_EXTENSION_ID = 'REditorSupport.r';
 const AUTO_NOTICE_DISMISSED_KEY = 'raven.rConsoleAutoNoticeDismissed';
+const VSCODE_R_NOTICE_SHOWN_KEY = 'raven.rConsoleVscodeRNoticeShown';
+const COEXISTENCE_URL = 'https://github.com/jbearak/raven/blob/main/docs/coexistence.md';
 
 export function readRConsoleActivation(): RConsoleActivation {
     const raw = vscode.workspace.getConfiguration('raven.rConsole')
@@ -39,10 +41,8 @@ export function isREditorSupportActive(): boolean {
     return ext !== undefined;
 }
 
-export function detectAutoDisableReason(): AutoDisableReason {
-    if (isREditorSupportActive()) return 'reditorsupport';
-    if (isPositron()) return 'positron';
-    return null;
+export function detectAutoDisableReason(appName?: string): AutoDisableReason {
+    return isPositron(appName) ? 'positron' : null;
 }
 
 export function resolveRConsoleActivation(
@@ -65,9 +65,7 @@ export async function notifyAutoDisable(
     if (reason === null) return;
     if (context.globalState.get<boolean>(AUTO_NOTICE_DISMISSED_KEY)) return;
 
-    const message = reason === 'reditorsupport'
-        ? "Raven includes an R console, plot viewer, and data viewer. Because REditorSupport (R) is enabled, Raven leaves these turned off by default so it doesn't interfere with your existing setup. Raven's code intelligence (completions, diagnostics, navigation) activates either way. See Learn more to decide whether to turn them on."
-        : "Raven includes an R console, plot viewer, and data viewer. Because you're running Positron, which has its own R-session integration, Raven leaves these turned off by default. Raven's code intelligence (completions, diagnostics, navigation) activates either way. See Learn more to decide whether to turn them on.";
+    const message = "Raven includes an R console, plot viewer, and data viewer. Because you're running Positron, which has its own R-session integration, Raven leaves these turned off by default. Raven's code intelligence (completions, diagnostics, navigation) activates either way. See Learn more to decide whether to turn them on.";
 
     const LEARN_MORE = 'Learn more';
     const OPEN_SETTINGS = 'Open setting';
@@ -77,9 +75,7 @@ export async function notifyAutoDisable(
         message, LEARN_MORE, OPEN_SETTINGS, DONT_SHOW,
     );
     if (choice === LEARN_MORE) {
-        await vscode.env.openExternal(
-            vscode.Uri.parse('https://github.com/jbearak/raven/blob/main/docs/coexistence.md'),
-        );
+        await vscode.env.openExternal(vscode.Uri.parse(COEXISTENCE_URL));
     } else if (choice === OPEN_SETTINGS) {
         await vscode.commands.executeCommand(
             'workbench.action.openSettings', 'raven.rConsole.activation',
@@ -90,11 +86,33 @@ export async function notifyAutoDisable(
 }
 
 /**
- * Watches for changes to `raven.rConsole.activation` and to
- * REditorSupport's installed/enabled state. When either flips the
- * resolved activation away from its current value, prompts the user to
- * reload the window so the new state takes effect — Raven does not
- * dynamically tear down or stand up R-session services mid-session.
+ * One-time notice for vscode-R users: Raven's R console used to stay off
+ * next to vscode-R and now runs alongside it. Shown once, at activation,
+ * when vscode-R is installed and the setting is `auto`.
+ */
+export async function notifyVscodeRCoexistence(
+    context: vscode.ExtensionContext,
+): Promise<void> {
+    if (readRConsoleActivation() !== 'auto' || isPositron()) return;
+    if (!isREditorSupportActive()) return;
+    if (context.globalState.get<boolean>(VSCODE_R_NOTICE_SHOWN_KEY)) return;
+    await context.globalState.update(VSCODE_R_NOTICE_SHOWN_KEY, true);
+
+    const LEARN_MORE = 'Learn more';
+    const choice = await vscode.window.showInformationMessage(
+        "Raven's R console now runs alongside vscode-R. When you first send code, Raven asks which console to use, unless raven.rTerminal.program names one.",
+        LEARN_MORE,
+    );
+    if (choice === LEARN_MORE) {
+        await vscode.env.openExternal(vscode.Uri.parse(COEXISTENCE_URL));
+    }
+}
+
+/**
+ * Watches for changes to `raven.rConsole.activation`. When a change flips
+ * the resolved activation, prompts the user to reload the window so the new
+ * state takes effect — Raven does not dynamically tear down or stand up
+ * R-session services mid-session.
  */
 export function registerActivationReactivity(
     context: vscode.ExtensionContext,
@@ -102,46 +120,20 @@ export function registerActivationReactivity(
 ): void {
     let lastResolved = initialResolved;
 
-    const promptIfChanged = async (
-        message: string,
-    ): Promise<void> => {
-        const next = resolveRConsoleActivation();
-        if (next === lastResolved) return;
-        lastResolved = next;
-        const RELOAD = 'Reload Window';
-        const choice = await vscode.window.showInformationMessage(message, RELOAD);
-        if (choice === RELOAD) {
-            await vscode.commands.executeCommand('workbench.action.reloadWindow');
-        }
-    };
-
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(async event => {
             if (!event.affectsConfiguration('raven.rConsole.activation')) return;
             const next = resolveRConsoleActivation();
             if (next === lastResolved) return;
+            lastResolved = next;
             const message = next === 'enabled'
                 ? "Raven's R console, plot viewer, and data viewer are now enabled. Reload the window to start them."
                 : "Raven's R console, plot viewer, and data viewer are now disabled. Reload the window to fully unload them.";
-            await promptIfChanged(message);
-        }),
-    );
-
-    context.subscriptions.push(
-        vscode.extensions.onDidChange(async () => {
-            // We only react to changes that affect the auto-resolution
-            // path; if the setting is explicit, REditorSupport coming or
-            // going doesn't change Raven's resolved state.
-            if (readRConsoleActivation() !== 'auto') return;
-            const next = resolveRConsoleActivation();
-            if (next === lastResolved) return;
-            const reason = detectAutoDisableReason();
-            const message = next === 'enabled'
-                ? "REditorSupport (R) was disabled. Reload the window to start Raven's R console, plot viewer, and data viewer."
-                : reason === 'reditorsupport'
-                    ? "REditorSupport (R) was enabled. Reload the window so Raven's R console steps aside (or set `raven.rConsole.activation` to \"enabled\" to keep both running)."
-                    : "Raven's R session features are now disabled. Reload the window to fully unload them.";
-            await promptIfChanged(message);
+            const RELOAD = 'Reload Window';
+            const choice = await vscode.window.showInformationMessage(message, RELOAD);
+            if (choice === RELOAD) {
+                await vscode.commands.executeCommand('workbench.action.reloadWindow');
+            }
         }),
     );
 }

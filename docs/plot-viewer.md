@@ -12,7 +12,7 @@ See plots from Raven's R console in a VS Code panel, with plot history and expor
 
 The viewer uses [httpgd](https://nx10.dev/httpgd/), a headless graphics device for R that serves plots over a local HTTP/WebSocket server. Each R session gets its own panel with independent history.
 
-The plot viewer works only when Raven's R console is active, which by default it isn't when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
+The plot viewer works only when Raven's R console is active, which by default it isn't in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting).
 
 ## Prerequisites
 

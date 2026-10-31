@@ -42,6 +42,12 @@ import {
     get_or_create_r_terminal,
     _dispose_cached_r_terminal_for_test,
 } from './send-to-r';
+import {
+    _set_picker_for_test,
+    type ConsolePick,
+    type PickerOptions,
+} from './send-to-r/console-picker';
+import { _reset_console_choice_for_test } from './send-to-r/r-terminal-manager';
 import { register_build_commands } from './build-commands';
 import {
     register_chunks_navigation_and_highlight,
@@ -55,6 +61,7 @@ import type { DataViewerManager } from './data-viewer/manager';
 import {
     detectAutoDisableReason,
     notifyAutoDisable,
+    notifyVscodeRCoexistence,
     readRConsoleActivation,
     registerActivationReactivity,
     resolveRConsoleActivation,
@@ -260,6 +267,14 @@ export interface RavenExtensionApi {
      * to `onDidCloseTerminal` and would otherwise be reused indefinitely.
      */
     _disposeCachedRTerminalForTest(): void;
+    /**
+     * Test-only: replace the bundled extension's console picker (null restores
+     * the real one) and forget its session choice, so suites can drive the
+     * `ask` path without a quick pick waiting for input.
+     */
+    _setConsolePickerForTest(
+        picker: ((options: PickerOptions) => Promise<ConsolePick | undefined>) | null,
+    ): void;
 }
 
 export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
@@ -402,9 +417,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     // R-console activation gating. The R console, plot viewer, and data viewer
     // share one umbrella — `raven.rConsole.activation`. Default `auto` steps
-    // aside when REditorSupport (R) is enabled or VS Code is running as
-    // Positron, so Raven supplements rather than fights existing R-session
-    // setups. The help viewer activates regardless and is wired above.
+    // aside only in Positron, which has its own R console. Next to vscode-R
+    // they stay on, and sends ask which console to use (vscode-R's terminal
+    // is one choice). The help viewer activates regardless and is wired above.
     const r_console_resolved = resolveRConsoleActivation();
     void vscode.commands.executeCommand(
         'setContext',
@@ -440,9 +455,8 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         register_build_commands(context);
         register_chunks_with_terminal(context);
 
-        // Chunk navigation and highlighting overlap with REditorSupport's
-        // chunk surfaces, so they're gated behind R-console activation. With
-        // REditorSupport / Positron handling chunks, Raven steps aside.
+        // Chunk navigation and highlighting overlap with Positron's chunk
+        // surfaces, so they're gated behind R-console activation.
         register_chunks_navigation_and_highlight(context);
 
         // R snippets for `rmd` / `quarto` are registered programmatically here
@@ -598,9 +612,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     if (r_console_resolved === 'disabled' && readRConsoleActivation() === 'auto') {
         void notifyAutoDisable(context, detectAutoDisableReason());
     }
+    if (r_console_resolved === 'enabled') {
+        void notifyVscodeRCoexistence(context);
+    }
 
-    // Listen for setting changes and REditorSupport extension toggles, and
-    // prompt the user to reload when the resolved activation flips.
+    // Listen for setting changes and prompt the user to reload when the
+    // resolved activation flips.
     registerActivationReactivity(context, r_console_resolved);
 
     // Register activity and tab-ownership listeners. A hidden text model can
@@ -814,6 +831,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             await data_viewer_manager?.dragScrollbarOnPanel(panelName, fraction);
         },
         _disposeCachedRTerminalForTest: () => _dispose_cached_r_terminal_for_test(),
+        _setConsolePickerForTest: (picker) => {
+            _set_picker_for_test(picker);
+            _reset_console_choice_for_test();
+        },
     };
 }
 

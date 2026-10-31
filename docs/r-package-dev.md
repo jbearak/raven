@@ -250,7 +250,7 @@ Raven watches `DESCRIPTION` and `NAMESPACE`. After you run `devtools::document()
 
 ## Build commands
 
-In VS Code, when the workspace is an R package (a `DESCRIPTION` with a non-empty `Package:` field, or `raven.packages.packageMode` set to `"enabled"`) **and** Raven's R console is active, Raven adds six Command Palette entries that wrap the standard devtools, testthat, and roxygen2 workflows. Their names follow RStudio's **Build** menu. If Raven's console stepped aside for vscode-R or Positron, these commands are hidden too; use that tool's package workflow instead. See [Using Raven with other R tools](coexistence.md).
+In VS Code, when the workspace is an R package (a `DESCRIPTION` with a non-empty `Package:` field, or `raven.packages.packageMode` set to `"enabled"`) **and** Raven's R console is active, Raven adds six Command Palette entries that wrap the standard devtools, testthat, and roxygen2 workflows. Their names follow RStudio's **Build** menu. If Raven's console stepped aside in Positron, these commands are hidden too; use Positron's package workflow instead. See [Using Raven with other R tools](coexistence.md).
 
 | Palette title | Runs in | R call |
 |---|---|---|
@@ -267,13 +267,15 @@ Each command passes the first workspace folder's absolute path, so a stray `setw
 
 `Load All`, `Document`, and `Install and Restart` change the R session, so they run in the same R terminal that Send-to-R uses, where you'd expect their effects.
 
-`Test Package`, `Check Package`, and `Build Source Package` can take 20 to 60 seconds or more, so they run in a separate `R: Package Tasks` terminal. That keeps your interactive prompt free and separates exploration from batch checks. Raven reuses the tasks terminal across runs, so it doesn't pay R's startup cost on every `devtools::test()`. Both terminals respect `raven.rTerminal.program`, so a configured `radian` or `arf` carries over.
+`Test Package`, `Check Package`, and `Build Source Package` can take 20 to 60 seconds or more, so they run in a separate `R: Package Tasks` terminal. That keeps your interactive prompt free and separates exploration from batch checks. Raven reuses the tasks terminal across runs, so it doesn't pay R's startup cost on every `devtools::test()`. The tasks terminal runs the console you chose, so `radian` or `arf` carries over. It runs Raven's console if you haven't chosen one yet or chose vscode-R, and it never asks.
 
 ### Install and Restart semantics
 
 `Install and Restart` runs `devtools::install()` and then `quit(save = "no")`, so R exits after the install. When the terminal closes, Raven recreates it in the same pane. The next Send-to-R or Build command runs in a fresh R session that loads the newly installed version, which is the point of the command.
 
 If the install fails, the wrapper prints the error with `message()` before R exits, and the output stays in the closed terminal's scrollback so you can read it.
+
+With vscode-R as your console, Raven can't restart vscode-R's R session. It sends only `devtools::install()` to vscode-R's terminal and tells you to restart R there when the install finishes.
 
 ## testthat problem matcher
 

@@ -1,6 +1,11 @@
 export {
     register_r_terminal,
     get_or_create_r_terminal,
+    get_or_create_raven_console,
+    get_or_create_terminal_for,
+    terminal_for_session,
+    terminal_program_now,
+    terminal_program_of,
     resolve_program,
     build_r_terminal_launch,
     RAVEN_CONSOLE_PROGRAM,

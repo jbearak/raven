@@ -1543,7 +1543,7 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 
 ### Native R console (`raven console`)
 
-`crates/raven/src/console/` is a terminal front end for R, and the default R terminal in the VS Code extension. Behavior and invariants are documented on the code: the module doc in `console/mod.rs` covers the thread model and input state machine, and the header of `console/shim.c` covers the longjmp boundary. In brief:
+`crates/raven/src/console/` is a terminal front end for R, and the first choice in the VS Code extension's console menu. Behavior and invariants are documented on the code: the module doc in `console/mod.rs` covers the thread model and input state machine, and the header of `console/shim.c` covers the longjmp boundary. In brief:
 
 - **Embedding.** `discovery.rs` finds R (`--r-home`, then `R_HOME`, then `R RHOME`). It replays the launcher's environment (`bin/R` resource-dir assignments plus `etc/ldpaths`) in `sh` and re-execs once, so the dynamic loader sees R's library path from process start. `libr.rs` then `dlopen`s `libR` with `RTLD_GLOBAL` and resolves every symbol up front. Any failure before R starts falls back to `exec`ing that installation's `bin/R` with the R arguments.
 - **Main thread.** R owns the main thread. `main.rs` dispatches `console` before building the tokio runtime used by every other subcommand.
@@ -1554,6 +1554,17 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 - **Windows.** R is embedded through `structRstart` instead of `Rf_initialize_R` and the `ptr_R_*` globals (`libr.rs` `Rstart`, `mod.rs` `init_r`; R 4.2+, `RSTART_VERSION` 1), following R's `src/gnuwin32/front-ends/rtest.c`. Interrupts set R's exported `UserBreak`, from the console's Ctrl-C handler and from other threads (`sys.rs`); R's event loop is `R_ProcessEvents`. `--ipc`/`--dap` are named pipes with an owner-only DACL, using overlapped I/O so one thread can read while another writes (`local_socket.rs`); the extension derives the same pipe name (`editors/vscode/src/send-to-r/console-endpoint.ts`). `raven.exe` embeds a manifest (`crates/raven/raven.exe.manifest`, linked by `build.rs`) that makes UTF-8 the active code page, which is what makes UTF-8 R's native encoding, as in Rterm.
 
 **Testing.** Unit tests sit next to each module. `crates/raven/tests/console_pty.rs` drives the real binary through a pseudo-terminal: editing, interrupts, nested prompts, sockets, events, and fallback. Each test skips itself when no R with a shared `libR` is installed; the `Cargo Tests` CI job installs `r-base-core`, so they run there. On Windows, `crates/raven/tests/console_windows.rs` drives the binary through ConPTY (typed input and UTF-8, Ctrl-C, the IPC pipe, a debugger stop); the `Windows Console` CI job installs R and runs it with clippy for the Windows target. To see what a user sees, run the console inside tmux and use `tmux capture-pane -p` (add `-e` to keep escapes). reedline paints to stderr, so don't redirect stderr while watching the screen.
+
+### Choosing the R console (VS Code)
+
+Where editor sends go is decided in `editors/vscode/src/send-to-r/` (design and review history: `docs/superpowers/specs/2026-10-31-r-console-picker-design.md`). The rules live in doc comments on the code:
+
+- `console-choice.ts` (no `vscode` import; tested by `tests/bun/console-choice.test.ts`): the session choice beats `raven.rTerminal.program`, and a setting change keeps the choice only if it equals the new Global or effective value, so the picker's own "All sessions" write never clears it, whenever its change event arrives.
+- `r-terminal-manager.ts`: tracks each managed terminal's program; a choice only ever reuses a terminal running that program. One picker is open at a time, and callers that arrive while it's open wait for it and then re-resolve. Profile-dropdown terminals are matched to their launch by a `RAVEN_TERMINAL_ID` env var (`pending-profiles.ts`), never by name.
+- `console-send.ts`: sends run one at a time in invocation order; vscode-R gets code through its `r.runCommand`.
+- `console-picker.ts`: the quick pick, and once-per-session detection of arf and radian.
+
+The VS Code test run pins `raven.rTerminal.program` to `raven` in its user settings (`.vscode-test.mjs`), so suites that send code don't stop at the picker; `src/test/send-to-r/console-picker.test.ts` covers `ask`.
 
 ### R debugger (`raven console --dap`)
 

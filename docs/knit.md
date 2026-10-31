@@ -29,7 +29,7 @@ While you edit, VS Code's Outline view and breadcrumbs show the document's Markd
 
 ## When the command is available
 
-Knit Preview is one of Raven's R-session features, so by default it steps aside when REditorSupport is enabled or you're in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). It also needs a trusted workspace; in an untrusted one, the command offers a button that opens the trust manager.
+Knit Preview is one of Raven's R-session features, so by default it steps aside in Positron; see [Coexistence](coexistence.md#the-ravenrconsoleactivation-setting). It also needs a trusted workspace; in an untrusted one, the command offers a button that opens the trust manager.
 
 When it's available, the command appears in the Command Palette and the editor-title Raven menu when the active file ends in `.rmd`, `.Rmd`, `.RMD`, `.rmarkdown`, `.Rmarkdown`, or `.RMARKDOWN`.
 

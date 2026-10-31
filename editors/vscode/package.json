@@ -89,6 +89,11 @@
         "category": "Raven"
       },
       {
+        "command": "raven.chooseRConsole",
+        "title": "Choose R Console",
+        "category": "Raven"
+      },
+      {
         "command": "raven.terminal.runLineOrSelection",
         "title": "Terminal - Run Line or Selection",
         "category": "Raven"
@@ -450,6 +455,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "raven.chooseRConsole",
+          "when": "raven.rConsoleEnabled"
+        },
+        {
           "command": "raven.debugger.start",
           "when": "raven.rConsoleEnabled"
         },
@@ -678,6 +687,10 @@
         {
           "submenu": "raven.sendToR.terminal",
           "group": "5_terminal"
+        },
+        {
+          "command": "raven.chooseRConsole",
+          "group": "6_console@1"
         }
       ],
       "raven.sendToR.terminal": [
@@ -1057,19 +1070,23 @@
         "raven.rTerminal.program": {
           "type": "string",
           "enum": [
+            "ask",
             "raven",
             "R",
             "arf",
-            "radian"
+            "radian",
+            "vscode-R"
           ],
           "enumDescriptions": [
-            "Raven's built-in R console: syntax highlighting, multi-line editing, Tab completion, and colored output. Runs the same R you get by typing R, and falls back to plain R if it can't.",
+            "Ask which console to use the first time you send code in a session. The menu lists Raven's R console, the R command line, and arf, radian, and vscode-R when they're installed.",
+            "Raven's built-in R console: syntax highlighting, multi-line editing, Tab completion, colored output, and the debugger. Runs the same R you get by typing R, and falls back to plain R if it can't.",
             "The standard R console.",
             "arf, a third-party Rust R console (install separately).",
-            "radian, a third-party Python R console (install separately)."
+            "radian, a third-party Python R console (install separately).",
+            "vscode-R's R terminal (needs the vscode-R extension). Raven's plot viewer, data viewer, and debugger don't apply there."
           ],
-          "default": "raven",
-          "description": "Program to use for the R terminal. 'raven' (the default) is Raven's built-in console; 'R' is the standard R console; 'arf' and 'radian' are third-party R consoles (must be installed separately). If arf or radian is not found in your shell PATH, Raven prompts you to switch to 'R' on this machine, leaving your User-level default unchanged."
+          "default": "ask",
+          "description": "Which R console Raven sends code to. 'ask' (the default) shows a menu the first time you send code in a session, where you choose for this session or for all sessions; choosing 'All sessions' saves your choice here. Run 'Raven: Choose R Console' to change it. If arf or radian is set here but not found in your shell PATH, Raven prompts you to switch to 'R' on this machine."
         },
         "raven.console.editMode": {
           "type": "string",
@@ -1078,7 +1095,7 @@
             "vi"
           ],
           "default": "emacs",
-          "description": "Key bindings for Raven's R console (raven.rTerminal.program = 'raven'). Applies to newly opened consoles."
+          "description": "Key bindings for Raven's R console. Applies to newly opened consoles."
         },
         "raven.console.colorOutput": {
           "type": "string",
@@ -1093,12 +1110,12 @@
             "No colors added (output that is already colored, e.g. by the cli package, keeps its colors)."
           ],
           "default": "streams",
-          "description": "How Raven's R console colors output (raven.rTerminal.program = 'raven'). Uses your terminal theme's colors. Applies to newly opened consoles."
+          "description": "How Raven's R console colors output. Uses your terminal theme's colors. Applies to newly opened consoles."
         },
         "raven.debugger.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Run the R debugger in Raven's R console (raven.rTerminal.program = 'raven'): breakpoints, stepping, variables and the Debug Console for R, R Markdown and Quarto files. Applies to newly opened consoles."
+          "description": "Run the R debugger in Raven's R console: breakpoints, stepping, variables and the Debug Console for R, R Markdown and Quarto files. Applies to newly opened consoles."
         },
         "raven.debugger.attach": {
           "type": "string",
@@ -1691,10 +1708,10 @@
           "enumDescriptions": [
             "Always activate Raven's R console, plot viewer, and data viewer.",
             "Never activate Raven's R console, plot viewer, or data viewer.",
-            "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
+            "Activate Raven's R console, plot viewer, and data viewer unless VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd / .Rmarkdown knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd / .Rmarkdown knit command. The default `auto` resolves to `disabled` when VS Code is running as Positron, which has its own R console. Next to vscode-R (REditorSupport) they stay on, and sending code asks which console to use (see raven.rTerminal.program). Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
         },
         "raven.knit.workingDirectory": {
           "type": "string",

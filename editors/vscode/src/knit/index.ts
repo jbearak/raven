@@ -34,7 +34,7 @@ export type { ExportDeps } from './export-commands';
  * entries keep working even when the resolved gate is closed; the
  * handler re-checks `resolveRConsoleActivation()` at invocation and
  * surfaces an info message if the gate has since closed (e.g.
- * REditorSupport was enabled after activation).
+ * `raven.rConsole.activation` changed after activation).
  *
  * The `raven.rmdKnit.enabled` context key controls whether the
  * command-palette entry is visible — set from the *resolved* gate, not

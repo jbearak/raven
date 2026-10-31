@@ -217,11 +217,12 @@ async function runKnitCommand(
     // Re-check the *resolved* gate. The command-palette `when` clauses
     // already gate on `raven.rmdKnit.enabled`, but the command itself
     // is registered unconditionally (so user keybindings and
-    // `tasks.json` entries keep working), and a stale auto-resolution
-    // after REditorSupport is enabled would otherwise let knit run.
+    // `tasks.json` entries keep working), and a change to
+    // `raven.rConsole.activation` before the window reloads would
+    // otherwise let knit run.
     if (resolveRConsoleActivation() !== 'enabled') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit Preview is disabled by your `raven.rConsole.activation` setting (or because REditorSupport / Positron is active).',
+            'Raven: Knit Preview is disabled by your `raven.rConsole.activation` setting (or because Raven is running in Positron).',
         );
         return;
     }

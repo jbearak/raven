@@ -94,7 +94,7 @@ Raven reads your files instead of asking a running R session what exists. That h
 
 ## Works with your setup
 
-Raven adds to the R tools you already use. Its language server runs alongside vscode-R's, and its R console and viewers step aside when vscode-R or Positron is present. [Using Raven with other R tools](docs/coexistence.md) explains each combination.
+Raven adds to the R tools you already use. Its language server and R console run alongside vscode-R's, and Raven asks which console to send code to. In Positron, Raven's console and viewers step aside. [Using Raven with other R tools](docs/coexistence.md) explains each combination.
 
 ## Documentation
 
