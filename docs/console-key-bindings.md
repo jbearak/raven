@@ -24,7 +24,7 @@ These work in `emacs` style and in vi's insert mode:
 |---|---|
 | `Enter` | Runs the input if it's a complete R expression, otherwise starts a new line |
 | `Alt+Enter` | Starts a new line, even if the input is complete |
-| `Tab` / `Shift+Tab` | Opens completions and moves through them |
+| `Tab` / `Shift+Tab` | Opens completions and moves through them; on a blank line, `Tab` indents |
 | `Up` / `Down`, `Ctrl+P` / `Ctrl+N` | Earlier and later history entries, or lines within multi-line input |
 | `→` or `End` at the end of the line | Accepts the dimmed suggestion from history |
 | `Ctrl+R` | Searches history |

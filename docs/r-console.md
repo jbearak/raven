@@ -51,7 +51,7 @@ Raven's console runs the same R you get by typing `R` in a terminal: the one on 
 
 ### Completion
 
-Press Tab to complete. A single match is inserted directly; otherwise a menu opens. Keep typing to narrow it, use Tab/Shift+Tab or the arrow keys to move, Enter to accept, and Esc to close.
+Press Tab to complete. A single match is inserted directly; otherwise a menu opens. Keep typing to narrow it, use Tab/Shift+Tab or the arrow keys to move, Enter to accept, and Esc to close. If nothing matches, Tab does nothing. On a blank line, or before any code on the line, Tab indents by two spaces.
 
 Completion uses R's own completion engine on your live session. It covers objects and functions, `df$` columns, `obj@` slots, function arguments (`name = `), `pkg::` exports, and file paths inside strings. After `library(`, `require(`, `requireNamespace(` or `loadNamespace(`, it completes installed package names. If a completion is slow, `Ctrl+C` interrupts it, as it would interrupt any R code; compiled code that never checks for interrupts can't be stopped this way.
 

@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, Completer, CompletionResult, DefaultHinter, EditCommand, Emacs,
-    FileBackedHistory, Highlighter, IdeMenu, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
-    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion, ValidationResult, Validator, Vi,
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    default_vi_visual_keybindings,
+    ColumnarMenu, Completer, CompletionResult, DefaultHinter, EditCommand, Editor, Emacs,
+    FileBackedHistory, Highlighter, IdeMenu, KeyCode, KeyModifiers, Keybindings, Menu, MenuBuilder,
+    MenuEvent, MenuSettings, Painter, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion,
+    ValidationResult, Validator, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
+    default_vi_normal_keybindings, default_vi_visual_keybindings,
 };
 
 use super::lexer::{self, Scan};
@@ -109,7 +109,9 @@ pub fn build(cfg: EditorConfig) -> Reedline {
         }))
         .with_quick_completions(true)
         .with_partial_completions(true)
-        .with_menu(ReedlineMenu::EngineCompleter(Box::new(completion_menu)))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(QuietMenu(
+            completion_menu,
+        ))))
         .with_menu(ReedlineMenu::HistoryMenu(Box::new(history_menu)))
         .with_edit_mode(edit)
         .with_break_signal(cfg.break_flag)
@@ -350,6 +352,16 @@ impl Completer for RCompleter {
         }
         let pos = pos.min(line.len());
         let head = &line[..pos];
+        // Tab on a blank line (or before any code on it) indents, as in
+        // Python's REPL. A lone suggestion is inserted without opening the menu.
+        if is_blank_line_head(head) {
+            return CompletionResult::fresh(vec![Suggestion {
+                value: INDENT.to_string(),
+                span: Span::new(pos, pos),
+                append_whitespace: false,
+                ..Default::default()
+            }]);
+        }
         let Ok(arg) = CString::new(head) else {
             return CompletionResult::fresh(Vec::<Suggestion>::new());
         };
@@ -385,6 +397,107 @@ impl Completer for RCompleter {
             })
             .collect();
         CompletionResult::fresh(suggestions)
+    }
+}
+
+/// Whether the cursor's line has only whitespace before the cursor.
+fn is_blank_line_head(head: &str) -> bool {
+    head.rsplit('\n').next().is_none_or(|l| l.trim().is_empty())
+}
+
+/// The completion menu, closed instead of drawn when completion finds nothing.
+///
+/// reedline's [`IdeMenu`] paints "NO RECORDS FOUND" for an empty result and
+/// stays active, so arrow keys would keep driving an empty menu instead of
+/// history. Here a settled empty result deactivates the menu: Tab with no
+/// matches does nothing, and narrowing an open menu to nothing closes it.
+struct QuietMenu(IdeMenu);
+
+impl QuietMenu {
+    fn close_if_empty(&mut self) {
+        if self.0.is_active() && self.0.get_values().is_empty() && !self.0.results_are_provisional()
+        {
+            self.0.handle_menu_event(&MenuEvent::Deactivate);
+        }
+    }
+}
+
+impl Menu for QuietMenu {
+    fn settings(&self) -> &MenuSettings {
+        self.0.settings()
+    }
+    fn is_active(&self) -> bool {
+        self.0.is_active()
+    }
+    fn set_active(&mut self, active: bool) {
+        self.0.set_active(active)
+    }
+    fn clear_input(&mut self) {
+        self.0.clear_input()
+    }
+    fn on_activate(&mut self) {
+        self.0.on_activate()
+    }
+    fn on_deactivate(&mut self) {
+        self.0.on_deactivate()
+    }
+    fn menu_event(&mut self, event: MenuEvent) {
+        self.0.menu_event(event)
+    }
+    fn can_quick_complete(&self) -> bool {
+        self.0.can_quick_complete()
+    }
+    fn can_partially_complete(
+        &mut self,
+        values_updated: bool,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+    ) -> bool {
+        self.0
+            .can_partially_complete(values_updated, editor, completer)
+    }
+    fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
+        self.0.update_values(editor, completer);
+        self.close_if_empty();
+    }
+    fn reset_position(&mut self) {
+        self.0.reset_position()
+    }
+    fn update_working_details(
+        &mut self,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+        painter: &Painter,
+    ) {
+        self.0.update_working_details(editor, completer, painter);
+        self.close_if_empty();
+    }
+    fn replace_in_buffer(&self, editor: &mut Editor) {
+        self.0.replace_in_buffer(editor)
+    }
+    fn menu_required_lines(&self, terminal_columns: u16) -> u16 {
+        self.0.menu_required_lines(terminal_columns)
+    }
+    fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.0.menu_string(available_lines, use_ansi_coloring)
+    }
+    fn min_rows(&self) -> u16 {
+        self.0.min_rows()
+    }
+    fn get_values(&self) -> &[Suggestion] {
+        self.0.get_values()
+    }
+    fn results_are_provisional(&self) -> bool {
+        self.0.results_are_provisional()
+    }
+    fn is_awaiting_first_answer(&self) -> bool {
+        self.0.is_awaiting_first_answer()
+    }
+    fn is_visible(&self) -> bool {
+        self.0.is_visible()
+    }
+    fn set_cursor_pos(&mut self, pos: (u16, u16)) {
+        self.0.set_cursor_pos(pos)
     }
 }
 
@@ -503,6 +616,16 @@ mod tests {
     fn enter_submits_complete_or_invalid_input() {
         assert_eq!(continuation("f()", fake_parse), None);
         assert_eq!(continuation("f <- function(a) {}", fake_parse), None);
+    }
+
+    #[test]
+    fn blank_line_head_is_whitespace_before_cursor_on_its_line() {
+        assert!(is_blank_line_head(""));
+        assert!(is_blank_line_head("   "));
+        assert!(is_blank_line_head("f <- function(x) {\n  "));
+        assert!(!is_blank_line_head("su"));
+        assert!(!is_blank_line_head("f(x,\n  y"));
+        assert!(!is_blank_line_head("f("));
     }
 
     #[test]
