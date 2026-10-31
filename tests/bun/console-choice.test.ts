@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
 import {
     detection_script,
     effective_target,
@@ -98,10 +99,11 @@ describe('console detection', () => {
         expect([...parse_detection_output('/Users/me/My Tools/arf\n')]).toEqual(['arf']);
     });
 
-    test('the script works in sh, zsh and bash, with a missing last program', async () => {
+    test('the script works in sh, zsh and bash (those installed), with a missing last program', async () => {
         const dir = `${process.env.TMPDIR ?? '/tmp'}/raven-detect-${process.pid}`;
         await Bun.$`mkdir -p ${dir} && printf '#!/bin/sh\n' > ${dir}/arf && chmod +x ${dir}/arf`;
-        for (const shell of ['/bin/sh', '/bin/zsh', '/bin/bash']) {
+        const shells = ['/bin/sh', '/bin/zsh', '/bin/bash'].filter((shell) => existsSync(shell));
+        for (const shell of shells) {
             const result = await Bun.$`${shell} -c ${detection_script()}`
                 .env({ PATH: `${dir}:/usr/bin:/bin` })
                 .nothrow()

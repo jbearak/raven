@@ -93,7 +93,8 @@ async function setup(opts: { savedSort?: any; savedFilter?: any; source?: any; p
         ViewColumn: { Active: -1 },
     }));
     mock.module('../../editors/vscode/src/send-to-r/r-terminal-manager', () => ({
-        get_or_create_r_terminal: async () => ({ name: 'R' }),
+        // Refresh re-runs only in the session that made the view.
+        terminal_for_session: (id: string) => (id === 'live' ? { name: 'R' } : undefined),
     }));
     mock.module('../../editors/vscode/src/send-to-r/send-code', () => ({
         get_send_options: () => ({ sendMethod: 'auto', autoTempFileThresholdLines: 25 }),
@@ -234,7 +235,7 @@ describe('help', () => {
 
 describe('refresh', () => {
     test('shows the View() call and asks; declining sends nothing', async () => {
-        const { wv } = await setup({ source: { expression: 'subset(tiny, x > 1)', sourceKind: 'data.frame' }, title: 'subset(tiny, x > 1)' });
+        const { wv } = await setup({ source: { expression: 'subset(tiny, x > 1)', sourceKind: 'data.frame', sessionId: 'live' }, title: 'subset(tiny, x > 1)' });
         const gen = await ready(wv);
         wv.deliver({ type: 'refresh', panelGeneration: gen });
         await flush();
@@ -245,7 +246,7 @@ describe('refresh', () => {
     });
 
     test('a titled view re-runs with its title; without an expression it explains', async () => {
-        const { wv } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame' }, title: 'My "data"' });
+        const { wv } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame', sessionId: 'live' }, title: 'My "data"' });
         const gen = await ready(wv);
         modalAnswer = 'Re-run';
         wv.deliver({ type: 'refresh', panelGeneration: gen });
@@ -258,8 +259,19 @@ describe('refresh', () => {
         expect(infos[0]).toContain('no View() expression');
     });
 
+    test('after the R session that made the view ends, it explains instead of asking', async () => {
+        const { wv } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame', sessionId: 'ended' } });
+        const gen = await ready(wv);
+        modalAnswer = 'Re-run';
+        wv.deliver({ type: 'refresh', panelGeneration: gen });
+        await flush();
+        expect(modals).toHaveLength(0);
+        expect(sent).toEqual([]);
+        expect(infos[0]).toContain('has ended');
+    });
+
     test('confirmed: the re-run keeps the sort when the schema matches, even with persistence off', async () => {
-        const { panel, wv, arrowMod, dir } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame' }, persistSort: false });
+        const { panel, wv, arrowMod, dir } = await setup({ source: { expression: 'tiny', sourceKind: 'data.frame', sessionId: 'live' }, persistSort: false });
         const gen = await ready(wv);
         await sortDesc(wv, gen);
         modalAnswer = 'Re-run';
