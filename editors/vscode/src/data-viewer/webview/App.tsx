@@ -2896,9 +2896,9 @@ export function App({
                                     type="button"
                                     className="toolbar-progress-action"
                                     onClick={() => setSortOrder('c')}
-                                    title="Code point order, as dplyr::arrange() uses"
+                                    title="Unicode code point order, as dplyr::arrange() uses"
                                 >
-                                    Switch to C order (fast, as dplyr)
+                                    Switch to dplyr order (fast)
                                 </button>
                             )}
                         </span>
@@ -3194,6 +3194,10 @@ export function App({
                                 stringOrder: toolbar.sortOrder ?? 'natural',
                                 onStringOrder: order => {
                                     setSortOrder(order);
+                                    setContextMenu(null);
+                                },
+                                onExplainStringOrder: () => {
+                                    vscode.postMessage({ type: 'openHelp', panelGeneration, topic: 'text-order' });
                                     setContextMenu(null);
                                 },
                             }

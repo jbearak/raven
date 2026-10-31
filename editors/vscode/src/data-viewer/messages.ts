@@ -657,6 +657,13 @@ export type WebviewToExtension =
         panelGeneration: number;
     }
     | {
+        /** Open a section of the data viewer docs in the browser. The
+         *  host owns the URL; the webview names only the topic. */
+        type: 'openHelp';
+        panelGeneration: number;
+        topic: 'text-order';
+    }
+    | {
         /** Asks the host to abandon the in-progress restore of a saved
          *  sort/filter (#519) and show the data unsorted/unfiltered,
          *  forgetting the saved preferences. `restoreId` echoes the value
