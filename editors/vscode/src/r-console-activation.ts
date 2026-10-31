@@ -100,7 +100,7 @@ export async function notifyVscodeRCoexistence(
 
     const LEARN_MORE = 'Learn more';
     const choice = await vscode.window.showInformationMessage(
-        "Raven's R console now runs alongside vscode-R. When you send code, Raven asks which console to use.",
+        "Raven's R console now runs alongside vscode-R. When you first send code, Raven asks which console to use, unless raven.rTerminal.program names one.",
         LEARN_MORE,
     );
     if (choice === LEARN_MORE) {

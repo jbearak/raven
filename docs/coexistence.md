@@ -22,7 +22,7 @@ The notification appears once and offers three choices: **Learn more** opens thi
 
 To use Raven's console anyway, set `raven.rConsole.activation` to `"enabled"` and reload the window. [Who benefits from Raven's R console](#who-benefits-from-ravens-r-console) helps you decide.
 
-With vscode-R installed, Raven's console stays on. A one-time notification says so: "Raven's R console now runs alongside vscode-R. When you send code, Raven asks which console to use." See [Run Raven next to vscode-R](#run-raven-next-to-vscode-r).
+With vscode-R installed, Raven's console stays on. A one-time notification says so: "Raven's R console now runs alongside vscode-R. When you first send code, Raven asks which console to use, unless raven.rTerminal.program names one." See [Run Raven next to vscode-R](#run-raven-next-to-vscode-r).
 
 ## The `raven.rConsole.activation` setting
 

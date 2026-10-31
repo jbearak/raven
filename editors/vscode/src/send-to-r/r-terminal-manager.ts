@@ -127,7 +127,16 @@ async function apply_pick(pick: ConsolePick): Promise<void> {
     session_choice = pick.target;
     if (pick.scope !== 'all') return;
     const config = vscode.workspace.getConfiguration('raven.rTerminal');
-    await config.update('program', pick.target, vscode.ConfigurationTarget.Global);
+    try {
+        await config.update('program', pick.target, vscode.ConfigurationTarget.Global);
+    } catch (err) {
+        // The session choice already holds, so the send goes ahead.
+        const message = err instanceof Error ? err.message : String(err);
+        void vscode.window.showWarningMessage(
+            `Raven: couldn't save raven.rTerminal.program to your user settings (${message}). Raven uses ${target_label(pick.target)} for this session.`,
+        );
+        return;
+    }
     const inspected = config.inspect<string>('program');
     if (inspected?.workspaceValue !== undefined || inspected?.workspaceFolderValue !== undefined) {
         void vscode.window.showWarningMessage(
