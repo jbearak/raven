@@ -4,17 +4,22 @@ set -e
 # Release script: bumps version, commits, tags, and pushes.
 #
 # Usage:
-#   ./scripts/bump-version.sh [patch|minor|major|<version>]
+#   ./scripts/bump-version.sh [--dry-run] [patch|minor|preview|major|<version>]
+#
+# Even minor versions are stable releases, odd minor versions are VS Code
+# Marketplace pre-releases (see scripts/release-channel.sh).
 #
 # Examples:
-#   ./scripts/bump-version.sh           # patch bump (default): 0.1.0 -> 0.1.1
-#   ./scripts/bump-version.sh patch     # same as above
-#   ./scripts/bump-version.sh minor     # 0.1.1 -> 0.2.0
-#   ./scripts/bump-version.sh major     # 0.2.0 -> 1.0.0
+#   ./scripts/bump-version.sh           # patch bump (default), same channel: 0.24.0 -> 0.24.1
+#   ./scripts/bump-version.sh patch     # same as above; 0.23.0 -> 0.23.1 stays pre-release
+#   ./scripts/bump-version.sh minor     # next stable minor: 0.23.2 -> 0.24.0
+#   ./scripts/bump-version.sh preview   # next pre-release: 0.24.1 -> 0.25.0, 0.25.0 -> 0.25.1
+#   ./scripts/bump-version.sh major     # 0.24.0 -> 1.0.0
 #   ./scripts/bump-version.sh 2.0.0     # explicit version
+#   ./scripts/bump-version.sh --dry-run preview   # print "0.25.0 pre-release" and stop
 #
 # This script will:
-#   1. Validate the working directory is clean
+#   1. Validate the working directory is clean and confirm the release channel
 #   2. Update version in Cargo.toml and editors/vscode/package.json
 #   3. Commit the version bump
 #   4. Create and push a git tag (triggers release-build.yml)
@@ -27,17 +32,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
-    echo "Usage: $0 [patch|minor|major|<version>]"
+    echo "Usage: $0 [--dry-run] [patch|minor|preview|major|<version>]"
     echo ""
-    echo "  patch     Bump patch version (default): 0.1.0 -> 0.1.1"
-    echo "  minor     Bump minor version: 0.1.1 -> 0.2.0"
-    echo "  major     Bump major version: 0.2.0 -> 1.0.0"
-    echo "  <version> Explicit semver (e.g., 2.0.0 or 1.0.0-beta.1)"
+    echo "  patch     Bump patch version, same channel (default): 0.24.0 -> 0.24.1"
+    echo "  minor     Next stable (even) minor: 0.23.2 -> 0.24.0"
+    echo "  preview   Next pre-release: 0.24.1 -> 0.25.0, 0.25.0 -> 0.25.1"
+    echo "  major     Bump major version: 0.24.0 -> 1.0.0"
+    echo "  <version> Explicit X.Y.Z (even minor = stable, odd minor = pre-release)"
+    echo "  --dry-run Print the next version and its channel without changing anything"
     echo ""
     echo "Examples:"
     echo "  $0"
     echo "  $0 patch"
     echo "  $0 minor"
+    echo "  $0 preview"
     echo "  $0 1.0.0"
     exit 1
 }
@@ -55,23 +63,36 @@ if [ -z "$CURRENT_VERSION" ]; then
     exit 1
 fi
 
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+    shift
+fi
+
 BUMP="${1:-patch}"
 
 if [ "$BUMP" = "--help" ] || [ "$BUMP" = "-h" ]; then
     usage
 fi
 
+IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
 case "$BUMP" in
     patch)
-        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
         VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
         ;;
     minor)
-        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
-        VERSION="$MAJOR.$((MINOR + 1)).0"
+        # Next even minor: the next stable line.
+        VERSION="$MAJOR.$(( (MINOR / 2 + 1) * 2 )).0"
+        ;;
+    preview)
+        # Continue the current pre-release line, or open the next odd minor.
+        if [ "$("$SCRIPT_DIR/release-channel.sh" "$CURRENT_VERSION")" = "pre-release" ]; then
+            VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+        else
+            VERSION="$MAJOR.$(( MINOR % 2 == 1 ? MINOR + 2 : MINOR + 1 )).0"
+        fi
         ;;
     major)
-        IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT_VERSION%%-*}"
         VERSION="$((MAJOR + 1)).0.0"
         ;;
     *)
@@ -79,11 +100,17 @@ case "$BUMP" in
         ;;
 esac
 
-# Validate version format
-if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-    echo "ERROR: Invalid version format: $VERSION"
-    echo "Expected format: X.Y.Z or X.Y.Z-suffix"
+# Validate the version and classify its release channel
+CHANNEL=$("$SCRIPT_DIR/release-channel.sh" "$VERSION")
+if [ "$BUMP" = "preview" ] && [ "$CHANNEL" != "pre-release" ]; then
+    echo "ERROR: preview bump produced $VERSION, which is a $CHANNEL version."
+    echo "Pass an explicit odd-minor version instead."
     exit 1
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    echo "$VERSION $CHANNEL"
+    exit 0
 fi
 
 TAG="v$VERSION"
@@ -101,7 +128,15 @@ if git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; t
     exit 1
 fi
 
-echo "Bumping version to $VERSION..."
+if [ -t 0 ]; then
+    read -r -p "Release $TAG as $CHANNEL? This commits, tags, and pushes. [y/N] " REPLY
+    case "$REPLY" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 1 ;;
+    esac
+fi
+
+echo "Bumping version to $VERSION ($CHANNEL)..."
 
 # Update workspace Cargo.toml
 sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
@@ -131,7 +166,7 @@ git -C "$REPO_ROOT" push origin
 git -C "$REPO_ROOT" push origin "$TAG"
 
 echo ""
-echo "Release $TAG initiated!"
+echo "Release $TAG ($CHANNEL) initiated!"
 echo ""
 echo "Next steps:"
 echo "  1. Wait for release-build.yml to finish: https://github.com/jbearak/raven/actions"

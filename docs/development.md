@@ -158,19 +158,27 @@ This reports timing and peak RSS per phase (parse, metadata, scope, packages). U
 
 ## Releasing
 
+### Stable and pre-release channels
+
+The VS Code Marketplace and Open VSX accept only plain `X.Y.Z` versions, so the channel is encoded in the minor version: **even minor = stable, odd minor = pre-release** (Microsoft's recommended scheme). Users opt in with **Switch to Pre-Release Version** on the extension page, and they get the highest version across both channels. Number a pre-release above the current stable release, or pre-release users stay on stable. Odd minors through 0.21 shipped as stable before this scheme; it starts with the 0.23.0 pre-release and the 0.24.0 stable release, and 0.22 is skipped. `scripts/release-channel.sh` is the single classifier, shared by the bump script and both release workflows, and it rejects suffixed versions like `1.0.0-beta.1`.
+
+For a pre-release, the workflows package each `.vsix` with `vsce package --pre-release`, mark the GitHub Release as a prerelease so `releases/latest` (and therefore `setup-raven`) keeps resolving to stable, and skip the Homebrew and apt bumps.
+
 ### Version bump and tag
 
 Use the bump script to update versions, commit, tag, and push:
 
 ```bash
-./scripts/bump-version.sh           # patch bump (default): 0.1.0 -> 0.1.1
-./scripts/bump-version.sh patch     # same as above
-./scripts/bump-version.sh minor     # 0.1.1 -> 0.2.0
-./scripts/bump-version.sh major     # 0.2.0 -> 1.0.0
+./scripts/bump-version.sh           # patch bump (default), same channel: 0.24.0 -> 0.24.1
+./scripts/bump-version.sh patch     # same as above; 0.23.0 -> 0.23.1 stays pre-release
+./scripts/bump-version.sh minor     # next stable (even) minor: 0.23.2 -> 0.24.0
+./scripts/bump-version.sh preview   # next pre-release: 0.24.1 -> 0.25.0, 0.25.0 -> 0.25.1
+./scripts/bump-version.sh major     # 0.24.0 -> 1.0.0
 ./scripts/bump-version.sh 2.0.0     # explicit version
+./scripts/bump-version.sh --dry-run preview   # print the version and channel, change nothing
 ```
 
-This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`, commits the change, creates a git tag, and pushes both.
+This updates `Cargo.toml` (workspace version) and `editors/vscode/package.json`, commits the change, creates a git tag, and pushes both. Run from a terminal, it first asks you to confirm the version and channel.
 
 ### CI build
 
