@@ -1,4 +1,5 @@
 import type { TerminalProgram } from './console-choice';
+import type { PerchApiV1 } from './perch-api';
 
 /**
  * Terminals the profile provider has described but VS Code hasn't opened yet.
@@ -15,6 +16,11 @@ export type PendingProfile = {
     consoleSocket?: string;
     /** Plot/data-viewer session the terminal's R profile reports to. */
     sessionId?: string;
+    /**
+     * Set when the terminal runs a Perch session (whose ID is the entry's
+     * key): the API that reaches it.
+     */
+    perch?: PerchApiV1;
     generatedAtMs: number;
 };
 

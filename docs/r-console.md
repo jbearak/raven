@@ -62,6 +62,18 @@ When you choose vscode-R, Raven hands the code to vscode-R's `r.runCommand`, whi
 
 Raven's plot viewer, data viewer, and debugger work only in terminals Raven opens. `plot()` and `View()` in vscode-R's terminal go to vscode-R's viewers. To have both extensions' `Cmd+Enter` behave the way you expect, see [Cmd+Enter next to vscode-R](coexistence.md#cmdenter-next-to-vscode-r).
 
+### Keep R running in remote windows
+
+In a remote window (Remote SSH, WSL, Dev Containers, or a tunnel), R normally ends when you close the window or the connection drops. If the [Perch](https://github.com/jbearak/perch) extension is installed on the remote host, Raven starts its consoles in Perch sessions instead, and R keeps running:
+
+- When you reconnect or reopen the window, Perch reopens the console's terminal, and Raven sends code to it as before, with your objects intact.
+- Closing the console's terminal only detaches it. The next time you send code with no console open, Raven lists the R consoles still running on the host in a menu titled "Reattach an R console?". Pick one to reopen it, or **Start a new** console.
+- `q()` ends R and its session.
+
+There is no setting: installing Perch on the remote host turns this on. Without Perch, and in local windows, the console is an ordinary terminal. Perch runs on macOS and Linux hosts.
+
+One thing differs: a console that kept running through a reload or reconnect can't show plots or `View()` in the reopened window, and Raven tells you so once. Quit R and send code again to start a fresh console that can.
+
 ## Raven's console
 
 Raven's console runs the same R you get by typing `R` in a terminal: the one on your `PATH`, or `R_HOME` if you set it. On Windows, where the installer doesn't put R on `PATH`, it also finds the R recorded in the registry; it needs R 4.2 or later there. It loads that installation's R library into its own process and drives R's own read–eval–print loop. Everything R does at its prompt works as usual: autoprinting, `.Last.value`, `browser()`, `readline()`, `menu()`, error recovery, and your `.Rprofile` and `.Renviron`. If the console can't embed your R (for example, R built without `--enable-R-shlib`), it says why in one line and starts plain R instead, so you always get a working session.

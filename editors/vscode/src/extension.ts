@@ -48,6 +48,7 @@ import {
     type PickerOptions,
 } from './send-to-r/console-picker';
 import { _reset_console_choice_for_test } from './send-to-r/r-terminal-manager';
+import { type_into } from './send-to-r/perch';
 import { register_build_commands } from './build-commands';
 import {
     register_chunks_navigation_and_highlight,
@@ -813,7 +814,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         getLanguageClient: () => client,
         sendToRTerminal: async (code: string) => {
             const terminal = await get_or_create_r_terminal();
-            terminal.sendText(code, true);
+            type_into(terminal, code);
         },
         getDataViewerPanelNames: () => data_viewer_manager?.getPanelNames() ?? [],
         getDataViewerPanelColumnNames: (panelName: string) =>

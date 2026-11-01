@@ -8,6 +8,7 @@ import { choose_r_console } from './r-terminal-manager';
 import { send_code, get_send_options, location_in } from './send-code';
 import { send_to_r_console } from './console-send';
 import type { SendLocation } from './console-ipc';
+import { type_into } from './perch';
 
 type SendMode = 'statement' | 'upward' | 'downward' | 'file';
 
@@ -115,7 +116,7 @@ async function handle_terminal_send(mode: SendMode): Promise<void> {
     terminal.show(true);
 
     if (mode === 'file') {
-        terminal.sendText(code);
+        type_into(terminal, code);
     } else {
         send_code(terminal, code, get_send_options(), location);
     }

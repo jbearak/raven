@@ -1563,6 +1563,7 @@ Where editor sends go is decided in `editors/vscode/src/send-to-r/` (design and 
 - `r-terminal-manager.ts`: tracks each managed terminal's program; a choice only ever reuses a terminal running that program. One picker is open at a time, and callers that arrive while it's open wait for it and then re-resolve. Profile-dropdown terminals are matched to their launch by a `RAVEN_TERMINAL_ID` env var (`pending-profiles.ts`), never by name.
 - `console-send.ts`: sends run one at a time in invocation order; vscode-R gets code through its `r.runCommand`.
 - `console-picker.ts`: the quick pick, and once-per-session detection of arf and radian.
+- `perch.ts`, `perch-sessions.ts` (pure; `tests/bun/perch-sessions.test.ts`), `perch-api.ts` (a copy of Perch's API v1 types): in a remote window with the Perch extension next to Raven, new consoles run in Perch sessions. `perch.ts` says when, and its invariants: only sessions with a terminal in this window are automatic targets, a closed Perch terminal is a detach, and text reaches a session through Perch's `send`, never `sendText`. `src/test/send-to-r/perch.test.ts` drives it with a fake API. For an end-to-end run with real Perch, load Perch's `editors/vscode` as a second `extensionDevelopmentPath` and set `RAVEN_TEST_PERCH_TREAT_AS_REMOTE=1`, which makes a local window count as remote.
 
 The VS Code test run pins `raven.rTerminal.program` to `raven` in its user settings (`.vscode-test.mjs`), so suites that send code don't stop at the picker; `src/test/send-to-r/console-picker.test.ts` covers `ask`.
 
