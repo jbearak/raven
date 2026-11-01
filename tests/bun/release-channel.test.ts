@@ -66,6 +66,7 @@ describe("bump-version.sh --dry-run", () => {
     ["0.24.1", "minor", "0.26.0 stable"],
     ["0.25.0", "major", "1.0.0 stable"],
     ["0.24.0", "0.27.0", "0.27.0 pre-release"],
+    ["0.24.0", "v0.25.0", "0.25.0 pre-release"],
     ["0.24.0", "1.0.0-beta.1", "exit 1"],
   ])("from %s, %s gives %s", (current, bump, expected) => {
     expect(dryRun(current, bump)).toBe(expected);

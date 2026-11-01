@@ -96,7 +96,7 @@ case "$BUMP" in
         VERSION="$((MAJOR + 1)).0.0"
         ;;
     *)
-        VERSION="$BUMP"
+        VERSION="${BUMP#v}"
         ;;
 esac
 
