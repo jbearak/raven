@@ -47,7 +47,7 @@ import {
     type ConsolePick,
     type PickerOptions,
 } from './send-to-r/console-picker';
-import { _reset_console_choice_for_test } from './send-to-r/r-terminal-manager';
+import { _reset_console_choice_for_test, new_console_in_perch } from './send-to-r/r-terminal-manager';
 import { type_into } from './send-to-r/perch';
 import { register_build_commands } from './build-commands';
 import {
@@ -467,6 +467,17 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         // docs/coexistence.md.
         registerRSnippetCompletionsForRmdAndQuarto(context);
     }
+
+    // Perch's list of new terminals runs this (Raven's `perch.launchers` entry
+    // in package.json) whether or not the R console is on, so it always exists.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('raven.perch.newConsole', async () => {
+            if (r_console_resolved !== 'enabled') {
+                throw new Error("Raven's R console is turned off in this window (raven.rConsole.activation).");
+            }
+            await new_console_in_perch();
+        }),
+    );
 
     // Package-mode context key. The `raven.isRPackage` key gates the
     // Build commands' palette entries and editor-title submenu — every

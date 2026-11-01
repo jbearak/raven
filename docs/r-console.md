@@ -70,7 +70,9 @@ In a remote window (Remote SSH, WSL, Dev Containers, or a tunnel), R normally en
 - Closing the console's terminal only detaches it. The next time you send code with no console open, Raven lists the R consoles still running on the host in a menu titled "Reattach an R console?". Pick one to reopen it, or **Start a new** console.
 - `q()` ends R and its session.
 
-There is no setting: installing Perch on the remote host turns this on. Without Perch, and in local windows, the console is an ordinary terminal. Perch runs on macOS and Linux hosts.
+There is no setting: installing Perch on the remote host turns this on. Without Perch, the console is an ordinary terminal. Perch runs on macOS and Linux hosts.
+
+In a local window, Raven's consoles stay ordinary terminals even with Perch installed. To keep one running there, start it from **Perch: New Persistent Terminal...** and pick **R console**. Raven sends code to it like any console it starts, and Perch reopens it when you reload the window.
 
 One thing differs: a console that kept running through a reload or reconnect can't show plots or `View()` in the reopened window, and Raven tells you so once. Quit R and send code again to start a fresh console that can.
 

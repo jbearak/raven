@@ -9,21 +9,26 @@ import type { CreateOptions, PerchApiV1, PerchExports, SessionInfo } from '../..
 import {
     _reset_perch_for_test,
     find_perch,
-    is_remote_workspace_host,
     PerchDeps,
+    perch_host,
     perch_session_of,
     type_into,
 } from '../../send-to-r/perch';
+import { _set_picker_for_test } from '../../send-to-r/console-picker';
 import {
     _add_pending_profile_for_test,
     _connect_perch_for_r_terminals_for_test,
     _dispose_cached_r_terminal_for_test,
     _handle_terminal_closed_for_test,
     _handle_terminal_opened_for_test,
+    _provide_r_terminal_profile_for_test,
+    _reset_console_choice_for_test,
     _set_reattach_picker_for_test,
     _set_server_path_for_test,
     _set_validator_for_test,
     get_or_create_terminal_for,
+    new_console_in_perch,
+    resolve_send_target,
     terminal_program_of,
 } from '../../send-to-r/r-terminal-manager';
 import { send_code } from '../../send-to-r/send-code';
@@ -99,10 +104,13 @@ class FakePerch implements PerchApiV1 {
     fire_end(session: SessionInfo): void { this.end_events.fire(session); }
 }
 
-function deps_for(perch: FakePerch | undefined, opts: { remote?: boolean; activate?: () => Promise<PerchExports> } = {}): PerchDeps & { looked_up: number } {
+type DepsOptions = { remote?: boolean; reachable?: boolean; activate?: () => Promise<PerchExports> };
+
+/** A remote window where Perch reaches Raven, unless `opts` says otherwise. */
+function deps_for(perch: FakePerch | undefined, opts: DepsOptions = {}): PerchDeps & { looked_up: number } {
     const deps = {
         looked_up: 0,
-        in_remote_workspace_host: () => opts.remote ?? true,
+        host: () => ({ remote: opts.remote ?? true, reachable: opts.reachable ?? true }),
         get_extension: () => {
             deps.looked_up++;
             if (!perch && !opts.activate) return undefined;
@@ -160,6 +168,7 @@ suite('R consoles in Perch sessions', () => {
         (vscode.window as any).createTerminal = original_create_terminal;
         for (const t of created.splice(0)) t.dispose();
         _set_reattach_picker_for_test(null);
+        _reset_console_choice_for_test();
         _set_server_path_for_test(null);
         _set_validator_for_test(null);
         _reset_perch_for_test();
@@ -167,20 +176,26 @@ suite('R consoles in Perch sessions', () => {
     });
 
     suite('when Raven uses Perch', () => {
-        test('only in a remote window where Raven runs in the workspace host', () => {
-            assert.strictEqual(is_remote_workspace_host(undefined, vscode.ExtensionKind.UI, {}), false, 'local window');
-            assert.strictEqual(is_remote_workspace_host('ssh-remote', vscode.ExtensionKind.UI, {}), false, 'Raven forced to UI');
-            assert.strictEqual(is_remote_workspace_host('ssh-remote', vscode.ExtensionKind.Workspace, {}), true);
-            assert.strictEqual(is_remote_workspace_host('wsl', vscode.ExtensionKind.Workspace, {}), true);
-            assert.strictEqual(
-                is_remote_workspace_host(undefined, vscode.ExtensionKind.UI, { RAVEN_TEST_PERCH_TREAT_AS_REMOTE: '1' }),
-                true,
+        test('Perch reaches Raven in a local window, and in a remote one only from the workspace host', () => {
+            const { UI, Workspace } = vscode.ExtensionKind;
+            assert.deepStrictEqual(perch_host(undefined, UI, {}), { remote: false, reachable: true }, 'local window');
+            assert.deepStrictEqual(perch_host('ssh-remote', Workspace, {}), { remote: true, reachable: true });
+            assert.deepStrictEqual(perch_host('wsl', Workspace, {}), { remote: true, reachable: true });
+            assert.deepStrictEqual(perch_host('ssh-remote', UI, {}), { remote: true, reachable: false }, 'Raven forced to UI');
+            assert.deepStrictEqual(
+                perch_host(undefined, UI, { RAVEN_TEST_PERCH_TREAT_AS_REMOTE: '1' }),
+                { remote: true, reachable: true },
                 'the end-to-end test override',
             );
         });
 
-        test('local window: Perch is not even looked up', async () => {
-            const deps = deps_for(new FakePerch(), { remote: false });
+        test('local window: Perch is usable', async () => {
+            const perch = new FakePerch();
+            assert.strictEqual(await find_perch(deps_for(perch, { remote: false })), perch);
+        });
+
+        test('remote window, Raven forced to UI: Perch is not even looked up', async () => {
+            const deps = deps_for(new FakePerch(), { reachable: false });
             assert.strictEqual(await find_perch(deps), undefined);
             assert.strictEqual(deps.looked_up, 0);
         });
@@ -360,6 +375,173 @@ suite('R consoles in Perch sessions', () => {
             assert.strictEqual(terminal_program_of(again), undefined);
             assert.strictEqual(console_socket_of(again), undefined);
             assert.strictEqual(perch_session_of(again), undefined);
+        });
+    });
+
+    suite('local window', () => {
+        const local = { remote: false };
+
+        test("a terminal Perch restored is adopted and is the send target", async () => {
+            const perch = new FakePerch();
+            const restored = perch.session();
+            const { terminal } = fake_terminal();
+            perch.open = [{ session: restored, terminal }];
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            assert.strictEqual(perch_session_of(terminal), restored.id);
+            assert.strictEqual(console_socket_of(terminal), path.join(restored.dir, 'ipc'));
+            assert.strictEqual(await get_or_create_terminal_for('raven'), terminal);
+            assert.strictEqual(perch.launches.length, 0);
+        });
+
+        test("Raven's own new consoles and its terminal profile stay ordinary, with no reattach offer", async () => {
+            const perch = new FakePerch();
+            perch.listed = [perch.session({ attached: false, attachedHere: false })];
+            _set_reattach_picker_for_test(async () => assert.fail('no reattach offer in a local window'));
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+
+            const terminal = await get_or_create_terminal_for('raven');
+            assert.strictEqual(perch_session_of(terminal), undefined);
+            const profile = await _provide_r_terminal_profile_for_test();
+            assert.strictEqual((profile.options as vscode.TerminalOptions).shellPath, 'raven');
+            assert.strictEqual(perch.launches.length, 0);
+        });
+
+        test('a lookup that never settles delays neither a new console nor the terminal profile', async () => {
+            const perch = new FakePerch();
+            perch.available = () => new Promise<boolean>(() => undefined);
+            void _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            const deadline = new Promise<'waited'>((r) => setTimeout(() => r('waited'), 2000));
+
+            const terminal = await Promise.race([get_or_create_terminal_for('R'), deadline]);
+            assert.notStrictEqual(terminal, 'waited', 'a new console waited for Perch');
+            assert.strictEqual(perch_session_of(terminal as vscode.Terminal), undefined);
+            const profile = await Promise.race([_provide_r_terminal_profile_for_test(), deadline]);
+            assert.notStrictEqual(profile, 'waited', 'the terminal profile waited for Perch');
+        });
+
+        test("a console from Perch's list that never starts delays no other console", async () => {
+            const perch = new FakePerch();
+            perch.waitForSession = () => new Promise<SessionInfo>(() => undefined);
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            void new_console_in_perch();
+            await until(() => perch.launches.length === 1, 'launch started');
+            const deadline = new Promise<'waited'>((r) => setTimeout(() => r('waited'), 2000));
+            const terminal = await Promise.race([get_or_create_terminal_for('R'), deadline]);
+            assert.notStrictEqual(terminal, 'waited', "a new console waited for the list's launch");
+        });
+
+        test("Perch's list starts a console in a new session, which becomes the send target", async () => {
+            const perch = new FakePerch();
+            perch.listed = [perch.session({ attached: false, attachedHere: false })];
+            _set_reattach_picker_for_test(async () => assert.fail('the launcher never offers to reattach'));
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            const ordinary = await get_or_create_terminal_for('raven');
+            _set_server_path_for_test(() => '/opt/raven/bin/raven');
+
+            await new_console_in_perch();
+            assert.strictEqual(perch.launches.length, 1);
+            assert.deepStrictEqual(perch.launches[0].annotations, { 'raven.program': 'raven', 'raven.console': 'ipc' });
+            const target = await resolve_send_target();
+            assert.ok(target?.kind === 'terminal');
+            assert.notStrictEqual(target.terminal, ordinary);
+            const id = perch_session_of(target.terminal);
+            assert.ok(id, 'the send target runs in a Perch session');
+            assert.strictEqual(console_socket_of(target.terminal), path.join(perch.root, id, 'ipc'));
+            assert.deepStrictEqual(infos, [], 'a console started here has its plots');
+        });
+
+        test('a program with no console socket started from the list gets sends through Perch', async () => {
+            const perch = new FakePerch();
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            const config = vscode.workspace.getConfiguration('raven.rTerminal');
+            const before = config.inspect<string>('program')?.globalValue;
+            await config.update('program', 'R', vscode.ConfigurationTarget.Global);
+            try {
+                await new_console_in_perch();
+                const target = await resolve_send_target();
+                assert.ok(target?.kind === 'terminal');
+                const id = perch_session_of(target.terminal);
+                assert.ok(id);
+                send_code(target.terminal, 'x <- 1', OPTIONS);
+                await until(() => perch.sends.length === 1, 'sent through Perch');
+                assert.strictEqual(perch.sends[0].id, id);
+            } finally {
+                await config.update('program', before, vscode.ConfigurationTarget.Global);
+            }
+        });
+    });
+
+    suite("Perch's list", () => {
+        test('rejects when Perch is not usable', async () => {
+            await _connect_perch_for_r_terminals_for_test(deps_for(undefined, { remote: false }));
+            await assert.rejects(new_console_in_perch(), /^Error: Perch is not available here\.$/);
+
+            const perch = new FakePerch();
+            perch.is_available = false;
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, { remote: false }));
+            await assert.rejects(new_console_in_perch(), /Perch is not available here/);
+
+            await _connect_perch_for_r_terminals_for_test(deps_for(new FakePerch(), { reachable: false }));
+            await assert.rejects(new_console_in_perch(), /Perch is not available here/, 'remote window, Raven forced to UI');
+        });
+
+        test('waits a bounded time for the lookup', async () => {
+            const perch = new FakePerch();
+            perch.available = () => new Promise<boolean>(() => undefined);
+            void _connect_perch_for_r_terminals_for_test(deps_for(perch, { remote: false }));
+            await assert.rejects(new_console_in_perch(50), /Perch is not available here/);
+        });
+
+        test('waits for a lookup in progress', async () => {
+            const perch = new FakePerch();
+            let answer: (yes: boolean) => void = () => undefined;
+            perch.available = () => new Promise<boolean>((resolve) => { answer = resolve; });
+            void _connect_perch_for_r_terminals_for_test(deps_for(perch, { remote: false }));
+            const starting = new_console_in_perch();
+            await new Promise((r) => setTimeout(r, 20));
+            answer(true);
+            await starting;
+            assert.strictEqual(perch.launches.length, 1);
+        });
+
+        test('rejects with the reason when the session does not start', async () => {
+            const perch = new FakePerch();
+            perch.waitForSession = async () => { throw new Error('the program exited'); };
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, { remote: false }));
+            await assert.rejects(new_console_in_perch(), /didn't start in a Perch session \(the program exited\)/);
+        });
+
+        test('cancelling the console picker cancels', async () => {
+            const perch = new FakePerch();
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, { remote: false }));
+            const config = vscode.workspace.getConfiguration('raven.rTerminal');
+            const before = config.inspect<string>('program')?.globalValue;
+            await config.update('program', 'ask', vscode.ConfigurationTarget.Global);
+            _set_picker_for_test(async () => undefined);
+            try {
+                await assert.rejects(new_console_in_perch(), vscode.CancellationError);
+                assert.strictEqual(perch.launches.length, 0);
+            } finally {
+                _set_picker_for_test(null);
+                await config.update('program', before, vscode.ConfigurationTarget.Global);
+            }
+        });
+
+        test('the command is registered, and says so when Perch is absent', async () => {
+            // The extension under test runs in a local window without Perch.
+            await assert.rejects(
+                Promise.resolve(vscode.commands.executeCommand('raven.perch.newConsole')),
+                /Perch is not available here/,
+            );
+        });
+
+        test('remote window: the list starts a session too, without a reattach offer', async () => {
+            const perch = new FakePerch();
+            perch.listed = [perch.session({ attached: false, attachedHere: false })];
+            _set_reattach_picker_for_test(async () => assert.fail('the launcher never offers to reattach'));
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch));
+            await new_console_in_perch();
+            assert.strictEqual(perch.launches.length, 1);
         });
     });
 
