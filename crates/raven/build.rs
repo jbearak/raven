@@ -18,7 +18,21 @@ fn main() {
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         // Let the dlopen'ed libR resolve system() to the console's wrapper.
-        println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic-symbol=system");
+        // zig's linker (cargo-zigbuild, which links the Linux release builds)
+        // rejects --export-dynamic-symbol and --dynamic-list, but it exports
+        // an executable's symbols that a version script declares global.
+        let zig = std::env::var("RUSTC_LINKER").is_ok_and(|linker| linker.contains("zigcc"));
+        if zig {
+            let script =
+                std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("export-system.map");
+            std::fs::write(&script, "{\n  global: system;\n};\n").unwrap();
+            println!(
+                "cargo:rustc-link-arg-bins=-Wl,--version-script={}",
+                script.display()
+            );
+        } else {
+            println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic-symbol=system");
+        }
     }
     if windows && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // R (4.2+) takes its native encoding from the process's active code
