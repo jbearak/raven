@@ -14,8 +14,7 @@ set -euo pipefail
 #
 # Every odd minor up to 0.21 shipped as stable before this scheme existed, so
 # 0.0 through 0.21 stay stable (a 0.21.x hotfix is still a stable release).
-# The scheme starts with the 0.23.0 pre-release and the 0.24.0 stable release;
-# 0.22 is skipped.
+# The first pre-release under the scheme is 0.23.0.
 #
 # Exits non-zero for versions the Marketplace would reject (e.g. 1.0.0-beta.1).
 # Shared by scripts/bump-version.sh and the release workflows so they cannot

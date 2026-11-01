@@ -12,7 +12,7 @@ In VS Code, open the Extensions view, search for **Raven**, and install **Raven*
 
 The extension includes the language server, so there is nothing else to install. Using Neovim, Zed, Helix, or Emacs instead? Follow [Editor setup](editor-integrations.md), then come back to step 2.
 
-To try new features before a stable release, open Raven in the Extensions view and click **Switch to Pre-Release Version**. Pre-releases have an odd minor version (0.23, 0.25) and stable releases an even one. On a remote host, such as over SSH, switch the copy installed on that host.
+To try new features before a stable release, open Raven in the Extensions view and click **Switch to Pre-Release Version**. Starting with 0.23, pre-releases have an odd minor version (0.23, 0.25) and stable releases an even one. On a remote host, such as over SSH, switch the copy installed on that host.
 
 ## 2. Make two files
 
