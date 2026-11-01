@@ -30,6 +30,8 @@ type ConsoleTerminal = {
     launched_ms: number;
     /** The socket never appeared: the console fell back to plain R. */
     fell_back: boolean;
+    /** Raven made the socket's directory and removes it with the terminal. */
+    owns_dir: boolean;
 };
 
 const terminal_sockets = new WeakMap<vscode.Terminal, ConsoleTerminal>();
@@ -122,20 +124,29 @@ export function make_console_socket_path(): string {
     return path.join(dir, 's');
 }
 
-export function register_console_terminal(terminal: vscode.Terminal, socket_path: string): void {
-    terminal_sockets.set(terminal, { socket: socket_path, launched_ms: Date.now(), fell_back: false });
+/**
+ * `owns_dir: false` is for a console in a Perch session: its socket lives in
+ * the session directory, which outlives the terminal (closing a Perch
+ * terminal only detaches) and which Perch removes when the session ends.
+ */
+export function register_console_terminal(
+    terminal: vscode.Terminal,
+    socket_path: string,
+    { owns_dir = true }: { owns_dir?: boolean } = {},
+): void {
+    terminal_sockets.set(terminal, { socket: socket_path, launched_ms: Date.now(), fell_back: false, owns_dir });
     live_consoles.set(terminal, socket_path);
     for (const l of console_listeners) l(terminal, socket_path);
 }
 
-/** Remove the socket's directory once its terminal is gone. */
+/** Forget a closed terminal's console, removing the socket's directory if Raven made it. */
 export function forget_console_terminal(terminal: vscode.Terminal): void {
     live_consoles.delete(terminal);
     const entry = terminal_sockets.get(terminal);
     if (!entry) return;
     send_gates.delete(entry.socket);
     terminal_sockets.delete(terminal);
-    fs.rm(path.dirname(entry.socket), { recursive: true, force: true }, () => undefined);
+    if (entry.owns_dir) fs.rm(path.dirname(entry.socket), { recursive: true, force: true }, () => undefined);
 }
 
 /**

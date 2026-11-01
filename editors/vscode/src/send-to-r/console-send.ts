@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { SendLocation } from './console-ipc';
 import { REDITORSUPPORT_EXTENSION_ID } from './console-picker';
 import { resolve_send_target, SendTarget } from './r-terminal-manager';
+import { type_into } from './perch';
 import { get_send_options, send_code } from './send-code';
 
 /**
@@ -66,7 +67,7 @@ export async function deliver_to_target(
     if (target.kind === 'vscode-r') return send_to_vscode_r(code);
     target.terminal.show(true);
     if (options.how === 'text') {
-        target.terminal.sendText(code);
+        type_into(target.terminal, code);
     } else {
         send_code(target.terminal, code, get_send_options(), options.location);
     }
