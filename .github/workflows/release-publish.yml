@@ -27,6 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag_sha: ${{ steps.tag_sha.outputs.sha }}
+      channel: ${{ steps.channel.outputs.channel }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -38,6 +39,16 @@ jobs:
             echo "ERROR: Tag must match format v*.*.* (e.g., v0.1.0)"
             exit 1
           fi
+
+      # Same classification release-build.yml used when it packaged the VSIX.
+      - name: Determine release channel
+        id: channel
+        run: |
+          channel=$(./scripts/release-channel.sh "$TAG")
+          echo "Release channel for $TAG: $channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ inputs.tag }}
 
       - name: Validate tag exists
         run: |
@@ -172,6 +183,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag }}
           name: Release ${{ inputs.tag }}
+          prerelease: ${{ needs.validate.outputs.channel == 'pre-release' }}
           files: |
             lsp-artifacts/**/*.zip
             lsp-artifacts/**/*.zip.sha256
@@ -202,15 +214,22 @@ jobs:
       - name: Install vsce and ovsx
         run: npm install -g @vscode/vsce@3.9.2 ovsx@0.10.9
 
+      # See the matching step in release-build.yml for why only vsce gets
+      # `--pre-release`.
       - name: Publish to VS Code Marketplace
         run: |
           shopt -s globstar
+          pre_release=()
+          if [ "$RELEASE_CHANNEL" = "pre-release" ]; then
+            pre_release=(--pre-release)
+          fi
           for vsix in vscode-artifacts/**/*.vsix; do
-            echo "Publishing $vsix to VS Code Marketplace..."
-            vsce publish --skip-duplicate --packagePath "$vsix"
+            echo "Publishing $vsix to VS Code Marketplace ($RELEASE_CHANNEL)..."
+            vsce publish --skip-duplicate "${pre_release[@]}" --packagePath "$vsix"
           done
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          RELEASE_CHANNEL: ${{ needs.validate.outputs.channel }}
 
       - name: Publish to Open VSX
         continue-on-error: true

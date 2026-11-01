@@ -16,12 +16,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Classify the tag as a stable or pre-release (odd minor) release before any
+  # other work, and reject versions the VS Code Marketplace would refuse.
+  # scripts/release-channel.sh documents the versioning scheme.
+  release-channel:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Determine release channel
+        id: channel
+        run: |
+          channel=$(./scripts/release-channel.sh "$GITHUB_REF_NAME")
+          echo "Release channel for $GITHUB_REF_NAME: $channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
   # Release preflight: tags never use path-based skipping. Fetch and verify the
   # pinned official-model holdout, validate Stan models with the development-time
   # compiler oracle, and run Raven's ignored external diagnostic suite before any
   # platform build can start.
   external-diagnostic-corpora:
     name: External Diagnostic Corpora
+    needs: release-channel
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -203,7 +221,7 @@ jobs:
           retention-days: 30
 
   build-vscode:
-    needs: build-lsp
+    needs: [release-channel, build-lsp]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -272,10 +290,17 @@ jobs:
           # into bin/. `vsce package` runs copy-binary, which must preserve it
           # rather than compare it against any host target/release build.
           RAVEN_BUNDLE_PREPLACED: '1'
+          RELEASE_CHANNEL: ${{ needs.release-channel.outputs.channel }}
         run: |
           cd editors/vscode
           npm run copy-notice
-          vsce package --target ${{ matrix.target }}
+          # The pre-release marker lives in the VSIX manifest; the Marketplace
+          # and Open VSX both read it from there at publish time.
+          if [ "$RELEASE_CHANNEL" = "pre-release" ]; then
+            vsce package --target ${{ matrix.target }} --pre-release
+          else
+            vsce package --target ${{ matrix.target }}
+          fi
 
       - name: Attest build provenance (VSIX)
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -300,7 +325,7 @@ jobs:
   #   2. "marketplace"  – add yourself as a required reviewer
 
   github-release:
-    needs: [build-lsp, build-vscode]
+    needs: [release-channel, build-lsp, build-vscode]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -340,6 +365,9 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
+          # Pre-releases never become GitHub's "latest" release, so installers
+          # that resolve releases/latest (setup-raven, docs) keep getting stable.
+          prerelease: ${{ needs.release-channel.outputs.channel == 'pre-release' }}
           files: |
             lsp-artifacts/**/*.zip
             lsp-artifacts/**/*.zip.sha256
@@ -350,7 +378,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-marketplace:
-    needs: github-release
+    needs: [release-channel, github-release]
     runs-on: ubuntu-latest
     environment: marketplace
     permissions: {}
@@ -370,14 +398,22 @@ jobs:
       - name: Install vsce and ovsx
         run: npm install -g @vscode/vsce@3.9.2 ovsx@0.10.9
 
+      # The channel comes from the VSIX manifest. `--pre-release` here only makes
+      # vsce refuse a VSIX that was not packaged as a pre-release. ovsx ignores
+      # the flag for prepackaged extensions, so Open VSX gets no flag.
       - name: Publish to VS Code Marketplace
         run: |
+          pre_release=()
+          if [ "$RELEASE_CHANNEL" = "pre-release" ]; then
+            pre_release=(--pre-release)
+          fi
           for vsix in $(find vscode-artifacts -name '*.vsix' | sort); do
-            echo "Publishing $vsix to VS Code Marketplace..."
-            vsce publish --skip-duplicate --packagePath "$vsix"
+            echo "Publishing $vsix to VS Code Marketplace ($RELEASE_CHANNEL)..."
+            vsce publish --skip-duplicate "${pre_release[@]}" --packagePath "$vsix"
           done
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          RELEASE_CHANNEL: ${{ needs.release-channel.outputs.channel }}
 
       - name: Publish to Open VSX
         continue-on-error: true
@@ -422,9 +458,10 @@ jobs:
   #   gh variable set ENABLE_APT_BUMP -R jbearak/raven --body true
   # APT_REPO_TOKEN: a GitHub App installation token or fine-grained PAT scoped
   # to jbearak/apt-raven with Contents:write + Pull requests:write.
+  # Pre-releases are skipped: apt users only follow the stable channel.
   bump-apt:
-    needs: github-release
-    if: vars.ENABLE_APT_BUMP == 'true' && !contains(github.ref_name, '-')
+    needs: [release-channel, github-release]
+    if: vars.ENABLE_APT_BUMP == 'true' && needs.release-channel.outputs.channel == 'stable'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -575,10 +612,11 @@ jobs:
   #   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/raven --body true
   # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
   # scoped to jbearak/homebrew-raven with Contents:write + Pull requests:write.
-  # The `if` guard keeps this job from failing on releases cut before setup.
+  # The `if` guard keeps this job from failing on releases cut before setup,
+  # and skips pre-releases: Homebrew users only follow the stable channel.
   bump-homebrew:
-    needs: github-release
-    if: vars.ENABLE_HOMEBREW_BUMP == 'true'
+    needs: [release-channel, github-release]
+    if: vars.ENABLE_HOMEBREW_BUMP == 'true' && needs.release-channel.outputs.channel == 'stable'
     runs-on: ubuntu-latest
     environment: release
     permissions:

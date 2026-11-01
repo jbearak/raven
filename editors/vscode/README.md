@@ -33,6 +33,8 @@ Raven knows `clean_names` came from `helpers.R`, so it doesn't flag it. It flags
 
 Open a folder with R files. Raven starts automatically and needs nothing else installed: the language server ships with the extension, and R is only needed for the console, debugger, and viewers. [Getting started](https://github.com/jbearak/raven/blob/main/docs/getting-started.md) walks through a first example in two minutes.
 
+To try new features early, click **Switch to Pre-Release Version** on this extension's page. Starting with 0.23, pre-releases have an odd minor version (0.23, 0.25) and stable releases an even one.
+
 <a id="features"></a><a id="code-intelligence"></a>
 ## What you get
 
