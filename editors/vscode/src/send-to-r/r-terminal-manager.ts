@@ -103,8 +103,8 @@ const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
  */
 const launched_here = new Map<string, { program: TerminalProgram; plot_session_id?: string }>();
 let stale_plots_notice_shown = false;
-// Perch terminals (from the profile or Perch's list) whose session hasn't
-// been reported yet; a new console waits for them rather than start a second.
+// Perch profile terminals VS Code has opened whose session hasn't been
+// reported yet; a new console waits for them rather than start a second one.
 const perch_profiles_starting = new Set<Promise<void>>();
 
 // What the user picked this session; beats the setting. In memory only.
@@ -941,13 +941,9 @@ export async function new_console_in_perch(lookup_ms = PERCH_LAUNCHER_LOOKUP_MS)
     } catch (err) {
         throw new Error(`Perch couldn't start the R console (${err instanceof Error ? err.message : String(err)}).`);
     }
-    const opening = open_perch_terminal(api, launch);
-    const starting = opening.then(() => undefined, () => undefined);
-    perch_profiles_starting.add(starting);
-    void starting.finally(() => perch_profiles_starting.delete(starting));
     let terminal: vscode.Terminal;
     try {
-        terminal = await opening;
+        terminal = await open_perch_terminal(api, launch);
     } catch (err) {
         throw new Error(`The R console didn't start in a Perch session (${err instanceof Error ? err.message : String(err)}).`);
     }

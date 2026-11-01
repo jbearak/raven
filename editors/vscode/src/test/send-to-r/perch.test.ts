@@ -419,6 +419,17 @@ suite('R consoles in Perch sessions', () => {
             assert.notStrictEqual(profile, 'waited', 'the terminal profile waited for Perch');
         });
 
+        test("a console from Perch's list that never starts delays no other console", async () => {
+            const perch = new FakePerch();
+            perch.waitForSession = () => new Promise<SessionInfo>(() => undefined);
+            await _connect_perch_for_r_terminals_for_test(deps_for(perch, local));
+            void new_console_in_perch();
+            await until(() => perch.launches.length === 1, 'launch started');
+            const deadline = new Promise<'waited'>((r) => setTimeout(() => r('waited'), 2000));
+            const terminal = await Promise.race([get_or_create_terminal_for('R'), deadline]);
+            assert.notStrictEqual(terminal, 'waited', "a new console waited for the list's launch");
+        });
+
         test("Perch's list starts a console in a new session, which becomes the send target", async () => {
             const perch = new FakePerch();
             perch.listed = [perch.session({ attached: false, attachedHere: false })];
