@@ -6,11 +6,19 @@ import { as_typed, is_ended, PERCH_EXTENSION_ID, RAVEN_CALLER_ID } from './perch
  * R consoles in Perch sessions (github.com/jbearak/perch, API v1), which
  * survive a closed window or a dropped connection.
  *
- * Raven uses Perch for a new console only in a remote window, only when
- * Raven itself runs in the remote (workspace) extension host, and only when
- * Perch is installed there and `available()`. Anything else, including any
- * error while looking Perch up, keeps the ordinary terminal path. Installing
- * Perch on the remote host is the switch; there is no setting.
+ * Two questions, answered separately:
+ * - Can Raven use Perch here? Perch must be installed, answer, and be
+ *   `available()`, and its API must reach Raven: a local window, or a remote
+ *   one where Raven runs in the remote (workspace) extension host. Then Raven
+ *   connects, adopts its Perch terminals in this window, and starts a console
+ *   from Perch's list (`new_console_in_perch` in `r-terminal-manager.ts`).
+ * - Do Raven's own new consoles go to Perch? Only in a remote window where
+ *   Perch is usable. In a local window, Raven's own consoles, its terminal
+ *   profile, and its sends stay ordinary terminals and never wait for Perch;
+ *   only consoles started from Perch's list, and those Perch restores, run in
+ *   sessions there.
+ * Anything else, including any error while looking Perch up, keeps the
+ * ordinary terminal path. Installing Perch is the switch; there is no setting.
  *
  * Invariants:
  * - Only sessions with a Perch terminal in this window are automatic send
@@ -23,47 +31,55 @@ import { as_typed, is_ended, PERCH_EXTENSION_ID, RAVEN_CALLER_ID } from './perch
  *   `outcome_unknown`.
  */
 
+/** Where Raven runs, as far as Perch is concerned. */
+export type PerchHost = {
+    /** A remote window (SSH, WSL, a container, a tunnel). */
+    remote: boolean;
+    /** Perch's API can reach Raven here. */
+    reachable: boolean;
+};
+
 /** Where Raven runs and how it finds Perch; replaced in tests. */
 export type PerchDeps = {
-    /** True in a remote window when Raven runs in the remote extension host. */
-    in_remote_workspace_host: () => boolean;
+    host: () => PerchHost;
     get_extension: () => vscode.Extension<PerchExports | undefined> | undefined;
 };
 
 /**
  * Test-only: makes a local window count as a remote one, so an end-to-end
- * test can load Perch next to Raven without a remote. Never set by users.
+ * test can exercise the remote behavior without a remote. Never set by users.
  */
 const TREAT_AS_REMOTE_ENV = 'RAVEN_TEST_PERCH_TREAT_AS_REMOTE';
 
 /**
- * Whether Raven runs in a remote window's workspace extension host, where
- * Perch's API can reach it. A user's `remote.extensionKind` override can run
- * Raven as a UI extension in a remote window; then Perch is out of reach.
+ * Where Raven runs. In a local window every extension shares one host, so
+ * Perch's API reaches Raven. In a remote window it does only when Raven runs
+ * in the workspace extension host, next to Perch; a user's
+ * `remote.extensionKind` override can run Raven as a UI extension there.
  */
-export function is_remote_workspace_host(
+export function perch_host(
     remote_name: string | undefined,
     extension_kind: vscode.ExtensionKind,
     env: Readonly<Record<string, string | undefined>>,
-): boolean {
-    if (env[TREAT_AS_REMOTE_ENV] === '1') return true;
-    return remote_name !== undefined && extension_kind === vscode.ExtensionKind.Workspace;
+): PerchHost {
+    if (env[TREAT_AS_REMOTE_ENV] === '1') return { remote: true, reachable: true };
+    if (remote_name === undefined) return { remote: false, reachable: true };
+    return { remote: true, reachable: extension_kind === vscode.ExtensionKind.Workspace };
 }
 
 export function default_perch_deps(context: vscode.ExtensionContext): PerchDeps {
     return {
-        in_remote_workspace_host: () =>
-            is_remote_workspace_host(vscode.env.remoteName, context.extension.extensionKind, process.env),
+        host: () => perch_host(vscode.env.remoteName, context.extension.extensionKind, process.env),
         get_extension: () => vscode.extensions.getExtension<PerchExports | undefined>(PERCH_EXTENSION_ID),
     };
 }
 
 /**
- * Perch's API if Raven should use it for new consoles, else undefined.
+ * Perch's API if Raven can use it here, else undefined.
  * Never rejects: a Perch that fails to activate or answer means "no Perch".
  */
 export async function find_perch(deps: PerchDeps): Promise<PerchApiV1 | undefined> {
-    if (!deps.in_remote_workspace_host()) return undefined;
+    if (!deps.host().reachable) return undefined;
     const ext = deps.get_extension();
     if (ext === undefined) return undefined;
     try {
@@ -160,21 +176,51 @@ async function look_up_perch(): Promise<void> {
     }
 }
 
-/**
- * Settles when the latest lookup has, including adopting the Raven
- * terminals Perch already has open in this window.
- */
-export function perch_lookup_settled(): Promise<void> {
-    return lookup;
+/** True in a remote window; false before activation. Never waits. */
+function in_remote_window(): boolean {
+    return deps?.host().remote ?? false;
 }
 
 /**
- * Perch's API for a new console, or undefined for an ordinary terminal.
- * Without Perch next to Raven, the lookup settles at once.
+ * Settles when the latest lookup has, including adopting the Raven
+ * terminals Perch already has open in this window, so a new console doesn't
+ * duplicate one. In a local window it settles at once: Raven's own consoles
+ * never wait for Perch there, and Perch's terminals join through
+ * `onDidAttach` whenever the lookup ends.
+ */
+export function perch_lookup_settled(): Promise<void> {
+    return in_remote_window() ? lookup : Promise.resolve();
+}
+
+/**
+ * Perch's API for one of Raven's own new consoles, or undefined for an
+ * ordinary terminal. Undefined at once in a local window; in a remote one,
+ * waits for the lookup, which settles at once without Perch next to Raven.
  */
 export async function perch_for_new_console(): Promise<PerchApiV1 | undefined> {
+    if (!in_remote_window()) return undefined;
     await lookup;
     return current;
+}
+
+/**
+ * Perch's API if Raven can use it here, waiting up to `timeout_ms` for the
+ * lookup (and any lookup started meanwhile). For a console the user asked
+ * Perch for, in any window.
+ */
+export async function usable_perch(timeout_ms: number): Promise<PerchApiV1 | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timed_out = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), timeout_ms);
+    });
+    try {
+        for (;;) {
+            const awaited = lookup;
+            if ((await Promise.race([awaited, timed_out])) === 'timeout' || lookup === awaited) return current;
+        }
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 export function track_perch_terminal(terminal: vscode.Terminal, id: string, api: PerchApiV1): void {

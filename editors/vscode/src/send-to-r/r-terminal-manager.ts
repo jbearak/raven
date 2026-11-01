@@ -39,6 +39,7 @@ import {
     _connect_perch_for_test,
     perch_for_new_console,
     perch_lookup_settled,
+    usable_perch,
     perch_session_of,
     perch_sessions_open_here,
     PerchDeps,
@@ -70,9 +71,10 @@ import {
  * merely was active more recently.
  *
  * In a remote window with Perch installed next to Raven, new R terminals run
- * in Perch sessions, which survive a closed window or dropped connection;
- * see `perch.ts` for when and the invariants. A Perch terminal is managed
- * like any other while it is open in this window.
+ * in Perch sessions, which survive a closed window or dropped connection. In
+ * any window with Perch, Perch's list of new terminals can start one too
+ * (`new_console_in_perch`). See `perch.ts` for when and the invariants. A
+ * Perch terminal is managed like any other while it is open in this window.
  */
 
 const PROFILE_ID = 'raven.rTerminal';
@@ -101,8 +103,8 @@ const terminal_to_session_id = new WeakMap<vscode.Terminal, string>();
  */
 const launched_here = new Map<string, { program: TerminalProgram; plot_session_id?: string }>();
 let stale_plots_notice_shown = false;
-// Perch profile terminals VS Code has opened whose session hasn't been
-// reported yet; a new console waits for them rather than start a second one.
+// Perch terminals (from the profile or Perch's list) whose session hasn't
+// been reported yet; a new console waits for them rather than start a second.
 const perch_profiles_starting = new Set<Promise<void>>();
 
 // What the user picked this session; beats the setting. In memory only.
@@ -676,6 +678,46 @@ function report_perch_start_failure(err: unknown): void {
     void vscode.window.showErrorMessage(`Raven: the R console didn't start in a Perch session (${message}).`);
 }
 
+/** The **R** terminal profile: Raven's console, or the chosen program. */
+async function provide_r_terminal_profile(token: vscode.CancellationToken): Promise<vscode.TerminalProfile> {
+    if (token.isCancellationRequested) {
+        throw new vscode.CancellationError();
+    }
+    const program = await resolve_profile_program();
+    if (token.isCancellationRequested) {
+        throw new vscode.CancellationError();
+    }
+    const plot_env = await get_plot_terminal_env();
+    if (token.isCancellationRequested) {
+        throw new vscode.CancellationError();
+    }
+    const perch_profile = await profile_in_perch(program, plot_env);
+    if (perch_profile) return perch_profile;
+    const launch = build_r_terminal_launch(program);
+    // VS Code opens this terminal itself; the id in its environment is
+    // how `handle_terminal_opened` recognizes it.
+    const id = crypto.randomUUID();
+    const profile = new vscode.TerminalProfile({
+        name: terminal_name_for(program),
+        shellPath: launch.shellPath,
+        shellArgs: launch.shellArgs,
+        env: { ...plot_env?.env, [TERMINAL_ID_ENV]: id },
+        isTransient: true,
+    });
+    pending_profiles.set(id, {
+        program,
+        consoleSocket: launch.consoleSocket,
+        sessionId: plot_env?.sessionId,
+        generatedAtMs: Date.now(),
+    });
+    return profile;
+}
+
+/** Test-only: what the **R** terminal profile would open now. */
+export function _provide_r_terminal_profile_for_test(): Promise<vscode.TerminalProfile> {
+    return provide_r_terminal_profile(new vscode.CancellationTokenSource().token);
+}
+
 export function register_r_terminal(
     context: vscode.ExtensionContext,
     services: PlotServices,
@@ -684,43 +726,7 @@ export function register_r_terminal(
     extension_context = context;
     plot_services = services;
     server_path_getter = get_server_path;
-    const provider: vscode.TerminalProfileProvider = {
-        async provideTerminalProfile(
-            token: vscode.CancellationToken
-        ): Promise<vscode.TerminalProfile> {
-            if (token.isCancellationRequested) {
-                throw new vscode.CancellationError();
-            }
-            const program = await resolve_profile_program();
-            if (token.isCancellationRequested) {
-                throw new vscode.CancellationError();
-            }
-            const plot_env = await get_plot_terminal_env();
-            if (token.isCancellationRequested) {
-                throw new vscode.CancellationError();
-            }
-            const perch_profile = await profile_in_perch(program, plot_env);
-            if (perch_profile) return perch_profile;
-            const launch = build_r_terminal_launch(program);
-            // VS Code opens this terminal itself; the id in its environment is
-            // how `handle_terminal_opened` recognizes it.
-            const id = crypto.randomUUID();
-            const profile = new vscode.TerminalProfile({
-                name: terminal_name_for(program),
-                shellPath: launch.shellPath,
-                shellArgs: launch.shellArgs,
-                env: { ...plot_env?.env, [TERMINAL_ID_ENV]: id },
-                isTransient: true,
-            });
-            pending_profiles.set(id, {
-                program,
-                consoleSocket: launch.consoleSocket,
-                sessionId: plot_env?.sessionId,
-                generatedAtMs: Date.now(),
-            });
-            return profile;
-        }
-    };
+    const provider: vscode.TerminalProfileProvider = { provideTerminalProfile: provide_r_terminal_profile };
 
     start_perch(context, perch_handlers);
     context.subscriptions.push(
@@ -894,16 +900,58 @@ async function create_perch_terminal(
         console.warn('raven: Perch could not prepare a session; using an ordinary terminal:', err);
         return undefined;
     }
-    const terminal = vscode.window.createTerminal(launch.options);
-    let session: SessionInfo;
     try {
-        session = await api.waitForSession(launch.id, terminal);
+        return await open_perch_terminal(api, launch);
     } catch (err) {
         report_perch_start_failure(err);
         throw err;
     }
+}
+
+/** Opens a prepared Perch launch; resolves once Perch reports it running. */
+async function open_perch_terminal(
+    api: PerchApiV1,
+    launch: { id: string; options: vscode.TerminalOptions },
+): Promise<vscode.Terminal> {
+    const terminal = vscode.window.createTerminal(launch.options);
+    const session = await api.waitForSession(launch.id, terminal);
     adopt_perch_terminal(session, terminal, api);
     return terminal;
+}
+
+/** How long a console asked for from Perch's list waits for the Perch lookup. */
+const PERCH_LAUNCHER_LOOKUP_MS = 5000;
+
+/**
+ * **New R console** in Perch's list of new terminals (Raven's
+ * `perch.launchers` entry), in any window: starts the program the terminal
+ * profile would (asking if no console is chosen) in a new Perch session, with
+ * no reattach offer, then shows it. Being the newest console of its program,
+ * it is where sends go. Resolves once the session runs; rejects with a
+ * message for the user, or `CancellationError` when the user cancels.
+ */
+export async function new_console_in_perch(lookup_ms = PERCH_LAUNCHER_LOOKUP_MS): Promise<void> {
+    const api = await usable_perch(lookup_ms);
+    if (!api) throw new Error('Perch is not available here.');
+    const program = await resolve_profile_program();
+    const plot_env = await get_plot_terminal_env();
+    let launch: { id: string; options: vscode.TerminalOptions };
+    try {
+        launch = prepare_perch_launch(api, program, plot_env);
+    } catch (err) {
+        throw new Error(`Perch couldn't start the R console (${err instanceof Error ? err.message : String(err)}).`);
+    }
+    const opening = open_perch_terminal(api, launch);
+    const starting = opening.then(() => undefined, () => undefined);
+    perch_profiles_starting.add(starting);
+    void starting.finally(() => perch_profiles_starting.delete(starting));
+    let terminal: vscode.Terminal;
+    try {
+        terminal = await opening;
+    } catch (err) {
+        throw new Error(`The R console didn't start in a Perch session (${err instanceof Error ? err.message : String(err)}).`);
+    }
+    terminal.show();
 }
 
 async function create_r_terminal(target: TerminalProgram): Promise<vscode.Terminal> {

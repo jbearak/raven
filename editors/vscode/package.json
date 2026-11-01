@@ -36,6 +36,16 @@
     "onDebugResolve:raven-r"
   ],
   "main": "./dist/extension.js",
+  "perch": {
+    "launchers": [
+      {
+        "label": "R console",
+        "description": "Raven",
+        "icon": "terminal",
+        "command": "raven.perch.newConsole"
+      }
+    ]
+  },
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
@@ -357,6 +367,11 @@
         "category": "Raven"
       },
       {
+        "command": "raven.perch.newConsole",
+        "title": "New R Console in Perch",
+        "category": "Raven"
+      },
+      {
         "command": "raven.debugger.inspectLastError",
         "title": "Inspect Last Error",
         "category": "Raven"
@@ -553,6 +568,10 @@
         },
         {
           "command": "raven.debugger.viewData",
+          "when": "false"
+        },
+        {
+          "command": "raven.perch.newConsole",
           "when": "false"
         }
       ],
