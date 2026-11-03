@@ -12,7 +12,7 @@ use tree_sitter::{Node, Tree};
 use super::binding::RuntimeFunctionScope;
 use super::scope::FunctionScopeInterval;
 use super::types::{
-    ForwardSource, ListFilesSourceRequest, SourceLocality, TarSourceRequest,
+    ForwardSource, ListFilesExtensions, ListFilesSourceRequest, SourceLocality, TarSourceRequest,
     TargetsPackageDeclaration, byte_offset_to_utf16_column,
 };
 
@@ -41,6 +41,20 @@ pub(crate) struct StaticScriptFacts {
 pub(crate) enum StaticPreludeEvent {
     Attach(LibraryCall),
     Source(ForwardSource),
+    /// A bounded `list.files()` source loop. The closure walker expands it
+    /// against the filesystem into ordered `Source` events at this position.
+    SourceBatch(ListFilesSourceRequest),
+}
+
+impl StaticPreludeEvent {
+    /// Source position used to replay events in execution order.
+    pub(crate) fn position(&self) -> (u32, u32) {
+        match self {
+            Self::Attach(call) => (call.line, call.column),
+            Self::Source(source) => (source.line, source.column),
+            Self::SourceBatch(request) => (request.line, request.column),
+        }
+    }
 }
 
 impl StaticScriptFacts {
@@ -54,6 +68,8 @@ impl StaticScriptFacts {
         let attaching_calls =
             top_level_attaching_library_calls_with_bindings(&tree, text, &mut bindings);
         let source_events = static_source_events_with_bindings(&tree, text, &mut bindings);
+        let batch_events =
+            detect_list_files_source_requests_with_bindings(tree.root_node(), text, &mut bindings);
         #[cfg(test)]
         let source_targets = source_events
             .iter()
@@ -64,11 +80,13 @@ impl StaticScriptFacts {
             .cloned()
             .map(StaticPreludeEvent::Attach)
             .chain(source_events.into_iter().map(StaticPreludeEvent::Source))
+            .chain(
+                batch_events
+                    .into_iter()
+                    .map(StaticPreludeEvent::SourceBatch),
+            )
             .collect();
-        prelude_events.sort_by_key(|event| match event {
-            StaticPreludeEvent::Attach(call) => (call.line, call.column),
-            StaticPreludeEvent::Source(source) => (source.line, source.column),
-        });
+        prelude_events.sort_by_key(|event| event.position());
         let attached_packages =
             replay_static_attaching_calls(attaching_calls, &std::collections::BTreeSet::new());
         Self {
@@ -3216,16 +3234,30 @@ pub(crate) fn detect_library_and_tar_source_requests(
     )
 }
 
-/// Detect the deliberately bounded directory-source idiom:
+/// Detect the deliberately bounded directory-source idiom, in either form:
 ///
 /// ```r
 /// files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
 /// for (file in files) source(file)
+///
+/// for (file in list.files(file.path("..", "..", "R"), pattern = "[.]R$", full.names = TRUE)) {
+///   source(file)
+/// }
 /// ```
 ///
-/// The assignment and loop must be adjacent executable top-level statements.
-/// This keeps evaluation order, helper shadowing, and the sequence binding
+/// In the two-statement form the assignment and loop must be adjacent
+/// executable top-level statements; in the inline form `list.files()` is the
+/// loop's own sequence, which R evaluates once before the first iteration.
+/// Either way evaluation order, helper shadowing, and the sequence binding stay
 /// syntax-local; filesystem enumeration remains a detached later phase.
+///
+/// The directory folds exactly like a `source()` path
+/// (`static_path::fold_string_expr`), so `file.path()` of fixed parts and a
+/// `normalizePath()` wrapper are accepted and anything dynamic fails closed.
+/// A directory held in a variable also fails closed: the loop's own
+/// unknown-mutation barrier invalidates single-assignment candidates
+/// file-wide. The pattern must be one of the spellings
+/// `ListFilesExtensions::from_pattern_literal` recognizes.
 pub fn detect_list_files_source_requests(
     tree: &Tree,
     content: &str,
@@ -3235,10 +3267,10 @@ pub fn detect_list_files_source_requests(
     detect_list_files_source_requests_with_bindings(root, content, &mut bindings)
 }
 
-fn detect_list_files_source_requests_with_bindings(
-    root: Node,
+fn detect_list_files_source_requests_with_bindings<'tree>(
+    root: Node<'tree>,
     content: &str,
-    bindings: &mut super::static_path::LazyStaticBindings,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, '_>,
 ) -> Vec<ListFilesSourceRequest> {
     if !content.contains("list.files") || !content.contains("source") {
         return Vec::new();
@@ -3248,19 +3280,39 @@ fn detect_list_files_source_requests_with_bindings(
         .named_children(&mut cursor)
         .filter(|node| node.kind() != "comment")
         .collect();
-    statements
-        .windows(2)
-        .filter_map(|pair| parse_list_files_source_pair(pair[0], pair[1], content, bindings))
-        .collect()
+    let mut requests = Vec::new();
+    for (index, &statement) in statements.iter().enumerate() {
+        if statement.kind() != "for_statement" {
+            continue;
+        }
+        let Some(sequence) = statement.child_by_field_name("sequence") else {
+            continue;
+        };
+        let listing = if sequence.kind() == "call" {
+            parse_bounded_list_files_call(sequence, content, bindings)
+        } else {
+            index.checked_sub(1).and_then(|previous| {
+                parse_list_files_assignment(statements[previous], sequence, content, bindings)
+            })
+        };
+        if let Some((directory, extensions)) = listing
+            && let Some(request) =
+                parse_bounded_source_loop(statement, directory, extensions, content, bindings)
+        {
+            requests.push(request);
+        }
+    }
+    requests
 }
 
-fn parse_list_files_source_pair(
-    assignment: Node,
-    loop_node: Node,
+/// Parse `name <- list.files(...)` when `name` is exactly the loop's sequence.
+fn parse_list_files_assignment<'tree>(
+    assignment: Node<'tree>,
+    sequence: Node<'tree>,
     content: &str,
-    bindings: &mut super::static_path::LazyStaticBindings,
-) -> Option<ListFilesSourceRequest> {
-    if assignment.kind() != "binary_operator" || loop_node.kind() != "for_statement" {
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, '_>,
+) -> Option<(String, ListFilesExtensions)> {
+    if assignment.kind() != "binary_operator" {
         return None;
     }
     let operator = assignment.child_by_field_name("operator")?;
@@ -3269,14 +3321,21 @@ fn parse_list_files_source_pair(
     }
     let assigned_name =
         super::binding::plain_identifier_name(assignment.child_by_field_name("lhs")?, content)?;
-    let sequence_name =
-        super::binding::plain_identifier_name(loop_node.child_by_field_name("sequence")?, content)?;
+    let sequence_name = super::binding::plain_identifier_name(sequence, content)?;
     if assigned_name != sequence_name {
         return None;
     }
-    let directory =
-        parse_bounded_list_files_call(assignment.child_by_field_name("rhs")?, content, bindings)?;
+    parse_bounded_list_files_call(assignment.child_by_field_name("rhs")?, content, bindings)
+}
 
+/// Accept a loop whose body is only `source(iterator)`, directly or braced.
+fn parse_bounded_source_loop(
+    loop_node: Node,
+    directory: String,
+    extensions: ListFilesExtensions,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<ListFilesSourceRequest> {
     let iterator =
         super::binding::plain_identifier_name(loop_node.child_by_field_name("variable")?, content)?;
     let body = loop_node.child_by_field_name("body")?;
@@ -3304,14 +3363,15 @@ fn parse_list_files_source_pair(
         directory,
         line: start.row as u32,
         column: byte_offset_to_utf16_column(line_text, start.column),
+        extensions,
     })
 }
 
-fn parse_bounded_list_files_call(
-    node: Node,
+fn parse_bounded_list_files_call<'tree>(
+    node: Node<'tree>,
     content: &str,
-    bindings: &mut super::static_path::LazyStaticBindings,
-) -> Option<String> {
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, '_>,
+) -> Option<(String, ListFilesExtensions)> {
     if node.kind() != "call" || node.has_error() {
         return None;
     }
@@ -3338,7 +3398,7 @@ fn parse_bounded_list_files_call(
 
     let arguments = node.child_by_field_name("arguments")?;
     let mut directory = None;
-    let mut pattern = None;
+    let mut extensions = None;
     let mut full_names = false;
     let mut cursor = arguments.walk();
     for argument in arguments.children(&mut cursor) {
@@ -3350,14 +3410,17 @@ fn parse_bounded_list_files_call(
             .child_by_field_name("name")
             .map(|name| node_text(name, content))
         {
-            None if directory.is_none() => {
-                directory = Some(extract_string_literal(value, content)?)
+            None | Some("path") if directory.is_none() => {
+                directory = Some(super::static_path::fold_string_expr(
+                    value,
+                    content,
+                    bindings.get(),
+                )?);
             }
-            Some("path") if directory.is_none() => {
-                directory = Some(extract_string_literal(value, content)?);
-            }
-            Some("pattern") if pattern.is_none() => {
-                pattern = Some(extract_string_literal(value, content)?);
+            Some("pattern") if extensions.is_none() => {
+                extensions = Some(ListFilesExtensions::from_pattern_literal(
+                    &extract_string_literal(value, content)?,
+                )?);
             }
             Some("full.names") if !full_names && node_text(value, content) == "TRUE" => {
                 full_names = true;
@@ -3365,10 +3428,10 @@ fn parse_bounded_list_files_call(
             _ => return None,
         }
     }
-    if pattern.as_deref() != Some(r"\\.R$") || !full_names {
+    if !full_names {
         return None;
     }
-    directory
+    Some((directory?, extensions?))
 }
 
 fn is_bounded_iterator_source_call(
@@ -3678,6 +3741,105 @@ mod tests {
         }
     }
 
+    /// The exact `tests/testthat/setup.R` loop from a non-package project:
+    /// `list.files()` as the loop's own sequence, a `[.]R$` pattern, and a
+    /// `file.path()` directory of literals.
+    #[test]
+    fn detects_inline_list_files_loop_with_file_path_directory() {
+        let code = r#"for (file in list.files(file.path("..", "..", "R"), pattern = "[.]R$", full.names = TRUE)) {
+  source(file)
+}
+"#;
+        let requests = list_files_requests(code);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].directory, "../../R");
+        assert_eq!(requests[0].line, 1);
+        assert_eq!(requests[0].column, 2);
+        assert_eq!(requests[0].extensions, ListFilesExtensions::UppercaseOnly);
+    }
+
+    #[test]
+    fn list_files_patterns_select_uppercase_or_either_case_extensions() {
+        for (pattern, expected) in [
+            (r#""\\.R$""#, ListFilesExtensions::UppercaseOnly),
+            (r#""[.]R$""#, ListFilesExtensions::UppercaseOnly),
+            (r#"'[.]R$'"#, ListFilesExtensions::UppercaseOnly),
+            (r#""\\.[Rr]$""#, ListFilesExtensions::EitherCase),
+            (r#""\\.[rR]$""#, ListFilesExtensions::EitherCase),
+            (r#""[.][Rr]$""#, ListFilesExtensions::EitherCase),
+        ] {
+            for code in [
+                format!(
+                    "files <- list.files(\"functions\", pattern = {pattern}, full.names = TRUE)\n\
+                     for (file in files) source(file)"
+                ),
+                format!(
+                    "for (file in list.files(\"functions\", pattern = {pattern}, full.names = TRUE)) source(file)"
+                ),
+            ] {
+                let requests = list_files_requests(&code);
+                assert_eq!(requests.len(), 1, "{code}: {requests:?}");
+                assert_eq!(requests[0].extensions, expected, "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_files_directory_folds_like_a_source_path() {
+        for (code, expected) in [
+            (
+                r#"for (f in list.files(normalizePath(file.path("..", "..", "R")), pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+                "../../R",
+            ),
+            (
+                r#"files <- list.files(file.path("..", "..", "R"), pattern = "[.]R$", full.names = TRUE)
+                   for (f in files) source(f)"#,
+                "../../R",
+            ),
+            (
+                r#"for (f in base::list.files(path = file.path("a", "b"), full.names = TRUE, pattern = "\\.R$")) base::source(f)"#,
+                "a/b",
+            ),
+        ] {
+            let requests = list_files_requests(code);
+            assert_eq!(requests.len(), 1, "{code}: {requests:?}");
+            assert_eq!(requests[0].directory, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn inline_list_files_loops_fail_closed_outside_the_bounded_shape() {
+        for code in [
+            // Dynamic directory parts.
+            r#"for (f in list.files(file.path(getwd(), "R"), pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            r#"for (f in list.files(file.path(dir, "R"), pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            r#"dir <- "R"
+               dir <- "other"
+               for (f in list.files(dir, pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            r#"for (f in list.files(file.path("..", "R", fsep = "\\"), pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            r#"file.path <- function(...) "elsewhere"
+               for (f in list.files(file.path("..", "R"), pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            // Other patterns and arguments.
+            r#"for (f in list.files("R", pattern = "[.][Rr]", full.names = TRUE)) source(f)"#,
+            r#"for (f in list.files("R", pattern = "R$", full.names = TRUE)) source(f)"#,
+            r#"for (f in list.files("R", pattern = "[.]R$", full.names = TRUE, recursive = TRUE)) source(f)"#,
+            r#"for (f in list.files("R", pattern = "[.]R$")) source(f)"#,
+            r#"for (f in list.files("R", pattern = "[.]R$", full.names = TRUE)) { source(f); message(f) }"#,
+            r#"for (f in sort(list.files("R", pattern = "[.]R$", full.names = TRUE))) source(f)"#,
+            r#"list.files <- function(...) "wrong.R"
+               for (f in list.files("R", pattern = "[.]R$", full.names = TRUE)) source(f)"#,
+            r#"f <- function() {
+                 for (f in list.files("R", pattern = "[.]R$", full.names = TRUE)) source(f)
+               }"#,
+        ] {
+            assert!(
+                list_files_requests(code).is_empty(),
+                "{code}: {:?}",
+                list_files_requests(code)
+            );
+        }
+    }
+
     #[test]
     fn list_files_source_loops_fail_closed_outside_the_bounded_shape() {
         for code in [
@@ -3685,7 +3847,7 @@ mod tests {
                for (file in files) source(file)"#,
             r#"files <- list.files("functions", pattern = "\\.R$", full.names = FALSE)
                for (file in files) source(file)"#,
-            r#"files <- list.files("functions", pattern = "\\.[Rr]$", full.names = TRUE)
+            r#"files <- list.files("functions", pattern = "\\.(R|r)$", full.names = TRUE)
                for (file in files) source(file)"#,
             r#"files <- list.files(directory, pattern = "\\.R$", full.names = TRUE)
                for (file in files) source(file)"#,

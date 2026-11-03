@@ -479,6 +479,16 @@ fn helper_use_is_deferred(node: Node, content: &str) -> bool {
         {
             return !super::binding::is_known_immediate_context(parent);
         }
+        // A `for` sequence is evaluated once when the loop statement runs, so
+        // `for (f in list.files(file.path(...), ...))` is as immediate as the
+        // loop itself. The body is not: it may run zero or many times.
+        if parent.kind() == "for_statement"
+            && parent
+                .child_by_field_name("sequence")
+                .is_some_and(|sequence| sequence == current)
+        {
+            return !super::binding::is_known_immediate_context(parent);
+        }
         current = parent;
     }
     true

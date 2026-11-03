@@ -596,9 +596,25 @@ fn visit_bindings<'tree, T>(
                 }
                 // The sequence is evaluated eagerly and the body may execute;
                 // either can mutate unrelated bindings through indirect calls.
+                // A side-effect-free sequence (such as `list.files(...)` of
+                // folded parts) runs before any body iteration, so the barrier
+                // then starts at the body: helper calls inside the sequence
+                // keep the trust they had before the loop.
+                let barrier_node = node
+                    .child_by_field_name("sequence")
+                    .filter(|sequence| {
+                        binding_value_is_side_effect_free(
+                            *sequence,
+                            content,
+                            collection,
+                            state.effective_immediate_binding_context(),
+                        )
+                    })
+                    .and_then(|_| node.child_by_field_name("body"))
+                    .unwrap_or(node);
                 invalidate_unknown_mutation_in_context(
                     collection,
-                    node,
+                    barrier_node,
                     state.known_immediate_context,
                 );
                 record_for_variable(node, content, collection);
@@ -2013,6 +2029,9 @@ fn binding_value_is_side_effect_free<T>(
         "c",
         "file.path",
         "normalizePath",
+        // Lists directory entries; it reads the filesystem but never creates
+        // or removes bindings.
+        "list.files",
         "paste0",
         "paste",
         // Environment accessors/constructors may allocate or return an

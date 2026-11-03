@@ -205,7 +205,9 @@ pub(crate) trait StaticSourceClosurePolicy {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct StaticSourceClosureResult {
     /// Routing spellings of every accepted static target, including targets that
-    /// are currently missing or unreadable. The root itself is not included.
+    /// are currently missing or unreadable, and of every directory a
+    /// `list.files()` source loop enumerates (so creating a member there routes
+    /// a rescan through its parent). The root itself is not included.
     pub(crate) sourced_files: BTreeSet<PathBuf>,
     /// Attachment environment after the root and every executed source frame.
     ///
@@ -230,6 +232,11 @@ pub(crate) struct StaticSourceClosureResult {
 /// discovered target is retained for watcher routing before either the
 /// file-budget check or source read, so the cap-boundary target and
 /// missing/unreadable targets can trigger a later rescan.
+///
+/// A bounded `list.files()` source loop is expanded when its frame reaches it,
+/// through the same `tar_source::list_files_batch_members` expansion editor
+/// scope uses, and its members are replayed in order as ordinary absolute-path
+/// `source()` events. A batch that fails closed contributes no members.
 pub(crate) fn walk_static_source_closure<P: StaticSourceClosurePolicy>(
     root_path: &Path,
     root_text: String,
@@ -325,7 +332,8 @@ fn walk_static_source_closure_with_limits_and_initial_attached<P: StaticSourceCl
             crate::cross_file::source_detect::StaticPreludeEvent::Attach(call) => {
                 call.requires_attached.clone()
             }
-            crate::cross_file::source_detect::StaticPreludeEvent::Source(_) => None,
+            crate::cross_file::source_detect::StaticPreludeEvent::Source(_)
+            | crate::cross_file::source_detect::StaticPreludeEvent::SourceBatch(_) => None,
         })
         .collect();
     facts_cache.insert(root_routing.clone(), root_facts.clone());
@@ -386,6 +394,56 @@ fn walk_static_source_closure_with_limits_and_initial_attached<P: StaticSourceCl
                     }
                 }
             }
+            crate::cross_file::source_detect::StaticPreludeEvent::SourceBatch(request) => {
+                // Expand the batch in place: its members run in order at the
+                // loop's position, each as an ordinary global `source()` with
+                // an absolute path, so budgets, cycle checks, caller policy,
+                // and routing apply per member exactly as for literal calls.
+                let frame = stack.last_mut().expect("event came from an active frame");
+                let Ok(file_uri) = tower_lsp::lsp_types::Url::from_file_path(&frame.path) else {
+                    continue;
+                };
+                let Some(context) =
+                    crate::cross_file::path_resolve::PathContext::forward_without_metadata(
+                        &file_uri,
+                        workspace_url,
+                    )
+                else {
+                    continue;
+                };
+                let (members, watch_paths) =
+                    crate::cross_file::tar_source::list_files_batch_members(
+                        &request,
+                        &context,
+                        workspace_url,
+                    );
+                // The listed directory (and its lexical candidates) route
+                // later file creation in it back to a rescan.
+                result.sourced_files.extend(
+                    watch_paths
+                        .iter()
+                        .map(|path| preamble::canonicalize_for_routing(path)),
+                );
+                let insert_at = frame.next_event;
+                frame.facts.prelude_events.splice(
+                    insert_at..insert_at,
+                    members.into_iter().filter_map(|member| {
+                        let resolved_uri =
+                            tower_lsp::lsp_types::Url::from_file_path(&member).ok()?;
+                        Some(
+                            crate::cross_file::source_detect::StaticPreludeEvent::Source(
+                                crate::cross_file::types::ForwardSource {
+                                    path: member.to_string_lossy().into_owned(),
+                                    line: request.line,
+                                    column: request.column,
+                                    resolved_uri: Some(resolved_uri),
+                                    ..Default::default()
+                                },
+                            ),
+                        )
+                    }),
+                );
+            }
             crate::cross_file::source_detect::StaticPreludeEvent::Source(source) => {
                 let (frame_path, frame_depth) = {
                     let frame = stack.last().expect("event came from an active frame");
@@ -408,12 +466,19 @@ fn walk_static_source_closure_with_limits_and_initial_attached<P: StaticSourceCl
                 else {
                     continue;
                 };
-                let Some(resolved) = crate::cross_file::path_resolve::resolve_source_path_rich(
-                    &source.path,
-                    &context,
-                )
-                .path
-                else {
+                // Expanded batch members arrive already resolved; their
+                // absolute path must not be re-read as workspace-root-relative.
+                let resolved = match &source.resolved_uri {
+                    Some(uri) => uri.to_file_path().ok(),
+                    None => {
+                        crate::cross_file::path_resolve::resolve_source_path_rich(
+                            &source.path,
+                            &context,
+                        )
+                        .path
+                    }
+                };
+                let Some(resolved) = resolved else {
                     continue;
                 };
                 let routing_path = preamble::canonicalize_for_routing(&resolved);
@@ -449,13 +514,16 @@ fn walk_static_source_closure_with_limits_and_initial_attached<P: StaticSourceCl
                             &sourced_text,
                         );
                         known_replay_triggers.extend(facts.prelude_events.iter().filter_map(
-                            |event| match event {
+                            |event| {
+                                match event {
                                 crate::cross_file::source_detect::StaticPreludeEvent::Attach(
                                     call,
                                 ) => call.requires_attached.clone(),
-                                crate::cross_file::source_detect::StaticPreludeEvent::Source(_) => {
-                                    None
-                                }
+                                crate::cross_file::source_detect::StaticPreludeEvent::Source(_)
+                                | crate::cross_file::source_detect::StaticPreludeEvent::SourceBatch(
+                                    _,
+                                ) => None,
+                            }
                             },
                         ));
                         facts_cache.insert(routing_path.clone(), facts.clone());
@@ -1763,6 +1831,17 @@ pub struct PackageScopeContribution {
     /// testthat's own implicit attach).
     pub test_helper_attached_packages: Arc<BTreeMap<PathBuf, Arc<BTreeSet<String>>>>,
 
+    /// Workspace root that `test_helper_symbols` and
+    /// `test_helper_attached_packages` are classified against.
+    ///
+    /// Set whenever a workspace root is known and package mode isn't
+    /// `Disabled`, in BOTH package and script mode: `testthat::test_dir()`
+    /// sources `helper*.R` and `setup*.R` for a project that isn't a package
+    /// just as `test_check()` does for one. Deliberately distinct from
+    /// `workspace_root`, which is `Some` only in package mode and gates
+    /// package-only facts (internals, namespace bindings, datasets).
+    pub test_preamble_root: Option<PathBuf>,
+
     /// Dataset names from the package's own `data/` directory. These are
     /// visible to any `.R` file under the workspace root — R/, tests/,
     /// vignettes/, inst/, demo/, data-raw/ — matching `data()` semantics
@@ -1802,6 +1881,16 @@ pub struct PackageScopeContribution {
 }
 
 impl PackageScopeContribution {
+    /// Root that testthat preamble contributions are classified against.
+    ///
+    /// A package workspace always implies one, so `workspace_root` stands in
+    /// when `test_preamble_root` is unset; script mode sets only the latter.
+    pub(crate) fn test_preamble_root(&self) -> Option<&PathBuf> {
+        self.test_preamble_root
+            .as_ref()
+            .or(self.workspace_root.as_ref())
+    }
+
     /// Every symbol this package exposes as a `load_all()` internal — the exact
     /// contents of the local-dev overlay: R/ internals, sysdata objects,
     /// `.onLoad`/`.onAttach` bindings, and NAMESPACE-imported names.

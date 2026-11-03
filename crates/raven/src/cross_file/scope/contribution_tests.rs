@@ -74,6 +74,46 @@ fn namespace_runtime_binding_is_not_a_load_all_export() {
     }
 }
 
+/// Script mode (no package workspace) still selects testthat preambles for
+/// peer test files through `test_preamble_root`, and nothing package-only.
+#[test]
+fn script_mode_selects_test_preambles_only_for_peer_test_files() {
+    let root = PathBuf::from("/work/pkg");
+    let setup = root.join("tests/testthat/setup.R");
+    let contribution = PackageScopeContribution {
+        test_preamble_root: Some(root.clone()),
+        test_helper_symbols: Arc::new(BTreeMap::from([(setup.clone(), names(&["compute_rate"]))])),
+        test_helper_attached_packages: Arc::new(BTreeMap::from([(
+            setup.clone(),
+            names(&["glue"]),
+        )])),
+        ..Default::default()
+    };
+    for (path, visible) in [
+        ("tests/testthat/test-rates.R", true),
+        ("tests/testthat/setup.R", false),
+        ("tests/testthat/sub/test-nested.R", false),
+        ("tests/testit/test-rates.R", false),
+        ("R/rates.R", false),
+        ("analysis.R", false),
+    ] {
+        let uri = Url::parse("file:///work/pkg/").unwrap().join(path).unwrap();
+        let prepared = ScopeContributions::new(&uri, Some(&contribution));
+        assert_eq!(
+            prepared.contains("compute_rate", ScopePhase::Immediate),
+            visible,
+            "{path}"
+        );
+        assert!(
+            !prepared.contains(".packageName", ScopePhase::Immediate),
+            "script mode has no namespace bindings: {path}"
+        );
+        let mut attached = HashSet::new();
+        prepared.seed_attached_packages(&mut attached);
+        assert_eq!(attached.contains("glue"), visible, "{path}");
+    }
+}
+
 /// Give each contribution source its own name and package so accidental
 /// widening or omission cannot hide behind another source's matching name.
 fn contribution_fixture() -> PackageScopeContribution {

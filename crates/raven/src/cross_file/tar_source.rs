@@ -844,6 +844,31 @@ fn expand_request(request: &TarSourceRequest, context: &PathContext) -> RequestE
     expansion
 }
 
+/// Members of one bounded `list.files()` batch for the package-state static
+/// closure walks (`.Rprofile` and testthat preamble scans).
+///
+/// Uses exactly the same expansion as editor scope, so the 256-member cap,
+/// workspace containment, and whole-batch fail-closed rules hold for both.
+/// Returns the ordered members (empty when the batch fails closed) and the
+/// paths whose creation or deletion can change that answer, for watcher
+/// routing. Project exclusions are left to the caller's per-target policy.
+pub(crate) fn list_files_batch_members(
+    request: &ListFilesSourceRequest,
+    context: &PathContext,
+    workspace_root: Option<&Url>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let expansion = expand_list_files_request(request, context, workspace_root);
+    if let Some(failure) = &expansion.list_files_failure {
+        log::debug!(
+            "bounded list.files() source batch failed closed in static scan at {}:{} (directory {:?}): {failure}",
+            request.line + 1,
+            request.column + 1,
+            request.directory,
+        );
+    }
+    (expansion.files, expansion.watch_paths)
+}
+
 fn expand_list_files_request(
     request: &ListFilesSourceRequest,
     context: &PathContext,
@@ -906,10 +931,11 @@ fn expand_list_files_request_with_probe(
         };
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.')
-            || Path::new(&name)
-                .extension()
-                .and_then(|value| value.to_str())
-                != Some("R")
+            || !request.extensions.matches(
+                Path::new(&name)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+            )
         {
             continue;
         }

@@ -101,7 +101,9 @@ pub struct PreambleScan {
     pub attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Routing paths of all static `source()` targets from any preamble,
     /// including targets that are currently missing or unreadable (preamble
-    /// files themselves NOT included). Existing paths are canonicalized;
+    /// files themselves NOT included), plus each directory a `list.files()`
+    /// source loop enumerates (routing matches its direct children). Existing
+    /// paths are canonicalized;
     /// missing paths use a canonical parent when possible. Used by watched-file
     /// freshness wiring so both edits and later creation trigger a rescan.
     pub sourced_files: BTreeSet<PathBuf>,
@@ -278,9 +280,14 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
                 .sourced_files_by_preamble
                 .get(preamble)
                 .is_some_and(|files| {
-                    routing_affected
-                        .iter()
-                        .any(|affected| files.contains(affected))
+                    // A direct child of a routed `list.files()` directory can
+                    // join or leave that batch.
+                    routing_affected.iter().any(|affected| {
+                        files.contains(affected)
+                            || affected
+                                .parent()
+                                .is_some_and(|parent| files.contains(parent))
+                    })
                 })
         {
             affected_preambles.insert(preamble.clone());
@@ -648,6 +655,41 @@ mod tests {
             scan.sourced_files_by_preamble
                 .get(&helper)
                 .is_some_and(|files| files.contains(&canonical_helpers))
+        );
+    }
+
+    /// A project's `setup.R` that loads every `R/*.R` file with an inline
+    /// `list.files()` loop (the common non-package idiom) contributes the
+    /// listed files' definitions, routes the directory for later creation,
+    /// and keeps lowercase `.r` files out under the `[.]R$` pattern.
+    #[test]
+    fn harvests_list_files_source_loop_closure_of_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("R")).unwrap();
+        std::fs::write(
+            root.join("R/rates.R"),
+            "compute_rate <- function(x) x / 2\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("R/lower.r"), "lowercase_only <- 1\n").unwrap();
+        let setup = root.join("tests/testthat/setup.R");
+        std::fs::write(
+            &setup,
+            "for (file in list.files(file.path(\"..\", \"..\", \"R\"), pattern = \"[.]R$\", full.names = TRUE)) {\n  source(file)\n}\n",
+        )
+        .unwrap();
+
+        let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        let symbols = scan.symbols.get(&setup).expect("setup keyed in scan");
+        assert!(symbols.contains("compute_rate"), "{symbols:?}");
+        assert!(!symbols.contains("lowercase_only"), "{symbols:?}");
+        let canonical_dir = canonicalize_for_routing(&root.join("R"));
+        assert!(
+            scan.sourced_files.contains(&canonical_dir),
+            "the listed directory must route later member creation: {:?}",
+            scan.sourced_files
         );
     }
 
