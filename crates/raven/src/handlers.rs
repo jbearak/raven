@@ -23334,9 +23334,9 @@ fn is_package_export(
 /// in the SAME directory as `uri`. Empty unless `uri` is a testthat/testit
 /// test file (R/ files and plain `tests/*.R` get an empty set). Script-mode
 /// workspaces get the helper attaches only: testthat's implicit attach is
-/// derived from a package `DESCRIPTION`. The same-directory restriction on the helper-attach union keeps
-/// `tests/testthat/` preambles from leaking into `tests/testit/` siblings,
-/// which never source them.
+/// derived from a package `DESCRIPTION`. The same-directory restriction on
+/// the helper-attach union keeps `tests/testthat/` preambles from leaking into
+/// `tests/testit/` siblings, which never source them.
 ///
 /// Used by the out-of-scope diagnostic collector to suppress
 /// misattribution of these packages' exports to a later `source()` call.
