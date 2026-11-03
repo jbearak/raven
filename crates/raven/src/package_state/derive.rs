@@ -56,11 +56,24 @@ fn build_scope_contribution(
     let rprofile_symbols = &inputs.rprofile_symbols;
     let rprofile_attached_packages = &inputs.rprofile_attached_packages;
     let rprofile_root = inputs.workspace_root.clone();
+    // testthat preambles apply in script mode too: `testthat::test_dir()`
+    // sources `helper*.R`/`setup*.R` for a project that isn't a package.
+    let test_preamble_root = inputs
+        .workspace_root
+        .clone()
+        .filter(|_| inputs.package_mode != PackageMode::Disabled);
+    let (test_helper_symbols, test_helper_attached_packages) = test_preamble_root
+        .as_deref()
+        .map(|root| collect_test_preamble_contribution(root, r_file_facts, inputs))
+        .unwrap_or_default();
     let Some(ws) = workspace else {
         return PackageScopeContribution {
             rprofile_symbols: Arc::new(rprofile_symbols.clone()),
             rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
             rprofile_root,
+            test_helper_symbols: Arc::new(test_helper_symbols),
+            test_helper_attached_packages: Arc::new(test_helper_attached_packages),
+            test_preamble_root,
             ..PackageScopeContribution::default()
         };
     };
@@ -69,90 +82,21 @@ fn build_scope_contribution(
     // driven by the canonical `RFileKind` classification carried in
     // `RFileFacts`, not by a path-prefix check.
     //
-    // test_helper_symbols: union of top_level_defs from test-preamble files
-    // (`tests/testthat/helper*.R` and `setup*.R` — kind == Test AND filename
-    // starts with "helper" or "setup"), keyed by file path so the
-    // scope-injection layer can skip a preamble file's own self-injection.
-    // Visible to peer test files; never injected into R/.
-    //
-    // test_helper_attached_packages: same preamble files, but their top-level
-    // `library()`/`require()` *attaches* (see `RFileFacts::attached_packages`),
-    // also keyed by file path. Sibling tests inherit these packages because
-    // testthat sources the preamble before each test runs. Same one-way
-    // visibility as the defs: peer test files only, never R/.
-    //
-    // Known limitation (matches `r_internal_symbols`): both sets are built
-    // from `top_level_defs`, which captures every top-level assignment
-    // without applying timeline-level `rm()` / `remove()`. A helper that
-    // does `x <- 1; rm(x)` still contributes `x` to peer-visible names. The
-    // rm-aware extractor (`live_top_level_exports`) operates on parsed
-    // `ScopeArtifacts`, not on the cheap `top_level_defs` slice; aligning
-    // here would require either re-parsing helper files at derive time or
-    // re-keying `RFileFacts` around `ScopeArtifacts`. This edge case is
-    // uncommon in real testthat helpers, so it is left untreated for
-    // symmetry with `r_internal_symbols` (which has the same limitation
-    // for R/ files).
+    // Known limitation: built from `top_level_defs`, which captures every
+    // top-level assignment without applying timeline-level `rm()` /
+    // `remove()`. The rm-aware extractor (`live_top_level_exports`) operates
+    // on parsed `ScopeArtifacts`, not on the cheap `top_level_defs` slice; the
+    // test-preamble sets share the same limitation (see
+    // `collect_test_preamble_contribution`).
     let mut r_internal_symbols: BTreeSet<String> = BTreeSet::new();
     let mut onload_all: BTreeSet<String> = BTreeSet::new();
-    let mut test_helper_symbols: BTreeMap<PathBuf, Arc<BTreeSet<String>>> = BTreeMap::new();
-    let mut test_helper_attached_packages: BTreeMap<PathBuf, Arc<BTreeSet<String>>> =
-        BTreeMap::new();
-    for (path, facts) in r_file_facts {
-        match facts.kind {
-            RFileKind::Source => {
-                for def in facts.top_level_defs.iter() {
-                    r_internal_symbols.insert(def.clone());
-                }
-                for sym in facts.onload_bindings.iter() {
-                    onload_all.insert(sym.clone());
-                }
+    for facts in r_file_facts.values() {
+        if facts.kind == RFileKind::Source {
+            for def in facts.top_level_defs.iter() {
+                r_internal_symbols.insert(def.clone());
             }
-            RFileKind::Test => {
-                // Preamble files must be direct children of `tests/testthat/`
-                // — `testthat::source_test_helpers` / `source_test_setup` use
-                // non-recursive `dir(path, pattern = "^helper.*\\.[Rr]$")` /
-                // `dir(path, pattern = "^setup.*\\.[Rr]$")`, so files in
-                // subdirectories (e.g. `tests/testthat/sub/helper-x.R`)
-                // are never auto-sourced. Treating them as preamble here
-                // would silently mute legitimate undefined-variable
-                // diagnostics for any symbol they define.
-                let direct_child = ws.root.join("tests").join("testthat");
-                let is_direct_child_of_testthat = path.parent() == Some(direct_child.as_path());
-                let is_preamble = is_direct_child_of_testthat
-                    && path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(super::is_test_preamble_filename)
-                        .unwrap_or(false);
-                if is_preamble {
-                    // Reuse the preamble file's `top_level_defs` `Arc` rather
-                    // than cloning into a fresh set — keeps
-                    // `derive_package_state` O(preamble-file count) on the
-                    // cached path instead of O(total preamble defs). When the
-                    // preamble-source scan harvested defs from the preamble's
-                    // transitive `source()` targets (issue #638), union them
-                    // in (allocating only for preambles that actually source
-                    // something).
-                    let defs = union_or_share(
-                        &facts.top_level_defs,
-                        inputs.preamble_sourced_symbols.get(path),
-                    );
-                    test_helper_symbols.insert(path.clone(), defs);
-                    // Same for top-level `library()`/`require()` attaches — a
-                    // helper/setup file's attaches propagate to sibling tests
-                    // (testthat sources the preamble before each test),
-                    // including attaches made by the preamble's sourced
-                    // closure (issue #638). Skip the entry entirely when there
-                    // are no attaches so the map stays sparse (most preamble
-                    // files attach nothing).
-                    let attached = union_or_share(
-                        &facts.attached_packages,
-                        inputs.preamble_sourced_attached_packages.get(path),
-                    );
-                    if !attached.is_empty() {
-                        test_helper_attached_packages.insert(path.clone(), attached);
-                    }
-                }
+            for sym in facts.onload_bindings.iter() {
+                onload_all.insert(sym.clone());
             }
         }
     }
@@ -215,6 +159,7 @@ fn build_scope_contribution(
         test_attached_packages: Arc::new(test_attached_packages),
         test_helper_symbols: Arc::new(test_helper_symbols),
         test_helper_attached_packages: Arc::new(test_helper_attached_packages),
+        test_preamble_root,
         dataset_symbols: Arc::new(dataset_names.clone()),
         sysdata_symbols: Arc::new(sysdata_names.clone()),
         onload_symbols: Arc::new(onload_all),
@@ -222,6 +167,81 @@ fn build_scope_contribution(
         rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
         rprofile_root,
     }
+}
+
+/// Name sets keyed by the testthat preamble file that contributes them.
+type PreambleNameSets = BTreeMap<PathBuf, Arc<BTreeSet<String>>>;
+
+/// Per-preamble definitions and attachments of the testthat preamble files
+/// directly in `<root>/tests/testthat/`.
+///
+/// test_helper_symbols: union of top_level_defs from test-preamble files
+/// (`tests/testthat/helper*.R` and `setup*.R` — kind == Test AND filename
+/// starts with "helper" or "setup"), keyed by file path so the
+/// scope-injection layer can skip a preamble file's own self-injection.
+/// Visible to peer test files; never injected into R/.
+///
+/// test_helper_attached_packages: same preamble files, but their top-level
+/// `library()`/`require()` *attaches* (see `RFileFacts::attached_packages`),
+/// also keyed by file path. Sibling tests inherit these packages because
+/// testthat sources the preamble before each test runs. Same one-way
+/// visibility as the defs: peer test files only, never R/.
+///
+/// Both include what the preamble's static source closure contributes
+/// (`preamble_sourced_*`, issue #638), including `list.files()` source loops.
+///
+/// Known limitation (matches `r_internal_symbols`): both sets are built from
+/// `top_level_defs`, which captures every top-level assignment without
+/// applying timeline-level `rm()` / `remove()`. A helper that does
+/// `x <- 1; rm(x)` still contributes `x` to peer-visible names. This edge case
+/// is uncommon in real testthat helpers, so it is left untreated.
+fn collect_test_preamble_contribution(
+    root: &Path,
+    r_file_facts: &BTreeMap<PathBuf, RFileFacts>,
+    inputs: &PackageInputs,
+) -> (PreambleNameSets, PreambleNameSets) {
+    let mut test_helper_symbols = BTreeMap::new();
+    let mut test_helper_attached_packages = BTreeMap::new();
+    // Preamble files must be direct children of `tests/testthat/` —
+    // `testthat::source_test_helpers` / `source_test_setup` use non-recursive
+    // `dir(path, pattern = "^helper.*\\.[Rr]$")` /
+    // `dir(path, pattern = "^setup.*\\.[Rr]$")`, so files in subdirectories
+    // (e.g. `tests/testthat/sub/helper-x.R`) are never auto-sourced. Treating
+    // them as preamble here would silently mute legitimate undefined-variable
+    // diagnostics for any symbol they define.
+    let direct_child = root.join("tests").join("testthat");
+    for (path, facts) in r_file_facts {
+        if facts.kind != RFileKind::Test || path.parent() != Some(direct_child.as_path()) {
+            continue;
+        }
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(super::is_test_preamble_filename)
+        {
+            continue;
+        }
+        // Reuse the preamble file's `top_level_defs` `Arc` rather than cloning
+        // into a fresh set — keeps derivation O(preamble-file count) on the
+        // cached path instead of O(total preamble defs). Harvested closure
+        // defs are unioned in, allocating only for preambles that actually
+        // source something.
+        let defs = union_or_share(
+            &facts.top_level_defs,
+            inputs.preamble_sourced_symbols.get(path),
+        );
+        test_helper_symbols.insert(path.clone(), defs);
+        // Skip the attach entry entirely when there are none so the map stays
+        // sparse (most preamble files attach nothing).
+        let attached = union_or_share(
+            &facts.attached_packages,
+            inputs.preamble_sourced_attached_packages.get(path),
+        );
+        if !attached.is_empty() {
+            test_helper_attached_packages.insert(path.clone(), attached);
+        }
+    }
+    (test_helper_symbols, test_helper_attached_packages)
 }
 
 /// Return the cached immutable set when adding `harvested` cannot change it.
@@ -451,6 +471,84 @@ mod tests {
         assert_eq!(
             merged.as_ref(),
             &BTreeSet::from(["added".to_string(), "cached".to_string()])
+        );
+    }
+
+    /// A project that isn't a package (`Type: project`, no `Package:`) still
+    /// runs its testthat preambles through `testthat::test_dir()`, so their
+    /// definitions, sourced closure, and attaches reach peer test files while
+    /// every package-only fact stays absent.
+    #[test]
+    fn script_mode_contributes_test_preambles_without_a_package_workspace() {
+        let setup_path: PathBuf = "/work/pkg/tests/testthat/setup.R".into();
+        let nested_path: PathBuf = "/work/pkg/tests/testthat/sub/setup-nested.R".into();
+        let source_path: PathBuf = "/work/pkg/R/rates.R".into();
+        let mut inputs = with_description(PackageMode::Auto, "Type: project\nTitle: x\n");
+        for (path, kind, text) in [
+            (
+                &setup_path,
+                RFileKind::Test,
+                "library(glue)\nsetup_flag <- TRUE\n",
+            ),
+            (&nested_path, RFileKind::Test, "nested_flag <- TRUE\n"),
+            (
+                &source_path,
+                RFileKind::Source,
+                "compute_rate <- function(x) x\n",
+            ),
+        ] {
+            let text: Arc<str> = text.into();
+            inputs.r_files.insert(
+                path.clone(),
+                RFileInput {
+                    kind,
+                    content_digest: ContentDigest::of(&text),
+                    text,
+                },
+            );
+        }
+        inputs.preamble_sourced_symbols.insert(
+            setup_path.clone(),
+            BTreeSet::from(["compute_rate".to_string()]),
+        );
+
+        let state = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let contribution = &state.scope_contribution;
+        assert_eq!(contribution.workspace_root, None);
+        assert_eq!(contribution.package_name, None);
+        assert!(contribution.r_internal_symbols.is_empty());
+        assert!(contribution.test_attached_packages.is_empty());
+        assert_eq!(
+            contribution.test_preamble_root.as_deref(),
+            Some(Path::new("/work/pkg"))
+        );
+        assert_eq!(
+            contribution.test_helper_symbols[&setup_path].as_ref(),
+            &BTreeSet::from(["compute_rate".to_string(), "setup_flag".to_string()])
+        );
+        assert!(!contribution.test_helper_symbols.contains_key(&nested_path));
+        assert_eq!(
+            contribution.test_helper_attached_packages[&setup_path].as_ref(),
+            &BTreeSet::from(["glue".to_string()])
+        );
+
+        inputs.package_mode = PackageMode::Disabled;
+        let disabled = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        assert_eq!(disabled.scope_contribution.test_preamble_root, None);
+        assert!(disabled.scope_contribution.test_helper_symbols.is_empty());
+        assert!(
+            disabled
+                .scope_contribution
+                .test_helper_attached_packages
+                .is_empty()
         );
     }
 

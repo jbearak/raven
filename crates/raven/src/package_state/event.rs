@@ -207,8 +207,9 @@ pub(crate) fn apply_preamble_scan(
 /// `true` when a watched change to `path` must refresh the testthat
 /// preamble-source scan (issue #638): the file IS a preamble scan root
 /// (direct `tests/testthat/` child named `helper*`/`setup*` — its `source()`
-/// set may have changed), or it is one of the files a preamble transitively
-/// `source()`s (`preamble_sourced_files`, canonical when possible).
+/// set may have changed), it is one of the files a preamble transitively
+/// `source()`s (`preamble_sourced_files`, canonical when possible), or it is a
+/// direct child of a directory a preamble's `list.files()` loop enumerates.
 fn preamble_rescan_needed(
     inputs: &PackageInputs,
     root: &Path,
@@ -221,6 +222,15 @@ fn preamble_rescan_needed(
     if inputs.preamble_sourced_files.contains(canonical_path)
         || inputs.preamble_sourced_files.contains(path)
     {
+        return true;
+    }
+    // A `list.files()` source batch routes its directory: creating or deleting
+    // a direct child can change the batch membership.
+    if [path, canonical_path].iter().any(|candidate| {
+        candidate
+            .parent()
+            .is_some_and(|parent| inputs.preamble_sourced_files.contains(parent))
+    }) {
         return true;
     }
     if super::preamble::is_testthat_preamble_path(path, root) {
@@ -279,7 +289,12 @@ fn fold_prelude_rescan(
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Option<PackageInputDelta> {
     let mut deltas: Vec<PackageInputDelta> = base.into_iter().collect();
-    if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(canonical_path) {
+    if inputs.model_rprofile
+        && (inputs.rprofile_sourced_files.contains(canonical_path)
+            || canonical_path
+                .parent()
+                .is_some_and(|parent| inputs.rprofile_sourced_files.contains(parent)))
+    {
         let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
         if let Some(delta) = apply_rprofile_scan(inputs, Some(scan)) {
             deltas.push(delta);
@@ -1572,6 +1587,61 @@ mod tests {
         let symbols = inputs.preamble_sourced_symbols.get(&preamble).unwrap();
         assert!(symbols.contains("new_def"), "got {symbols:?}");
         assert!(!symbols.contains("old_def"), "got {symbols:?}");
+    }
+
+    /// A file created in a directory that a preamble's `list.files()` loop
+    /// enumerates joins the batch on the watcher event, with no edit to the
+    /// preamble itself.
+    #[test]
+    fn creating_a_list_files_member_rescans_the_preamble_closure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("R")).unwrap();
+        std::fs::write(root.join("R/rates.R"), "compute_rate <- function(x) x\n").unwrap();
+        let preamble = root.join("tests/testthat/setup.R");
+        std::fs::write(
+            &preamble,
+            "for (file in list.files(file.path(\"..\", \"..\", \"R\"), pattern = \"[.]R$\", full.names = TRUE)) {\n  source(file)\n}\n",
+        )
+        .unwrap();
+
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let mut inputs = PackageInputs {
+            workspace_root: Some(root.to_path_buf()),
+            package_mode: PackageMode::Auto,
+            ..PackageInputs::default()
+        };
+        let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, &exclusions);
+        let _ = apply_preamble_scan(&mut inputs, Some(scan));
+        assert!(
+            inputs.preamble_sourced_symbols[&preamble].contains("compute_rate"),
+            "precondition: {:?}",
+            inputs.preamble_sourced_symbols
+        );
+
+        let created = root.join("R/counts.R");
+        std::fs::write(&created, "count_births <- function(x) x\n").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&created).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert!(
+            matches!(
+                &delta,
+                Some(PackageInputDelta::Batch(deltas))
+                    if deltas.contains(&PackageInputDelta::PreambleSourcesChanged)
+            ),
+            "member creation must rescan the preamble, got {delta:?}"
+        );
+        let symbols = &inputs.preamble_sourced_symbols[&preamble];
+        assert!(symbols.contains("count_births"), "got {symbols:?}");
+        assert!(symbols.contains("compute_rate"), "got {symbols:?}");
     }
 
     #[test]

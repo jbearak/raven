@@ -46,7 +46,7 @@ Raven reads these forms without any configuration:
 | `source(system.file("helper.R", package = "pkg"))` | Resolves to `inst/helper.R` for the package you're developing, or to the installed package's copy. |
 | `source(file.path("scripts", "helpers.R"))` | Folds a path built from fixed parts into a plain path. |
 | `if (file.exists("config.R")) source("config.R")` | Follows the file when it exists, and reports nothing when it doesn't. |
-| `files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)` then `for (file in files) source(file)` | Sources each `.R` file in that folder, in order. |
+| `for (file in list.files("functions", pattern = "[.]R$", full.names = TRUE)) source(file)`, or the listing assigned to a variable first | Sources each `.R` file in that folder, in order. |
 | `source(paste0(dir, "/x.R"))`, `source(Sys.getenv("SETUP"))` | Skips the call. Use a [directive](#when-raven-cant-see-the-link). |
 
 Each form has exact limits, described in [How Raven reads `source()` calls](#how-raven-reads-source-calls). Raven also models how [Shiny apps](#shiny-application-loading) load `R/` helpers and `global.R`, and how [`targets::tar_source()`](#targetstar_source-scripts) loads pipeline scripts.
@@ -351,22 +351,33 @@ For a bare `file.exists`, Raven applies the same bounded check as for other bare
 <details markdown="1">
 <summary>Directory source loops with <code>list.files()</code></summary>
 
-This pair of statements sources the `.R` files directly inside `functions/` as one ordered batch:
+A loop over `list.files()` sources the `.R` files directly inside a directory as one ordered batch. Raven recognizes two forms. The listing can be assigned in the statement before the loop:
 
 ```r
 files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
 for (file in files) source(file)
 ```
 
+Or `list.files()` can be the loop's own sequence. A project that isn't an R package often loads its functions for testthat this way, in `tests/testthat/setup.R`:
+
+```r
+for (file in list.files(file.path("..", "..", "R"), pattern = "[.]R$", full.names = TRUE)) {
+  source(file)
+}
+```
+
 The files share one source environment from first to last, and the finished batch lends its final scope to the code after the loop. Raven orders the files by platform-native lexical order (raw bytes on Unix). R's order can vary with `LC_COLLATE`, so if your definitions depend on locale-specific filename order, use explicit `source()` calls.
 
 Raven requires all of these:
 
-- The two statements are adjacent, executable, and at the top level.
-- One literal directory, exactly `pattern = "\\.R$"`, and `full.names = TRUE`.
+- The loop is executable and at the top level. In the two-statement form, the assignment comes directly before the loop and is also at the top level.
+- The directory is one literal or a path Raven [folds](#how-raven-reads-source-calls) from literals, such as `file.path("..", "..", "R")` or a `normalizePath()` around one. It resolves like a `source()` path, so in `tests/testthat/` it starts from that folder.
+- `full.names = TRUE`, and one of these patterns: `"\\.R$"` or `"[.]R$"` for `.R` files only, or `"\\.[Rr]$"` or `"[.][Rr]$"` for both `.R` and `.r` files.
 - A loop body that is only `source(iterator)`, written directly or alone inside braces.
 
-`base::` and `base:::` qualification is accepted. The following fail closed, contributing nothing: extra arguments, other patterns (including regex equivalents such as `"\\.[Rr]$"` and `"[.]R$"`), dynamic paths, code between the two statements, shadowed helpers, nested or deferred loops, lowercase `.r` files, hidden entries, files in subdirectories, and paths outside the workspace. `lapply`, `sapply`, and `purrr::walk` idioms aren't supported.
+`base::` and `base:::` qualification is accepted. The following fail closed, contributing nothing: extra arguments, any other pattern, dynamic paths such as `file.path(getwd(), "R")` or a directory held in a variable, code between the two statements, shadowed helpers, nested or deferred loops, hidden entries, files in subdirectories, and paths outside the workspace. `lapply`, `sapply`, and `purrr::walk` idioms aren't supported.
+
+In a testthat `helper*.R` or `setup*.R` file, the batch's definitions reach the test files too, as described in [Package development](r-package-dev.md#helper-and-setup-files-teststestthathelperr-setupr). That works in a project that isn't a package. A `.Rprofile` that sources a directory this way contributes the batch to [its startup prelude](rprofile.md).
 
 Project-excluded files don't take part. If a matching entry is a directory, a directory entry or matching file can't be read, or there are more than 256 matches, Raven drops the whole batch rather than model a partial run. The reason goes to the log at debug level, and the editor shows no hint, because filesystem failures can be temporary. Missing and empty directories stay watched, so creating a file there later updates the analysis.
 

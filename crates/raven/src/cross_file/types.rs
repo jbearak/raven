@@ -451,12 +451,52 @@ pub struct TarSourceRequest {
 /// of `directory` after working-directory enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub struct ListFilesSourceRequest {
-    /// Literal directory passed to `list.files()`.
+    /// Statically folded directory passed to `list.files()`: a literal, or a
+    /// `file.path()`/`normalizePath()` expression folded exactly like a
+    /// `source()` path.
     pub directory: String,
     /// 0-based line of the `source(iterator)` call.
     pub line: u32,
     /// 0-based UTF-16 column of the `source(iterator)` call.
     pub column: u32,
+    /// Which `.R`/`.r` extensions the accepted `pattern` matches.
+    #[serde(default)]
+    pub extensions: ListFilesExtensions,
+}
+
+/// File extensions matched by an accepted `list.files()` `pattern`.
+///
+/// R matches `pattern` case-sensitively, so `"\\.R$"` / `"[.]R$"` never
+/// select `.r` files, while `"\\.[Rr]$"` / `"[.][Rr]$"` select both.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum ListFilesExtensions {
+    /// Only `.R` (`"\\.R$"`, `"[.]R$"`).
+    #[default]
+    UppercaseOnly,
+    /// Both `.R` and `.r` (`"\\.[Rr]$"`, `"[.][Rr]$"`, and the `[rR]` spellings).
+    EitherCase,
+}
+
+impl ListFilesExtensions {
+    /// Classify the raw text between a pattern literal's quotes.
+    ///
+    /// Only these exact spellings are accepted; any other regex fails closed
+    /// rather than risk modeling a different file set than R would list.
+    pub(crate) fn from_pattern_literal(raw: &str) -> Option<Self> {
+        match raw {
+            r"\\.R$" | "[.]R$" => Some(Self::UppercaseOnly),
+            r"\\.[Rr]$" | r"\\.[rR]$" | "[.][Rr]$" | "[.][rR]$" => Some(Self::EitherCase),
+            _ => None,
+        }
+    }
+
+    /// Whether a directory entry with this extension matches the pattern.
+    pub(crate) fn matches(self, extension: Option<&str>) -> bool {
+        matches!(
+            (self, extension),
+            (_, Some("R")) | (Self::EitherCase, Some("r"))
+        )
+    }
 }
 
 /// Origin of an ordered source batch.

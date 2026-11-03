@@ -64,6 +64,9 @@ impl<'a> ScopeContributions<'a> {
                 .attachment_groups
                 .push(&contrib.rprofile_attached_packages);
         }
+        // testthat preambles apply in script mode too, so they are selected
+        // against their own root before the package-only contributions.
+        selected.select_test_preambles(&path, contrib);
         let Some(root) = contrib.workspace_root.as_ref() else {
             return selected;
         };
@@ -91,26 +94,32 @@ impl<'a> ScopeContributions<'a> {
             ]);
             selected.imported_names = Some(&contrib.imported_symbols);
         }
-        let Some(is_preamble) = test_preamble_context(&path, root, kind) else {
-            return selected;
-        };
-
         selected
-            .attachment_groups
-            .push(&contrib.test_attached_packages);
+    }
+
+    /// Select testthat's implicit attach and the peer preamble groups for a
+    /// test file, against `test_preamble_root` (known in script mode too).
+    fn select_test_preambles(&mut self, path: &Path, contrib: &'a PackageScopeContribution) {
+        let Some(root) = contrib.test_preamble_root() else {
+            return;
+        };
+        let kind = package_state::is_r_source_path(path, root);
+        let Some(is_preamble) = test_preamble_context(path, root, kind) else {
+            return;
+        };
+        self.attachment_groups.push(&contrib.test_attached_packages);
         for (peer, names) in contrib.test_helper_symbols.iter() {
-            match preamble_phase(peer, &path, is_preamble) {
-                Some(ScopePhase::Immediate) => selected.immediate_groups.push(names),
-                Some(ScopePhase::Deferred) => selected.deferred_helper_groups.push(names),
+            match preamble_phase(peer, path, is_preamble) {
+                Some(ScopePhase::Immediate) => self.immediate_groups.push(names),
+                Some(ScopePhase::Deferred) => self.deferred_helper_groups.push(names),
                 None => {}
             }
         }
         for (peer, packages) in contrib.test_helper_attached_packages.iter() {
-            if preamble_phase(peer, &path, is_preamble) == Some(ScopePhase::Immediate) {
-                selected.attachment_groups.push(packages);
+            if preamble_phase(peer, path, is_preamble) == Some(ScopePhase::Immediate) {
+                self.attachment_groups.push(packages);
             }
         }
-        selected
     }
 
     /// Class lookup uses exactly the same package-context gate as internal names.
@@ -237,7 +246,7 @@ pub(crate) fn test_helper_sources_for_symbol<'a>(
     name: &'a str,
 ) -> impl Iterator<Item = &'a Path> {
     let context = uri.to_file_path().ok().and_then(|path| {
-        let root = contribution.workspace_root.as_ref()?;
+        let root = contribution.test_preamble_root()?;
         let is_preamble =
             test_preamble_context(&path, root, package_state::is_r_source_path(&path, root))?;
         Some((path, is_preamble))

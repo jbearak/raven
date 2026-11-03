@@ -3715,6 +3715,10 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
 /// package R directories as well as ordinary existing targets. Empty sets
 /// return before filesystem-backed routing canonicalization because live
 /// routing snapshots may hold the state read guard.
+///
+/// The sets also hold each directory a `list.files()` source loop enumerates,
+/// so a direct child of a routed directory matches too: creating or deleting
+/// it can change that batch's members.
 fn path_in_rprofile_sourced_set(
     p: &std::path::Path,
     sourced: &std::collections::BTreeSet<std::path::PathBuf>,
@@ -3723,8 +3727,10 @@ fn path_in_rprofile_sourced_set(
         return false;
     }
 
-    sourced.contains(p)
-        || sourced.contains(&crate::package_state::preamble::canonicalize_for_routing(p))
+    let matches = |path: &std::path::Path| {
+        sourced.contains(path) || path.parent().is_some_and(|parent| sourced.contains(parent))
+    };
+    matches(p) || matches(&crate::package_state::preamble::canonicalize_for_routing(p))
 }
 
 #[cfg(test)]
@@ -32482,6 +32488,12 @@ mod tests {
             // An unrelated file is not a member.
             let other = tmp.path().join("scripts").join("other.R");
             assert!(!path_in_rprofile_sourced_set(&other, &sourced));
+            // A direct child of a routed `list.files()` directory matches, so
+            // a file created there reaches the rescan; a grandchild does not.
+            sourced.insert(tmp.path().join("scripts").canonicalize().unwrap());
+            assert!(path_in_rprofile_sourced_set(&other, &sourced));
+            let nested = tmp.path().join("scripts").join("nested").join("x.R");
+            assert!(!path_in_rprofile_sourced_set(&nested, &sourced));
         }
 
         #[test]
@@ -43813,6 +43825,83 @@ mod project_config_initialize_tests {
             .unwrap();
         assert!(symbols.contains("disk_a"), "got {symbols:?}");
         assert!(!symbols.contains("changed_a"), "got {symbols:?}");
+    }
+
+    /// A project that isn't a package loads `R/*.R` for testthat through the
+    /// exact `setup.R` loop below. Test files see those functions in the
+    /// editor, and a live edit that drops the loop withdraws them.
+    #[tokio::test]
+    async fn project_setup_list_files_loop_lends_r_functions_to_open_test_file() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("R")).unwrap();
+        let description = "Type: project\nTitle: Analysis project\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        fs::write(
+            root_path.join("R/rates.R"),
+            "compute_rate <- function(births, women) births / women\n",
+        )
+        .unwrap();
+        let setup_path = root_path.join("tests/testthat/setup.R");
+        let setup_loop = "for (file in list.files(file.path(\"..\", \"..\", \"R\"), pattern = \"[.]R$\", full.names = TRUE)) {\n  source(file)\n}\n";
+        fs::write(&setup_path, setup_loop).unwrap();
+        let test_path = root_path.join("tests/testthat/test-rates.R");
+        let test_text = "rate <- compute_rate(10, 100)\nnever_defined_anywhere\n";
+        fs::write(&test_path, test_text).unwrap();
+
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                collect_package_r_file_inputs_from_disk(&root_path),
+                None,
+                None,
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+            state.workspace_scan_complete = true;
+        }
+        let undefined_compute_rate = |state: &WorldState, uri: &Url| {
+            snapshot_diagnostics(state, uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("compute_rate is not defined"))
+        };
+
+        let test_uri = Url::from_file_path(&test_path).unwrap();
+        open_doc(backend, &test_uri, "r", 1, test_text).await;
+        {
+            let state = backend.state.read().await;
+            assert!(state.package_state.workspace().is_none(), "not a package");
+            assert!(
+                snapshot_diagnostics(&state, &test_uri)
+                    .iter()
+                    .any(|diagnostic| diagnostic
+                        .message
+                        .contains("never_defined_anywhere is not defined")),
+                "control: undefined names are still reported: {:?}",
+                diagnostic_signature(&state, &test_uri)
+            );
+            assert!(
+                !undefined_compute_rate(&state, &test_uri),
+                "setup.R's loop must lend R/ functions: {:?}",
+                diagnostic_signature(&state, &test_uri)
+            );
+        }
+
+        let setup_uri = Url::from_file_path(&setup_path).unwrap();
+        open_doc(backend, &setup_uri, "r", 1, setup_loop).await;
+        change_doc(backend, &setup_uri, 2, "# loop removed\n").await;
+        let state = backend.state.read().await;
+        assert!(
+            undefined_compute_rate(&state, &test_uri),
+            "dropping the loop must withdraw R/ functions: {:?}",
+            diagnostic_signature(&state, &test_uri)
+        );
     }
 
     /// A preamble buffer opened (with unsaved edits) BEFORE the first package

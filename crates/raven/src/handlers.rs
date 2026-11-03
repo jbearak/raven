@@ -23332,10 +23332,11 @@ fn is_package_export(
 /// testthat preamble files via `library()`/`require()`
 /// (`scope_contribution.test_helper_attached_packages`, issue #432) that live
 /// in the SAME directory as `uri`. Empty unless `uri` is a testthat/testit
-/// test file (R/ files, plain `tests/*.R`, and non-package workspaces get an
-/// empty set). The same-directory restriction on the helper-attach union keeps
-/// `tests/testthat/` preambles from leaking into `tests/testit/` siblings,
-/// which never source them.
+/// test file (R/ files and plain `tests/*.R` get an empty set). Script-mode
+/// workspaces get the helper attaches only: testthat's implicit attach is
+/// derived from a package `DESCRIPTION`. The same-directory restriction on
+/// the helper-attach union keeps `tests/testthat/` preambles from leaking into
+/// `tests/testit/` siblings, which never source them.
 ///
 /// Used by the out-of-scope diagnostic collector to suppress
 /// misattribution of these packages' exports to a later `source()` call.
@@ -23363,7 +23364,7 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
     {
         return Vec::new();
     }
-    let Some(root) = snapshot.scope_contribution.workspace_root.as_ref() else {
+    let Some(root) = snapshot.scope_contribution.test_preamble_root() else {
         return Vec::new();
     };
     let query_uri = snapshot.package_query_uri.as_ref().unwrap_or(uri);
@@ -26074,7 +26075,7 @@ fn test_helper_definition_symbol(
     name: &str,
 ) -> Option<ScopedSymbol> {
     let contribution = state.package_state.scope_contribution();
-    let root = contribution.workspace_root.as_ref()?;
+    let root = contribution.test_preamble_root()?;
     let query_uri = state
         .authoritative_workspace_query_uri_for_open_document(uri, root)
         .unwrap_or_else(|| uri.clone());

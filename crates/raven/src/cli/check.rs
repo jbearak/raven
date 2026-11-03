@@ -1006,10 +1006,10 @@ async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
 /// bare calls to an installed-but-uncached package attached only inside a chunk,
 /// under-reporting relative to the editor.
 ///
-/// In package mode, also covers NAMESPACE whole-package `import(pkg)`
-/// directives (`scope_contribution.full_imports`) and packages attached by
-/// testthat preamble files (`scope_contribution.test_helper_attached_packages`,
-/// issue #432). For both, the undefined-variable
+/// Also covers NAMESPACE whole-package `import(pkg)` directives in package
+/// mode (`scope_contribution.full_imports`) and packages attached by testthat
+/// preamble files in package and script mode
+/// (`scope_contribution.test_helper_attached_packages`, issue #432). For both, the undefined-variable
 /// check resolves call- and value-position uses of the package's exports via
 /// `is_package_export`, which needs the cache warm; without this
 /// the "pending" heuristic suppresses only call-position uses, so
@@ -1067,7 +1067,7 @@ fn reported_packages_to_warm(
             .iter()
             .cloned(),
     );
-    // Package mode: packages attached by testthat preamble files
+    // Package and script mode: packages attached by testthat preamble files
     // (`helper*.R`/`setup*.R`) via `library()`/`require()` propagate to sibling
     // test files (issue #432), so warm their exports too — the undefined-
     // variable check resolves them via `is_package_export` reading the

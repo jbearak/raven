@@ -32,6 +32,7 @@ The startup prelude contributes:
 - Names assigned inside top-level conditionals, such as `if (interactive()) helper <- function() {}`.
 - Packages attached by top-level `library(pkg)` or `require(pkg)`, whose exports become available by bare name.
 - Top-level definitions reachable through `source()` and `sys.source()` calls whose paths are literal or can be [folded to literal paths](cross-file.md#how-raven-reads-source-calls), followed through those files' own such calls.
+- Top-level definitions in the files a top-level [`list.files()` source loop](cross-file.md#how-raven-reads-source-calls) loads, under the same limits as in any other file.
 
 Top-level `source()` and `sys.source()` calls use the same `local` and `envir` rules as [automatic `source()` detection](cross-file.md#automatic-source-detection). Only calls whose symbols land in the global scope contribute. Calls inside function bodies are ignored, because Raven doesn't run or model function calls while reading `.Rprofile`.
 
