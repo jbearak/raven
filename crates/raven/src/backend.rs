@@ -3715,6 +3715,10 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
 /// package R directories as well as ordinary existing targets. Empty sets
 /// return before filesystem-backed routing canonicalization because live
 /// routing snapshots may hold the state read guard.
+///
+/// The sets also hold each directory a `list.files()` source loop enumerates,
+/// so a direct child of a routed directory matches too: creating or deleting
+/// it can change that batch's members.
 fn path_in_rprofile_sourced_set(
     p: &std::path::Path,
     sourced: &std::collections::BTreeSet<std::path::PathBuf>,
@@ -3723,8 +3727,10 @@ fn path_in_rprofile_sourced_set(
         return false;
     }
 
-    sourced.contains(p)
-        || sourced.contains(&crate::package_state::preamble::canonicalize_for_routing(p))
+    let matches = |path: &std::path::Path| {
+        sourced.contains(path) || path.parent().is_some_and(|parent| sourced.contains(parent))
+    };
+    matches(p) || matches(&crate::package_state::preamble::canonicalize_for_routing(p))
 }
 
 #[cfg(test)]
@@ -32482,6 +32488,12 @@ mod tests {
             // An unrelated file is not a member.
             let other = tmp.path().join("scripts").join("other.R");
             assert!(!path_in_rprofile_sourced_set(&other, &sourced));
+            // A direct child of a routed `list.files()` directory matches, so
+            // a file created there reaches the rescan; a grandchild does not.
+            sourced.insert(tmp.path().join("scripts").canonicalize().unwrap());
+            assert!(path_in_rprofile_sourced_set(&other, &sourced));
+            let nested = tmp.path().join("scripts").join("nested").join("x.R");
+            assert!(!path_in_rprofile_sourced_set(&nested, &sourced));
         }
 
         #[test]
