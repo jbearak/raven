@@ -26075,7 +26075,7 @@ fn test_helper_definition_symbol(
     name: &str,
 ) -> Option<ScopedSymbol> {
     let contribution = state.package_state.scope_contribution();
-    let root = contribution.workspace_root.as_ref()?;
+    let root = contribution.test_preamble_root()?;
     let query_uri = state
         .authoritative_workspace_query_uri_for_open_document(uri, root)
         .unwrap_or_else(|| uri.clone());

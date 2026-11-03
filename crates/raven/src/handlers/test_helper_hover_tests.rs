@@ -100,6 +100,37 @@ async fn later_helper_hover_has_definition_and_location_open_or_closed() {
     }
 }
 
+/// A project that isn't a package has no `workspace_root`, only the preamble
+/// root, and its helper hovers still show the file-backed definition.
+#[tokio::test]
+async fn script_mode_helper_hover_has_definition_and_location() {
+    let mut f = Fixture::new();
+    let target = f.helper(
+        "tests/testthat/setup.R",
+        "compute_rate <- function(births, women) births / women\n",
+        &["compute_rate"],
+        false,
+    );
+    f.state.package_state.set_from(PackageState {
+        scope_contribution: PackageScopeContribution {
+            test_preamble_root: Some(f.dir.path().to_path_buf()),
+            test_helper_symbols: Arc::new(f.helpers.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let query = f.file("tests/testthat/test-rates.R", "compute_rate(1, 2)\n", true);
+    let value = f.hover(&query, 0, 1).await;
+    assert!(
+        value.contains("compute_rate <- function(births, women) births / women"),
+        "{value}"
+    );
+    assert!(
+        value.contains(&format!("[tests/testthat/setup.R]({target}), line 1")),
+        "{value}"
+    );
+}
+
 #[tokio::test]
 async fn helper_hover_respects_source_order_and_hoisting() {
     let mut f = Fixture::new();
