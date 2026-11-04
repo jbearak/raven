@@ -64884,6 +64884,20 @@ pacman::p_load(__qualified_missing_package__)";
         );
     }
 
+    /// `<<-` inside a top-level `local()` assigns in the global environment,
+    /// so the name is visible after the block, unlike a plain `<-`.
+    #[test]
+    fn super_assignment_in_local_block_escapes_the_block() {
+        let files = [(
+            "main.R",
+            "local({ g <<- 1; plain <- 2 })\nprint(g)\nprint(plain)\n",
+        )];
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "main.R"),
+            vec!["plain is not defined"]
+        );
+    }
+
     /// A `local()` block's own definitions stay in it, and its body runs
     /// immediately: a global defined after the block is not yet visible in
     /// it, unlike in a function body.

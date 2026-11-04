@@ -405,7 +405,7 @@ For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed 
 - **Inside `local({ ... })`**, the environment is the block's. The child sees the parent's bindings as of the call, including ones the block defined earlier, and its definitions are visible in the rest of the block and nowhere after it. So `d <- local({ source("child.R", local = TRUE); d })` works even when only the child creates `d`, and the child's other names don't leak into the script. `local()` with an explicit `envir`, or a `local` the file redefines, isn't modeled this way.
 - **Inside a function body**, the environment is the function's frame. The child sees the function's earlier locals and the script's globals, read from the whole file as for any function body, and its definitions are visible in the rest of the function only.
 
-A `local()` block also keeps its own definitions to itself, as in R: after `y <- local({ a <- 1; a })`, `a` is undefined. Unlike a function body, a block runs where it stands, so a global defined after the block isn't visible inside it.
+A `local()` block also keeps its own definitions to itself, as in R: after `y <- local({ a <- 1; a })`, `a` is undefined. Two effects escape the block, as they do in R: `library()` attaches the package for the rest of the script, and `<<-` assigns in the enclosing environment. Unlike a function body, a block runs where it stands, so a global defined after the block isn't visible inside it.
 
 Inside any other call, such as `with()`, `tryCatch()`, or a Shiny `observe()` body, Raven doesn't assume the call runs its argument in the script's own environment, so `local = TRUE` there isn't treated as top level.
 

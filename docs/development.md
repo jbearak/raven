@@ -879,7 +879,7 @@ never reads completed globals. A `source(local = TRUE)` call that provably runs
 in the file's own frame (`runs_in_file_frame` in `source_detect.rs`) is
 promoted to `SourceLocality::Global` at detection, so the graph, the scope
 resolvers, and the handler-side `inherits_symbols()` filters agree; one inside a
-`local()` block stays `CurrentFrame` and lends to the block's interval.
+`local()` block stays `CurrentFrame` and lends to the block's interval. `library()` and `<<-`/`->>` effects inside a block escape it (`FunctionScopeTree::outside_immediate`, applied in `annotate_event_function_scopes`), because in R they reach the search path and the enclosing frame.
 
 Traversal and mutation stay with their existing owners. Ordered attachment
 projection still discovers conditional Shiny scopes; the evaluation module only

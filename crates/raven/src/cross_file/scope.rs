@@ -420,6 +420,29 @@ impl FunctionScopeTree {
         self.immediate.insert(interval);
     }
 
+    /// `scope`, or, when it is an immediate `local()` interval, the innermost
+    /// enclosing interval that isn't (`None` at top level). For effects that
+    /// escape a `local()` body in R: `library()` attaches to the process search
+    /// path, and `<<-` assigns in the block's enclosing frame.
+    fn outside_immediate(
+        &self,
+        scope: Option<FunctionScopeInterval>,
+    ) -> Option<FunctionScopeInterval> {
+        let scope = scope?;
+        if !self.immediate.contains(&scope) {
+            return Some(scope);
+        }
+        self.query_point(scope.start)
+            .into_iter()
+            .filter(|outer| {
+                !self.immediate.contains(outer)
+                    && *outer != scope
+                    && outer.start <= scope.start
+                    && scope.end <= outer.end
+            })
+            .max_by_key(|outer| outer.start)
+    }
+
     /// Whether a query inside every interval of `scopes` reads globals as they
     /// stand at the query, or, when this is `true`, as the completed file
     /// leaves them. That holds when some interval is a real function or a
@@ -906,6 +929,9 @@ pub struct ScopeArtifacts {
     /// `local()` body intervals, which `rebuild_function_scope_index` marks
     /// immediate in `function_scope_tree` (see `push_local_block_scopes`).
     pub immediate_function_scopes: Vec<FunctionScopeInterval>,
+    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions, which escape an
+    /// immediate `local()` body (see `FunctionScopeTree::outside_immediate`).
+    pub escaping_def_anchors: HashSet<(u32, u32)>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
     /// `pkgload::load_all()` / bare `load_all()` call site (including one that
     /// lives only inside a function body).
@@ -953,6 +979,7 @@ impl Default for ScopeArtifacts {
             function_scope_tree: FunctionScopeTree::default(),
             conditional_shiny_deferred_scopes: Vec::new(),
             immediate_function_scopes: Vec::new(),
+            escaping_def_anchors: HashSet::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
         }
@@ -2097,23 +2124,47 @@ fn rebuild_function_scope_index(artifacts: &mut ScopeArtifacts, line_index: &Lin
 
 fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     let tree = &artifacts.function_scope_tree;
+    let escaping_defs = &artifacts.escaping_def_anchors;
     for event in &mut artifacts.timeline {
         match event {
+            // `<<-` / `->>` and `library()` escape an immediate `local()` body;
+            // everything else defined in one stays there.
             ScopeEvent::Def {
                 line,
                 column,
                 runtime_function_scope,
                 function_scope,
                 ..
+            } => {
+                let resolved = resolve_runtime_function_scope(
+                    tree,
+                    line_index,
+                    *runtime_function_scope,
+                    *line,
+                    *column,
+                );
+                *function_scope = if escaping_defs.contains(&(*line, *column)) {
+                    tree.outside_immediate(resolved)
+                } else {
+                    resolved
+                };
             }
-            | ScopeEvent::Removal {
+            ScopeEvent::PackageLoad {
                 line,
                 column,
                 runtime_function_scope,
                 function_scope,
                 ..
+            } => {
+                *function_scope = tree.outside_immediate(resolve_runtime_function_scope(
+                    tree,
+                    line_index,
+                    *runtime_function_scope,
+                    *line,
+                    *column,
+                ));
             }
-            | ScopeEvent::PackageLoad {
+            ScopeEvent::Removal {
                 line,
                 column,
                 runtime_function_scope,
@@ -3237,6 +3288,11 @@ fn collect_definitions(
     {
         let (visible_line, visible_column) =
             assignment_visible_from_position(node, line_index, &symbol);
+        if assignment_escapes_current_frame {
+            artifacts
+                .escaping_def_anchors
+                .insert((symbol.defined_line, symbol.defined_column));
+        }
         let event = ScopeEvent::Def {
             line: symbol.defined_line,
             column: symbol.defined_column,
@@ -15416,6 +15472,34 @@ g <- function() {
             source_events[0].inherits_symbols(),
             "Source should inherit symbols"
         );
+    }
+
+    /// `library()` inside a `local()` body attaches to the process search
+    /// path, so its event has no owner; a plain `<-` in the same block keeps
+    /// the block as its owner.
+    #[test]
+    fn library_in_local_block_is_not_owned_by_the_block() {
+        let code = "local({ library(stats4); plain <- 1 })\n";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+        let package_owner = artifacts.timeline.iter().find_map(|event| match event {
+            ScopeEvent::PackageLoad {
+                package,
+                function_scope,
+                ..
+            } if package == "stats4" => Some(*function_scope),
+            _ => None,
+        });
+        assert_eq!(package_owner, Some(None));
+        let plain_owner = artifacts.timeline.iter().find_map(|event| match event {
+            ScopeEvent::Def {
+                symbol,
+                function_scope,
+                ..
+            } if symbol.name.as_ref() == "plain" => Some(*function_scope),
+            _ => None,
+        });
+        assert!(matches!(plain_owner, Some(Some(_))), "{plain_owner:?}");
     }
 
     #[test]
