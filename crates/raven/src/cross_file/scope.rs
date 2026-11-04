@@ -2407,14 +2407,17 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
     );
     finalize_scope_timeline(&mut artifacts, &line_index);
     let definitions = live_top_level_exports(&artifacts).into_iter().collect();
+    // A `load_all()` in a `local()` body runs at top level too: like
+    // `library()`, it escapes the block (`outside_immediate`).
+    let tree = &artifacts.function_scope_tree;
     let load_all = artifacts.dev_load_all_sites.iter().any(|site| {
-        resolve_runtime_function_scope(
-            &artifacts.function_scope_tree,
+        tree.outside_immediate(resolve_runtime_function_scope(
+            tree,
             &line_index,
             site.runtime_function_scope,
             site.line,
             site.column,
-        )
+        ))
         .is_none()
     });
     (definitions, load_all)

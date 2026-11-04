@@ -5674,6 +5674,19 @@ source("b.R")"#;
         assert_eq!(sources[1].locality, SourceLocality::NonInheriting);
     }
 
+    /// `local()` runs its body at top level, so a `load_all()` there counts
+    /// in the static facts, while one in a function body still doesn't.
+    #[test]
+    fn static_script_facts_count_load_all_in_a_local_block() {
+        assert!(
+            StaticScriptFacts::from_text("local({ devtools::load_all() })\n").calls_dev_load_all
+        );
+        assert!(
+            !StaticScriptFacts::from_text("f <- function() devtools::load_all()\n")
+                .calls_dev_load_all
+        );
+    }
+
     #[test]
     fn static_script_facts_source_targets_apply_all_scope_filters() {
         let code = r#"
