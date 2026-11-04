@@ -204,9 +204,10 @@ With that installed and the package loaded, Raven reads `x[...] := value` like t
 - Every positional index except the last is evaluated among the columns, so it isn't checked. That's `i` in `d[i, name]`.
 - The last positional index is the column to write. A bare name or a string isn't a reference. In parentheses, `(var)` is evaluated, so `var` is checked.
 - A named index listed in `masked_arguments` is evaluated among the columns: `by = g`, `by = .(g, h)`, or `by = c("g", "h")`. Any other named index is checked.
+- With `raven.diagnostics.undefinedVariableInBracketIndices` off, no index is checked, `(var)` and other named indices included, as in an ordinary `[`.
 - `value` is evaluated among the columns, so it isn't checked.
 
-An `x[...]` that isn't on the left of the operator keeps its ordinary meaning, and so does a left side that isn't a `[` call, such as `a := b`.
+An `x[...]` that isn't on the left of the operator keeps its ordinary meaning. A left side that isn't a `[` call, such as `a := b`, does too, unless a `[[function]]` entry for the operator applies (see below).
 
 | Key | Meaning |
 | --- | --- |

@@ -23040,8 +23040,9 @@ fn collect_declared_infix_usages<'a>(
 /// The `[` call here is not an ordinary read, so [`collect_subset_usages`]
 /// and its data.table rules are bypassed: whether `x` is a data.table or a
 /// declared `[subset]` container does not change what this operator
-/// evaluates. With `undefinedVariableInBracketIndices` off, the column-name
-/// slot is suppressed with the other indices.
+/// evaluates. With `undefinedVariableInBracketIndices` off, every index is
+/// suppressed, the column-name slot and unlisted named indices included, as
+/// in an ordinary `[`.
 fn collect_subset_assign_usages<'a>(
     subset: Node<'a>,
     value: Node<'a>,
@@ -23071,7 +23072,10 @@ fn collect_subset_assign_usages<'a>(
             .map(|arg| arg.id());
         for arg in arg_nodes {
             let checked = match arg.child_by_field_name("name") {
-                Some(label) => !masked_arguments.contains(node_text(label, text)),
+                Some(label) => {
+                    analysis.bracket_indices_enabled
+                        && !masked_arguments.contains(node_text(label, text))
+                }
                 None if Some(arg.id()) == name_slot => {
                     analysis.bracket_indices_enabled
                         && arg
@@ -32019,6 +32023,46 @@ d[, k, keyby = grp] := 1
         let shadowed = format!("library(datakit)\n`:=` <- function(lhs, rhs) NULL\n{body}");
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), &shadowed).await;
         assert!(flagged.iter().any(|n| n == "age"), "shadowed: {flagged:?}");
+    }
+
+    /// With `undefinedVariableInBracketIndices` off, no index of the
+    /// left-hand `[` is checked, as in an ordinary `[`; the object and the
+    /// value keep their rules.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_honors_the_bracket_index_opt_out() {
+        let (_root, lib) =
+            library_with_declaring_package("datakit", &["\":=\""], Some(DATAKIT_OPERATOR_SIDECAR))
+                .await;
+        let code = "d[, (nm_typo), keyby = grp] := value_col\nundefined_obj[, k] := 1";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            false,
+            vec!["datakit".to_string()],
+            None,
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(!was_collected(&used, "nm_typo"));
+        assert!(!was_collected(&used, "grp"));
+        assert!(!was_collected(&used, "value_col"));
+        assert!(was_collected(&used, "undefined_obj"));
     }
 
     /// A `subset-assign` form changes nothing when the left side is not a
