@@ -872,8 +872,9 @@ A `local()` body is a synthetic interval too (`push_local_block_scopes`), but an
 the block runs where it stands. `FunctionScopeTree` records which intervals are
 immediate, and every "is this query inside a function?" decision (the
 `QueryContext` phase, the point resolvers' and attachment projection's
-`query_inside_function`, `ScopeStream::query_inside_function`, and the
-undefined-variable hoisting fast path) goes through
+`query_inside_function`, the cached resolver's prefix-cache key,
+`ScopeStream::query_inside_function`, the undefined-variable hoisting fast
+path, and `nested_closure_late_binding_resolves`) goes through
 `FunctionScopeTree::any_deferring`, so a query inside only immediate intervals
 never reads completed globals. A `source(local = TRUE)` call that provably runs
 in the file's own frame (`runs_in_file_frame` in `source_detect.rs`) is

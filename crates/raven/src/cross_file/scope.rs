@@ -420,6 +420,11 @@ impl FunctionScopeTree {
         self.immediate.insert(interval);
     }
 
+    /// Whether `interval` is an immediate `local()` body.
+    pub(crate) fn is_immediate(&self, interval: &FunctionScopeInterval) -> bool {
+        !self.immediate.is_empty() && self.immediate.contains(interval)
+    }
+
     /// `scope`, or, when it is an immediate `local()` interval, the innermost
     /// enclosing interval that isn't (`None` at top level). For effects that
     /// escape a `local()` body in R: `library()` attaches to the process search
@@ -429,7 +434,7 @@ impl FunctionScopeTree {
         scope: Option<FunctionScopeInterval>,
     ) -> Option<FunctionScopeInterval> {
         let scope = scope?;
-        if !self.immediate.contains(&scope) {
+        if self.immediate.is_empty() || !self.immediate.contains(&scope) {
             return Some(scope);
         }
         self.query_point(scope.start)
@@ -453,9 +458,13 @@ impl FunctionScopeTree {
         &self,
         scopes: impl IntoIterator<Item = &'s FunctionScopeInterval>,
     ) -> bool {
-        scopes
-            .into_iter()
-            .any(|scope| !self.immediate.contains(scope))
+        let mut scopes = scopes.into_iter();
+        // Hot path (every streaming visibility check): a file with no
+        // `local()` body pays only the old non-empty test.
+        if self.immediate.is_empty() {
+            return scopes.next().is_some();
+        }
+        scopes.any(|scope| !self.immediate.contains(scope))
     }
 
     /// Builds a balanced interval subtree from a sorted slice of function-scope intervals.
@@ -2143,11 +2152,12 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                     *line,
                     *column,
                 );
-                *function_scope = if escaping_defs.contains(&(*line, *column)) {
-                    tree.outside_immediate(resolved)
-                } else {
-                    resolved
-                };
+                *function_scope =
+                    if !escaping_defs.is_empty() && escaping_defs.contains(&(*line, *column)) {
+                        tree.outside_immediate(resolved)
+                    } else {
+                        resolved
+                    };
             }
             ScopeEvent::PackageLoad {
                 line,
@@ -7057,7 +7067,13 @@ where
     let inside = match get_artifacts(uri) {
         Some(art) => {
             hoist_globals
-                && !active_function_scopes_at(&art.function_scope_tree, line, column).is_empty()
+                && art
+                    .function_scope_tree
+                    .any_deferring(&active_function_scopes_at(
+                        &art.function_scope_tree,
+                        line,
+                        column,
+                    ))
         }
         None => false,
     };

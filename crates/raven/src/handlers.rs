@@ -10881,12 +10881,16 @@ fn nested_closure_late_binding_resolves(
     function_scope_tree: &scope::FunctionScopeTree,
     function_defs_by_name: &HashMap<String, Vec<(scope::FunctionScopeInterval, u32, u32)>>,
 ) -> bool {
-    let active_scopes =
-        function_scope_tree.query_point(scope::Position::new(usage_line, usage_col_utf16));
-    if active_scopes.len() < 2 {
-        return false;
-    }
-    let Some(innermost) = innermost_function_scope(&active_scopes) else {
+    // The closure that runs later is the innermost function body: an
+    // immediate `local()` body runs where it stands, so it can't be one. A
+    // later binding in any enclosing scope, `local()` bodies included, is
+    // what that closure late-binds.
+    let deferring_scopes: Vec<_> = function_scope_tree
+        .query_point(scope::Position::new(usage_line, usage_col_utf16))
+        .into_iter()
+        .filter(|scope| !function_scope_tree.is_immediate(scope))
+        .collect();
+    let Some(innermost) = innermost_function_scope(&deferring_scopes) else {
         return false;
     };
     function_defs_by_name.get(name).is_some_and(|defs| {
@@ -64882,6 +64886,21 @@ pacman::p_load(__qualified_missing_package__)";
             undefined_messages_in_workspace(&files, "R/child.R"),
             vec!["parent_var is not defined"]
         );
+    }
+
+    /// A `local()` block inside a function runs where it stands, so a local
+    /// the function defines afterwards is not yet bound there; a nested
+    /// function body, which runs later, still late-binds it, including one
+    /// defined inside a `local()` block.
+    #[test]
+    fn local_block_in_function_does_not_late_bind_later_locals() {
+        let files = [(
+            "main.R",
+            "f <- function() {\n  local({ print(x) })\n  x <- 1\n}\ng <- function() {\n  h <- function() print(y)\n  y <- 1\n}\nlocal({\n  k <- function() print(z)\n  z <- 1\n  k()\n})\n",
+        )];
+        let messages = undefined_messages_in_workspace(&files, "main.R");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("x "), "{messages:?}");
     }
 
     /// `<<-` inside a top-level `local()` assigns in the global environment,
