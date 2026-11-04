@@ -126,7 +126,7 @@ Each `[[function]]` entry takes:
 
 | Key | Meaning |
 | --- | --- |
-| `name` | The exported function. A name the package doesn't export is ignored. |
+| `name` | The exported function. A name the package doesn't export is ignored. An infix operator (`"%where%"`, `":="`) counts: its entry applies to `a %where% b` as it does to `` `%where%`(a, b) ``, with `a` as the first argument and `b` as the second. |
 | `policy` | `"per-formal"` (the default), `"whole-call"`, or `"named-arguments"`: the three policy kinds Raven's built-in table uses. |
 | `formals` | The function's formal arguments **in declaration order**. Raven matches positional arguments against this list, so a stale order shifts which argument is skipped. |
 | `captured` | The formals whose argument is captured, data-masked, or tidy-selected. Every name must appear in `formals`. |
@@ -174,6 +174,56 @@ The two optional lists refine this for objects Raven can trace to a definition:
 - The lists are intersected with the package's export set, like `[[function]]` entries, and share their size limits: the file may be at most 256 KiB, and each list honors its first 2,000 entries, ignoring any beyond that.
 - `data.table` itself is built in. A sidecar under that name can't change Raven's own entry.
 - Older Raven versions that predate `[subset]` ignore the table, since unknown keys are never an error, so it ships under `schema = 1`.
+
+</details>
+
+### Declaring an assignment operator
+
+Some packages export an infix operator that writes a column of a data frame, with the row selection and the new value evaluated among the data frame's columns. datakit's `:=` is one:
+
+```r
+library(datakit)
+d[age >= 40, older] := 1
+d[, avg, by = region] := mean(income, na.rm = TRUE)
+```
+
+Here `d[...]` isn't an ordinary read, so neither a `[[function]]` entry nor `[subset]` describes it. `[subset]` would also be wrong for datakit, because its `[` is base R's: it would silence `d[typo > 1, ]` everywhere. Declare the operator with an `[[operator]]` entry instead:
+
+```toml
+schema = 1
+
+[[operator]]
+name = ":="
+form = "subset-assign"
+masked_arguments = ["by"]
+```
+
+With that installed and the package loaded, Raven reads `x[...] := value` like this:
+
+- `x` is an ordinary variable and is checked, so an undefined `d` is still reported. In `l$d[...] := value`, `l` is checked.
+- Every positional index except the last is evaluated among the columns, so it isn't checked. That's `i` in `d[i, name]`.
+- The last positional index is the column to write. A bare name or a string isn't a reference. In parentheses, `(var)` is evaluated, so `var` is checked.
+- A named index listed in `masked_arguments` is evaluated among the columns: `by = g`, `by = .(g, h)`, or `by = c("g", "h")`. Any other named index is checked.
+- With `raven.diagnostics.undefinedVariableInBracketIndices` off, no index is checked, `(var)` and other named indices included, as in an ordinary `[`.
+- `value` is evaluated among the columns, so it isn't checked.
+
+An `x[...]` that isn't on the left of the operator keeps its ordinary meaning. A left side that isn't a `[` call, such as `a := b`, does too, unless a `[[function]]` entry for the operator applies (see below).
+
+| Key | Meaning |
+| --- | --- |
+| `name` | The exported operator: `":="` or a `"%op%"` name. A name the package doesn't export is ignored. |
+| `form` | Required. `"subset-assign"` is the only form so far. An entry with a missing or unknown form is ignored, so a future form can ship under `schema = 1`. |
+| `masked_arguments` | Named `[` arguments evaluated among, or naming, the columns. May be empty or omitted. |
+
+<details markdown="1">
+<summary>When an operator declaration applies</summary>
+
+- An infix operator can't be written `pkg::op`, so Raven applies a declaration only while the package provides the operator: the package is in play through `library()`, `require()`, `Imports:`, `importFrom`, or its own sources, or the file binds `` `:=` <- datakit::`:=` ``. A `pkg::` reference to another of the package's functions doesn't count, because it doesn't put the operator on the search path.
+- A top-level `` `:=` <- function(...) `` in the file shadows every package's declaration, as it shadows the package's operator in R.
+- Raven doesn't check the call heads inside masked parts either, so `mean` in `mean(income)` isn't checked, the same as inside data.table's `[` or a dplyr verb.
+- An `[[operator]]` entry and a `[[function]]` entry may name the same operator. The `[[function]]` policy applies when the left side doesn't match the form.
+- A declaration for an operator Raven models itself is ignored. That covers magrittr's pipes and `%$%`, zeallot's `%<-%` and `%->%`, foreach's `%do%` family and `%:%`, and base R's operators such as `%in%`. The same holds for `[[function]]` entries naming those operators.
+- Older Raven versions ignore `[[operator]]`, so it ships under `schema = 1`.
 
 </details>
 

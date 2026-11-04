@@ -240,7 +240,7 @@ Objects you build locally with `data.frame()`, `tibble()`, or `read.csv()` still
 
 ### Shipping NSE metadata with your package
 
-If your package exports data-masking or tidy-selecting functions, or a container whose `[` method quotes its arguments like data.table's, describe that once in `inst/raven/nse.toml` and every user of the package gets the right diagnostics without writing `# raven: nse` directives. `[[function]]` entries declare per-function argument policies, and an optional `[subset]` table declares data.table-style `[` semantics, naming the constructors and by-reference converters that produce such objects.
+If your package exports data-masking or tidy-selecting functions, or a container whose `[` method quotes its arguments like data.table's, describe that once in `inst/raven/nse.toml` and every user of the package gets the right diagnostics without writing `# raven: nse` directives. `[[function]]` entries declare per-function argument policies, including those of infix operators. An optional `[subset]` table declares data.table-style `[` semantics, naming the constructors and by-reference converters that produce such objects. `[[operator]]` entries declare an assignment operator such as `d[i, name] := value`, whose indices and value are evaluated among `d`'s columns.
 
 Inside your package's own files, the `[subset]` declaration applies without a `library()` call, like your own NSE verbs. Raven reads the file from the *installed* copy of your package, though, so install it (for example with `devtools::install()`) for the declaration to take effect while you develop. See [Declaring NSE from a package](non-standard-evaluation.md#declaring-nse-from-a-package).
 

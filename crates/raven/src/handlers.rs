@@ -21516,11 +21516,17 @@ fn callee_leaf_name<'t>(func: Node<'t>, text: &'t str) -> Option<&'t str> {
 ///
 /// Every `package_policy` consumer in this module routes through here so a new
 /// resolution path can't silently skip declared policies.
+///
+/// `name` may arrive backtick-quoted: `canonical_use_name` strips backticks
+/// only from syntactic names, so `` `%op%`(a, b) `` and the alias target of
+/// `` `:=` <- pkg::`:=` `` keep them. Both tables key on the bare name, so the
+/// quotes are dropped here.
 fn package_arg_policy(
     pkg: &str,
     name: &str,
     analysis: &NseAnalysis,
 ) -> Option<crate::nse::ArgPolicy> {
+    let name = unquote_backtick_name(name).unwrap_or(name);
     crate::nse::package_policy(pkg, name).or_else(|| {
         analysis
             .package_library
@@ -22586,6 +22592,9 @@ fn collect_usages_with_analysis<'a>(
     match node.kind() {
         "call" => collect_call_usages(node, text, analysis, &base_context, used),
         "subset" | "subset2" => collect_subset_usages(node, text, analysis, &base_context, used),
+        "binary_operator"
+            if !base_context.suppressed
+                && collect_declared_infix_usages(node, text, analysis, &base_context, used) => {}
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -22877,6 +22886,209 @@ fn collect_subset_usages<'a>(
         // Bracket indices are never pipe-fed (their policies are uniform anyway).
         apply_arg_policy(args, text, analysis, context, &policy, false, used);
     }
+}
+
+/// The name of a `binary_operator`'s operator when it is one a package can
+/// export and declare: `:=` or a `%op%` special. `None` for `<-`, `+`, `~`,
+/// `|>`, and the rest of R's fixed operators.
+fn declarable_infix_operator<'t>(node: Node<'t>, text: &'t str) -> Option<&'t str> {
+    let op = node.child_by_field_name("operator")?;
+    match op.kind() {
+        ":=" => Some(":="),
+        "special" => Some(node_text(op, text)),
+        _ => None,
+    }
+}
+
+/// Infix operators whose evaluation Raven models itself: magrittr's pipes and
+/// exposition operator, zeallot / rlang destructuring, foreach's `%:%` and
+/// `%do%` family, and base R's (`%in%`, `%%`, `%o%`, …). A package
+/// declaration for one of these is ignored, the operator analogue of
+/// "built-ins win" in [`package_arg_policy`]: an installed sidecar must not be
+/// able to blank out every pipeline in a file.
+fn raven_models_infix_operator(op: &str, analysis: &NseAnalysis) -> bool {
+    matches!(
+        op,
+        "%>%" | "%<>%" | "%$%" | "%T>%" | "%!>%" | "%|>%" | "%<-%" | "%->%" | "%<~%" | "%:%"
+    ) || op.starts_with("%do")
+        || is_builtin(op)
+        || analysis
+            .base_exports
+            .is_some_and(|exports| exports.contains(op))
+}
+
+/// What the package providing infix operator `op` declares for it in
+/// `raven/nse.toml`: its `[[operator]]` form and its `[[function]]` policy
+/// (built-in table first, via [`package_arg_policy`]), from the first package
+/// that declares either.
+///
+/// An infix operator cannot be namespace-qualified, so the provider is found
+/// the way R's search path would: a top-level `` `op` <- pkg::`op` `` alias
+/// names it outright; any other top-level binding of `` `op` `` shadows every
+/// package; otherwise the in-play packages, the package under development,
+/// and the owner of the export among in-play packages' dependencies are tried
+/// in that order. A `pkg::` qualifier elsewhere in the file does not count:
+/// it does not put `op` on the search path.
+fn declared_infix_operator(
+    op: &str,
+    analysis: &NseAnalysis,
+) -> (
+    Option<crate::nse_declarations::OperatorForm>,
+    Option<crate::nse::ArgPolicy>,
+) {
+    let none = (None, None);
+    let Some(lib) = analysis.package_library else {
+        return none;
+    };
+    if raven_models_infix_operator(op, analysis) {
+        return none;
+    }
+    let lookup = |pkg: &str| {
+        let found = (
+            lib.declared_operator_form(pkg, op),
+            package_arg_policy(pkg, op, analysis),
+        );
+        (found.0.is_some() || found.1.is_some()).then_some(found)
+    };
+    // `collect_nse_facts` keys a non-syntactic binding with its backticks.
+    let key = format!("`{op}`");
+    if let Some(alias) = analysis.local_callee_aliases.get(&key) {
+        return match alias {
+            LocalCalleeAlias::Qualified { package, name }
+                if unquote_backtick_name(name).unwrap_or(name) == op =>
+            {
+                lookup(package).unwrap_or(none)
+            }
+            _ => none,
+        };
+    }
+    if analysis.local_callee_shadows.contains(&key) {
+        return none;
+    }
+    analysis
+        .in_play_packages
+        .iter()
+        .map(String::as_str)
+        .chain(analysis.self_nse_package.as_deref())
+        .find_map(lookup)
+        .or_else(|| {
+            lib.find_package_owner_for_symbol(op, &analysis.in_play_packages)
+                .filter(|owner| !crate::package_library::is_load_all_sentinel(owner))
+                .and_then(|owner| lookup(&owner))
+        })
+        .unwrap_or(none)
+}
+
+/// Visit an infix `binary_operator` whose operator a package declares in its
+/// `raven/nse.toml`, and return `true` when it did; `false` leaves the node to
+/// the ordinary child walk. Two declarations apply:
+///
+/// 1. An `[[operator]]` form, when its left side has the form's shape. For
+///    [`OperatorForm::SubsetAssign`](crate::nse_declarations::OperatorForm::SubsetAssign)
+///    that is a `[` call, `x[...] OP value`: see
+///    [`collect_subset_assign_usages`].
+/// 2. Otherwise a `[[function]]` policy, applied to `lhs OP rhs` as R applies
+///    it to `` `OP`(lhs, rhs) ``: `lhs` is the first positional argument and
+///    `rhs` the second.
+///
+/// Before declarations existed for infix operators the collector walked every
+/// `binary_operator` as a plain expression, which is still what happens when
+/// nothing is declared.
+fn collect_declared_infix_usages<'a>(
+    node: Node<'a>,
+    text: &str,
+    analysis: &NseAnalysis,
+    context: &UsageContext,
+    used: &mut Vec<(String, Node<'a>)>,
+) -> bool {
+    let Some(op) = declarable_infix_operator(node, text) else {
+        return false;
+    };
+    let (Some(lhs), Some(rhs)) = (
+        node.child_by_field_name("lhs"),
+        node.child_by_field_name("rhs"),
+    ) else {
+        return false;
+    };
+    let (form, policy) = declared_infix_operator(op, analysis);
+    if let Some(crate::nse_declarations::OperatorForm::SubsetAssign { masked_arguments }) = &form
+        && lhs.kind() == "subset"
+    {
+        collect_subset_assign_usages(lhs, rhs, text, analysis, context, masked_arguments, used);
+        return true;
+    }
+    let Some(policy) = policy else {
+        return false;
+    };
+    let mask = crate::nse::suppressed_arguments(&policy, &[None, None], false);
+    for (operand, suppress) in [lhs, rhs].into_iter().zip(mask) {
+        let operand_context = UsageContext {
+            in_formula: context.in_formula,
+            suppressed: suppress,
+        };
+        collect_usages_with_analysis(operand, text, analysis, &operand_context, used);
+    }
+    true
+}
+
+/// Visit `x[...] OP value` under a declared `subset-assign` form (see
+/// [`crate::nse_declarations::OperatorForm::SubsetAssign`]). `x` is checked;
+/// positional indices before the last are masked; the last positional index
+/// is the column name, checked only in its `(expr)` form; a named index is
+/// masked iff `masked_arguments` lists it; `value` is masked.
+///
+/// The `[` call here is not an ordinary read, so [`collect_subset_usages`]
+/// and its data.table rules are bypassed: whether `x` is a data.table or a
+/// declared `[subset]` container does not change what this operator
+/// evaluates. With `undefinedVariableInBracketIndices` off, every index is
+/// suppressed, the column-name slot and unlisted named indices included, as
+/// in an ordinary `[`.
+fn collect_subset_assign_usages<'a>(
+    subset: Node<'a>,
+    value: Node<'a>,
+    text: &str,
+    analysis: &NseAnalysis,
+    context: &UsageContext,
+    masked_arguments: &HashSet<String>,
+    used: &mut Vec<(String, Node<'a>)>,
+) {
+    let masked = UsageContext {
+        in_formula: context.in_formula,
+        suppressed: true,
+    };
+    if let Some(object) = subset.child_by_field_name("function") {
+        collect_usages_with_analysis(object, text, analysis, context, used);
+    }
+    if let Some(args) = subset.child_by_field_name("arguments") {
+        let mut cursor = args.walk();
+        let arg_nodes: Vec<Node> = args
+            .children(&mut cursor)
+            .filter(|child| child.kind() == "argument")
+            .collect();
+        let name_slot = arg_nodes
+            .iter()
+            .rev()
+            .find(|arg| arg.child_by_field_name("name").is_none())
+            .map(|arg| arg.id());
+        for arg in arg_nodes {
+            let checked = match arg.child_by_field_name("name") {
+                Some(label) => {
+                    analysis.bracket_indices_enabled
+                        && !masked_arguments.contains(node_text(label, text))
+                }
+                None if Some(arg.id()) == name_slot => {
+                    analysis.bracket_indices_enabled
+                        && arg
+                            .child_by_field_name("value")
+                            .is_some_and(|v| v.kind() == "parenthesized_expression")
+                }
+                None => false,
+            };
+            let arg_context = if checked { context } else { &masked };
+            collect_usages_with_analysis(arg, text, analysis, arg_context, used);
+        }
+    }
+    collect_usages_with_analysis(value, text, analysis, &masked, used);
 }
 
 /// Recurse into a call/subset `arguments` node, suppressing each argument's
@@ -31691,6 +31903,217 @@ mod tests {
             "built-in dplyr policy still checks `.data`"
         );
         assert!(!was_collected(&used, "col"));
+    }
+
+    // ---- Package-declared infix operators (`[[operator]]`, infix `[[function]]`) ----
+
+    /// datakit's sidecar: `d[i, name, by = g] := value`.
+    const DATAKIT_OPERATOR_SIDECAR: &str = r#"
+        schema = 1
+        [[operator]]
+        name = ":="
+        form = "subset-assign"
+        masked_arguments = ["by"]
+    "#;
+
+    /// Run the full diagnostics pipeline on `code` with two fake packages
+    /// installed, as in do2r's generated scripts: `dtaparser` exporting
+    /// `read_dta` with no sidecar, and `datakit` exporting `:=` with `sidecar`.
+    /// Returns the names reported as undefined variables.
+    async fn datakit_undefined_names(sidecar: Option<&str>, code: &str) -> Vec<String> {
+        let (root, mut lib) = library_with_declaring_package("datakit", &["\":=\""], sidecar).await;
+        let reader_dir = root.path().join("dtaparser");
+        std::fs::create_dir_all(&reader_dir).unwrap();
+        std::fs::write(
+            reader_dir.join("DESCRIPTION"),
+            "Package: dtaparser\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(reader_dir.join("NAMESPACE"), "export(read_dta)\n").unwrap();
+        lib.set_lib_paths(vec![root.path().to_path_buf()]);
+        lib.get_package("dtaparser").await;
+        lib.get_package("datakit").await;
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(lib);
+        state.open_document(uri.clone(), code, Some(1));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics");
+        diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ))
+            })
+            .filter_map(|d| {
+                d.message
+                    .strip_suffix(" is not defined")
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The motivating script: the `:=` lines' columns are silent, while the
+    /// ordinary `[` read and the unrelated typo are still reported.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_masks_columns_but_not_ordinary_reads() {
+        let code = r#"library(dtaparser)
+library(datakit)
+d <- read_dta("s.dta")
+d[age >= 40, older] := 1
+d[, avg, by = region] := mean(income, na.rm = TRUE)
+x <- d[typo_plain > 1, ]
+print(undefined_thing)
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["typo_plain", "undefined_thing"]);
+
+        // Control: without the sidecar every column is flagged, so the
+        // declaration is what silenced them.
+        let flagged = datakit_undefined_names(None, code).await;
+        for name in ["age", "older", "avg", "region", "income", "typo_plain"] {
+            assert!(flagged.iter().any(|n| n == name), "{name}: {flagged:?}");
+        }
+    }
+
+    /// Every shape do2r emits, plus the parts that stay checked: the indexed
+    /// object (also when it is a function formal), the `(var)` column-name
+    /// form, and named `[` arguments the declaration does not list.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_checks_object_and_parenthesized_name() {
+        let code = r#"library(dtaparser)
+library(datakit)
+d <- read_dta("s.dta")
+d[, n, by = c("g", "h")] := .N
+d[, m, by = .(g, h)] := mean(.data$income)
+for (v in c("a", "b")) d[x > 1, (v)] := 0
+p <- function(d) {
+  d[x > 3, big] := 1
+  d
+}
+d[, (nm_typo)] := 1
+e[, col] := 1
+d[, k, keyby = grp] := 1
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["nm_typo", "e", "grp"]);
+    }
+
+    /// The declaration applies only while the package provides `:=`: a
+    /// `library()` call (above), or a `` `:=` <- datakit::`:=` `` binding.
+    /// Without either, or under a local definition, the columns are flagged.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_requires_the_package_to_provide_it() {
+        let body = "d <- data.frame(a = 1)\nd[age > 1, older] := 1\n";
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), body).await;
+        assert!(
+            flagged.iter().any(|n| n == "age"),
+            "not in play: {flagged:?}"
+        );
+
+        let aliased = format!("`:=` <- datakit::`:=`\n{body}");
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), &aliased).await;
+        assert!(flagged.is_empty(), "aliased: {flagged:?}");
+
+        let shadowed = format!("library(datakit)\n`:=` <- function(lhs, rhs) NULL\n{body}");
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), &shadowed).await;
+        assert!(flagged.iter().any(|n| n == "age"), "shadowed: {flagged:?}");
+    }
+
+    /// With `undefinedVariableInBracketIndices` off, no index of the
+    /// left-hand `[` is checked, as in an ordinary `[`; the object and the
+    /// value keep their rules.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_honors_the_bracket_index_opt_out() {
+        let (_root, lib) =
+            library_with_declaring_package("datakit", &["\":=\""], Some(DATAKIT_OPERATOR_SIDECAR))
+                .await;
+        let code = "d[, (nm_typo), keyby = grp] := value_col\nundefined_obj[, k] := 1";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            false,
+            vec!["datakit".to_string()],
+            None,
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(!was_collected(&used, "nm_typo"));
+        assert!(!was_collected(&used, "grp"));
+        assert!(!was_collected(&used, "value_col"));
+        assert!(was_collected(&used, "undefined_obj"));
+    }
+
+    /// A `subset-assign` form changes nothing when the left side is not a
+    /// `[` call: `a := b` is walked as before.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_ignores_a_non_bracket_left_side() {
+        let code = "library(datakit)\nlhs_name := rhs_name\n";
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(flagged, vec!["lhs_name", "rhs_name"]);
+    }
+
+    /// A `[[function]]` entry for an infix operator applies to `a %op% b`
+    /// exactly as to `` `%op%`(a, b) ``, which also now resolves despite its
+    /// backticks.
+    #[tokio::test]
+    async fn infix_function_declaration_applies_to_operator_and_backtick_call() {
+        let sidecar = r#"
+            [[function]]
+            name = "%where%"
+            formals = ["data", "cond"]
+            captured = ["cond"]
+        "#;
+        let (_root, lib) =
+            library_with_declaring_package("pkgop", &["\"%where%\""], Some(sidecar)).await;
+        let code = "survey %where% income > 5\n`%where%`(survey2, age > 1)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgop"], &lib, &mut used);
+        assert!(was_collected(&used, "survey"));
+        assert!(was_collected(&used, "survey2"));
+        assert!(!was_collected(&used, "income"));
+        assert!(!was_collected(&used, "age"));
+    }
+
+    /// A sidecar cannot redeclare an operator Raven models itself: a package
+    /// claiming `%>%` is whole-call NSE leaves pipelines checked.
+    #[tokio::test]
+    async fn infix_declaration_cannot_claim_a_modeled_operator() {
+        let sidecar = r#"
+            [[function]]
+            name = "%>%"
+            policy = "whole-call"
+        "#;
+        let (_root, lib) =
+            library_with_declaring_package("pkgop", &["\"%>%\""], Some(sidecar)).await;
+        let code = "piped_input %>% head(piped_arg)";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgop"], &lib, &mut used);
+        assert!(was_collected(&used, "piped_input"));
+        assert!(was_collected(&used, "piped_arg"));
     }
 
     // ---- Package-declared bracket NSE (`[subset]` in `inst/raven/nse.toml`) ----

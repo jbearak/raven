@@ -2025,6 +2025,20 @@ impl PackageLibrary {
             .and_then(|info| info.nse_declarations.policies.get(name).cloned())
     }
 
+    /// The `[[operator]]` form `package` declares for its exported infix
+    /// operator `op` in `raven/nse.toml`. Same cached-only contract as
+    /// [`Self::declared_nse_policy`].
+    pub(crate) fn declared_operator_form(
+        &self,
+        package: &str,
+        op: &str,
+    ) -> Option<crate::nse_declarations::OperatorForm> {
+        self.packages
+            .load()
+            .get(package)
+            .and_then(|info| info.nse_declarations.operators.get(op).cloned())
+    }
+
     /// Every cached package whose `raven/nse.toml` carries a `[subset]` table,
     /// with what it declared (synchronous, cached-only).
     ///
