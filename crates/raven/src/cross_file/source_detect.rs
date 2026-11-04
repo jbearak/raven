@@ -287,7 +287,9 @@ pub struct NamespaceReference {
 ///
 /// let mut parser = tree_sitter::Parser::new();
 /// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-/// let source = "source('utils.R', local = TRUE)\n";
+/// // Inside a function, `local = TRUE` is the function's frame. At a
+/// // script's top level it would be the script's own frame, so `Global`.
+/// let source = "f <- function() source('utils.R', local = TRUE)\n";
 /// let tree = parser.parse(source, None).unwrap();
 /// let sources = detect_source_calls(&tree, source);
 /// assert_eq!(sources.len(), 1);
