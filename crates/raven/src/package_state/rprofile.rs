@@ -645,10 +645,30 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
     }
 
     #[test]
-    fn local_true_source_is_not_followed() {
+    fn local_true_source_inside_local_block_is_not_followed() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("priv.R"), "private_def <- 1\n").unwrap();
-        // source(..., local = TRUE) puts defs in a local env, not globals.
+        // Inside `local()`, `local = TRUE` puts defs in the block's env, not
+        // globals.
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "local({ source(\"priv.R\", local = TRUE) })\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            !scan.symbols.contains("private_def"),
+            "a local() block's source must not contribute globals: {:?}",
+            scan.symbols
+        );
+    }
+
+    #[test]
+    fn top_level_local_true_source_is_followed() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("priv.R"), "shared_def <- 1\n").unwrap();
+        // R sources the user profile into the global environment, so a
+        // top-level `local = TRUE` evaluates the child there too.
         fs::write(
             tmp.path().join(".Rprofile"),
             "source(\"priv.R\", local = TRUE)\n",
@@ -656,8 +676,8 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
         .unwrap();
         let scan = scan_workspace_rprofile(tmp.path());
         assert!(
-            !scan.symbols.contains("private_def"),
-            "local=TRUE source must not contribute globals: {:?}",
+            scan.symbols.contains("shared_def"),
+            "top-level local=TRUE source contributes globals: {:?}",
             scan.symbols
         );
     }

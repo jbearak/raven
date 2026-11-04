@@ -287,7 +287,9 @@ pub struct NamespaceReference {
 ///
 /// let mut parser = tree_sitter::Parser::new();
 /// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-/// let source = "source('utils.R', local = TRUE)\n";
+/// // Inside a function, `local = TRUE` is the function's frame. At a
+/// // script's top level it would be the script's own frame, so `Global`.
+/// let source = "f <- function() source('utils.R', local = TRUE)\n";
 /// let tree = parser.parse(source, None).unwrap();
 /// let sources = detect_source_calls(&tree, source);
 /// assert_eq!(sources.len(), 1);
@@ -677,6 +679,19 @@ fn try_parse_source_call<'tree, 'text>(
         }
     };
     let locality = locality.relative_to(evaluation_frame);
+    // `local = TRUE` names the frame that calls `source()`. When that call
+    // provably runs in the file's own frame, that frame is the one the file's
+    // top-level definitions live in, so the child's definitions land beside
+    // them exactly as with `local = FALSE`.
+    let locality = if locality == SourceLocality::CurrentFrame
+        && evaluation_frame == CaptureEvaluationFrame::Caller
+        && runtime_function_scope == RuntimeFunctionScope::Lexical
+        && runs_in_file_frame(node, content)
+    {
+        SourceLocality::Global
+    } else {
+        locality
+    };
     let chdir = matches!(
         classify_matched_bool(
             &matched_arguments,
@@ -710,6 +725,43 @@ fn try_parse_source_call<'tree, 'text>(
         source_batch_kind: None,
         guarded_by_file_exists: false,
     })
+}
+
+/// True when `node` provably evaluates in the frame running the file's
+/// top-level code: every ancestor up to the root is syntax that evaluates its
+/// operands in place (braces, parentheses, `if`, loops, and assignments).
+///
+/// Any call ancestor fails the proof, because a call may evaluate its argument
+/// in another frame (`local()`, `with()`, a Shiny `observe()` body) or not at
+/// all. A function definition fails it too. So does a binary operator other
+/// than an assignment: `%do%` runs its body in foreach's frame, and `~`
+/// doesn't evaluate. A failed proof leaves `local = TRUE` as
+/// [`SourceLocality::CurrentFrame`], which the scope resolver places in the
+/// enclosing function or synthetic frame.
+fn runs_in_file_frame(node: Node, content: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "program" => return true,
+            "braced_expression"
+            | "parenthesized_expression"
+            | "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "repeat_statement" => {}
+            "binary_operator" => {
+                let is_assignment = parent.child_by_field_name("operator").is_some_and(|op| {
+                    matches!(node_text(op, content), "<-" | "<<-" | "=" | "->" | "->>")
+                });
+                if !is_assignment {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Recognize the narrow optional-source idiom
@@ -4030,11 +4082,11 @@ mod tests {
 
     #[test]
     fn detects_folded_file_path_source_call() {
-        let code = r#"source(file.path("scripts", "helpers.R"), local = TRUE)"#;
+        let code = r#"source(file.path("scripts", "helpers.R"), local = FALSE)"#;
         let sources = detect_source_calls(&parse_r(code), code);
         assert_eq!(sources.len(), 1, "got: {sources:?}");
         assert_eq!(sources[0].path, "scripts/helpers.R");
-        assert!(sources[0].locality != SourceLocality::Global);
+        assert_eq!(sources[0].locality, SourceLocality::Global);
         assert!(!sources[0].is_directive);
         assert!(sources[0].system_file.is_none());
     }
@@ -5355,10 +5407,11 @@ source(p)
 
     #[test]
     fn test_source_with_local_true() {
+        // Inside a function body, where `local = TRUE` is the function's frame.
         for code in [
-            r#"source("utils.R", local = TRUE)"#,
-            r#"source("utils.R", local = T)"#,
-            r#"source("utils.R", TRUE)"#,
+            r#"f <- function() source("utils.R", local = TRUE)"#,
+            r#"f <- function() source("utils.R", local = T)"#,
+            r#"f <- function() source("utils.R", TRUE)"#,
         ] {
             let tree = parse_r(code);
             let sources = detect_source_calls(&tree, code);
@@ -5621,6 +5674,19 @@ source("b.R")"#;
         assert_eq!(sources[1].locality, SourceLocality::NonInheriting);
     }
 
+    /// `local()` runs its body at top level, so a `load_all()` there counts
+    /// in the static facts, while one in a function body still doesn't.
+    #[test]
+    fn static_script_facts_count_load_all_in_a_local_block() {
+        assert!(
+            StaticScriptFacts::from_text("local({ devtools::load_all() })\n").calls_dev_load_all
+        );
+        assert!(
+            !StaticScriptFacts::from_text("f <- function() devtools::load_all()\n")
+                .calls_dev_load_all
+        );
+    }
+
     #[test]
     fn static_script_facts_source_targets_apply_all_scope_filters() {
         let code = r#"
@@ -5651,6 +5717,9 @@ f <- function() source("deferred.R")
                 "partial-file.R",
                 "short-false.R",
                 "computed/helper.R",
+                // Top-level `local = TRUE` is the file's own frame.
+                "local.R",
+                "short-local.R",
                 "missing-local.R"
             ]
         );

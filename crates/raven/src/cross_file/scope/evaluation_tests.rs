@@ -557,3 +557,25 @@ fn conditional_shiny_ownership_uses_attachment_state_at_the_call() {
         ],
     );
 }
+
+/// A child's `local()` block runs when the child is sourced, so with hoisting
+/// on it still sees the parent only as of the call: an immediate interval must
+/// not select the parent's end-of-file prefix the way a function body does.
+#[test]
+fn local_block_reads_the_parent_as_of_the_call_in_every_resolver() {
+    assert_evaluation_contract(
+        &[
+            (
+                "main.R",
+                "# raven: sourced-by parent.R line=2\nlocal({ print(late) })\n",
+            ),
+            ("parent.R", "early <- 1\nsource(\"main.R\")\nlate <- 1\n"),
+        ],
+        true,
+        false,
+        &[
+            Checkpoint::at((1, 0), &["early"], &["late"]),
+            Checkpoint::at((1, 16), &["early"], &["late"]),
+        ],
+    );
+}

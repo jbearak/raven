@@ -585,7 +585,9 @@ proptest! {
     /// Property 15 extended: Named argument with other arguments
     #[test]
     fn prop_named_argument_with_other_args(path in relative_path()) {
-        let code = format!("source(file = \"{}\", local = TRUE)", path);
+        // Inside a function, so `local = TRUE` stays the function's frame
+        // (a top-level call would be promoted to Global).
+        let code = format!("f <- function() source(file = \"{}\", local = TRUE)", path);
         let tree = parse_r(&code);
         let sources = detect_source_calls(&tree, &code);
 
@@ -688,10 +690,26 @@ proptest! {
     /// SourceCall SHALL have local = true.
     #[test]
     fn prop_source_local_true_extraction(path in relative_path()) {
-        let code = format!("source(\"{}\", local = TRUE)", path);
+        let code = format!("f <- function() source(\"{}\", local = TRUE)", path);
         let tree = parse_r(&code);
         let sources = detect_source_calls(&tree, &code);
 
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
+    }
+
+    /// At a script's top level, `local = TRUE` names the frame the file's own
+    /// definitions live in, so it lends like `local = FALSE`; inside a
+    /// `local()` block it stays the block's frame.
+    #[test]
+    fn prop_top_level_source_local_true_is_global(path in relative_path()) {
+        let code = format!("source(\"{}\", local = TRUE)", path);
+        let sources = detect_source_calls(&parse_r(&code), &code);
+        prop_assert_eq!(sources.len(), 1);
+        prop_assert_eq!(sources[0].locality, SourceLocality::Global);
+
+        let code = format!("d <- local({{ source(\"{}\", local = TRUE); d }})", path);
+        let sources = detect_source_calls(&parse_r(&code), &code);
         prop_assert_eq!(sources.len(), 1);
         prop_assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
     }
@@ -733,7 +751,7 @@ proptest! {
     /// Property 18 extended: Both local and chdir together
     #[test]
     fn prop_source_local_and_chdir_extraction(path in relative_path()) {
-        let code = format!("source(\"{}\", local = TRUE, chdir = TRUE)", path);
+        let code = format!("f <- function() source(\"{}\", local = TRUE, chdir = TRUE)", path);
         let tree = parse_r(&code);
         let sources = detect_source_calls(&tree, &code);
 

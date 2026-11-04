@@ -1355,8 +1355,9 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
         );
     }
 
-    /// `local = TRUE`, function-scoped, and directive sources contribute
-    /// nothing; a missing tests/testthat dir yields an empty scan.
+    /// A `local = TRUE` source inside a `local()` block, a function-scoped
+    /// source, and a directive source contribute nothing; a missing
+    /// tests/testthat dir yields an empty scan.
     #[test]
     fn respects_source_filters_and_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1372,7 +1373,7 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
         let helper = root.join("tests/testthat/helper-local.R");
         std::fs::write(
             &helper,
-            "source(\"../../scripts/x.R\", local = TRUE)\nf <- function() source(\"../../scripts/x.R\")\n",
+            "local({ source(\"../../scripts/x.R\", local = TRUE) })\nf <- function() source(\"../../scripts/x.R\")\n",
         )
         .unwrap();
         let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
