@@ -220,7 +220,7 @@ An `x[...]` that isn't on the left of the operator keeps its ordinary meaning. A
 
 - An infix operator can't be written `pkg::op`, so Raven applies a declaration only while the package provides the operator: the package is in play through `library()`, `require()`, `Imports:`, `importFrom`, or its own sources, or the file binds `` `:=` <- datakit::`:=` ``. A `pkg::` reference to another of the package's functions doesn't count, because it doesn't put the operator on the search path.
 - A top-level `` `:=` <- function(...) `` in the file shadows every package's declaration, as it shadows the package's operator in R.
-- Raven doesn't check the call heads inside masked parts either, so `mean` in `mean(income)` isn't checked, the same as inside data.table's `[` or a dplyr verb.
+- Function names in the masked indices and the value are still checked, because a column can't be called: in `d[, avg] := maen(income)`, `income` is a column but `maen` is reported. Names inside a call that doesn't evaluate its argument, such as `quote(foo())`, stay unchecked, and so does `by`, whose `.(g, h)` is never called. Inside data.table's `[` and dplyr verbs, Raven still skips call heads too.
 - An `[[operator]]` entry and a `[[function]]` entry may name the same operator. The `[[function]]` policy applies when the left side doesn't match the form.
 - A declaration for an operator Raven models itself is ignored. That covers magrittr's pipes and `%$%`, zeallot's `%<-%` and `%->%`, foreach's `%do%` family and `%:%`, and base R's operators such as `%in%`. The same holds for `[[function]]` entries naming those operators.
 - Older Raven versions ignore `[[operator]]`, so it ships under `schema = 1`.
