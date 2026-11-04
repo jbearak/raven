@@ -24,6 +24,12 @@
 //! [subset]
 //! constructors = ["dibble", "as_dibble"]
 //! converters = ["set_dibble"]
+//!
+//! # `d[i, name, by = g] := value` masks `i`, `by`, and `value`.
+//! [[operator]]
+//! name = ":="
+//! form = "subset-assign"
+//! masked_arguments = ["by"]
 //! ```
 //!
 //! Besides per-function policies, the optional `[subset]` table declares that
@@ -31,6 +37,11 @@
 //! (see [`DeclaredSubset`]). Its presence alone puts the package in the
 //! bracket-NSE set the undefined-variable collector consults; `constructors`
 //! and `converters` additionally let the collector classify specific objects.
+//!
+//! `[[operator]]` entries describe an exported infix operator whose evaluation
+//! is not expressible per argument (see [`OperatorForm`]). A per-argument
+//! policy for an infix operator needs no new table: a `[[function]]` entry
+//! named `%op%` or `:=` applies to `a %op% b` as it does to `` `%op%`(a, b) ``.
 //!
 //! The file is parsed without `deny_unknown_fields`, so a Raven that predates a
 //! key ignores it rather than rejecting the file — which is what lets `[subset]`
@@ -93,6 +104,39 @@ pub(crate) struct DeclaredSubset {
     pub(crate) converters: HashSet<String>,
 }
 
+/// How an `[[operator]]` entry's infix operator evaluates its operands.
+///
+/// Each variant is a whole-expression shape that a per-argument [`ArgPolicy`]
+/// cannot describe. An entry whose `form` this build does not know is dropped,
+/// so a later Raven can add forms under `schema = 1` without an older one
+/// misreading them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OperatorForm {
+    /// `form = "subset-assign"`: `x[...] OP value` writes a column of `x`, and
+    /// the `[` indices and `value` are evaluated among `x`'s columns
+    /// (datakit's `d[i, name, by = g] := value`). When the left side is a
+    /// `[` call, the collector:
+    ///
+    /// - checks `x`, the indexed object expression, normally;
+    /// - masks every positional index except the last;
+    /// - treats the last positional index as the column name: a bare name or
+    ///   string is not a reference, and a parenthesized `(expr)` is evaluated
+    ///   normally, so its names are checked;
+    /// - masks a named index listed in `masked_arguments` and checks any other;
+    /// - masks `value`.
+    ///
+    /// Any other left side (`a := b`) and every `x[...]` not on the left of
+    /// the operator keep their ordinary handling.
+    SubsetAssign {
+        /// Named `[` arguments evaluated among, or naming, `x`'s columns
+        /// (`by`).
+        masked_arguments: HashSet<String>,
+    },
+}
+
+/// Parsed `[[operator]]` entries for one package: exported operator → form.
+pub(crate) type DeclaredOperators = HashMap<String, OperatorForm>;
+
 /// Everything one sidecar declares.
 #[derive(Debug, Default)]
 pub(crate) struct Declarations {
@@ -101,11 +145,12 @@ pub(crate) struct Declarations {
     /// so the per-diagnostic-pass snapshot in `handlers.rs` shares it rather
     /// than cloning the lists.
     pub(crate) subset: Option<Arc<DeclaredSubset>>,
+    pub(crate) operators: DeclaredOperators,
 }
 
 impl Declarations {
     pub(crate) fn is_empty(&self) -> bool {
-        self.policies.is_empty() && self.subset.is_none()
+        self.policies.is_empty() && self.subset.is_none() && self.operators.is_empty()
     }
 }
 
@@ -117,6 +162,19 @@ struct DeclarationFile {
     functions: Vec<FunctionDeclaration>,
     #[serde(default)]
     subset: Option<SubsetDeclaration>,
+    #[serde(default, rename = "operator")]
+    operators: Vec<OperatorDeclaration>,
+}
+
+/// Raw `[[operator]]` entry. `form` has no default: an entry must say which
+/// shape it declares, and one this build does not know is dropped.
+#[derive(Debug, Deserialize)]
+struct OperatorDeclaration {
+    name: String,
+    #[serde(default)]
+    form: Option<String>,
+    #[serde(default)]
+    masked_arguments: Vec<String>,
 }
 
 /// Raw `[subset]` table. A type error here (e.g. `constructors = 5`) fails
@@ -206,7 +264,39 @@ pub(crate) fn parse_declarations(contents: &str, exports: &HashSet<String>) -> D
             converters: exported(subset.converters),
         })
     });
-    Declarations { policies, subset }
+    let mut operators = DeclaredOperators::new();
+    for declaration in file.operators.into_iter().take(MAX_ENTRIES) {
+        if !exports.contains(&declaration.name) || !is_infix_operator_name(&declaration.name) {
+            continue;
+        }
+        if let Some(form) = operator_form(declaration.form.as_deref(), declaration.masked_arguments)
+        {
+            operators.insert(declaration.name, form);
+        }
+    }
+    Declarations {
+        policies,
+        subset,
+        operators,
+    }
+}
+
+/// True for the names R parses as a user-callable binary operator: `:=` and
+/// `%op%`. Only these can head the `binary_operator` an `[[operator]]` entry
+/// describes; any other name (`+`, `gen`) is dropped rather than stored.
+pub(crate) fn is_infix_operator_name(name: &str) -> bool {
+    name == ":=" || (name.len() >= 2 && name.starts_with('%') && name.ends_with('%'))
+}
+
+/// Convert one `[[operator]]` entry's `form` into an [`OperatorForm`], or
+/// `None` for a missing or unknown form.
+fn operator_form(form: Option<&str>, masked_arguments: Vec<String>) -> Option<OperatorForm> {
+    match form? {
+        "subset-assign" => Some(OperatorForm::SubsetAssign {
+            masked_arguments: masked_arguments.into_iter().take(MAX_ENTRIES).collect(),
+        }),
+        _ => None,
+    }
 }
 
 /// Convert one validated declaration into an [`ArgPolicy`], or `None` when it
@@ -517,5 +607,75 @@ mod tests {
         let all: HashSet<String> = (0..MAX_ENTRIES + 5).map(|i| format!("c{i}")).collect();
         let subset = parse_declarations(&toml, &all).subset.unwrap();
         assert_eq!(subset.constructors.len(), MAX_ENTRIES);
+    }
+
+    // ---- `[[operator]]`: infix operators with a whole-expression form ----
+
+    const DATAKIT: &str = r#"
+        schema = 1
+        [[operator]]
+        name = ":="
+        form = "subset-assign"
+        masked_arguments = ["by"]
+    "#;
+
+    #[test]
+    fn parses_a_subset_assign_operator() {
+        let declarations = parse_declarations(DATAKIT, &exports(&[":="]));
+        assert!(!declarations.is_empty());
+        assert_eq!(
+            declarations.operators.get(":="),
+            Some(&OperatorForm::SubsetAssign {
+                masked_arguments: exports(&["by"]),
+            })
+        );
+    }
+
+    #[test]
+    fn drops_an_operator_the_package_does_not_export() {
+        assert!(parse_declarations(DATAKIT, &exports(&["read_dta"])).is_empty());
+    }
+
+    #[test]
+    fn drops_an_operator_entry_with_a_missing_or_unknown_form() {
+        // Forward compatibility: a form a later Raven adds must be ignored
+        // here, never read as a form this build knows.
+        let unknown = DATAKIT.replace("subset-assign", "exposition");
+        assert!(parse_declarations(&unknown, &exports(&[":="])).is_empty());
+        let missing = DATAKIT.replace(r#"form = "subset-assign""#, "");
+        assert!(parse_declarations(&missing, &exports(&[":="])).is_empty());
+    }
+
+    #[test]
+    fn drops_an_operator_entry_whose_name_is_not_an_infix_operator() {
+        let not_infix = DATAKIT.replace(r#"name = ":=""#, r#"name = "gen""#);
+        assert!(parse_declarations(&not_infix, &exports(&["gen"])).is_empty());
+    }
+
+    #[test]
+    fn accepts_a_percent_operator_and_an_empty_masked_list() {
+        let toml = r#"
+            [[operator]]
+            name = "%set%"
+            form = "subset-assign"
+        "#;
+        assert_eq!(
+            parse_declarations(toml, &exports(&["%set%"]))
+                .operators
+                .get("%set%"),
+            Some(&OperatorForm::SubsetAssign {
+                masked_arguments: HashSet::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn infix_operator_names() {
+        assert!(is_infix_operator_name(":="));
+        assert!(is_infix_operator_name("%set%"));
+        assert!(is_infix_operator_name("%%"));
+        assert!(!is_infix_operator_name("%"));
+        assert!(!is_infix_operator_name("+"));
+        assert!(!is_infix_operator_name("gen"));
     }
 }
