@@ -305,6 +305,11 @@ pub struct FunctionScopeTree {
     root: Option<Box<IntervalNode>>,
     /// Number of intervals in the tree
     count: usize,
+    /// Intervals that own their definitions but run when control reaches them,
+    /// as a `local()` body does, rather than later, as a function body does.
+    /// A query inside only such intervals is not deferred: later top-level
+    /// definitions stay invisible to it. See [`Self::any_deferring`].
+    immediate: HashSet<FunctionScopeInterval>,
 }
 
 impl FunctionScopeTree {
@@ -313,6 +318,7 @@ impl FunctionScopeTree {
         Self {
             root: None,
             count: 0,
+            immediate: HashSet::new(),
         }
     }
 
@@ -402,7 +408,31 @@ impl FunctionScopeTree {
         let count = intervals.len();
         let root = Self::build_balanced_tree(&intervals);
 
-        Self { root, count }
+        Self {
+            root,
+            count,
+            immediate: HashSet::new(),
+        }
+    }
+
+    /// Mark `interval` as immediate (see the `immediate` field).
+    pub(crate) fn mark_immediate(&mut self, interval: FunctionScopeInterval) {
+        self.immediate.insert(interval);
+    }
+
+    /// Whether a query inside every interval of `scopes` reads globals as they
+    /// stand at the query, or, when this is `true`, as the completed file
+    /// leaves them. That holds when some interval is a real function or a
+    /// deferred body (Shiny, foreach) rather than an immediate `local()` body.
+    /// Every "is this query inside a function?" decision goes through here, so
+    /// an immediate interval never defers one.
+    pub(crate) fn any_deferring<'s>(
+        &self,
+        scopes: impl IntoIterator<Item = &'s FunctionScopeInterval>,
+    ) -> bool {
+        scopes
+            .into_iter()
+            .any(|scope| !self.immediate.contains(scope))
     }
 
     /// Builds a balanced interval subtree from a sorted slice of function-scope intervals.
@@ -873,6 +903,9 @@ pub struct ScopeArtifacts {
     /// timeline/tree until graph-aware package scope proves Shiny attached at
     /// the helper call, including through inherited or conditional state.
     pub conditional_shiny_deferred_scopes: Vec<ConditionalShinyDeferredScope>,
+    /// `local()` body intervals, which `rebuild_function_scope_index` marks
+    /// immediate in `function_scope_tree` (see `push_local_block_scopes`).
+    pub immediate_function_scopes: Vec<FunctionScopeInterval>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
     /// `pkgload::load_all()` / bare `load_all()` call site (including one that
     /// lives only inside a function body).
@@ -919,6 +952,7 @@ impl Default for ScopeArtifacts {
             interface_hash: 0,
             function_scope_tree: FunctionScopeTree::default(),
             conditional_shiny_deferred_scopes: Vec::new(),
+            immediate_function_scopes: Vec::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
         }
@@ -1894,6 +1928,7 @@ fn shiny_attached_at_position(
     let query = QueryContext::new(
         Position::new(line, column),
         query_inside_function,
+        &artifacts.function_scope_tree,
         active_function_scopes,
         &conditional_scopes,
         None,
@@ -1929,7 +1964,10 @@ fn active_conditional_shiny_scopes(
         let call = candidate.call_position;
         let ordinary_active_scopes =
             active_function_scopes_at(&artifacts.function_scope_tree, call.line, call.column);
-        let query_inside_function = hoist_globals && !ordinary_active_scopes.is_empty();
+        let query_inside_function = hoist_globals
+            && artifacts
+                .function_scope_tree
+                .any_deferring(&ordinary_active_scopes);
         let seed = if query_inside_function {
             in_function_seed
         } else {
@@ -1959,7 +1997,7 @@ fn single_file_attachment_projection(
     ordinary_scopes: &HashSet<FunctionScopeInterval>,
 ) -> (HashSet<FunctionScopeInterval>, HashSet<String>) {
     let needs_late_conditional_load = hoist_globals
-        && !ordinary_scopes.is_empty()
+        && artifacts.function_scope_tree.any_deferring(ordinary_scopes)
         && artifacts.timeline.iter().any(|event| {
             matches!(
                 event,
@@ -2006,7 +2044,7 @@ fn single_file_attachment_projection(
     stream.advance_to(line, column);
     let active = stream.active_conditional_shiny_scopes.clone();
     let query_inside = hoist_globals
-        && (!ordinary_scopes.is_empty()
+        && (artifacts.function_scope_tree.any_deferring(ordinary_scopes)
             || active
                 .iter()
                 .any(|scope| scope.contains(Position::new(line, column))));
@@ -2051,6 +2089,9 @@ fn rebuild_function_scope_index(artifacts: &mut ScopeArtifacts, line_index: &Lin
         })
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
+    for interval in &artifacts.immediate_function_scopes {
+        artifacts.function_scope_tree.mark_immediate(*interval);
+    }
     annotate_event_function_scopes(artifacts, line_index);
 }
 
@@ -2817,6 +2858,7 @@ pub fn scope_at_position(
     let query = QueryContext::new(
         Position::new(line, column),
         hoist_globals,
+        &artifacts.function_scope_tree,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
         None,
@@ -2979,6 +3021,7 @@ where
     let query = QueryContext::new(
         Position::new(line, column),
         hoist_globals,
+        &artifacts.function_scope_tree,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
         None,
@@ -3668,6 +3711,121 @@ fn append_synthetic_function_scopes<'tree, 'text>(
         capture_bindings,
     );
     push_foreach_iterator_scopes(artifacts, root, content, line_index, uri, capture_bindings);
+    push_local_block_scopes(artifacts, root, content, line_index, capture_bindings);
+}
+
+/// Append a parameterless `FunctionScope` for the body of each `local(expr)`
+/// call.
+///
+/// `local()` evaluates `expr` in a new environment whose parent is the calling
+/// frame, so outer bindings stay visible inside the body while the body's own
+/// definitions stay there: `y <- local({ a <- 1; a })` leaves no `a` behind.
+/// That is the visibility a parameterless interval gives, as for Shiny bodies.
+///
+/// The interval is also what lets `local({ source("child.R", local = TRUE);
+/// d })` work. The `source()` call's current frame is the block, so the
+/// resolver places the child's definitions in this interval: visible after the
+/// call inside the block, and nowhere after it.
+///
+/// Only the fresh-environment form counts. An explicit `envir` (named or
+/// second positional) evaluates in an environment Raven can't follow, so that
+/// call gets no interval, and neither does a `local` the file rebinds.
+fn push_local_block_scopes<'tree, 'text>(
+    artifacts: &mut ScopeArtifacts,
+    root: Node<'tree>,
+    content: &'text str,
+    line_index: &LineIndex,
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
+) {
+    if !content.contains("local") {
+        return;
+    }
+    let local_defs = &artifacts.exported_interface;
+    let events = &mut artifacts.timeline;
+    let immediate = &mut artifacts.immediate_function_scopes;
+    visit_runtime_reachable_scope_syntax(
+        root,
+        content,
+        capture_bindings,
+        &mut |node, lexical_bindings| {
+            if let Some(body) = local_call_body(node, content, local_defs, lexical_bindings) {
+                let event = braced_body_scope_event(body, line_index);
+                if let ScopeEvent::FunctionScope {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    ..
+                } = &event
+                {
+                    immediate.push(FunctionScopeInterval::from_tuple((
+                        *start_line,
+                        *start_column,
+                        *end_line,
+                        *end_column,
+                    )));
+                }
+                events.push(event);
+            }
+        },
+    );
+}
+
+/// The `expr` argument of a `local(expr)` / `base::local(expr)` call that
+/// evaluates in a fresh environment, or `None` (see
+/// [`push_local_block_scopes`]).
+fn local_call_body<'tree>(
+    node: Node<'tree>,
+    text: &str,
+    local_defs: &HashMap<Arc<str>, ScopedSymbol>,
+    lexical_bindings: &mut LazyStaticBindings,
+) -> Option<Node<'tree>> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => {
+            let deferred = !super::binding::is_known_immediate_context(node);
+            if node_text(function, text) != "local"
+                || local_defs.contains_key("local")
+                || lexical_bindings
+                    .get()
+                    .named_local_binding_may_shadow_without_helper_uncertainty(
+                        "local", node, deferred,
+                    )
+            {
+                return None;
+            }
+        }
+        "namespace_operator" => {
+            let lhs = function.child_by_field_name("lhs")?;
+            let rhs = function.child_by_field_name("rhs")?;
+            if node_text(lhs, text) != "base" || node_text(rhs, text) != "local" {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut expr = None;
+    let mut cursor = arguments.walk();
+    for argument in arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        let value = argument.child_by_field_name("value");
+        match argument
+            .child_by_field_name("name")
+            .map(|name| node_text(name, text))
+        {
+            Some("expr") if expr.is_none() => expr = value,
+            None if expr.is_none() => expr = value,
+            // `envir`, by name or position, or anything else.
+            _ => return None,
+        }
+    }
+    expr
 }
 
 /// Sort and index a complete scope-event timeline exactly once.
@@ -8279,7 +8437,10 @@ where
 
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
-    let query_inside_function = (hoist_globals && !active_function_scopes.is_empty())
+    let query_inside_function = (hoist_globals
+        && artifacts
+            .function_scope_tree
+            .any_deferring(&active_function_scopes))
         || (merge_policy.is_execution_order() && line == u32::MAX && column == u32::MAX);
 
     // STEP 1: Process parent context from dependency graph edges
@@ -8525,6 +8686,7 @@ where
     let query = QueryContext::new(
         Position::new(line, column),
         hoist_globals,
+        &artifacts.function_scope_tree,
         &active_function_scopes,
         &active_conditional_shiny_scopes,
         pre_entry_batch_cutoff,
@@ -10105,13 +10267,13 @@ where
         &self,
         candidate: ConditionalShinyDeferredScope,
     ) -> bool {
+        let tree = &self.artifacts.function_scope_tree;
         self.hoist_globals
-            && !active_function_scopes_at(
-                &self.artifacts.function_scope_tree,
+            && tree.any_deferring(&active_function_scopes_at(
+                tree,
                 candidate.call_position.line,
                 candidate.call_position.column,
-            )
-            .is_empty()
+            ))
     }
 
     /// Evaluate one dormant helper exactly once against the attachment
@@ -10612,7 +10774,11 @@ where
     /// Mirrors `scope_at_position_with_graph_cached`'s `inside` calculation
     /// at the same `(line, column)`.
     fn query_inside_function(&self) -> bool {
-        self.hoist_globals && !self.function_stack.is_empty()
+        self.hoist_globals
+            && self
+                .artifacts
+                .function_scope_tree
+                .any_deferring(self.function_stack.iter().map(|(interval, _)| interval))
     }
 
     /// Cheap presence check: is `name` visible at the current cursor?
@@ -15273,8 +15439,10 @@ g <- function() {
             "source() with local=TRUE should NOT inherit symbols"
         );
 
-        // Local=TRUE sources are included in the timeline
-        let code = "x <- 1\nsource(\"child.R\", local = TRUE)\ny <- 2";
+        // Local=TRUE sources are included in the timeline. Inside a function,
+        // because a top-level `local = TRUE` is the file's own frame and is
+        // promoted to Global.
+        let code = "x <- 1\nf <- function() source(\"child.R\", local = TRUE)\ny <- 2";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 

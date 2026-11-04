@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use super::{FunctionScopeInterval, Position, ScopeEvent, SourceBatchBoundary};
+use super::{FunctionScopeInterval, FunctionScopeTree, Position, ScopeEvent, SourceBatchBoundary};
 
 /// The environment observed by a lookup after applying the hoisting setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +223,7 @@ impl<'a> QueryContext<'a> {
     pub(super) fn new(
         position: Position,
         hoist_globals: bool,
+        tree: &FunctionScopeTree,
         ordinary_scopes: &'a HashSet<FunctionScopeInterval>,
         conditional_scopes: &'a HashSet<FunctionScopeInterval>,
         pre_entry_cutoff: Option<SourceBatchBoundary>,
@@ -243,7 +244,9 @@ impl<'a> QueryContext<'a> {
                     .collect(),
             )
         };
-        let phase = ScopePhase::from_deferred(hoist_globals && !active_scopes.is_empty());
+        // An immediate `local()` body owns its definitions without deferring
+        // the query (`FunctionScopeTree::any_deferring`).
+        let phase = ScopePhase::from_deferred(hoist_globals && tree.any_deferring(&*active_scopes));
         Self {
             position,
             phase,

@@ -10116,9 +10116,11 @@ fn collect_undefined_variables_from_snapshot(
             && let Some((ref exports, ref fn_tree)) = local_opt
             && exports.contains(name.as_str())
         {
-            let inside_function = !fn_tree
-                .query_point(scope::Position::new(usage_line, usage_col_utf16))
-                .is_empty();
+            // An immediate `local()` body runs where it stands, so it doesn't
+            // see later globals (`FunctionScopeTree::any_deferring`).
+            let inside_function = fn_tree.any_deferring(
+                &fn_tree.query_point(scope::Position::new(usage_line, usage_col_utf16)),
+            );
             if inside_function {
                 continue;
             }
@@ -62787,7 +62789,7 @@ helper_transform <- function(data) {
 
         let main_code = r#"# Test local vs global sourcing
 source("global_source.R")           # Global scope
-source("local_source.R", local = TRUE)  # Local scope
+local({ source("local_source.R", local = TRUE) })  # Local scope
 
 # These should be available from global source
 global_result <- global_func(42)
@@ -64667,13 +64669,15 @@ pacman::p_load(__qualified_missing_package__)";
 
     /// Regression lock for issue #135 (Phase 1, Category A).
     ///
-    /// `source("helper.R", local=TRUE)` does NOT inherit symbols into the
-    /// caller's scope (R semantics: local=TRUE evaluates the sourced file in
-    /// a fresh local environment). The "used before sourced" diagnostic must
-    /// not fire for symbols defined in a local-sourced file — they are
-    /// genuinely undefined from the caller's perspective. The legacy
-    /// collector got this right after PR #134 (handlers.rs:5721 filters via
-    /// `inherits_symbols()`); this test locks it in.
+    /// `source("helper.R", local=TRUE)` inside a `local()` block does NOT
+    /// inherit symbols into the file's scope (R semantics: local=TRUE
+    /// evaluates the sourced file in the block's environment). The "used
+    /// before sourced" diagnostic must not fire for symbols defined in such a
+    /// file — they are genuinely undefined from the caller's perspective.
+    /// The legacy collector got this right after PR #134 (handlers.rs:5721
+    /// filters via `inherits_symbols()`); this test locks it in. A top-level
+    /// `local=TRUE` call is different: it is the file's own frame, so it
+    /// inherits like `local=FALSE`.
     #[test]
     fn test_out_of_scope_skips_local_true_source() {
         use tempfile::TempDir;
@@ -64692,7 +64696,7 @@ pacman::p_load(__qualified_missing_package__)";
         // the filter must skip the source and no diagnostic should fire.
         // helper() is also genuinely undefined from the caller's perspective,
         // so the undefined-variable diagnostic IS expected.
-        let main_code = "result <- helper(1)\nsource(\"helper.R\", local=TRUE)\n";
+        let main_code = "result <- helper(1)\nlocal({ source(\"helper.R\", local=TRUE) })\n";
         let helper_code = "helper <- function(x) x + 1\n";
         std::fs::write(&main_path, main_code).unwrap();
         std::fs::write(&helper_path, helper_code).unwrap();
@@ -64759,6 +64763,159 @@ pacman::p_load(__qualified_missing_package__)";
             "Expected 'helper' diagnostic — local=TRUE \
              doesn't inherit. Got: {:?} is not defined",
             diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Diagnose each of `files` (workspace-relative path, code) in a temp
+    /// workspace wired the way the server wires one, and return the
+    /// undefined-variable messages reported in `target`.
+    fn undefined_messages_in_workspace(files: &[(&str, &str)], target: &str) -> Vec<String> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Canonical, so resolved child paths match the document URIs where the
+        // temp dir sits behind a symlink (macOS `/var` → `/private/var`).
+        let root = temp_dir.path().canonicalize().unwrap();
+        let workspace_url = Url::from_file_path(&root).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_url.clone());
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+        // Every file is on disk before any graph update: the workspace-root
+        // fallback checks that a candidate exists.
+        for (relative, code) in files {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, code).unwrap();
+        }
+        let mut target_url = None;
+        for (relative, code) in files {
+            let url = Url::from_file_path(root.join(relative)).unwrap();
+            state
+                .documents
+                .insert(url.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                &url,
+                &crate::cross_file::extract_metadata(code),
+                Some(&workspace_url),
+                |_| None,
+            );
+            if *relative == target {
+                target_url = Some(url);
+            }
+        }
+        let target_url = target_url.expect("target is one of the files");
+        diagnostics(&state, &target_url, &DiagCancelToken::never())
+            .into_iter()
+            .filter(|d| {
+                d.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// do2r's `include child.do`: a top-level `source(local = TRUE)` runs the
+    /// child in the file's own frame, so the child's definitions reach the
+    /// parent, as they do in R. The path is root-relative from a nested file
+    /// (workspace-root fallback).
+    #[test]
+    fn top_level_source_local_true_lends_child_definitions() {
+        let files = [
+            (
+                "R/code/main.R",
+                "parent_var <- 1\nsource(\"R/child.R\", local = TRUE)\nprint(inc_var)\n",
+            ),
+            ("R/child.R", "print(parent_var)\ninc_var <- 3\n"),
+        ];
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "R/code/main.R"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "R/child.R"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// do2r's `do child.do`: `d <- local({ source(..., local = TRUE); d })`.
+    /// The child's definitions reach the rest of the block, so the trailing
+    /// `d` resolves even though only the child creates `d`, and nothing the
+    /// child defines leaks past the block.
+    #[test]
+    fn source_local_true_in_local_block_lends_only_to_the_block() {
+        let files = [
+            (
+                "R/code/main.R",
+                "parent_var <- 1\nd <- local({ source(\"R/child.R\", local = TRUE); d })\nprint(d)\nprint(helper)\n",
+            ),
+            (
+                "R/child.R",
+                "print(parent_var)\nd <- data.frame(a = 1)\nhelper <- 2\n",
+            ),
+        ];
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "R/code/main.R"),
+            vec!["helper is not defined"]
+        );
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "R/child.R"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The child of a `local()`-block source sees the parent's variables as
+    /// of the call: `early` resolves, while `parent_var`, which the parent
+    /// defines only afterwards, is still reported.
+    #[test]
+    fn source_local_true_in_local_block_child_sees_parent_as_of_the_call() {
+        let files = [
+            (
+                "R/code/main.R",
+                "early <- 1\nd <- local({ source(\"R/child.R\", local = TRUE); d })\nparent_var <- 1\n",
+            ),
+            ("R/child.R", "print(early)\nprint(parent_var)\nd <- 1\n"),
+        ];
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "R/child.R"),
+            vec!["parent_var is not defined"]
+        );
+    }
+
+    /// A `local()` block's own definitions stay in it, and its body runs
+    /// immediately: a global defined after the block is not yet visible in
+    /// it, unlike in a function body.
+    #[test]
+    fn local_block_definitions_stay_in_the_block_and_run_immediately() {
+        let files = [(
+            "main.R",
+            "y <- local({ a <- 1; a })\nprint(a)\nz <- local({ print(late) })\nlate <- 1\nf <- function() local({ print(later) })\nlater <- 2\n",
+        )];
+        let messages = undefined_messages_in_workspace(&files, "main.R");
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0], "a is not defined");
+        assert!(
+            messages[1].starts_with("late is used before it is defined"),
+            "{messages:?}"
+        );
+    }
+
+    /// Unchanged: `local = TRUE` inside a function body puts the child's
+    /// definitions in the function's frame, not the file's.
+    #[test]
+    fn source_local_true_in_function_body_stays_in_the_function() {
+        let files = [
+            (
+                "main.R",
+                "f <- function() { source(\"child.R\", local = TRUE); child_local }\nprint(child_local)\n",
+            ),
+            ("child.R", "child_local <- 2\n"),
+        ];
+        assert_eq!(
+            undefined_messages_in_workspace(&files, "main.R"),
+            vec!["child_local is not defined"]
         );
     }
 

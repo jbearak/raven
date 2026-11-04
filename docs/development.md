@@ -867,6 +867,20 @@ routing, and completed-global filtering. Global events may be hoisted inside a
 function, while local events remain position-aware within their owning frame.
 The positional/hoisted distinction also preserves removal tombstone behavior.
 
+A `local()` body is a synthetic interval too (`push_local_block_scopes`), but an
+*immediate* one: it owns its definitions without deferring the query, because
+the block runs where it stands. `FunctionScopeTree` records which intervals are
+immediate, and every "is this query inside a function?" decision (the
+`QueryContext` phase, the point resolvers' and attachment projection's
+`query_inside_function`, `ScopeStream::query_inside_function`, and the
+undefined-variable hoisting fast path) goes through
+`FunctionScopeTree::any_deferring`, so a query inside only immediate intervals
+never reads completed globals. A `source(local = TRUE)` call that provably runs
+in the file's own frame (`runs_in_file_frame` in `source_detect.rs`) is
+promoted to `SourceLocality::Global` at detection, so the graph, the scope
+resolvers, and the handler-side `inherits_symbols()` filters agree; one inside a
+`local()` block stays `CurrentFrame` and lends to the block's interval.
+
 Traversal and mutation stay with their existing owners. Ordered attachment
 projection still discovers conditional Shiny scopes; the evaluation module only
 consumes those intervals. Source locality, source-batch execution, recursion
