@@ -19,7 +19,7 @@ Run `raven`, `raven --help`, or `raven help` for top-level usage. Every command 
 <!-- example: version -->
 ```console
 $ raven --version
-raven 0.23.2
+raven 0.23.3
 ```
 
 To run Raven on every pull request, start with [Automated checks in CI](ci.md). It explains what CI is and has copyable GitHub Actions and Bitbucket Pipelines files.
@@ -78,7 +78,7 @@ The full `--help` text:
 <!-- example: check-help -->
 ```console
 $ raven check --help
-raven check 0.23.2 — R and model diagnostics for CI
+raven check 0.23.3 — R and model diagnostics for CI
 
 Usage: raven check [OPTIONS] [PATHS...]
 
