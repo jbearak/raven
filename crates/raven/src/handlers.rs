@@ -32100,9 +32100,13 @@ d[, n, by = .(g, h)] := .N
 d[, q] := quote(not_a_fn(x))
 d[, w] := undefined_wrapper(inner_head(x))
 d[, s] := sapply(income, function(v) round(v))
+d[, nested] := sum(nested_maen(income))
 "#;
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
-        assert_eq!(flagged, vec!["maen", "is_typo", "undefined_wrapper"]);
+        assert_eq!(
+            flagged,
+            vec!["maen", "is_typo", "undefined_wrapper", "nested_maen"]
+        );
     }
 
     /// The declaration applies only while the package provides `:=`: a
