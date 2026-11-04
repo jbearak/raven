@@ -19669,6 +19669,15 @@ struct UsageContext {
     /// bool means "suppress identifiers in this subtree", *not* "this node is
     /// syntactically call-like".
     suppressed: bool,
+    /// Within a `suppressed` subtree, still check identifiers in call-head
+    /// position. Set only where Raven knows the subtree is evaluated in a
+    /// data mask whose parent is the caller's environment (the `i` and value
+    /// of a declared `subset-assign` operator): R looks a call head up in
+    /// function mode, which skips non-function columns, so `maen(income)` is
+    /// a typo even though `income` is a column. It survives into a nested
+    /// call's argument only when that call's own policy evaluates the
+    /// argument, so `quote(foo())` or an unresolved wrapper turns it off.
+    check_call_heads: bool,
 }
 
 /// How an indexed object's class is known for data.table-style `[`
@@ -22494,7 +22503,10 @@ fn collect_usages_with_analysis<'a>(
     }
 
     if node.kind() == "identifier" {
-        if context.in_formula || context.suppressed {
+        if context.in_formula {
+            return;
+        }
+        if context.suppressed && !(context.check_call_heads && is_call_function_head(node)) {
             return;
         }
         if is_structural_non_reference(node, text) {
@@ -22630,8 +22642,24 @@ fn collect_call_usages<'a>(
     {
         collect_usages_with_analysis(func, text, analysis, context, used);
     }
+    // Inside a head-checked mask, the call's own policy decides which
+    // arguments it evaluates, and so which keep their heads checked.
+    let head_policy = (context.suppressed
+        && context.check_call_heads
+        && analysis.call_args_enabled
+        && !internal_routine_call)
+        .then(|| resolve_call_arg_policy(node, text, analysis));
     if let Some(args) = node.child_by_field_name("arguments") {
-        apply_arg_policy(args, text, analysis, context, &policy, pipe_fed, used);
+        apply_arg_policy(
+            args,
+            text,
+            analysis,
+            context,
+            &policy,
+            head_policy.as_ref(),
+            pipe_fed,
+            used,
+        );
     }
 }
 
@@ -22882,9 +22910,21 @@ fn collect_subset_usages<'a>(
     if let Some(func) = node.child_by_field_name("function") {
         collect_usages_with_analysis(func, text, analysis, context, used);
     }
+    let head_policy =
+        (context.suppressed && context.check_call_heads && analysis.bracket_indices_enabled)
+            .then(|| resolve_subset_arg_policy(node, text, analysis));
     if let Some(args) = node.child_by_field_name("arguments") {
         // Bracket indices are never pipe-fed (their policies are uniform anyway).
-        apply_arg_policy(args, text, analysis, context, &policy, false, used);
+        apply_arg_policy(
+            args,
+            text,
+            analysis,
+            context,
+            &policy,
+            head_policy.as_ref(),
+            false,
+            used,
+        );
     }
 }
 
@@ -23025,6 +23065,7 @@ fn collect_declared_infix_usages<'a>(
         let operand_context = UsageContext {
             in_formula: context.in_formula,
             suppressed: suppress,
+            check_call_heads: false,
         };
         collect_usages_with_analysis(operand, text, analysis, &operand_context, used);
     }
@@ -23035,7 +23076,9 @@ fn collect_declared_infix_usages<'a>(
 /// [`crate::nse_declarations::OperatorForm::SubsetAssign`]). `x` is checked;
 /// positional indices before the last are masked; the last positional index
 /// is the column name, checked only in its `(expr)` form; a named index is
-/// masked iff `masked_arguments` lists it; `value` is masked.
+/// masked iff `masked_arguments` lists it; `value` is masked. In the masked
+/// positional indices and `value`, call heads are still checked
+/// ([`UsageContext::check_call_heads`]).
 ///
 /// The `[` call here is not an ordinary read, so [`collect_subset_usages`]
 /// and its data.table rules are bypassed: whether `x` is a data.table or a
@@ -23052,9 +23095,18 @@ fn collect_subset_assign_usages<'a>(
     masked_arguments: &HashSet<String>,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
+    // `i` and the value are evaluated in a data mask over `x`'s columns, so
+    // their call heads are still functions to check. Named indices such as
+    // `by` only name columns (`.(g, h)` is never called), so they stay fully
+    // masked.
     let masked = UsageContext {
         in_formula: context.in_formula,
         suppressed: true,
+        check_call_heads: false,
+    };
+    let evaluated_in_mask = UsageContext {
+        check_call_heads: true,
+        ..masked.clone()
     };
     if let Some(object) = subset.child_by_field_name("function") {
         collect_usages_with_analysis(object, text, analysis, context, used);
@@ -23070,25 +23122,32 @@ fn collect_subset_assign_usages<'a>(
             .rev()
             .find(|arg| arg.child_by_field_name("name").is_none())
             .map(|arg| arg.id());
+        let indices_checked = analysis.bracket_indices_enabled;
         for arg in arg_nodes {
-            let checked = match arg.child_by_field_name("name") {
-                Some(label) => {
-                    analysis.bracket_indices_enabled
-                        && !masked_arguments.contains(node_text(label, text))
+            let arg_context = match arg.child_by_field_name("name") {
+                Some(label)
+                    if indices_checked && !masked_arguments.contains(node_text(label, text)) =>
+                {
+                    context
                 }
+                Some(_) => &masked,
                 None if Some(arg.id()) == name_slot => {
-                    analysis.bracket_indices_enabled
-                        && arg
-                            .child_by_field_name("value")
-                            .is_some_and(|v| v.kind() == "parenthesized_expression")
+                    let parenthesized = arg
+                        .child_by_field_name("value")
+                        .is_some_and(|v| v.kind() == "parenthesized_expression");
+                    if indices_checked && parenthesized {
+                        context
+                    } else {
+                        &masked
+                    }
                 }
-                None => false,
+                None if indices_checked => &evaluated_in_mask,
+                None => &masked,
             };
-            let arg_context = if checked { context } else { &masked };
             collect_usages_with_analysis(arg, text, analysis, arg_context, used);
         }
     }
-    collect_usages_with_analysis(value, text, analysis, &masked, used);
+    collect_usages_with_analysis(value, text, analysis, &evaluated_in_mask, used);
 }
 
 /// Recurse into a call/subset `arguments` node, suppressing each argument's
@@ -23096,19 +23155,40 @@ fn collect_subset_assign_usages<'a>(
 /// names) are skipped by `is_structural_non_reference` regardless of the mask,
 /// so named-argument labels remain suppressed independent of the callee.
 /// `pipe_fed` shifts per-formal matching past the pipe-supplied first formal.
+///
+/// `head_policy` is the callee's own policy when the call sits in a
+/// head-checked mask (see [`UsageContext::check_call_heads`]): an argument
+/// keeps head checking only if that policy evaluates it. `None` turns head
+/// checking off for every argument.
+// Each input is a distinct piece of the call-site decision.
+#[allow(clippy::too_many_arguments)]
 fn apply_arg_policy<'a>(
     args_node: Node<'a>,
     text: &str,
     analysis: &NseAnalysis,
     context: &UsageContext,
     policy: &crate::nse::ArgPolicy,
+    head_policy: Option<&crate::nse::ArgPolicy>,
     pipe_fed: bool,
     used: &mut Vec<(String, Node<'a>)>,
 ) {
-    for (arg, suppress) in call_argument_suppression(args_node, text, policy, pipe_fed) {
+    let head_mask: Option<Vec<bool>> = head_policy.map(|head_policy| {
+        call_argument_suppression(args_node, text, head_policy, pipe_fed)
+            .into_iter()
+            .map(|(_, suppress)| suppress)
+            .collect()
+    });
+    for (i, (arg, suppress)) in call_argument_suppression(args_node, text, policy, pipe_fed)
+        .into_iter()
+        .enumerate()
+    {
         let arg_context = UsageContext {
             in_formula: context.in_formula,
             suppressed: context.suppressed || suppress,
+            check_call_heads: context.check_call_heads
+                && head_mask
+                    .as_ref()
+                    .is_some_and(|mask| !mask.get(i).copied().unwrap_or(true)),
         };
         collect_usages_with_analysis(arg, text, analysis, &arg_context, used);
     }
@@ -32002,6 +32082,31 @@ d[, k, keyby = grp] := 1
 "#;
         let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
         assert_eq!(flagged, vec!["nm_typo", "e", "grp"]);
+    }
+
+    /// Inside the masked `i` and value, call heads are still checked: a
+    /// column can't be called, so `maen(income)` is a typo. Heads inside a
+    /// call that doesn't evaluate its argument (`quote()`, an unresolved
+    /// wrapper) stay masked, and so does `by`, whose `.()` is never called.
+    #[tokio::test]
+    async fn declared_subset_assign_operator_checks_call_heads_in_masked_parts() {
+        let code = r#"library(dtaparser)
+library(datakit)
+d <- read_dta("s.dta")
+d[, avg, by = region] := maen(income, na.rm = TRUE)
+d[is_typo(age), older] := 1
+d[is.na(age), flag] := mean(income)
+d[, n, by = .(g, h)] := .N
+d[, q] := quote(not_a_fn(x))
+d[, w] := undefined_wrapper(inner_head(x))
+d[, s] := sapply(income, function(v) round(v))
+d[, nested] := sum(nested_maen(income))
+"#;
+        let flagged = datakit_undefined_names(Some(DATAKIT_OPERATOR_SIDECAR), code).await;
+        assert_eq!(
+            flagged,
+            vec!["maen", "is_typo", "undefined_wrapper", "nested_maen"]
+        );
     }
 
     /// The declaration applies only while the package provides `:=`: a
