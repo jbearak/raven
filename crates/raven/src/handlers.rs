@@ -10885,8 +10885,15 @@ fn nested_closure_late_binding_resolves(
     // immediate `local()` body runs where it stands, so it can't be one. A
     // later binding in any enclosing scope, `local()` bodies included, is
     // what that closure late-binds.
-    let deferring_scopes: Vec<_> = function_scope_tree
-        .query_point(scope::Position::new(usage_line, usage_col_utf16))
+    let active_scopes =
+        function_scope_tree.query_point(scope::Position::new(usage_line, usage_col_utf16));
+    // A late binding lives in a scope strictly enclosing the closure, so it
+    // needs two active scopes. This keeps the common case (a usage in one
+    // function body) as cheap as a length check.
+    if active_scopes.len() < 2 {
+        return false;
+    }
+    let deferring_scopes: Vec<_> = active_scopes
         .into_iter()
         .filter(|scope| !function_scope_tree.is_immediate(scope))
         .collect();
