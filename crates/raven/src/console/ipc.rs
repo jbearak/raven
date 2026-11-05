@@ -73,10 +73,6 @@ pub struct Server {
     queue: Arc<Mutex<VecDeque<Request>>>,
 }
 
-/// Set while R is evaluating a submission (between handing input to R and
-/// the next top-level prompt). An `interrupt` request only signals R then.
-pub static R_BUSY: AtomicBool = AtomicBool::new(false);
-
 impl Server {
     pub fn start(
         path: &Path,
@@ -187,7 +183,9 @@ fn serve(
                 break_flag.store(true, Ordering::Relaxed);
             }
             Some("interrupt") => {
-                if R_BUSY.load(Ordering::Relaxed) {
+                // Only running code takes a signal; at a prompt it would
+                // interrupt whatever runs next.
+                if super::r_wait() == super::RWait::Evaluating {
                     super::sys::interrupt_r();
                 }
                 let _ = writeln!(writer, "{}", serde_json::json!({"id": id, "status": "ok"}));

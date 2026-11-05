@@ -1280,6 +1280,35 @@ fn expressions_name_exactly_the_value_shown() {
     d.event("terminated", m);
 }
 
+/// Stop ends an F5 program even while it waits at `readline()`, as it does
+/// for a Python program waiting in `input()`: the next typed line runs at
+/// the top-level prompt instead of answering the abandoned `readline()`.
+#[test]
+fn terminate_ends_a_program_waiting_at_readline() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("launch", json!({"program": "/w/p.R"}));
+    d.req("configurationDone", json!({}));
+    // The program's own output is upper-cased, so it can't match the echo.
+    c.send_program("ans <- readline('answer: '); cat(toupper('program got'), ans, '\\n')");
+    c.expect("answer: ");
+    std::thread::sleep(Duration::from_millis(300));
+    let m = d.mark();
+    d.req("terminate", json!({}));
+    d.event("terminated", m);
+    std::thread::sleep(Duration::from_millis(500));
+    c.type_line("cat('alive', '\\n')");
+    c.expect("alive ");
+    assert!(
+        !c.text().contains("PROGRAM GOT"),
+        "the typed line answered the stopped program's readline(): {}",
+        c.text()
+    );
+}
+
 #[test]
 fn a_program_session_ends_when_its_program_finishes() {
     if !r_available() {

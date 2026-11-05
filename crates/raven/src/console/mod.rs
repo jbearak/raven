@@ -49,7 +49,7 @@ use std::ffi::{CStr, CString, OsString, c_char, c_int};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use reedline::{EditCommand, Reedline, Signal};
@@ -480,7 +480,7 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
             flag_for_idle.store(true, Ordering::Relaxed);
         }
     }));
-    let plain = editor::build_plain(Box::new(event_pump()));
+    let plain = editor::build_plain(Box::new(event_pump()), dap::input_abort_signal());
     with_state(|s| {
         s.editor = Some(ed);
         s.plain_editor = Some(plain);
@@ -492,6 +492,39 @@ unsafe fn start_r(lib: &'static libr::LibR, opts: Options) -> i32 {
     // SAFETY: as above. R exits the process from q(); this does not return.
     unsafe { (lib.run_rmainloop)() };
     0
+}
+
+/// What the R thread is doing, as the socket and debugger threads see it.
+/// Written only by [`read_new_input`]; read through [`r_wait`] wherever
+/// another thread decides what an interrupt, Stop, Pause, or Inspect Last
+/// Error can do right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RWait {
+    /// R is running code: a signal interrupts it.
+    Evaluating = 0,
+    /// The editor waits at R's top-level prompt, outside any browser.
+    IdleTopLevel = 1,
+    /// Another REPL prompt (`+`, `Browse>`, a nested top level), or R is
+    /// still starting up.
+    OtherPrompt = 2,
+    /// `readline()`, `menu()`, or `scan()` waits for the user's answer.
+    UserInput = 3,
+}
+
+static R_WAIT: AtomicU8 = AtomicU8::new(RWait::OtherPrompt as u8);
+
+pub(crate) fn r_wait() -> RWait {
+    match R_WAIT.load(Ordering::SeqCst) {
+        0 => RWait::Evaluating,
+        1 => RWait::IdleTopLevel,
+        3 => RWait::UserInput,
+        _ => RWait::OtherPrompt,
+    }
+}
+
+fn set_r_wait(wait: RWait) {
+    R_WAIT.store(wait as u8, Ordering::SeqCst);
 }
 
 /// The editor is at a prompt where it would start a queued request now (the
@@ -1049,14 +1082,18 @@ fn finish_request() {
 }
 
 fn read_new_input(prompt: &str, kind: PromptKind, cap: usize, depth: u32) -> Option<String> {
-    ipc::R_BUSY.store(false, Ordering::Relaxed);
-    dap::set_idle_top_level(kind == PromptKind::TopLevel && depth == 1);
+    set_r_wait(match kind {
+        PromptKind::TopLevel if depth == 1 => RWait::IdleTopLevel,
+        PromptKind::Other => RWait::UserInput,
+        _ => RWait::OtherPrompt,
+    });
     let result = read_new_input_from(prompt, kind, cap, depth);
-    dap::set_idle_top_level(false);
     if result.is_some() {
         // R runs again (also after a `readline()` answer): socket interrupts
         // apply from here.
-        ipc::R_BUSY.store(true, Ordering::Relaxed);
+        set_r_wait(RWait::Evaluating);
+    } else {
+        set_r_wait(RWait::OtherPrompt);
     }
     result
 }
@@ -1291,6 +1328,12 @@ fn plain_edit(ed: &mut Reedline, prompt: &str) -> Option<String> {
                 return Some("\n".into());
             }
             Ok(Signal::CtrlD) => return None,
+            // Only the debugger's Stop breaks this editor: end the program
+            // waiting here, as Ctrl-C would.
+            Ok(Signal::ExternalBreak(_)) => {
+                request_interrupt();
+                return Some("\n".into());
+            }
             Ok(_) => continue,
             Err(_) => return plain_read(prompt),
         }
@@ -1315,6 +1358,11 @@ fn plain_read(prompt: &str) -> Option<String> {
     let mut idle = || {
         if dap::has_work() {
             dap::service();
+        }
+        if !browser && dap::take_input_abort() {
+            // Stop ends a program waiting here, as Ctrl-C would.
+            request_interrupt();
+            return Some("\n".into());
         }
         if browser {
             dap::take_resume().map(|cmd| format!("{cmd}\n"))

@@ -124,11 +124,14 @@ pub fn build(cfg: EditorConfig) -> Reedline {
 /// usual editing keys and bracketed paste — no history, completion,
 /// highlighting or pairing — read in raw mode, so it has no line-length cap
 /// (a cooked terminal's line discipline truncates at ~1 KB on macOS).
-pub fn build_plain(idle: Box<dyn FnMut() + Send>) -> Reedline {
+///
+/// `abort` breaks the read (the debugger's Stop ending a program waiting here).
+pub fn build_plain(idle: Box<dyn FnMut() + Send>, abort: Arc<AtomicBool>) -> Reedline {
     Reedline::create()
         .use_bracketed_paste(true)
         .with_poll_interval(std::time::Duration::from_millis(33))
         .with_idle_callback(idle)
+        .with_break_signal(abort)
 }
 
 fn add_common_keybindings(kb: &mut Keybindings) {

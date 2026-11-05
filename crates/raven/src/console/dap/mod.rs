@@ -766,15 +766,37 @@ fn request_resume(cmd: &str) {
 
 fn request_abort() {
     let Some(h) = handle() else { return };
-    if super::ipc::R_BUSY.load(Ordering::Relaxed) {
-        h.abort.store(true, Ordering::SeqCst);
-        super::sys::interrupt_r();
+    match super::r_wait() {
+        super::RWait::Evaluating => {
+            h.abort.store(true, Ordering::SeqCst);
+            super::sys::interrupt_r();
+        }
+        // A `readline()` the program is waiting on: break the read and
+        // interrupt the code that asked, as Ctrl-C there does.
+        super::RWait::UserInput => {
+            h.abort.store(true, Ordering::SeqCst);
+            INPUT_ABORT.store(true, Ordering::SeqCst);
+        }
+        super::RWait::IdleTopLevel | super::RWait::OtherPrompt => {}
     }
+}
+
+/// Set by Stop while R waits for user input; breaks the `readline()` editor
+/// (its break signal) or the cooked fallback read ([`take_input_abort`]).
+static INPUT_ABORT: std::sync::LazyLock<Arc<AtomicBool>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+pub fn input_abort_signal() -> Arc<AtomicBool> {
+    INPUT_ABORT.clone()
+}
+
+pub fn take_input_abort() -> bool {
+    INPUT_ABORT.swap(false, Ordering::SeqCst)
 }
 
 fn request_pause() {
     let Some(h) = handle() else { return };
-    if super::ipc::R_BUSY.load(Ordering::Relaxed) {
+    if super::r_wait() == super::RWait::Evaluating {
         h.pause.store(true, Ordering::SeqCst);
         // Interrupt R exactly as a Ctrl-C would; the global interrupt
         // handler sees the pause flag and opens the browser instead (§7).
@@ -1606,15 +1628,6 @@ static HAS_LAST_ERROR: AtomicBool = AtomicBool::new(false);
 /// top-level prompt.
 static INSPECT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// The console is waiting for input at R's top-level prompt, the only place
-/// a requested inspection is picked up (not a `+` continuation, a
-/// `readline()`, or a browser).
-static IDLE_TOP_LEVEL: AtomicBool = AtomicBool::new(false);
-
-pub fn set_idle_top_level(idle: bool) {
-    IDLE_TOP_LEVEL.store(idle, Ordering::SeqCst);
-}
-
 /// The socket thread's answer to an `inspect` request: `ok` (R opens the
 /// last error at its prompt), or why not (`none`, `busy`, `stopped`).
 pub fn request_inspect() -> &'static str {
@@ -1625,7 +1638,9 @@ pub fn request_inspect() -> &'static str {
     if lock(h).stop.is_some() {
         return "stopped";
     }
-    if !IDLE_TOP_LEVEL.load(Ordering::SeqCst) {
+    // Picked up only at R's top-level prompt (not a `+` continuation, a
+    // `readline()`, or a browser).
+    if super::r_wait() != super::RWait::IdleTopLevel {
         return "busy";
     }
     INSPECT_REQUESTED.store(true, Ordering::SeqCst);
@@ -1684,6 +1699,7 @@ fn on_top_level(more: bool) -> Option<String> {
         h.pause.store(false, Ordering::SeqCst);
         h.abort.store(false, Ordering::SeqCst);
     }
+    INPUT_ABORT.store(false, Ordering::SeqCst);
     let reset = if RESET_SINCE_PROMPT.swap(false, Ordering::SeqCst) {
         "TRUE"
     } else {
