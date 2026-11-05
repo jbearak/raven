@@ -22,7 +22,7 @@ You don't need a `launch.json`. VS Code attaches when R stops, whether at a brea
 
 To attach before anything stops, run Raven: Start R Debugging. You need this to change an exception filter (for example, to stop on warnings) for the first time, because the filters live in the Breakpoints view of a running session (Raven remembers them per workspace after that).
 
-F5 with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger; the session ends when the file has run. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script.
+F5 with an `.R` file open attaches and `source()`s that file, like running a Python script under the debugger; the session ends when the file has run. A `launch.json` entry with `"request": "launch"` and `"program"` does the same for a fixed script. Stop ends the run, including one waiting at a `readline()` or `menu()` prompt, and returns R to the `>` prompt.
 
 ## What you can do while stopped
 

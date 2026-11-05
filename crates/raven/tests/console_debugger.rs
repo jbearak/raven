@@ -156,6 +156,15 @@ impl Console {
         }
     }
 
+    /// Type without pressing Enter.
+    fn type_keys(&mut self, s: &str) {
+        self.master
+            .as_mut()
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap();
+    }
+
     fn type_line(&mut self, s: &str) {
         let m = self.master.as_mut().unwrap();
         m.write_all(s.as_bytes()).unwrap();
@@ -1278,6 +1287,56 @@ fn expressions_name_exactly_the_value_shown() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+}
+
+/// Stop ends an F5 program even while it waits at `readline()`, as it does
+/// for a Python program waiting in `input()`: the next typed line runs at
+/// the top-level prompt instead of answering the abandoned `readline()`.
+#[test]
+fn terminate_ends_a_program_waiting_at_readline() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("launch", json!({"program": "/w/p.R"}));
+    d.req("configurationDone", json!({}));
+    // The program's own output is upper-cased, so it can't match the echo.
+    c.send_program("ans <- readline('answer: '); cat(toupper('program got'), ans, '\\n')");
+    // Wait for the prompt itself: the echoed code also contains "answer: ".
+    let deadline = Instant::now() + TIMEOUT;
+    while c.text().matches("answer: ").count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "no readline() prompt: {}",
+            c.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A half-typed answer is abandoned with the program.
+    c.type_keys("partial");
+    c.expect("answer: partial");
+    let m = d.mark();
+    d.req("terminate", json!({}));
+    d.event("terminated", m);
+    std::thread::sleep(Duration::from_millis(500));
+    c.type_line("cat('alive', '\\n')");
+    c.expect("alive ");
+    assert!(
+        !c.text().contains("PROGRAM GOT"),
+        "the typed line answered the stopped program's readline(): {}",
+        c.text()
+    );
+    c.type_line("ans2 <- readline('again: ')");
+    c.expect("again: ");
+    c.type_line("fresh");
+    c.type_line("cat(toupper(ans2), '\\n')");
+    c.expect("FRESH");
+    assert!(
+        !c.text().contains("PARTIALFRESH"),
+        "the abandoned answer leaked into the next readline(): {}",
+        c.text()
+    );
 }
 
 #[test]
