@@ -20864,13 +20864,21 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let state = self.state.read().await;
-        Ok(handlers::hover(
-            &state,
-            &params.text_document_position_params.text_document.uri,
-            params.text_document_position_params.position,
-        )
-        .await)
+        // Phase 1: plan under the read lock. Phase 2: any R help lookup runs
+        // after the lock is released, so a cold lookup can't hold up writers.
+        let plan = {
+            let state = self.state.read().await;
+            handlers::prepare_hover(
+                &state,
+                &params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            )
+        };
+        Ok(match plan {
+            Some(handlers::HoverPlan::Ready(hover)) => Some(hover),
+            Some(handlers::HoverPlan::Help(help)) => help.resolve().await,
+            None => None,
+        })
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
@@ -55421,6 +55429,71 @@ lineLength = 200
             assert_eq!(cleared.uri, *uri);
             assert!(cleared.diagnostics.is_empty());
         }
+    }
+
+    /// A hover that waits on an R help lookup must not hold the `WorldState`
+    /// read lock while it waits, or a writer (a package refresh, a watched-file
+    /// update) stalls behind R, up to the help lookup timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hover_releases_the_state_lock_while_r_help_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tower_lsp::lsp_types::{
+            DidOpenTextDocumentParams, HoverParams, TextDocumentIdentifier, TextDocumentItem,
+            TextDocumentPositionParams,
+        };
+
+        // A stand-in R that takes a while and prints no help.
+        let dir = tempfile::tempdir().unwrap();
+        let slow_r = dir.path().join("R");
+        std::fs::write(&slow_r, "#!/bin/sh\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&slow_r, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let uri = Url::parse("untitled:hover-buffer").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "r".to_string(),
+                    version: 1,
+                    text: "no_such_symbol_xyz\n".to_string(),
+                },
+            })
+            .await;
+        // Only the hover's help lookup should meet the slow R, not open-time work.
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .packages_r_path = Some(slow_r);
+
+        let hover = backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(0, 2),
+            },
+            work_done_progress_params: Default::default(),
+        });
+        tokio::pin!(hover);
+        // Let the hover reach the help lookup and park on the fake R.
+        tokio::select! {
+            _ = &mut hover => panic!("hover finished before the help lookup returned"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        let writer = tokio::time::timeout(Duration::from_secs(1), backend.state.write()).await;
+        assert!(
+            writer.is_ok(),
+            "a writer must get the state lock while hover waits on R help"
+        );
+        drop(writer);
+        assert!(
+            hover.await.unwrap().is_none(),
+            "no help text means no hover"
+        );
     }
 
     #[tokio::test]

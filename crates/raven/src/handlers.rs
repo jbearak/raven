@@ -27007,7 +27007,70 @@ fn resolve_directive_origin(
     matches().min_by_key(|(line, _)| *line)
 }
 
+/// What a hover shows: finished content, or content that waits on one R help
+/// lookup.
+///
+/// [`prepare_hover`] builds the plan from `WorldState`; [`HelpHover::resolve`]
+/// runs the lookup, which may start an R subprocess, without needing the state.
+/// The LSP handler holds the `WorldState` read lock only for the first half.
+pub enum HoverPlan {
+    Ready(Hover),
+    Help(HelpHover),
+}
+
+/// A hover that shows R help for `topic` (in `package`, when known) if R has
+/// any, and `missing` otherwise (no hover when `missing` is `None`). Found help
+/// is headed by the help-panel link for `(topic, package)` when the package is
+/// known.
+pub struct HelpHover {
+    help_cache: crate::help::HelpCache,
+    r_path: std::path::PathBuf,
+    topic: String,
+    package: Option<String>,
+    missing: Option<String>,
+    range: Range,
+}
+
+impl HelpHover {
+    /// Look up the help text and build the hover.
+    pub async fn resolve(self) -> Option<Hover> {
+        let help_text = get_help_cached(
+            &self.help_cache,
+            &self.topic,
+            self.package.as_deref(),
+            self.r_path,
+        )
+        .await;
+        let value = match (help_text, self.package) {
+            (Some(text), Some(package)) => format!(
+                "{}```\n{}\n```",
+                build_help_panel_link(&self.topic, &package),
+                text
+            ),
+            (Some(text), None) => format!("```\n{}\n```", text),
+            (None, _) => self.missing?,
+        };
+        Some(markdown_hover(value, self.range))
+    }
+}
+
+fn ready(hover: Hover) -> Option<HoverPlan> {
+    Some(HoverPlan::Ready(hover))
+}
+
 /// Provide hover information for the symbol at a given text document position.
+///
+/// Builds the plan with [`prepare_hover`] and resolves it. Callers that hold
+/// the `WorldState` lock should call the two halves themselves and release
+/// the lock before resolving, since a help lookup can wait on R.
+pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+    match prepare_hover(state, uri, position)? {
+        HoverPlan::Ready(hover) => Some(hover),
+        HoverPlan::Help(help) => help.resolve().await,
+    }
+}
+
+/// Plan the hover for the symbol at a given text document position.
 ///
 /// Stan documents use a separate text-based path: compiler-known callables and
 /// distributions show signatures from Raven's pinned compiler catalog and a
@@ -27038,13 +27101,13 @@ fn resolve_directive_origin(
 /// ```
 ///
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
-pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+pub fn prepare_hover(state: &WorldState, uri: &Url, position: Position) -> Option<HoverPlan> {
     let doc = state.get_document(uri)?;
     if doc.file_type == FileType::Stan {
-        return stan_builtin_hover(&doc.text(), position);
+        return stan_builtin_hover(&doc.text(), position).map(HoverPlan::Ready);
     }
     if doc.file_type == FileType::Jags {
-        return jags_builtin_hover(&doc.text(), position);
+        return jags_builtin_hover(&doc.text(), position).map(HoverPlan::Ready);
     }
     if doc.file_type != FileType::R {
         return None;
@@ -27098,7 +27161,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             start: ts_point_to_lsp_position(&text, m.string_node.start_position()),
             end: ts_point_to_lsp_position(&text, m.string_node.end_position()),
         };
-        return Some(markdown_hover(
+        return ready(markdown_hover(
             local_definition_hover(state, &def_info, uri),
             string_range,
         ));
@@ -27115,6 +27178,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         start: ts_point_to_lsp_position(&text, node.start_position()),
         end: ts_point_to_lsp_position(&text, node.end_position()),
     };
+    // A hover that waits on one R help lookup for `topic` in `package`.
+    let help = |topic: &str, package: Option<String>, missing: Option<String>| {
+        Some(HoverPlan::Help(HelpHover {
+            help_cache: state.help_cache.clone(),
+            r_path: r_path.clone(),
+            topic: topic.to_string(),
+            package,
+            missing,
+            range: node_range,
+        }))
+    };
 
     // Explicit `pkg::name` / `pkg:::name` qualifier wins over the cross-file
     // scope's name resolution. Without this, hovering `filter` in
@@ -27130,7 +27204,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // member (RHS) side keeps the qualified help-topic behavior below.
         if node.kind() == "identifier" && is_namespace_package_side(node) {
             return package_metadata_hover(state, name)
-                .map(|value| markdown_hover(value, node_range));
+                .map(|value| HoverPlan::Ready(markdown_hover(value, node_range)));
         }
 
         let pkg_owned = qualifier_pkg.to_string();
@@ -27154,19 +27228,16 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             return None;
         }
 
-        let mut value = build_help_panel_link(name, &pkg_owned);
-        if let Some(help_text) =
-            get_help_cached(&state.help_cache, name, Some(&pkg_owned), r_path.clone()).await
-        {
-            value.push_str(&format!("```\n{}\n```", help_text));
-        } else {
-            // No help text available — still show the qualified heading + a
-            // 'from {pkg}' attribution so the user sees we honored the
-            // qualifier even when R doesn't have a topic for it.
-            value.push_str(&format!("```r\n{}\n```\n", name));
-            value.push_str(&format!("\nfrom {{{}}}", pkg_owned));
-        }
-        return Some(markdown_hover(value, node_range));
+        // No help text available — still show the qualified heading + a
+        // 'from {pkg}' attribution so the user sees we honored the
+        // qualifier even when R doesn't have a topic for it.
+        let missing = format!(
+            "{}```r\n{}\n```\n\nfrom {{{}}}",
+            build_help_panel_link(name, &pkg_owned),
+            name,
+            pkg_owned
+        );
+        return help(name, Some(pkg_owned), Some(missing));
     }
 
     // #382 steps 2-4: structural labels that hover can now *resolve* rather than
@@ -27219,7 +27290,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     }
                     crate::parameter_resolver::SignatureSource::RSubprocess { .. } => None,
                 };
-                return Some(markdown_hover(
+                return ready(markdown_hover(
                     parameter_hover(&decl, Some(funcname), param_doc.as_deref()),
                     node_range,
                 ));
@@ -27233,7 +27304,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             && let Some(func_line) = enclosing_named_function_line(node)
             && let Some(doc) = crate::roxygen::user_function_param_doc(&text, func_line, name)
         {
-            return Some(markdown_hover(
+            return ready(markdown_hover(
                 parameter_hover(name, None, Some(&doc)),
                 node_range,
             ));
@@ -27250,22 +27321,19 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             if let Some(package) = crate::qualified_resolve::selective_namespace_package(
                 state, uri, position, &path, name,
             ) {
-                let mut value = build_help_panel_link(name, &package);
-                if let Some(help_text) =
-                    get_help_cached(&state.help_cache, name, Some(&package), r_path.clone()).await
-                {
-                    value.push_str(&format!("```\n{}\n```", help_text));
-                } else {
-                    value.push_str(&format!("```r\n{}\n```\n", name));
-                    value.push_str(&format!("\nfrom {{{}}}", package));
-                }
-                return Some(markdown_hover(value, node_range));
+                let missing = format!(
+                    "{}```r\n{}\n```\n\nfrom {{{}}}",
+                    build_help_panel_link(name, &package),
+                    name,
+                    package
+                );
+                return help(name, Some(package), Some(missing));
             }
             if let Some(location) = crate::qualified_resolve::resolve_qualified_member(
                 state, uri, position, &path, name, op,
             ) && let Some(def_info) = member_definition_info(state, &location)
             {
-                return Some(markdown_hover(
+                return ready(markdown_hover(
                     local_definition_hover(state, &def_info, uri),
                     node_range,
                 ));
@@ -27395,7 +27463,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                 value.push_str(&format!("\n\n*Defined in {}*", relative_path));
             }
 
-            return Some(markdown_hover(value, node_range));
+            return ready(markdown_hover(value, node_range));
         }
 
         // Check if this is an external package export. Selective package
@@ -27431,24 +27499,9 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     } else {
                         pkg.to_string()
                     };
-                    let owner_ref = owner.as_str();
-                    let help_text =
-                        get_help_cached(&state.help_cache, topic, Some(owner_ref), r_path.clone())
-                            .await;
-                    log::trace!(
-                        "hover: get_help returned {:?}",
-                        help_text.as_ref().map(|s| s.len())
-                    );
-                    if let Some(help_text) = help_text {
-                        value.push_str(&format!("```\n{}\n```", help_text));
-                        value.insert_str(0, &build_help_panel_link(topic, owner_ref));
-                    } else if let Some(sig) = &symbol.signature {
-                        value.push_str(&format!("```r\n{}\n```\n", sig));
-                        value.push_str(&format!("\nfrom {{{}}}", owner_ref));
-                    } else {
-                        value.push_str(&format!("```r\n{}\n```\n", name));
-                        value.push_str(&format!("\nfrom {{{}}}", owner_ref));
-                    }
+                    let shown = symbol.signature.as_deref().unwrap_or(name);
+                    let missing = format!("```r\n{}\n```\n\nfrom {{{}}}", shown, owner);
+                    return help(topic, Some(owner), Some(missing));
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
                     if symbol.source_uri != *uri
@@ -27472,7 +27525,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }
         };
 
-        return Some(markdown_hover(value, node_range));
+        return ready(markdown_hover(value, node_range));
     }
 
     // Check package exports from the aggregate package cache (if packages enabled)
@@ -27510,33 +27563,16 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                         .as_deref(),
                 );
                 let value = format!("```r\n{}\n```\n\nfrom {}", name, owner_display);
-                return Some(markdown_hover(value, node_range));
+                return ready(markdown_hover(value, node_range));
             }
 
-            let mut value = String::new();
-
-            let help_text =
-                get_help_cached(&state.help_cache, name, Some(&pkg_name), r_path.clone()).await;
-            if let Some(help_text) = help_text {
-                value.push_str(&format!("```\n{}\n```", help_text));
-                value.insert_str(0, &build_help_panel_link(name, &pkg_name));
-            } else {
-                value.push_str(&format!("```r\n{}\n```\n", name));
-                value.push_str(&format!("\nfrom {{{}}}", pkg_name));
-            }
-
-            return Some(markdown_hover(value, node_range));
+            let missing = format!("```r\n{}\n```\n\nfrom {{{}}}", name, pkg_name);
+            return help(name, Some(pkg_name), Some(missing));
         }
     }
 
     // Fallback to R help system for built-ins and undefined symbols
-    if let Some(help_text) = get_help_cached(&state.help_cache, name, None, r_path).await {
-        return Some(markdown_hover(
-            format!("```\n{}\n```", help_text),
-            node_range,
-        ));
-    }
-    None
+    help(name, None, None)
 }
 
 /// Build a Markdown-content `Hover` anchored to `range`. Centralizes the
@@ -79558,6 +79594,75 @@ mod issue_459_backtick_navigation_tests {
             result.is_some(),
             "hover on a present namespace member must still resolve"
         );
+    }
+
+    /// The hover plan names the help lookup without running it: a qualified
+    /// member asks R for the member in its qualifier's package, and resolving
+    /// renders found help under the help-panel link, or the attribution when
+    /// R has none.
+    #[tokio::test]
+    async fn hover_plan_defers_the_qualified_help_lookup() {
+        let mut state = create_state();
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "pkgload".to_string(),
+            std::collections::HashSet::from(["load_all".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        state.package_library.insert_package(info).await;
+        let uri = add_doc(&mut state, "file:///t.R", "pkgload::load_all()\n");
+
+        let plan = || match super::prepare_hover(&state, &uri, Position::new(0, 12)) {
+            Some(super::HoverPlan::Help(help)) => help,
+            _ => panic!("a package member hover must wait on R help"),
+        };
+        let help = plan();
+        assert_eq!(
+            (help.topic.as_str(), help.package.as_deref()),
+            ("load_all", Some("pkgload"))
+        );
+        let markdown =
+            |hover: Option<tower_lsp::lsp_types::Hover>| match hover.expect("hover").contents {
+                tower_lsp::lsp_types::HoverContents::Markup(m) => m.value,
+                other => panic!("expected markdown, got {other:?}"),
+            };
+
+        state.help_cache.insert(
+            "load_all",
+            Some("pkgload"),
+            Some("Load a package".to_string()),
+        );
+        let found = markdown(plan().resolve().await);
+        assert!(
+            found.starts_with(&super::build_help_panel_link("load_all", "pkgload"))
+                && found.ends_with("```\nLoad a package\n```"),
+            "{found}"
+        );
+
+        state.help_cache.insert("load_all", Some("pkgload"), None);
+        let missing = markdown(plan().resolve().await);
+        assert!(missing.ends_with("from {pkgload}"), "{missing}");
+    }
+
+    /// A local definition needs no help lookup, so its plan is ready under the
+    /// lock.
+    #[test]
+    fn hover_plan_for_a_local_definition_is_ready() {
+        let mut state = create_state();
+        let uri = add_doc(&mut state, "file:///t.R", "f <- function(x) x\nf(1)\n");
+        assert!(matches!(
+            super::prepare_hover(&state, &uri, Position::new(1, 0)),
+            Some(super::HoverPlan::Ready(_))
+        ));
+    }
+
+    /// A plan owns what it needs, so the LSP handler can release the
+    /// `WorldState` lock before a help lookup that may wait on R.
+    #[test]
+    fn hover_plan_does_not_borrow_state() {
+        fn owned<T: Send + 'static>() {}
+        owned::<super::HoverPlan>();
     }
 
     /// Go-to-definition on a variable declared only by an `exists("name")` call
