@@ -156,6 +156,15 @@ impl Console {
         }
     }
 
+    /// Type without pressing Enter.
+    fn type_keys(&mut self, s: &str) {
+        self.master
+            .as_mut()
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap();
+    }
+
     fn type_line(&mut self, s: &str) {
         let m = self.master.as_mut().unwrap();
         m.write_all(s.as_bytes()).unwrap();
@@ -1295,6 +1304,8 @@ fn terminate_ends_a_program_waiting_at_readline() {
     // The program's own output is upper-cased, so it can't match the echo.
     c.send_program("ans <- readline('answer: '); cat(toupper('program got'), ans, '\\n')");
     c.expect("answer: ");
+    // A half-typed answer is abandoned with the program.
+    c.type_keys("partial");
     std::thread::sleep(Duration::from_millis(300));
     let m = d.mark();
     d.req("terminate", json!({}));
@@ -1305,6 +1316,16 @@ fn terminate_ends_a_program_waiting_at_readline() {
     assert!(
         !c.text().contains("PROGRAM GOT"),
         "the typed line answered the stopped program's readline(): {}",
+        c.text()
+    );
+    c.type_line("ans2 <- readline('again: ')");
+    c.expect("again: ");
+    c.type_line("fresh");
+    c.type_line("cat(toupper(ans2), '\\n')");
+    c.expect("FRESH");
+    assert!(
+        !c.text().contains("PARTIALFRESH"),
+        "the abandoned answer leaked into the next readline(): {}",
         c.text()
     );
 }

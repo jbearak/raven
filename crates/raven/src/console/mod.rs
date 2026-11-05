@@ -1329,8 +1329,10 @@ fn plain_edit(ed: &mut Reedline, prompt: &str) -> Option<String> {
             }
             Ok(Signal::CtrlD) => return None,
             // Only the debugger's Stop breaks this editor: end the program
-            // waiting here, as Ctrl-C would.
+            // waiting here, as Ctrl-C would. The break keeps the half-typed
+            // answer in the editor; drop it so the next read starts empty.
             Ok(Signal::ExternalBreak(_)) => {
+                ed.run_edit_commands(&[EditCommand::Clear]);
                 request_interrupt();
                 return Some("\n".into());
             }
