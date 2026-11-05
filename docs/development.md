@@ -603,6 +603,8 @@ Key files under `crates/raven/src/cross_file/`:
 
 - `mod.rs` — Public API (`extract_metadata()`)
 - `dependency.rs` — Dependency graph (forward + backward edges)
+- `dependency/plan.rs` — `plan_file_edges`: the edges `update_file` would insert for one file, with each candidate's provenance and each dropped entry's reason, without touching the graph. `update_file` is plan plus apply. A graph with tracing on (only `raven graph`, and every graph under `cfg(test)`) keeps each file's latest plan; under `cfg(test)` a debug assertion checks after every apply that the plan's surviving candidates equal the edges that file owns
+- `dependency/export.rs` — Joins a traced graph's stored edges to their owners' plans by `GraphEdgeDedupKey` for `raven graph` (`cli/graph.rs`). The rows are the graph's edges, not the plans, so an edge removed later (the `system.file()` pass dropping an orphan) is no row, and its stale record is counted in a warning
 - `scope.rs` — Scope artifacts, interface hash, scope-at-position resolution
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce

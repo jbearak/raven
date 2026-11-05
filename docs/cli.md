@@ -8,6 +8,7 @@ The `raven` binary checks R code from a terminal or CI job, manages the package 
 |---|---|
 | [`raven check`](#raven-check) | Indexes the workspace and reports the full diagnostic set, the same diagnostics the editor publishes. |
 | [`raven lint`](#raven-lint) | Runs only the native style linter. |
+| [`raven graph`](#raven-graph) | Prints the links Raven found between files: `source()` calls, directives, and the rest of the cross-file graph. |
 | [`raven packages update`](#raven-packages-update) | Downloads CRAN/Bioconductor export names so `raven check` recognizes package functions without R. |
 | [`raven packages freeze`](#raven-packages-freeze) | Writes a committed `.raven/packages.json` from your installed packages. |
 | [`raven packages fetch`](#raven-packages-fetch) | Writes the same file from r-universe, with no R needed. |
@@ -327,6 +328,84 @@ Invoking `raven lint` turns on the native linter, even when no config is discove
 <a id="github-actions-example-1"></a>
 
 To run `raven lint` in CI, see [Automated checks in CI](ci.md#gate-on-style).
+
+## `raven graph`
+
+Print the cross-file graph Raven builds for a workspace: every link it stores between files, the call sites it found but didn't link, and why. Use it to see why a symbol is or isn't in scope, or to compare Raven's view of a project with another tool's.
+
+```text
+raven graph [--workspace DIR] [--config FILE | --no-config] [--format text|json]
+```
+
+`raven graph` indexes the workspace exactly as `raven check` does, with the same configuration, exclusions, and package handling, and prints the graph that indexing produced. In this example, `main.R` sources one helper inside `local()`, one at the top level with `local = TRUE`, and one that doesn't exist:
+
+<!-- example: graph-text -->
+```console
+$ raven graph
+main.R:2:3 -> R/clean.R (source, call, current_frame)
+main.R:5:1 -> R/model.R (source, call, global)
+main.R:6:1 -> R/report.R (source, call, global, missing, not portable from root)
+
+3 edge(s), 0 dropped, 4 file(s)
+```
+
+The text format is for reading and may change between releases. For scripts, use `--format json`.
+
+### Graph options
+
+- `--workspace DIR`: the workspace root to index. The default is the current directory.
+- `--config PATH`: explicit path to a `raven.toml` or `.lintr`. By default Raven walks upward from the workspace.
+- `--no-config`: ignore `raven.toml` and `.lintr` and use Raven's built-in defaults.
+- `--format text|json`: output format, default `text`. `sarif` isn't accepted, because the graph isn't a list of findings.
+
+`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config exits `2`.
+
+### Graph JSON
+
+The JSON object has `schema_version` (currently `1`), `raven_version`, `root`, `package_mode`, `complete`, `warnings`, `files`, `edges`, and `dropped`. Adding a field or an enum value keeps `schema_version`; removing or renaming a field, or changing its meaning, increments it. Ignore fields you don't know and treat unknown enum values as "other".
+
+Paths are relative to the canonical workspace root with `/` separators, or absolute outside it. Positions are 0-based lines and UTF-16 characters, as in the editor protocol. A file reached through two spellings, such as a symlink, appears once per spelling.
+
+- `package_mode`: Raven analyzed the workspace as an R package.
+- `complete`: every file the workspace scan found went through graph building. When it's `false`, `warnings` says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
+- `warnings`: sentences for people, covering incomplete files, files without full text (backward call sites into them may be unfound), failed `list.files()` batches, and any mismatch between the graph and its records.
+- `files`: every indexed file and every edge endpoint, each with `path`, `indexed`, `exists`, `self_contained`, `syntax_errors`, and `working_directory` (`null`, or `{"raw", "resolved"}` for a `# raven: cd`).
+
+Each entry in `edges` is one stored link, including repeated calls and every file of a batch. Edges are sorted by `caller`, call-site position, `batch_ordinal`, `kind`, `origin`, and `target`:
+
+| Field | Meaning |
+|---|---|
+| `caller`, `target` | The endpoints. For a backward directive, `caller` is the parent it names and `target` is the file containing it. |
+| `kind` | `source`, `sys_source`, `tar_source`, `list_files`, `shiny_global`, `shiny`, `box`, or `tarchetypes_document`. |
+| `origin` | `call`, `directive` (`# raven: source`, `run`, `include`), or `backward_directive` (`# raven: sourced-by`, `run-by`, `included-by`). |
+| `call_site` | Where in `caller` scope treats the call as happening: `basis` (`call`, `directive`, `line`, `line_end`, `eof`, `match`, `inferred`, or `implicit` for Shiny), `position` (`null` for `eof` and for a backward call site that wasn't found; `character` is `null` for `line_end`), and `failure` (`null`, `not_found`, or `parent_content_unavailable`). |
+| `directive` | For a directive, `{"file", "line"}` where it's written; otherwise `null`. |
+| `raw_path` | The path as Raven read it, for `source()` and `sys.source()` calls, directives, and report documents. `null` for `system.file()` calls, batches, and `box` modules. |
+| `system_file` | For a `system.file()` call, `{"package", "parts"}`; otherwise `null`. |
+| `batch_ordinal` | Order within a `tar_source`, `list_files`, `shiny_global`, or `shiny` batch. |
+| `locality` | `global` (top level, including `local = TRUE` at a file's top level), `current_frame` (`local = TRUE` inside `local()` or a function), or `non_inheriting` (`local = <env>`, or `sys.source()` without a global `envir`). `null` for `box`, report, and backward edges. |
+| `chdir`, `function_scoped` | As Raven stored them; `null` for backward directives. |
+| `guarded_by_file_exists` | The call is the only consequence of an `if (file.exists(...))` naming the same path. |
+| `resolution` | How the written path resolved: `endpoint` (`target`, or `caller` for backward directives), `exists`, `case` (`exact`, `filesystem_folds_case`, `raven_leniency`, or `null` when the file doesn't exist), `outside_root`, and `working_directory` (the base used when it wasn't the file's own directory). `null` for batches and `box` modules. |
+| `portable_from_root` | `true` when `raw_path` has no leading `/` and resolves, with the same case, to an existing file at that path under the root, so the call works when R runs from the root. `null` without a `raw_path` and for backward directives. |
+
+Each entry in `dropped` is a call site Raven found that produced no edge: `caller`, `position`, `kind`, `origin`, `raw_path`, `system_file`, `target`, and `reason`. The reasons are:
+
+- `excluded`: the target matches `[workspace].exclude` or `.gitignore`.
+- `unresolvable`: the path couldn't be normalized.
+- `system_file_unresolved`: a `system.file()` call that didn't resolve. A package that isn't installed and a run without R look the same.
+- `superseded`: a forward directive stands in for the call. For example, a plain `# raven: source` directive followed by a `line=eof` directive for the same file covers a later call to that file.
+- `duplicate`: merged with an identical edge, such as a repeated directive.
+- `no_path_context`: Raven couldn't resolve any path in the file. It shouldn't happen for files on disk.
+
+### Graph limits
+
+- **One resolution per call.** A child reached under different working directories, through `chdir = TRUE`, an inherited `# raven: cd`, or `tar_source()` with `change_directory`, appears once.
+- **Detected calls only.** A call Raven doesn't detect, such as a path built with `paste0()` or a call lost to a syntax error, is absent. `syntax_errors` flags files where that can happen.
+- **The workspace graph only.** Links that `raven check FILE.Rmd` adds for a named report aren't shown, and `.Rmd` and `.qmd` files appear only as endpoints.
+- **Implicit scope isn't an edge**: a package's `R/` namespace, testthat helpers, and `.Rprofile`.
+- **Losses before the graph sees a call aren't listed.** Batch expansion drops excluded members, and a failed `list.files()` batch contributes no members; `warnings` names each failed batch and why. Raven also drops a `source()` call on the same line as a `line=N` forward directive's call site, whatever its target, so only the directive's edge appears.
+- **Files indexed from outside the root contribute no edges of their own.**
 
 ## `raven console`
 

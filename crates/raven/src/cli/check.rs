@@ -489,37 +489,40 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         return EXIT_OPERATOR_ERROR;
     };
 
-    // Build the indexed WorldState (config + workspace scan + package-mode).
-    let mut state = match build_indexed_state(
-        &root,
-        &workspace_url,
-        args.no_config,
-        args.config_path.as_deref(),
-        cwd,
-    ) {
-        Ok(s) => s,
+    // Config, workspace scan, package mode, R detection, and `system.file()`
+    // resolution: the setup `raven graph` shares (see `prepare_workspace`).
+    let PreparedWorkspace {
+        mut state,
+        startup_notes,
+        db_load_notes,
+        shipped_db_load,
+        scan: _,
+    } = match prepare_workspace(WorkspaceSetup {
+        command: "raven check",
+        root: &root,
+        workspace_url: &workspace_url,
+        no_config: args.no_config,
+        config_path: args.config_path.as_deref(),
+        explicit_config_base: cwd,
+        trace_graph: false,
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
         Err(code) => return code,
     };
+    for note in startup_notes {
+        eprintln!("{note}");
+    }
 
     // CI default: suppress generic missing-package diagnostics because CI
     // deliberately omits installation (spec §10.1). Actionable subtypes such
     // as "available outside this active renv project" remain enabled.
-    // `--report-uninstalled` opts the generic diagnostic back in.
+    // `--report-uninstalled` opts the generic diagnostic back in. Setup reads
+    // no diagnostic setting, so applying it afterwards changes nothing there.
     if !args.report_uninstalled {
         state.cross_file_config.packages_report_generic_uninstalled = false;
     }
-
-    // Auto-detect R for installed-package / base-symbol awareness. Any failure
-    // (R absent, init error, no library paths) degrades gracefully and prints
-    // its own one-line note to stderr. The returned verdict feeds the
-    // missing-export-metadata warning below; the returned load notes
-    // (present-but-unusable package DB) ride the shared footer.
-    let (shipped_db_load, db_load_notes) = maybe_init_r(&mut state, &root).await;
-
-    // Resolve system.file() sources now that both package state AND library
-    // paths are available (maybe_init_r populates lib_paths from R discovery
-    // and additionalLibraryPaths).
-    state.resolve_system_file_in_workspace_cli_compat(None);
 
     // R fallback for sysdata: when the AST scan found nothing AND
     // R/sysdata.rda exists, load it via the R subprocess (see
@@ -656,6 +659,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
 /// package-input seeding ([`crate::backend::initialize_package_inputs_from_state_with_exclusions`]),
 /// and the R package library ([`crate::package_library::build_package_library`]).
 /// Keep new startup logic in those seams, not duplicated here.
+#[cfg(test)]
 fn build_indexed_state(
     root: &Path,
     workspace_url: &Url,
@@ -663,10 +667,117 @@ fn build_indexed_state(
     config_path: Option<&Path>,
     explicit_config_base: &Path,
 ) -> Result<crate::state::WorldState, i32> {
-    let (project_settings, project_config_path) =
-        resolve_project_config(no_config, config_path, root, explicit_config_base)?;
+    let (state, _, notes) = build_indexed_state_reporting(&WorkspaceSetup {
+        command: "raven check",
+        root,
+        workspace_url,
+        no_config,
+        config_path,
+        explicit_config_base,
+        trace_graph: false,
+    })?;
+    for note in notes {
+        eprintln!("{note}");
+    }
+    Ok(state)
+}
+
+/// What [`prepare_workspace`] needs: the command name for messages, where the
+/// workspace and config are, and whether the dependency graph keeps edge plans
+/// (only `raven graph` turns that on).
+pub(crate) struct WorkspaceSetup<'a> {
+    /// For messages, e.g. `"raven check"`.
+    pub(crate) command: &'a str,
+    /// The canonicalized workspace root.
+    pub(crate) root: &'a Path,
+    pub(crate) workspace_url: &'a Url,
+    pub(crate) no_config: bool,
+    pub(crate) config_path: Option<&'a Path>,
+    /// Where a relative `--config` resolves from: the invocation directory.
+    pub(crate) explicit_config_base: &'a Path,
+    /// Keep each file's edge plan, set before the first graph build so the
+    /// workspace build's plans are kept too.
+    pub(crate) trace_graph: bool,
+}
+
+/// The workspace after [`prepare_workspace`].
+pub(crate) struct PreparedWorkspace {
+    pub(crate) state: crate::state::WorldState,
+    /// One-line notes for stderr, already prefixed with the command name: a
+    /// model switch that failed closed, and a degraded R environment.
+    pub(crate) startup_notes: Vec<String>,
+    /// Present-but-unusable package-DB notes (unprefixed), for `check`'s
+    /// footer.
+    pub(crate) db_load_notes: Vec<String>,
+    /// Whether the shipped `names.db` loaded, for `check`'s
+    /// missing-export-metadata warning.
+    pub(crate) shipped_db_load: crate::package_library::ShippedDbLoad,
+    /// What the workspace scan discovered beyond its index entries.
+    pub(crate) scan: crate::state::WorkspaceScanReport,
+}
+
+/// The setup `raven check` and `raven graph` share: load the project config,
+/// scan the workspace and build the dependency graph, derive package mode,
+/// detect R, then resolve `system.file()` sources (which patches the graph's
+/// `system.file()` entries once library paths are known).
+///
+/// Config-load failures print `{command}: ...` to stderr and return
+/// `Err(EXIT_OPERATOR_ERROR)`; config warnings print as before. Every other
+/// note is returned, not printed.
+pub(crate) async fn prepare_workspace(setup: WorkspaceSetup<'_>) -> Result<PreparedWorkspace, i32> {
+    let (mut state, scan, mut startup_notes) = build_indexed_state_reporting(&setup)?;
+
+    // Auto-detect R for installed-package / base-symbol awareness. Any failure
+    // (R absent, init error, no library paths) degrades gracefully with a
+    // one-line note. The returned verdict feeds `check`'s
+    // missing-export-metadata warning; the load notes (present-but-unusable
+    // package DB) ride its footer.
+    let (shipped_db_load, db_load_notes, degraded_note) = init_r(&mut state, setup.root).await;
+    if let Some(note) = degraded_note {
+        startup_notes.push(format!("{}: {note}", setup.command));
+    }
+
+    // Resolve system.file() sources now that both package state AND library
+    // paths are available (init_r populates lib_paths from R discovery and
+    // additionalLibraryPaths).
+    state.resolve_system_file_in_workspace_cli_compat(None);
+
+    Ok(PreparedWorkspace {
+        state,
+        startup_notes,
+        db_load_notes,
+        shipped_db_load,
+        scan,
+    })
+}
+
+/// The config, scan, and package-mode half of [`prepare_workspace`]. Returns
+/// the state, the scan report, and the prefixed startup notes so far.
+fn build_indexed_state_reporting(
+    setup: &WorkspaceSetup<'_>,
+) -> Result<
+    (
+        crate::state::WorldState,
+        crate::state::WorkspaceScanReport,
+        Vec<String>,
+    ),
+    i32,
+> {
+    let root = setup.root;
+    let workspace_url = setup.workspace_url;
+    let (project_settings, project_config_path) = resolve_project_config_for(
+        setup.command,
+        setup.no_config,
+        setup.config_path,
+        root,
+        setup.explicit_config_base,
+        &crate::config_file::DiscoveryOptions::default(),
+    )?;
 
     let mut state = crate::state::WorldState::new();
+    // Before the first graph build (inside `apply_workspace_index` below), so
+    // the workspace build's plans are kept.
+    state.cross_file_graph.set_tracing(setup.trace_graph);
     state.workspace_folders = vec![workspace_url.clone()];
     state.raw_project_settings = project_settings;
     state.project_config_path = project_config_path;
@@ -679,23 +790,24 @@ fn build_indexed_state(
     // A model switch that fails closed is otherwise silent here: the recompute
     // logs it, but the CLI runs without a logger by default, so `stan = "On"`
     // in `raven.toml` reads exactly like the built-in "off" — an empty report
-    // with no explanation. Put it on stderr so it cannot be mistaken for a
-    // clean run, and keep it off stdout so `--format json|sarif` output stays
-    // machine-parsable.
-    for message in crate::backend::invalid_model_switch_messages(
+    // with no explanation. The caller puts it on stderr so it cannot be
+    // mistaken for a clean run, and keeps it off stdout so `--format
+    // json|sarif` output stays machine-parsable.
+    let notes: Vec<String> = crate::backend::invalid_model_switch_messages(
         state
             .raw_project_settings
             .as_ref()
             .unwrap_or(&serde_json::Value::Null),
-    ) {
-        eprintln!("raven check: {message}");
-    }
+    )
+    .into_iter()
+    .map(|message| format!("{}: {message}", setup.command))
+    .collect();
 
     // Index the workspace exactly as the LSP server does on startup. This is
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let entries = crate::state::scan_workspace_with_box_context(
+    let (entries, scan) = crate::state::scan_workspace_reporting(
         std::slice::from_ref(workspace_url),
         max_chain_depth,
         &state.workspace_exclusions,
@@ -751,7 +863,7 @@ fn build_indexed_state(
         &workspace_exclusions,
     );
 
-    Ok(state)
+    Ok((state, scan, notes))
 }
 
 /// Discover and load the project config at or above `search_start` (the search
@@ -760,6 +872,7 @@ fn build_indexed_state(
 /// workspace root. Returns `(settings, config_path)` to wire into the
 /// `WorldState`. Prints warnings to stderr; returns `Err(EXIT_OPERATOR_ERROR)`
 /// when a config that exists cannot be loaded.
+#[cfg(test)]
 fn resolve_project_config(
     no_config: bool,
     config_path: Option<&Path>,
@@ -775,7 +888,28 @@ fn resolve_project_config(
     )
 }
 
+#[cfg(test)]
 fn resolve_project_config_with_options(
+    no_config: bool,
+    config_path: Option<&Path>,
+    search_start: &Path,
+    explicit_config_base: &Path,
+    discovery_options: &crate::config_file::DiscoveryOptions,
+) -> Result<(Option<serde_json::Value>, Option<PathBuf>), i32> {
+    resolve_project_config_for(
+        "raven check",
+        no_config,
+        config_path,
+        search_start,
+        explicit_config_base,
+        discovery_options,
+    )
+}
+
+/// Resolve the project config (`raven.toml` / `.lintr`), naming `command` in
+/// its errors.
+fn resolve_project_config_for(
+    command: &str,
     no_config: bool,
     config_path: Option<&Path>,
     search_start: &Path,
@@ -800,10 +934,7 @@ fn resolve_project_config_with_options(
         ) {
             Some((explicit_abs, l)) => loaded(l.warnings, l.settings, explicit_abs),
             None => {
-                eprintln!(
-                    "raven check: failed to load --config {}",
-                    explicit.display()
-                );
+                eprintln!("{command}: failed to load --config {}", explicit.display());
                 Err(EXIT_OPERATOR_ERROR)
             }
         };
@@ -818,7 +949,7 @@ fn resolve_project_config_with_options(
             warnings,
         } => loaded(warnings, settings, path),
         crate::config_file::DiscoveredLoad::LoadFailed { path } => {
-            eprintln!("raven check: failed to load {}", path.display());
+            eprintln!("{command}: failed to load {}", path.display());
             Err(EXIT_OPERATOR_ERROR)
         }
         crate::config_file::DiscoveredLoad::None => Ok((None, None)),
@@ -855,10 +986,28 @@ fn resolve_project_config_with_options(
 ///   than this function printing them, so they ride the diagnostics' own stream
 ///   (stdout for `text`) instead of being reorderable against the findings on
 ///   stderr. See `footer_stream`.
+#[cfg(test)]
 async fn maybe_init_r(
     state: &mut crate::state::WorldState,
     root: &Path,
 ) -> (crate::package_library::ShippedDbLoad, Vec<String>) {
+    let (shipped_db_load, load_notes, degraded_note) = init_r(state, root).await;
+    if let Some(note) = degraded_note {
+        eprintln!("raven check: {note}");
+    }
+    (shipped_db_load, load_notes)
+}
+
+/// Initialize R and the package library, returning the degraded-environment
+/// note (unprefixed) instead of printing it.
+async fn init_r(
+    state: &mut crate::state::WorldState,
+    root: &Path,
+) -> (
+    crate::package_library::ShippedDbLoad,
+    Vec<String>,
+    Option<String>,
+) {
     // Snapshot config into locals before the call so the later `state`
     // mutation doesn't conflict with the borrow.
     let r_path = state.cross_file_config.packages_r_path.clone();
@@ -911,10 +1060,8 @@ async fn maybe_init_r(
     // because `get_fallback_lib_paths()` finds the framework library and the
     // build classifies `Ready`). `has_providers()` is the coverage gate: offline
     // Tier 2/3 data resolves package symbols without R, so the note is suppressed.
-    if let Some(note) = degraded_env_note(&status, state.package_library.has_providers()) {
-        eprintln!("raven check: {note}");
-    }
-    (shipped_db_load, load_notes)
+    let degraded_note = degraded_env_note(&status, state.package_library.has_providers());
+    (shipped_db_load, load_notes, degraded_note)
 }
 
 /// Shared tail of the degraded-environment startup notes: the consequence
@@ -967,7 +1114,7 @@ fn degraded_env_note(
 /// a user script that attaches the package still flags these objects —
 /// `library(cli); emojis` remains a real R error.
 ///
-/// Must run after [`maybe_init_r`] (needs the library's R subprocess) and
+/// Must run after [`init_r`] (needs the library's R subprocess) and
 /// before diagnostics. Fail-soft: no R, no `.rda`, or a load failure leaves
 /// the AST-scan result in place.
 async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
@@ -3317,13 +3464,21 @@ infixContinuationStyle = "indented"
     ) -> (crate::state::WorldState, Vec<PathBuf>) {
         let root = std::fs::canonicalize(args.workspace.as_ref().unwrap()).unwrap();
         let workspace_url = Url::from_file_path(&root).unwrap();
-        let mut state =
-            build_indexed_state(&root, &workspace_url, args.no_config, None, &root).unwrap();
+        let mut state = prepare_workspace(WorkspaceSetup {
+            command: "raven check",
+            root: &root,
+            workspace_url: &workspace_url,
+            no_config: args.no_config,
+            config_path: None,
+            explicit_config_base: &root,
+            trace_graph: false,
+        })
+        .await
+        .unwrap_or_else(|code| panic!("setup failed with exit code {code}"))
+        .state;
         if !args.report_uninstalled {
             state.cross_file_config.packages_report_generic_uninstalled = false;
         }
-        maybe_init_r(&mut state, &root).await;
-        state.resolve_system_file_in_workspace_cli_compat(None);
         maybe_load_sysdata_fallback(&mut state).await;
         let mut operator_error = false;
         let targets = collect_report_targets_with_exclusions(
@@ -3374,6 +3529,82 @@ infixContinuationStyle = "indented"
             }
             all
         })
+    }
+
+    /// `raven graph` and `raven check` agree, by category, on the golden
+    /// workspace with default severities: `unresolved-source-path` is
+    /// reported at exactly the unguarded edges whose endpoint doesn't exist,
+    /// and `source-path-case-mismatch` at exactly the unguarded,
+    /// non-`system.file()` edges whose case differs. Locations are the
+    /// directive line for directives, else the call site.
+    #[cfg(unix)]
+    #[test]
+    fn graph_edges_match_check_path_diagnostics_by_category() {
+        use std::collections::BTreeSet;
+        let (_tmp, ws) = crate::cli::graph::golden_workspace();
+        let root = fs::canonicalize(&ws).unwrap();
+        let mut args = base_args(&root);
+        args.no_config = false;
+        let diagnostics = collect_diagnostics_blocking(&args);
+        let reported = |code: &str| -> BTreeSet<(String, u32)> {
+            diagnostics
+                .iter()
+                .filter(|(_, d)| {
+                    matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == code)
+                })
+                .map(|(path, d)| {
+                    let rel = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+                    (rel, d.range.start.line)
+                })
+                .collect()
+        };
+
+        let report = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::cli::graph::build_graph_report(
+                &crate::cli::graph::GraphArgs {
+                    workspace: Some(root.clone()),
+                    config_path: None,
+                    no_config: false,
+                    format: crate::cli::graph::GraphFormat::Json,
+                },
+                &root,
+            ))
+            .unwrap();
+        let location = |edge: &crate::cli::graph::EdgeRow| -> (String, u32) {
+            match &edge.directive {
+                Some(directive) => (directive.file.clone(), directive.line),
+                None => (
+                    edge.caller.clone(),
+                    edge.call_site.as_ref().unwrap().position.unwrap().line,
+                ),
+            }
+        };
+        let unguarded =
+            |edge: &&crate::cli::graph::EdgeRow| edge.guarded_by_file_exists != Some(true);
+        let missing: BTreeSet<(String, u32)> = report
+            .edges
+            .iter()
+            .filter(unguarded)
+            .filter(|edge| edge.resolution.as_ref().is_some_and(|r| !r.exists))
+            .map(location)
+            .collect();
+        let case_differs: BTreeSet<(String, u32)> = report
+            .edges
+            .iter()
+            .filter(unguarded)
+            .filter(|edge| edge.system_file.is_none())
+            .filter(|edge| {
+                edge.resolution.as_ref().is_some_and(|r| {
+                    matches!(r.case, Some("filesystem_folds_case" | "raven_leniency"))
+                })
+            })
+            .map(location)
+            .collect();
+
+        assert!(!missing.is_empty() && !case_differs.is_empty());
+        assert_eq!(reported("unresolved-source-path"), missing);
+        assert_eq!(reported("source-path-case-mismatch"), case_differs);
     }
 
     #[test]
