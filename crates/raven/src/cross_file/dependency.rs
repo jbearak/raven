@@ -891,13 +891,16 @@ pub struct DependencyGraph {
     /// Each file's latest edge plan, kept only when tracing is on (`raven
     /// graph`, and every graph under `cfg(test)`). The language server never
     /// traces. Clones and extracted subgraphs start with an empty trace.
-    trace: Option<GraphTrace>,
+    /// Boxed so the graph (and `WorldState`, which embeds it) stays small:
+    /// debug-build futures copy `WorldState` often enough that 72 inline
+    /// bytes overflowed a 2 MiB test-thread stack.
+    trace: Option<Box<GraphTrace>>,
 }
 
 /// Whether a new graph traces: on under `cfg(test)`, so the plan/graph
 /// consistency assertion in `update_file_traced` covers every in-crate test.
-fn traces_by_default() -> Option<GraphTrace> {
-    cfg!(test).then(GraphTrace::default)
+fn traces_by_default() -> Option<Box<GraphTrace>> {
+    cfg!(test).then(Box::default)
 }
 
 impl Default for DependencyGraph {
@@ -975,7 +978,7 @@ impl DependencyGraph {
     /// Turn plan tracing on (an empty trace) or off. Set before the first
     /// `update_file` so the workspace build's plans are kept.
     pub(crate) fn set_tracing(&mut self, on: bool) {
-        self.trace = on.then(GraphTrace::default);
+        self.trace = on.then(Box::default);
     }
 
     /// Every stored edge's revision identity, from both indexes, sorted: two
