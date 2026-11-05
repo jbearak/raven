@@ -681,7 +681,9 @@ pub(crate) fn is_plyr_split_apply_verb(name: &str) -> bool {
 
 fn dplyr_policy(name: &str) -> Option<ArgPolicy> {
     let policy = match name {
-        "filter" | "slice" => {
+        // `filter_out` (dplyr 1.2.0) is `filter`'s complement (drops the rows
+        // where the condition is TRUE) and shares its exact signature.
+        "filter" | "filter_out" | "slice" => {
             ArgPolicy::per_formal(&[".data", "...", ".by", ".preserve"], &[".by"], true)
         }
         "mutate" => ArgPolicy::per_formal(
@@ -2997,6 +2999,7 @@ mod tests {
         use Shape::*;
         let cases: &[(&str, Shape)] = &[
             ("filter", PerFormal),
+            ("filter_out", PerFormal),
             ("slice", PerFormal),
             ("mutate", PerFormal),
             ("transmute", PerFormal),
@@ -3026,6 +3029,13 @@ mod tests {
             // Not in the curated table -> evaluated normally.
             ("coalesce", None),
             ("n", None),
+            // dplyr 1.2.0 vector helpers evaluate their arguments normally
+            // (they are data-masked only via the enclosing verb).
+            ("when_any", None),
+            ("when_all", None),
+            ("replace_when", None),
+            ("recode_values", None),
+            ("replace_values", None),
         ];
         for (name, want) in cases {
             assert_eq!(

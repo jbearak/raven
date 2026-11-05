@@ -31882,6 +31882,28 @@ mod tests {
         assert!(!was_collected(&used, "col"));
     }
 
+    /// dplyr 1.2.0 `filter_out()` data-masks exactly like `filter()`, bare (with
+    /// dplyr in play), namespaced, pipe-fed, and with `.by`/`by`: the
+    /// data-masked columns are suppressed, while `.data` is still checked.
+    #[test]
+    fn nse_phase2_dplyr_filter_out_matches_filter() {
+        for code in [
+            "filter_out(df, is.na(col), .by = grp)",
+            "dplyr::filter_out(df, col > 1, by = grp)",
+            "df |> filter_out(col > 1)",
+        ] {
+            let tree = parse_r_code(code);
+            let mut used = Vec::new();
+            collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
+            assert!(was_collected(&used, "df"), "{code}: .data must be checked");
+            assert!(
+                !was_collected(&used, "col"),
+                "{code}: column is data-masked"
+            );
+            assert!(!was_collected(&used, "grp"), "{code}: .by is data-masked");
+        }
+    }
+
     // ---- Package-declared NSE policies (`inst/raven/nse.toml`) ----
 
     /// Install a fake package into a fresh temp library, optionally with a

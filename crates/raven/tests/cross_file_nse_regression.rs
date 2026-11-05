@@ -439,3 +439,55 @@ fn rmd_own_library_in_chunk_suppresses_filter_nse() {
          Output:\n{output}"
     );
 }
+
+/// dplyr 1.2.0 `filter_out()` data-masks its `...` and `.by` exactly like
+/// `filter()`, bare and `dplyr::`-qualified, under `raven check --format json`
+/// (the output used by tools that validate generated code). A genuinely
+/// undefined data frame passed as `.data` is still reported for both verbs.
+#[test]
+fn dplyr_filter_out_masks_columns_like_filter() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("main.R"),
+        "library(dplyr)\n\
+         d <- data.frame(income = c(1, NA, 3), grp = c(\"a\", \"a\", \"b\"))\n\
+         d <- filter_out(d, is.na(income))\n\
+         d <- dplyr::filter_out(d, income > 1)\n\
+         d <- filter(d, income > 1)\n\
+         d <- filter_out(d, income > 1, .by = grp)\n\
+         d <- d |> filter_out(income > 1)\n\
+         a <- filter(missing_frame_a, income > 1)\n\
+         b <- filter_out(missing_frame_b, income > 1)\n",
+    )
+    .unwrap();
+
+    let output = Command::new(raven_binary())
+        .args(["check", "--workspace"])
+        .arg(dir.path())
+        .args(["--format", "json", "--max-severity", "off"])
+        .output()
+        .expect("failed to execute raven check");
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(1)),
+        "raven check did not complete cleanly: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let messages: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{stdout}"))
+        .iter()
+        .filter_map(|d| d["diagnostic"]["message"].as_str().map(str::to_owned))
+        .collect();
+
+    for column in ["income", "grp"] {
+        assert!(
+            !messages.contains(&format!("{column} is not defined")),
+            "filter_out() must data-mask `{column}` like filter(); got: {messages:?}"
+        );
+    }
+    for frame in ["missing_frame_a", "missing_frame_b"] {
+        assert!(
+            messages.contains(&format!("{frame} is not defined")),
+            "an undefined `.data` must still be reported; got: {messages:?}"
+        );
+    }
+}
