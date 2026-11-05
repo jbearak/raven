@@ -305,6 +305,34 @@ pub(crate) fn enrich_selective_import_resolutions(
     );
 }
 
+/// Expand a file's source batches (`tar_source()`, `list.files()` loops,
+/// Shiny helpers), then resolve its `{box}` and `{import}` selective imports.
+///
+/// The order matters: batch expansion records the Shiny application working
+/// directory, and a local `{import}` script path resolves against it, as
+/// Shiny runs helpers with the app directory as the working directory. Run
+/// after inherited-working-directory enrichment, which both steps read.
+/// Returns the selected Shiny host, as
+/// [`tar_source::finalize_tar_source_requests_with_exclusions`] does.
+///
+/// No caller may hold a `WorldState` guard while this probes the filesystem.
+pub(crate) fn finalize_source_batches_and_imports(
+    meta: &mut CrossFileMetadata,
+    uri: &tower_lsp::lsp_types::Url,
+    workspace_root: Option<&tower_lsp::lsp_types::Url>,
+    exclusions: &crate::config_file::exclusions::CompiledWorkspaceExclusions,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) -> Option<std::path::PathBuf> {
+    let selected_shiny_entry = tar_source::finalize_tar_source_requests_with_exclusions(
+        meta,
+        uri,
+        workspace_root,
+        exclusions,
+    );
+    enrich_selective_import_resolutions_with_context(meta, uri, workspace_root, box_context);
+    selected_shiny_entry
+}
+
 /// Shared detached resolver with captured static box inputs. No caller may hold
 /// a `WorldState` guard while this performs filesystem probes.
 pub(crate) fn enrich_selective_import_resolutions_with_context(

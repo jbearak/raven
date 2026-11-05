@@ -234,16 +234,11 @@ fn open_disk_fallback_target(
         let ws_root = ws.map(|w| w.root.as_path());
         let lib_paths = state.package_library.lib_paths();
         crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        let _ = crate::cross_file::finalize_source_batches_and_imports(
             &mut meta,
             uri,
             workspace_root.as_ref(),
             &state.workspace_exclusions,
-        );
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            &mut meta,
-            uri,
-            workspace_root.as_ref(),
             &state.box_search_context(),
         );
     }
@@ -415,16 +410,11 @@ fn materialize_cli_contextual_provider(
             workspace.map(|value| value.root.as_path()),
             state.package_library.lib_paths(),
         );
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        let _ = crate::cross_file::finalize_source_batches_and_imports(
             &mut metadata,
             &execution.uri,
             workspace_root,
             &state.workspace_exclusions,
-        );
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            &mut metadata,
-            &execution.uri,
-            workspace_root,
             &state.box_search_context(),
         );
     }
