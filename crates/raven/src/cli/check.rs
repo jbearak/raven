@@ -3533,8 +3533,9 @@ infixContinuationStyle = "indented"
 
     /// `raven graph` and `raven check` agree, by category, on the golden
     /// workspace with default severities: `unresolved-source-path` is
-    /// reported at exactly the unguarded edges whose endpoint doesn't exist,
-    /// and `source-path-case-mismatch` at exactly the unguarded,
+    /// reported at exactly the unguarded edges whose endpoint doesn't exist
+    /// or lies outside the root, plus guarded edges whose endpoint exists
+    /// outside the root, and `source-path-case-mismatch` at exactly the unguarded,
     /// non-`system.file()` edges whose case differs. Locations are the
     /// directive line for directives, else the call site.
     #[cfg(unix)]
@@ -3582,11 +3583,18 @@ infixContinuationStyle = "indented"
         };
         let unguarded =
             |edge: &&crate::cli::graph::EdgeRow| edge.guarded_by_file_exists != Some(true);
-        let missing: BTreeSet<(String, u32)> = report
+        let unresolved: BTreeSet<(String, u32)> = report
             .edges
             .iter()
-            .filter(unguarded)
-            .filter(|edge| edge.resolution.as_ref().is_some_and(|r| !r.exists))
+            .filter(|edge| {
+                edge.resolution.as_ref().is_some_and(|r| {
+                    if unguarded(edge) {
+                        !r.exists || r.outside_root
+                    } else {
+                        r.exists && r.outside_root
+                    }
+                })
+            })
             .map(location)
             .collect();
         let case_differs: BTreeSet<(String, u32)> = report
@@ -3602,8 +3610,8 @@ infixContinuationStyle = "indented"
             .map(location)
             .collect();
 
-        assert!(!missing.is_empty() && !case_differs.is_empty());
-        assert_eq!(reported("unresolved-source-path"), missing);
+        assert!(!unresolved.is_empty() && !case_differs.is_empty());
+        assert_eq!(reported("unresolved-source-path"), unresolved);
         assert_eq!(reported("source-path-case-mismatch"), case_differs);
     }
 

@@ -2449,7 +2449,7 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_max_depth_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics, cancel);
 
     // Missing file diagnostics (sync check from snapshot metadata)
-    collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+    collect_report_document_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
     // Explicit target-name reads use a separate namespace from ordinary R
     // bindings. Resolve them against the connected pipeline/report authority set.
@@ -6630,8 +6630,10 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
     diagnostics_via_snapshot(state, uri, cancel)
 }
 
-/// The async half of a file's diagnostics: replace the snapshot's cache-based
-/// missing-file findings with real on-disk existence checks.
+/// The async half of a file's diagnostics: the on-disk source-path findings
+/// (`unresolved-source-path` for `source()` calls and source directives) and
+/// case mismatches. The sync half emits none of these, so a publisher that
+/// skips this phase reports no missing source paths at all.
 ///
 /// Every publisher (the debounced LSP worker, the direct LSP publish, and
 /// `raven check`) runs [`diagnostics_from_snapshot`] and then [`Self::apply`],
@@ -6701,20 +6703,9 @@ pub async fn diagnostics_async_standalone(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = sync_diagnostics;
 
-    // Replace sync missing-file diagnostics with async disk-checked results.
-    // Include both source() call messages and `# raven: source` directive messages.
-    diagnostics.retain(|d| {
-        !d.message.starts_with("File not found:")
-            && !d.message.starts_with("Parent file not found:")
-            && !d.message.starts_with("Cannot resolve path:")
-            && !d.message.starts_with("Cannot resolve parent path:")
-            && !d.message.starts_with("Path is outside workspace:")
-            // `# raven: source` directive specific messages
-            && !d.message.contains("referenced by source directive")
-            && !d.message.contains("in source directive")
-    });
-
-    // Collect URIs to check (skip if severity is disabled)
+    // Source-path findings come only from this phase (the sync phase emits
+    // none), so they are appended, never swapped for sync ones. Skipped when
+    // the missing-file severity is off.
     if let Some(severity) = missing_file_severity {
         let missing_file_diags = collect_missing_file_diagnostics_standalone(
             uri,
@@ -6751,7 +6742,110 @@ pub async fn diagnostics_async_standalone(
     diagnostics
 }
 
-/// Standalone async missing file diagnostics that performs disk checks directly
+/// Where a source path that fails to lead to a file was written. Decides the
+/// diagnostic's message wording and range; see [`source_path_diagnostic`].
+#[derive(Clone, Copy)]
+enum SourcePathSite<'a> {
+    /// An AST-detected `source()` call (or `sys.source()` and friends).
+    Call {
+        line: u32,
+        column: u32,
+        path: &'a str,
+    },
+    /// A forward directive: `# raven: source` / `run` / `include`.
+    ForwardDirective {
+        line: u32,
+        column: u32,
+        path: &'a str,
+    },
+    /// A backward directive: `# raven: sourced-by` / `run-by` / `included-by`.
+    BackwardDirective { line: u32, path: &'a str },
+}
+
+/// Why a source path fails to lead to a file.
+#[derive(Clone, Copy)]
+enum SourcePathProblem {
+    /// Path resolution returned nothing.
+    Unresolvable,
+    /// The path resolves outside the workspace root.
+    OutsideWorkspace,
+    /// The path resolves inside the workspace but no file exists there.
+    NotFound,
+}
+
+/// The one constructor for `unresolved-source-path` diagnostics on `source()`
+/// calls and source directives, so every finding carries the code, a UTF-16
+/// range, and the wording for its site.
+///
+/// Forward ranges start at the path's column and extend past the literal by a
+/// fixed margin (the closing quote and paren); backward ranges cover the whole
+/// directive line.
+fn source_path_diagnostic(
+    site: SourcePathSite<'_>,
+    problem: SourcePathProblem,
+    severity: DiagnosticSeverity,
+) -> Diagnostic {
+    use SourcePathProblem::*;
+    use SourcePathSite::*;
+    let forward_range = |line: u32, column: u32, path: &str| {
+        Range::new(
+            Position::new(line, column),
+            Position::new(
+                line,
+                column
+                    .saturating_add(path.encode_utf16().count() as u32)
+                    .saturating_add(10),
+            ),
+        )
+    };
+    let (range, message) = match site {
+        Call { line, column, path } => (
+            forward_range(line, column, path),
+            match problem {
+                Unresolvable => format!("Cannot resolve path: '{path}'"),
+                OutsideWorkspace => format!("Path is outside workspace: '{path}'"),
+                NotFound => format!("File not found: '{path}'"),
+            },
+        ),
+        ForwardDirective { line, column, path } => (
+            forward_range(line, column, path),
+            match problem {
+                Unresolvable => format!("Cannot resolve path '{path}' in source directive"),
+                OutsideWorkspace => {
+                    format!("File '{path}' referenced by source directive is outside workspace")
+                }
+                NotFound => format!("File '{path}' referenced by source directive not found"),
+            },
+        ),
+        BackwardDirective { line, path } => (
+            Range::new(
+                Position::new(line, 0),
+                Position::new(line, LSP_EOL_CHARACTER),
+            ),
+            match problem {
+                Unresolvable => format!("Cannot resolve parent path: '{path}'"),
+                OutsideWorkspace => format!("Path is outside workspace: '{path}'"),
+                NotFound => format!("Parent file not found: '{path}'"),
+            },
+        ),
+    };
+    Diagnostic {
+        range,
+        severity: Some(severity),
+        code: Some(NumberOrString::String(
+            crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+        )),
+        message,
+        ..Default::default()
+    }
+}
+
+/// Every `unresolved-source-path` finding for a file's `source()` calls and
+/// source directives: unresolvable paths, paths outside the workspace, and
+/// missing files, checked against the disk on a blocking thread.
+///
+/// This is the only producer of these findings; the sync snapshot phase emits
+/// none, so nothing upstream needs replacing.
 async fn collect_missing_file_diagnostics_standalone(
     uri: &Url,
     meta: &crate::cross_file::CrossFileMetadata,
@@ -6767,20 +6861,15 @@ async fn collect_missing_file_diagnostics_standalone(
     // Backward directives IGNORE `# raven: cd` - always resolve relative to file's directory
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders);
 
-    struct PathToCheck {
+    struct PathToCheck<'a> {
         path: std::path::PathBuf,
-        path_str: String,
-        line: u32,
-        col: u32,
-        is_backward: bool,
-        is_directive: bool,
+        site: SourcePathSite<'a>,
         guarded_by_file_exists: bool,
         outside_workspace: bool,
     }
 
-    // is_directive is true for `# raven: source` directives, false for source() calls.
-    // _Requirements: 6.1, 6.3_ (for `# raven: source` directive missing file diagnostics)
     let mut paths_to_check = Vec::new();
+    let finding = |site, problem| source_path_diagnostic(site, problem, missing_file_severity);
 
     for source in &meta.sources {
         // Resolved or inert-unresolved system.file() sources carry no literal
@@ -6788,6 +6877,19 @@ async fn collect_missing_file_diagnostics_standalone(
         if source.exempt_from_missing_file_diagnostics() {
             continue;
         }
+        let site = if source.is_directive {
+            SourcePathSite::ForwardDirective {
+                line: source.line,
+                column: source.column,
+                path: &source.path,
+            }
+        } else {
+            SourcePathSite::Call {
+                line: source.line,
+                column: source.column,
+                path: &source.path,
+            }
+        };
         let outcome = forward_ctx.as_ref().map(|ctx| {
             crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, ctx)
         });
@@ -6807,112 +6909,43 @@ async fn collect_missing_file_diagnostics_standalone(
                 .as_ref()
                 .is_some_and(|root| !path.starts_with(root));
             if outside_workspace && !source.guarded_by_file_exists {
-                let message = if source.is_directive {
-                    format!(
-                        "File '{}' referenced by source directive is outside workspace",
-                        source.path
-                    )
-                } else {
-                    format!("Path is outside workspace: '{}'", source.path)
-                };
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(source.line, source.column),
-                        end: Position::new(
-                            source.line,
-                            source
-                                .column
-                                .saturating_add(source.path.len() as u32)
-                                .saturating_add(10),
-                        ),
-                    },
-                    severity: Some(missing_file_severity),
-                    message,
-                    ..Default::default()
-                });
+                diagnostics.push(finding(site, SourcePathProblem::OutsideWorkspace));
                 continue;
             }
             paths_to_check.push(PathToCheck {
                 path,
-                path_str: source.path.clone(),
-                line: source.line,
-                col: source.column,
-                is_backward: false,
-                is_directive: source.is_directive,
+                site,
                 guarded_by_file_exists: source.guarded_by_file_exists,
                 outside_workspace,
             });
         } else if !source.guarded_by_file_exists {
-            let message = if source.is_directive {
-                format!("Cannot resolve path '{}' in source directive", source.path)
-            } else {
-                format!("Cannot resolve path: '{}'", source.path)
-            };
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(source.line, source.column),
-                    end: Position::new(
-                        source.line,
-                        source
-                            .column
-                            .saturating_add(source.path.len() as u32)
-                            .saturating_add(10),
-                    ),
-                },
-                severity: Some(missing_file_severity),
-                message,
-                ..Default::default()
-            });
+            diagnostics.push(finding(site, SourcePathProblem::Unresolvable));
         }
     }
 
     for directive in &meta.sourced_by {
+        let site = SourcePathSite::BackwardDirective {
+            line: directive.directive_line,
+            path: &directive.path,
+        };
         let resolved = backward_ctx
             .as_ref()
             .and_then(|ctx| crate::cross_file::path_resolve::resolve_path(&directive.path, ctx));
-        if let Some(path) = resolved {
-            if let Some(root) = &workspace_root
-                && !path.starts_with(root)
+        match resolved {
+            Some(path)
+                if workspace_root
+                    .as_ref()
+                    .is_some_and(|root| !path.starts_with(root)) =>
             {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(directive.directive_line, 0),
-                        end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(missing_file_severity),
-                    message: format!("Path is outside workspace: '{}'", directive.path),
-                    code: Some(NumberOrString::String(
-                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                    )),
-                    ..Default::default()
-                });
-                continue;
+                diagnostics.push(finding(site, SourcePathProblem::OutsideWorkspace));
             }
-            // Backward directives are always directives (is_directive=true for backward)
-            paths_to_check.push(PathToCheck {
+            Some(path) => paths_to_check.push(PathToCheck {
                 path,
-                path_str: directive.path.clone(),
-                line: directive.directive_line,
-                col: 0,
-                is_backward: true,
-                // false because is_backward distinguishes this path.
-                is_directive: false,
+                site,
                 guarded_by_file_exists: false,
                 outside_workspace: false,
-            });
-        } else {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(directive.directive_line, 0),
-                    end: Position::new(directive.directive_line, LSP_EOL_CHARACTER),
-                },
-                severity: Some(missing_file_severity),
-                message: format!("Cannot resolve parent path: '{}'", directive.path),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                )),
-                ..Default::default()
-            });
+            }),
+            None => diagnostics.push(finding(site, SourcePathProblem::Unresolvable)),
         }
     }
 
@@ -6937,74 +6970,14 @@ async fn collect_missing_file_diagnostics_standalone(
         }
     };
 
-    // Generate diagnostics for missing files
-    // _Requirements: 6.1_ (for `# raven: source` directive missing file diagnostics)
-    for (i, candidate) in paths_to_check.into_iter().enumerate() {
-        let exists = existence.get(i).copied().unwrap_or(false);
+    for (candidate, exists) in paths_to_check.into_iter().zip(existence) {
         if candidate.outside_workspace && exists {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(candidate.line, candidate.col),
-                    end: Position::new(
-                        candidate.line,
-                        candidate
-                            .col
-                            .saturating_add(candidate.path_str.len() as u32)
-                            .saturating_add(10),
-                    ),
-                },
-                severity: Some(missing_file_severity),
-                message: format!("Path is outside workspace: '{}'", candidate.path_str),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                )),
-                ..Default::default()
-            });
-            continue;
-        }
-        if !exists && !candidate.guarded_by_file_exists {
-            if candidate.is_backward {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(candidate.line, 0),
-                        end: Position::new(candidate.line, LSP_EOL_CHARACTER),
-                    },
-                    severity: Some(missing_file_severity),
-                    message: format!("Parent file not found: '{}'", candidate.path_str),
-                    code: Some(NumberOrString::String(
-                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                    )),
-                    ..Default::default()
-                });
-            } else {
-                // Use specific message for `# raven: source` directives (Requirement 6.1)
-                let message = if candidate.is_directive {
-                    format!(
-                        "File '{}' referenced by source directive not found",
-                        candidate.path_str
-                    )
-                } else {
-                    format!("File not found: '{}'", candidate.path_str)
-                };
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::new(candidate.line, candidate.col),
-                        end: Position::new(
-                            candidate.line,
-                            candidate
-                                .col
-                                .saturating_add(candidate.path_str.len() as u32)
-                                .saturating_add(10),
-                        ),
-                    },
-                    severity: Some(missing_file_severity),
-                    message,
-                    code: Some(NumberOrString::String(
-                        crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                    )),
-                    ..Default::default()
-                });
-            }
+            // Only guarded sources reach here outside the workspace (unguarded
+            // ones were reported above); an existing guarded file outside the
+            // workspace is still diagnosed.
+            diagnostics.push(finding(candidate.site, SourcePathProblem::OutsideWorkspace));
+        } else if !exists && !candidate.guarded_by_file_exists {
+            diagnostics.push(finding(candidate.site, SourcePathProblem::NotFound));
         }
     }
 
@@ -7736,6 +7709,129 @@ fn collect_invalid_line_param_diagnostics(
     }
 }
 
+#[cfg(test)]
+mod source_path_finding_tests {
+    use super::*;
+    use crate::state::Document;
+
+    fn unresolved_code() -> Option<NumberOrString> {
+        Some(NumberOrString::String(
+            crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+        ))
+    }
+
+    /// The full two-phase pipeline every publisher runs: the sync snapshot
+    /// pass, then the on-disk missing-file phase.
+    fn publish_pipeline(workspace: &std::path::Path, main: &std::path::Path) -> Vec<Diagnostic> {
+        let code = std::fs::read_to_string(main).unwrap();
+        let main_url = Url::from_file_path(main).unwrap();
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::from_file_path(workspace).unwrap());
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(&code, None));
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot");
+        let sync = diagnostics_from_snapshot(&snapshot, &main_url, &DiagCancelToken::never())
+            .unwrap_or_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(snapshot.missing_file_checks().apply(&main_url, sync))
+    }
+
+    /// The `line=0` warning's text contains "in source directive", which the
+    /// async phase used to match when it swapped out sync source-path findings
+    /// by message, so the warning never reached a client or `raven check`.
+    #[test]
+    fn line_zero_warning_reaches_the_published_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.R"), "helper <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        std::fs::write(&main, "# raven: source utils.R line=0\nhelper\n").unwrap();
+
+        let diagnostics = publish_pipeline(dir.path(), &main);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("Invalid line=0 in source directive")),
+            "the line=0 warning must survive the missing-file phase: {diagnostics:?}"
+        );
+    }
+
+    /// Each unresolvable or missing source path is reported once, by the
+    /// on-disk phase, with the `unresolved-source-path` code.
+    #[test]
+    fn each_source_path_finding_is_reported_once_with_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.R");
+        std::fs::write(
+            &main,
+            "# raven: sourced-by parent.R\n# raven: source gone.R\nsource(\"missing.R\")\n",
+        )
+        .unwrap();
+
+        let diagnostics = publish_pipeline(dir.path(), &main);
+        let findings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == unresolved_code())
+            .map(|d| (d.range.start.line, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            findings,
+            vec![
+                (1, "File 'gone.R' referenced by source directive not found"),
+                (2, "File not found: 'missing.R'"),
+                (0, "Parent file not found: 'parent.R'"),
+            ],
+            "{diagnostics:?}"
+        );
+    }
+
+    /// Forward ranges are measured in UTF-16 code units, the LSP default
+    /// position encoding, and outside-workspace findings carry the code too.
+    #[test]
+    fn forward_findings_use_utf16_ranges_and_carry_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(dir.path().join("outside.R"), "x <- 1\n").unwrap();
+        let main = workspace.join("main.R");
+        let code = "source(\"\u{e9}t\u{e9}.R\")\nsource(\"../outside.R\")\n";
+        std::fs::write(&main, code).unwrap();
+
+        let meta = crate::cross_file::extract_metadata(code);
+        let diagnostics = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(collect_missing_file_diagnostics_standalone(
+                &Url::from_file_path(&main).unwrap(),
+                &meta,
+                Some(&Url::from_file_path(&workspace).unwrap()),
+                DiagnosticSeverity::WARNING,
+            ));
+
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics.iter().all(|d| d.code == unresolved_code()));
+        // Outside-workspace findings are reported during resolution, before
+        // the batched existence check reports missing files.
+        assert_eq!(
+            diagnostics[0].message,
+            "Path is outside workspace: '../outside.R'"
+        );
+        let missing = &diagnostics[1];
+        assert_eq!(missing.message, "File not found: '\u{e9}t\u{e9}.R'");
+        // "été.R" is 7 UTF-8 bytes but 5 UTF-16 code units.
+        assert_eq!(
+            missing.range.end.character - missing.range.start.character,
+            5 + 10
+        );
+    }
+}
+
 // ============================================================================
 // Snapshot-based diagnostic collectors
 // ============================================================================
@@ -7892,7 +7988,11 @@ fn collect_missing_target_reference_diagnostics(
     }
 }
 
-fn collect_missing_file_diagnostics_from_snapshot(
+/// `unresolved-source-path` for missing literal tarchetypes report documents
+/// (`tar_render()` and friends). Source-path findings for `source()` calls and
+/// directives are not here: [`collect_missing_file_diagnostics_standalone`]
+/// produces all of those against the disk.
+fn collect_report_document_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
     diagnostics: &mut Vec<Diagnostic>,
@@ -7901,47 +8001,11 @@ fn collect_missing_file_diagnostics_from_snapshot(
         return;
     };
     let meta = &snapshot.directive_meta;
-    let workspace_root = snapshot.workspace_folders.first();
-
-    let forward_ctx =
-        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
-    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
-
-    for source in &meta.sources {
-        // Resolved or inert-unresolved system.file() sources carry no literal
-        // path to diagnose — see the predicate's doc comment for the matrix.
-        if source.exempt_from_missing_file_diagnostics() {
-            continue;
-        }
-        let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
-        });
-        if resolved.is_none() && !source.guarded_by_file_exists {
-            let message = if source.is_directive {
-                format!("Cannot resolve path '{}' in source directive", source.path)
-            } else {
-                format!("Cannot resolve path: '{}'", source.path)
-            };
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(source.line, source.column),
-                    end: Position::new(
-                        source.line,
-                        source
-                            .column
-                            .saturating_add(source.path.encode_utf16().count() as u32)
-                            .saturating_add(10),
-                    ),
-                },
-                severity: Some(severity),
-                message,
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                )),
-                ..Default::default()
-            });
-        }
-    }
+    let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri,
+        meta,
+        snapshot.workspace_folders.first(),
+    );
 
     for link in &meta.tarchetypes_document_links {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
@@ -7955,26 +8019,6 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 ),
                 severity: Some(severity),
                 message: format!("Cannot resolve report document: '{}'", link.path),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
-                )),
-                ..Default::default()
-            });
-        }
-    }
-
-    for sourced_by in &meta.sourced_by {
-        let resolved = backward_ctx
-            .as_ref()
-            .and_then(|ctx| crate::cross_file::path_resolve::resolve_path(&sourced_by.path, ctx));
-        if resolved.is_none() {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(sourced_by.directive_line, 0),
-                    end: Position::new(sourced_by.directive_line, LSP_EOL_CHARACTER),
-                },
-                severity: Some(severity),
-                message: format!("Cannot resolve parent path: '{}'", sourced_by.path),
                 code: Some(NumberOrString::String(
                     crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
                 )),
@@ -18518,8 +18562,14 @@ mod semantic_warning_pipeline_tests {
     fn unresolved_system_file_source_emits_no_cannot_resolve_path() {
         let code = "source(system.file(\"scripts/setup.R\", package = \"otherpkg\"))\nx <- 1\n";
         let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
-        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+        let sync = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
             .expect("diagnostics returned");
+        // Source-path findings come from the on-disk phase, so run it too.
+        let diags = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(snapshot.missing_file_checks().apply(&uri, sync));
         assert!(
             !diags
                 .iter()
@@ -64201,13 +64251,20 @@ pacman::p_load(__qualified_missing_package__)";
 
         let snapshot =
             DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
-        let mut diagnostics = Vec::new();
-        collect_missing_file_diagnostics_from_snapshot(&snapshot, &main_url, &mut diagnostics);
+        let sync = diagnostics_from_snapshot(&snapshot, &main_url, &DiagCancelToken::never())
+            .unwrap_or_default();
+        let diagnostics = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(snapshot.missing_file_checks().apply(&main_url, sync));
 
-        assert_eq!(
-            diagnostics.len(),
-            0,
-            "Should not emit missing file diagnostic when severity is off"
+        assert!(
+            !diagnostics.iter().any(|d| d.code
+                == Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string()
+                ))),
+            "Should not emit missing file diagnostic when severity is off: {diagnostics:?}"
         );
     }
 
@@ -64523,34 +64580,6 @@ pacman::p_load(__qualified_missing_package__)";
             outgoing
         );
 
-        // (b) Sync diagnostics() snapshot pipeline: no missing-file or
-        // unresolvable-path diagnostic on the directive line. The snapshot
-        // collector doesn't itself check existence, but it does emit
-        // "Cannot resolve path" when resolution returns None. With the fix,
-        // resolution returns Some(<workspace>/helpers.R).
-        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
-        let directive_path_diags: Vec<_> = diags
-            .iter()
-            .filter(|d| {
-                d.range.start.line == 0
-                    && (d.message.contains("Cannot resolve")
-                        || d.message.contains("not found")
-                        || d.message.contains("does not exist")
-                        || d.message.contains("missing")
-                        || d.message.contains("@lsp-source"))
-            })
-            .collect();
-        assert!(
-            directive_path_diags.is_empty(),
-            "Expected NO missing-file/path diagnostic on the @lsp-source \
-             directive line — workspace-root fallback should resolve \
-             helpers.R to <workspace>/helpers.R. Got: {:?}",
-            directive_path_diags
-                .iter()
-                .map(|d| (d.message.clone(), d.range))
-                .collect::<Vec<_>>()
-        );
-
         // (b') Async standalone missing-file collector (production
         // did_open/did_change path with disk-existence checks). Camp B
         // regressed here: plain `resolve_path` returned <scripts>/helpers.R
@@ -64599,6 +64628,7 @@ pacman::p_load(__qualified_missing_package__)";
         // foo()). This worked even on Camp B because scope.rs prefers the
         // dependency-graph edge (Camp A) over re-resolving the path. The
         // assertion guards against a regression in that fallback chain.
+        let diags = diagnostics(&state, &main_url, &DiagCancelToken::never());
         let foo_diags: Vec<_> = diags
             .iter()
             .filter(|d| {
