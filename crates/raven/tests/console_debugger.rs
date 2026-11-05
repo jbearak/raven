@@ -1303,10 +1303,19 @@ fn terminate_ends_a_program_waiting_at_readline() {
     d.req("configurationDone", json!({}));
     // The program's own output is upper-cased, so it can't match the echo.
     c.send_program("ans <- readline('answer: '); cat(toupper('program got'), ans, '\\n')");
-    c.expect("answer: ");
+    // Wait for the prompt itself: the echoed code also contains "answer: ".
+    let deadline = Instant::now() + TIMEOUT;
+    while c.text().matches("answer: ").count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "no readline() prompt: {}",
+            c.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // A half-typed answer is abandoned with the program.
     c.type_keys("partial");
-    std::thread::sleep(Duration::from_millis(300));
+    c.expect("answer: partial");
     let m = d.mark();
     d.req("terminate", json!({}));
     d.event("terminated", m);
