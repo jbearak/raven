@@ -11384,17 +11384,12 @@ async fn commit_detached_live_package_open_edit(
         };
         let expansion_uri = uri.clone();
         metadata = tokio::task::spawn_blocking(move || {
-            crate::cross_file::enrich_selective_import_resolutions_with_context(
-                &mut metadata,
-                &expansion_uri,
-                workspace_root.as_ref(),
-                &box_context,
-            );
-            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            let _ = crate::cross_file::finalize_source_batches_and_imports(
                 &mut metadata,
                 &expansion_uri,
                 workspace_root.as_ref(),
                 &exclusions,
+                &box_context,
             );
             metadata
         })
@@ -12148,17 +12143,12 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                         captured.max_chain_depth,
                     );
                 }
-                crate::cross_file::enrich_selective_import_resolutions_with_context(
-                    &mut semantic,
-                    &root.uri,
-                    captured.workspace_root.as_ref(),
-                    &captured.box_context,
-                );
-                let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+                let _ = crate::cross_file::finalize_source_batches_and_imports(
                     &mut semantic,
                     &root.uri,
                     captured.workspace_root.as_ref(),
                     &captured.exclusions,
+                    &captured.box_context,
                 );
             }
             let disk_artifacts = disk_material.get(&root.uri).map(|(_, document, _)| {
@@ -12663,17 +12653,12 @@ fn derive_open_install_analysis(
         );
     }
     let selected_shiny_entry = if is_r {
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            &mut metadata,
-            &captured.uri,
-            captured.workspace_root.as_ref(),
-            &captured.box_context,
-        );
-        crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        crate::cross_file::finalize_source_batches_and_imports(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             &captured.exclusions,
+            &captured.box_context,
         )
     } else {
         None
@@ -13118,23 +13103,18 @@ fn derive_open_metadata_reenrichment(
             metadata_lookup,
             captured.max_chain_depth,
         );
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            &mut metadata,
-            &captured.uri,
-            captured.workspace_root.as_ref(),
-            &captured.box_context,
-        );
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
             captured.workspace_name.as_deref(),
             captured.package_workspace_root.as_deref(),
             &captured.library_paths,
         );
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        let _ = crate::cross_file::finalize_source_batches_and_imports(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             &captured.exclusions,
+            &captured.box_context,
         );
     }
 
@@ -14262,17 +14242,12 @@ async fn resync_file_from_disk(
     };
 
     if non_r_document.is_none() {
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            &mut cross_file_meta,
-            uri,
-            workspace_root.as_ref(),
-            &box_context,
-        );
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        let _ = crate::cross_file::finalize_source_batches_and_imports(
             &mut cross_file_meta,
             uri,
             workspace_root.as_ref(),
             &exclusions,
+            &box_context,
         );
     }
 
@@ -23418,13 +23393,6 @@ impl Backend {
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
         if non_r_document.is_none() {
-            crate::cross_file::enrich_selective_import_resolutions_with_context(
-                &mut cross_file_meta,
-                file_uri,
-                workspace_root.as_ref(),
-                &box_context,
-            );
-
             // Resolve system.file() source entries into concrete paths so
             // transitive on-demand walks don't stop at this hop.
             crate::cross_file::resolve_system_file_sources(
@@ -23433,11 +23401,12 @@ impl Backend {
                 sys_file_ws_root.as_deref(),
                 &sys_file_lib_paths,
             );
-            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            let _ = crate::cross_file::finalize_source_batches_and_imports(
                 &mut cross_file_meta,
                 file_uri,
                 workspace_root.as_ref(),
                 &exclusions,
+                &box_context,
             );
         }
         let artifacts = std::sync::Arc::new(non_r_document.as_ref().map_or_else(
@@ -23981,13 +23950,6 @@ impl Backend {
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
         if non_r_document.is_none() {
-            crate::cross_file::enrich_selective_import_resolutions_with_context(
-                &mut cross_file_meta,
-                file_uri,
-                workspace_root.as_ref(),
-                &box_context,
-            );
-
             // Resolve system.file() source entries into concrete paths so
             // transitive on-demand walks don't stop at this hop.
             crate::cross_file::resolve_system_file_sources(
@@ -23996,11 +23958,12 @@ impl Backend {
                 sys_file_ws_root.as_deref(),
                 &sys_file_lib_paths,
             );
-            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            let _ = crate::cross_file::finalize_source_batches_and_imports(
                 &mut cross_file_meta,
                 file_uri,
                 workspace_root.as_ref(),
                 &exclusions,
+                &box_context,
             );
         }
         let artifacts = std::sync::Arc::new(non_r_document.as_ref().map_or_else(
@@ -55493,6 +55456,57 @@ lineLength = 200
         assert!(
             hover.await.unwrap().is_none(),
             "no help text means no hover"
+        );
+    }
+
+    /// Shiny runs helpers with the app directory as the working directory, so
+    /// an `{import}` script path in a helper resolves against it. Opening the
+    /// helper must agree with `raven check`: source-batch expansion records
+    /// the app directory, so it has to run before import resolution. The open
+    /// path used to resolve imports first and stored the script as missing.
+    #[tokio::test]
+    async fn did_open_resolves_shiny_helper_import_scripts_against_the_app_directory() {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let app = root.join("myapp");
+        std::fs::create_dir_all(app.join("R")).unwrap();
+        std::fs::write(
+            app.join("app.R"),
+            "library(shiny)\nshinyApp(ui = fluidPage(), server = function(input, output) {})\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("R/utils.R"), "tidy_name <- function(x) x\n").unwrap();
+        let helper_text = "import::from(\"R/utils.R\", tidy_name)\ntidy_name(\"a\")\n";
+        std::fs::write(app.join("R/helpers.R"), helper_text).unwrap();
+        let helper_uri = Url::from_file_path(app.join("R/helpers.R")).unwrap();
+
+        let (service, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = service.inner();
+        backend.state.write().await.workspace_folders = vec![Url::from_file_path(&root).unwrap()];
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: helper_uri.clone(),
+                    language_id: "r".to_string(),
+                    version: 1,
+                    text: helper_text.to_string(),
+                },
+            })
+            .await;
+
+        let metadata = backend
+            .state
+            .read()
+            .await
+            .get_enriched_metadata(&helper_uri)
+            .expect("the opened helper has metadata");
+        assert_eq!(
+            metadata.import_calls[0].local_resolution,
+            Some(crate::import_pkg::LocalScriptResolution::Resolved(
+                Url::from_file_path(app.join("R/utils.R")).unwrap()
+            )),
         );
     }
 
