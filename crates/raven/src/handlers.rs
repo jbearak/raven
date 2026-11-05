@@ -32010,7 +32010,7 @@ mod tests {
     "#;
 
     /// Run the full diagnostics pipeline on `code` with two fake packages
-    /// installed, as in do2r's generated scripts: `dtaparser` exporting
+    /// installed, as in generated analysis scripts: `dtaparser` exporting
     /// `read_dta` with no sidecar, and `datakit` exporting `:=` with `sidecar`.
     /// Returns the names reported as undefined variables.
     async fn datakit_undefined_names(sidecar: Option<&str>, code: &str) -> Vec<String> {
@@ -32074,7 +32074,7 @@ print(undefined_thing)
         }
     }
 
-    /// Every shape do2r emits, plus the parts that stay checked: the indexed
+    /// Every subset-assign shape a code generator emits, plus the parts that stay checked: the indexed
     /// object (also when it is a function formal), the `(var)` column-name
     /// form, and named `[` arguments the declaration does not list.
     #[tokio::test]
@@ -64828,7 +64828,7 @@ pacman::p_load(__qualified_missing_package__)";
             .collect()
     }
 
-    /// do2r's `include child.do`: a top-level `source(local = TRUE)` runs the
+    /// A top-level `source(local = TRUE)`, as a translated `include` emits, runs the
     /// child in the file's own frame, so the child's definitions reach the
     /// parent, as they do in R. The path is root-relative from a nested file
     /// (workspace-root fallback).
@@ -64851,7 +64851,7 @@ pacman::p_load(__qualified_missing_package__)";
         );
     }
 
-    /// do2r's `do child.do`: `d <- local({ source(..., local = TRUE); d })`.
+    /// `d <- local({ source(..., local = TRUE); d })`, as a translated `do` emits.
     /// The child's definitions reach the rest of the block, so the trailing
     /// `d` resolves even though only the child creates `d`, and nothing the
     /// child defines leaks past the block.

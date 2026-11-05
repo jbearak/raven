@@ -1,0 +1,1992 @@
+{
+  "schema_version": 1,
+  "raven_version": "<VERSION>",
+  "root": "<ROOT>",
+  "package_mode": false,
+  "complete": true,
+  "warnings": [],
+  "files": [
+    {
+      "path": "<TMP>/outside.R",
+      "indexed": false,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/a.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/b.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/chdir.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/cyc1.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/cyc2.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/dup.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/env.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/fd_eof.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/fd_line.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/fd_plain.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/fn.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/maybe.R",
+      "indexed": false,
+      "exists": false,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/missing.R",
+      "indexed": false,
+      "exists": false,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/nested.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/sup.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/sys1.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/sys2.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "R/top.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "_targets.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "app/R/h1.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "app/R/h2.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "app/global.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "app/server.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "app/ui.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "boxuser.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "broken.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": true,
+      "working_directory": null
+    },
+    {
+      "path": "cdno/no/such/dir/x.R",
+      "indexed": false,
+      "exists": false,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "cdno/run.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": {
+        "raw": "no/such/dir",
+        "resolved": "cdno/no/such/dir"
+      }
+    },
+    {
+      "path": "cdyes/run.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": {
+        "raw": "..",
+        "resolved": "."
+      }
+    },
+    {
+      "path": "gone.R",
+      "indexed": false,
+      "exists": false,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_eof.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_excluded.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_inferred.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_line.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_match.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_nomatch.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_none.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "kids/k_unavailable.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "lf/lf1.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "lf/lf2.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "lf_loop.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "main.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "mods/helper.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "no_such_report.Rmd",
+      "indexed": false,
+      "exists": false,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "parent.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "pipeline/p1.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "pipeline/p2.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "report.Rmd",
+      "indexed": false,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "selfc.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": true,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "tools/run.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    },
+    {
+      "path": "tools/util.R",
+      "indexed": true,
+      "exists": true,
+      "self_contained": false,
+      "syntax_errors": false,
+      "working_directory": null
+    }
+  ],
+  "edges": [
+    {
+      "caller": "R/cyc1.R",
+      "target": "R/cyc2.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/cyc2.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "R/cyc2.R",
+      "target": "R/cyc1.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/cyc1.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "R/nested.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "_targets.R",
+      "target": "pipeline/p1.R",
+      "kind": "tar_source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "_targets.R",
+      "target": "pipeline/p2.R",
+      "kind": "tar_source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 1,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "_targets.R",
+      "target": "report.Rmd",
+      "kind": "tarchetypes_document",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 32
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "report.Rmd",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "_targets.R",
+      "target": "no_such_report.Rmd",
+      "kind": "tarchetypes_document",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 2,
+          "character": 37
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "no_such_report.Rmd",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": false,
+        "case": null,
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "app/server.R",
+      "target": "app/R/h1.R",
+      "kind": "shiny",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "app/server.R",
+      "target": "app/global.R",
+      "kind": "shiny_global",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "app/server.R",
+      "target": "app/R/h2.R",
+      "kind": "shiny",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 1,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "app/ui.R",
+      "target": "app/R/h1.R",
+      "kind": "shiny",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "app/ui.R",
+      "target": "app/global.R",
+      "kind": "shiny_global",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "app/ui.R",
+      "target": "app/R/h2.R",
+      "kind": "shiny",
+      "origin": "call",
+      "call_site": {
+        "basis": "implicit",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 1,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "boxuser.R",
+      "target": "mods/helper.R",
+      "kind": "box",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 9
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "broken.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "cdno/run.R",
+      "target": "cdno/no/such/dir/x.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "x.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": false,
+        "case": null,
+        "outside_root": false,
+        "working_directory": "cdno/no/such/dir"
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "cdyes/run.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": "."
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "gone.R",
+      "target": "kids/k_unavailable.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "inferred",
+        "position": null,
+        "failure": "parent_content_unavailable"
+      },
+      "directive": {
+        "file": "kids/k_unavailable.R",
+        "line": 0
+      },
+      "raw_path": "../gone.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": false,
+        "case": null,
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "lf_loop.R",
+      "target": "lf/lf1.R",
+      "kind": "list_files",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 69
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 0,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "lf_loop.R",
+      "target": "lf/lf2.R",
+      "kind": "list_files",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 69
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": null,
+      "system_file": null,
+      "batch_ordinal": 1,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": null,
+      "portable_from_root": null
+    },
+    {
+      "caller": "main.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/b.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/b.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/a.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 2,
+          "character": 13
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/a.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "current_frame",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/fn.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 3,
+          "character": 16
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/fn.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "current_frame",
+      "chdir": false,
+      "function_scoped": true,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/env.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 4,
+          "character": 16
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/env.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "non_inheriting",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/sys1.R",
+      "kind": "sys_source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 5,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/sys1.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "non_inheriting",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/sys2.R",
+      "kind": "sys_source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 6,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/sys2.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/chdir.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 7,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/chdir.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": true,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/maybe.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 8,
+          "character": 30
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/maybe.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": true,
+      "resolution": {
+        "endpoint": "target",
+        "exists": false,
+        "case": null,
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "main.R",
+      "target": "R/missing.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 9,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/missing.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": false,
+        "case": null,
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "main.R",
+      "target": "<TMP>/outside.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 11,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "../outside.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": true,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/sup.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "directive",
+        "position": {
+          "line": 13,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 13
+      },
+      "raw_path": "R/sup.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/fd_plain.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "directive",
+        "position": {
+          "line": 16,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 16
+      },
+      "raw_path": "R/fd_plain.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/fd_line.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "line",
+        "position": {
+          "line": 18,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 17
+      },
+      "raw_path": "R/fd_line.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 21,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/cyc1.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 22,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/cyc1.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "report.Rmd",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 23,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "report.Rmd",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/dup.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "line",
+        "position": {
+          "line": 29,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 19
+      },
+      "raw_path": "R/dup.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/fd_eof.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "eof",
+        "position": null,
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 18
+      },
+      "raw_path": "R/fd_eof.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "main.R",
+      "target": "R/sup.R",
+      "kind": "source",
+      "origin": "directive",
+      "call_site": {
+        "basis": "eof",
+        "position": null,
+        "failure": null
+      },
+      "directive": {
+        "file": "main.R",
+        "line": 14
+      },
+      "raw_path": "R/sup.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_match.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "match",
+        "position": {
+          "line": 1,
+          "character": 8
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "kids/k_match.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_inferred.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "inferred",
+        "position": {
+          "line": 2,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "kids/k_inferred.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_inferred.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 2,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "kids/k_inferred.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_line.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "line_end",
+        "position": {
+          "line": 3,
+          "character": null
+        },
+        "failure": null
+      },
+      "directive": {
+        "file": "kids/k_line.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_eof.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "eof",
+        "position": null,
+        "failure": null
+      },
+      "directive": {
+        "file": "kids/k_eof.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_nomatch.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "match",
+        "position": null,
+        "failure": "not_found"
+      },
+      "directive": {
+        "file": "kids/k_nomatch.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "parent.R",
+      "target": "kids/k_none.R",
+      "kind": "source",
+      "origin": "backward_directive",
+      "call_site": {
+        "basis": "inferred",
+        "position": null,
+        "failure": "not_found"
+      },
+      "directive": {
+        "file": "kids/k_none.R",
+        "line": 0
+      },
+      "raw_path": "../parent.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": null,
+      "chdir": null,
+      "function_scoped": null,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "caller",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": null
+    },
+    {
+      "caller": "selfc.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": true
+    },
+    {
+      "caller": "tools/run.R",
+      "target": "tools/util.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 0,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "util.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "tools/run.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 1,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "/R/top.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "exact",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    },
+    {
+      "caller": "tools/run.R",
+      "target": "R/top.R",
+      "kind": "source",
+      "origin": "call",
+      "call_site": {
+        "basis": "call",
+        "position": {
+          "line": 2,
+          "character": 0
+        },
+        "failure": null
+      },
+      "directive": null,
+      "raw_path": "r/TOP.R",
+      "system_file": null,
+      "batch_ordinal": null,
+      "locality": "global",
+      "chdir": false,
+      "function_scoped": false,
+      "guarded_by_file_exists": false,
+      "resolution": {
+        "endpoint": "target",
+        "exists": true,
+        "case": "<case differs>",
+        "outside_root": false,
+        "working_directory": null
+      },
+      "portable_from_root": false
+    }
+  ],
+  "dropped": [
+    {
+      "caller": "kids/k_excluded.R",
+      "position": {
+        "line": 0,
+        "character": 0
+      },
+      "kind": "source",
+      "origin": "backward_directive",
+      "raw_path": "../excluded/x.R",
+      "system_file": null,
+      "target": "excluded/x.R",
+      "reason": "excluded"
+    },
+    {
+      "caller": "main.R",
+      "position": {
+        "line": 10,
+        "character": 0
+      },
+      "kind": "source",
+      "origin": "call",
+      "raw_path": "excluded/x.R",
+      "system_file": null,
+      "target": "excluded/x.R",
+      "reason": "excluded"
+    },
+    {
+      "caller": "main.R",
+      "position": {
+        "line": 12,
+        "character": 0
+      },
+      "kind": "source",
+      "origin": "call",
+      "raw_path": null,
+      "system_file": {
+        "package": "raven.not.installed",
+        "parts": [
+          "scripts",
+          "x.R"
+        ]
+      },
+      "target": null,
+      "reason": "system_file_unresolved"
+    },
+    {
+      "caller": "main.R",
+      "position": {
+        "line": 15,
+        "character": 0
+      },
+      "kind": "source",
+      "origin": "call",
+      "raw_path": "R/sup.R",
+      "system_file": null,
+      "target": "R/sup.R",
+      "reason": "superseded"
+    },
+    {
+      "caller": "main.R",
+      "position": {
+        "line": 29,
+        "character": 0
+      },
+      "kind": "source",
+      "origin": "directive",
+      "raw_path": "R/dup.R",
+      "system_file": null,
+      "target": "R/dup.R",
+      "reason": "duplicate"
+    }
+  ]
+}

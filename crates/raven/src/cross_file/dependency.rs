@@ -8,11 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
-use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
-use super::path_resolve::{
-    PathContext, path_to_uri, resolve_path, resolve_path_with_workspace_fallback,
-};
-use super::types::{CallSiteSpec, CrossFileMetadata, SourceBatchKind, SourceLocality};
+pub(crate) mod export;
+pub(crate) mod plan;
+
+use super::path_resolve::{PathContext, path_to_uri, resolve_path};
+use super::types::{CrossFileMetadata, SourceBatchKind, SourceLocality};
+use plan::{ExcludedGraphEntries, GraphTrace};
 
 /// Resolve the effective working directory of a parent file for inheritance,
 /// with depth tracking and cycle detection to prevent infinite chains.
@@ -887,6 +888,19 @@ pub struct DependencyGraph {
     /// because a child's resolved scope is only a pure function of its key when
     /// no cycle is reachable from it. Recomputed on edge-revision change.
     any_cycle_cache: std::sync::RwLock<Option<(u64, bool)>>,
+    /// Each file's latest edge plan, kept only when tracing is on (`raven
+    /// graph`, and every graph under `cfg(test)`). The language server never
+    /// traces. Clones and extracted subgraphs start with an empty trace.
+    /// Boxed so the graph (and `WorldState`, which embeds it) stays small:
+    /// debug-build futures copy `WorldState` often enough that 72 inline
+    /// bytes overflowed a 2 MiB test-thread stack.
+    trace: Option<Box<GraphTrace>>,
+}
+
+/// Whether a new graph traces: on under `cfg(test)`, so the plan/graph
+/// consistency assertion in `update_file_traced` covers every in-crate test.
+fn traces_by_default() -> Option<Box<GraphTrace>> {
+    cfg!(test).then(Box::default)
 }
 
 impl Default for DependencyGraph {
@@ -908,6 +922,7 @@ impl Default for DependencyGraph {
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
             any_cycle_cache: std::sync::RwLock::new(None),
+            trace: traces_by_default(),
         }
     }
 }
@@ -935,6 +950,7 @@ impl Clone for DependencyGraph {
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
             any_cycle_cache: std::sync::RwLock::new(None),
+            trace: traces_by_default(),
         }
     }
 }
@@ -957,6 +973,79 @@ impl std::fmt::Debug for DependencyGraph {
 impl DependencyGraph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Turn plan tracing on (an empty trace) or off. Set before the first
+    /// `update_file` so the workspace build's plans are kept.
+    pub(crate) fn set_tracing(&mut self, on: bool) {
+        self.trace = on.then(Box::default);
+    }
+
+    /// Every stored edge's revision identity, from both indexes, sorted: two
+    /// graphs with equal snapshots hold the same edges.
+    #[cfg(test)]
+    pub(crate) fn edge_identity_snapshot(&self) -> Vec<String> {
+        let forward = self
+            .forward
+            .values()
+            .flatten()
+            .map(|edge| format!("forward {:?}", edge.revision_identity()));
+        let backward = self
+            .backward
+            .values()
+            .flatten()
+            .map(|edge| format!("backward {:?}", edge.revision_identity()));
+        let mut snapshot: Vec<String> = forward.chain(backward).collect();
+        snapshot.sort();
+        snapshot
+    }
+
+    /// The edges `uri`'s own `update_file` created: its forward edges other
+    /// than backward directives (which other files' directives create), plus
+    /// the backward-directive edges in which it is the child.
+    #[cfg(test)]
+    fn owned_edges(&self, uri: &Url) -> Vec<&DependencyEdge> {
+        let forward = self
+            .forward
+            .get(uri)
+            .into_iter()
+            .flatten()
+            .filter(|edge| !edge.is_backward_directive);
+        let backward = self
+            .backward
+            .get(uri)
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.is_backward_directive && &edge.to == uri);
+        forward.chain(backward).collect()
+    }
+
+    /// `cfg(test)` check that a just-applied plan matches the edges its file
+    /// owns. Apply touches only that file's edges, so this holds right after
+    /// apply regardless of later removals.
+    #[cfg(test)]
+    fn debug_assert_plan_matches_owned_edges(&self, uri: &Url) {
+        let Some(stored) = self.trace.as_ref().and_then(|trace| trace.plans.get(uri)) else {
+            return;
+        };
+        let mut planned: Vec<_> = stored
+            .plan
+            .surviving_edges()
+            .iter()
+            .map(DependencyEdge::revision_identity)
+            .collect();
+        let mut owned: Vec<_> = self
+            .owned_edges(uri)
+            .into_iter()
+            .map(DependencyEdge::revision_identity)
+            .collect();
+        let sort_key = |identity: &EdgeRevisionIdentity| format!("{identity:?}");
+        planned.sort_by_key(sort_key);
+        owned.sort_by_key(sort_key);
+        debug_assert_eq!(
+            planned, owned,
+            "stored plan for {uri} must match the edges it owns after apply"
+        );
     }
 
     /// Update edges for a file based on extracted metadata.
@@ -984,53 +1073,67 @@ impl DependencyGraph {
     where
         F: Fn(&Url) -> Option<String>,
     {
+        self.update_file_traced(
+            uri,
+            meta,
+            &ExcludedGraphEntries::default(),
+            workspace_root,
+            get_content,
+        )
+    }
+
+    /// [`Self::update_file`], also given the entries the exclusion filter
+    /// removed from `meta` (see [`plan::ExcludedGraphEntries`]), which a traced
+    /// graph records as `excluded` drops.
+    ///
+    /// The update is a plan ([`plan::plan_file_edges`], which doesn't touch the
+    /// graph) followed by an apply that removes the file's previous edges and
+    /// inserts the plan's surviving candidates. When no path context can be
+    /// built it changes nothing: the file's edges and stored plan stay as they
+    /// were, and a traced graph notes the failed update.
+    pub(crate) fn update_file_traced<F>(
+        &mut self,
+        uri: &Url,
+        meta: &CrossFileMetadata,
+        excluded: &ExcludedGraphEntries,
+        workspace_root: Option<&Url>,
+        get_content: F,
+    ) -> UpdateResult
+    where
+        F: Fn(&Url) -> Option<String>,
+    {
+        let plan = match plan::plan_file_edges(uri, meta, excluded, workspace_root, get_content) {
+            Ok(plan) => plan,
+            Err(plan::NoPathContext) => {
+                if let Some(trace) = self.trace.as_mut() {
+                    trace.no_path_context.insert(uri.clone());
+                }
+                return UpdateResult::default();
+            }
+        };
+        if self.trace.is_none() {
+            return self.apply_file_edges(uri, plan.into_surviving_edges());
+        }
+        let result = self.apply_file_edges(uri, plan.surviving_edges());
+        let trace = self.trace.as_mut().expect("trace checked above");
+        trace.no_path_context.remove(uri);
+        trace.plans.insert(
+            uri.clone(),
+            plan::StoredFilePlan {
+                plan,
+                metadata: meta.clone(),
+                excluded: excluded.clone(),
+            },
+        );
+        #[cfg(test)]
+        self.debug_assert_plan_matches_owned_edges(uri);
+        result
+    }
+
+    /// Replace `uri`'s owned edges with `edges` (the surviving candidates of
+    /// its plan) and report whether its dependency interface changed.
+    fn apply_file_edges(&mut self, uri: &Url, edges: Vec<DependencyEdge>) -> UpdateResult {
         let mut result = UpdateResult::default();
-
-        // Build PathContext for forward sources (includes working_directory from `# raven: cd`)
-        // IMPORTANT: Forward directives (`# raven: source`, `# raven: run`, `# raven: include`)
-        // and AST-detected source() calls should use the working directory from `# raven: cd`
-        // for path resolution.
-        // This is because forward directives are semantically equivalent to source() calls
-        // and describe runtime execution behavior where the working directory matters.
-        // Using PathContext::from_metadata() includes both explicit `# raven: cd` and inherited
-        // working directories in the path resolution context.
-        // (Requirements 3.1, 3.2, 3.4)
-        let path_ctx = match PathContext::from_metadata(uri, meta, workspace_root) {
-            Some(ctx) => ctx,
-            None => return result,
-        };
-
-        // Build separate PathContext for backward directives (without any working_directory)
-        // IMPORTANT: Backward directive paths (e.g., `# raven: sourced-by ../parent.R`) should
-        // ALWAYS resolve relative to the child file's directory, regardless of:
-        //   - Explicit `# raven: cd` directives in the child file
-        //   - Inherited working directory from parent files
-        // This is intentional behavior per Requirements 4.1, 4.2, 4.3.
-        // Using PathContext::new() ensures neither working_directory nor
-        // inherited_working_directory are set, so paths resolve file-relative.
-        let backward_path_ctx = match PathContext::new(uri, workspace_root) {
-            Some(ctx) => ctx,
-            None => return result,
-        };
-
-        // Helper to resolve paths for forward sources (`# raven: source` directives and source() calls)
-        // Uses PathContext with working_directory from `# raven: cd`, enabling paths to resolve
-        // relative to the configured working directory rather than the file's directory.
-        // Also uses workspace-root fallback for AST source() calls AND forward directives
-        // in files without `# raven: cd` — forward directives are semantically equivalent to
-        // source() calls (see .kiro/specs/lsp-source-directive/) and must resolve identically.
-        // Returns Option<Url> - existence is checked later during file read operations.
-        let do_resolve = |path: &str| -> Option<Url> {
-            let resolved = resolve_path_with_workspace_fallback(path, &path_ctx)?;
-            path_to_uri(&resolved)
-        };
-
-        // Helper to resolve paths for backward directives (file-relative only)
-        // Does NOT use working_directory or inherited_working_directory
-        let do_resolve_backward = |path: &str| -> Option<Url> {
-            let resolved = resolve_path(path, &backward_path_ctx)?;
-            path_to_uri(&resolved)
-        };
 
         // Snapshot both purpose-specific edge projections. Dependency-interface
         // identity drives dependent revalidation; revision identity additionally
@@ -1094,268 +1197,10 @@ impl DependencyGraph {
         // These will be re-created from the current metadata
         self.remove_backward_edges_for_child(uri);
 
-        // Collect directive edges first (they are authoritative)
-        let mut directive_edges: Vec<DependencyEdge> = Vec::new();
-        // Relationship-only index for directive-vs-AST conflict detection.
-        // Edge storage is deliberately call-site-aware and is deduplicated by
-        // `GraphEdgeDedupKey` after conflict resolution.
-        let mut directive_from_to: HashSet<DirectiveConflictIdentity> = HashSet::new();
-
-        // Process forward directive sources (`# raven: source`, `# raven: run`, `# raven: include`)
-        // Uses do_resolve which includes `# raven: cd` working directory in path resolution.
-        // This differs from backward directives which ignore `# raven: cd`.
-        // Creates edges optimistically; file existence is validated during file operations.
-        // (Requirements 3.1, 3.2, 3.4)
-        for source in &meta.sources {
-            if source.is_directive {
-                match do_resolve(&source.path) {
-                    Some(to_uri) => {
-                        // Path resolved, create edge
-                        let edge = DependencyEdge {
-                            from: uri.clone(),
-                            to: to_uri.clone(),
-                            call_site_line: Some(source.line),
-                            call_site_column: Some(source.column),
-                            tar_source_ordinal: source.tar_source_ordinal,
-                            source_batch_kind: source.source_batch_kind,
-                            locality: source.locality,
-                            chdir: source.chdir,
-                            is_sys_source: source.is_sys_source,
-                            is_function_scoped: source.is_function_scoped,
-                            is_directive: true,
-                            is_backward_directive: false,
-                            non_lending: false,
-                            kind: DependencyEdgeKind::OrdinarySource,
-                        };
-                        directive_from_to.insert(edge.directive_conflict_identity());
-                        directive_edges.push(edge);
-                    }
-                    None => {
-                        // Path resolution failed - skip edge creation. The
-                        // user-facing missing/unresolved diagnostics are
-                        // recomputed from the snapshot graph by a separate
-                        // collector path, not from this result.
-                        log::trace!(
-                            "Forward directive @lsp-source '{}' at line {} could not be resolved, skipping edge creation",
-                            source.path,
-                            source.line
-                        );
-                    }
-                }
-            }
-        }
-
-        // Process backward directives (`# raven: sourced-by`) - create forward edges from parent to this file
-        // Uses do_resolve_backward which resolves paths relative to the file's directory,
-        // ignoring both explicit `# raven: cd` and inherited working directories (Requirements 4.1-4.3)
-        for directive in &meta.sourced_by {
-            if let Some(parent_uri) = do_resolve_backward(&directive.path) {
-                // Extract child filename for inference
-                let child_filename = uri
-                    .path_segments()
-                    .and_then(|mut s| s.next_back())
-                    .unwrap_or("");
-
-                let (call_site_line, call_site_column) = match &directive.call_site {
-                    CallSiteSpec::Line(n) => (Some(*n), Some(u32::MAX)), // end-of-line
-                    CallSiteSpec::Match(pattern) => {
-                        // Resolve match pattern in parent content
-                        if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) =
-                                resolve_match_pattern(&parent_content, pattern, child_filename)
-                            {
-                                (Some(line), Some(col))
-                            } else {
-                                (None, None) // Pattern not found
-                            }
-                        } else {
-                            (None, None) // Can't read parent
-                        }
-                    }
-                    CallSiteSpec::Default => {
-                        // Try text-inference: scan parent for source() call to child
-                        if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) =
-                                infer_call_site_from_parent(&parent_content, child_filename)
-                            {
-                                (Some(line), Some(col))
-                            } else {
-                                (None, None) // No source() call found
-                            }
-                        } else {
-                            (None, None) // Can't read parent
-                        }
-                    }
-                };
-                let edge = DependencyEdge {
-                    from: parent_uri.clone(),
-                    to: uri.clone(),
-                    call_site_line,
-                    call_site_column,
-                    tar_source_ordinal: None,
-                    source_batch_kind: None,
-                    locality: SourceLocality::Global,
-                    chdir: false,
-                    is_sys_source: false,
-                    is_function_scoped: false,
-                    is_directive: true,
-                    is_backward_directive: true,
-                    non_lending: false,
-                    kind: DependencyEdgeKind::OrdinarySource,
-                };
-                let pair = edge.directive_conflict_identity();
-                directive_from_to.insert(pair);
-                directive_edges.push(edge);
-            }
-        }
-
-        // Process AST-detected sources, applying directive-vs-AST conflict resolution
-        // Requirements 4.1, 4.2, 4.3, 4.4, 4.5
-        let mut ast_edges: Vec<DependencyEdge> = Vec::new();
-        for source in &meta.sources {
-            if !source.is_directive
-                && let Some(to_uri) = source
-                    .resolved_uri
-                    .clone()
-                    .or_else(|| do_resolve(&source.path))
-            {
-                let edge = DependencyEdge {
-                    from: uri.clone(),
-                    to: to_uri.clone(),
-                    call_site_line: Some(source.line),
-                    call_site_column: Some(source.column),
-                    tar_source_ordinal: source.tar_source_ordinal,
-                    source_batch_kind: source.source_batch_kind,
-                    locality: source.locality,
-                    chdir: source.chdir,
-                    is_sys_source: source.is_sys_source,
-                    is_function_scoped: source.is_function_scoped,
-                    is_directive: false,
-                    is_backward_directive: false,
-                    non_lending: false,
-                    kind: DependencyEdgeKind::OrdinarySource,
-                };
-                let pair = edge.directive_conflict_identity();
-
-                // Check for directive-vs-AST conflict
-                if directive_from_to.contains(&pair) {
-                    let mut found_matching_directive = false;
-                    let directive_covers_ast = directive_edges
-                        .iter()
-                        .filter(|edge| edge.directive_conflict_identity() == pair)
-                        .any(|dir_edge| {
-                            found_matching_directive = true;
-                            let directive_call_site = dir_edge.call_site_identity();
-
-                            if directive_call_site.is_known_directive_call_site() {
-                                // A known directive covers only an AST edge at
-                                // the same call site. All matching directives
-                                // participate because one relationship can
-                                // retain multiple distinct call sites.
-                                directive_call_site == edge.call_site_identity()
-                            } else {
-                                // A directive without an explicit call site
-                                // covers an AST edge at the same or a later
-                                // line (Requirement 4.5).
-                                let directive_line = meta
-                                    .sources
-                                    .iter()
-                                    .find(|source| {
-                                        source.is_directive
-                                            && do_resolve(&source.path) == Some(to_uri.clone())
-                                    })
-                                    .map(|source| source.line);
-                                let ast_is_earlier = match directive_line {
-                                    Some(directive_line) => source.line < directive_line,
-                                    None => false,
-                                };
-                                !ast_is_earlier
-                            }
-                        });
-
-                    if directive_covers_ast || !found_matching_directive {
-                        // The index and edge list are populated together, so
-                        // the no-match case should be impossible. Preserve the
-                        // existing fail-closed behavior if they ever drift.
-                        continue;
-                    }
-                }
-
-                ast_edges.push(edge);
-            }
-        }
-
-        // Process selective `box::use()` local-module imports (issue #662).
-        // Each import to a resolvable local module contributes a typed
-        // `SelectiveModule` edge from the importer to the module file. These
-        // edges are graph-structural (cycles, neighborhood, membership, watch,
-        // revalidation) but never lend ordinary scope — see
-        // `DependencyEdgeKind`. Package imports (`box::use(dplyr)`) and
-        // unsupported specs contribute NO file edge; missing/case-mismatch
-        // module diagnostics are computed separately from metadata.
-        let mut module_edges: Vec<DependencyEdge> = Vec::new();
-        for request in meta.selective_import_requests(uri) {
-            let crate::selective_import::ImportSource::LocalModule(source) = request.source else {
-                continue;
-            };
-            module_edges.push(DependencyEdge {
-                from: uri.clone(),
-                to: source.uri,
-                call_site_line: Some(request.provenance.line),
-                call_site_column: Some(request.provenance.column),
-                tar_source_ordinal: None,
-                source_batch_kind: None,
-                // Locality/chdir/sys are irrelevant for a non-lending module
-                // edge; use neutral values. `is_function_scoped` is carried so a
-                // top-level↔function-scoped flip changes edge identity and
-                // revalidates dependents.
-                locality: SourceLocality::Global,
-                chdir: false,
-                is_sys_source: false,
-                is_function_scoped: request.function_scoped,
-                is_directive: false,
-                is_backward_directive: false,
-                non_lending: false,
-                kind: DependencyEdgeKind::SelectiveModule,
-            });
-        }
-
-        // Process literal report-document links from supported `{tarchetypes}`
-        // factories. They use the same forward path semantics as `source()` but
-        // carry a dedicated non-lending kind: report chunks share target-name
-        // authority with the pipeline, not its ordinary R execution scope.
-        let report_edges = meta.tarchetypes_document_links.iter().filter_map(|link| {
-            do_resolve(&link.path).map(|to| DependencyEdge {
-                from: uri.clone(),
-                to,
-                call_site_line: Some(link.line),
-                call_site_column: Some(link.column),
-                tar_source_ordinal: None,
-                source_batch_kind: None,
-                locality: SourceLocality::Global,
-                chdir: false,
-                is_sys_source: false,
-                is_function_scoped: false,
-                is_directive: false,
-                is_backward_directive: false,
-                non_lending: false,
-                kind: DependencyEdgeKind::TarchetypesDocument,
-            })
-        });
-
-        // Deduplicate and add all edges. Typed non-source edges dedup
-        // independently of ordinary source edges because `kind` is part of the
-        // key, so multiple relationship dialects to one URI remain explicit.
-        let mut seen_keys = HashSet::new();
-        for edge in directive_edges
-            .into_iter()
-            .chain(ast_edges)
-            .chain(module_edges)
-            .chain(report_edges)
-        {
-            if seen_keys.insert(edge.graph_dedup_key()) {
-                self.add_edge(edge);
-            }
+        // The plan's survivors are already deduplicated by `GraphEdgeDedupKey`
+        // (`FileEdgePlan::survivor_mask`), in candidate order.
+        for edge in edges {
+            self.add_edge(edge);
         }
 
         // Detect whether forward OR backward edges changed for this file.
@@ -1497,6 +1342,7 @@ impl DependencyGraph {
             visited_budget_truncations: std::sync::atomic::AtomicU64::new(0),
             depth_truncations: std::sync::atomic::AtomicU64::new(0),
             any_cycle_cache: std::sync::RwLock::new(None),
+            trace: traces_by_default(),
         }
     }
 
@@ -2761,6 +2607,7 @@ impl DependencyGraph {
 mod tests {
     use super::super::types::BackwardDirective;
     use super::*;
+    use crate::cross_file::types::CallSiteSpec;
     use std::fs::File;
     use std::sync::Arc;
     use tempfile::TempDir;

@@ -1,0 +1,5 @@
+main.R:2:3 -> R/clean.R (source, call, current_frame)
+main.R:5:1 -> R/model.R (source, call, global)
+main.R:6:1 -> R/report.R (source, call, global, missing, not portable from root)
+
+3 edge(s), 0 dropped, 4 file(s)

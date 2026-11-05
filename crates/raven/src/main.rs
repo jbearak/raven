@@ -25,6 +25,7 @@ fn print_usage() {
 Usage: raven [OPTIONS]
        raven console [OPTIONS] [R OPTIONS...]
        raven check [PATHS...] [--workspace DIR]
+       raven graph [--workspace DIR] [--format text|json]
        raven lint [PATHS...]
        raven analysis-stats <path> [--csv] [--only <phase>]
        raven packages <fetch|freeze|update|build-shipped-db|build-embedded-base|validate-shipped-db> [OPTIONS]
@@ -42,6 +43,8 @@ Subcommands:
 check [PATHS...]             Index the workspace and report full diagnostics
                              (syntax, semantic, cross-file, package, lints)
   --workspace DIR            Workspace root to index (default: current directory)
+graph                        Print the cross-file graph Raven builds for the
+                             workspace (--format json is the stable contract)
 lint [PATHS...]              Run the native style linter on files / directories
 analysis-stats <path>        Profile workspace analysis phases
   --csv                      Output results in CSV format
@@ -150,6 +153,23 @@ async fn async_main() -> anyhow::Result<()> {
                 }
                 Err(msg) => {
                     return Err(anyhow::anyhow!("raven check: {}", msg));
+                }
+            }
+        }
+        Some("graph") => {
+            env_logger::init();
+            let rest = args.into_iter().skip(1);
+            match cli::graph::parse_args(rest) {
+                Ok(graph_args) => {
+                    let code = cli::graph::run(graph_args).await;
+                    std::process::exit(code);
+                }
+                Err(msg) if msg == "HELP" => {
+                    cli::graph::print_help();
+                    return Ok(());
+                }
+                Err(msg) => {
+                    return Err(anyhow::anyhow!("raven graph: {}", msg));
                 }
             }
         }

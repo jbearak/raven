@@ -44,6 +44,35 @@ pub struct TarSourceExpansion {
     pub application_working_directory: Option<PathBuf>,
     /// Exact selected Shiny entry used to bootstrap direct support-file opens.
     pub selected_shiny_entry: Option<PathBuf>,
+    /// `list.files()` source batches that failed closed and so contributed no
+    /// members. Reported by `raven graph`; the editor only logs them.
+    pub list_files_failures: Vec<ListFilesBatchFailure>,
+}
+
+/// One `list.files()` source batch that failed closed (see
+/// `ListFilesSourceFailure`): over its member cap, an unreadable directory
+/// or entry, or a matching entry that is a directory. The batch contributes no
+/// members at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListFilesBatchFailure {
+    /// 0-based line of the `list.files()` source call.
+    pub line: u32,
+    /// 0-based UTF-16 column of the call.
+    pub column: u32,
+    /// The directory argument as written.
+    pub directory: String,
+    /// Why the batch failed, for people.
+    pub reason: String,
+}
+
+/// What [`finalize_source_batches_reporting_failures`] installed beyond the
+/// metadata itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinalizedSourceBatches {
+    /// See [`finalize_tar_source_requests_with_exclusions`].
+    pub selected_shiny_entry: Option<PathBuf>,
+    /// Batches that failed closed during this finalization.
+    pub list_files_failures: Vec<ListFilesBatchFailure>,
 }
 
 /// Context-sensitive provider files needed in addition to a URI-global graph
@@ -465,6 +494,12 @@ pub fn expand_tar_source_requests_with_exclusions(
                 request.column + 1,
                 request.directory,
             );
+            result.list_files_failures.push(ListFilesBatchFailure {
+                line: request.line,
+                column: request.column,
+                directory: request.directory.clone(),
+                reason: failure.to_string(),
+            });
         }
         result.watch_paths.extend(expansion.watch_paths);
         for (ordinal, path) in expansion
@@ -570,11 +605,27 @@ pub fn finalize_tar_source_requests_with_exclusions(
     workspace_root: Option<&Url>,
     exclusions: &CompiledWorkspaceExclusions,
 ) -> Option<PathBuf> {
-    let expansion =
+    finalize_source_batches_reporting_failures(metadata, uri, workspace_root, exclusions)
+        .selected_shiny_entry
+}
+
+/// [`finalize_tar_source_requests_with_exclusions`], also returning the
+/// `list.files()` batches that failed closed, which the workspace scan
+/// collects for `raven graph`.
+pub fn finalize_source_batches_reporting_failures(
+    metadata: &mut CrossFileMetadata,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    exclusions: &CompiledWorkspaceExclusions,
+) -> FinalizedSourceBatches {
+    let mut expansion =
         expand_tar_source_requests_with_exclusions(metadata, uri, workspace_root, exclusions);
-    let selected_shiny_entry = expansion.selected_shiny_entry.clone();
+    let finalized = FinalizedSourceBatches {
+        selected_shiny_entry: expansion.selected_shiny_entry.clone(),
+        list_files_failures: std::mem::take(&mut expansion.list_files_failures),
+    };
     apply_tar_source_expansion(metadata, expansion);
-    selected_shiny_entry
+    finalized
 }
 
 /// Reuse a prior record's derived expansion when its syntax, effective path
@@ -623,6 +674,7 @@ pub fn reuse_tar_source_expansion(
             .as_ref()
             .map(PathBuf::from),
         selected_shiny_entry: None,
+        list_files_failures: Vec::new(),
     };
     apply_tar_source_expansion(metadata, expansion);
     true

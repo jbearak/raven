@@ -7368,15 +7368,56 @@ impl WorldState {
         meta: &'a crate::cross_file::CrossFileMetadata,
         workspace_root: Option<&Url>,
     ) -> Cow<'a, crate::cross_file::CrossFileMetadata> {
+        Self::metadata_for_dependency_graph_reporting_exclusions(
+            exclusions,
+            uri,
+            meta,
+            workspace_root,
+        )
+        .0
+    }
+
+    /// [`Self::metadata_for_dependency_graph`], also returning the entries it
+    /// removed, for [`crate::cross_file::dependency::DependencyGraph::update_file_traced`].
+    pub(crate) fn metadata_for_dependency_graph_traced<'a>(
+        &self,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> (
+        Cow<'a, crate::cross_file::CrossFileMetadata>,
+        crate::cross_file::dependency::plan::ExcludedGraphEntries,
+    ) {
+        Self::metadata_for_dependency_graph_reporting_exclusions(
+            &self.workspace_exclusions,
+            uri,
+            meta,
+            workspace_root,
+        )
+    }
+
+    /// [`Self::metadata_for_dependency_graph_with_exclusions`], also returning
+    /// each removed entry with the excluded target or parent it resolved to.
+    pub(crate) fn metadata_for_dependency_graph_reporting_exclusions<'a>(
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> (
+        Cow<'a, crate::cross_file::CrossFileMetadata>,
+        crate::cross_file::dependency::plan::ExcludedGraphEntries,
+    ) {
+        let mut removed = crate::cross_file::dependency::plan::ExcludedGraphEntries::default();
         if exclusions.is_empty() {
-            return Cow::Borrowed(meta);
+            return (Cow::Borrowed(meta), removed);
         }
 
         let forward_ctx =
             crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
         let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
 
-        let forward_target_excluded = |source: &crate::cross_file::ForwardSource| {
+        // The excluded target or parent, or `None` when the entry stays.
+        let forward_excluded_target = |source: &crate::cross_file::ForwardSource| {
             let target_uri = source.resolved_uri.clone().or_else(|| {
                 let ctx = forward_ctx.as_ref()?;
                 let resolved =
@@ -7386,43 +7427,50 @@ impl WorldState {
                     )?;
                 Url::from_file_path(resolved).ok()
             });
-            target_uri
-                .as_ref()
-                .is_some_and(|target| exclusions.is_excluded_uri(target))
+            target_uri.filter(|target| exclusions.is_excluded_uri(target))
         };
 
-        let backward_parent_excluded = |directive: &crate::cross_file::types::BackwardDirective| {
-            let Some(ctx) = backward_ctx.as_ref() else {
-                return false;
-            };
-            let Some(resolved) =
-                crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
-            else {
-                return false;
-            };
+        let backward_excluded_parent = |directive: &crate::cross_file::types::BackwardDirective| {
+            let ctx = backward_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)?;
             Url::from_file_path(resolved)
                 .ok()
-                .is_some_and(|parent| exclusions.is_excluded_uri(&parent))
+                .filter(|parent| exclusions.is_excluded_uri(parent))
         };
 
-        let sources_changed = meta.sources.iter().any(forward_target_excluded);
-        let sourced_by_changed = meta.sourced_by.iter().any(backward_parent_excluded);
+        let source_targets: Vec<Option<Url>> =
+            meta.sources.iter().map(forward_excluded_target).collect();
+        let directive_parents: Vec<Option<Url>> = meta
+            .sourced_by
+            .iter()
+            .map(backward_excluded_parent)
+            .collect();
+        let sources_changed = source_targets.iter().any(Option::is_some);
+        let sourced_by_changed = directive_parents.iter().any(Option::is_some);
         if !sources_changed && !sourced_by_changed {
-            return Cow::Borrowed(meta);
+            return (Cow::Borrowed(meta), removed);
         }
 
         let mut filtered = meta.clone();
         if sources_changed {
-            filtered
-                .sources
-                .retain(|source| !forward_target_excluded(source));
+            filtered.sources.clear();
+            for (source, target) in meta.sources.iter().zip(source_targets) {
+                match target {
+                    Some(target) => removed.sources.push((source.clone(), target)),
+                    None => filtered.sources.push(source.clone()),
+                }
+            }
         }
         if sourced_by_changed {
-            filtered
-                .sourced_by
-                .retain(|directive| !backward_parent_excluded(directive));
+            filtered.sourced_by.clear();
+            for (directive, parent) in meta.sourced_by.iter().zip(directive_parents) {
+                match parent {
+                    Some(parent) => removed.sourced_by.push((directive.clone(), parent)),
+                    None => filtered.sourced_by.push(directive.clone()),
+                }
+            }
         }
-        Cow::Owned(filtered)
+        (Cow::Owned(filtered), removed)
     }
 
     /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
@@ -11329,15 +11377,16 @@ impl WorldState {
                     .map(|e| e.contents.to_string())
                     .or_else(|| cross_file_file_cache.get(parent_uri))
             };
-            let graph_meta = Self::metadata_for_dependency_graph_with_exclusions(
+            let (graph_meta, excluded) = Self::metadata_for_dependency_graph_reporting_exclusions(
                 &workspace_exclusions,
                 uri,
                 meta.as_ref(),
                 workspace_root.as_ref(),
             );
-            let _result = cross_file_graph.update_file(
+            let _result = cross_file_graph.update_file_traced(
                 uri,
                 graph_meta.as_ref(),
+                &excluded,
                 workspace_root.as_ref(),
                 get_content,
             );
@@ -11604,11 +11653,15 @@ impl WorldState {
                         .map(|e| e.contents.to_string())
                         .or_else(|| self.cross_file_file_cache.get(parent_uri))
                 };
-                let graph_meta =
-                    self.metadata_for_dependency_graph(uri, meta.as_ref(), workspace_root.as_ref());
-                self.cross_file_graph.update_file(
+                let (graph_meta, excluded) = self.metadata_for_dependency_graph_traced(
+                    uri,
+                    meta.as_ref(),
+                    workspace_root.as_ref(),
+                );
+                self.cross_file_graph.update_file_traced(
                     uri,
                     graph_meta.as_ref(),
+                    &excluded,
                     workspace_root.as_ref(),
                     get_content,
                 );
@@ -13206,6 +13259,32 @@ pub(crate) fn scan_workspace_with_box_context(
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
     box_context: &crate::box_use::search_path::SearchPathContext,
 ) -> WorkspaceScanResult {
+    scan_workspace_reporting(folders, max_chain_depth, exclusions, box_context).0
+}
+
+/// What a workspace scan saw beyond the entries it indexed, for `raven graph`'s
+/// completeness report.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceScanReport {
+    /// Every file the directory walk discovered, as a filesystem path, in
+    /// walk order.
+    pub(crate) discovered: Vec<PathBuf>,
+    /// Discovered files the scan couldn't read or process (unreadable,
+    /// undecodable, or without a file URL), so no index entry exists for them.
+    pub(crate) unprocessed: Vec<PathBuf>,
+    /// `list.files()` source batches that failed closed, by calling file.
+    pub(crate) failed_list_files_batches:
+        Vec<(Url, crate::cross_file::tar_source::ListFilesBatchFailure)>,
+}
+
+/// [`scan_workspace_with_box_context`], also reporting the discovered files,
+/// the ones it couldn't process, and failed `list.files()` batches.
+pub(crate) fn scan_workspace_reporting(
+    folders: &[Url],
+    max_chain_depth: usize,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) -> (WorkspaceScanResult, WorkspaceScanReport) {
     use rayon::prelude::*;
 
     // Get workspace root for path resolution
@@ -13250,6 +13329,19 @@ pub(crate) fn scan_workspace_with_box_context(
             left.extend(right);
             left
         });
+    // `process_workspace_file` returns `None` exactly when it couldn't read,
+    // decode, or address a path, so the discovered paths with no entry are
+    // the ones it dropped.
+    let unprocessed: Vec<PathBuf> = file_paths
+        .iter()
+        .filter(|path| {
+            Url::from_file_path(path)
+                .ok()
+                .is_none_or(|uri| !entries.contains_key(&uri))
+        })
+        .cloned()
+        .collect();
+    let mut failed_list_files_batches = Vec::new();
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
     // Track only files that need enrichment to avoid O(n²) behavior
@@ -13322,11 +13414,17 @@ pub(crate) fn scan_workspace_with_box_context(
     while let Some((uri, depth)) = module_queue.pop_front() {
         let entry = entries.get_mut(&uri).expect("queued module was installed");
         let metadata = Arc::make_mut(&mut entry.metadata);
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+        let finalized = crate::cross_file::tar_source::finalize_source_batches_reporting_failures(
             metadata,
             &uri,
             workspace_root.as_ref(),
             exclusions,
+        );
+        failed_list_files_batches.extend(
+            finalized
+                .list_files_failures
+                .into_iter()
+                .map(|failure| (uri.clone(), failure)),
         );
         crate::cross_file::enrich_selective_import_resolutions_with_context(
             metadata,
@@ -13385,7 +13483,15 @@ pub(crate) fn scan_workspace_with_box_context(
     // The canonical derivation is now single-sourced through the event path
     // (`PackageInputs` → `derive_package_state`).
 
-    entries
+    failed_list_files_batches.sort_by(|(a, x), (b, y)| {
+        (a.as_str(), x.line, x.column).cmp(&(b.as_str(), y.line, y.column))
+    });
+    let report = WorkspaceScanReport {
+        discovered: file_paths,
+        unprocessed,
+        failed_list_files_batches,
+    };
+    (entries, report)
 }
 
 /// Non-hidden directories to skip during workspace scanning.
