@@ -358,7 +358,7 @@ The text format is for reading and may change between releases. For scripts, use
 - `--no-config`: ignore `raven.toml` and `.lintr` and use Raven's built-in defaults.
 - `--format text|json`: output format, default `text`. `sarif` isn't accepted, because the graph isn't a list of findings.
 
-`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config exits `2`.
+`raven graph` exits `0` once it prints the graph, even when some call sites were dropped or the graph is incomplete. An unknown flag exits `1`, and an operator error such as an unreadable config or a `--workspace` that isn't a directory exits `2`.
 
 ### Graph JSON
 
@@ -389,7 +389,7 @@ Each entry in `edges` is one stored link, including repeated calls and every fil
 | `resolution` | How the written path resolved: `endpoint` (`target`, or `caller` for backward directives), `exists`, `case` (`exact`, `filesystem_folds_case`, `raven_leniency`, or `null` when the file doesn't exist), `outside_root`, and `working_directory` (the base used when it wasn't the file's own directory). `null` for batches and `box` modules. |
 | `portable_from_root` | `true` when `raw_path` has no leading `/` and resolves, with the same case, to an existing file at that path under the root, so the call works when R runs from the root. `null` without a `raw_path` and for backward directives. |
 
-Each entry in `dropped` is a call site Raven found that produced no edge: `caller`, `position`, `kind`, `origin`, `raw_path`, `system_file`, `target`, and `reason`. The reasons are:
+Each entry in `dropped` is a call site Raven found that produced no edge: `caller`, `position`, `kind`, `origin`, `raw_path`, `system_file`, `target`, and `reason`. In `dropped`, `caller` is always the file that holds the call or directive, so `position` is in that file. For a backward directive, `target` is the parent it names, the reverse of its row in `edges`. The reasons are:
 
 - `excluded`: the target matches `[workspace].exclude` or `.gitignore`.
 - `unresolvable`: the path couldn't be normalized.

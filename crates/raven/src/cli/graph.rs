@@ -146,6 +146,14 @@ pub(crate) async fn build_graph_report(args: &GraphArgs, cwd: &Path) -> Result<G
         None => cwd.to_path_buf(),
     };
     let root = std::fs::canonicalize(&abs_workspace).unwrap_or(abs_workspace);
+    // A missing workspace would scan as an empty, complete graph.
+    if !root.is_dir() {
+        eprintln!(
+            "raven graph: workspace is not a directory: {}",
+            root.display()
+        );
+        return Err(EXIT_OPERATOR_ERROR);
+    }
     let Ok(workspace_url) = Url::from_file_path(&root) else {
         eprintln!("raven graph: invalid workspace path: {}", root.display());
         return Err(EXIT_OPERATOR_ERROR);
@@ -1271,6 +1279,16 @@ mod tests {
         let plain = TempDir::new().unwrap();
         write(plain.path(), "main.R", "x <- 1\n");
         assert!(!report(plain.path(), true).package_mode);
+    }
+
+    #[test]
+    fn missing_workspace_is_an_operator_error() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-dir");
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(build_graph_report(&args(&missing, true), tmp.path()));
+        assert_eq!(result.err(), Some(EXIT_OPERATOR_ERROR));
     }
 
     #[test]
