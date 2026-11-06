@@ -824,6 +824,15 @@ fn build_indexed_state_reporting(
         },
         false,
     );
+    // An `import::from()` path that resolves only from an inherited directory
+    // can lead outside the scanned files; index those modules too.
+    crate::state::admit_local_module_targets(
+        &mut entries,
+        Some(workspace_url),
+        &state.workspace_exclusions,
+        &state.box_search_context(),
+        max_chain_depth,
+    );
     // Preserve package text before bounded index admission can evict helpers.
     // Rope clones share their storage. Materialize and hash only evicted files
     // below; shared package hydration already supplies every resident file.
@@ -3891,6 +3900,35 @@ infixContinuationStyle = "indented"
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// An `import::from(.all = TRUE)` script found only through an inherited
+    /// working directory outside the workspace is indexed like any other
+    /// module, so its exports bind instead of reading as undefined.
+    #[test]
+    fn an_inherited_directory_outside_the_workspace_indexes_its_import_modules() {
+        let tmp = TempDir::new().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let workspace = root.join("W");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(root.join("shared")).unwrap();
+        fs::write(
+            workspace.join("main.R"),
+            "# raven: cd ../shared\nsource(\"../W/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("child.R"),
+            "import::from(\"x.R\", .all = TRUE)\nf()\nh()\n",
+        )
+        .unwrap();
+        fs::write(root.join("shared/x.R"), "f <- function() 1\n").unwrap();
+
+        let messages: Vec<_> = collect_diagnostics_parallel_blocking(&base_args(&workspace))
+            .into_iter()
+            .map(|(_, d)| d.message)
+            .collect();
+        assert_eq!(messages, vec!["h is not defined"], "{messages:?}");
     }
 
     /// Issue #479 WI3: the parallel per-file collection must be byte-identical to

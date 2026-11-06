@@ -4492,7 +4492,7 @@ async fn prepare_workspace_scan(
     let scan_generation = inputs.basis.scan_generation();
     let (retained_entries, retained_artifacts) = retained_entries;
     let retained_uris: std::collections::HashSet<_> = retained_entries.keys().cloned().collect();
-    let scanned_uris: std::collections::HashSet<_> = scanned_entries.keys().cloned().collect();
+    let mut scanned_uris: std::collections::HashSet<_> = scanned_entries.keys().cloned().collect();
     let mut complete_entries = retained_entries;
     complete_entries.extend(scanned_entries);
     let mut graph_entries = complete_entries.clone();
@@ -4521,6 +4521,18 @@ async fn prepare_workspace_scan(
     };
     let (complete_graph, complete_open_metadata) =
         derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context, true);
+    // An `import::from()` path that resolves only from an inherited directory
+    // can lead outside the scanned files; index those modules with the scan.
+    for uri in crate::state::admit_local_module_targets(
+        &mut graph_entries,
+        context.workspace_root.as_ref(),
+        &inputs.exclusions,
+        &inputs.box_context,
+        inputs.basis.max_chain_depth,
+    ) {
+        complete_entries.insert(uri.clone(), graph_entries[&uri].clone());
+        scanned_uris.insert(uri);
+    }
     // Ignore filtering applies to roots, not edges. Dynamic entries must not
     // keep ignored caller cycles alive solely because they were indexed once.
     let mut pending: Vec<_> = graph_entries

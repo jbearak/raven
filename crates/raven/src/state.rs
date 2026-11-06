@@ -13489,39 +13489,17 @@ pub(crate) fn scan_workspace_reporting(
     let mut discovered_modules = 0;
     while let Some((uri, depth)) = module_queue.pop_front() {
         let entry = entries.get_mut(&uri).expect("queued module was installed");
-        let metadata = Arc::make_mut(&mut entry.metadata);
-        let finalized = crate::cross_file::tar_source::finalize_source_batches_reporting_failures(
-            metadata,
-            &uri,
-            workspace_root.as_ref(),
-            exclusions,
-        );
         failed_list_files_batches.extend(
-            finalized
-                .list_files_failures
-                .into_iter()
-                .map(|failure| (uri.clone(), failure)),
+            finish_scanned_entry(
+                &uri,
+                entry,
+                workspace_root.as_ref(),
+                exclusions,
+                box_context,
+            )
+            .into_iter()
+            .map(|failure| (uri.clone(), failure)),
         );
-        crate::cross_file::enrich_selective_import_resolutions_with_context(
-            metadata,
-            &uri,
-            workspace_root.as_ref(),
-            box_context,
-        );
-        let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(if file_type_from_uri(&uri) == FileType::R {
-            match entry.tree.as_ref() {
-                Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-                    &uri,
-                    tree,
-                    &analysis,
-                    Some(entry.metadata.as_ref()),
-                ),
-                None => crate::cross_file::scope::ScopeArtifacts::default(),
-            }
-        } else {
-            crate::cross_file::scope::ScopeArtifacts::default()
-        });
         if depth < max_chain_depth {
             let targets: Vec<_> = entry
                 .metadata
@@ -13568,6 +13546,114 @@ pub(crate) fn scan_workspace_reporting(
         failed_list_files_batches,
     };
     (entries, report)
+}
+
+/// The scan's last per-file stage: expand source batches, resolve selective
+/// imports, and compute artifacts. Returns the `list.files()` batches that
+/// failed closed.
+fn finish_scanned_entry(
+    uri: &Url,
+    entry: &mut crate::workspace_index::IndexEntry,
+    workspace_root: Option<&Url>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+) -> Vec<crate::cross_file::tar_source::ListFilesBatchFailure> {
+    let metadata = Arc::make_mut(&mut entry.metadata);
+    let finalized = crate::cross_file::tar_source::finalize_source_batches_reporting_failures(
+        metadata,
+        uri,
+        workspace_root,
+        exclusions,
+    );
+    crate::cross_file::enrich_selective_import_resolutions_with_context(
+        metadata,
+        uri,
+        workspace_root,
+        box_context,
+    );
+    let analysis = entry.contents.to_string();
+    entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
+        match entry.tree.as_ref() {
+            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &analysis,
+                Some(entry.metadata.as_ref()),
+            ),
+            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        }
+    } else {
+        crate::cross_file::scope::ScopeArtifacts::default()
+    });
+    finalized.list_files_failures
+}
+
+/// Index the `{import}`/`{box}` module files that `entries` resolve to but
+/// don't contain, transitively, as the scan's own module pass does (same depth
+/// bound, discovery cap, and exclusions). Returns the URIs it added.
+///
+/// The scan admits modules before [`derive_workspace_dependency_graph`] passes
+/// a parent's working directory down; an `import::from()` path that resolves
+/// only from that directory (and lies outside the scanned files) is found
+/// after it, so callers run this after the derivation.
+pub(crate) fn admit_local_module_targets(
+    entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
+    workspace_root: Option<&Url>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+    max_chain_depth: usize,
+) -> Vec<Url> {
+    let missing_targets = |entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
+                           uri: &Url| {
+        entries.get(uri).map_or_else(Vec::new, |entry| {
+            entry
+                .metadata
+                .selective_import_requests(uri)
+                .filter_map(|request| request.source.local_module_uri().cloned())
+                .filter(|target| !entries.contains_key(target))
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut importers: Vec<_> = entries.keys().cloned().collect();
+    importers.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut queue: std::collections::VecDeque<_> = importers
+        .iter()
+        .flat_map(|uri| missing_targets(entries, uri))
+        .map(|target| (target, 1))
+        .collect();
+    let mut seen: HashSet<Url> = HashSet::new();
+    let mut admitted = Vec::new();
+    while let Some((uri, depth)) = queue.pop_front() {
+        if admitted.len() >= 50_000 || entries.contains_key(&uri) || !seen.insert(uri.clone()) {
+            continue;
+        }
+        let Ok(path) = uri.to_file_path() else {
+            continue;
+        };
+        if exclusions.is_excluded_path(&path) {
+            continue;
+        }
+        let Some(mut item) = process_workspace_file(&path) else {
+            continue;
+        };
+        finish_scanned_entry(
+            &item.uri,
+            &mut item.entry,
+            workspace_root,
+            exclusions,
+            box_context,
+        );
+        entries.insert(item.uri.clone(), item.entry);
+        if depth < max_chain_depth {
+            queue.extend(
+                missing_targets(entries, &item.uri)
+                    .into_iter()
+                    .map(|target| (target, depth + 1)),
+            );
+        }
+        admitted.push(item.uri);
+    }
+    admitted
 }
 
 /// Non-hidden directories to skip during workspace scanning.
