@@ -10620,7 +10620,7 @@ fn extract_enriched_live_metadata_with_contexts(
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let attempted = std::cell::RefCell::new(Vec::new());
 
-    crate::cross_file::enrich_metadata_with_inherited_wd(
+    crate::state::enrich_open_metadata_with_inherited_wd(
         &mut meta,
         uri,
         workspace_root.as_ref(),
@@ -10628,6 +10628,7 @@ fn extract_enriched_live_metadata_with_contexts(
             attempted.borrow_mut().push(parent_uri.clone());
             state.get_enriched_metadata(parent_uri)
         },
+        &crate::state::forward_parents(&state.cross_file_graph, uri),
         max_chain_depth,
     );
 
@@ -12401,6 +12402,8 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
 }
 
 struct CapturedOpenInstallAnalysis {
+    /// See [`crate::state::forward_parents`].
+    forward_parents: Vec<(Url, bool)>,
     basis: AnalysisBasis,
     intent: OpenInstallIntentToken,
     uri: Url,
@@ -12577,6 +12580,7 @@ fn capture_open_install_analysis(
         .unwrap_or_default();
     let (workspace_name, system_package_root, library_paths) = state.snapshot_system_file_inputs();
     Some(CapturedOpenInstallAnalysis {
+        forward_parents: crate::state::forward_parents(&state.cross_file_graph, &uri),
         box_context: state.box_search_context_for_document(&uri, &document.contents),
         basis,
         intent: intent.clone(),
@@ -12654,11 +12658,12 @@ fn derive_open_install_analysis(
     let is_r = captured.document.file_type == crate::file_type::FileType::R;
     let mut metadata = captured.document.cross_file_metadata();
     if !local_only && is_r {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
+        crate::state::enrich_open_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             metadata_lookup,
+            &captured.forward_parents,
             captured.max_chain_depth,
         );
         crate::cross_file::resolve_system_file_sources(
@@ -13112,11 +13117,12 @@ fn derive_open_metadata_reenrichment(
         crate::cross_file::CrossFileMetadata::default()
     };
     if is_r {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
+        crate::state::enrich_open_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             metadata_lookup,
+            &captured.forward_parents,
             captured.max_chain_depth,
         );
         crate::cross_file::resolve_system_file_sources(
@@ -39378,6 +39384,76 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.contains(&y_uri),
             "gitignored module it imports"
+        );
+    }
+
+    /// A file with no backward directive, sourced by a parent whose `cd` is in
+    /// effect, keeps the parent's working directory when it is opened and
+    /// edited, as it has while closed: its own `source("util.R")` resolves
+    /// from `lib/` instead of reporting a missing file.
+    #[tokio::test]
+    async fn an_open_file_keeps_the_directory_its_parent_runs_it_in() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(base.join("lib")).unwrap();
+        fs::create_dir_all(base.join("scripts")).unwrap();
+        fs::write(
+            base.join("main.R"),
+            "# raven: cd lib\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(base.join("scripts/child.R"), "source(\"util.R\")\n").unwrap();
+        fs::write(base.join("lib/util.R"), "f <- function() 1\n").unwrap();
+        let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+        let lib = base.join("lib").to_string_lossy().into_owned();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&base).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.index_workspace = true;
+            state.advance_workspace_scan_generation();
+        }
+        run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+
+        let inherited = |state: &WorldState| {
+            state
+                .get_enriched_metadata(&child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone())
+        };
+        open_doc(backend, &child_uri, "r", 1, "source(\"util.R\")\n").await;
+        assert_eq!(
+            inherited(&*backend.state.read().await).as_deref(),
+            Some(lib.as_str()),
+            "after open"
+        );
+        change_doc(backend, &child_uri, 2, "source(\"util.R\")\nf()\n").await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            inherited(&state).as_deref(),
+            Some(lib.as_str()),
+            "after edit"
+        );
+        let diagnostics = snapshot_diagnostics(&state, &child_uri);
+        assert!(
+            diagnostics.iter().all(|d| !d.message.contains("not found")),
+            "{diagnostics:?}"
         );
     }
 

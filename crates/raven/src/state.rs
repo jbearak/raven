@@ -3449,6 +3449,8 @@ pub(crate) struct PreparedOpenAliasReconcileAnalysis {
 #[derive(Clone)]
 pub(crate) struct CapturedOpenMetadataAnalysis {
     pub(crate) box_context: crate::box_use::search_path::SearchPathContext,
+    /// See [`forward_parents`].
+    pub(crate) forward_parents: Vec<(Url, bool)>,
     basis: AnalysisBasis,
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
@@ -9298,6 +9300,7 @@ impl WorldState {
         let (workspace_name, package_workspace_root, library_paths) =
             self.snapshot_system_file_inputs();
         Some(CapturedOpenMetadataAnalysis {
+            forward_parents: forward_parents(&self.cross_file_graph, uri),
             box_context: self.box_search_context(),
             basis,
             uri: uri.clone(),
@@ -12358,6 +12361,73 @@ pub(crate) struct WorkspaceGraphDerivationContext {
     pub(crate) system_file_workspace_name: Option<String>,
     pub(crate) system_file_workspace_root: Option<PathBuf>,
     pub(crate) system_file_library_paths: Vec<PathBuf>,
+}
+
+/// The files that `source()` `uri` (or name it in a forward directive) on an
+/// edge that lends scope, each with that edge's `chdir`: the parents that can
+/// pass it a working directory.
+pub(crate) fn forward_parents(
+    graph: &crate::cross_file::DependencyGraph,
+    uri: &Url,
+) -> Vec<(Url, bool)> {
+    graph
+        .get_dependents(uri)
+        .into_iter()
+        .filter(|edge| {
+            edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
+                && !edge.is_backward_directive
+                && !edge.non_lending
+        })
+        .map(|edge| (edge.from.clone(), edge.chdir))
+        .collect()
+}
+
+/// An open buffer's inherited working directory: through its backward
+/// directives first, else from the parents in `forward_parents` (see
+/// [`forward_parents`]), under the workspace derivation's agreement rule
+/// ([`forward_wd_proposals`]): a directory only when every proposing parent
+/// agrees. Without this, opening a file that inherits only through the files
+/// that source it would drop the directory the workspace scan gave it.
+pub(crate) fn enrich_open_metadata_with_inherited_wd(
+    metadata: &mut crate::cross_file::CrossFileMetadata,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    get_metadata: impl Fn(&Url) -> Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    forward_parents: &[(Url, bool)],
+    max_depth: usize,
+) {
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        metadata,
+        uri,
+        workspace_root,
+        &get_metadata,
+        max_depth,
+    );
+    if metadata.working_directory.is_some() || metadata.inherited_working_directory.is_some() {
+        return;
+    }
+    let Ok(child_path) = uri.to_file_path() else {
+        return;
+    };
+    let mut proposals = std::collections::BTreeSet::new();
+    for (parent_uri, chdir) in forward_parents {
+        let Some(parent) = get_metadata(parent_uri) else {
+            continue;
+        };
+        let Some(context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+            parent_uri,
+            &parent,
+            workspace_root,
+        ) else {
+            continue;
+        };
+        if let Some(directory) = context.forward_child_inherited_wd(&child_path, *chdir) {
+            proposals.insert(directory.to_string_lossy().into_owned());
+        }
+    }
+    if proposals.len() == 1 {
+        metadata.inherited_working_directory = proposals.pop_first();
+    }
 }
 
 /// Forward working-directory proposals for files with no directory of their
