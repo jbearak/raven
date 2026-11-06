@@ -527,6 +527,20 @@ fn set_r_wait(wait: RWait) {
     R_WAIT.store(wait as u8, Ordering::SeqCst);
 }
 
+/// Held while R leaves a prompt for evaluation and while the debugger's Stop
+/// decides what to do, so Stop either sees R still waiting for an answer (and
+/// [`read_new_input`] finds its abort on the way out) or sees R evaluating
+/// (and interrupts that) — never an answer slipping between the two.
+static R_WAIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` on what R is doing, with no move out of a prompt in between.
+pub(crate) fn with_r_wait<T>(f: impl FnOnce(RWait) -> T) -> T {
+    let _guard = R_WAIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(r_wait())
+}
+
 /// The editor is at a prompt where it would start a queued request now (the
 /// idle callback only interrupts the editor for requests it can serve, so a
 /// request that has to wait never spins the read loop).
@@ -1088,7 +1102,26 @@ fn read_new_input(prompt: &str, kind: PromptKind, cap: usize, depth: u32) -> Opt
         _ => RWait::OtherPrompt,
     });
     let result = read_new_input_from(prompt, kind, cap, depth);
+    // Tests widen the gap between an answer arriving and R running again, so
+    // a Stop can be landed inside it.
+    #[cfg(feature = "test-support")]
+    if kind == PromptKind::Other
+        && result.is_some()
+        && let Some(ms) = std::env::var("RAVEN_TEST_INPUT_DEPARTURE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     if result.is_some() {
+        let _guard = R_WAIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Stop arrived after the answer was typed but before R ran again:
+        // drop the answer and interrupt the code that asked, as Stop meant.
+        if kind == PromptKind::Other && dap::take_input_abort() {
+            request_interrupt();
+        }
         // R runs again (also after a `readline()` answer): socket interrupts
         // apply from here.
         set_r_wait(RWait::Evaluating);
