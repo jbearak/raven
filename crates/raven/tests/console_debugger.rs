@@ -827,6 +827,44 @@ fn steps_never_leak_into_a_later_send_and_function_breakpoints_bind_late() {
     assert!(!c.text().contains("Error"), "{}", c.text());
 }
 
+/// The R package `later` is installed (callbacks the event pump runs).
+fn later_available() -> bool {
+    let ok = Command::new("Rscript")
+        .args([
+            "-e",
+            "quit(status = !requireNamespace('later', quietly = TRUE))",
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: R package later is not installed");
+    }
+    ok
+}
+
+/// A browser opened by code the event pump runs (a `later` callback) reads
+/// its input with the fallback line reader. A browser command typed there is
+/// a resume, as at any other browser prompt: the session leaves its stop.
+#[test]
+fn typed_continue_at_a_callback_browser_resumes_the_session() {
+    if !r_available() || !later_available() {
+        return;
+    }
+    let mut c = Console::spawn();
+    let mut d = Dap::connect(&c);
+    d.req("configurationDone", json!({}));
+    let m = d.mark();
+    c.send(
+        "later::later(function() { browser(); cat(toupper('after callback'), '\\n') }, 0.3)",
+        None,
+    );
+    d.event("stopped", m);
+    let m = d.mark();
+    c.type_line("c");
+    c.expect("AFTER CALLBACK");
+    d.event("continued", m);
+}
+
 #[test]
 fn unbraced_bodies_handlers_completions_and_nested_browsers() {
     if !r_available() {

@@ -1357,6 +1357,8 @@ fn plain_read(prompt: &str) -> Option<String> {
     // While nothing is typed, serve the debugger (a breakpoint hit inside a
     // `later`/httpuv callback stops here; design §2).
     let browser = is_browser_prompt(prompt);
+    // The debugger fed the line (Continue, Step… in the UI), not the user.
+    let mut fed = false;
     let mut idle = || {
         if dap::has_work() {
             dap::service();
@@ -1367,7 +1369,9 @@ fn plain_read(prompt: &str) -> Option<String> {
             return Some("\n".into());
         }
         if browser {
-            dap::take_resume().map(|cmd| format!("{cmd}\n"))
+            let cmd = dap::take_resume();
+            fed |= cmd.is_some();
+            cmd.map(|cmd| format!("{cmd}\n"))
         } else {
             None
         }
@@ -1375,6 +1379,13 @@ fn plain_read(prompt: &str) -> Option<String> {
     let result = match sys::read_line(
         dap::active().then_some(&mut idle as &mut dyn FnMut() -> Option<String>),
     ) {
+        // Typed at a browser prompt: a browser command is a resume, exactly
+        // as in the editor (`edit_loop`).
+        sys::Line::Text(text) if browser && !fed => Some(
+            dap::on_user_line(&text)
+                .map(|cmd| format!("{cmd}\n"))
+                .unwrap_or(text),
+        ),
         sys::Line::Text(text) => Some(text),
         sys::Line::Interrupted => {
             request_interrupt();
