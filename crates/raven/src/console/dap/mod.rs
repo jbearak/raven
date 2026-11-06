@@ -766,19 +766,20 @@ fn request_resume(cmd: &str) {
 
 fn request_abort() {
     let Some(h) = handle() else { return };
-    match super::r_wait() {
+    super::with_r_wait(|wait| match wait {
         super::RWait::Evaluating => {
             h.abort.store(true, Ordering::SeqCst);
             super::sys::interrupt_r();
         }
         // A `readline()` the program is waiting on: break the read and
-        // interrupt the code that asked, as Ctrl-C there does.
+        // interrupt the code that asked, as Ctrl-C there does. If the answer
+        // is already on its way, `read_new_input` takes the abort instead.
         super::RWait::UserInput => {
             h.abort.store(true, Ordering::SeqCst);
             INPUT_ABORT.store(true, Ordering::SeqCst);
         }
         super::RWait::IdleTopLevel | super::RWait::OtherPrompt => {}
-    }
+    });
 }
 
 /// Set by Stop while R waits for user input; breaks the `readline()` editor

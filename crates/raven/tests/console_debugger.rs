@@ -60,6 +60,10 @@ struct Console {
 
 impl Console {
     fn spawn() -> Console {
+        Console::spawn_with_env(&[])
+    }
+
+    fn spawn_with_env(env: &[(&str, &str)]) -> Console {
         let dir = scratch();
         let mut master: libc::c_int = 0;
         let mut slave: libc::c_int = 0;
@@ -90,6 +94,7 @@ impl Console {
             .arg(dir.join("d"))
             .args(["--no-save", "--no-restore", "--vanilla", "-q"])
             .env("TERM", "xterm-256color")
+            .envs(env.iter().copied())
             .env_remove("RAVEN_CONSOLE_BOOTSTRAPPED")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -1325,6 +1330,45 @@ fn expressions_name_exactly_the_value_shown() {
     let m = d.mark();
     d.req("continue", json!({"threadId": 1}));
     d.event("terminated", m);
+}
+
+/// Stop that lands just after the user answered `readline()`, before R runs
+/// again, still ends the program: the answer is dropped and the code that
+/// asked is interrupted, instead of the program running on with it.
+#[test]
+fn terminate_racing_a_readline_answer_still_ends_the_program() {
+    if !r_available() {
+        return;
+    }
+    let mut c = Console::spawn_with_env(&[("RAVEN_TEST_INPUT_DEPARTURE_DELAY_MS", "1500")]);
+    let mut d = Dap::connect(&c);
+    d.req("launch", json!({"program": "/w/p.R"}));
+    d.req("configurationDone", json!({}));
+    // The program's own output is upper-cased, so it can't match the echo.
+    c.send_program("ans <- readline('answer: '); cat(toupper('program got'), ans, '\\n')");
+    let deadline = Instant::now() + TIMEOUT;
+    while c.text().matches("answer: ").count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "no readline() prompt: {}",
+            c.text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Answer, then Stop while the answer is on its way back to R.
+    c.type_line("yes");
+    std::thread::sleep(Duration::from_millis(400));
+    let m = d.mark();
+    d.req("terminate", json!({}));
+    d.event("terminated", m);
+    std::thread::sleep(Duration::from_millis(2000));
+    c.type_line("cat('alive', '\\n')");
+    c.expect("alive ");
+    assert!(
+        !c.text().contains("PROGRAM GOT"),
+        "the program ran on with the answer after Stop: {}",
+        c.text()
+    );
 }
 
 /// Stop ends an F5 program even while it waits at `readline()`, as it does
