@@ -12369,11 +12369,13 @@ pub(crate) struct WorkspaceGraphDerivationContext {
 /// parents with neither propose nothing. A child takes a proposal only when
 /// every proposing parent agrees. Parents that disagree leave it with none,
 /// so its own paths resolve as if no directory were in effect, and the
-/// result never depends on which parent happens to sort first.
+/// result never depends on which parent happens to sort first. Files in
+/// `unstable` (see [`derive_workspace_dependency_graph`]) take none.
 fn forward_wd_proposals(
     parents: &[(Url, Arc<crate::cross_file::CrossFileMetadata>)],
     children: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     workspace_root: Option<&Url>,
+    unstable: &HashSet<Url>,
 ) -> HashMap<Url, String> {
     let mut proposals: HashMap<Url, std::collections::BTreeSet<String>> = HashMap::new();
     for (parent_uri, parent_metadata) in parents {
@@ -12402,7 +12404,10 @@ fn forward_wd_proposals(
             let Some(child) = children.get(&child_uri) else {
                 continue;
             };
-            if child.working_directory.is_some() || child.inherited_working_directory.is_some() {
+            if child.working_directory.is_some()
+                || child.inherited_working_directory.is_some()
+                || unstable.contains(&child_uri)
+            {
                 continue;
             }
             if let Some(inherited) =
@@ -12435,6 +12440,7 @@ fn derive_closed_descendant_metadata(
     open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     workspace_root: Option<&Url>,
     max_depth: usize,
+    unstable: &HashSet<Url>,
 ) -> bool {
     let mut closed_uris: Vec<_> = base_closed_metadata.keys().cloned().collect();
     closed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -12470,7 +12476,7 @@ fn derive_closed_descendant_metadata(
                 .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
         )
         .collect();
-    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root) {
+    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root, unstable) {
         if let Some(metadata) = next.get_mut(&uri) {
             Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
         }
@@ -12504,6 +12510,7 @@ fn derive_open_candidate_metadata(
     entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
     workspace_root: Option<&Url>,
     max_depth: usize,
+    unstable: &HashSet<Url>,
 ) -> (
     HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
     bool,
@@ -12541,7 +12548,7 @@ fn derive_open_candidate_metadata(
                 .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
         )
         .collect();
-    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root) {
+    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root, unstable) {
         if let Some(metadata) = next.get_mut(&uri) {
             Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
         }
@@ -12662,13 +12669,43 @@ pub(crate) fn derive_workspace_dependency_graph(
     for metadata in open_metadata.values_mut() {
         Arc::make_mut(metadata).inherited_working_directory = None;
     }
-    for _ in 0..context.max_depth.max(1) {
+    // A cycle of `source()` calls whose roots disagree can make forward
+    // proposals alternate between rounds instead of converging, so the result
+    // would depend on where the round limit falls. A repeated state is such an
+    // oscillation: every file whose directory varies across the repeat takes
+    // no forward directory from then on, as when its parents disagree, and the
+    // round budget restarts. `unstable` only grows, so this terminates.
+    let mut unstable: HashSet<Url> = HashSet::new();
+    let wd_state =
+        |entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
+         open: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>| {
+            entries
+                .iter()
+                .map(|(uri, entry)| {
+                    (
+                        (false, uri.clone()),
+                        entry.metadata.inherited_working_directory.clone(),
+                    )
+                })
+                .chain(open.iter().map(|(uri, metadata)| {
+                    (
+                        (true, uri.clone()),
+                        metadata.inherited_working_directory.clone(),
+                    )
+                }))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+    let mut history = vec![wd_state(entries, &open_metadata)];
+    let mut rounds = 0;
+    while rounds < context.max_depth.max(1) {
+        rounds += 1;
         let closed_changed = derive_closed_descendant_metadata(
             &base_closed_metadata,
             entries,
             &open_metadata,
             workspace_root,
             context.max_depth,
+            &unstable,
         );
         let (next_open_metadata, open_changed) = derive_open_candidate_metadata(
             &base_open_metadata,
@@ -12676,11 +12713,30 @@ pub(crate) fn derive_workspace_dependency_graph(
             entries,
             workspace_root,
             context.max_depth,
+            &unstable,
         );
         open_metadata = next_open_metadata;
         if !closed_changed && !open_changed {
             break;
         }
+        let state = wd_state(entries, &open_metadata);
+        if let Some(start) = history.iter().position(|seen| *seen == state) {
+            let cycle = &history[start..];
+            let pinned = unstable.len();
+            unstable.extend(
+                state
+                    .iter()
+                    .filter(|(key, value)| cycle.iter().any(|seen| seen.get(*key) != Some(*value)))
+                    .map(|((_, uri), _)| uri.clone()),
+            );
+            if unstable.len() == pinned {
+                // Nothing left that forward proposals could settle.
+                break;
+            }
+            history.clear();
+            rounds = 0;
+        }
+        history.push(state);
     }
 
     // Source-batch expansion is the final metadata derivation stage: inherited
@@ -15634,6 +15690,43 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 .all(|edge| edge.to != tar_helper_uri),
             "excluded tar_source members must leave the dependency graph"
         );
+    }
+
+    /// Two files that source each other, reached from roots that `cd` into
+    /// different directories, would alternate between the two directories and
+    /// none from one round to the next. They settle on none, whatever the
+    /// round limit's parity.
+    #[test]
+    fn a_source_cycle_between_disagreeing_roots_settles_on_no_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["wd1", "wd2", "s"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("r1.R"), "# raven: cd wd1\nsource(\"../s/x.R\")\n").unwrap();
+        fs::write(root.join("r2.R"), "# raven: cd wd2\nsource(\"../s/y.R\")\n").unwrap();
+        fs::write(root.join("s/x.R"), "source(\"../s/y.R\")\n").unwrap();
+        fs::write(root.join("s/y.R"), "source(\"../s/x.R\")\n").unwrap();
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for max_depth in [20, 21] {
+            let mut entries = scan_workspace(std::slice::from_ref(&root_uri), max_depth);
+            let context = WorkspaceGraphDerivationContext {
+                workspace_root: Some(root_uri.clone()),
+                max_depth,
+                exclusions: Default::default(),
+                system_file_workspace_name: None,
+                system_file_workspace_root: None,
+                system_file_library_paths: Vec::new(),
+            };
+            derive_workspace_dependency_graph(&mut entries, None, &[], &context, false);
+            for file in ["s/x.R", "s/y.R"] {
+                let uri = Url::from_file_path(root.join(file)).unwrap();
+                assert_eq!(
+                    entries[&uri].metadata.inherited_working_directory, None,
+                    "{file} with max_depth {max_depth}"
+                );
+            }
+        }
     }
 
     /// A closed file that parents source from different working directories
