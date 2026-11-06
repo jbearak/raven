@@ -264,33 +264,41 @@ impl<'a> QueryContext<'a> {
         event: &ScopeEvent,
     ) -> (Option<FunctionScopeInterval>, EventVisibility) {
         let context = EventContext::new(event).with_conditional_scopes(self.conditional_scopes);
+        (context.owner, self.visibility(context))
+    }
+
+    /// Visibility of an event's effects that escape its owner to the global
+    /// frame, classified as if no function owned the event. The caller decides
+    /// which effects escape: a child's global assignments from a
+    /// `source(local = TRUE)` inside a top-level `local()` block do.
+    pub(super) fn evaluate_escaping(&self, event: &ScopeEvent) -> EventVisibility {
+        let mut context = EventContext::new(event).with_conditional_scopes(self.conditional_scopes);
+        context.owner = None;
+        self.visibility(context)
+    }
+
+    fn visibility(&self, context: EventContext) -> EventVisibility {
         let positional = match context.timing {
             EventTiming::At(position) => position <= self.position,
             EventTiming::After(position) | EventTiming::OrderedBatch(position) => {
                 position < self.position
             }
             EventTiming::FunctionBody(interval) => {
-                return (
-                    context.owner,
-                    if !self.position.is_full_eof() && interval.contains(self.position) {
-                        EventVisibility::Positional
-                    } else {
-                        EventVisibility::Hidden
-                    },
-                );
+                return if !self.position.is_full_eof() && interval.contains(self.position) {
+                    EventVisibility::Positional
+                } else {
+                    EventVisibility::Hidden
+                };
             }
             EventTiming::PreEntry(boundary) => {
-                return (
-                    context.owner,
-                    if self.pre_entry_cutoff.is_none_or(|cutoff| boundary < cutoff) {
-                        EventVisibility::Positional
-                    } else {
-                        EventVisibility::Hidden
-                    },
-                );
+                return if self.pre_entry_cutoff.is_none_or(|cutoff| boundary < cutoff) {
+                    EventVisibility::Positional
+                } else {
+                    EventVisibility::Hidden
+                };
             }
         };
-        let visibility = if context
+        if context
             .owner
             .is_some_and(|scope| !self.active_scopes.contains(&scope))
         {
@@ -301,8 +309,7 @@ impl<'a> QueryContext<'a> {
             EventVisibility::Hoisted
         } else {
             EventVisibility::Hidden
-        };
-        (context.owner, visibility)
+        }
     }
 }
 

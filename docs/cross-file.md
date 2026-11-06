@@ -128,12 +128,12 @@ Raven recognizes these R constructs as definitions:
 
 #### Global assignments
 
-`assign("name", expr, envir = globalenv())` (or `envir = .GlobalEnv`) with a literal name, and `name <<- expr` where no enclosing `local()` frame binds `name`, define `name` in the global scope from that point on. That holds even when the assignment runs outside the global frame:
+`assign("name", expr, envir = globalenv())` (or `envir = .GlobalEnv`) with a literal name, and `name <<- expr` outside a function body, define `name` in the global scope from that point on. That holds even when the assignment runs outside the global frame:
 
-- inside `local({ ... })` or an `if` block;
-- at the top level of a file that a caller sources with `local = TRUE`, including from inside `local()`.
+- inside a `local({ ... })` block, which the name escapes, or an `if` block;
+- at the top level of a file that a caller sources with `local = TRUE` from inside `local()`.
 
-In the second case, both the rest of that file and the caller after the `source()` call see the name:
+In the second case, both the rest of that file and the caller after the block see the name. The child's other definitions stay in the block:
 
 ```r
 # main.R
@@ -421,7 +421,6 @@ For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed 
 
 `source("child.R", local = TRUE)` evaluates the child in the environment that calls `source()`, and the child's new definitions land in that same environment. Where they're visible depends on where the call sits:
 
-<<<<<<< HEAD
 - **At the top level of a script**, the environment is the one the script's own definitions live in. For a script run in the global environment, as `Rscript` and an interactive session run one, the call behaves exactly like the default `local = FALSE`. The child sees every parent binding defined before the call, and the child's definitions are visible in the parent after it. Wrapping the call in braces, `if`, a loop, or an assignment doesn't change this.
 - **Inside `local({ ... })`**, the environment is the block's. The child sees the parent's bindings as of the call, including ones the block defined earlier, and its definitions are visible in the rest of the block and nowhere after it. So `d <- local({ source("child.R", local = TRUE); d })` works even when only the child creates `d`, and the child's other names don't leak into the script. `local()` with an explicit `envir`, or a `local` the file redefines, isn't modeled this way.
 - **Inside a function body**, the environment is the function's frame. The child sees the function's earlier locals and the script's globals, read from the whole file as for any function body, and its definitions are visible in the rest of the function only.

@@ -938,7 +938,8 @@ pub struct ScopeArtifacts {
     /// `local()` body intervals, which `rebuild_function_scope_index` marks
     /// immediate in `function_scope_tree` (see `push_local_block_scopes`).
     pub immediate_function_scopes: Vec<FunctionScopeInterval>,
-    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions, which escape an
+    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions and of
+    /// `assign()` calls with a proven global destination, which escape an
     /// immediate `local()` body (see `FunctionScopeTree::outside_immediate`).
     pub escaping_def_anchors: HashSet<(u32, u32)>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
@@ -963,18 +964,20 @@ pub struct ScopeArtifacts {
     /// later top-level call must still attach for files sourced after it.
     pub dev_load_all_sites: Vec<DevLoadAllSite>,
     /// Definitions at this file's runtime top level (outside every function
-    /// scope) that bind in the global environment whatever frame runs the
-    /// file: `name <<- value` / `value ->> name`, and `assign("name", value)`
-    /// whose destination is proven global (`envir = globalenv()` or
-    /// `.GlobalEnv`, or `pos = 1`). In document order.
+    /// scope, but possibly inside `local()` blocks) that bind in the global
+    /// environment whatever frame runs the file: `name <<- value` /
+    /// `value ->> name` unless an outer `local()` block binds the name, and
+    /// `assign("name", value)` whose destination is proven global
+    /// (`envir = globalenv()` or `.GlobalEnv`, or `pos = 1`). In document
+    /// order.
     ///
-    /// A caller that runs this file without taking its ordinary definitions
-    /// (a top-level `source(local = TRUE)`, possibly inside `local()`) still
-    /// sees these after the call; see [`merge_current_frame_global_assignments`].
-    /// A top-level `<<-` in such a file reaches the global environment because
-    /// the frame running it (the global environment, or a top-level `local()`
-    /// frame) has the global environment as its enclosure. Assignments inside
-    /// function bodies are excluded. Folded into `interface_hash`.
+    /// A caller that runs this file in a `local()` block's frame
+    /// (`local({ source(file, local = TRUE) })`) keeps the file's ordinary
+    /// definitions in that block, but these still reach the caller's global
+    /// scope after the call; see `current_frame_source_reaches_global`. A
+    /// top-level `<<-` in such a file reaches the global environment because
+    /// the frame running it has the global environment as its enclosure.
+    /// Folded into `interface_hash`.
     pub global_assignments: Vec<ScopedSymbol>,
 }
 
@@ -1299,22 +1302,65 @@ fn child_source_symbol_is_leak(
     symbol.source_uri == *queried_uri || child_parent_prefix_names.contains(name)
 }
 
-/// Merge the global assignments of a child that a top-level current-frame
-/// `source()` runs (`source(file, local = TRUE)`, directly or inside a
-/// top-level `local()`).
+/// Whether a child's [`ScopeArtifacts::global_assignments`] reach this file's
+/// global scope through a `CurrentFrame` `source()` owned by `owner`.
 ///
-/// Such a source otherwise contributes no child definitions to the caller:
-/// the child's ordinary bindings land in the calling frame, which Raven does
-/// not carry back. Its [`ScopeArtifacts::global_assignments`] are different:
-/// they bind in the global environment whichever frame runs the child, so
-/// they are visible after the call. Only the child's own top-level
-/// assignments count; nested sources inside the child are not followed.
+/// Such a source runs the child in the calling frame. Its ordinary
+/// definitions stay in that frame (a `local()` block keeps them to itself),
+/// but its global assignments bind in the global environment. They reach the
+/// file's global scope when the frame is the top level, or a `local()` block
+/// nested only in other `local()` blocks: `outside_immediate` of the owner is
+/// then the top level. A source inside a function body is left alone, since
+/// Raven doesn't follow the function's calls.
+fn current_frame_source_reaches_global(
+    source: &ForwardSource,
+    owner: Option<FunctionScopeInterval>,
+    tree: &FunctionScopeTree,
+) -> bool {
+    should_apply_local_scoping(source)
+        && source.locality != super::types::SourceLocality::NonInheriting
+        && tree.outside_immediate(owner).is_none()
+}
+
+/// Merge a child's global assignments into the recursive resolver's flat
+/// scope, with the same parent-prefix bookkeeping as its forward child merge
+/// (#476): an identical binding is a no-op that still clears a stale marker,
+/// a parent-prefix-only name is overridden, anything else is first-wins.
+fn merge_global_assignments_into_point_scope(
+    scope: &mut ScopeAtPosition,
+    forward_contributed: &mut HashSet<Arc<str>>,
+    child: &ScopeArtifacts,
+    queried_uri: &Url,
+) {
+    for symbol in child_global_assignments(child, queried_uri) {
+        let name = &symbol.name;
+        if scope.parent_prefix_symbol_names.contains(name) {
+            forward_contributed.insert(name.clone());
+        }
+        if scope.symbols.get(name) == Some(symbol) {
+            continue;
+        }
+        scope.removed_names.remove(name);
+        if scope.parent_prefix_symbol_names.remove(name) {
+            scope.symbols.insert(name.clone(), symbol.clone());
+        } else {
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| symbol.clone());
+        }
+    }
+}
+
+/// The global assignments of a child run by a `CurrentFrame` `source()` that
+/// [`current_frame_source_reaches_global`] accepts.
 ///
-/// Yields the symbols to merge. A symbol the queried file itself defines (a
+/// Only the child's own top-level assignments count; sources nested inside
+/// the child are not followed. A symbol the queried file itself defines (a
 /// source cycle) is skipped, as in [`child_source_symbol_is_leak`]. Callers
-/// merge the rest at the call site exactly like their other source
+/// merge the rest into the global scope like their other source
 /// contributions (first source wins, a prior `rm()` is cleared).
-fn merge_current_frame_global_assignments<'a>(
+fn child_global_assignments<'a>(
     child: &'a ScopeArtifacts,
     queried_uri: &'a Url,
 ) -> impl Iterator<Item = &'a ScopedSymbol> + 'a {
@@ -3444,7 +3490,12 @@ fn collect_definitions(
                 function_scope: None,
             };
             artifacts.timeline.push(event);
+            // A global destination binds outside any `local()` block, like
+            // `<<-`.
             if effect_frame == CaptureEvaluationFrame::Global {
+                artifacts
+                    .escaping_def_anchors
+                    .insert((symbol.defined_line, symbol.defined_column));
                 artifacts.global_assignments.push(symbol.clone());
             }
             artifacts
@@ -5471,7 +5522,7 @@ fn outer_local_frame_binds(node: Node, name: &str, content: &str) -> bool {
             return false;
         }
         if parent.kind() == "call"
-            && let Some(body) = super::binding::local_call_body(parent, content)
+            && let Some(body) = super::binding::local_call_expr(parent, content)
             && body.start_byte() <= node.start_byte()
             && node.end_byte() <= body.end_byte()
         {
@@ -5492,7 +5543,7 @@ fn local_frame_body_binds(node: Node, name: &str, content: &str) -> bool {
     if node.kind() == "function_definition" {
         return false;
     }
-    if node.kind() == "call" && super::binding::local_call_body(node, content).is_some() {
+    if node.kind() == "call" && super::binding::local_call_expr(node, content).is_some() {
         return false;
     }
     if node.kind() == "binary_operator"
@@ -8949,9 +9000,68 @@ where
     // marked parent-prefix-only and the leak filter would wrongly drop it when
     // the hub is itself forward-sourced. Recording it here lets us reconcile.
     let mut forward_contributed: HashSet<Arc<str>> = HashSet::new();
+    // Resolve a forward source's child URI: prefer pre-computed dependency
+    // graph edges (which use workspace-root fallback) over re-resolving the
+    // path (which doesn't). This ensures paths like source("subdir/file.R")
+    // that rely on workspace-root-relative resolution work correctly in scope
+    // resolution, matching the dependency graph's behavior.
+    let forward_child_uri = |src_line: u32, src_col: u32, source: &ForwardSource| {
+        let resolve_lexically = || {
+            path_ctx.as_ref().and_then(|ctx| {
+                let resolved =
+                    super::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
+                super::path_resolve::path_to_uri(&resolved)
+            })
+        };
+        let graph_uri = || {
+            graph
+                .get_dependencies(uri)
+                .iter()
+                .find(|edge| {
+                    edge.is_ordinary_source()
+                        && edge.call_site_line == Some(src_line)
+                        && edge.call_site_column == Some(src_col)
+                })
+                .map(|edge| edge.to.clone())
+        };
+        if prefer_supplied_path_context && source.system_file.is_none() {
+            resolve_lexically()
+                .or_else(|| source.resolved_uri.clone())
+                .or_else(graph_uri)
+        } else {
+            graph_uri()
+                .or_else(|| source.resolved_uri.clone())
+                .or_else(resolve_lexically)
+        }
+    };
     for event in &artifacts.timeline {
         let (event_owner, visibility) = query.evaluate(event);
         if visibility == EventVisibility::Hidden {
+            // A `source(local = TRUE)` inside a top-level `local()` block is
+            // owned by the block, so a query after the block can't see it.
+            // The child's global assignments escape the block, though.
+            if let ScopeEvent::Source {
+                line: src_line,
+                column: src_col,
+                source,
+                ..
+            } = event
+                && current_frame_source_reaches_global(
+                    source,
+                    event_owner,
+                    &artifacts.function_scope_tree,
+                )
+                && query.evaluate_escaping(event) != EventVisibility::Hidden
+                && let Some(child_artifacts) =
+                    forward_child_uri(*src_line, *src_col, source).and_then(|u| get_artifacts(&u))
+            {
+                merge_global_assignments_into_point_scope(
+                    &mut scope,
+                    &mut forward_contributed,
+                    &child_artifacts,
+                    uri,
+                );
+            }
             continue;
         }
         match event {
@@ -8970,74 +9080,22 @@ where
                 let package_effects_only =
                     source.locality == super::types::SourceLocality::NonInheriting;
                 // A top-level CurrentFrame source contributes only the child's
-                // global assignments to this file (handled once the child URI
-                // is resolved below). A NonInheriting source lends no symbols,
-                // but its orderable package-attachment side effects still apply
-                // to R's process search path after the call.
-                let current_frame_top_level = should_apply_local_scoping(source)
+                // global assignments to this file. A NonInheriting source lends
+                // no symbols, but its orderable package-attachment side effects
+                // still apply to R's process search path after the call.
+                let child_uri = forward_child_uri(*src_line, *src_col, source);
+                if should_apply_local_scoping(source)
                     && effective_function_scope.is_none()
                     && !package_effects_only
-                    && !merge_policy.is_execution_order();
-
-                // Resolve the child URI: prefer pre-computed dependency graph edges
-                // (which use workspace-root fallback) over re-resolving the path
-                // (which doesn't). This ensures paths like source("subdir/file.R")
-                // that rely on workspace-root-relative resolution work correctly
-                // in scope resolution, matching the dependency graph's behavior.
-                let resolve_lexically = || {
-                    path_ctx.as_ref().and_then(|ctx| {
-                        let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
-                            &source.path,
-                            ctx,
-                        )?;
-                        super::path_resolve::path_to_uri(&resolved)
-                    })
-                };
-                let graph_uri = || {
-                    graph
-                        .get_dependencies(uri)
-                        .iter()
-                        .find(|edge| {
-                            edge.is_ordinary_source()
-                                && edge.call_site_line == Some(*src_line)
-                                && edge.call_site_column == Some(*src_col)
-                        })
-                        .map(|edge| edge.to.clone())
-                };
-                let child_uri = if prefer_supplied_path_context && source.system_file.is_none() {
-                    resolve_lexically()
-                        .or_else(|| source.resolved_uri.clone())
-                        .or_else(graph_uri)
-                } else {
-                    graph_uri()
-                        .or_else(|| source.resolved_uri.clone())
-                        .or_else(resolve_lexically)
-                };
-
-                if current_frame_top_level {
-                    let child_artifacts = child_uri.as_ref().and_then(get_artifacts);
-                    if let Some(child_artifacts) = child_artifacts {
-                        for symbol in merge_current_frame_global_assignments(&child_artifacts, uri)
-                        {
-                            // Same parent-prefix bookkeeping as the forward
-                            // child merge further down (#476).
-                            let name = &symbol.name;
-                            if scope.parent_prefix_symbol_names.contains(name) {
-                                forward_contributed.insert(name.clone());
-                            }
-                            if scope.symbols.get(name) == Some(symbol) {
-                                continue;
-                            }
-                            scope.removed_names.remove(name);
-                            if scope.parent_prefix_symbol_names.remove(name) {
-                                scope.symbols.insert(name.clone(), symbol.clone());
-                            } else {
-                                scope
-                                    .symbols
-                                    .entry(name.clone())
-                                    .or_insert_with(|| symbol.clone());
-                            }
-                        }
+                    && !merge_policy.is_execution_order()
+                {
+                    if let Some(child_artifacts) = child_uri.as_ref().and_then(get_artifacts) {
+                        merge_global_assignments_into_point_scope(
+                            &mut scope,
+                            &mut forward_contributed,
+                            &child_artifacts,
+                            uri,
+                        );
                     }
                     continue;
                 }
@@ -10675,15 +10733,14 @@ where
                 source,
                 ..
             } => {
-                // Top-level CurrentFrame sources contribute only the child's
-                // global assignments. An orderable NonInheriting source still
-                // contributes process-wide package attachments, while
-                // `resolve_source_contribution` suppresses all of its child
-                // symbols.
-                if should_apply_local_scoping(source)
-                    && function_scope.is_none()
-                    && source.locality != super::types::SourceLocality::NonInheriting
-                {
+                // A CurrentFrame source at top level or in a top-level
+                // `local()` block brings the child's global assignments into
+                // the global frame, whatever else it contributes.
+                if current_frame_source_reaches_global(
+                    source,
+                    function_scope,
+                    &self.artifacts.function_scope_tree,
+                ) {
                     let globals =
                         self.current_frame_global_assignments(*src_line, *src_col, source);
                     if !globals.is_empty()
@@ -10694,6 +10751,15 @@ where
                             frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
                         }
                     }
+                }
+                // Top-level CurrentFrame sources contribute nothing else. An
+                // orderable NonInheriting source still contributes process-wide
+                // package attachments, while `resolve_source_contribution`
+                // suppresses all of its child symbols.
+                if should_apply_local_scoping(source)
+                    && function_scope.is_none()
+                    && source.locality != super::types::SourceLocality::NonInheriting
+                {
                     return;
                 }
                 // Resolve once per call site, reuse on every application
@@ -11723,6 +11789,26 @@ where
     fn apply_event_to_late(&mut self, frame: &mut ScopeFrame, event: &ScopeEvent) {
         let event_context =
             EventContext::new(event).with_conditional_scopes(&self.active_conditional_shiny_scopes);
+        // A CurrentFrame source at top level or in a top-level `local()` block
+        // brings only the child's global assignments into the global frame.
+        if let ScopeEvent::Source {
+            line: src_line,
+            column: src_col,
+            source,
+            ..
+        } = event
+            && current_frame_source_reaches_global(
+                source,
+                event_context.owner,
+                &self.artifacts.function_scope_tree,
+            )
+        {
+            for symbol in self.current_frame_global_assignments(*src_line, *src_col, source) {
+                frame.removed_names.remove(&symbol.name);
+                frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
+            }
+            return;
+        }
         if !event_context.is_global() {
             return;
         }
@@ -11768,13 +11854,7 @@ where
                 if should_apply_local_scoping(source)
                     && source.locality != super::types::SourceLocality::NonInheriting
                 {
-                    // Top-level CurrentFrame source: only the child's global
-                    // assignments reach this global frame.
-                    for symbol in self.current_frame_global_assignments(*src_line, *src_col, source)
-                    {
-                        frame.removed_names.remove(&symbol.name);
-                        frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
-                    }
+                    // Top-level CurrentFrame source — skipped globally.
                     return;
                 }
                 let mut attached_for_child = frame.attached_packages.clone();
@@ -11951,7 +12031,7 @@ where
     }
 
     /// The global assignments a top-level current-frame `source()` brings in;
-    /// see [`merge_current_frame_global_assignments`].
+    /// see [`child_global_assignments`].
     fn current_frame_global_assignments(
         &self,
         src_line: u32,
@@ -11964,7 +12044,7 @@ where
         else {
             return Vec::new();
         };
-        merge_current_frame_global_assignments(&child, self.queried_uri)
+        child_global_assignments(&child, self.queried_uri)
             .cloned()
             .collect()
     }

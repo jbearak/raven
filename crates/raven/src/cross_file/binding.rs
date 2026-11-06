@@ -4048,8 +4048,10 @@ fn source_ordered_step<'tree>(
 }
 
 /// The `expr` argument value of a bare or `base::`-qualified `local()` call,
-/// or `None` when `call` is not one. Spelling only: no shadowing check.
-pub(crate) fn local_call_body<'tree>(call: Node<'tree>, content: &str) -> Option<Node<'tree>> {
+/// or `None` when `call` is not one. Spelling only: no shadowing check, and an
+/// `envir` argument is allowed (unlike the scope collector's `local()` block
+/// recognizer), so callers must use it only where over-matching is safe.
+pub(crate) fn local_call_expr<'tree>(call: Node<'tree>, content: &str) -> Option<Node<'tree>> {
     let arguments = call.child_by_field_name("arguments")?;
     if matches!(
         source_ordered_step(call, arguments, content),
