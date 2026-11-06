@@ -938,7 +938,8 @@ pub struct ScopeArtifacts {
     /// `local()` body intervals, which `rebuild_function_scope_index` marks
     /// immediate in `function_scope_tree` (see `push_local_block_scopes`).
     pub immediate_function_scopes: Vec<FunctionScopeInterval>,
-    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions, which escape an
+    /// Anchors (`line`, `column`) of `<<-` / `->>` definitions and of
+    /// `assign()` calls with a proven global destination, which escape an
     /// immediate `local()` body (see `FunctionScopeTree::outside_immediate`).
     pub escaping_def_anchors: HashSet<(u32, u32)>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
@@ -962,6 +963,22 @@ pub struct ScopeArtifacts {
     /// just the first) matters when an earlier call is function-scoped but a
     /// later top-level call must still attach for files sourced after it.
     pub dev_load_all_sites: Vec<DevLoadAllSite>,
+    /// Definitions at this file's runtime top level (outside every function
+    /// scope, but possibly inside `local()` blocks) that bind in the global
+    /// environment whatever frame runs the file: `name <<- value` /
+    /// `value ->> name` unless an outer `local()` block binds the name, and
+    /// `assign("name", value)` whose destination is proven global
+    /// (`envir = globalenv()` or `.GlobalEnv`, or `pos = 1`). In document
+    /// order.
+    ///
+    /// A caller that runs this file in a `local()` block's frame
+    /// (`local({ source(file, local = TRUE) })`) keeps the file's ordinary
+    /// definitions in that block, but these still reach the caller's global
+    /// scope after the call; see `current_frame_source_reaches_global`. A
+    /// top-level `<<-` in such a file reaches the global environment because
+    /// the frame running it has the global environment as its enclosure.
+    /// Folded into `interface_hash`.
+    pub global_assignments: Vec<ScopedSymbol>,
 }
 
 impl Default for ScopeArtifacts {
@@ -991,6 +1008,7 @@ impl Default for ScopeArtifacts {
             escaping_def_anchors: HashSet::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
+            global_assignments: Vec::new(),
         }
     }
 }
@@ -1282,6 +1300,76 @@ fn child_source_symbol_is_leak(
     child_parent_prefix_names: &HashSet<Arc<str>>,
 ) -> bool {
     symbol.source_uri == *queried_uri || child_parent_prefix_names.contains(name)
+}
+
+/// Whether a child's [`ScopeArtifacts::global_assignments`] reach this file's
+/// global scope through a `CurrentFrame` `source()` owned by `owner`.
+///
+/// Such a source runs the child in the calling frame. Its ordinary
+/// definitions stay in that frame (a `local()` block keeps them to itself),
+/// but its global assignments bind in the global environment. They reach the
+/// file's global scope when the frame is the top level, or a `local()` block
+/// nested only in other `local()` blocks: `outside_immediate` of the owner is
+/// then the top level. A source inside a function body is left alone, since
+/// Raven doesn't follow the function's calls.
+fn current_frame_source_reaches_global(
+    source: &ForwardSource,
+    owner: Option<FunctionScopeInterval>,
+    tree: &FunctionScopeTree,
+) -> bool {
+    should_apply_local_scoping(source)
+        && source.locality != super::types::SourceLocality::NonInheriting
+        && tree.outside_immediate(owner).is_none()
+}
+
+/// Merge a child's global assignments into the recursive resolver's flat
+/// scope, with the same parent-prefix bookkeeping as its forward child merge
+/// (#476): an identical binding is a no-op that still clears a stale marker,
+/// a parent-prefix-only name is overridden, and anything else is first-wins,
+/// or overrides under execution-order merging.
+fn merge_global_assignments_into_point_scope(
+    scope: &mut ScopeAtPosition,
+    forward_contributed: &mut HashSet<Arc<str>>,
+    child: &ScopeArtifacts,
+    queried_uri: &Url,
+    execution_order: bool,
+) {
+    for symbol in child_global_assignments(child, queried_uri) {
+        let name = &symbol.name;
+        if scope.parent_prefix_symbol_names.contains(name) {
+            forward_contributed.insert(name.clone());
+        }
+        if scope.symbols.get(name) == Some(symbol) {
+            continue;
+        }
+        scope.removed_names.remove(name);
+        if scope.parent_prefix_symbol_names.remove(name) || execution_order {
+            scope.symbols.insert(name.clone(), symbol.clone());
+        } else {
+            scope
+                .symbols
+                .entry(name.clone())
+                .or_insert_with(|| symbol.clone());
+        }
+    }
+}
+
+/// The global assignments of a child run by a `CurrentFrame` `source()` that
+/// [`current_frame_source_reaches_global`] accepts.
+///
+/// Only the child's own top-level assignments count; sources nested inside
+/// the child are not followed. A symbol the queried file itself defines (a
+/// source cycle) is skipped, as in [`child_source_symbol_is_leak`]. Callers
+/// merge the rest into the global scope like their other source
+/// contributions (first source wins, a prior `rm()` is cleared).
+fn child_global_assignments<'a>(
+    child: &'a ScopeArtifacts,
+    queried_uri: &'a Url,
+) -> impl Iterator<Item = &'a ScopedSymbol> + 'a {
+    child
+        .global_assignments
+        .iter()
+        .filter(move |symbol| symbol.source_uri != *queried_uri)
 }
 
 /// Merge one package channel while preserving the invariant that an ordinary
@@ -2865,6 +2953,16 @@ pub fn compute_artifacts_with_metadata(
         &artifacts.timeline,
         box_exports,
     );
+    // A caller's `source(local = TRUE)` takes only these definitions, so an
+    // edit between `x <- 1` and `x <<- 1` must revalidate it even though the
+    // top-level interface is unchanged. Mixed in only when present, so other
+    // files keep their existing hash.
+    if !artifacts.global_assignments.is_empty() {
+        let mut hash = DefaultHasher::new();
+        artifacts.interface_hash.hash(&mut hash);
+        artifacts.global_assignments.hash(&mut hash);
+        artifacts.interface_hash = hash.finish();
+    }
 
     if content.contains("R6Class") {
         let completed_scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
@@ -3316,6 +3414,16 @@ fn collect_definitions(
             function_scope: None,
         };
         artifacts.timeline.push(event);
+        // From the caller frame (the file's top level, or a top-level
+        // `local()` frame), `<<-` reaches the global environment unless an
+        // outer `local()` frame binds the name. From an external capture
+        // frame, its target is unknown.
+        if assignment_escapes_current_frame
+            && evaluation_frame.is_caller_or_global()
+            && !outer_local_frame_binds(node, &symbol.name, line_index.text)
+        {
+            artifacts.global_assignments.push(symbol.clone());
+        }
         artifacts
             .exported_interface
             .insert(symbol.name.clone(), symbol);
@@ -3384,6 +3492,14 @@ fn collect_definitions(
                 function_scope: None,
             };
             artifacts.timeline.push(event);
+            // A global destination binds outside any `local()` block, like
+            // `<<-`.
+            if effect_frame == CaptureEvaluationFrame::Global {
+                artifacts
+                    .escaping_def_anchors
+                    .insert((symbol.defined_line, symbol.defined_column));
+                artifacts.global_assignments.push(symbol.clone());
+            }
             artifacts
                 .exported_interface
                 .insert(symbol.name.clone(), symbol);
@@ -3906,6 +4022,43 @@ fn local_call_body<'tree>(
 fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     artifacts.timeline.sort_by_key(event_sort_key);
     rebuild_function_scope_index(artifacts, line_index);
+    retain_top_level_global_assignments(artifacts);
+}
+
+/// Drop [`ScopeArtifacts::global_assignments`] entries whose definition landed
+/// in a function scope (real or synthetic) once the timeline is annotated.
+/// Each entry shares its anchor with the `Def` event pushed alongside it.
+fn retain_top_level_global_assignments(artifacts: &mut ScopeArtifacts) {
+    if artifacts.global_assignments.is_empty() {
+        return;
+    }
+    let top_level: HashSet<(&str, u32, u32)> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::Def {
+                line,
+                column,
+                symbol,
+                function_scope: None,
+                ..
+            } => Some((symbol.name.as_ref(), *line, *column)),
+            _ => None,
+        })
+        .collect();
+    let retained: Vec<ScopedSymbol> = artifacts
+        .global_assignments
+        .iter()
+        .filter(|symbol| {
+            top_level.contains(&(
+                symbol.name.as_ref(),
+                symbol.defined_line,
+                symbol.defined_column,
+            ))
+        })
+        .cloned()
+        .collect();
+    artifacts.global_assignments = retained;
 }
 
 /// Issue #402: append nested `FunctionScope` events for Shiny deferred-
@@ -4521,12 +4674,17 @@ fn try_extract_assign_call(
     }
 
     let args_node = node.child_by_field_name("arguments")?;
-    let deferred_use = !super::binding::is_known_immediate_context(node);
     let bindings = capture_bindings.get();
+    // A call in a top-level `if` branch or `local()` body runs at its source
+    // position, so only earlier effects can rebind `globalenv`/`.GlobalEnv`.
+    // This collector already treats a bare `assign()` as `base::assign` (it is
+    // emitting a definition for one), so other unproven bare `assign()` calls,
+    // this one included, bind only their literal names.
+    let deferred_use = !bindings.is_source_ordered_at(node);
     let bare_globalenv_trusted =
-        !bindings.named_alias_may_shadow_at("globalenv", node, deferred_use);
+        !bindings.named_alias_may_shadow_assuming_base_assign_at("globalenv", node, deferred_use);
     let dot_global_env_trusted =
-        !bindings.named_alias_may_shadow_at(".GlobalEnv", node, deferred_use);
+        !bindings.named_alias_may_shadow_assuming_base_assign_at(".GlobalEnv", node, deferred_use);
     let resolved = super::binding::resolve_assign_arguments(
         args_node,
         line_index.text,
@@ -5347,6 +5505,68 @@ fn try_extract_assignment(node: Node, line_index: &LineIndex, uri: &Url) -> Opti
         signature,
         is_declared: false,
     })
+}
+
+/// Whether the `<<-`/`->>` at `node` would stop at an enclosing `local()`
+/// frame instead of reaching the global environment.
+///
+/// A superassignment starts its search in the enclosure of the frame running
+/// it, so the innermost enclosing `local()` frame never matters, but any
+/// outer `local()` body that binds `name` directly (with `<-`, `=` or `->`,
+/// outside nested functions and `local()` calls) catches it. Source order is
+/// ignored, which errs toward "not global". Stops at a function boundary:
+/// definitions inside function bodies are excluded separately.
+fn outer_local_frame_binds(node: Node, name: &str, content: &str) -> bool {
+    let mut current = node;
+    let mut inside_local_frame = false;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return false;
+        }
+        if parent.kind() == "call"
+            && let Some(body) = super::binding::local_call_expr(parent, content)
+            && body.start_byte() <= node.start_byte()
+            && node.end_byte() <= body.end_byte()
+        {
+            if inside_local_frame && local_frame_body_binds(body, name, content) {
+                return true;
+            }
+            inside_local_frame = true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether `node` (part of a `local()` body) binds `name` in that body's own
+/// frame with an ordinary `<-`, `=` or `->`. Nested function definitions and
+/// nested `local()` bodies run in other frames and are skipped.
+fn local_frame_body_binds(node: Node, name: &str, content: &str) -> bool {
+    if node.kind() == "function_definition" {
+        return false;
+    }
+    if node.kind() == "call" && super::binding::local_call_expr(node, content).is_some() {
+        return false;
+    }
+    if node.kind() == "binary_operator"
+        && let Some(operator) = node.child_by_field_name("operator")
+    {
+        let target_field = match node_text(operator, content) {
+            "<-" | "=" => Some("lhs"),
+            "->" => Some("rhs"),
+            _ => None,
+        };
+        if target_field
+            .and_then(|field| node.child_by_field_name(field))
+            .and_then(|target| assignment_identifier_name(target, content))
+            == Some(name)
+        {
+            return true;
+        }
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| local_frame_body_binds(child, name, content))
 }
 
 /// Extract the symbols bound by a destructuring/delayed binding operator:
@@ -8782,9 +9002,76 @@ where
     // marked parent-prefix-only and the leak filter would wrongly drop it when
     // the hub is itself forward-sourced. Recording it here lets us reconcile.
     let mut forward_contributed: HashSet<Arc<str>> = HashSet::new();
+    // Resolve a forward source's child URI: prefer pre-computed dependency
+    // graph edges (which use workspace-root fallback) over re-resolving the
+    // path (which doesn't). This ensures paths like source("subdir/file.R")
+    // that rely on workspace-root-relative resolution work correctly in scope
+    // resolution, matching the dependency graph's behavior.
+    let forward_child_uri = |src_line: u32, src_col: u32, source: &ForwardSource| {
+        let resolve_lexically = || {
+            path_ctx.as_ref().and_then(|ctx| {
+                let resolved =
+                    super::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
+                super::path_resolve::path_to_uri(&resolved)
+            })
+        };
+        let graph_uri = || {
+            graph
+                .get_dependencies(uri)
+                .iter()
+                .find(|edge| {
+                    edge.is_ordinary_source()
+                        && edge.call_site_line == Some(src_line)
+                        && edge.call_site_column == Some(src_col)
+                })
+                .map(|edge| edge.to.clone())
+        };
+        if prefer_supplied_path_context && source.system_file.is_none() {
+            resolve_lexically()
+                .or_else(|| source.resolved_uri.clone())
+                .or_else(graph_uri)
+        } else {
+            graph_uri()
+                .or_else(|| source.resolved_uri.clone())
+                .or_else(resolve_lexically)
+        }
+    };
     for event in &artifacts.timeline {
         let (event_owner, visibility) = query.evaluate(event);
         if visibility == EventVisibility::Hidden {
+            // A `source(local = TRUE)` inside a top-level `local()` block is
+            // owned by the block, so a query after the block can't see it.
+            // The child's global assignments escape the block, though.
+            if let ScopeEvent::Source {
+                line: src_line,
+                column: src_col,
+                source,
+                ..
+            } = event
+                && current_frame_source_reaches_global(
+                    source,
+                    event_owner,
+                    &artifacts.function_scope_tree,
+                )
+                && query.evaluate_escaping(event) != EventVisibility::Hidden
+                && let Some(child_artifacts) =
+                    forward_child_uri(*src_line, *src_col, source).and_then(|u| get_artifacts(&u))
+            {
+                // Same depth budget as an ordinary forward child.
+                if current_depth + 1 >= max_depth {
+                    scope
+                        .depth_exceeded
+                        .push((uri.clone(), *src_line, *src_col));
+                } else {
+                    merge_global_assignments_into_point_scope(
+                        &mut scope,
+                        &mut forward_contributed,
+                        &child_artifacts,
+                        uri,
+                        merge_policy.is_execution_order(),
+                    );
+                }
+            }
             continue;
         }
         match event {
@@ -8802,52 +9089,34 @@ where
                 let effective_function_scope = event_owner;
                 let package_effects_only =
                     source.locality == super::types::SourceLocality::NonInheriting;
-                // A top-level CurrentFrame source contributes no child state to
-                // this file. A NonInheriting source likewise lends no symbols,
-                // but its orderable package-attachment side effects still apply
-                // to R's process search path after the call.
+                // A top-level CurrentFrame source contributes only the child's
+                // global assignments to this file. A NonInheriting source lends
+                // no symbols, but its orderable package-attachment side effects
+                // still apply to R's process search path after the call.
+                let child_uri = forward_child_uri(*src_line, *src_col, source);
                 if should_apply_local_scoping(source)
                     && effective_function_scope.is_none()
                     && !package_effects_only
                     && !merge_policy.is_execution_order()
                 {
+                    if let Some(child_artifacts) = child_uri.as_ref().and_then(get_artifacts) {
+                        // Same depth budget as an ordinary forward child.
+                        if current_depth + 1 >= max_depth {
+                            scope
+                                .depth_exceeded
+                                .push((uri.clone(), *src_line, *src_col));
+                        } else {
+                            merge_global_assignments_into_point_scope(
+                                &mut scope,
+                                &mut forward_contributed,
+                                &child_artifacts,
+                                uri,
+                                false,
+                            );
+                        }
+                    }
                     continue;
                 }
-
-                // Resolve the child URI: prefer pre-computed dependency graph edges
-                // (which use workspace-root fallback) over re-resolving the path
-                // (which doesn't). This ensures paths like source("subdir/file.R")
-                // that rely on workspace-root-relative resolution work correctly
-                // in scope resolution, matching the dependency graph's behavior.
-                let resolve_lexically = || {
-                    path_ctx.as_ref().and_then(|ctx| {
-                        let resolved = super::path_resolve::resolve_path_with_workspace_fallback(
-                            &source.path,
-                            ctx,
-                        )?;
-                        super::path_resolve::path_to_uri(&resolved)
-                    })
-                };
-                let graph_uri = || {
-                    graph
-                        .get_dependencies(uri)
-                        .iter()
-                        .find(|edge| {
-                            edge.is_ordinary_source()
-                                && edge.call_site_line == Some(*src_line)
-                                && edge.call_site_column == Some(*src_col)
-                        })
-                        .map(|edge| edge.to.clone())
-                };
-                let child_uri = if prefer_supplied_path_context && source.system_file.is_none() {
-                    resolve_lexically()
-                        .or_else(|| source.resolved_uri.clone())
-                        .or_else(graph_uri)
-                } else {
-                    graph_uri()
-                        .or_else(|| source.resolved_uri.clone())
-                        .or_else(resolve_lexically)
-                };
 
                 if let Some(child_uri) = child_uri {
                     // Check if we would exceed max depth
@@ -10482,7 +10751,26 @@ where
                 source,
                 ..
             } => {
-                // Top-level CurrentFrame sources contribute nothing. An
+                // A CurrentFrame source at top level or in a top-level
+                // `local()` block brings the child's global assignments into
+                // the global frame, whatever else it contributes.
+                if current_frame_source_reaches_global(
+                    source,
+                    function_scope,
+                    &self.artifacts.function_scope_tree,
+                ) {
+                    let globals =
+                        self.current_frame_global_assignments(*src_line, *src_col, source);
+                    if !globals.is_empty()
+                        && let Some(frame) = self.pick_frame_mut(None)
+                    {
+                        for symbol in globals {
+                            frame.removed_names.remove(&symbol.name);
+                            frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
+                        }
+                    }
+                }
+                // Top-level CurrentFrame sources contribute nothing else. An
                 // orderable NonInheriting source still contributes process-wide
                 // package attachments, while `resolve_source_contribution`
                 // suppresses all of its child symbols.
@@ -11519,6 +11807,26 @@ where
     fn apply_event_to_late(&mut self, frame: &mut ScopeFrame, event: &ScopeEvent) {
         let event_context =
             EventContext::new(event).with_conditional_scopes(&self.active_conditional_shiny_scopes);
+        // A CurrentFrame source at top level or in a top-level `local()` block
+        // brings only the child's global assignments into the global frame.
+        if let ScopeEvent::Source {
+            line: src_line,
+            column: src_col,
+            source,
+            ..
+        } = event
+            && current_frame_source_reaches_global(
+                source,
+                event_context.owner,
+                &self.artifacts.function_scope_tree,
+            )
+        {
+            for symbol in self.current_frame_global_assignments(*src_line, *src_col, source) {
+                frame.removed_names.remove(&symbol.name);
+                frame.symbols.entry(symbol.name.clone()).or_insert(symbol);
+            }
+            return;
+        }
         if !event_context.is_global() {
             return;
         }
@@ -11706,20 +12014,16 @@ where
     /// child's STEP 2 still runs from scratch via
     /// `scope_at_position_with_graph_recursive` — the cached prefix is
     /// supplied via the `pre_computed_prefix` parameter.
-    fn resolve_source_contribution(
+    /// Resolve a forward `source()` call's child URI: prefer the dependency
+    /// graph edge (which honors workspace-root fallback), then the detected
+    /// URI, then direct path resolution from `path_ctx`.
+    fn forward_child_uri(
         &self,
         src_line: u32,
         src_col: u32,
         source: &ForwardSource,
-        attached_packages_for_source: &HashSet<String>,
-    ) -> ChildSourceContribution {
-        let mut contrib = ChildSourceContribution::default();
-
-        // Resolve the child URI: prefer the dependency graph edge (which
-        // honors workspace-root fallback). Fall back to direct path
-        // resolution from `path_ctx`.
-        let child_uri = self
-            .graph
+    ) -> Option<Url> {
+        self.graph
             .get_dependencies(self.queried_uri)
             .iter()
             .find(|edge| {
@@ -11741,8 +12045,42 @@ where
                         super::path_resolve::path_to_uri(&resolved)
                     })
                 })
-            });
-        let Some(child_uri) = child_uri else {
+            })
+    }
+
+    /// The global assignments a top-level current-frame `source()` brings in;
+    /// see [`child_global_assignments`].
+    fn current_frame_global_assignments(
+        &self,
+        src_line: u32,
+        src_col: u32,
+        source: &ForwardSource,
+    ) -> Vec<ScopedSymbol> {
+        // Same depth budget as `resolve_source_contribution`.
+        if self.resolution_depth + 1 >= self.max_depth {
+            return Vec::new();
+        }
+        let Some(child) = self
+            .forward_child_uri(src_line, src_col, source)
+            .and_then(|child_uri| (self.get_artifacts)(&child_uri))
+        else {
+            return Vec::new();
+        };
+        child_global_assignments(&child, self.queried_uri)
+            .cloned()
+            .collect()
+    }
+
+    fn resolve_source_contribution(
+        &self,
+        src_line: u32,
+        src_col: u32,
+        source: &ForwardSource,
+        attached_packages_for_source: &HashSet<String>,
+    ) -> ChildSourceContribution {
+        let mut contrib = ChildSourceContribution::default();
+
+        let Some(child_uri) = self.forward_child_uri(src_line, src_col, source) else {
             return contrib;
         };
 
@@ -13601,6 +13939,237 @@ mod tests {
                 "{code}: {artifacts:?}"
             );
         }
+    }
+
+    #[test]
+    fn global_assign_inside_local_or_if_defines_name_after_call() {
+        for (code, name) in [
+            (
+                "local({ assign(\"x\", 1, envir = globalenv()) })\nprint(x)\n",
+                "x",
+            ),
+            (
+                "local({ assign(\"x\", 1, envir = .GlobalEnv) })\nprint(x)\n",
+                "x",
+            ),
+            (
+                "base::local({ assign(\"x\", 1, envir = base::globalenv()) })\nprint(x)\n",
+                "x",
+            ),
+            (
+                "if (TRUE) { assign(\"x\", 1, envir = globalenv()) }\nprint(x)\n",
+                "x",
+            ),
+            (
+                "helper <- local({ assign(\"x\", 1, envir = globalenv()); function() x })\nprint(x)\n",
+                "x",
+            ),
+            // Earlier effects that keep the walk from proving bare `assign`
+            // (a call-valued assignment, another unproven `assign()`) must not
+            // make `globalenv` look rebound.
+            (
+                "local({\n  tmp <- compute()\n  assign(\"a\", tmp, envir = globalenv())\n  assign(\"x\", g(), envir = globalenv())\n})\nprint(x)\n",
+                "x",
+            ),
+            (
+                "y <- f()\nassign(\"a\", 1, envir = globalenv())\nassign(\"x\", 1, envir = globalenv())\nprint(x)\n",
+                "x",
+            ),
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(scope.symbols.contains_key(name), "{code}: {artifacts:?}");
+        }
+    }
+
+    #[test]
+    fn global_assign_stays_undefined_when_globalenv_may_be_rebound() {
+        for code in [
+            "globalenv <- function() new.env()\nlocal({ assign(\"x\", 1, envir = globalenv()) })\n",
+            "local({ globalenv <- function() new.env(); assign(\"x\", 1, envir = globalenv()) })\n",
+            // `assign` itself rebound: an earlier bare `assign()` may bind any
+            // name, including `globalenv`.
+            "assign <- function(...) NULL\nassign(\"globalenv\", 1)\nlocal({ base::assign(\"x\", 1, envir = globalenv()) })\n",
+            // A user `local` may defer its argument past a later rebinding.
+            "local <- function(expr) function() expr\nrun <- local({ assign(\"x\", 1, envir = globalenv()) })\nglobalenv <- function() new.env()\nrun()\n",
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            assert!(
+                !artifacts.exported_interface.contains_key("x"),
+                "{code}: {artifacts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_assignments_keep_top_level_global_effects_only() {
+        let code = r#"published <<- 1
+local({ in_local <<- 2 })
+assign("assigned", 3, envir = globalenv())
+assign("dotted", 4, envir = .GlobalEnv)
+local({ assign("local_assigned", 5, envir = globalenv()) })
+ordinary <- 6
+assign("current_frame", 7)
+assign("other_env", 8, envir = new.env())
+name <- "dynamic"
+assign(name, 9, envir = globalenv())
+f <- function() { in_function <<- 10; assign("function_assigned", 11, envir = globalenv()) }
+local({ caught <- 0; local({ caught <<- 12 }) })
+"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let names: Vec<&str> = artifacts
+            .global_assignments
+            .iter()
+            .map(|symbol| symbol.name.as_ref())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "published",
+                "in_local",
+                "assigned",
+                "dotted",
+                "local_assigned"
+            ]
+        );
+    }
+
+    #[test]
+    fn global_assignment_edit_changes_interface_hash() {
+        let hash = |code: &str| compute_artifacts(&test_uri(), &parse_r(code), code).interface_hash;
+        assert_ne!(hash("x <- 1\n"), hash("x <<- 1\n"));
+        assert_ne!(
+            hash("assign(\"x\", 1)\n"),
+            hash("assign(\"x\", 1, envir = globalenv())\n")
+        );
+        assert_eq!(hash("x <- 1\n"), hash("x <- 1\n"));
+    }
+
+    #[test]
+    fn current_frame_source_contributes_child_global_assignments() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let parent_code = "use_later <- function() published\n\
+                           local({ source(\"child.R\", local = TRUE) })\n\
+                           after <- 2\n";
+        let parent_artifacts = Arc::new(compute_artifacts(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+        ));
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_code = "published <<- 1\n\
+                          assign(\"assigned\", 2, envir = globalenv())\n\
+                          private <- 3\n";
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |uri: &Url| -> Option<std::sync::Arc<crate::cross_file::types::CrossFileMetadata>> {
+                (uri == &parent_uri).then(|| std::sync::Arc::new(parent_meta.clone()))
+            };
+        let base_exports = HashSet::new();
+
+        // (line, column, hoist globals, expected visibility of the child's
+        // global assignments). Line 0 column 30 is inside `use_later`'s body,
+        // which sees later globals only when hoisting is on.
+        let checkpoints = [
+            (1, 0, false, false),
+            (2, 0, false, true),
+            (0, 30, false, false),
+            (0, 30, true, true),
+        ];
+        for (line, column, hoist, visible) in checkpoints {
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                line,
+                column,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                hoist,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            for name in ["published", "assigned"] {
+                assert_eq!(
+                    scope.symbols.contains_key(name),
+                    visible,
+                    "recursive {name} at ({line}, {column}), hoist={hoist}"
+                );
+            }
+            assert!(!scope.symbols.contains_key("private"));
+
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &parent_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                hoist,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(line, column);
+            for name in ["published", "assigned"] {
+                assert_eq!(
+                    stream.is_visible(name),
+                    visible,
+                    "stream {name} at ({line}, {column}), hoist={hoist}"
+                );
+            }
+            assert!(!stream.is_visible("private"));
+        }
+
+        // The child counts against the chain depth like any forward source.
+        let shallow = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            1,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!shallow.symbols.contains_key("published"));
+        assert!(!shallow.depth_exceeded.is_empty());
     }
 
     #[test]

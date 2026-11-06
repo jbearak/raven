@@ -234,6 +234,13 @@ struct BindingCollection<T> {
     /// sourced definitions, and opaque evaluation are deliberately outside this
     /// check, as they are for Raven's other bare-helper classifications.
     bare_read_lines_trusted: bool,
+    /// [`is_source_ordered_context`] for the node `visit_bindings` is
+    /// currently recording. A record function's unknown-mutation barrier is
+    /// persistent only when its node may run out of source order; this field
+    /// carries that class to `invalidate_unknown_mutation_in_context` without
+    /// threading it through every call site. `visit_bindings` sets it before
+    /// each node's own records, which run before any descendant is visited.
+    source_ordered_visit: bool,
 }
 
 impl<T> Default for BindingCollection<T> {
@@ -242,6 +249,7 @@ impl<T> Default for BindingCollection<T> {
             map: HashMap::new(),
             immediate_generation: 0,
             bare_read_lines_trusted: false,
+            source_ordered_visit: false,
         }
     }
 }
@@ -302,6 +310,7 @@ pub(crate) fn collect_bindings_with_checkpoints<'tree, T>(
             runtime_function_scope: RuntimeFunctionScope::Lexical,
             known_immediate_context: false,
             eager_assignment_value_root: false,
+            source_ordered: false,
         },
     );
     // Materializing the collector generation is deliberately deferred until
@@ -320,6 +329,15 @@ pub(crate) fn collect_bindings_with_checkpoints<'tree, T>(
 const UNKNOWN_BINDING_KEY: &str = "\0raven-unknown-binding";
 const UNKNOWN_HELPER_BINDING_KEY: &str = "\0raven-unknown-helper-binding";
 const UNKNOWN_NAMED_BINDING_KEY: &str = "\0raven-unknown-named-binding";
+/// Unknown-name uncertainty from a bare `assign()` call whose callee could not
+/// be proven to be `base::assign` at the call (it is deferred, or an earlier
+/// effect may have rebound helpers). Every ordinary consumer treats it exactly
+/// like [`UNKNOWN_NAMED_BINDING_KEY`]. It is kept separate only so
+/// [`named_alias_may_shadow_assuming_base_assign_lexically_at`] can drop it
+/// when `assign` itself has no possible rebinding before the use: a base
+/// `assign()` with a literal name binds only that name, which the collector
+/// records separately.
+const UNKNOWN_BARE_ASSIGN_BINDING_KEY: &str = "\0raven-unknown-bare-assign-binding";
 const UNKNOWN_LOADED_BINDING_KEY: &str = "\0raven-unknown-loaded-binding";
 const ASSIGN_FORMALS: [&str; 6] = ["x", "value", "pos", "envir", "inherits", "immediate"];
 const LOAD_FORMALS: [&str; 3] = ["file", "envir", "verbose"];
@@ -481,6 +499,9 @@ struct BindingVisitState {
     /// This node is the direct value of an immediately evaluated assignment,
     /// modulo transparent braces/parentheses.
     eager_assignment_value_root: bool,
+    /// Cached [`is_source_ordered_context`] classification for this node,
+    /// derived during descent like `known_immediate_context`.
+    source_ordered: bool,
 }
 
 impl BindingVisitState {
@@ -560,6 +581,7 @@ fn visit_bindings<'tree, T>(
                             runtime_function_scope: captured_runtime_scope,
                             known_immediate_context: false,
                             eager_assignment_value_root: false,
+                            source_ordered: false,
                         },
                     );
                 },
@@ -567,6 +589,9 @@ fn visit_bindings<'tree, T>(
             return;
         }
     }
+    // Unknown mutations recorded for this node use its own ordering class;
+    // see `BindingCollection::source_ordered_visit`.
+    collection.source_ordered_visit = state.source_ordered;
     match node.kind() {
         "binary_operator" if first_effect_visit => {
             record_assignment(node, content, collection, candidate_for, state)
@@ -636,6 +661,20 @@ fn visit_bindings<'tree, T>(
         } else {
             state.known_immediate_context && assignment_value_child(node, child, content)
         };
+        let source_ordered = node.kind() == "program"
+            || (state.source_ordered
+                && match source_ordered_step(node, child, content) {
+                    SourceOrderedStep::Ordered => true,
+                    SourceOrderedStep::IfBareLocalTrusted(call) => {
+                        !named_alias_may_shadow_assuming_base_assign_lexically_at(
+                            &collection.map,
+                            "local",
+                            call,
+                            false,
+                        )
+                    }
+                    SourceOrderedStep::NotOrdered => false,
+                });
         visit_bindings(
             child,
             content,
@@ -666,6 +705,7 @@ fn visit_bindings<'tree, T>(
                 },
                 known_immediate_context,
                 eager_assignment_value_root,
+                source_ordered,
             },
         );
     }
@@ -943,13 +983,23 @@ fn record_mutation_call<'tree, T>(
         return;
     };
     if let Some(kind) = assign_call_kind(function, content) {
-        if kind == AssignCallKind::UnknownNamespace
-            || (kind == AssignCallKind::BareCandidate
-                && (!effective_immediate_binding_context
-                    || !bare_helper_is_trusted(&collection.map, "assign")))
-        {
+        if kind == AssignCallKind::UnknownNamespace {
             if evaluation_frame.is_caller_or_global() {
                 mark_unknown_named_binding_in_scope(collection, node, None);
+                invalidate_unknown_mutation_in_context(
+                    collection,
+                    node,
+                    effective_immediate_binding_context,
+                );
+            }
+            return;
+        }
+        if kind == AssignCallKind::BareCandidate
+            && (!effective_immediate_binding_context
+                || !bare_helper_is_trusted(&collection.map, "assign"))
+        {
+            if evaluation_frame.is_caller_or_global() {
+                record_unproven_bare_assign(node, arguments, content, collection, state);
                 invalidate_unknown_mutation_in_context(
                     collection,
                     node,
@@ -1146,6 +1196,51 @@ fn record_mutation_call<'tree, T>(
             mark_unknown_named_binding_in_scope(collection, node, None);
             invalidate_persistent_unknown_mutation(collection, node);
         }
+    }
+}
+
+/// Record a bare `assign()` call that cannot be proven to be `base::assign`.
+///
+/// If the callee were some other function, it could bind any name, so the
+/// call always leaves unknown-name uncertainty. When the arguments have the
+/// shape of a base `assign()` with a literal name, that uncertainty goes under
+/// [`UNKNOWN_BARE_ASSIGN_BINDING_KEY`] and the literal name is recorded as an
+/// ordinary binding event. That way a consumer that treats bare `assign` as
+/// base (see [`named_alias_may_shadow_assuming_base_assign_lexically_at`])
+/// still sees the name it binds. Any other shape records generic unknown-name
+/// uncertainty, as before.
+fn record_unproven_bare_assign<T>(
+    node: Node,
+    arguments: Node,
+    content: &str,
+    collection: &mut BindingCollection<T>,
+    state: BindingVisitState,
+) {
+    let base_target = (!arguments.has_error()
+        && !has_duplicate_exact_names(arguments, content, &ASSIGN_FORMALS)
+        && !arguments_have_uninterpreted_names(arguments, content))
+    .then(|| {
+        resolve_assign_arguments(
+            arguments,
+            content,
+            bare_helper_is_trusted(&collection.map, "globalenv"),
+            bare_helper_is_trusted(&collection.map, ".GlobalEnv"),
+        )
+    })
+    .flatten()
+    .and_then(|resolved| {
+        extract_plain_string(resolved.name, content).map(|name| (name, resolved.destination))
+    });
+    let Some((name, destination)) = base_target else {
+        mark_unknown_named_binding_in_scope(collection, node, None);
+        return;
+    };
+    let binding = bump_at_in_scope(collection, UNKNOWN_BARE_ASSIGN_BINDING_KEY, node, None);
+    binding.persistent_uncertainty = true;
+    if destination == CaptureEvaluationFrame::Caller {
+        bump_at_in_runtime_scope(collection, &name, node, state.runtime_function_scope);
+    } else {
+        bump_at_in_scope(collection, &name, node, None);
     }
 }
 
@@ -2118,12 +2213,16 @@ pub(crate) fn named_binding_may_shadow_at<T>(
             || binding
                 .first_offset
                 .is_none_or(|offset| offset < before_byte)
-    }) || map.get(UNKNOWN_NAMED_BINDING_KEY).is_some_and(|binding| {
-        (deferred_use && binding.persistent_uncertainty)
-            || binding
-                .first_offset
-                .is_none_or(|offset| offset < before_byte)
-    })
+    }) || [UNKNOWN_NAMED_BINDING_KEY, UNKNOWN_BARE_ASSIGN_BINDING_KEY]
+        .into_iter()
+        .any(|key| {
+            map.get(key).is_some_and(|binding| {
+                (deferred_use && binding.persistent_uncertainty)
+                    || binding
+                        .first_offset
+                        .is_none_or(|offset| offset < before_byte)
+            })
+        })
 }
 
 /// Whether `name` may be shadowed along `use_node`'s lexical function-scope
@@ -2194,7 +2293,13 @@ pub(crate) fn named_local_binding_may_shadow_lexically_at<T>(
     use_node: Node,
     deferred_use: bool,
 ) -> bool {
-    [name, UNKNOWN_NAMED_BINDING_KEY].into_iter().any(|key| {
+    [
+        name,
+        UNKNOWN_NAMED_BINDING_KEY,
+        UNKNOWN_BARE_ASSIGN_BINDING_KEY,
+    ]
+    .into_iter()
+    .any(|key| {
         map.get(key).is_some_and(|binding| {
             ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
         })
@@ -2222,7 +2327,13 @@ pub(crate) fn named_local_binding_may_shadow_without_helper_uncertainty<T>(
     use_node: Node,
     deferred_use: bool,
 ) -> bool {
-    [name, UNKNOWN_NAMED_BINDING_KEY].into_iter().any(|key| {
+    [
+        name,
+        UNKNOWN_NAMED_BINDING_KEY,
+        UNKNOWN_BARE_ASSIGN_BINDING_KEY,
+    ]
+    .into_iter()
+    .any(|key| {
         map.get(key).is_some_and(|binding| {
             ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
         })
@@ -2239,7 +2350,50 @@ pub(crate) fn named_alias_may_shadow_lexically_at<T>(
     use_node: Node,
     deferred_use: bool,
 ) -> bool {
-    [name, UNKNOWN_NAMED_BINDING_KEY].into_iter().any(|key| {
+    named_alias_may_shadow_lexically_at_impl(map, name, use_node, deferred_use, true)
+}
+
+/// [`named_alias_may_shadow_lexically_at`] for a consumer that already treats
+/// a bare `assign("name", ...)` call as `base::assign`, as the scope collector
+/// does when it turns such a call into a definition.
+///
+/// Under that model, a bare `assign()` call the binding walk could not prove
+/// binds only its literal name (recorded as an ordinary event), so its
+/// unknown-name marker is ignored. The marker still counts when `assign`
+/// itself may be rebound before the use, since the call could then bind
+/// anything.
+pub(crate) fn named_alias_may_shadow_assuming_base_assign_lexically_at<T>(
+    map: &HashMap<String, Binding<T>>,
+    name: &str,
+    use_node: Node,
+    deferred_use: bool,
+) -> bool {
+    named_alias_may_shadow_lexically_at_impl(map, name, use_node, deferred_use, false)
+        || (named_alias_may_shadow_lexically_at_impl(map, "assign", use_node, deferred_use, false)
+            && map
+                .get(UNKNOWN_BARE_ASSIGN_BINDING_KEY)
+                .is_some_and(|binding| {
+                    ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
+                }))
+}
+
+fn named_alias_may_shadow_lexically_at_impl<T>(
+    map: &HashMap<String, Binding<T>>,
+    name: &str,
+    use_node: Node,
+    deferred_use: bool,
+    include_unproven_bare_assign: bool,
+) -> bool {
+    let unproven_bare_assign_key =
+        include_unproven_bare_assign.then_some(UNKNOWN_BARE_ASSIGN_BINDING_KEY);
+    [
+        Some(name),
+        Some(UNKNOWN_NAMED_BINDING_KEY),
+        unproven_bare_assign_key,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|key| {
         map.get(key).is_some_and(|binding| {
             ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
         })
@@ -2339,11 +2493,13 @@ fn invalidate_unknown_mutation_in_context<T>(
     node: Node,
     known_immediate_context: bool,
 ) {
-    if !known_immediate_context {
+    if !known_immediate_context && !collection.source_ordered_visit {
         // A mutation nested in a function/quoted/deferred context may execute
         // after syntactically later assignments. Retain a persistent barrier
         // so AST visitation order cannot make those later candidates appear
-        // safe.
+        // safe. A source-ordered mutation (a top-level `if` branch or trusted
+        // `local()` body) runs at its position or not at all, so the ordered
+        // barrier below already covers it.
         invalidate_persistent_unknown_mutation(collection, node);
     } else {
         invalidate_existing_bindings(collection);
@@ -3791,6 +3947,139 @@ pub(crate) fn is_known_immediate_context(node: Node) -> bool {
         }
     }
     false
+}
+
+/// Whether `node` runs at most once, at its source position, whenever the
+/// top-level expression containing it runs.
+///
+/// This extends [`is_known_immediate_context`] through `if`/`else` parts,
+/// assignment values, and the `expr` argument of a `local()` call. Code there
+/// may be conditional or
+/// run in a child frame, but it cannot run after syntactically later top-level
+/// code. So an ordered shadow query or mutation barrier is sound for it.
+/// Function bodies, loop bodies, and other call arguments stay excluded: they
+/// can run later, repeatedly, or not in source order.
+///
+/// `base::local` is trusted as written. A bare `local` call counts only when
+/// `bare_local_trusted(call)` says that spelling is not rebound before the
+/// call.
+pub(crate) fn is_source_ordered_context(
+    node: Node,
+    content: &str,
+    mut bare_local_trusted: impl FnMut(Node) -> bool,
+) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "program" {
+            return true;
+        }
+        match source_ordered_step(parent, current, content) {
+            SourceOrderedStep::Ordered => {}
+            SourceOrderedStep::IfBareLocalTrusted(call) => {
+                if !bare_local_trusted(call) {
+                    return false;
+                }
+            }
+            SourceOrderedStep::NotOrdered => return false,
+        }
+        current = parent;
+    }
+    false
+}
+
+/// How [`is_source_ordered_context`] treats one parent-to-child edge.
+enum SourceOrderedStep<'tree> {
+    /// The child runs in source order whenever the parent does.
+    Ordered,
+    /// The child is the argument list of a bare `local(...)` call; it runs in
+    /// source order only if that `local` is the base function.
+    IfBareLocalTrusted(Node<'tree>),
+    NotOrdered,
+}
+
+/// Classify the parent-to-child edge for [`is_source_ordered_context`]. Shared
+/// by the upward climb and the binding walk's descent so the two cannot drift.
+///
+/// A `local()` body is reached through three edges: call to argument list
+/// (where the callee is checked), argument list to argument, and argument to
+/// its value (which must be the `expr` argument).
+fn source_ordered_step<'tree>(
+    parent: Node<'tree>,
+    child: Node<'tree>,
+    content: &str,
+) -> SourceOrderedStep<'tree> {
+    match parent.kind() {
+        "braced_expression" | "parenthesized_expression" | "if_statement" | "arguments" => {
+            SourceOrderedStep::Ordered
+        }
+        // `name <- local({ ... })`: an assignment forces its value first.
+        "binary_operator" if assignment_value_child(parent, child, content) => {
+            SourceOrderedStep::Ordered
+        }
+        "argument"
+            if parent.child_by_field_name("value") == Some(child)
+                && argument_is_local_expr(parent, content) =>
+        {
+            SourceOrderedStep::Ordered
+        }
+        "call" if parent.child_by_field_name("arguments") == Some(child) => {
+            let Some(function) = parent.child_by_field_name("function") else {
+                return SourceOrderedStep::NotOrdered;
+            };
+            match function.kind() {
+                "identifier" | "string" | "raw_string_literal"
+                    if node_is_plain_name(function, content, "local") =>
+                {
+                    SourceOrderedStep::IfBareLocalTrusted(parent)
+                }
+                "namespace_operator"
+                    if namespace_is_base(function, content)
+                        && function
+                            .child_by_field_name("rhs")
+                            .is_some_and(|rhs| node_is_plain_name(rhs, content, "local")) =>
+                {
+                    SourceOrderedStep::Ordered
+                }
+                _ => SourceOrderedStep::NotOrdered,
+            }
+        }
+        _ => SourceOrderedStep::NotOrdered,
+    }
+}
+
+/// The `expr` argument value of a bare or `base::`-qualified `local()` call,
+/// or `None` when `call` is not one. Spelling only: no shadowing check, and an
+/// `envir` argument is allowed (unlike the scope collector's `local()` block
+/// recognizer), so callers must use it only where over-matching is safe.
+pub(crate) fn local_call_expr<'tree>(call: Node<'tree>, content: &str) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    if matches!(
+        source_ordered_step(call, arguments, content),
+        SourceOrderedStep::NotOrdered
+    ) {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+        .find(|argument| argument_is_local_expr(*argument, content))
+        .and_then(|argument| argument.child_by_field_name("value"))
+}
+
+/// Whether `argument` supplies `local()`'s `expr` formal: named exactly
+/// `expr`, or the first argument when it is unnamed.
+fn argument_is_local_expr(argument: Node, content: &str) -> bool {
+    if let Some(name) = argument.child_by_field_name("name") {
+        return node_is_plain_name(name, content, "expr");
+    }
+    argument.parent().is_some_and(|arguments| {
+        let mut cursor = arguments.walk();
+        arguments
+            .children(&mut cursor)
+            .find(|child| child.kind() == "argument")
+            == Some(argument)
+    })
 }
 
 enum RemoveListValue {

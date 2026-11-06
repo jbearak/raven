@@ -295,6 +295,33 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
         )
     }
 
+    /// [`Self::named_alias_may_shadow_at`] for a consumer that treats bare
+    /// `assign("name", ...)` calls as `base::assign`; see
+    /// [`super::binding::named_alias_may_shadow_assuming_base_assign_lexically_at`].
+    pub(crate) fn named_alias_may_shadow_assuming_base_assign_at(
+        &self,
+        name: &str,
+        use_node: Node,
+        deferred_use: bool,
+    ) -> bool {
+        super::binding::named_alias_may_shadow_assuming_base_assign_lexically_at(
+            &self.bindings,
+            name,
+            use_node,
+            deferred_use,
+        )
+    }
+
+    /// Whether `use_node` runs in source order (see
+    /// [`super::binding::is_source_ordered_context`]), with bare `local` trusted
+    /// under the same base-`assign` model as
+    /// [`Self::named_alias_may_shadow_assuming_base_assign_at`].
+    pub(crate) fn is_source_ordered_at(&self, use_node: Node) -> bool {
+        super::binding::is_source_ordered_context(use_node, self.content, |call| {
+            !self.named_alias_may_shadow_assuming_base_assign_at("local", call, false)
+        })
+    }
+
     /// Resolve a package-vector candidate under the package consumer's distinct
     /// eligibility policy.
     pub(crate) fn resolve_package_vector(&self, name: &str, use_node: Node) -> Option<&[String]> {
