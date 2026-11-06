@@ -352,16 +352,14 @@ impl PathContext {
     ///   resolves the same edge.
     ///
     /// This is the single source of truth for forward-source working-directory
-    /// propagation across the two LIVE-LSP consumers that thread a caller context
-    /// into a child: the on-demand index walk (`index_forward_chain`) and scope
-    /// resolution (`build_forward_child_path_context`). They share this method so
-    /// they cannot disagree. The dependency-graph build
-    /// (`build_dependency_graph_from_workspace` → `update_file`) does NOT call
-    /// this — it resolves each file from that file's own metadata with no caller
-    /// context, and stays consistent by a separate invariant: the workspace scan
-    /// only ever enriches *backward*-directive (`sourced_by`) files with an
-    /// inherited WD, never forward-source children, so a plain forward hop has no
-    /// baked-in WD there either. Keep that invariant if extending scan enrichment.
+    /// propagation: the on-demand index walk (`index_forward_chain`), scope
+    /// resolution (`build_forward_child_path_context`), and the workspace graph
+    /// derivation that bakes a forward parent's directory into a closed child's
+    /// metadata (`forward_wd_proposals` in `state.rs`, used by the editor's
+    /// scan and by `raven check`). They share this method so they cannot
+    /// disagree. Because only a `cd` or `chdir` proposes a directory, a plain
+    /// forward hop still bakes in none, and the graph build resolves it from the
+    /// child's own directory with the workspace-root fallback.
     ///
     /// Injecting the caller's plain directory for a non-cd hop would re-base a
     /// deep hop and suppress the fallback (see `resolve_path_impl`'s gate, which

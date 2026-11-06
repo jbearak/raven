@@ -12360,6 +12360,69 @@ pub(crate) struct WorkspaceGraphDerivationContext {
     pub(crate) system_file_library_paths: Vec<PathBuf>,
 }
 
+/// Forward working-directory proposals for files with no directory of their
+/// own (no `# raven: cd`, nothing inherited through a backward directive).
+///
+/// A parent proposes the directory a sourced child runs in when its own
+/// `# raven: cd` is in effect or it sources with `chdir = TRUE`
+/// ([`PathContext::forward_child_inherited_wd`](crate::cross_file::path_resolve::PathContext::forward_child_inherited_wd));
+/// parents with neither propose nothing. A child takes a proposal only when
+/// every proposing parent agrees. Parents that disagree leave it with none,
+/// so its own paths resolve as if no directory were in effect, and the
+/// result never depends on which parent happens to sort first.
+fn forward_wd_proposals(
+    parents: &[(Url, Arc<crate::cross_file::CrossFileMetadata>)],
+    children: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    workspace_root: Option<&Url>,
+) -> HashMap<Url, String> {
+    let mut proposals: HashMap<Url, std::collections::BTreeSet<String>> = HashMap::new();
+    for (parent_uri, parent_metadata) in parents {
+        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+            parent_uri,
+            parent_metadata,
+            workspace_root,
+        ) else {
+            continue;
+        };
+        for source in &parent_metadata.sources {
+            let resolved = source
+                .resolved_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .or_else(|| {
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        &path_context,
+                    )
+                });
+            let Some(resolved) = resolved else { continue };
+            let Ok(child_uri) = Url::from_file_path(&resolved) else {
+                continue;
+            };
+            let Some(child) = children.get(&child_uri) else {
+                continue;
+            };
+            if child.working_directory.is_some() || child.inherited_working_directory.is_some() {
+                continue;
+            }
+            if let Some(inherited) =
+                path_context.forward_child_inherited_wd(&resolved, source.chdir)
+            {
+                proposals
+                    .entry(child_uri)
+                    .or_default()
+                    .insert(inherited.to_string_lossy().to_string());
+            }
+        }
+    }
+    proposals
+        .into_iter()
+        .filter_map(|(uri, mut directories)| {
+            (directories.len() == 1).then(|| (uri, directories.pop_first().expect("one")))
+        })
+        .collect()
+}
+
 /// Recompute closed-file inherited working directories from immutable metadata.
 ///
 /// Each round starts from `base_closed_metadata`, so a disk-derived inherited
@@ -12397,7 +12460,7 @@ fn derive_closed_descendant_metadata(
         next.insert(uri, Arc::new(metadata));
     }
 
-    let mut parents: Vec<_> = entries
+    let parents: Vec<_> = entries
         .iter()
         .filter(|(uri, _)| !open_metadata.contains_key(*uri))
         .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
@@ -12407,48 +12470,7 @@ fn derive_closed_descendant_metadata(
                 .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
         )
         .collect();
-    parents.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-    let mut forward_proposals = HashMap::new();
-    for (parent_uri, parent_metadata) in parents {
-        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            &parent_uri,
-            &parent_metadata,
-            workspace_root,
-        ) else {
-            continue;
-        };
-        for source in &parent_metadata.sources {
-            let resolved = source
-                .resolved_uri
-                .as_ref()
-                .and_then(|uri| uri.to_file_path().ok())
-                .or_else(|| {
-                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                        &source.path,
-                        &path_context,
-                    )
-                });
-            let Some(resolved) = resolved else { continue };
-            let Ok(child_uri) = Url::from_file_path(&resolved) else {
-                continue;
-            };
-            let Some(child) = next.get(&child_uri) else {
-                continue;
-            };
-            if child.working_directory.is_some()
-                || child.inherited_working_directory.is_some()
-                || forward_proposals.contains_key(&child_uri)
-            {
-                continue;
-            }
-            if let Some(inherited) =
-                path_context.forward_child_inherited_wd(&resolved, source.chdir)
-            {
-                forward_proposals.insert(child_uri, inherited.to_string_lossy().to_string());
-            }
-        }
-    }
-    for (uri, inherited) in forward_proposals {
+    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root) {
         if let Some(metadata) = next.get_mut(&uri) {
             Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
         }
@@ -12471,9 +12493,9 @@ fn derive_closed_descendant_metadata(
 /// Recompute open-buffer inherited working directories against the current
 /// mixed open/closed candidate.
 ///
-/// Backward directives win when they produce a context. Forward proposals are
-/// deterministic (URI-sorted parent order) and cover open children that have no
-/// backward directive. Re-running this together with
+/// Backward directives win when they produce a context. Forward proposals
+/// ([`forward_wd_proposals`]) cover open children that have no backward
+/// directive. Re-running this together with
 /// [`derive_closed_descendant_metadata`] reaches alternating
 /// open → closed → open chains without consulting live `WorldState`.
 fn derive_open_candidate_metadata(
@@ -12510,7 +12532,7 @@ fn derive_open_candidate_metadata(
         next.insert(uri, Arc::new(metadata));
     }
 
-    let mut parents: Vec<_> = entries
+    let parents: Vec<_> = entries
         .iter()
         .filter(|(uri, _)| !current_open_metadata.contains_key(*uri))
         .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
@@ -12519,48 +12541,7 @@ fn derive_open_candidate_metadata(
                 .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
         )
         .collect();
-    parents.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-    let mut forward_proposals = HashMap::new();
-    for (parent_uri, parent_metadata) in parents {
-        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            &parent_uri,
-            &parent_metadata,
-            workspace_root,
-        ) else {
-            continue;
-        };
-        for source in &parent_metadata.sources {
-            let resolved = source
-                .resolved_uri
-                .as_ref()
-                .and_then(|uri| uri.to_file_path().ok())
-                .or_else(|| {
-                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                        &source.path,
-                        &path_context,
-                    )
-                });
-            let Some(resolved) = resolved else { continue };
-            let Ok(child_uri) = Url::from_file_path(&resolved) else {
-                continue;
-            };
-            let Some(child) = next.get(&child_uri) else {
-                continue;
-            };
-            if child.working_directory.is_some()
-                || child.inherited_working_directory.is_some()
-                || forward_proposals.contains_key(&child_uri)
-            {
-                continue;
-            }
-            if let Some(inherited) =
-                path_context.forward_child_inherited_wd(&resolved, source.chdir)
-            {
-                forward_proposals.insert(child_uri, inherited.to_string_lossy().to_string());
-            }
-        }
-    }
-    for (uri, inherited) in forward_proposals {
+    for (uri, inherited) in forward_wd_proposals(&parents, &next, workspace_root) {
         if let Some(metadata) = next.get_mut(&uri) {
             Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
         }
@@ -12572,6 +12553,33 @@ fn derive_open_candidate_metadata(
         })
     });
     (next, changed)
+}
+
+/// `{import}` script paths resolve against the directory a file runs in, and
+/// derivation can change it: a parent's `# raven: cd` passed on, or a Shiny
+/// app directory from batch expansion. Re-resolve them when that directory
+/// differs from what the incoming metadata was resolved against. (`{box}`
+/// modules resolve from the file's own directory and need nothing.)
+fn reresolve_import_scripts_after_wd_change(
+    metadata: &mut crate::cross_file::CrossFileMetadata,
+    previous: Option<&crate::cross_file::CrossFileMetadata>,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+) {
+    let unchanged = previous.is_some_and(|previous| {
+        previous.inherited_working_directory == metadata.inherited_working_directory
+            && previous.application_working_directory == metadata.application_working_directory
+    });
+    if unchanged || metadata.import_calls.is_empty() {
+        return;
+    }
+    let snapshot = metadata.clone();
+    crate::import_pkg::path::enrich_local_imports(
+        uri,
+        &snapshot,
+        &mut metadata.import_calls,
+        workspace_root,
+    );
 }
 
 /// Derive a deterministic complete graph from closed entries plus open overlays.
@@ -12699,6 +12707,12 @@ pub(crate) fn derive_workspace_dependency_graph(
                 &context.exclusions,
             );
         }
+        reresolve_import_scripts_after_wd_change(
+            metadata,
+            previous_closed_metadata.get(uri).map(Arc::as_ref),
+            uri,
+            workspace_root,
+        );
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
             match entry.tree.as_ref() {
@@ -12734,6 +12748,12 @@ pub(crate) fn derive_workspace_dependency_graph(
                 &context.exclusions,
             );
         }
+        reresolve_import_scripts_after_wd_change(
+            metadata,
+            previous_open_metadata.get(uri).map(Arc::as_ref),
+            uri,
+            workspace_root,
+        );
     }
 
     let mut content: HashMap<Url, String> = entries
@@ -15613,6 +15633,50 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 .iter()
                 .all(|edge| edge.to != tar_helper_uri),
             "excluded tar_source members must leave the dependency graph"
+        );
+    }
+
+    /// A closed file that parents source from different working directories
+    /// inherits none, whichever parent sorts first; parents that agree still
+    /// pass their directory on.
+    #[test]
+    fn forward_working_directory_needs_agreeing_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("wd1")).unwrap();
+        fs::create_dir_all(root.join("wd2")).unwrap();
+        fs::write(root.join("a.R"), "x <- 1\n").unwrap();
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let a_uri = Url::from_file_path(root.join("a.R")).unwrap();
+        let inherited = |second_cd: &str| {
+            fs::write(
+                root.join("00_other.R"),
+                "# raven: cd wd1\nsource(\"../a.R\")\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("zz_main.R"),
+                format!("# raven: cd {second_cd}\nsource(\"../a.R\")\n"),
+            )
+            .unwrap();
+            let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+            let context = WorkspaceGraphDerivationContext {
+                workspace_root: Some(root_uri.clone()),
+                max_depth: 20,
+                exclusions: Default::default(),
+                system_file_workspace_name: None,
+                system_file_workspace_root: None,
+                system_file_library_paths: Vec::new(),
+            };
+            derive_workspace_dependency_graph(&mut entries, None, &[], &context, false);
+            entries[&a_uri].metadata.inherited_working_directory.clone()
+        };
+
+        assert_eq!(inherited("wd2"), None, "parents disagree");
+        assert_eq!(
+            inherited("wd1").map(PathBuf::from),
+            Some(root.join("wd1")),
+            "parents agree"
         );
     }
 

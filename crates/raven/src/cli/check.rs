@@ -797,11 +797,32 @@ fn build_indexed_state_reporting(
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let (entries, scan) = crate::state::scan_workspace_reporting(
+    let (mut entries, scan) = crate::state::scan_workspace_reporting(
         std::slice::from_ref(workspace_url),
         max_chain_depth,
         &state.workspace_exclusions,
         &state.box_search_context(),
+    );
+    // The scan gives a file a working directory only through its own backward
+    // directives. Derive the ones parents pass on (`# raven: cd`, `chdir =
+    // TRUE`) as the editor's workspace scan does, so a sourced file resolves
+    // its own paths the same way in both. `apply_workspace_index` builds the
+    // graph from the derived metadata.
+    let (system_file_workspace_name, system_file_workspace_root, system_file_library_paths) =
+        state.snapshot_system_file_inputs();
+    crate::state::derive_workspace_dependency_graph(
+        &mut entries,
+        None,
+        &[],
+        &crate::state::WorkspaceGraphDerivationContext {
+            workspace_root: Some(workspace_url.clone()),
+            max_depth: max_chain_depth,
+            exclusions: state.workspace_exclusions.clone(),
+            system_file_workspace_name,
+            system_file_workspace_root,
+            system_file_library_paths,
+        },
+        false,
     );
     // Preserve package text before bounded index admission can evict helpers.
     // Rope clones share their storage. Materialize and hash only evicted files
@@ -3838,6 +3859,38 @@ infixContinuationStyle = "indented"
             let (all, _packages, _oe) = collect_target_diagnostics(&mut state, &targets).await;
             all
         })
+    }
+
+    /// A parent's `# raven: cd` reaches the files it sources, as R runs them:
+    /// `main.R` works in `lib/`, so `child.R`'s `source("util.R")` and
+    /// `import::from("util.R", ...)` both find `lib/util.R`. Check used to
+    /// resolve the child from its own directory and report `f` as undefined in
+    /// `main.R`, where the editor reported nothing.
+    #[test]
+    fn a_parents_working_directory_reaches_the_files_it_sources() {
+        for child in ["source(\"util.R\")\n", "import::from(\"util.R\", f)\n"] {
+            let tmp = TempDir::new().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap();
+            fs::create_dir_all(root.join("lib")).unwrap();
+            fs::create_dir_all(root.join("scripts")).unwrap();
+            fs::write(
+                root.join("main.R"),
+                "# raven: cd lib\nsource(\"../scripts/child.R\")\nf()\n",
+            )
+            .unwrap();
+            fs::write(root.join("scripts/child.R"), child).unwrap();
+            fs::write(root.join("lib/util.R"), "f <- function() 1\n").unwrap();
+
+            let diagnostics = collect_diagnostics_parallel_blocking(&base_args(&root));
+            assert!(
+                diagnostics.is_empty(),
+                "{child:?}: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|(path, d)| (path, &d.message))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Issue #479 WI3: the parallel per-file collection must be byte-identical to
