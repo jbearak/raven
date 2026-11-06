@@ -215,6 +215,8 @@ Rough pipeline:
 6. Resolve scope at a position by traversing edges and applying call-site filtering
 7. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
+Inherited working directories (step 2) come from a file's backward directives and, for a file without either a `cd` or a backward directive, from the parents that `source()` it (`forward_wd_proposals` in `state.rs`). A file whose proposing parents disagree gets none. The editor's workspace scan and `raven check` both derive them with `derive_workspace_dependency_graph`, which also re-resolves `{import}` script paths when it changes a file's directory.
+
 Source-batch expansion is caller-owned and filesystem-backed; it has no
 process-global cache. A finalized record stores its ordered ordinal sources and
 every existing or potential watch root. `WorldState` derives a bidirectional
