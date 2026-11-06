@@ -10620,7 +10620,7 @@ fn extract_enriched_live_metadata_with_contexts(
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let attempted = std::cell::RefCell::new(Vec::new());
 
-    crate::cross_file::enrich_metadata_with_inherited_wd(
+    crate::state::enrich_open_metadata_with_inherited_wd(
         &mut meta,
         uri,
         workspace_root.as_ref(),
@@ -10628,6 +10628,10 @@ fn extract_enriched_live_metadata_with_contexts(
             attempted.borrow_mut().push(parent_uri.clone());
             state.get_enriched_metadata(parent_uri)
         },
+        &crate::state::forward_parents(
+            &state.cross_file_graph,
+            &state.authoritative_revalidation_roots_for_uri(uri),
+        ),
         max_chain_depth,
     );
 
@@ -10755,11 +10759,15 @@ fn semantic_metadata_for_graph_root<'a>(
 
     let mut root_meta = meta.clone();
     root_meta.inherited_working_directory = None;
-    crate::cross_file::enrich_metadata_with_inherited_wd(
+    crate::state::enrich_open_metadata_with_inherited_wd(
         &mut root_meta,
         root,
         workspace_root,
         |parent_uri| state.get_enriched_metadata(parent_uri),
+        &crate::state::forward_parents(
+            &state.cross_file_graph,
+            &state.authoritative_revalidation_roots_for_uri(input_root),
+        ),
         state.cross_file_config.max_chain_depth,
     );
     std::borrow::Cow::Owned(root_meta)
@@ -12401,6 +12409,8 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
 }
 
 struct CapturedOpenInstallAnalysis {
+    /// See [`crate::state::forward_parents`].
+    forward_parents: Vec<crate::state::ForwardParent>,
     basis: AnalysisBasis,
     intent: OpenInstallIntentToken,
     uri: Url,
@@ -12577,6 +12587,7 @@ fn capture_open_install_analysis(
         .unwrap_or_default();
     let (workspace_name, system_package_root, library_paths) = state.snapshot_system_file_inputs();
     Some(CapturedOpenInstallAnalysis {
+        forward_parents: crate::state::forward_parents(&state.cross_file_graph, &graph_roots),
         box_context: state.box_search_context_for_document(&uri, &document.contents),
         basis,
         intent: intent.clone(),
@@ -12624,6 +12635,14 @@ struct OpenInstallPrerequisites {
 }
 
 impl OpenInstallPrerequisites {
+    fn uris(&self) -> impl Iterator<Item = &Url> {
+        self.direct_sources
+            .iter()
+            .map(|(uri, _)| uri)
+            .chain(&self.source_batch_hosts)
+            .chain(&self.backward_parents)
+    }
+
     fn is_empty(&self) -> bool {
         self.direct_sources.is_empty()
             && self.source_batch_hosts.is_empty()
@@ -12641,6 +12660,7 @@ fn derive_open_install_analysis(
     captured: CapturedOpenInstallAnalysis,
     local_only: bool,
     convergence_seed_uris: Vec<Url>,
+    unindexable_prerequisites: &std::collections::HashSet<Url>,
 ) -> DerivedOpenInstallAnalysis {
     let attempted = std::cell::RefCell::new(Vec::new());
     let metadata_lookup = |parent_uri: &Url| {
@@ -12654,11 +12674,12 @@ fn derive_open_install_analysis(
     let is_r = captured.document.file_type == crate::file_type::FileType::R;
     let mut metadata = captured.document.cross_file_metadata();
     if !local_only && is_r {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
+        crate::state::enrich_open_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             metadata_lookup,
+            &captured.forward_parents,
             captured.max_chain_depth,
         );
         crate::cross_file::resolve_system_file_sources(
@@ -12703,6 +12724,7 @@ fn derive_open_install_analysis(
             && !captured.graph_roots.contains(&host_uri)
             && !captured.exclusions.is_excluded_uri(&host_uri)
             && !captured.metadata_map.contains_key(&host_uri)
+            && !unindexable_prerequisites.contains(&host_uri)
         {
             prerequisites.source_batch_hosts.push(host_uri);
         }
@@ -12731,6 +12753,7 @@ fn derive_open_install_analysis(
                 };
                 if captured.exclusions.is_excluded_uri(&source_uri)
                     || captured.metadata_map.contains_key(&source_uri)
+                    || unindexable_prerequisites.contains(&source_uri)
                     || prerequisites
                         .direct_sources
                         .iter()
@@ -12751,6 +12774,7 @@ fn derive_open_install_analysis(
             };
             if !captured.exclusions.is_excluded_uri(target)
                 && !captured.metadata_map.contains_key(target)
+                && !unindexable_prerequisites.contains(target)
                 && !prerequisites
                     .direct_sources
                     .iter()
@@ -12779,6 +12803,7 @@ fn derive_open_install_analysis(
                 };
                 if captured.exclusions.is_excluded_uri(&parent_uri)
                     || captured.metadata_map.contains_key(&parent_uri)
+                    || unindexable_prerequisites.contains(&parent_uri)
                     || prerequisites.backward_parents.contains(&parent_uri)
                 {
                     continue;
@@ -12796,11 +12821,12 @@ fn derive_open_install_analysis(
                 let mut root_metadata = input.clone();
                 if graph_uri != input_root && !local_only {
                     root_metadata.inherited_working_directory = None;
-                    crate::cross_file::enrich_metadata_with_inherited_wd(
+                    crate::state::enrich_open_metadata_with_inherited_wd(
                         &mut root_metadata,
                         graph_uri,
                         captured.workspace_root.as_ref(),
                         metadata_lookup,
+                        &captured.forward_parents,
                         captured.max_chain_depth,
                     );
                 }
@@ -13112,11 +13138,12 @@ fn derive_open_metadata_reenrichment(
         crate::cross_file::CrossFileMetadata::default()
     };
     if is_r {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
+        crate::state::enrich_open_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             metadata_lookup,
+            &captured.forward_parents,
             captured.max_chain_depth,
         );
         crate::cross_file::resolve_system_file_sources(
@@ -13142,11 +13169,12 @@ fn derive_open_metadata_reenrichment(
                 let mut root_metadata = input.clone();
                 if graph_uri != input_root {
                     root_metadata.inherited_working_directory = None;
-                    crate::cross_file::enrich_metadata_with_inherited_wd(
+                    crate::state::enrich_open_metadata_with_inherited_wd(
                         &mut root_metadata,
                         graph_uri,
                         captured.workspace_root.as_ref(),
                         metadata_lookup,
+                        &captured.forward_parents,
                         captured.max_chain_depth,
                     );
                 }
@@ -13243,6 +13271,22 @@ fn commit_open_metadata_reenrichment(
         .ok_or(crate::state::AnalysisCommitRejected::StaleBasis)?;
     let effects =
         state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared)))?;
+    // The commit treats `uri` as its subject and so leaves it unmarked, as an
+    // edit's own new version needs no marker. A re-enrichment keeps the text
+    // and its version: the subject's diagnostics changed because a dependency
+    // did, so its same-version republish needs a force marker like any other
+    // dependent's, or the monotonic gate drops it. The dependency's own commit
+    // may already have reserved one for it; that one serves, once the workers
+    // that could consume it first are cancelled.
+    if effects.revalidations.iter().any(|ticket| ticket.uri == uri) {
+        // A worker computed against the replaced metadata keeps a fresh
+        // trigger (the text and version are unchanged), so it could consume
+        // that marker first and leave the new one gated out. This commit
+        // holds the publish lock, and workers re-check cancellation under it
+        // before consuming, so cancelling here retires them.
+        state.cross_file_revalidation.cancel(&uri);
+        state.diagnostics_gate.ensure_force_republish(&uri);
+    }
     Ok(effects.revalidations)
 }
 
@@ -17855,6 +17899,12 @@ async fn did_open_transactional(
     let mut commit_retries = 0usize;
     let mut local_only = false;
     let mut convergence_seed_uris = Vec::new();
+    // Prerequisites a convergence round tried and failed to index (a
+    // `source()` of a file that does not exist). They stop blocking the
+    // commit instead of exhausting the retry ceiling and degrading the whole
+    // open to a local-only candidate. One that was indexed and later
+    // invalidated is not here, so it converges again.
+    let mut unindexable_prerequisites = std::collections::HashSet::new();
     // A degraded package build can legitimately remain not-ready. Remember
     // only the exact key whose build won its CAS, and bound fresh-key retries
     // so hostile config churn cannot hold didOpen forever.
@@ -17938,8 +17988,14 @@ async fn did_open_transactional(
         let excluded = captured.exclusions.is_excluded_uri(uri);
         let derive_local_only = local_only;
         let derived_convergence_seeds = convergence_seed_uris.clone();
+        let unindexable = unindexable_prerequisites.clone();
         let Ok(derived) = tokio::task::spawn_blocking(move || {
-            derive_open_install_analysis(captured, derive_local_only, derived_convergence_seeds)
+            derive_open_install_analysis(
+                captured,
+                derive_local_only,
+                derived_convergence_seeds,
+                &unindexable,
+            )
         })
         .await
         else {
@@ -17955,11 +18011,20 @@ async fn did_open_transactional(
                 local_only = true;
                 continue;
             }
+            let prerequisite_uris: Vec<_> = derived.prerequisites.uris().cloned().collect();
             convergence_seed_uris.extend(
                 Box::pin(backend.converge_open_install_prerequisites(derived.prerequisites)).await,
             );
             convergence_seed_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
             convergence_seed_uris.dedup();
+            {
+                let state = backend.state.read().await;
+                unindexable_prerequisites.extend(
+                    prerequisite_uris
+                        .into_iter()
+                        .filter(|uri| state.get_enriched_metadata(uri).is_none()),
+                );
+            }
             if !backend
                 .state
                 .read()
@@ -18101,6 +18166,7 @@ async fn did_open_transactional(
                     commit_retries = commit_retries.saturating_add(1);
                     convergence_rounds = 0;
                     local_only = false;
+                    unindexable_prerequisites.clear();
                     continue;
                 }
                 break;
@@ -18390,6 +18456,10 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
             .publish_diagnostics(uri.clone(), Vec::new(), None)
             .await;
         drop(publish_guard);
+        // Closing a parent whose buffer ran its children in a different
+        // directory than its file on disk queues them; the continuation
+        // below has no backend to drain the queue with.
+        backend.refresh_open_children_after_parent_change().await;
 
         let close = effects
             .close
@@ -23083,10 +23153,45 @@ impl Backend {
             .await;
     }
 
+    /// Re-derive open documents whose inherited working directory a commit
+    /// may have changed (`WorldState::open_wd_refresh_queue`): new diagnostics
+    /// alone would reuse the stale metadata. Each refresh runs on its own
+    /// coordinator; its commit's revalidations are spawned when it lands.
+    async fn refresh_open_children_after_parent_change(&self) {
+        let stale = std::mem::take(&mut self.state.write().await.open_wd_refresh_queue);
+        for uri in stale {
+            let Some(receipt) = self.schedule_open_tar_source_parent_refresh(uri).await else {
+                continue;
+            };
+            let shutdown = self.routing_tasks.shutdown_token();
+            let _ = self.routing_tasks.spawn_root(
+                self.clone()
+                    .revalidate_after_open_refresh(receipt, shutdown),
+            );
+        }
+    }
+
+    /// Spawn the revalidations of a refresh commit once it lands. Boxed
+    /// behind a named type: it re-enters `spawn_analysis_revalidation_tickets`,
+    /// which drains the refresh queue, and the recursion needs a nominal
+    /// future type for its `Send` check to terminate.
+    fn revalidate_after_open_refresh(
+        self,
+        receipt: OpenTarSourceRefreshReceipt,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            if let OpenTarSourceRefreshOutcome::Committed(tickets) = receipt.wait(shutdown).await {
+                self.spawn_analysis_revalidation_tickets(tickets).await;
+            }
+        })
+    }
+
     async fn spawn_analysis_revalidation_tickets(
         &self,
         tickets: Vec<crate::state::AnalysisRevalidationTicket>,
     ) {
+        self.refresh_open_children_after_parent_change().await;
         #[cfg(test)]
         let final_handoff_completion = {
             let capture = self
@@ -39378,6 +39483,342 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.contains(&y_uri),
             "gitignored module it imports"
+        );
+    }
+
+    /// When an open parent changes the directory it runs a sourced file in,
+    /// the open file follows, whether it inherits through the parent's
+    /// `source()` call or through its own backward directive: its metadata
+    /// takes the new directory and its diagnostics are republished, so a
+    /// `source("util.R")` that only resolves from the new directory stops
+    /// being reported missing without the child itself being edited.
+    #[tokio::test]
+    async fn an_open_file_follows_its_parent_changing_directory() {
+        an_open_file_follows_its_parent_changing_directory_with("source(\"util.R\")\n").await;
+        an_open_file_follows_its_parent_changing_directory_with(
+            "# raven: sourced-by ../main.R\nsource(\"util.R\")\n",
+        )
+        .await;
+    }
+
+    async fn an_open_file_follows_its_parent_changing_directory_with(child_text: &str) {
+        use futures_util::StreamExt;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        for dir in ["lib", "lib2", "scripts"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let main_text = |dir: &str| format!("# raven: cd {dir}\nsource(\"../scripts/child.R\")\n");
+        fs::write(base.join("main.R"), main_text("lib")).unwrap();
+        fs::write(base.join("scripts/child.R"), child_text).unwrap();
+        fs::write(base.join("lib2/util.R"), "f <- function() 1\n").unwrap();
+        let main_uri = Url::from_file_path(base.join("main.R")).unwrap();
+        let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+
+        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+        // The latest diagnostics published for the child: `Some(true)` while
+        // they report `util.R` missing.
+        let missing = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let collector = {
+            let missing = missing.clone();
+            let child_uri = child_uri.clone();
+            tokio::spawn(async move {
+                while let Some(message) = socket.next().await {
+                    if message.method() != "textDocument/publishDiagnostics" {
+                        continue;
+                    }
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                    if params.uri == child_uri {
+                        *missing.lock().unwrap() = Some(
+                            params
+                                .diagnostics
+                                .iter()
+                                .any(|diagnostic| diagnostic.message.contains("util.R")),
+                        );
+                    }
+                }
+            })
+        };
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&base).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false },
+                        "diagnosticUris": [main_uri.to_string(), child_uri.to_string()]
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = svc.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+        open_doc(backend, &main_uri, "r", 1, &main_text("lib")).await;
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+        let inherited = |state: &WorldState| {
+            state
+                .get_enriched_metadata(&child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone())
+        };
+        let lib = |dir: &str| base.join(dir).to_string_lossy().into_owned();
+        let until = |want: bool, what: &'static str| {
+            let missing = missing.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let now = *missing.lock().unwrap();
+                    if now == Some(want) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{child_text:?}: {what}, latest {now:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        until(true, "util.R must be missing from lib/").await;
+        // Let every worker the opens scheduled finish first, so the publish
+        // awaited below can only come from the parent's edit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backend
+            .state
+            .read()
+            .await
+            .cross_file_revalidation
+            .has_pending_for_test(&child_uri)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open diagnostics settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
+
+        change_doc(backend, &main_uri, 2, &main_text("lib2")).await;
+        until(false, "util.R resolves from lib2/").await;
+        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib2")));
+
+        // Closing the unsaved parent reverts it to its file (`cd lib`).
+        close_doc(backend, &main_uri).await;
+        until(true, "util.R is missing again once the parent closes").await;
+        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
+        collector.abort();
+    }
+
+    /// A metadata refresh retires the subject's in-flight diagnostics worker.
+    /// That worker was computed against the replaced metadata but keeps a
+    /// fresh trigger, since the text and version are unchanged; left running,
+    /// it could consume the refresh's force marker and gate out the refresh's
+    /// own republish.
+    #[tokio::test]
+    async fn a_metadata_refresh_cancels_the_subjects_stale_diagnostics_worker() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("child.R"), "x <- 1\n").unwrap();
+        let child_uri = Url::from_file_path(base.join("child.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&base).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        open_doc(backend, &child_uri, "r", 1, "x <- 1\n").await;
+
+        let mut state = backend.state.write().await;
+        state.diagnostics_gate.clear_force_republish(&child_uri);
+        let (_, stale_worker) = state.cross_file_revalidation.schedule(child_uri.clone());
+        let generation = state.documents.get_record(&child_uri).unwrap().generation();
+        let captured = state
+            .capture_open_metadata_derivation(&child_uri, generation)
+            .unwrap();
+        let derived = derive_open_metadata_reenrichment(&captured);
+        let tickets =
+            commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+        assert!(tickets.iter().any(|ticket| ticket.uri == child_uri));
+        assert!(stale_worker.is_cancelled());
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&child_uri),
+            1
+        );
+    }
+
+    /// Opening a file whose `source()` names a file that does not exist keeps
+    /// its cross-file context. On-demand indexing cannot satisfy that
+    /// prerequisite, and once it has tried, the open commits anyway instead of
+    /// exhausting its retries and falling back to a local-only candidate that
+    /// drops, among the rest, the directory a backward parent runs it in.
+    #[tokio::test]
+    async fn opening_a_file_that_sources_a_missing_file_keeps_its_context() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(base.join("lib")).unwrap();
+        fs::create_dir_all(base.join("scripts")).unwrap();
+        fs::write(
+            base.join("main.R"),
+            "# raven: cd lib\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        let child_text = "# raven: sourced-by ../main.R\nsource(\"missing.R\")\n";
+        fs::write(base.join("scripts/child.R"), child_text).unwrap();
+        let child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&base).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        open_doc(backend, &child_uri, "r", 1, child_text).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .get_enriched_metadata(&child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone()),
+            Some(base.join("lib").to_string_lossy().into_owned())
+        );
+    }
+
+    /// A file with no backward directive, sourced by a parent whose `cd` is in
+    /// effect, keeps the parent's working directory when it is opened and
+    /// edited, as it has while closed: its own `source("util.R")` resolves
+    /// from `lib/` instead of reporting a missing file.
+    #[tokio::test]
+    async fn an_open_file_keeps_the_directory_its_parent_runs_it_in() {
+        an_open_file_keeps_the_directory_its_parent_runs_it_in_with(false).await;
+    }
+
+    /// The same through a symlinked path to the workspace: the parent's edge
+    /// names the real path, so the open alias must find its parents there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_open_file_keeps_the_directory_its_parent_runs_it_in_through_an_alias() {
+        an_open_file_keeps_the_directory_its_parent_runs_it_in_with(true).await;
+    }
+
+    async fn an_open_file_keeps_the_directory_its_parent_runs_it_in_with(through_alias: bool) {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap().join("real");
+        fs::create_dir_all(base.join("lib")).unwrap();
+        fs::create_dir_all(base.join("scripts")).unwrap();
+        fs::write(
+            base.join("main.R"),
+            "# raven: cd lib\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(base.join("scripts/child.R"), "source(\"util.R\")\n").unwrap();
+        fs::write(base.join("lib/util.R"), "f <- function() 1\n").unwrap();
+        let opened_base = if through_alias {
+            let link = base.with_file_name("link");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&base, &link).unwrap();
+            link
+        } else {
+            base.clone()
+        };
+        let child_uri = Url::from_file_path(opened_base.join("scripts/child.R")).unwrap();
+        let lib = base.join("lib").to_string_lossy().into_owned();
+        // The graph names the file by its real path; its edge to `util.R`
+        // must resolve from the inherited directory there too.
+        let real_child_uri = Url::from_file_path(base.join("scripts/child.R")).unwrap();
+        let util_uri = Url::from_file_path(base.join("lib/util.R")).unwrap();
+        let resolves_util = |state: &WorldState| {
+            state
+                .cross_file_graph
+                .get_dependencies(&real_child_uri)
+                .iter()
+                .any(|edge| edge.to == util_uri)
+        };
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&base).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.index_workspace = true;
+            state.advance_workspace_scan_generation();
+        }
+        run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+
+        let inherited = |state: &WorldState| {
+            state
+                .get_enriched_metadata(&child_uri)
+                .and_then(|meta| meta.inherited_working_directory.clone())
+        };
+        open_doc(backend, &child_uri, "r", 1, "source(\"util.R\")\n").await;
+        assert_eq!(
+            inherited(&*backend.state.read().await).as_deref(),
+            Some(lib.as_str()),
+            "after open"
+        );
+        assert!(
+            resolves_util(&*backend.state.read().await),
+            "graph after open"
+        );
+        change_doc(backend, &child_uri, 2, "source(\"util.R\")\nf()\n").await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            inherited(&state).as_deref(),
+            Some(lib.as_str()),
+            "after edit"
+        );
+        assert!(resolves_util(&state), "graph after edit");
+        let diagnostics = snapshot_diagnostics(&state, &child_uri);
+        assert!(
+            diagnostics.iter().all(|d| !d.message.contains("not found")),
+            "{diagnostics:?}"
         );
     }
 

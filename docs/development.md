@@ -215,7 +215,7 @@ Rough pipeline:
 6. Resolve scope at a position by traversing edges and applying call-site filtering
 7. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
-Inherited working directories (step 2) come from a file's backward directives and, for a file without either a `cd` or a backward directive, from the parents that `source()` it (`forward_wd_proposals` in `state.rs`). A file whose proposing parents disagree gets none. The editor's workspace scan and `raven check` both derive them with `derive_workspace_dependency_graph`, which also re-resolves `{import}` script paths when it changes a file's directory.
+Inherited working directories (step 2) come from a file's backward directives and, for a file without either a `cd` or a backward directive, from the parents that `source()` it (`forward_wd_proposals` in `state.rs`). A file whose proposing parents disagree gets none. The editor's workspace scan and `raven check` both derive them with `derive_workspace_dependency_graph`, which also re-resolves `{import}` script paths when it changes a file's directory. Open documents take the same forward proposals from their parents' graph edges (`enrich_open_metadata_with_inherited_wd`). When a commit changes a parent's effective directory or its edges, `apply_open_commit_plan` queues the parent's open children in `WorldState::open_wd_refresh_queue`; the next revalidation hand-off re-derives each child's metadata through the open metadata refresh, whose commit force-marks the child so its unchanged-version diagnostics republish.
 
 Source-batch expansion is caller-owned and filesystem-backed; it has no
 process-global cache. A finalized record stores its ordered ordinal sources and
@@ -522,7 +522,11 @@ record, aliases, lifecycle, raw-cache invalidations, graph, pins, package
 projection, and final capped reservation. Direct/forward/backward
 prerequisites converge before that commit: dynamic Pending enrichment reports
 unmarked affected candidates, any already-owned tickets are drained, and a
-fresh final capture reserves the complete union once. `.Rprofile` and testthat
+fresh final capture reserves the complete union once. A prerequisite that a
+convergence round tried and failed to index (a `source()` of a file that does
+not exist) stops blocking the commit until a commit retry, so it
+cannot exhaust the bounded retry ceiling and degrade the open to a local-only
+candidate. `.Rprofile` and testthat
 scans overlay all authoritative buffers plus only package routes the candidate
 will authoritatively own, and reduce with its package `DidOpen` event into one
 package state. Package-library initialization precedes every derivation that
