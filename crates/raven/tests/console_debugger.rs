@@ -1334,7 +1334,9 @@ fn expressions_name_exactly_the_value_shown() {
 
 /// Stop that lands just after the user answered `readline()`, before R runs
 /// again, still ends the program: the answer is dropped and the code that
-/// asked is interrupted, instead of the program running on with it.
+/// asked is interrupted, instead of the program running on with it. Needs
+/// the `test-support` delay that widens that gap.
+#[cfg(feature = "test-support")]
 #[test]
 fn terminate_racing_a_readline_answer_still_ends_the_program() {
     if !r_available() {
