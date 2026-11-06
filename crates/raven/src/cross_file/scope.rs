@@ -1325,12 +1325,14 @@ fn current_frame_source_reaches_global(
 /// Merge a child's global assignments into the recursive resolver's flat
 /// scope, with the same parent-prefix bookkeeping as its forward child merge
 /// (#476): an identical binding is a no-op that still clears a stale marker,
-/// a parent-prefix-only name is overridden, anything else is first-wins.
+/// a parent-prefix-only name is overridden, and anything else is first-wins,
+/// or overrides under execution-order merging.
 fn merge_global_assignments_into_point_scope(
     scope: &mut ScopeAtPosition,
     forward_contributed: &mut HashSet<Arc<str>>,
     child: &ScopeArtifacts,
     queried_uri: &Url,
+    execution_order: bool,
 ) {
     for symbol in child_global_assignments(child, queried_uri) {
         let name = &symbol.name;
@@ -1341,7 +1343,7 @@ fn merge_global_assignments_into_point_scope(
             continue;
         }
         scope.removed_names.remove(name);
-        if scope.parent_prefix_symbol_names.remove(name) {
+        if scope.parent_prefix_symbol_names.remove(name) || execution_order {
             scope.symbols.insert(name.clone(), symbol.clone());
         } else {
             scope
@@ -9055,12 +9057,20 @@ where
                 && let Some(child_artifacts) =
                     forward_child_uri(*src_line, *src_col, source).and_then(|u| get_artifacts(&u))
             {
-                merge_global_assignments_into_point_scope(
-                    &mut scope,
-                    &mut forward_contributed,
-                    &child_artifacts,
-                    uri,
-                );
+                // Same depth budget as an ordinary forward child.
+                if current_depth + 1 >= max_depth {
+                    scope
+                        .depth_exceeded
+                        .push((uri.clone(), *src_line, *src_col));
+                } else {
+                    merge_global_assignments_into_point_scope(
+                        &mut scope,
+                        &mut forward_contributed,
+                        &child_artifacts,
+                        uri,
+                        merge_policy.is_execution_order(),
+                    );
+                }
             }
             continue;
         }
@@ -9090,12 +9100,20 @@ where
                     && !merge_policy.is_execution_order()
                 {
                     if let Some(child_artifacts) = child_uri.as_ref().and_then(get_artifacts) {
-                        merge_global_assignments_into_point_scope(
-                            &mut scope,
-                            &mut forward_contributed,
-                            &child_artifacts,
-                            uri,
-                        );
+                        // Same depth budget as an ordinary forward child.
+                        if current_depth + 1 >= max_depth {
+                            scope
+                                .depth_exceeded
+                                .push((uri.clone(), *src_line, *src_col));
+                        } else {
+                            merge_global_assignments_into_point_scope(
+                                &mut scope,
+                                &mut forward_contributed,
+                                &child_artifacts,
+                                uri,
+                                false,
+                            );
+                        }
                     }
                     continue;
                 }
@@ -12038,6 +12056,10 @@ where
         src_col: u32,
         source: &ForwardSource,
     ) -> Vec<ScopedSymbol> {
+        // Same depth budget as `resolve_source_contribution`.
+        if self.resolution_depth + 1 >= self.max_depth {
+            return Vec::new();
+        }
         let Some(child) = self
             .forward_child_uri(src_line, src_col, source)
             .and_then(|child_uri| (self.get_artifacts)(&child_uri))
@@ -14128,6 +14150,26 @@ local({ caught <- 0; local({ caught <<- 12 }) })
             }
             assert!(!stream.is_visible("private"));
         }
+
+        // The child counts against the chain depth like any forward source.
+        let shallow = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            1,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!shallow.symbols.contains_key("published"));
+        assert!(!shallow.depth_exceeded.is_empty());
     }
 
     #[test]
