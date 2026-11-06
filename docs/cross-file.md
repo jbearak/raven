@@ -100,7 +100,7 @@ y <- foo()     # foo() from a.R is now in scope
 
 This applies to `source()` calls and to forward directives. The scope model aims to match what is available at runtime, for the cases Raven can determine statically. See [Symbol recognition](#symbol-recognition) for what's covered.
 
-`source("child.R", local = TRUE)` evaluates the child where `source()` is called. At the top level of a script it behaves like a plain `source()`, so the child's definitions reach the rest of the script. Inside a `local({ ... })` block they reach the rest of that block, and inside a function body the rest of that function. See [`source(local = TRUE)` inheritance](#how-raven-reads-source-calls) for the exact rules.
+`source("child.R", local = TRUE)` evaluates the child where `source()` is called. At the top level of a script it behaves like a plain `source()`, so the child's definitions reach the rest of the script. Inside a `local({ ... })` block they reach the rest of that block, and inside a function body the rest of that function. The child's [global assignments](#global-assignments) reach the rest of the script from a block too. See [`source(local = TRUE)` inheritance](#how-raven-reads-source-calls) for the exact rules.
 
 ### Global symbol hoisting
 
@@ -125,6 +125,26 @@ Raven recognizes these R constructs as definitions:
 - `name <- expr`, `name <<- expr`, `expr -> name`, `expr ->> name`
 - `name = expr` (in assignment context)
 - `assign("name", expr)` (string-literal names only)
+
+#### Global assignments
+
+`assign("name", expr, envir = globalenv())` (or `envir = .GlobalEnv`) with a literal name, and `name <<- expr` where no enclosing `local()` frame binds `name`, define `name` in the global scope from that point on. That holds even when the assignment runs outside the global frame:
+
+- inside `local({ ... })` or an `if` block;
+- at the top level of a file that a caller sources with `local = TRUE`, including from inside `local()`.
+
+In the second case, both the rest of that file and the caller after the `source()` call see the name:
+
+```r
+# main.R
+local({ source("R/setup.R", local = TRUE) })
+print(config)  # defined by R/setup.R
+
+# R/setup.R
+assign("config", list(debug = TRUE), envir = globalenv())
+```
+
+A non-literal name or any other `envir` defines nothing, and a read before the call is still undefined. Raven doesn't follow function calls, so an assignment inside a function body still only counts within that function.
 
 For symbols created dynamically (`eval()`, `load()`, `assign()` with a computed name), use [declaration directives](directives.md#declaration-directives).
 
@@ -401,6 +421,7 @@ For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed 
 
 `source("child.R", local = TRUE)` evaluates the child in the environment that calls `source()`, and the child's new definitions land in that same environment. Where they're visible depends on where the call sits:
 
+<<<<<<< HEAD
 - **At the top level of a script**, the environment is the one the script's own definitions live in. For a script run in the global environment, as `Rscript` and an interactive session run one, the call behaves exactly like the default `local = FALSE`. The child sees every parent binding defined before the call, and the child's definitions are visible in the parent after it. Wrapping the call in braces, `if`, a loop, or an assignment doesn't change this.
 - **Inside `local({ ... })`**, the environment is the block's. The child sees the parent's bindings as of the call, including ones the block defined earlier, and its definitions are visible in the rest of the block and nowhere after it. So `d <- local({ source("child.R", local = TRUE); d })` works even when only the child creates `d`, and the child's other names don't leak into the script. `local()` with an explicit `envir`, or a `local` the file redefines, isn't modeled this way.
 - **Inside a function body**, the environment is the function's frame. The child sees the function's earlier locals and the script's globals, read from the whole file as for any function body, and its definitions are visible in the rest of the function only.
@@ -408,6 +429,8 @@ For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`. A shadowed 
 A `local()` block also keeps its own definitions to itself, as in R: after `y <- local({ a <- 1; a })`, `a` is undefined. Two effects escape the block, as they do in R: `library()` attaches the package for the rest of the script, and `<<-` assigns in the enclosing environment. Unlike a function body, a block runs where it stands, so a global defined after the block isn't visible inside it.
 
 Inside any other call, such as `with()`, `tryCatch()`, or a Shiny `observe()` body, Raven doesn't assume the call runs its argument in the script's own environment, so `local = TRUE` there isn't treated as top level.
+
+When the call sits inside a top-level `local({ ... })` block, the child's top-level [global assignments](#global-assignments) also reach the rest of the script after the block, since they bind in the global environment rather than the block's.
 
 This proven current-frame case is different from `local = some_environment`, `local = new.env()`, or another unknown expression, which don't inherit even at top level. The same rules apply inside evaluated capture code: `base::bquote(.(source("child.R", local = TRUE)), where = env)` doesn't inherit when `env` can't be proven to be the caller or global environment, while a proven `.GlobalEnv` `where` makes the call global.
 
