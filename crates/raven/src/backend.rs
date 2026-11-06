@@ -4519,32 +4519,23 @@ async fn prepare_workspace_scan(
         system_file_workspace_root: package_workspace_root,
         system_file_library_paths: library_paths,
     };
-    let (mut complete_graph, mut complete_open_metadata) =
-        derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context, true);
     // An `import::from()` path that resolves only from an inherited directory
     // can lead outside the scanned files; index those modules with the scan.
-    let admitted = crate::state::admit_local_module_targets(
-        &mut graph_entries,
-        context.workspace_root.as_ref(),
-        &inputs.exclusions,
-        &inputs.box_context,
-        inputs.basis.max_chain_depth,
-    );
-    if !admitted.is_empty() {
-        for uri in admitted {
-            complete_entries.insert(uri.clone(), graph_entries[&uri].clone());
-            scanned_uris.insert(uri);
-        }
-        // Reachability and pins below follow this graph, so it must carry
-        // the admitted modules' own edges (e.g. to a gitignored module they
-        // import explicitly).
-        (complete_graph, complete_open_metadata) = derive_workspace_dependency_graph(
+    // Reachability and pins below follow this graph, so it carries the
+    // admitted modules' own edges (e.g. to a gitignored module they import
+    // explicitly).
+    let (complete_graph, complete_open_metadata, admitted) =
+        crate::state::derive_workspace_graph_admitting_modules(
             &mut graph_entries,
-            None,
             &open_overlays,
             &context,
             true,
+            &inputs.box_context,
+            None,
         );
+    for uri in admitted {
+        complete_entries.insert(uri.clone(), graph_entries[&uri].clone());
+        scanned_uris.insert(uri);
     }
     // Ignore filtering applies to roots, not edges. Dynamic entries must not
     // keep ignored caller cycles alive solely because they were indexed once.

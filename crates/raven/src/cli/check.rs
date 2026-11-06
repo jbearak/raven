@@ -797,7 +797,7 @@ fn build_indexed_state_reporting(
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let (mut entries, scan) = crate::state::scan_workspace_reporting(
+    let (mut entries, mut scan) = crate::state::scan_workspace_reporting(
         std::slice::from_ref(workspace_url),
         max_chain_depth,
         &state.workspace_exclusions,
@@ -810,9 +810,10 @@ fn build_indexed_state_reporting(
     // graph from the derived metadata.
     let (system_file_workspace_name, system_file_workspace_root, system_file_library_paths) =
         state.snapshot_system_file_inputs();
-    crate::state::derive_workspace_dependency_graph(
+    // An `import::from()` path that resolves only from an inherited directory
+    // can lead outside the scanned files; index those modules too.
+    crate::state::derive_workspace_graph_admitting_modules(
         &mut entries,
-        None,
         &[],
         &crate::state::WorkspaceGraphDerivationContext {
             workspace_root: Some(workspace_url.clone()),
@@ -823,15 +824,8 @@ fn build_indexed_state_reporting(
             system_file_library_paths,
         },
         false,
-    );
-    // An `import::from()` path that resolves only from an inherited directory
-    // can lead outside the scanned files; index those modules too.
-    crate::state::admit_local_module_targets(
-        &mut entries,
-        Some(workspace_url),
-        &state.workspace_exclusions,
         &state.box_search_context(),
-        max_chain_depth,
+        Some(&mut scan),
     );
     // Preserve package text before bounded index admission can evict helpers.
     // Rope clones share their storage. Materialize and hash only evicted files

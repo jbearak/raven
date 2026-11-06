@@ -13588,20 +13588,87 @@ fn finish_scanned_entry(
     finalized.list_files_failures
 }
 
-/// Index the `{import}`/`{box}` module files that `entries` resolve to but
-/// don't contain, transitively, as the scan's own module pass does (same depth
-/// bound, discovery cap, and exclusions). Returns the URIs it added.
+/// [`derive_workspace_dependency_graph`] over a scan's entries, indexing the
+/// `{import}`/`{box}` module files they resolve to but don't contain, until a
+/// derivation finds no new ones. Returns the graph and open metadata of the
+/// last derivation and the URIs it added.
 ///
-/// The scan admits modules before [`derive_workspace_dependency_graph`] passes
-/// a parent's working directory down; an `import::from()` path that resolves
-/// only from that directory (and lies outside the scanned files) is found
-/// after it, so callers run this after the derivation.
-pub(crate) fn admit_local_module_targets(
+/// The scan admits modules before the derivation passes a parent's working
+/// directory down, so an `import::from()` path that resolves only from that
+/// directory (and lies outside the scanned files) is found after it. An
+/// admitted module can itself inherit a directory and so resolve further
+/// targets, hence the repeat. Admission follows the scan's own module pass:
+/// the same chain-depth bound and exclusions, and one 50,000-file cap across
+/// all rounds. When `report` is given, admitted files join its `discovered`
+/// list and their failed `list.files()` batches its failures, as scanned
+/// files do.
+pub(crate) fn derive_workspace_graph_admitting_modules(
+    entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
+    open_overlays: &[WorkspaceGraphOverlay],
+    context: &WorkspaceGraphDerivationContext,
+    refresh_open_source_batches: bool,
+    box_context: &crate::box_use::search_path::SearchPathContext,
+    mut report: Option<&mut WorkspaceScanReport>,
+) -> (
+    DependencyGraph,
+    HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    Vec<Url>,
+) {
+    let mut derived = derive_workspace_dependency_graph(
+        entries,
+        None,
+        open_overlays,
+        context,
+        refresh_open_source_batches,
+    );
+    let mut admitted = Vec::new();
+    // Each round that admits anything can only add files, so the cap bounds
+    // the rounds; the depth bound is a backstop.
+    for _ in 0..context.max_depth.max(1) {
+        let mut failures = Vec::new();
+        let round = admit_local_module_targets(
+            entries,
+            context.workspace_root.as_ref(),
+            &context.exclusions,
+            box_context,
+            context.max_depth,
+            50_000usize.saturating_sub(admitted.len()),
+            &mut failures,
+        );
+        if let Some(report) = report.as_deref_mut() {
+            report
+                .discovered
+                .extend(round.iter().filter_map(|uri| uri.to_file_path().ok()));
+            report.failed_list_files_batches.extend(failures);
+            report.failed_list_files_batches.sort_by(|(a, x), (b, y)| {
+                (a.as_str(), x.line, x.column).cmp(&(b.as_str(), y.line, y.column))
+            });
+        }
+        if round.is_empty() {
+            break;
+        }
+        admitted.extend(round);
+        derived = derive_workspace_dependency_graph(
+            entries,
+            None,
+            open_overlays,
+            context,
+            refresh_open_source_batches,
+        );
+    }
+    (derived.0, derived.1, admitted)
+}
+
+/// One admission round: index the module files `entries` resolve to but don't
+/// contain, transitively up to `max_chain_depth`, at most `limit` of them.
+fn admit_local_module_targets(
     entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
     workspace_root: Option<&Url>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
     box_context: &crate::box_use::search_path::SearchPathContext,
     max_chain_depth: usize,
+    limit: usize,
+    failures: &mut Vec<(Url, crate::cross_file::tar_source::ListFilesBatchFailure)>,
 ) -> Vec<Url> {
     let missing_targets = |entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
                            uri: &Url| {
@@ -13624,7 +13691,7 @@ pub(crate) fn admit_local_module_targets(
     let mut seen: HashSet<Url> = HashSet::new();
     let mut admitted = Vec::new();
     while let Some((uri, depth)) = queue.pop_front() {
-        if admitted.len() >= 50_000 || entries.contains_key(&uri) || !seen.insert(uri.clone()) {
+        if admitted.len() >= limit || entries.contains_key(&uri) || !seen.insert(uri.clone()) {
             continue;
         }
         let Ok(path) = uri.to_file_path() else {
@@ -13636,12 +13703,16 @@ pub(crate) fn admit_local_module_targets(
         let Some(mut item) = process_workspace_file(&path) else {
             continue;
         };
-        finish_scanned_entry(
-            &item.uri,
-            &mut item.entry,
-            workspace_root,
-            exclusions,
-            box_context,
+        failures.extend(
+            finish_scanned_entry(
+                &item.uri,
+                &mut item.entry,
+                workspace_root,
+                exclusions,
+                box_context,
+            )
+            .into_iter()
+            .map(|failure| (item.uri.clone(), failure)),
         );
         entries.insert(item.uri.clone(), item.entry);
         if depth < max_chain_depth {
@@ -15813,6 +15884,68 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 );
             }
         }
+    }
+
+    /// A module admitted because a parent's directory led to it can inherit a
+    /// directory of its own, from another parent that sources it, and so
+    /// resolve an `import::from()` target no earlier round could see.
+    /// Admission repeats until a derivation finds nothing new, and admitted
+    /// files join the scan report like scanned ones.
+    #[test]
+    fn module_admission_repeats_once_admitted_modules_inherit_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["W", "lib", "other"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let workspace = root.join("W");
+        fs::write(
+            workspace.join("main.R"),
+            "# raven: cd ../lib\nsource(\"../W/child.R\")\n",
+        )
+        .unwrap();
+        // Resolves only from `lib/`, which `main.R` passes down.
+        fs::write(
+            workspace.join("child.R"),
+            "import::from(\"x.R\", .all = TRUE)\n",
+        )
+        .unwrap();
+        // Gives `lib/x.R` the directory `other/` once it is indexed.
+        fs::write(
+            workspace.join("runner.R"),
+            "# raven: cd ../other\nsource(\"../lib/x.R\")\n",
+        )
+        .unwrap();
+        fs::write(root.join("lib/x.R"), "import::from(\"y.R\", .all = TRUE)\n").unwrap();
+        fs::write(root.join("other/y.R"), "g <- function() 1\n").unwrap();
+        let workspace_uri = Url::from_directory_path(&workspace).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&workspace_uri), 20);
+        let context = WorkspaceGraphDerivationContext {
+            workspace_root: Some(workspace_uri),
+            max_depth: 20,
+            exclusions: Default::default(),
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+        let mut report = WorkspaceScanReport::default();
+        let (_, _, admitted) = derive_workspace_graph_admitting_modules(
+            &mut entries,
+            &[],
+            &context,
+            false,
+            &Default::default(),
+            Some(&mut report),
+        );
+        let x = Url::from_file_path(root.join("lib/x.R")).unwrap();
+        let y = Url::from_file_path(root.join("other/y.R")).unwrap();
+        assert_eq!(admitted, vec![x, y.clone()]);
+        assert!(entries.contains_key(&y));
+        // `raven graph` reports a missing plan for any of them as incomplete.
+        assert_eq!(
+            report.discovered,
+            vec![root.join("lib/x.R"), root.join("other/y.R")]
+        );
     }
 
     /// A closed file that parents source from different working directories
