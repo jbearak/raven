@@ -13276,8 +13276,15 @@ fn commit_open_metadata_reenrichment(
     // and its version: the subject's diagnostics changed because a dependency
     // did, so its same-version republish needs a force marker like any other
     // dependent's, or the monotonic gate drops it. The dependency's own commit
-    // may already have reserved one for it; that one serves.
+    // may already have reserved one for it; that one serves, once the workers
+    // that could consume it first are cancelled.
     if effects.revalidations.iter().any(|ticket| ticket.uri == uri) {
+        // A worker computed against the replaced metadata keeps a fresh
+        // trigger (the text and version are unchanged), so it could consume
+        // that marker first and leave the new one gated out. This commit
+        // holds the publish lock, and workers re-check cancellation under it
+        // before consuming, so cancelling here retires them.
+        state.cross_file_revalidation.cancel(&uri);
         state.diagnostics_gate.ensure_force_republish(&uri);
     }
     Ok(effects.revalidations)
@@ -18449,6 +18456,10 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
             .publish_diagnostics(uri.clone(), Vec::new(), None)
             .await;
         drop(publish_guard);
+        // Closing a parent whose buffer ran its children in a different
+        // directory than its file on disk queues them; the continuation
+        // below has no backend to drain the queue with.
+        backend.refresh_open_children_after_parent_change().await;
 
         let close = effects
             .close
@@ -39601,7 +39612,61 @@ mod project_config_initialize_tests {
         change_doc(backend, &main_uri, 2, &main_text("lib2")).await;
         until(false, "util.R resolves from lib2/").await;
         assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib2")));
+
+        // Closing the unsaved parent reverts it to its file (`cd lib`).
+        close_doc(backend, &main_uri).await;
+        until(true, "util.R is missing again once the parent closes").await;
+        assert_eq!(inherited(&*backend.state.read().await), Some(lib("lib")));
         collector.abort();
+    }
+
+    /// A metadata refresh retires the subject's in-flight diagnostics worker.
+    /// That worker was computed against the replaced metadata but keeps a
+    /// fresh trigger, since the text and version are unchanged; left running,
+    /// it could consume the refresh's force marker and gate out the refresh's
+    /// own republish.
+    #[tokio::test]
+    async fn a_metadata_refresh_cancels_the_subjects_stale_diagnostics_worker() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("child.R"), "x <- 1\n").unwrap();
+        let child_uri = Url::from_file_path(base.join("child.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&base).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        open_doc(backend, &child_uri, "r", 1, "x <- 1\n").await;
+
+        let mut state = backend.state.write().await;
+        state.diagnostics_gate.clear_force_republish(&child_uri);
+        let (_, stale_worker) = state.cross_file_revalidation.schedule(child_uri.clone());
+        let generation = state.documents.get_record(&child_uri).unwrap().generation();
+        let captured = state
+            .capture_open_metadata_derivation(&child_uri, generation)
+            .unwrap();
+        let derived = derive_open_metadata_reenrichment(&captured);
+        let tickets =
+            commit_open_metadata_reenrichment(&mut state, captured, derived, &[]).unwrap();
+        assert!(tickets.iter().any(|ticket| ticket.uri == child_uri));
+        assert!(stale_worker.is_cancelled());
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&child_uri),
+            1
+        );
     }
 
     /// Opening a file whose `source()` names a file that does not exist keeps
