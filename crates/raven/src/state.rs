@@ -1349,6 +1349,11 @@ pub struct WorldState {
     /// and retries exact-basis conflicts until it commits, the open lifecycle
     /// disappears, or backend shutdown drains it.
     pub(crate) open_tar_source_refreshes: CrossFileRevalidationState,
+    /// Open documents whose inherited working directory may be stale because
+    /// a parent's directory or its `source()` edges changed in a commit. The
+    /// backend re-derives them after the commit (diagnostic tickets alone
+    /// would reuse the stale metadata).
+    pub(crate) open_wd_refresh_queue: std::collections::BTreeSet<Url>,
     pub cross_file_activity: CrossFileActivityState,
     /// Editor resources eligible to own push diagnostics, when the client
     /// supplies an explicit UI-resource set.
@@ -3450,7 +3455,7 @@ pub(crate) struct PreparedOpenAliasReconcileAnalysis {
 pub(crate) struct CapturedOpenMetadataAnalysis {
     pub(crate) box_context: crate::box_use::search_path::SearchPathContext,
     /// See [`forward_parents`].
-    pub(crate) forward_parents: Vec<(Url, bool)>,
+    pub(crate) forward_parents: Vec<ForwardParent>,
     basis: AnalysisBasis,
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
@@ -7791,6 +7796,7 @@ impl WorldState {
             package_config_generation: 0,
             cross_file_revalidation: CrossFileRevalidationState::new(),
             open_tar_source_refreshes: CrossFileRevalidationState::new(),
+            open_wd_refresh_queue: std::collections::BTreeSet::new(),
             cross_file_activity: CrossFileActivityState::new(),
             editor_diagnostic_uris: None,
             editor_eligibility_generation: EditorEligibilityGeneration(0),
@@ -9300,7 +9306,7 @@ impl WorldState {
         let (workspace_name, package_workspace_root, library_paths) =
             self.snapshot_system_file_inputs();
         Some(CapturedOpenMetadataAnalysis {
-            forward_parents: forward_parents(&self.cross_file_graph, uri),
+            forward_parents: forward_parents(&self.cross_file_graph, &graph_roots),
             box_context: self.box_search_context(),
             basis,
             uri: uri.clone(),
@@ -10695,6 +10701,7 @@ impl WorldState {
         let mut wd_affected = Vec::new();
         let workspace_root = self.workspace_folders.first().cloned();
         for projection in plan.graph {
+            let forward_children_before = forward_children(&self.cross_file_graph, &projection.uri);
             let result = self.cross_file_graph.update_file(
                 &projection.uri,
                 projection.graph_metadata.as_ref(),
@@ -10707,15 +10714,61 @@ impl WorldState {
                     .cross_file_graph
                     .make_forward_edges_non_lending(&projection.uri);
             }
-            wd_affected.extend(
+            let backward_affected =
                 crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                     &projection.uri,
                     projection.old_metadata.as_deref(),
                     projection.new_metadata.as_ref(),
                     &self.cross_file_graph,
                     &self.cross_file_meta,
-                ),
+                );
+            // Children that inherit through this parent's `source()` calls:
+            // re-derive those whose proposal from it changed, whether because
+            // the directory it runs them in changed or because it started or
+            // stopped sourcing them. A parent that proposes nothing (no `cd`
+            // in effect, no `chdir = TRUE`) queues nothing.
+            let effective_wd = |metadata: Option<&crate::cross_file::CrossFileMetadata>| {
+                metadata.and_then(|metadata| {
+                    metadata
+                        .working_directory
+                        .clone()
+                        .or_else(|| metadata.inherited_working_directory.clone())
+                })
+            };
+            let proposals = |children: Vec<(Url, bool)>, wd: Option<String>| {
+                children
+                    .into_iter()
+                    .filter_map(|(child, chdir)| {
+                        // `chdir = TRUE` runs the child in its own directory.
+                        let proposal = if chdir {
+                            Some(None)
+                        } else {
+                            wd.clone().map(Some)
+                        };
+                        proposal.map(|proposal| (child, proposal))
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let before = proposals(
+                forward_children_before,
+                effective_wd(projection.old_metadata.as_deref()),
             );
+            let after = proposals(
+                forward_children(&self.cross_file_graph, &projection.uri),
+                effective_wd(Some(projection.new_metadata.as_ref())),
+            );
+            let mut refresh = backward_affected.clone();
+            refresh.extend(
+                before
+                    .symmetric_difference(&after)
+                    .map(|(child, _)| child.clone()),
+            );
+            for child in refresh {
+                if let Some(open_child) = self.open_document_uri_for_authoritative_uri(&child) {
+                    self.open_wd_refresh_queue.insert(open_child);
+                }
+            }
+            wd_affected.extend(backward_affected);
         }
         let close_post_graph_neighbors: Vec<Url> = changed_authoritative_roots
             .iter()
@@ -12363,22 +12416,54 @@ pub(crate) struct WorkspaceGraphDerivationContext {
     pub(crate) system_file_library_paths: Vec<PathBuf>,
 }
 
-/// The files that `source()` `uri` (or name it in a forward directive) on an
-/// edge that lends scope, each with that edge's `chdir`: the parents that can
-/// pass it a working directory.
+/// A file that `source()`s an open document (or names it in a forward
+/// directive) on an edge that lends scope: a parent that can pass it a working
+/// directory.
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardParent {
+    pub(crate) parent: Url,
+    /// The edge's `chdir`.
+    pub(crate) chdir: bool,
+    /// The URI the edge names, one of the document's graph roots: a
+    /// `chdir = TRUE` parent runs the file in that path's directory, which
+    /// for an alias is not the editor URI's.
+    pub(crate) child: Url,
+}
+
+/// The [`ForwardParent`]s of a document, over all of its graph `roots` (its
+/// editor URI and the aliases its graph edges may name instead).
 pub(crate) fn forward_parents(
     graph: &crate::cross_file::DependencyGraph,
-    uri: &Url,
-) -> Vec<(Url, bool)> {
+    roots: &[Url],
+) -> Vec<ForwardParent> {
+    roots
+        .iter()
+        .flat_map(|root| graph.get_dependents(root))
+        .filter(|edge| {
+            edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
+                && !edge.is_backward_directive
+                && !edge.non_lending
+        })
+        .map(|edge| ForwardParent {
+            parent: edge.from.clone(),
+            chdir: edge.chdir,
+            child: edge.to.clone(),
+        })
+        .collect()
+}
+
+/// The files `uri` sources on an edge that can pass a working directory
+/// down: the reverse of [`forward_parents`].
+fn forward_children(graph: &crate::cross_file::DependencyGraph, uri: &Url) -> Vec<(Url, bool)> {
     graph
-        .get_dependents(uri)
+        .get_dependencies(uri)
         .into_iter()
         .filter(|edge| {
             edge.kind == crate::cross_file::DependencyEdgeKind::OrdinarySource
                 && !edge.is_backward_directive
                 && !edge.non_lending
         })
-        .map(|edge| (edge.from.clone(), edge.chdir))
+        .map(|edge| (edge.to.clone(), edge.chdir))
         .collect()
 }
 
@@ -12393,7 +12478,7 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
     uri: &Url,
     workspace_root: Option<&Url>,
     get_metadata: impl Fn(&Url) -> Option<Arc<crate::cross_file::CrossFileMetadata>>,
-    forward_parents: &[(Url, bool)],
+    forward_parents: &[ForwardParent],
     max_depth: usize,
 ) {
     crate::cross_file::enrich_metadata_with_inherited_wd(
@@ -12406,22 +12491,22 @@ pub(crate) fn enrich_open_metadata_with_inherited_wd(
     if metadata.working_directory.is_some() || metadata.inherited_working_directory.is_some() {
         return;
     }
-    let Ok(child_path) = uri.to_file_path() else {
-        return;
-    };
     let mut proposals = std::collections::BTreeSet::new();
-    for (parent_uri, chdir) in forward_parents {
-        let Some(parent) = get_metadata(parent_uri) else {
+    for edge in forward_parents {
+        let Ok(child_path) = edge.child.to_file_path() else {
+            continue;
+        };
+        let Some(parent) = get_metadata(&edge.parent) else {
             continue;
         };
         let Some(context) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            parent_uri,
+            &edge.parent,
             &parent,
             workspace_root,
         ) else {
             continue;
         };
-        if let Some(directory) = context.forward_child_inherited_wd(&child_path, *chdir) {
+        if let Some(directory) = context.forward_child_inherited_wd(&child_path, edge.chdir) {
             proposals.insert(directory.to_string_lossy().into_owned());
         }
     }

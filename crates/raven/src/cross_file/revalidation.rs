@@ -337,6 +337,17 @@ impl CrossFileDiagnosticsGate {
         Self::mark_force_republish_locked(&mut force, uri);
     }
 
+    /// Make sure one forced republish is outstanding for `uri`, marking it
+    /// only when none is. For a republish that any outstanding marker already
+    /// serves: one publish of the current state satisfies both reservations,
+    /// and a second marker would outlive it.
+    pub fn ensure_force_republish(&self, uri: &Url) {
+        let mut force = self.force_republish.write().unwrap();
+        if !force.contains_key(uri) {
+            Self::mark_force_republish_locked(&mut force, uri);
+        }
+    }
+
     /// Mark every URI in the iterator for forced republish under a single
     /// `force_republish` write-lock acquisition. Use this when fanning out
     /// to a batch of dependents so we don't pay the lock pair per URI.
