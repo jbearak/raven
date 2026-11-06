@@ -4519,19 +4519,32 @@ async fn prepare_workspace_scan(
         system_file_workspace_root: package_workspace_root,
         system_file_library_paths: library_paths,
     };
-    let (complete_graph, complete_open_metadata) =
+    let (mut complete_graph, mut complete_open_metadata) =
         derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context, true);
     // An `import::from()` path that resolves only from an inherited directory
     // can lead outside the scanned files; index those modules with the scan.
-    for uri in crate::state::admit_local_module_targets(
+    let admitted = crate::state::admit_local_module_targets(
         &mut graph_entries,
         context.workspace_root.as_ref(),
         &inputs.exclusions,
         &inputs.box_context,
         inputs.basis.max_chain_depth,
-    ) {
-        complete_entries.insert(uri.clone(), graph_entries[&uri].clone());
-        scanned_uris.insert(uri);
+    );
+    if !admitted.is_empty() {
+        for uri in admitted {
+            complete_entries.insert(uri.clone(), graph_entries[&uri].clone());
+            scanned_uris.insert(uri);
+        }
+        // Reachability and pins below follow this graph, so it must carry
+        // the admitted modules' own edges (e.g. to a gitignored module they
+        // import explicitly).
+        (complete_graph, complete_open_metadata) = derive_workspace_dependency_graph(
+            &mut graph_entries,
+            None,
+            &open_overlays,
+            &context,
+            true,
+        );
     }
     // Ignore filtering applies to roots, not edges. Dynamic entries must not
     // keep ignored caller cycles alive solely because they were indexed once.
@@ -39308,6 +39321,72 @@ mod project_config_initialize_tests {
                 .get_dependencies(&child_uri)
                 .iter()
                 .any(|edge| edge.to == stale_helper_uri)
+        );
+    }
+
+    /// A module found only through an inherited working directory is indexed
+    /// by the scan, and so is a gitignored module it imports explicitly: the
+    /// scan's reachability follows the admitted module's own edges.
+    #[tokio::test]
+    async fn workspace_scan_indexes_import_modules_found_through_an_inherited_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let workspace = base.join("W");
+        fs::create_dir_all(workspace.join("generated")).unwrap();
+        fs::create_dir_all(base.join("shared")).unwrap();
+        fs::write(workspace.join(".gitignore"), "generated/\n").unwrap();
+        fs::write(
+            workspace.join("main.R"),
+            "# raven: cd ../shared\nsource(\"../W/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("child.R"),
+            "import::from(\"x.R\", .all = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(
+            base.join("shared/x.R"),
+            "import::from(\"../W/generated/y.R\", .all = TRUE)\nf <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("generated/y.R"), "g <- function() 2\n").unwrap();
+        let x_uri = Url::from_file_path(base.join("shared/x.R")).unwrap();
+        let y_uri = Url::from_file_path(workspace.join("generated/y.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&workspace).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.index_workspace = true;
+            state.advance_workspace_scan_generation();
+        }
+        run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.contains(&x_uri),
+            "module via inherited directory"
+        );
+        assert!(
+            state.workspace_index.contains(&y_uri),
+            "gitignored module it imports"
         );
     }
 
