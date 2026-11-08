@@ -672,6 +672,34 @@ fn build_indexed_state(
     Ok(state)
 }
 
+/// The canonical workspace root and its URL for `--workspace` (relative to
+/// `cwd`; default `cwd`), for `raven graph` and `raven parse`. A root that
+/// isn't a directory would scan as an empty workspace, so it is an operator
+/// error, printed as `{command}: ...`.
+pub(crate) fn resolve_workspace_root(
+    command: &str,
+    workspace: Option<&Path>,
+    cwd: &Path,
+) -> Result<(PathBuf, Url), i32> {
+    let abs_workspace = match workspace {
+        Some(path) => absolute_path(cwd, path),
+        None => cwd.to_path_buf(),
+    };
+    let root = std::fs::canonicalize(&abs_workspace).unwrap_or(abs_workspace);
+    if !root.is_dir() {
+        eprintln!(
+            "{command}: workspace is not a directory: {}",
+            root.display()
+        );
+        return Err(EXIT_OPERATOR_ERROR);
+    }
+    let Ok(workspace_url) = Url::from_file_path(&root) else {
+        eprintln!("{command}: invalid workspace path: {}", root.display());
+        return Err(EXIT_OPERATOR_ERROR);
+    };
+    Ok((root, workspace_url))
+}
+
 /// What [`prepare_workspace`] needs: the command name for messages, where the
 /// workspace and config are, and whether the dependency graph keeps edge plans
 /// (only `raven graph` turns that on).
