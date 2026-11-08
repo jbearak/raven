@@ -46,8 +46,8 @@ check [PATHS...]             Index the workspace and report full diagnostics
   --workspace DIR            Workspace root to index (default: current directory)
 graph                        Print the cross-file graph Raven builds for the
                              workspace (--format json is the stable contract)
-parse [FILES...]             Print each R file's statements and comments as
-                             JSON, one document per line
+parse [FILES...]             Print each R file's statements, comments, and
+                             syntax tree as JSON, one document per line
 lint [PATHS...]              Run the native style linter on files / directories
 analysis-stats <path>        Profile workspace analysis phases
   --csv                      Output results in CSV format

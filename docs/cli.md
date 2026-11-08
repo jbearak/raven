@@ -9,7 +9,7 @@ The `raven` binary checks R code from a terminal or CI job, manages the package 
 | [`raven check`](#raven-check) | Indexes the workspace and reports the full diagnostic set, the same diagnostics the editor publishes. |
 | [`raven lint`](#raven-lint) | Runs only the native style linter. |
 | [`raven graph`](#raven-graph) | Prints the links Raven found between files: `source()` calls, directives, and the rest of the cross-file graph. |
-| [`raven parse`](#raven-parse) | Prints each R file's statements and comments as JSON, for tools that read R code. |
+| [`raven parse`](#raven-parse) | Prints each R file's statements, comments, and syntax tree as JSON, for tools that read R code. |
 | [`raven packages update`](#raven-packages-update) | Downloads CRAN/Bioconductor export names so `raven check` recognizes package functions without R. |
 | [`raven packages freeze`](#raven-packages-freeze) | Writes a committed `.raven/packages.json` from your installed packages. |
 | [`raven packages fetch`](#raven-packages-fetch) | Writes the same file from r-universe, with no R needed. |
@@ -412,7 +412,7 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 
 ## `raven parse`
 
-Print what Raven parsed in each R file as JSON: every statement with its exact source text and range, and every comment. A downstream tool, such as one that translates R code into another language, can use it to keep the comments and the layout of the code it reads.
+Print what Raven parsed in each R file as JSON: every statement with its exact source text, range, and syntax tree, and every comment. A downstream tool, such as one that translates R code into another language, can use it to read the code as R parses it and keep its comments and layout.
 
 ```text
 raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format json]
@@ -423,10 +423,10 @@ raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format
 <!-- example: parse-json -->
 ```console
 $ raven parse clean.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}}}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}}},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}}}}}],"comments":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}}}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[]}
 ```
 
-The command is new, and its output is growing. The full syntax tree (names, literal types and values, operators as written, argument names), parsed `# raven:` directives on comments, a list of parse errors, and the package each call resolves to are being added. Each arrives as new fields and values under the versioning rule below, so code written against this page keeps working.
+The command is new, and its output is growing. Parsed `# raven:` directives on comments, a list of parse errors with narrower `unparsed` spans, and the package each call resolves to are being added. Each arrives as new fields and values under the versioning rule below, so code written against this page keeps working.
 
 ### Parse options
 
@@ -448,7 +448,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 <!-- example: parse-unreadable -->
 ```console
 $ raven parse clean.R gone.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}}}}}],"comments":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[]}
 {"schema_version":1,"raven_version":"0.23.7","path":"gone.R","error":{"message":"No such file or directory (os error 2)"}}
 ```
 
@@ -458,7 +458,7 @@ That run exits `3`.
 
 Every document has `schema_version` (currently `1`) and `raven_version`. Removing or renaming a field, changing a field's type, or changing what a field or a value means increments `schema_version`. Adding a field, a node kind, or a value to any enum-like field doesn't. The rule applies from the first release that includes `raven parse`.
 
-Every enum-like field is open: node `kind`, comment `kind`, the encoding `name`, `line_endings`, and the fields still to come, such as operators, literal types, directive kinds, resolution kinds, and error sources and severities. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
+Every enum-like field is open: node `kind`, operator `op`, literal `type`, name `form`, comment `kind`, the encoding `name`, `line_endings`, and the fields still to come, such as directive kinds, resolution kinds, and error sources and severities. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
 
 ### Parse positions
 
@@ -501,27 +501,88 @@ Parsed directives on `# raven:` comments are being added.
 
 ### Parse syntax tree
 
-Each statement's `expression` is a tree of nodes. Every node has `kind` and `range`, and its child nodes are in named fields, in source order. A field for an optional part, such as an `if` without `else` or a parameter without a default, is `null`. This version reports the tree's structure; the details of each node are being added.
+Each statement's `expression` is a tree of nodes. Every node has `kind` and `range`, whatever its kind, so you can still show the source of a node whose kind you don't know. Every child's range lies inside its parent's. The tree is the source as written, not R's rewritten form: `x |> f()` stays a `pipe`, `x -> y` keeps its arrow, `2 ** 3` keeps `**`, and parentheses are a node of their own.
 
-| `kind` | What it is | Child fields |
+`kind`, `op`, `type`, and `form` are open enums, so read a value you don't know as "other". After `kind` and `range`, a node has the fields listed below, details before child nodes, and its child nodes are in source order. A field for an optional part, such as an `if` without `else`, is `null`.
+
+Leaves have a `text`: the source as written, which slicing the file by the node's `range` gives.
+
+| `kind` | What it is | Fields |
 |---|---|---|
-| `identifier` | A name, including `...` and `..1` | |
-| `number`, `string`, `constant` | A literal; `constant` is `TRUE`, `FALSE`, `NULL`, `NA` and its typed forms, `Inf`, or `NaN` | |
-| `call` | `f(...)` | `function`, `arguments` |
-| `index` | `x[...]` or `x[[...]]` | `target`, `arguments` |
-| `namespace`, `extract` | `pkg::name` or `pkg:::name`; `x$name` or `x@name` | `left`, `right` |
-| `assignment` | `<-`, `<<-`, `=`, `->`, `->>`, or `:=` | `target`, `value`, in source order |
-| `pipe`, `binary` | `\|>`; any other binary operator | `left`, `right` |
-| `formula` | `~`, with or without a left side | `left` (`null` when one-sided), `right` |
-| `unary` | `-`, `+`, `!`, or unary `?` | `operand` |
-| `parenthesized` | `( ... )` | `body` |
-| `function` | `function(...)` or `\(...)` | `parameters`, `body` |
-| `if`, `for`, `while`, `repeat` | Control flow | `condition`, `consequence`, `alternative`; `variable`, `sequence`, `body`; `condition`, `body`; `body` |
-| `next`, `break` | Loop control | |
-| `block` | `{ ... }` | `statements`, `comments` (`block_end`) |
-| `unparsed` | Source with a syntax error | |
+| `identifier` | A name | `text`, `name`, `form` |
+| `placeholder` | The pipe placeholder `_` | `text` |
+| `number` | A number literal | `text`, `type`, `value` |
+| `string` | A string literal | `text`, `value`, `quote`, `raw`, `delimiters` |
+| `constant` | `TRUE`, `FALSE`, `NULL`, `NA` and its typed forms, `Inf`, or `NaN` | `text`, `type` |
+| `next`, `break` | Loop control | `text` |
+| `unparsed` | Source with a syntax error | `text` |
 
-`arguments` and `parameters` are lists of entries, not nodes: each has the entry's `range` and its `value` (arguments) or `default` (parameters) node. Argument names, empty arguments such as the second in `x[i, ]`, and the pipe placeholder `_` as its own kind are being added.
+The other nodes:
+
+| `kind` | What it is | Fields |
+|---|---|---|
+| `call` | `f(...)`, where the function is any expression | `function`, `arguments` |
+| `index` | `x[...]` or `x[[...]]` | `op` (`[` or `[[`), `target`, `arguments` |
+| `extract` | `x$name` or `x@name` | `op` (`$` or `@`), `left`, `right` (an `identifier`) |
+| `namespace` | `pkg::name` or `pkg:::name` | `op` (`::` or `:::`), `left`, `right` (both `identifier`) |
+| `assignment` | `<-`, `<<-`, `=`, `->`, `->>`, or `:=` | `op`, `target`, `value` |
+| `pipe` | `\|>` | `op`, `left`, `right` |
+| `binary` | Any other binary operator | `op`, `left`, `right` |
+| `formula` | `~`, with or without a left side | `op`, `left` (`null` when one-sided), `right` |
+| `unary` | `-`, `+`, `!`, or unary `?` | `op`, `operand` |
+| `parenthesized` | `( ... )` | `body` |
+| `block` | `{ ... }` | `statements`, `comments` (`block_end`) |
+| `function` | `function(...)` or `\(...)` | `keyword` (`function` or `\`), `parameters`, `body` |
+| `if` | `if`, with an optional `else` | `condition`, `consequence`, `alternative` |
+| `for` | `for (i in s)` | `variable` (an `identifier`), `sequence`, `body` |
+| `while` | `while (c)` | `condition`, `body` |
+| `repeat` | `repeat` | `body` |
+
+#### Tree operators
+
+`op` is the operator as written. On a `binary` node it is one of `+`, `-`, `*`, `/`, `^`, `**`, `:`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&`, `&&`, `|`, `||`, and `?`, or a `%...%` operator with its text, such as `%%`, `%/%`, `%in%`, or `%>%`.
+
+An `assignment`'s `target` is what is assigned to, wherever it stands. `->` and `->>` keep their direction, so `x -> y` has `value` `x` and `target` `y`. `=` is an `assignment` only where R reads it as one, such as `x = 1` as a statement or `(x = 1)`. In `f(x = 1)` it names an argument. Control flow is an expression, so `y <- if (c) a else b` has an `if` as its `value`. An `else if` is an `alternative` that is itself an `if`.
+
+R's parser has no negative literals, so `-1` is a `unary` `-` over the number `1`, and `-Inf` is one over the constant `Inf`. Nested operators stay nested: `!!x` is two `unary` `!` nodes, `!!!x` is three, and `!(!x)` has a `parenthesized` node between its two. `{{ x }}` is a `block` whose one statement is a `block`.
+
+#### Tree names
+
+An `identifier`'s `name` is the name as R reads it, and `form` says how it was written:
+
+- `plain`: `x`, `...`, `..1`, `.`, `.data`, `T`, `F`. `T` and `F` are identifiers, not constants, because they can be reassigned.
+- `backtick`: `` `größe` ``. The `name` drops the backticks and decodes backslash escapes as R does, so `` `a\`b` `` is the name ``a`b``.
+- `string`: a string where R accepts one in a name's place. That is an argument name (`c("a" = "b")`, `f("msg" = e)`), either side of `::` (`"dplyr"::filter`), or the right side of `$` or `@` (`d$"x"`). The `name` is the string's value.
+
+Names are reported as written, with no Unicode normalization. `NULL` as an argument name, as in `f(NULL = 1)`, which R allows, is the identifier `NULL` with form `plain`. When R rejects a name, such as `` `\u{e9}` `` (R doesn't allow `\u` in backticks) or an empty argument name, the `identifier` has no `name`.
+
+A plain `_` is always a `placeholder`, because it is R's pipe placeholder. R accepts it as a named argument in a pipe step (`x |> f(y = _)`) and at the head of an extraction (`x |> _$a`). A backticked `` `_` `` is an identifier. `.` in a `%>%` step is an ordinary identifier, kept where it stands, so `f(a, .)` and `f(a, g(.))` differ.
+
+#### Tree literals
+
+A `number`'s `type` is the type R's parser gives it, which isn't always what its spelling suggests:
+
+| Written | `type` |
+|---|---|
+| `1`, `1e3`, `0x10`, `0x1p3` | `double` |
+| `1L`, `1e3L`, `0x10L`, and `1.0L`, which R warns about | `integer` |
+| `1.5L`, `1e-3L`, `100000000000L`: R can't make an integer of them, so it warns and uses the double | `double` |
+| `1i`, `0x10i` | `complex` |
+
+`value` is the number as a JSON number, in the shortest form that reads back as the same double: `16` for `0x10L`, `0.001` for `1e-3L`. R's numbers are doubles or 32-bit integers, so a JSON parser that reads numbers as doubles gets R's value exactly. A complex literal's `value` is its imaginary part. A literal too large for a double, such as `1e999`, is `Inf` in R and has `"value": null`.
+
+A `constant`'s `type` is R's: `logical` for `TRUE`, `FALSE`, and `NA`, `integer` for `NA_integer_`, `double` for `NA_real_`, `Inf`, and `NaN`, `complex` for `NA_complex_`, `character` for `NA_character_`, and `NULL` for `NULL`.
+
+A `string`'s `value` is the string R reads. Escapes are decoded as R decodes them, such as `\n`, `\"`, `\x41`, `\101`, `\u{00e9}`, and `\U{1F600}`, and a line ending inside the string reads as `\n`. `quote` is `"` or `'`. `raw` is `true` for a raw string, whose `value` is its content as written. `delimiters` has the `open` and `close` text around the content: `"` and `"`, or `r"---(` and `)---"` for `r"---(text)---"`.
+
+A `string` has no `value` when R rejects it, as for an unknown escape such as `\q` or for `\u` and `\x` escapes mixed in one string. It also has none when R's value isn't Unicode text, as for `"\xe9"`, a lone byte that isn't UTF-8. R's errors and warnings for these literals, and for `1.0L` and its kin, are being added as an `errors` list.
+
+#### Tree arguments and parameters
+
+`arguments`, on `call` and `index`, and `parameters`, on `function`, are lists of entries. An entry isn't a node and has no `kind`, but it has the whole entry's `range`.
+
+- An argument has `name`, an `identifier` or `null`, and `value`, a node or `null`. Arguments are in their original order, named and positional mixed as written. An empty argument, such as the second in `x[i, ]` or the first in `d[, y := e]`, has `null` for both, and an empty `range` just after the `(`, `[`, `[[`, or comma before it. As in R, `f()` has no arguments and `f(,)` has two empty ones. A named argument without a value, as in `alist(x = )`, has a `name` and a `null` `value`.
+- A parameter has `name`, an `identifier` such as `x` or `...`, and `default`, a node or `null`.
 
 A file with syntax errors still gets a full document and exit code `0`. For now, a statement with a syntax error anywhere in it is a single `unparsed` node, and comments inside it are its `interior` comments. Narrower `unparsed` spans and an `errors` list are being added.
 
