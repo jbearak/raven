@@ -2520,6 +2520,34 @@ impl PackageLibrary {
             }
         }
 
+        // Step 4b: Embedded export floor for pattern packages that R did not
+        // enumerate (no R, or the batch query failed or timed out). INDEX lists
+        // help *topics*, and a multi-object topic hides the objects it documents:
+        // base's `Constants` topic covers `pi`, `LETTERS`, `letters`,
+        // `month.name` and `month.abb`, none of which the static builtin table
+        // carries. Without this floor every bare `pi` is reported as undefined.
+        // The floor only adds names, and these packages stay `Partial` in Step 5,
+        // so it can suppress findings but never create one. Decide the CI
+        // fallback below before this floor runs, so a bare on-disk `base` it
+        // fills does not hide the fallback for packages absent from disk.
+        let use_embedded_fallback = all_base_exports.is_empty();
+        for package in pattern_packages.iter().filter(|p| !r_resolved.contains(*p)) {
+            let Some(embedded) = crate::package_db::embedded_base::packages()
+                .iter()
+                .find(|p| p.name == *package)
+            else {
+                continue;
+            };
+            let is_attached_base = attached_base_packages.contains(package);
+            let pkg_exports = per_package_exports.entry(package.clone()).or_default();
+            for sym in embedded.exports {
+                if is_attached_base {
+                    all_base_exports.insert((*sym).to_string());
+                }
+                pkg_exports.insert((*sym).to_string());
+            }
+        }
+
         // CI/runtime fallback: with no base exports found on disk, load the
         // embedded base-priority table. All 14 packages populate the per-package
         // cache (datasets → lazy_data) so `library(grid)` etc. resolve offline,
@@ -2528,7 +2556,7 @@ impl PackageLibrary {
         // A non-empty disk merge (a real install) always wins and skips this
         // entirely. No sidecar, so initialize() never depends on names.db and
         // the startup ordering problem is gone (ADR 1).
-        if all_base_exports.is_empty() {
+        if use_embedded_fallback {
             let attached: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
                 .into_iter()
                 .collect();
@@ -3918,7 +3946,7 @@ pub async fn build_package_library_tier1_only(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The shared `RAVEN_NAMES_DB` env-var serialization lock and its RAII guard
@@ -5759,6 +5787,106 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// Writes a fake library holding the seven default-attached base packages
+    /// as R installs them: `base` has no NAMESPACE (so it is a pattern package)
+    /// and its INDEX lists the multi-object `Constants` topic, not the
+    /// constants themselves.
+    pub(crate) fn write_fake_base_library_with_constants_topic(root: &Path) {
+        for pkg in [
+            "base",
+            "methods",
+            "utils",
+            "grDevices",
+            "graphics",
+            "stats",
+            "datasets",
+        ] {
+            let dir = root.join(pkg);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("DESCRIPTION"),
+                format!("Package: {}\nVersion: 4.6.0\nPriority: base\n", pkg),
+            )
+            .unwrap();
+            if pkg != "base" {
+                std::fs::write(dir.join("NAMESPACE"), "# minimal NAMESPACE\n").unwrap();
+            }
+        }
+        std::fs::write(
+            root.join("base").join("INDEX"),
+            "Constants               Built-in Constants\n\
+             log                     Logarithms and Exponentials\n",
+        )
+        .unwrap();
+    }
+
+    /// Base's INDEX lists the `Constants` help topic, not `pi`, `LETTERS`,
+    /// `letters`, `month.name` or `month.abb`. When R does not enumerate base's
+    /// exports (no R, or the batch query failed), the embedded table must
+    /// supply them, or a bare `pi` is reported as undefined.
+    #[tokio::test]
+    async fn test_initialize_unions_embedded_exports_when_r_does_not_enumerate_base() {
+        let lib_root = tempfile::tempdir().unwrap();
+        write_fake_base_library_with_constants_topic(lib_root.path());
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        assert!(lib.is_base_export("log"), "INDEX topics still merge");
+        let base_info = lib
+            .get_cached_package("base")
+            .await
+            .expect("base is cached");
+        for name in [
+            "pi",
+            "LETTERS",
+            "letters",
+            "month.name",
+            "month.abb",
+            "T",
+            "F",
+        ] {
+            assert!(
+                lib.is_base_export(name),
+                "Expected `{name}` in base_exports via the embedded export floor"
+            );
+            assert!(
+                base_info.exports.contains(name),
+                "Expected `{name}` in the cached base package exports"
+            );
+        }
+        assert_eq!(
+            base_info.exports_completeness,
+            MemberCompleteness::Partial,
+            "an export set R did not enumerate must stay Partial"
+        );
+    }
+
+    /// The embedded export floor for an on-disk `base` must not hide the CI
+    /// fallback that fills default-attached packages absent from disk.
+    #[tokio::test]
+    async fn test_initialize_embedded_floor_keeps_fallback_for_absent_packages() {
+        let lib_root = tempfile::tempdir().unwrap();
+        let base_dir = lib_root.path().join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("DESCRIPTION"),
+            "Package: base\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        assert!(lib.is_base_export("pi"), "base floor applies");
+        assert!(
+            lib.is_base_export("median"),
+            "stats is absent from disk, so the embedded fallback must still seed it"
+        );
     }
 
     #[tokio::test]
