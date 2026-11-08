@@ -1015,6 +1015,55 @@ fn pipe_right_sides_and_placeholders_follow_r() {
             "return()",
         ),
         (
+            "x |> y@z",
+            "pipe-rhs",
+            "function '@' not supported in RHS call of a pipe",
+            "y@z",
+        ),
+        (
+            "x |> y::z",
+            "pipe-rhs",
+            "function '::' not supported in RHS call of a pipe",
+            "y::z",
+        ),
+        (
+            "x |> y:::z",
+            "pipe-rhs",
+            "function ':::' not supported in RHS call of a pipe",
+            "y:::z",
+        ),
+        (
+            "x |> ~y",
+            "pipe-rhs",
+            "function '~' not supported in RHS call of a pipe",
+            "~y",
+        ),
+        (
+            "x |> ?y",
+            "pipe-rhs",
+            "function '?' not supported in RHS call of a pipe",
+            "?y",
+        ),
+        (
+            "x |> `|>`(a)",
+            "pipe-rhs",
+            "function '|>' not supported in RHS call of a pipe",
+            "`|>`(a)",
+        ),
+        // `|>` binds tighter than `~` and `%in%`: the right side is `a`.
+        (
+            "x |> a ~ b",
+            "pipe-rhs",
+            "The pipe operator requires a function call as RHS",
+            "a",
+        ),
+        (
+            "x |> a %in% b",
+            "pipe-rhs",
+            "The pipe operator requires a function call as RHS",
+            "a",
+        ),
+        (
             "x |> f(y = g(_))",
             "pipe-placeholder",
             "invalid use of pipe placeholder",

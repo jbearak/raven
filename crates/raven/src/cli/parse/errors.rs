@@ -310,11 +310,12 @@ impl Collector<'_> {
 const ZERO_LENGTH_MESSAGE: &str = "attempt to use zero-length variable name";
 
 /// R's function symbols a pipe can't call (`IS_SPECIAL_SYMBOL` in R's
-/// `names.c`): `x |> if (a) b` and `x |> -1` are errors.
+/// `names.c`): `x |> if (a) b`, `x |> -1` and `x |> y::z` are errors. The
+/// set is R 4.6's, found by parsing ``x |> `op`(a)`` for each symbol.
 const SPECIAL_SYMBOLS: &[&str] = &[
     "if", "while", "repeat", "for", "break", "next", "return", "function", "(", "{", "+", "-", "*",
     "/", "^", "%%", "%/%", "%*%", ":", "==", "!=", "<", ">", "<=", ">=", "&", "|", "&&", "||", "!",
-    "<-", "<<-", "=", "$", "[", "[[", "$<-", "[<-", "[[<-",
+    "<-", "<<-", "=", "$", "[", "[[", "$<-", "[<-", "[[<-", "@", "::", ":::", "~", "?", "|>",
 ];
 
 /// One pipe's right side, checked as R's `xxpipe` does.
