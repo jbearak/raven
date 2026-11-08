@@ -832,7 +832,9 @@ fn chunk_codes_or_all(body: Option<&str>) -> crate::cross_file::types::LineSuppr
 
 /// If `line` is an in-chunk `# raven: ignore-chunk` directive, return what it
 /// suppresses; otherwise `None`.
-fn parse_ignore_chunk_directive(line: &str) -> Option<crate::cross_file::types::LineSuppression> {
+pub(crate) fn parse_ignore_chunk_directive(
+    line: &str,
+) -> Option<crate::cross_file::types::LineSuppression> {
     let caps = ignore_chunk_re().captures(line)?;
     Some(chunk_codes_or_all(caps.get(1).map(|m| m.as_str())))
 }

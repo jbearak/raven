@@ -2368,9 +2368,10 @@ pub(crate) fn diagnostics_from_snapshot(
     let mut suppressed_pairs: Vec<(u32, String)> = Vec::new();
 
     // Fast collectors (no scope resolution needed)
-    collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
-    collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
-    collect_chained_comparison_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    diagnostics.extend(r_syntax_diagnostics(
+        snapshot.tree.root_node(),
+        &snapshot.text,
+    ));
     collect_invalid_assignment_targets(
         snapshot.tree.root_node(),
         &snapshot.text,
@@ -11724,6 +11725,18 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
         start: Position::new(start_row as u32, start_col_utf16),
         end: Position::new(start_row as u32, end_col_clamped),
     }
+}
+
+/// The syntax errors Raven reports for an R file: the parser's recovery
+/// errors, an `else` R can't attach, and chained comparisons, in that order.
+/// `raven check` and `raven parse`'s `errors` list both come from here, so
+/// their codes and messages agree.
+pub(crate) fn r_syntax_diagnostics(root: Node, text: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_syntax_errors(root, text, &mut diagnostics);
+    collect_else_newline_errors(root, text, &mut diagnostics);
+    collect_chained_comparison_errors(root, text, &mut diagnostics);
+    diagnostics
 }
 
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {

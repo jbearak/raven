@@ -91,7 +91,7 @@
 //! full pipeline and limits.
 
 pub mod config;
-mod nolint;
+pub(crate) mod nolint;
 mod parse_gate;
 
 /// Test-only re-export of the `nolint` string scanner so the cross-parser

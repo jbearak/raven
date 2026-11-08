@@ -423,10 +423,10 @@ raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format
 <!-- example: parse-json -->
 ```console
 $ raven parse clean.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}}}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"directive":null}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}},"directive":null}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
 ```
 
-The command is new, and its output is growing. Parsed `# raven:` directives on comments, a list of parse errors with narrower `unparsed` spans, and the package each call resolves to are being added. Each arrives as new fields and values under the versioning rule below, so code written against this page keeps working.
+The command is new, and its output is growing. The package each call resolves to is being added. It will arrive as new fields and values under the versioning rule below, so code written against this page keeps working.
 
 ### Parse options
 
@@ -448,7 +448,7 @@ The output is JSON Lines: one compact JSON document per line, each ending in a n
 <!-- example: parse-unreadable -->
 ```console
 $ raven parse clean.R gone.R
-{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"text":"x","name":"x","form":"plain"},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}},"text":"1","type":"double","value":1}}}],"comments":[],"errors":[]}
 {"schema_version":1,"raven_version":"0.23.7","path":"gone.R","error":{"message":"No such file or directory (os error 2)"}}
 ```
 
@@ -458,7 +458,7 @@ That run exits `3`.
 
 Every document has `schema_version` (currently `1`) and `raven_version`. Removing or renaming a field, changing a field's type, or changing what a field or a value means increments `schema_version`. Adding a field, a node kind, or a value to any enum-like field doesn't. The rule applies from the first release that includes `raven parse`.
 
-Every enum-like field is open: node `kind`, operator `op`, literal `type`, name `form`, comment `kind`, the encoding `name`, `line_endings`, and the fields still to come, such as directive kinds, resolution kinds, and error sources and severities. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
+Every enum-like field is open: node `kind`, operator `op`, literal `type`, name `form`, comment `kind`, the encoding `name`, `line_endings`, a directive's `kind`, `prefix`, `reason`, `call_type`, `family`, and `scope`, an error's `source`, `code`, and `severity`, and the resolution kinds still to come. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
 
 ### Parse positions
 
@@ -468,13 +468,14 @@ Every `range` has a `start` and an `end` position, and the end is exclusive. A p
 
 ### Parse documents
 
-A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `line_count`, `statements`, and `comments`.
+A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `line_count`, `statements`, `comments`, and `errors`.
 
 - `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root.
 - `encoding`: `name` (`UTF-8`, `UTF-16LE`, or `UTF-16BE`), `bom` (whether a byte-order mark was present and stripped), and `line_endings` (`lf`, `crlf`, `cr`, `mixed`, or `none` for a file without one). Raven reads files as `raven check` does, as described in [File encoding](#file-encoding). A file that isn't valid in its encoding gets the error document, with a message naming the first invalid byte's offset. Raven never substitutes replacement characters.
 - `line_count`: the number of lines. A final line ending doesn't start another line, so `a\nb\n` has 2 lines and an empty file has 0.
 - `statements`: the file's top-level statements. See [Statements and comments](#statements-and-comments).
 - `comments`: the comments no statement owns: every comment in a file without statements, and own-line comments after the last top-level statement.
+- `errors`: what R's parser would reject or warn about. See [Parse errors](#parse-errors).
 
 A file Raven can't open or decode gets the error document instead: `schema_version`, `raven_version`, `path`, and `error` with a `message`. It has no statements. Tell the two shapes apart by the presence of `error`.
 
@@ -490,14 +491,12 @@ A statement is each expression in the file's top level and each expression direc
 
 Two statements on one line, separated by `;`, are two statements. Neither one's text includes the `;`.
 
-Each comment has `kind` (`comment`, or `roxygen` for a `#'` comment), `text` with its `#`, and `range`. Comments on their own line (`leading`, `block_end`, and the file's `comments`) also have `blank_line_before`, measured from the previous comment in the list or from what precedes the list, so blank lines between comment groups are kept. Every comment in the file appears exactly once:
+Each comment has `kind` (`comment`, or `roxygen` for a `#'` comment), `text` with its `#`, `range`, and `directive`: the [directive](#parse-directives) it carries, or `null`. Comments on their own line (`leading`, `block_end`, and the file's `comments`) also have `blank_line_before`, measured from the previous comment in the list or from what precedes the list, so blank lines between comment groups are kept. Every comment in the file appears exactly once:
 
 - `trailing`: a comment that starts on the line where a statement ends, after it. With two statements on the line, it is the last one's.
 - `interior`: a comment inside a statement's range that no nested statement or block owns, such as one between two steps of a pipe or two arguments.
 - `leading`: other comments before a statement and after the previous one in the same sequence. A comment after a block's `{`, on the same line, leads the block's first statement.
 - `block_end`: comments in a block after its last statement, or in a block with no statements. They are on the block node, in `comments.block_end`, so each block of an `if ... else` has its own list.
-
-Parsed directives on `# raven:` comments are being added.
 
 ### Parse syntax tree
 
@@ -515,7 +514,7 @@ Leaves have a `text`: the source as written, which slicing the file by the node'
 | `string` | A string literal | `text`, `value`, `quote`, `raw`, `delimiters` |
 | `constant` | `TRUE`, `FALSE`, `NULL`, `NA` and its typed forms, `Inf`, or `NaN` | `text`, `type` |
 | `next`, `break` | Loop control | `text` |
-| `unparsed` | Source with a syntax error | `text` |
+| `unparsed` | A statement R can't parse; see [Parse errors](#parse-errors) | `text` |
 
 The other nodes:
 
@@ -554,7 +553,7 @@ An `identifier`'s `name` is the name as R reads it, and `form` says how it was w
 - `backtick`: `` `größe` ``. The `name` drops the backticks and decodes backslash escapes as R does, so `` `a\`b` `` is the name ``a`b``.
 - `string`: a string where R accepts one in a name's place. That is an argument name (`c("a" = "b")`, `f("msg" = e)`), either side of `::` (`"dplyr"::filter`), or the right side of `$` or `@` (`d$"x"`). The `name` is the string's value.
 
-Names are reported as written, with no Unicode normalization. `NULL` as an argument name, as in `f(NULL = 1)`, which R allows, is the identifier `NULL` with form `plain`. When R rejects a name, such as `` `\u{e9}` `` (R doesn't allow `\u` in backticks) or an empty argument name, the `identifier` has no `name`.
+Names are reported as written, with no Unicode normalization. `NULL` as an argument name, as in `f(NULL = 1)`, which R allows, is the identifier `NULL` with form `plain`. A name R rejects, such as `` `\u{e9}` `` (R doesn't allow `\u` in backticks) or an empty argument name, is a parse error: its statement is `unparsed`, and `errors` says why.
 
 A plain `_` is always a `placeholder`, because it is R's pipe placeholder. R accepts it as a named argument in a pipe step (`x |> f(y = _)`) and at the head of an extraction (`x |> _$a`). A backticked `` `_` `` is an identifier. `.` in a `%>%` step is an ordinary identifier, kept where it stands, so `f(a, .)` and `f(a, g(.))` differ.
 
@@ -565,7 +564,7 @@ A `number`'s `type` is the type R's parser gives it, which isn't always what its
 | Written | `type` |
 |---|---|
 | `1`, `1e3`, `0x10`, `0x1p3` | `double` |
-| `1L`, `1e3L`, `0x10L`, and `1.0L`, which R warns about | `integer` |
+| `1L`, `1e3L`, `0x10L`, and `1.0L`, which R warns about in `errors` | `integer` |
 | `1.5L`, `1e-3L`, `100000000000L`: R can't make an integer of them, so it warns and uses the double | `double` |
 | `1i`, `0x10i` | `complex` |
 
@@ -575,7 +574,7 @@ A `constant`'s `type` is R's: `logical` for `TRUE`, `FALSE`, and `NA`, `integer`
 
 A `string`'s `value` is the string R reads. Escapes are decoded as R decodes them, such as `\n`, `\"`, `\x41`, `\101`, `\u{00e9}`, and `\U{1F600}`, and a line ending inside the string reads as `\n`. `quote` is `"` or `'`. `raw` is `true` for a raw string, whose `value` is its content as written. `delimiters` has the `open` and `close` text around the content: `"` and `"`, or `r"---(` and `)---"` for `r"---(text)---"`.
 
-A `string` has no `value` when R rejects it, as for an unknown escape such as `\q` or for `\u` and `\x` escapes mixed in one string. It also has none when R's value isn't Unicode text, as for `"\xe9"`, a lone byte that isn't UTF-8. R's errors and warnings for these literals, and for `1.0L` and its kin, are being added as an `errors` list.
+A high and a low surrogate escape in a row, as in `"\u{d83d}\u{de00}"`, are one character, as R reads them. A `string` has no `value` when R's value isn't Unicode text: a lone byte that isn't UTF-8, as in `"\xe9"`, or an unpaired surrogate escape, as in `"\u{d800}"`, which R reads with a warning. An escape R rejects, such as `\q`, or `\u` and `\x` escapes mixed in one string, is a parse error, and its statement is `unparsed`.
 
 #### Tree arguments and parameters
 
@@ -584,7 +583,95 @@ A `string` has no `value` when R rejects it, as for an unknown escape such as `\
 - An argument has `name`, an `identifier` or `null`, and `value`, a node or `null`. Arguments are in their original order, named and positional mixed as written. An empty argument, such as the second in `x[i, ]` or the first in `d[, y := e]`, has `null` for both, and an empty `range` just after the `(`, `[`, `[[`, or comma before it. As in R, `f()` has no arguments and `f(,)` has two empty ones. A named argument without a value, as in `alist(x = )`, has a `name` and a `null` `value`.
 - A parameter has `name`, an `identifier` such as `x` or `...`, and `default`, a node or `null`.
 
-A file with syntax errors still gets a full document and exit code `0`. For now, a statement with a syntax error anywhere in it is a single `unparsed` node, and comments inside it are its `interior` comments. Narrower `unparsed` spans and an `errors` list are being added.
+### Parse directives
+
+A comment's `directive` is the `# raven:` directive, `@lsp-` alias, or lintr `# nolint` marker it carries, or `null`. Raven reads it with the same code `raven check` uses, so the two agree on what a directive means and whether it applies. [Directives](directives.md) explains what each one does.
+
+```json
+{"kind": "backward", "prefix": "raven", "keyword": "run-by", "honored": true, "reason": null,
+ "call_type": "run", "path": "../main.R", "line": 12, "match": null}
+```
+
+Every directive has these fields, then the fields for its `kind`:
+
+- `kind`: `forward`, `backward`, `working_directory`, `self_contained`, `variable`, `function`, `nse`, `suppression`, or `unknown`.
+- `prefix`: `raven` for `# raven:`, `lsp` for the `@lsp-` alias, or `nolint`.
+- `keyword`: the directive word as written, such as `run-by`, `working-dir`, `ignore-next`, or `nolint`. Synonyms share a `kind` but keep their spelling here.
+- `honored`: whether Raven acts on the directive where it stands.
+- `reason`: why it doesn't, or a caveat, or `null`. See below.
+
+| `kind` | `keyword` | Fields |
+|---|---|---|
+| `forward` | `source`, `run`, `include` | `call_type`, `path`, `line` |
+| `backward` | `sourced-by`, `run-by`, `included-by` | `call_type`, `path`, `line`, `match` |
+| `working_directory` | `cd`, `wd`, `working-directory`, `working-dir`, `current-directory`, `current-dir` | `path` |
+| `self_contained` | `self-contained`, `standalone` | None |
+| `variable` | `var`, `variable`, `declare-var`, `declare-variable` | `name` |
+| `function` | `func`, `function`, `declare-func`, `declare-function` | `name`, `package`, `formals` |
+| `nse` | `nse` | `declaration`, `name`, `package`, `formals` |
+| `suppression` | `ignore` and `expect`, each with its `-next`, `-start`, `-end`, and `-file` forms, `ignore-chunk`, and `nolint` | `family`, `scope`, `codes`, `target` |
+| `unknown` | Any other word after `# raven:` or `# @lsp-`, such as `sorce` | None |
+
+The fields:
+
+- `call_type`: `source`, `run`, or `include`, so `run-by` has `run`.
+- `path`: the path as written, without quotes. Raven resolves it as described in [Path resolution](cross-file.md#path-resolution).
+- `line`: `line=` as written: a number (1-based, as you write it), the string `eof` or `end`, or `null`. A backward directive with both `line=` and `match=` uses `line`.
+- `match`: the `match=` pattern without its quotes, or `null`.
+- `name` and `package`: the declared name without quotes. A `pkg::name` declaration has `package` `pkg`; otherwise `package` is `null`.
+- `formals`: the formal names with their defaults dropped, or `null`. On `nse`, `null` means every argument is captured.
+- `declaration`: what `nse` declares, as written, such as `helper(x)`.
+- `family`: `ignore`, `expect`, or `nolint`. A `# nolint` marker silences only what lintr's markers cover in Raven; see [`# nolint`](diagnostics.md#-nolint-lintr-style).
+- `scope`: `line` (its own line), `next` (the next line), `start` or `end` (a block), `file`, or `chunk`.
+- `codes`: the codes listed, in Raven's kebab-case spelling, so `line_length` is `line-length`. An empty list means every code.
+- `target`: the lines the directive covers, as a range from the first line's start to the last line's end. A block's `-start` and `-end` both have the block, from the `-start` line through the `-end` line. `null` when it covers nothing.
+
+`reason` is one of these:
+
+- `outside_header`: a backward, working-directory, or self-contained directive after the first line of code, which Raven ignores.
+- `not_own_line`: a directive written after code on its line, which Raven ignores. Only `ignore`, `expect`, and `# nolint` work there.
+- `malformed`: Raven rejects what follows the directive word, as in `# raven: func some-func`, whose name needs quotes, or `# raven: nse f(x,,y)`.
+- `nested`: a `-start` while another block is open, which Raven ignores.
+- `unpaired`: an `-end` with no open block, which does nothing, or a `-start` that nothing closes. Raven honors that `-start` through the last line.
+- `chunk_only`: `# raven: ignore-chunk`, which works only in R Markdown and Quarto chunks.
+
+An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and `@lsp-` blocks pair with each other, and `# nolint start` and `# nolint end` with each other.
+
+### Parse errors
+
+`errors` lists what R's parser would reject or warn about, in source order. A file with errors still gets a full document and exit code `0`. Each entry has `source`, `code`, `severity`, `message`, and `range`. `source` is `parser` or `lexer`, and `severity` is `error`, `warning`, `information`, or `hint`.
+
+| `source` | `code` | `severity` | For |
+|---|---|---|---|
+| `parser` | [`syntax-error`](diagnostics.md#syntax-error), [`chained-comparison`](diagnostics.md#chained-comparison) | `error` | The parse errors `raven check` reports, with its codes and messages |
+| `parser` | `pipe-rhs` | `error` | A right side of `\|>` that R rejects, as in `x \|> f` or `x \|> -1` |
+| `parser` | `pipe-placeholder` | `error` | A `_` that R rejects: unnamed, used twice, in the called function, or outside a pipe step |
+| `lexer` | `invalid-escape` | `error` | An escape R rejects, in a string or a backticked name |
+| `lexer` | `zero-length-name` | `error` | ``` `` ``` or an empty argument name, as in `f("" = 1)` |
+| `lexer` | `invalid-number` | `error` | A number R can't read, such as `1e` |
+| `lexer` | `unpaired-surrogate` | `warning` | A surrogate escape without its pair, as in `"\u{d800}"` |
+| `lexer` | `integer-literal-unnecessary-decimal` | `warning` | `1.0L` |
+| `lexer` | `integer-literal-decimal` | `warning` | `1.5L` |
+| `lexer` | `integer-literal-non-integer` | `warning` | `1e-3L`, `100000000000L` |
+
+The `pipe-*` and `lexer` messages are R's own, without R's location suffix. Raven's parser accepts a few other things R rejects, so an empty `errors` list doesn't promise that R parses the file.
+
+An `error` entry is one R's parser stops at. The statement holding it is a single `unparsed` node with its `text` and `range`, and the statements before and after it are reported as usual. Inside a block, the `unparsed` statement is the innermost one holding the error, so an enclosing function or `if` keeps its tree. Warnings leave the tree as it is. Comments inside an `unparsed` statement are its `interior` comments, and their directives are still parsed, so an `ignore` on a broken line is seen.
+
+Raven's parser recovers from a syntax error by skipping to where it can read code again, and that recovery sets the statement's span. When it can't find where the statement ends, as after an unclosed `(` or `{`, the `unparsed` node runs on to where recovery resumed, which can be several lines or the rest of the file.
+
+<!-- example: parse-errors file=broken.R -->
+```r
+# raven: source helpers.R
+x <- c(1 2) # raven: ignore
+y <- 1.0L
+```
+
+<!-- example: parse-errors -->
+```console
+$ raven parse broken.R
+{"schema_version":1,"raven_version":"0.23.7","path":"broken.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":3,"statements":[{"text":"x <- c(1 2)","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# raven: source helpers.R","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":25}},"blank_line_before":false,"directive":{"kind":"forward","prefix":"raven","keyword":"source","honored":true,"reason":null,"call_type":"source","path":"helpers.R","line":null}}],"trailing":[{"kind":"comment","text":"# raven: ignore","range":{"start":{"line":1,"character":12},"end":{"line":1,"character":27}},"directive":{"kind":"suppression","prefix":"raven","keyword":"ignore","honored":true,"reason":null,"family":"ignore","scope":"line","codes":[],"target":{"start":{"line":1,"character":0},"end":{"line":1,"character":27}}}}],"interior":[]},"expression":{"kind":"unparsed","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"text":"x <- c(1 2)"}},{"text":"y <- 1.0L","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":1}},"text":"y","name":"y","form":"plain"},"value":{"kind":"number","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}},"text":"1.0L","type":"integer","value":1}}}],"comments":[],"errors":[{"source":"parser","code":"syntax-error","severity":"error","message":"R code could not be parsed here","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":8}}},{"source":"lexer","code":"integer-literal-unnecessary-decimal","severity":"warning","message":"integer literal 1.0L contains unnecessary decimal point","range":{"start":{"line":2,"character":5},"end":{"line":2,"character":9}}}]}
+```
 
 ## `raven console`
 

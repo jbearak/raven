@@ -10,13 +10,15 @@
 //! A `block` node holds its statements and its `block_end` comments, which is
 //! how statements inside braces hang on the tree (see `statements`).
 //!
-//! A statement whose source has a syntax error anywhere in it is, for now, a
-//! single `unparsed` node: its blocks aren't descended into, so comments
-//! inside it are its `interior` comments.
+//! A statement R's parser can't read is a single `unparsed` node: the
+//! innermost statement holding an `error`-severity entry of the `errors`
+//! list, or a syntax error in its own structure (see [`Builder::parses`]).
+//! Enclosing statements keep their trees, and comments inside an `unparsed`
+//! node are its statement's `interior` comments.
 //!
 //! Literal types and decoded values come from `literals`, which mirrors R's
-//! lexer. Where R would reject a literal, the node omits the value R never
-//! produces; the parse-errors list reports why.
+//! lexer. Where R reads a literal but its value isn't Unicode text (`"\xe9"`),
+//! the node omits the value.
 
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
@@ -111,6 +113,29 @@ fn value(value: impl Into<serde_json::Value>) -> Field {
     Field::Value(value.into())
 }
 
+/// Whether `node`'s own structure, outside the statements nested in its
+/// blocks, is free of ERROR and MISSING nodes. Collects those nested
+/// statements' byte ranges into `nested`.
+fn own_structure_parses(node: TsNode<'_>, nested: &mut Vec<std::ops::Range<usize>>) -> bool {
+    if node.is_error() || node.is_missing() {
+        return false;
+    }
+    let statements = if node.kind() == "braced_expression" {
+        sequence_children(node)
+    } else {
+        Vec::new()
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if statements.contains(&child) {
+            nested.push(child.byte_range());
+        } else if child.kind() != "comment" && !own_structure_parses(child, nested) {
+            return false;
+        }
+    }
+    true
+}
+
 impl Builder<'_> {
     /// A statement's expression. `pool` holds the comments inside the
     /// statement; blocks take theirs out, and the rest are its `interior`.
@@ -119,10 +144,47 @@ impl Builder<'_> {
         node: TsNode<'_>,
         pool: &mut Vec<CommentSpan>,
     ) -> Node {
-        if node.has_error() {
-            return self.leaf(node, "unparsed");
+        if self.parses(node) {
+            self.node(node, pool)
+        } else {
+            self.leaf(node, "unparsed")
         }
-        self.node(node, pool)
+    }
+
+    /// Whether a statement keeps its tree. It does unless R's parser would
+    /// stop in it outside every statement nested in its blocks: an ERROR or
+    /// MISSING node in its own structure (a missing `}` of one of its blocks
+    /// included), or an `error`-severity entry of the `errors` list that
+    /// starts inside it but in none of its nested statements. A nested
+    /// statement is judged the same way when its block is built, so the
+    /// innermost statement that doesn't parse is the `unparsed` one.
+    ///
+    /// The span is tree-sitter's: where its recovery can't find a statement's
+    /// end (an unclosed bracket), the statement, and so the `unparsed` node,
+    /// runs on to where recovery picked up again, which can be the end of the
+    /// file.
+    fn parses(&self, node: TsNode<'_>) -> bool {
+        let inside: Vec<usize> = self
+            .error_spans
+            .iter()
+            .filter(|&&(start, end)| {
+                node.start_byte() <= start
+                    && (start < node.end_byte() || (start == end && start == node.end_byte()))
+            })
+            .map(|&(start, _)| start)
+            .collect();
+        if inside.is_empty() && !node.has_error() {
+            return true;
+        }
+        let mut nested = Vec::new();
+        if !own_structure_parses(node, &mut nested) {
+            return false;
+        }
+        inside.iter().all(|&at| {
+            nested
+                .iter()
+                .any(|range: &std::ops::Range<usize>| range.start <= at && at < range.end)
+        })
     }
 
     fn source(&self, node: TsNode<'_>) -> &str {
