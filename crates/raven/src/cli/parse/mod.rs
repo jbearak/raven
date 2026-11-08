@@ -10,10 +10,12 @@
 //! - `document`: the per-file envelope, the error document, positions.
 //! - `statements`: statements and the comments each one owns.
 //! - `tree`: the expression tree on each statement.
+//! - `literals`: number types and values, string and name decoding, as R reads them.
 //!
 //! `docs/cli.md` (`raven parse`) is the contract.
 
 mod document;
+mod literals;
 mod statements;
 mod tree;
 
@@ -87,9 +89,10 @@ Usage: raven parse [OPTIONS] [FILES...]
 
 Indexes the workspace exactly as `raven check` does, then prints one JSON
 document per line for each requested `.R`/`.r` file, in the order requested:
-every statement with its source text and range, and every comment. With no
-FILES, prints every R file in the workspace, sorted by path. Relative FILES
-resolve against the workspace root; a directory stands for the R files under it.
+every statement with its source text, range, and syntax tree, and every
+comment. With no FILES, prints every R file in the workspace, sorted by path.
+Relative FILES resolve against the workspace root; a directory stands for the R
+files under it.
 
 Options:
   --workspace DIR      Workspace root to index (default: current directory)

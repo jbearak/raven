@@ -1,12 +1,11 @@
 //! The expression tree on each statement.
 //!
-//! Every node has `kind` and `range`; its child nodes sit in named fields in
-//! source order. This version gives the structure: which construct each node
-//! is, and where its sub-expressions and blocks are. Leaf details (names and
-//! how they're written, literal types and values, operators as written,
-//! argument names, empty arguments, the pipe placeholder) are not reported
-//! yet; they are added as new fields and kinds, so nothing here changes
-//! meaning.
+//! Every node has `kind` and `range`; the rest of its fields follow in a fixed
+//! order: scalar details first (`op`, `text`, `name`, ...), then child nodes in
+//! source order. The tree is the source as written, not R's desugared form:
+//! `|>` stays a `pipe`, `->` keeps its direction, `**` stays `**`, and
+//! parentheses are a node. `docs/cli.md` (`raven parse`, "Parse syntax tree")
+//! is the node reference; keep it in step with [`Builder::node`].
 //!
 //! A `block` node holds its statements and its `block_end` comments, which is
 //! how statements inside braces hang on the tree (see `statements`).
@@ -14,12 +13,17 @@
 //! A statement whose source has a syntax error anywhere in it is, for now, a
 //! single `unparsed` node: its blocks aren't descended into, so comments
 //! inside it are its `interior` comments.
+//!
+//! Literal types and decoded values come from `literals`, which mirrors R's
+//! lexer. Where R would reject a literal, the node omits the value R never
+//! produces; the parse-errors list reports why.
 
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 use tree_sitter::Node as TsNode;
 
 use super::document::Range;
+use super::literals;
 use super::statements::{Builder, Comment, CommentSpan, Statement, sequence_children};
 
 #[derive(Debug)]
@@ -47,6 +51,8 @@ pub(crate) enum Field {
     Entries(Vec<Entry>),
     Statements(Vec<Statement>),
     BlockComments(BlockComments),
+    /// A scalar detail: `op`, `text`, a decoded `name` or `value`, ...
+    Value(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -84,8 +90,25 @@ impl Serialize for Field {
             Field::Entries(entries) => entries.serialize(serializer),
             Field::Statements(statements) => statements.serialize(serializer),
             Field::BlockComments(comments) => comments.serialize(serializer),
+            Field::Value(value) => value.serialize(serializer),
         }
     }
+}
+
+/// A JSON number for a literal's value: an integer when the value is whole
+/// and exactly representable, otherwise the shortest form that round-trips;
+/// `null` for infinity.
+fn json_number(value: f64) -> serde_json::Value {
+    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+    if value.fract() == 0.0 && value.abs() < EXACT {
+        serde_json::Value::from(value as i64)
+    } else {
+        serde_json::Number::from_f64(value).map_or(serde_json::Value::Null, Into::into)
+    }
+}
+
+fn value(value: impl Into<serde_json::Value>) -> Field {
+    Field::Value(value.into())
 }
 
 impl Builder<'_> {
@@ -102,30 +125,137 @@ impl Builder<'_> {
         self.node(node, pool)
     }
 
-    fn leaf(&self, node: TsNode<'_>, kind: &'static str) -> Node {
+    fn source(&self, node: TsNode<'_>) -> &str {
+        &self.text[node.byte_range()]
+    }
+
+    fn with_fields(
+        &self,
+        node: TsNode<'_>,
+        kind: &'static str,
+        fields: Vec<(&'static str, Field)>,
+    ) -> Node {
         Node {
             kind,
             range: self.lines.range(node.byte_range()),
-            fields: Vec::new(),
+            fields,
         }
+    }
+
+    /// A node with no children: its kind and its `text`.
+    fn leaf(&self, node: TsNode<'_>, kind: &'static str) -> Node {
+        self.with_fields(node, kind, vec![("text", value(self.source(node)))])
     }
 
     fn optional(&self, node: Option<TsNode<'_>>, pool: &mut Vec<CommentSpan>) -> Field {
         Field::Node(node.map(|node| Box::new(self.node(node, pool))))
     }
 
+    fn optional_name(&self, node: Option<TsNode<'_>>, argument: bool) -> Field {
+        Field::Node(node.map(|node| Box::new(self.name(node, argument))))
+    }
+
+    /// An `identifier` node. `name` is `None` when R rejects the name (an
+    /// invalid escape in backticks), and then isn't printed.
+    fn identifier_node(&self, node: TsNode<'_>, name: Option<String>, form: &'static str) -> Node {
+        let mut fields = vec![("text", value(self.source(node)))];
+        if let Some(name) = name {
+            fields.push(("name", value(name)));
+        }
+        fields.push(("form", value(form)));
+        self.with_fields(node, "identifier", fields)
+    }
+
+    /// A name token (`identifier`, `dots`, `dot_dot_i`): an identifier, or the
+    /// pipe placeholder. A plain `_` is always R's placeholder token; R
+    /// rejects it outside the places the pipe allows, and the parse-errors
+    /// list says so.
+    fn identifier(&self, node: TsNode<'_>) -> Node {
+        let text = self.source(node);
+        if text == "_" {
+            return self.leaf(node, "placeholder");
+        }
+        if text.starts_with('`') {
+            return self.identifier_node(node, literals::backtick_name(text).text(), "backtick");
+        }
+        self.identifier_node(node, Some(text.to_string()), "plain")
+    }
+
+    /// A name where R also accepts a string (an argument name, either side of
+    /// `::`, the right side of `$` and `@`) or, for an argument name, `NULL`.
+    /// A string there is an identifier with form `string`. An empty argument
+    /// name is one R rejects, so it has no `name`.
+    fn name(&self, node: TsNode<'_>, argument: bool) -> Node {
+        match node.kind() {
+            "string" => {
+                let (_, decoded) = literals::string(self.source(node));
+                let name = decoded.text().filter(|name| !(argument && name.is_empty()));
+                self.identifier_node(node, name, "string")
+            }
+            "null" => self.identifier_node(node, Some("NULL".into()), "plain"),
+            _ => self.identifier(node),
+        }
+    }
+
+    fn number(&self, node: TsNode<'_>) -> Node {
+        let text = self.source(node);
+        let number = literals::number(text);
+        let mut fields = vec![
+            ("text", value(text)),
+            ("type", value(number.class.r_type())),
+        ];
+        if let Some(v) = number.value {
+            fields.push(("value", Field::Value(json_number(v))));
+        }
+        self.with_fields(node, "number", fields)
+    }
+
+    fn string(&self, node: TsNode<'_>) -> Node {
+        let text = self.source(node);
+        let (form, decoded) = literals::string(text);
+        let mut fields = vec![("text", value(text))];
+        if let Some(decoded) = decoded.text() {
+            fields.push(("value", value(decoded)));
+        }
+        fields.push(("quote", value(form.quote.to_string())));
+        fields.push(("raw", value(form.raw)));
+        fields.push((
+            "delimiters",
+            value(serde_json::json!({"open": form.open, "close": form.close})),
+        ));
+        self.with_fields(node, "string", fields)
+    }
+
+    fn constant(&self, node: TsNode<'_>) -> Node {
+        let text = self.source(node);
+        let r_type = match text {
+            "TRUE" | "FALSE" | "NA" => "logical",
+            "NA_integer_" => "integer",
+            "NA_real_" | "Inf" | "NaN" => "double",
+            "NA_complex_" => "complex",
+            "NA_character_" => "character",
+            _ => "NULL",
+        };
+        self.with_fields(
+            node,
+            "constant",
+            vec![("text", value(text)), ("type", value(r_type))],
+        )
+    }
+
     /// The node for one syntax-error-free expression.
     fn node(&self, node: TsNode<'_>, pool: &mut Vec<CommentSpan>) -> Node {
         let field = |name: &str| node.child_by_field_name(name);
+        let op = || value(field("operator").map_or("", |op| self.source(op)));
         let kind: &'static str;
         let mut fields: Vec<(&'static str, Field)> = Vec::new();
         match node.kind() {
-            "identifier" | "dots" | "dot_dot_i" => kind = "identifier",
-            "integer" | "float" | "complex" => kind = "number",
-            "string" => kind = "string",
-            "true" | "false" | "null" | "inf" | "nan" | "na" => kind = "constant",
-            "next" => kind = "next",
-            "break" => kind = "break",
+            "identifier" | "dots" | "dot_dot_i" => return self.identifier(node),
+            "integer" | "float" | "complex" => return self.number(node),
+            "string" => return self.string(node),
+            "true" | "false" | "null" | "inf" | "nan" | "na" => return self.constant(node),
+            "next" => return self.leaf(node, "next"),
+            "break" => return self.leaf(node, "break"),
             "braced_expression" => {
                 kind = "block";
                 let comments =
@@ -141,44 +271,48 @@ impl Builder<'_> {
                     Field::BlockComments(BlockComments { block_end }),
                 ));
             }
-            "call" | "subset" | "subset2" => {
-                let (head, kind_name) = if node.kind() == "call" {
-                    ("function", "call")
-                } else {
-                    ("target", "index")
-                };
-                kind = kind_name;
-                fields.push((head, self.optional(field("function"), pool)));
-                fields.push((
-                    "arguments",
-                    self.entries(field("arguments"), "argument", "value", pool),
-                ));
+            "call" => {
+                kind = "call";
+                fields.push(("function", self.optional(field("function"), pool)));
+                fields.push(("arguments", self.arguments(field("arguments"), pool)));
             }
-            "namespace_operator" | "extract_operator" => {
-                kind = if node.kind() == "namespace_operator" {
-                    "namespace"
-                } else {
-                    "extract"
-                };
+            "subset" | "subset2" => {
+                kind = "index";
+                let op = if node.kind() == "subset" { "[" } else { "[[" };
+                fields.push(("op", value(op)));
+                fields.push(("target", self.optional(field("function"), pool)));
+                fields.push(("arguments", self.arguments(field("arguments"), pool)));
+            }
+            "namespace_operator" => {
+                kind = "namespace";
+                fields.push(("op", op()));
+                fields.push(("left", self.optional_name(field("lhs"), false)));
+                fields.push(("right", self.optional_name(field("rhs"), false)));
+            }
+            "extract_operator" => {
+                kind = "extract";
+                fields.push(("op", op()));
                 fields.push(("left", self.optional(field("lhs"), pool)));
-                fields.push(("right", self.optional(field("rhs"), pool)));
+                fields.push(("right", self.optional_name(field("rhs"), false)));
             }
             "binary_operator" => {
-                let op = field("operator").map_or("", |op| op.kind());
+                let operator = field("operator").map_or("", |op| op.kind());
                 let (lhs, rhs) = (field("lhs"), field("rhs"));
-                match op {
+                fields.push(("op", op()));
+                match operator {
                     "<-" | "<<-" | "=" | ":=" => {
                         kind = "assignment";
                         fields.push(("target", self.optional(lhs, pool)));
                         fields.push(("value", self.optional(rhs, pool)));
                     }
+                    // As written: the value is on the left.
                     "->" | "->>" => {
                         kind = "assignment";
                         fields.push(("value", self.optional(lhs, pool)));
                         fields.push(("target", self.optional(rhs, pool)));
                     }
                     _ => {
-                        kind = match op {
+                        kind = match operator {
                             "|>" => "pipe",
                             "~" => "formula",
                             _ => "binary",
@@ -189,8 +323,9 @@ impl Builder<'_> {
                 }
             }
             "unary_operator" => {
-                let op = field("operator").map_or("", |op| op.kind());
-                if op == "~" {
+                let operator = field("operator").map_or("", |op| op.kind());
+                fields.push(("op", op()));
+                if operator == "~" {
                     kind = "formula";
                     fields.push(("left", Field::Node(None)));
                     fields.push(("right", self.optional(field("rhs"), pool)));
@@ -205,10 +340,9 @@ impl Builder<'_> {
             }
             "function_definition" => {
                 kind = "function";
-                fields.push((
-                    "parameters",
-                    self.entries(field("parameters"), "parameter", "default", pool),
-                ));
+                let keyword = field("name").map_or("function", |k| self.source(k));
+                fields.push(("keyword", value(keyword)));
+                fields.push(("parameters", self.parameters(field("parameters"), pool)));
                 fields.push(("body", self.optional(field("body"), pool)));
             }
             "if_statement" => {
@@ -234,37 +368,86 @@ impl Builder<'_> {
             }
             // Not reached for an error-free statement; reported honestly if a
             // grammar update adds a construct this table doesn't know.
-            _ => kind = "unparsed",
+            _ => return self.leaf(node, "unparsed"),
         }
-        Node {
-            kind,
-            range: self.lines.range(node.byte_range()),
-            fields,
-        }
+        self.with_fields(node, kind, fields)
     }
 
-    /// The `arguments` of a call or index, or the `parameters` of a function:
-    /// one entry per `entry_kind` child, with its `value_field` child.
-    fn entries(
-        &self,
-        list: Option<TsNode<'_>>,
-        entry_kind: &str,
-        value_field: &'static str,
-        pool: &mut Vec<CommentSpan>,
-    ) -> Field {
+    /// A call's or index's `arguments`, in order, with an entry for each
+    /// empty argument. As in R, the commas delimit the arguments: `f()` has
+    /// none, `f(,)` two empty ones, `x[i, ]` an `i` and an empty one. An
+    /// empty argument's range is empty, just after the `(`, `[`, `[[` or `,`
+    /// before it.
+    fn arguments(&self, list: Option<TsNode<'_>>, pool: &mut Vec<CommentSpan>) -> Field {
+        let Some(list) = list else {
+            return Field::Entries(Vec::new());
+        };
+        let close = list.child_by_field_name("close");
+        let empty = |at: usize| Entry {
+            range: self.lines.range(at..at),
+            fields: vec![("name", Field::Node(None)), ("value", Field::Node(None))],
+        };
+        let mut entries = Vec::new();
+        let mut slot_start = list
+            .child_by_field_name("open")
+            .map_or(list.start_byte(), |open| open.end_byte());
+        let mut slot_filled = false;
+        let mut commas = 0;
+        let mut cursor = list.walk();
+        for child in list.children(&mut cursor) {
+            if child.is_extra() {
+                continue;
+            }
+            if child.kind() == "argument" {
+                entries.push(Entry {
+                    range: self.lines.range(child.byte_range()),
+                    fields: vec![
+                        (
+                            "name",
+                            self.optional_name(child.child_by_field_name("name"), true),
+                        ),
+                        (
+                            "value",
+                            self.optional(child.child_by_field_name("value"), pool),
+                        ),
+                    ],
+                });
+                slot_filled = true;
+            } else if child.kind() == "comma" {
+                if !slot_filled {
+                    entries.push(empty(slot_start));
+                }
+                commas += 1;
+                slot_filled = false;
+                slot_start = child.end_byte();
+            } else if Some(child) == close && !slot_filled && commas > 0 {
+                entries.push(empty(slot_start));
+            }
+        }
+        Field::Entries(entries)
+    }
+
+    /// A function's `parameters`: each with its `name` and its `default`.
+    fn parameters(&self, list: Option<TsNode<'_>>, pool: &mut Vec<CommentSpan>) -> Field {
         let Some(list) = list else {
             return Field::Entries(Vec::new());
         };
         let mut cursor = list.walk();
         let entries = list
             .named_children(&mut cursor)
-            .filter(|child| child.kind() == entry_kind)
-            .map(|entry| Entry {
-                range: self.lines.range(entry.byte_range()),
-                fields: vec![(
-                    value_field,
-                    self.optional(entry.child_by_field_name(value_field), pool),
-                )],
+            .filter(|child| child.kind() == "parameter")
+            .map(|parameter| Entry {
+                range: self.lines.range(parameter.byte_range()),
+                fields: vec![
+                    (
+                        "name",
+                        self.optional_name(parameter.child_by_field_name("name"), false),
+                    ),
+                    (
+                        "default",
+                        self.optional(parameter.child_by_field_name("default"), pool),
+                    ),
+                ],
             })
             .collect();
         Field::Entries(entries)

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::document::{document_for_file, document_from_text};
 use super::*;
@@ -139,6 +139,7 @@ fn assert_invariants(text: &str, document: &Value) {
             "statement range doesn't slice to its text"
         );
     }
+    assert_tree_invariants(text, document);
     let listed = comments(document);
     for comment in &listed {
         assert_eq!(
@@ -177,6 +178,54 @@ fn assert_invariants(text: &str, document: &Value) {
                 .any(|&(start, end)| start <= index && index < end),
             "{ch:?} at byte {index} is in no statement or comment"
         );
+    }
+}
+
+/// The tree's invariants, over every statement's expression: every node has
+/// `kind` and `range`; every node, argument or parameter entry, and nested
+/// statement lies inside its parent's range; and a node's `text`, where it
+/// has one, is its range's slice.
+fn assert_tree_invariants(text: &str, document: &Value) {
+    type Span = (usize, usize);
+    fn check(text: &str, value: &Value, parent: Span, entry: bool) {
+        let Value::Object(map) = value else { return };
+        let mut own = parent;
+        if let Some(range) = map.get("range") {
+            let span = (offset(text, &range["start"]), offset(text, &range["end"]));
+            assert!(
+                parent.0 <= span.0 && span.0 <= span.1 && span.1 <= parent.1,
+                "{value} at {span:?} isn't inside its parent at {parent:?}"
+            );
+            let statement = map.contains_key("expression");
+            if !entry && !statement {
+                assert!(map["kind"].is_string(), "a node without `kind`: {value}");
+            }
+            if let Some(Value::String(written)) = map.get("text") {
+                assert_eq!(
+                    &text[span.0..span.1],
+                    written,
+                    "`text` isn't the range's slice"
+                );
+            }
+            own = span;
+        }
+        for (key, child) in map {
+            match (key.as_str(), child) {
+                // Comments aren't tree nodes: a leading comment precedes its
+                // statement.
+                ("comments", _) => {}
+                ("arguments" | "parameters", Value::Array(items)) => {
+                    items.iter().for_each(|item| check(text, item, own, true));
+                }
+                (_, Value::Array(items)) => {
+                    items.iter().for_each(|item| check(text, item, own, false));
+                }
+                (_, other) => check(text, other, own, false),
+            }
+        }
+    }
+    for statement in document["statements"].as_array().unwrap() {
+        check(text, statement, (0, text.len()), false);
     }
 }
 
@@ -565,78 +614,527 @@ fn recovery_errors_are_unparsed_statements_not_dropped() {
     assert_eq!(texts, ["x <- 1", ")", "y <- 2"]);
 }
 
-#[test]
-fn tree_nodes_all_have_kind_and_range_within_their_parent() {
-    fn check(node: &Value, parent: Option<(&Value, &Value)>) {
-        let Value::Object(map) = node else { return };
-        if map.contains_key("kind") {
-            assert!(map.contains_key("range"), "{node}");
-            if let Some((start, end)) = parent {
-                let key = |p: &Value| (p["line"].as_u64(), p["character"].as_u64());
-                assert!(key(&node["range"]["start"]) >= key(start));
-                assert!(key(&node["range"]["end"]) <= key(end));
-            }
-        }
-        let own = map
-            .get("range")
-            .map(|r| (&r["start"], &r["end"]))
-            .or(parent);
-        // Comments aren't tree nodes: a leading comment precedes its
-        // statement.
-        for (key, child) in map {
-            match child {
-                _ if key == "comments" => {}
-                Value::Array(items) => items.iter().for_each(|item| check(item, own)),
-                other => check(other, own),
-            }
-        }
+/// A tree with `range` removed everywhere, for comparing shapes.
+fn shape(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "range")
+                .map(|(key, child)| (key.clone(), shape(child)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(shape).collect()),
+        other => other.clone(),
     }
-    let d = doc(FIXTURE);
-    for statement in d["statements"].as_array().unwrap() {
-        check(&statement["expression"], None);
-    }
-    // Kinds this version gives, as decided in docs/cli.md.
-    let text = "a$b; pkg::f; x[1]; x[[1]]; !x; -1; ~y; y ~ x; (z); \\(q) q; \
-                for (i in s) next; while (TRUE) break; repeat break; x -> y; \
-                \"s\"; NULL; 1L; x |> f(); x %in% y\n";
+}
+
+/// Each top-level statement's expression, with the document's invariants
+/// (child ranges inside their parents, `text` matching ranges) checked.
+fn expressions(text: &str) -> Vec<Value> {
     let d = doc(text);
-    let kinds: Vec<&str> = d["statements"]
+    assert_invariants(text, &d);
+    d["statements"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|s| s["expression"]["kind"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        kinds,
-        [
-            "extract",
-            "namespace",
-            "index",
-            "index",
-            "unary",
-            "unary",
-            "formula",
-            "formula",
-            "parenthesized",
-            "function",
-            "for",
-            "while",
-            "repeat",
-            "assignment",
-            "string",
-            "constant",
-            "number",
-            "pipe",
-            "binary",
-        ]
-    );
-    // `->`: the value is on the left as written.
-    let arrow = &top(&d, 13)["expression"];
-    assert_eq!(arrow["value"]["range"]["start"], arrow["range"]["start"]);
-    assert_eq!(arrow["target"]["range"]["end"], arrow["range"]["end"]);
-    assert!(top(&d, 6)["expression"]["left"].is_null());
+        .map(|s| s["expression"].clone())
+        .collect()
 }
 
+fn ident(name: &str) -> Value {
+    json!({"kind": "identifier", "text": name, "name": name, "form": "plain"})
+}
+
+fn start_character(node: &Value) -> u64 {
+    node["range"]["start"]["character"].as_u64().unwrap()
+}
+
+#[test]
+fn number_literals_report_r_types_and_values() {
+    let cases = [
+        ("1", "double", json!(1)),
+        ("1e3", "double", json!(1000)),
+        ("0.1", "double", json!(0.1)),
+        ("1L", "integer", json!(1)),
+        ("1e3L", "integer", json!(1000)),
+        ("1.0L", "integer", json!(1)),
+        ("0x10", "double", json!(16)),
+        ("0x10L", "integer", json!(16)),
+        ("0x1p3", "double", json!(8)),
+        ("1.5L", "double", json!(1.5)),
+        ("1e-3L", "double", json!(0.001)),
+        ("100000000000L", "double", json!(100000000000_i64)),
+        ("1e999", "double", Value::Null),
+        ("1i", "complex", json!(1)),
+        ("2.5i", "complex", json!(2.5)),
+    ];
+    let text: Vec<&str> = cases.iter().map(|case| case.0).collect();
+    let text = text.join("; ");
+    let nodes = expressions(&text);
+    assert_eq!(nodes.len(), cases.len());
+    for (node, (written, r_type, value)) in nodes.iter().zip(&cases) {
+        assert_eq!(
+            shape(node),
+            json!({"kind": "number", "text": written, "type": r_type, "value": value}),
+            "{written}"
+        );
+    }
+    // Whole values print as JSON integers; others in shortest round-trip form.
+    let printed = serde_json::to_string(&nodes).unwrap();
+    assert!(printed.contains(r#""text":"100000000000L","type":"double","value":100000000000}"#));
+    assert!(printed.contains(r#""text":"1e-3L","type":"double","value":0.001}"#));
+    assert!(printed.contains(r#""text":"1e999","type":"double","value":null}"#));
+}
+
+#[test]
+fn reserved_constants_have_types_and_t_and_f_are_identifiers() {
+    let cases = [
+        ("TRUE", "logical"),
+        ("FALSE", "logical"),
+        ("NA", "logical"),
+        ("NA_integer_", "integer"),
+        ("NA_real_", "double"),
+        ("NA_character_", "character"),
+        ("NA_complex_", "complex"),
+        ("Inf", "double"),
+        ("NaN", "double"),
+        ("NULL", "NULL"),
+    ];
+    let text: Vec<&str> = cases.iter().map(|case| case.0).collect();
+    let nodes = expressions(&format!("{}; T; F", text.join("; ")));
+    for (node, (written, r_type)) in nodes.iter().zip(&cases) {
+        assert_eq!(
+            shape(node),
+            json!({"kind": "constant", "text": written, "type": r_type})
+        );
+    }
+    assert_eq!(shape(&nodes[cases.len()]), ident("T"));
+    assert_eq!(shape(&nodes[cases.len() + 1]), ident("F"));
+}
+
+#[test]
+fn negative_numbers_are_unary_minus_over_a_literal() {
+    let nodes = expressions("-1; -Inf; - 2L");
+    assert_eq!(
+        shape(&nodes[0]),
+        json!({"kind": "unary", "op": "-",
+               "operand": {"kind": "number", "text": "1", "type": "double", "value": 1}})
+    );
+    assert_eq!(start_character(&nodes[0]["operand"]), 1);
+    assert_eq!(
+        shape(&nodes[1]),
+        json!({"kind": "unary", "op": "-",
+               "operand": {"kind": "constant", "text": "Inf", "type": "double"}})
+    );
+    assert_eq!(nodes[2]["operand"]["type"], "integer");
+}
+
+#[test]
+fn strings_decode_escapes_and_keep_their_delimiters() {
+    let text = concat!(
+        r#""a\tb\x41\\\"\101\xc3\xa9"; 'it\'s'; "#,
+        r#"r"(a\nb)"; R"[x]"; r"---(a)"b)---"; r'{y}'; "\q"; "\xe9"; ""; "#,
+        r#""\u{00e9}\U{1F600}"; "\u{00e9}\x41""#,
+    );
+    let nodes = expressions(text);
+    let string = |text: &str, value: &str, quote: &str, raw: bool, open: &str, close: &str| {
+        json!({"kind": "string", "text": text, "value": value, "quote": quote, "raw": raw,
+               "delimiters": {"open": open, "close": close}})
+    };
+    assert_eq!(
+        shape(&nodes[0]),
+        string(
+            r#""a\tb\x41\\\"\101\xc3\xa9""#,
+            "a\tbA\\\"Aé",
+            "\"",
+            false,
+            "\"",
+            "\""
+        )
+    );
+    assert_eq!(
+        shape(&nodes[1]),
+        string(r"'it\'s'", "it's", "'", false, "'", "'")
+    );
+    assert_eq!(
+        shape(&nodes[2]),
+        string(r#"r"(a\nb)""#, r"a\nb", "\"", true, "r\"(", ")\"")
+    );
+    assert_eq!(
+        shape(&nodes[3]),
+        string(r#"R"[x]""#, "x", "\"", true, "R\"[", "]\"")
+    );
+    assert_eq!(
+        shape(&nodes[4]),
+        string(
+            r#"r"---(a)"b)---""#,
+            "a)\"b",
+            "\"",
+            true,
+            "r\"---(",
+            ")---\""
+        )
+    );
+    assert_eq!(
+        shape(&nodes[5]),
+        string("r'{y}'", "y", "'", true, "r'{", "}'")
+    );
+    // R rejects `\q`, and `\xe9` alone isn't UTF-8: no `value` either way.
+    for node in &nodes[6..8] {
+        assert_eq!(node["kind"], "string");
+        assert!(node.get("value").is_none(), "{node}");
+        assert_eq!(node["raw"], false);
+    }
+    assert_eq!(nodes[8]["value"], "");
+    assert_eq!(nodes[9]["value"], "é😀");
+    // R rejects mixing Unicode and byte escapes in one string.
+    assert!(nodes[10].get("value").is_none());
+
+    // A line ending inside a string reads as `\n`, in a CRLF file too.
+    let crlf = "x <- \"a\r\nb\"\r\n";
+    let nodes = expressions(crlf);
+    assert_eq!(nodes[0]["value"]["value"], "a\nb");
+    assert_eq!(nodes[0]["value"]["text"], "\"a\r\nb\"");
+}
+
+#[test]
+fn names_in_every_form() {
+    let text = concat!(
+        "`größe` <- 1; `_merge`; `a\\`b`; `a\\nb`; `\\u{e9}`; d$\"x\"; ",
+        "f(\"msg\" = e); c(\"a\" = \"b\"); \"dplyr\"::filter; pkg:::f; x@`s t`; ",
+        "...; ..1; .; .data; `_`; f(NULL = 1)",
+    );
+    let nodes = expressions(text);
+    let name = |text: &str, name: &str, form: &str| json!({"kind": "identifier", "text": text, "name": name, "form": form});
+    assert_eq!(
+        shape(&nodes[0]["target"]),
+        name("`größe`", "größe", "backtick")
+    );
+    assert_eq!(shape(&nodes[1]), name("`_merge`", "_merge", "backtick"));
+    // Backslash escapes in backticks decode as R decodes them.
+    assert_eq!(shape(&nodes[2]), name("`a\\`b`", "a`b", "backtick"));
+    assert_eq!(shape(&nodes[3]), name("`a\\nb`", "a\nb", "backtick"));
+    // R rejects `\u` in backticks: no `name`.
+    assert_eq!(
+        shape(&nodes[4]),
+        json!({"kind": "identifier", "text": "`\\u{e9}`", "form": "backtick"})
+    );
+    // Strings in a name's place.
+    assert_eq!(
+        shape(&nodes[5]),
+        json!({"kind": "extract", "op": "$", "left": ident("d"),
+               "right": name("\"x\"", "x", "string")})
+    );
+    assert_eq!(
+        shape(&nodes[6]["arguments"][0]["name"]),
+        name("\"msg\"", "msg", "string")
+    );
+    assert_eq!(
+        shape(&nodes[7]["arguments"][0]),
+        json!({"name": name("\"a\"", "a", "string"),
+               "value": {"kind": "string", "text": "\"b\"", "value": "b", "quote": "\"",
+                         "raw": false, "delimiters": {"open": "\"", "close": "\""}}})
+    );
+    assert_eq!(
+        shape(&nodes[8]),
+        json!({"kind": "namespace", "op": "::",
+               "left": name("\"dplyr\"", "dplyr", "string"), "right": ident("filter")})
+    );
+    assert_eq!(nodes[9]["op"], ":::");
+    assert_eq!(
+        shape(&nodes[10]),
+        json!({"kind": "extract", "op": "@", "left": ident("x"),
+               "right": name("`s t`", "s t", "backtick")})
+    );
+    for (node, written) in nodes[11..15].iter().zip(["...", "..1", ".", ".data"]) {
+        assert_eq!(shape(node), ident(written));
+    }
+    // A backticked `_` is a name, not the placeholder.
+    assert_eq!(shape(&nodes[15]), name("`_`", "_", "backtick"));
+    assert_eq!(
+        shape(&nodes[16]["arguments"][0]["name"]),
+        name("NULL", "NULL", "plain")
+    );
+}
+
+#[test]
+fn name_ranges_count_utf16_units() {
+    let text = "`größe` <- \"😀\"; größe\nf(größe = 1)";
+    let nodes = expressions(text);
+    let range = |node: &Value| {
+        let r = &node["range"];
+        (
+            r["start"]["character"].as_u64().unwrap(),
+            r["end"]["character"].as_u64().unwrap(),
+        )
+    };
+    assert_eq!(range(&nodes[0]["target"]), (0, 7));
+    // The emoji is two UTF-16 units.
+    assert_eq!(range(&nodes[0]["value"]), (11, 15));
+    assert_eq!(range(&nodes[1]), (17, 22));
+    let argument = &nodes[2]["arguments"][0];
+    assert_eq!(range(&argument["name"]), (2, 7));
+    assert_eq!(range(argument), (2, 11));
+}
+
+#[test]
+fn pipes_placeholders_and_operators_as_written() {
+    let nodes = expressions(concat!(
+        "x |> f(y = _); x |> _$a; x %>% f(a, .); x %>% f(a, g(.)); ",
+        "x -> y; x ->> y; 2 ** 3; 2 ^ 3; \\(x) x; function(a, b = 1, ...) NULL",
+    ));
+    assert_eq!(
+        shape(&nodes[0]),
+        json!({"kind": "pipe", "op": "|>", "left": ident("x"),
+               "right": {"kind": "call", "function": ident("f"), "arguments": [
+                   {"name": ident("y"), "value": {"kind": "placeholder", "text": "_"}}]}})
+    );
+    assert_eq!(
+        shape(&nodes[1]),
+        json!({"kind": "pipe", "op": "|>", "left": ident("x"),
+               "right": {"kind": "extract", "op": "$",
+                         "left": {"kind": "placeholder", "text": "_"}, "right": ident("a")}})
+    );
+    // `.` in a `%>%` step is an identifier, kept where it stands.
+    assert_eq!(nodes[2]["kind"], "binary");
+    assert_eq!(nodes[2]["op"], "%>%");
+    assert_eq!(
+        shape(&nodes[2]["right"]["arguments"][1]["value"]),
+        ident(".")
+    );
+    let nested = &nodes[3]["right"]["arguments"][1]["value"];
+    assert_eq!(
+        shape(nested),
+        json!({"kind": "call", "function": ident("g"),
+               "arguments": [{"name": null, "value": ident(".")}]})
+    );
+    // `->` and `->>` keep their direction: the value is on the left.
+    for (node, op) in nodes[4..6].iter().zip(["->", "->>"]) {
+        assert_eq!(
+            shape(node),
+            json!({"kind": "assignment", "op": op, "value": ident("x"), "target": ident("y")})
+        );
+        assert_eq!(node["value"]["range"]["start"], node["range"]["start"]);
+    }
+    assert_eq!(nodes[6]["op"], "**");
+    assert_eq!(nodes[7]["op"], "^");
+    assert_eq!(
+        shape(&nodes[8]),
+        json!({"kind": "function", "keyword": "\\",
+               "parameters": [{"name": ident("x"), "default": null}], "body": ident("x")})
+    );
+    assert_eq!(
+        shape(&nodes[9]),
+        json!({"kind": "function", "keyword": "function", "parameters": [
+                   {"name": ident("a"), "default": null},
+                   {"name": ident("b"), "default":
+                       {"kind": "number", "text": "1", "type": "double", "value": 1}},
+                   {"name": ident("..."), "default": null}],
+               "body": {"kind": "constant", "text": "NULL", "type": "NULL"}})
+    );
+    // A parameter entry's range covers its name and default.
+    assert_eq!(
+        slice(
+            "function(a, b = 1, ...) NULL",
+            &expressions("function(a, b = 1, ...) NULL")[0]["parameters"][1]["range"]
+        ),
+        "b = 1"
+    );
+}
+
+#[test]
+fn every_operator_is_reported_as_written() {
+    let binary = [
+        "+", "-", "*", "/", "^", "**", "%%", "%/%", "%in%", "%>%", "%<>%", "%T>%", "%$%", ":",
+        "==", "!=", "<", "<=", ">", ">=", "&", "&&", "|", "||", "?",
+    ];
+    let text: Vec<String> = binary.iter().map(|op| format!("a {op} b")).collect();
+    for (node, op) in expressions(&text.join("; ")).iter().zip(binary) {
+        assert_eq!(
+            shape(node),
+            json!({"kind": "binary", "op": op, "left": ident("a"), "right": ident("b")})
+        );
+    }
+    let nodes = expressions("x <- 1; x <<- 1; x = 1; x := 1; ~ y; y ~ x; ?a; +a; -a; !a");
+    for (node, op) in nodes[..4].iter().zip(["<-", "<<-", "=", ":="]) {
+        assert_eq!(node["kind"], "assignment");
+        assert_eq!(node["op"], op);
+        assert_eq!(shape(&node["target"]), ident("x"));
+    }
+    assert_eq!(
+        shape(&nodes[4]),
+        json!({"kind": "formula", "op": "~", "left": null, "right": ident("y")})
+    );
+    assert_eq!(
+        shape(&nodes[5]),
+        json!({"kind": "formula", "op": "~", "left": ident("y"), "right": ident("x")})
+    );
+    for (node, op) in nodes[6..].iter().zip(["?", "+", "-", "!"]) {
+        assert_eq!(
+            shape(node),
+            json!({"kind": "unary", "op": op, "operand": ident("a")})
+        );
+    }
+}
+
+#[test]
+fn equals_assignment_is_told_apart_from_a_named_argument() {
+    let nodes = expressions("f(x = 1); x = 1; (x = 1); f((x = 1))");
+    let one = json!({"kind": "number", "text": "1", "type": "double", "value": 1});
+    let assignment = json!({"kind": "assignment", "op": "=", "target": ident("x"), "value": one});
+    assert_eq!(
+        shape(&nodes[0]["arguments"]),
+        json!([{"name": ident("x"), "value": one}])
+    );
+    assert_eq!(shape(&nodes[1]), assignment);
+    assert_eq!(
+        shape(&nodes[2]),
+        json!({"kind": "parenthesized", "body": assignment})
+    );
+    assert_eq!(
+        shape(&nodes[3]["arguments"]),
+        json!([{"name": null, "value": {"kind": "parenthesized", "body": assignment}}])
+    );
+}
+
+#[test]
+fn arguments_keep_order_and_empty_arguments() {
+    let text = "x[i, ]; d[, y := e]; d[i, y, by = g]; x[[1]]; f(); f(,); f(a = ); f(b, a = 1, c)";
+    let nodes = expressions(text);
+    let empty = json!({"name": null, "value": null});
+    let unnamed = |name: &str| json!({"name": null, "value": ident(name)});
+    assert_eq!(
+        shape(&nodes[0]),
+        json!({"kind": "index", "op": "[", "target": ident("x"),
+               "arguments": [unnamed("i"), empty]})
+    );
+    // The empty argument's range is empty, just after the comma.
+    let range = &nodes[0]["arguments"][1]["range"];
+    assert_eq!(range["start"], json!({"line": 0, "character": 4}));
+    assert_eq!(range["end"], range["start"]);
+    assert_eq!(
+        shape(&nodes[1]["arguments"]),
+        json!([empty, {"name": null, "value": {"kind": "assignment", "op": ":=",
+                                               "target": ident("y"), "value": ident("e")}}])
+    );
+    assert_eq!(
+        nodes[1]["arguments"][0]["range"]["start"],
+        json!({"line": 0, "character": 10})
+    );
+    assert_eq!(
+        shape(&nodes[2]["arguments"]),
+        json!([unnamed("i"), unnamed("y"), {"name": ident("by"), "value": ident("g")}])
+    );
+    assert_eq!(nodes[3]["op"], "[[");
+    assert_eq!(nodes[3]["arguments"].as_array().unwrap().len(), 1);
+    assert_eq!(nodes[4]["arguments"], json!([]));
+    assert_eq!(shape(&nodes[5]["arguments"]), json!([empty, empty]));
+    // A named argument with no value.
+    assert_eq!(
+        shape(&nodes[6]["arguments"]),
+        json!([{"name": ident("a"), "value": null}])
+    );
+    let names: Vec<&Value> = nodes[7]["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| &a["name"])
+        .collect();
+    assert_eq!(names[0], &Value::Null);
+    assert_eq!(names[1]["name"], "a");
+    assert_eq!(names[2], &Value::Null);
+}
+
+#[test]
+fn nested_unary_operators_and_double_braces_stay_nested() {
+    let nodes = expressions("!!x; !!!x; !(!x); f({{ x }})");
+    let not = |operand: Value| json!({"kind": "unary", "op": "!", "operand": operand});
+    assert_eq!(shape(&nodes[0]), not(not(ident("x"))));
+    assert_eq!(shape(&nodes[1]), not(not(not(ident("x")))));
+    // Each `!` starts one column after its parent.
+    let three = &nodes[1];
+    let starts = [
+        start_character(three),
+        start_character(&three["operand"]),
+        start_character(&three["operand"]["operand"]),
+        start_character(&three["operand"]["operand"]["operand"]),
+    ];
+    assert_eq!(starts, [5, 6, 7, 8]);
+    assert_eq!(
+        shape(&nodes[2]),
+        not(json!({"kind": "parenthesized", "body": not(ident("x"))}))
+    );
+    // `{{ x }}` is a block whose one statement is a block.
+    let outer = &nodes[3]["arguments"][0]["value"];
+    assert_eq!(outer["kind"], "block");
+    let inner = &outer["statements"][0]["expression"];
+    assert_eq!(inner["kind"], "block");
+    assert_eq!(shape(&inner["statements"][0]["expression"]), ident("x"));
+}
+
+#[test]
+fn any_expression_can_be_called() {
+    let nodes = expressions("f()(x); (\\(x) x)(1); pkg::f(1); x$f(1)");
+    assert_eq!(
+        shape(&nodes[0]),
+        json!({"kind": "call",
+               "function": {"kind": "call", "function": ident("f"), "arguments": []},
+               "arguments": [{"name": null, "value": ident("x")}]})
+    );
+    let head = &nodes[1]["function"];
+    assert_eq!(head["kind"], "parenthesized");
+    assert_eq!(head["body"]["kind"], "function");
+    assert_eq!(head["body"]["keyword"], "\\");
+    assert_eq!(nodes[2]["function"]["kind"], "namespace");
+    assert_eq!(nodes[3]["function"]["kind"], "extract");
+}
+
+#[test]
+fn control_flow_is_an_expression() {
+    let nodes = expressions(concat!(
+        "y <- if (c) a else b; if (a) 1 else if (b) 2 else 3; if (p) q; ",
+        "for (i in s) next; while (TRUE) break; repeat {}; f(for (i in 1) i)",
+    ));
+    assert_eq!(
+        shape(&nodes[0]),
+        json!({"kind": "assignment", "op": "<-", "target": ident("y"),
+               "value": {"kind": "if", "condition": ident("c"), "consequence": ident("a"),
+                         "alternative": ident("b")}})
+    );
+    // `else if`: an `else` whose branch is an `if`.
+    let alternative = &nodes[1]["alternative"];
+    assert_eq!(alternative["kind"], "if");
+    assert_eq!(alternative["alternative"]["text"], "3");
+    assert!(nodes[2]["alternative"].is_null());
+    assert_eq!(
+        shape(&nodes[3]),
+        json!({"kind": "for", "variable": ident("i"), "sequence": ident("s"),
+               "body": {"kind": "next", "text": "next"}})
+    );
+    assert_eq!(
+        shape(&nodes[4]),
+        json!({"kind": "while", "condition": {"kind": "constant", "text": "TRUE", "type": "logical"},
+               "body": {"kind": "break", "text": "break"}})
+    );
+    assert_eq!(nodes[5]["body"]["kind"], "block");
+    assert_eq!(nodes[6]["arguments"][0]["value"]["kind"], "for");
+}
+
+/// Every fixture in this file, for the tree invariants.
+#[test]
+fn child_ranges_lie_inside_their_parents_in_every_fixture() {
+    let crlf = FIXTURE.replace('\n', "\r\n");
+    let fixtures = [
+        FIXTURE,
+        crlf.as_str(),
+        "x <- function(a, b = c(1, 2), ...) {\n  if (a) b[a, ] else d[[1]]$e@f\n}\n",
+        "`größe` <- \"😀\" |> f(y = _)\n",
+        "y <- df |>\n  filter(a,\n    b) %>%\n  g(., x = 'q')\n",
+    ];
+    for text in fixtures {
+        assert_invariants(text, &doc(text));
+    }
+}
 #[test]
 fn unreadable_and_undecodable_files_get_the_error_document() {
     let dir = tempfile::tempdir().unwrap();
