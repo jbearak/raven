@@ -114,7 +114,7 @@ fn number_value(text: &str) -> Option<f64> {
 /// optional `p` exponent (the part after `0x`).
 fn hex_value(text: &str) -> Option<f64> {
     let (digits, exponent) = match text.find(['p', 'P']) {
-        Some(at) => (&text[..at], text[at + 1..].parse::<i32>().ok()?),
+        Some(at) => (&text[..at], exponent(&text[at + 1..])?),
         None => (text, 0),
     };
     let mut mantissa: u128 = 0;
@@ -141,6 +141,22 @@ fn hex_value(text: &str) -> Option<f64> {
         }
     }
     Some(scale_by_power_of_two(mantissa as f64, shift))
+}
+
+/// A binary exponent (`3`, `-2`, `+10`). One past any double's range
+/// saturates, as R reads it: `0x1p99999999999` is `Inf`, `0x1p-99999999999`
+/// is `0`.
+fn exponent(text: &str) -> Option<i32> {
+    let digits = text.trim_start_matches(['+', '-']);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let negative = text.starts_with('-');
+    Some(match text.parse::<i32>() {
+        Ok(exponent) => exponent,
+        Err(_) if negative => -100_000,
+        Err(_) => 100_000,
+    })
 }
 
 /// `value * 2^shift`, in steps that can't overflow or underflow early.
@@ -512,6 +528,9 @@ mod tests {
         );
         assert_eq!(class_and_value("0x1p-1074").1, Some(f64::from_bits(1)));
         assert_eq!(class_and_value("0x1p99999").1, Some(f64::INFINITY));
+        // Exponents beyond `i32` saturate, as in R.
+        assert_eq!(class_and_value("0x1p2147483648").1, Some(f64::INFINITY));
+        assert_eq!(class_and_value("0x1p-2147483649").1, Some(0.0));
     }
 
     fn decoded(text: &str) -> Decoded {
