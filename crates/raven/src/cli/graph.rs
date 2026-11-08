@@ -1140,6 +1140,53 @@ mod tests {
         assert_eq!(case.portable_from_root, Some(false));
     }
 
+    /// Every `line` in the JSON is 0-based, as documented in `docs/cli.md`
+    /// ("Graph JSON"): `directive.line`, `call_site.position.line`, and
+    /// `dropped[].position.line`. A directive on a file's first line has
+    /// `line: 0`, and a backward directive's 1-based `line=N` appears as
+    /// `N - 1`.
+    #[test]
+    fn line_fields_are_zero_based() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write(ws, "raven.toml", "[workspace]\nexclude = [\"skip/\"]\n");
+        write(
+            ws,
+            "main.R",
+            "# raven: source R/a.R\nsource(\"R/b.R\")\nx <- 1\n",
+        );
+        write(ws, "R/a.R", "a <- 1\n");
+        write(ws, "R/b.R", "b <- 1\n");
+        write(
+            ws,
+            "R/c.R",
+            "\n\n# raven: sourced-by ../main.R line=3\nc <- x\n",
+        );
+        write(ws, "R/d.R", "d <- 1\nsource(\"skip/s.R\")\n");
+        write(ws, "skip/s.R", "s <- 1\n");
+        let report = report(ws, false);
+
+        // Forward directive on line 1 of main.R.
+        let directive = edge(&report, "main.R", "R/a.R", 0);
+        let location = directive.directive.as_ref().unwrap();
+        assert_eq!((location.file.as_str(), location.line), ("main.R", 0));
+        // source() call on line 2 of main.R.
+        let call = edge(&report, "main.R", "R/b.R", 1);
+        assert!(call.directive.is_none());
+        // Backward directive on line 3 of R/c.R, naming main.R's line 3.
+        let backward = edge(&report, "main.R", "R/c.R", 2);
+        let location = backward.directive.as_ref().unwrap();
+        assert_eq!((location.file.as_str(), location.line), ("R/c.R", 2));
+        // Dropped source() call on line 2 of R/d.R.
+        let dropped = report
+            .dropped
+            .iter()
+            .find(|d| d.caller == "R/d.R")
+            .unwrap_or_else(|| panic!("no dropped row for R/d.R: {:?}", report.dropped));
+        assert_eq!(dropped.reason, "excluded");
+        assert_eq!(dropped.position.map(|p| p.line), Some(1));
+    }
+
     fn prepared(workspace: &Path, no_config: bool, trace_graph: bool) -> PreparedWorkspace {
         let root = std::fs::canonicalize(workspace).unwrap();
         let workspace_url = Url::from_file_path(&root).unwrap();
