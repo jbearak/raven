@@ -66571,6 +66571,76 @@ y <- x"#;
         );
     }
 
+    /// Regression: base constants used inside a function body of a file
+    /// sourced with `local = TRUE` must resolve even when R did not enumerate
+    /// base's exports (no R, or the batch query failed). Base's INDEX lists
+    /// only the `Constants` topic, so before the embedded export floor this
+    /// reported `pi is not defined` (and the same for the other constants).
+    #[tokio::test]
+    async fn test_base_constants_in_sourced_function_resolve_without_r_enumeration() {
+        use tempfile::TempDir;
+
+        let lib_root = TempDir::new().unwrap();
+        crate::package_library::tests::write_fake_base_library_with_constants_topic(
+            lib_root.path(),
+        );
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+        std::fs::create_dir_all(workspace_path.join("R")).unwrap();
+        let main_path = workspace_path.join("R").join("main.R");
+        let helpers_path = workspace_path.join("R").join("helpers.R");
+        let main_code = "source(\"R/helpers.R\", local = TRUE)\n";
+        let helpers_code = "ll <- function(model) {\n\
+                            \x20 n <- nobs(model)\n\
+                            \x20 -n / 2 * (1 + log(2 * pi))\n\
+                            }\n\
+                            consts <- function() {\n\
+                            \x20 list(LETTERS, letters, month.name, month.abb, T, F)\n\
+                            }\n\
+                            still_flagged <- function() not_a_base_name\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        std::fs::write(&helpers_path, helpers_code).unwrap();
+
+        let workspace_url = Url::from_file_path(workspace_path).unwrap();
+        let main_url = Url::from_file_path(&main_path).unwrap();
+        let helpers_url = Url::from_file_path(&helpers_path).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders.push(workspace_url.clone());
+        state.workspace_scan_complete = true;
+        state.package_library = std::sync::Arc::new(lib);
+        state.package_library_ready = true;
+        for (url, code) in [(&main_url, main_code), (&helpers_url, helpers_code)] {
+            state
+                .documents
+                .insert(url.clone(), Document::new(code, None));
+            let meta = crate::cross_file::extract_metadata(code);
+            state
+                .cross_file_graph
+                .update_file(url, &meta, Some(&workspace_url), |_| None);
+        }
+
+        let messages: Vec<String> = diagnostics(&state, &helpers_url, &DiagCancelToken::never())
+            .into_iter()
+            .filter(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                    ))
+            })
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["not_a_base_name is not defined".to_string()],
+            "base constants must resolve; got: {messages:?}"
+        );
+    }
+
     /// Regression: `rm()` in a directly-sourced child must propagate to the
     /// parent's scope as cleanly as `rm()` in a transitively-sourced
     /// grandchild does.
