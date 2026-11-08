@@ -157,6 +157,27 @@ fn assert_invariants(text: &str, document: &Value) {
         .collect();
     listed.sort();
     assert_eq!(listed, grammar_comments(text), "every comment exactly once");
+
+    // No source is lost: every byte other than whitespace and `;` lies in a
+    // top-level statement or a comment.
+    let mut covered: Vec<(usize, usize)> = listed;
+    for statement in document["statements"].as_array().unwrap() {
+        covered.push((
+            offset(text, &statement["range"]["start"]),
+            offset(text, &statement["range"]["end"]),
+        ));
+    }
+    for (index, ch) in text.char_indices() {
+        if ch.is_whitespace() || ch == ';' {
+            continue;
+        }
+        assert!(
+            covered
+                .iter()
+                .any(|&(start, end)| start <= index && index < end),
+            "{ch:?} at byte {index} is in no statement or comment"
+        );
+    }
 }
 
 fn texts(list: &Value) -> Vec<&str> {
@@ -518,6 +539,30 @@ fn syntax_error_still_gets_a_full_document() {
     assert_eq!(kinds.first(), Some(&"assignment"));
     assert!(kinds.contains(&"unparsed"), "{kinds:?}");
     assert_eq!(kinds.last(), Some(&"assignment"));
+}
+
+#[test]
+fn recovery_errors_are_unparsed_statements_not_dropped() {
+    for text in [")\n", "x <- )\n", "x <- 1\n)\ny <- 2\n", "f({ a\n)\n# c\n"] {
+        let d = doc(text);
+        assert_invariants(text, &d);
+        assert!(
+            d["statements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["expression"]["kind"] == "unparsed"),
+            "{text:?}: {d}"
+        );
+    }
+    let d = doc("x <- 1\n)\ny <- 2\n");
+    let texts: Vec<&str> = d["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.text())
+        .collect();
+    assert_eq!(texts, ["x <- 1", ")", "y <- 2"]);
 }
 
 #[test]

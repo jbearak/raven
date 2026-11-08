@@ -110,11 +110,11 @@ fn lone_cr_as_lf(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// The statements of a sequence node (`program` or `braced_expression`): its
 /// named children other than comments. Syntax-error nodes count, so no source
-/// is lost.
+/// is lost; the parser's recovery attaches some of them as extras.
 pub(super) fn sequence_children(node: TsNode<'_>) -> Vec<TsNode<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .filter(|child| !child.is_extra() && child.kind() != "comment")
+        .filter(|child| child.kind() != "comment" && (!child.is_extra() || child.is_error()))
         .collect()
 }
 
