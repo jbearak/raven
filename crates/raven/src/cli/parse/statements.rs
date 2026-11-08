@@ -26,10 +26,13 @@
 //! For a statement the gap measured is the one before its first leading
 //! comment, if it has one.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 use tree_sitter::Node as TsNode;
 
 use super::document::{LineIndex, Range};
+use super::errors::ParseError;
 use super::tree::Node;
 
 /// A comment's byte span in the decoded text. The grammar's comment token
@@ -50,6 +53,8 @@ pub(crate) struct Comment {
     /// Only on own-line comments (`leading`, `block_end`, file-level).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) blank_line_before: Option<bool>,
+    /// The directive the comment carries, or `null` (see `directives`).
+    pub(crate) directive: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,11 +82,20 @@ pub(super) struct Builder<'a> {
     /// The decoded text, BOM removed. Every slice comes from here.
     pub(super) text: &'a str,
     pub(super) lines: &'a LineIndex<'a>,
+    /// Each directive comment's `directive`, by the comment's start byte.
+    pub(super) directives: HashMap<usize, serde_json::Value>,
+    /// The byte span of each `error`-severity entry in `errors`: the
+    /// statements that hold them are `unparsed` (see `tree`).
+    pub(super) error_spans: Vec<(usize, usize)>,
 }
 
-/// Parse `text` and build the document's top-level statements and file-level
-/// comments.
-pub(crate) fn build_document_body(text: &str, lines: &LineIndex<'_>) -> Sequence {
+/// The parsed body of a document: top-level statements, file-level comments,
+/// and the `errors` list.
+pub(crate) type Body = (Vec<Statement>, Vec<Comment>, Vec<ParseError>);
+
+/// Parse `text` and build the document's top-level statements, file-level
+/// comments, and errors.
+pub(crate) fn build_document_body(text: &str, lines: &LineIndex<'_>) -> Body {
     // The grammar treats a lone `\r` as whitespace, so a comment before one
     // would run on through the next line. R ends a line there, so parse a copy
     // with each lone `\r` read as `\n`: same length, so every byte offset holds.
@@ -89,10 +103,39 @@ pub(crate) fn build_document_body(text: &str, lines: &LineIndex<'_>) -> Sequence
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(parse_text.as_ref(), None))
         .expect("the R parser has a language and no timeout");
     let root = tree.root_node();
-    let builder = Builder { text, lines };
+    let errors = super::errors::collect(root, &parse_text, lines);
+    let error_spans: Vec<(usize, usize)> = errors
+        .iter()
+        .filter(|e| e.is_error())
+        .map(|e| (e.bytes.start, e.bytes.end))
+        .collect();
     let mut comments = Vec::new();
-    builder.collect_comments(root, &mut comments);
-    builder.sequence(&sequence_children(root), comments, None)
+    collect_comments(text, root, &mut comments);
+    let builder = Builder {
+        text,
+        lines,
+        directives: super::directives::directives_by_comment(&parse_text, lines, &comments),
+        error_spans,
+    };
+    let (statements, file_comments) = builder.sequence(&sequence_children(root), comments, None);
+    (statements, file_comments, errors)
+}
+
+/// Every comment under `node`, in source order.
+fn collect_comments(text: &str, node: TsNode<'_>, out: &mut Vec<CommentSpan>) {
+    if node.kind() == "comment" {
+        let start = node.start_byte();
+        let mut end = node.end_byte();
+        if text.as_bytes()[start..end].ends_with(b"\r") {
+            end -= 1;
+        }
+        out.push(CommentSpan { start, end });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comments(text, child, out);
+    }
 }
 
 fn lone_cr_as_lf(text: &str) -> std::borrow::Cow<'_, str> {
@@ -119,22 +162,6 @@ pub(super) fn sequence_children(node: TsNode<'_>) -> Vec<TsNode<'_>> {
 }
 
 impl Builder<'_> {
-    fn collect_comments(&self, node: TsNode<'_>, out: &mut Vec<CommentSpan>) {
-        if node.kind() == "comment" {
-            let start = node.start_byte();
-            let mut end = node.end_byte();
-            if self.text.as_bytes()[start..end].ends_with(b"\r") {
-                end -= 1;
-            }
-            out.push(CommentSpan { start, end });
-            return;
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            self.collect_comments(child, out);
-        }
-    }
-
     pub(super) fn line(&self, byte: usize) -> usize {
         self.lines.line_of(byte)
     }
@@ -150,6 +177,11 @@ impl Builder<'_> {
             text: text.to_string(),
             range: self.lines.range(span.start..span.end),
             blank_line_before,
+            directive: self
+                .directives
+                .get(&span.start)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         }
     }
 

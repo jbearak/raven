@@ -779,16 +779,17 @@ fn strings_decode_escapes_and_keep_their_delimiters() {
         shape(&nodes[5]),
         string("r'{y}'", "y", "'", true, "r'{", "}'")
     );
-    // R rejects `\q`, and `\xe9` alone isn't UTF-8: no `value` either way.
-    for node in &nodes[6..8] {
-        assert_eq!(node["kind"], "string");
-        assert!(node.get("value").is_none(), "{node}");
-        assert_eq!(node["raw"], false);
-    }
+    // R rejects `\q`: the statement doesn't parse (see
+    // `literal_errors_and_warnings_are_listed`).
+    assert_eq!(nodes[6]["kind"], "unparsed");
+    // R reads `\xe9`, but alone it isn't UTF-8: no `value`.
+    assert_eq!(nodes[7]["kind"], "string");
+    assert!(nodes[7].get("value").is_none(), "{}", nodes[7]);
+    assert_eq!(nodes[7]["raw"], false);
     assert_eq!(nodes[8]["value"], "");
     assert_eq!(nodes[9]["value"], "é😀");
     // R rejects mixing Unicode and byte escapes in one string.
-    assert!(nodes[10].get("value").is_none());
+    assert_eq!(nodes[10]["kind"], "unparsed");
 
     // A line ending inside a string reads as `\n`, in a CRLF file too.
     let crlf = "x <- \"a\r\nb\"\r\n";
@@ -814,10 +815,10 @@ fn names_in_every_form() {
     // Backslash escapes in backticks decode as R decodes them.
     assert_eq!(shape(&nodes[2]), name("`a\\`b`", "a`b", "backtick"));
     assert_eq!(shape(&nodes[3]), name("`a\\nb`", "a\nb", "backtick"));
-    // R rejects `\u` in backticks: no `name`.
+    // R rejects `\u` in backticks: the statement doesn't parse.
     assert_eq!(
         shape(&nodes[4]),
-        json!({"kind": "identifier", "text": "`\\u{e9}`", "form": "backtick"})
+        json!({"kind": "unparsed", "text": "`\\u{e9}`"})
     );
     // Strings in a name's place.
     assert_eq!(
@@ -1203,3 +1204,5 @@ fn requested_paths_resolve_lexically_against_the_root() {
     assert_eq!(printed_path(Path::new("/ws/R/a.R"), root), "R/a.R");
     assert_eq!(printed_path(Path::new("/out.R"), root), "/out.R");
 }
+
+mod errors_and_directives;

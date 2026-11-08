@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::errors::ParseError;
 use super::statements::{Comment, Statement, build_document_body};
 
 /// JSON schema version. Removing or renaming a field, changing a field's
@@ -56,6 +57,8 @@ pub(crate) struct ParsedDocument {
     /// Comments no statement or block owns: every comment in a file without
     /// statements, and own-line comments after the last top-level statement.
     pub(crate) comments: Vec<Comment>,
+    /// What R's parser would reject or warn about, in source order.
+    pub(crate) errors: Vec<ParseError>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,7 +122,7 @@ pub(crate) fn document_from_text(
         E::Utf16Be => ("UTF-16BE", true),
     };
     let lines = LineIndex::new(text);
-    let (statements, comments) = build_document_body(text, &lines);
+    let (statements, comments, errors) = build_document_body(text, &lines);
     Document::Parsed(Box::new(ParsedDocument {
         schema_version: SCHEMA_VERSION,
         raven_version: env!("CARGO_PKG_VERSION"),
@@ -132,6 +135,7 @@ pub(crate) fn document_from_text(
         line_count: lines.line_count(),
         statements,
         comments,
+        errors,
     }))
 }
 
@@ -206,6 +210,42 @@ impl<'a> LineIndex<'a> {
             start: self.position(bytes.start),
             end: self.position(bytes.end),
         }
+    }
+
+    /// The byte offset of `position`: the inverse of [`Self::position`]. A
+    /// character past the line's end clamps to it, and a line past the last
+    /// to the text's end.
+    pub(crate) fn offset(&self, position: Position) -> usize {
+        let line = position.line as usize;
+        let Some(&start) = self.starts.get(line) else {
+            return self.text.len();
+        };
+        let end = self.line_end(line);
+        let mut units = 0;
+        for (index, ch) in self.text[start..end].char_indices() {
+            if units >= position.character as usize {
+                return start + index;
+            }
+            units += ch.len_utf16();
+        }
+        end
+    }
+
+    /// The byte offset where `line` starts.
+    pub(crate) fn line_start(&self, line: usize) -> usize {
+        self.starts[line]
+    }
+
+    /// The byte offset where `line`'s characters end, before its line ending.
+    pub(crate) fn line_end(&self, line: usize) -> usize {
+        let start = self.starts[line];
+        let rest = &self.text[start..];
+        start + rest.find(['\r', '\n']).unwrap_or(rest.len())
+    }
+
+    /// The range of `line`'s characters, without its line ending.
+    pub(crate) fn line_range(&self, line: usize) -> Range {
+        self.range(self.line_start(line)..self.line_end(line))
     }
 
     /// The number of lines. A final line ending doesn't start another line,

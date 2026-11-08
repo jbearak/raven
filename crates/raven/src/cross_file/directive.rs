@@ -137,7 +137,31 @@ pub(crate) struct SuppressionMarker {
     /// What the marker suppresses: blanket, or the codes in its `[code]`
     /// selector. Always [`LineSuppression::All`] for [`SuppressionKind::BlockEnd`].
     pub(crate) what: LineSuppression,
+    /// The flavor as written. On a [`SuppressionKind::BlockEnd`] it only
+    /// records the spelling (`expect-end`); a block takes its start's flavor.
     pub(crate) flavor: SuppressionFlavor,
+    /// Written with the `@lsp-` alias rather than `# raven:`.
+    pub(crate) lsp_alias: bool,
+}
+
+impl SuppressionMarker {
+    /// The directive word as written: the flavor and the form's suffix
+    /// (`ignore`, `expect-next`, `ignore-start`, ...). The marker grammar is
+    /// literal, so this is exactly what the comment says.
+    pub(crate) fn keyword(&self) -> String {
+        let flavor = match self.flavor {
+            SuppressionFlavor::Ignore => "ignore",
+            SuppressionFlavor::Expect => "expect",
+        };
+        let suffix = match self.kind {
+            SuppressionKind::SameLine => "",
+            SuppressionKind::NextLine => "-next",
+            SuppressionKind::BlockStart => "-start",
+            SuppressionKind::BlockEnd => "-end",
+            SuppressionKind::File => "-file",
+        };
+        format!("{flavor}{suffix}")
+    }
 }
 
 /// The one grammar for Raven's `# raven:` and `@lsp-` suppression markers.
@@ -161,35 +185,37 @@ pub(crate) fn classify_suppression_marker(
     comment: Option<&str>,
 ) -> Option<SuppressionMarker> {
     let patterns = patterns();
-    let marker = |kind, caps: regex::Captures<'_>| SuppressionMarker {
+    let marker = |kind, lsp_alias, caps: regex::Captures<'_>| SuppressionMarker {
         kind,
         flavor: parse_flavor(caps.get(1).map(|m| m.as_str())),
         what: parse_suppression_codes(caps.get(2).map(|m| m.as_str())),
+        lsp_alias,
     };
     if let Some(caps) = comment.and_then(|comment| patterns.ignore.captures(comment)) {
-        return Some(marker(SuppressionKind::SameLine, caps));
+        return Some(marker(SuppressionKind::SameLine, true, caps));
     }
     if let Some(caps) = patterns.ignore_next.captures(line) {
-        return Some(marker(SuppressionKind::NextLine, caps));
+        return Some(marker(SuppressionKind::NextLine, true, caps));
     }
     if let Some(caps) = patterns.raven_ignore_start.captures(line) {
-        return Some(marker(SuppressionKind::BlockStart, caps));
+        return Some(marker(SuppressionKind::BlockStart, false, caps));
     }
-    if patterns.raven_ignore_end.is_match(line) {
+    if let Some(caps) = patterns.raven_ignore_end.captures(line) {
         return Some(SuppressionMarker {
             kind: SuppressionKind::BlockEnd,
             what: LineSuppression::All,
-            flavor: SuppressionFlavor::Ignore,
+            flavor: parse_flavor(caps.get(1).map(|m| m.as_str())),
+            lsp_alias: false,
         });
     }
     if let Some(caps) = patterns.raven_ignore_file.captures(line) {
-        return Some(marker(SuppressionKind::File, caps));
+        return Some(marker(SuppressionKind::File, false, caps));
     }
     if let Some(caps) = patterns.raven_ignore_next.captures(line) {
-        return Some(marker(SuppressionKind::NextLine, caps));
+        return Some(marker(SuppressionKind::NextLine, false, caps));
     }
     if let Some(caps) = comment.and_then(|comment| patterns.raven_ignore.captures(comment)) {
-        return Some(marker(SuppressionKind::SameLine, caps));
+        return Some(marker(SuppressionKind::SameLine, false, caps));
     }
     None
 }
@@ -499,7 +525,7 @@ fn patterns() -> &'static DirectivePatterns {
                 r"^\s*#\s*raven:\s*(ignore|expect)-start(?:\[([^\]]*)\])?\s*$"
             ).unwrap(),
             raven_ignore_end: Regex::new(
-                r"^\s*#\s*raven:\s*(?:ignore|expect)-end\s*$"
+                r"^\s*#\s*raven:\s*(ignore|expect)-end\s*$"
             ).unwrap(),
             raven_ignore_file: Regex::new(
                 r"^\s*#\s*raven:\s*(ignore|expect)-file(?:\[([^\]]*)\])?\s*$"
@@ -661,6 +687,9 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
 /// R's public parser uses its single-/double-quoted-string scanner unchanged.
 /// Stan supplies a scanner that understands apostrophe transpose and returns
 /// the actual Raven marker suffix after any earlier hash construct.
+///
+/// This folds [`scan_directives_with_same_line_scanner`]'s per-line results
+/// into the metadata; directives the scan marks as not honored are skipped.
 pub(crate) fn parse_directives_with_same_line_scanner<F>(
     content: &str,
     same_line_comment: F,
@@ -669,111 +698,77 @@ where
     F: Copy + for<'a> Fn(&'a str) -> Option<&'a str>,
 {
     log::trace!("Starting directive parsing");
-    let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
-
-    // BOM-tolerant scan anchor (see `strip_leading_bom_for_scan`). Directive
-    // positions are line-based — column is always 0 — so this shifts nothing. #346.
-    let content = crate::utf16::strip_leading_bom_for_scan(content);
-
-    // Header tracking: backward and working-dir directives are only recognized
-    // in the file header (consecutive blank/comment lines from the start).
-    let mut in_header = true;
+    let scan = scan_directives_with_same_line_scanner(content, same_line_comment);
 
     // Open `# raven: ignore-start` block, if any: (start_line, what, flavor).
     // Closed by `# raven: ignore-end`; an unterminated block extends to EOF
     // (mirrors the lint track's `# nolint start` behavior).
     let mut open_block: Option<(u32, LineSuppression, SuppressionFlavor)> = None;
-    let mut total_lines: u32 = 0;
 
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num as u32;
-        total_lines = line_num + 1;
-
-        // Track header boundary before the @lsp- pre-filter so that code lines
-        // without directives still end the header region.
-        if in_header {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                in_header = false;
-            }
+    for scanned in scan.directives {
+        let line_num = scanned.line;
+        match scanned.status {
+            DirectiveStatus::Honored
+            | DirectiveStatus::BlockStart { .. }
+            | DirectiveStatus::BlockEnd { .. } => {}
+            DirectiveStatus::OutsideHeader
+            | DirectiveStatus::NestedStart
+            | DirectiveStatus::UnpairedEnd
+            | DirectiveStatus::Malformed => continue,
         }
-
-        // Fast pre-filter: skip lines that can't contain any directive.
-        // All directives require "@lsp-" (or the "raven:" suppression
-        // namespace) so a cheap contains() check avoids running the regex
-        // battery on the vast majority of lines.
-        if !line.contains("@lsp-") && !line.contains("raven:") {
-            continue;
-        }
-
-        // Header-only: backward directives
-        if in_header && let Some(caps) = patterns.backward.captures(line) {
-            let path = capture_path(&caps, 1).unwrap_or_default();
-            let call_site = if let Some(line_match) = caps.get(4) {
-                let line_str = line_match.as_str();
-                if line_str == "eof" || line_str == "end" {
-                    // Use u32::MAX as EOF sentinel
-                    CallSiteSpec::Line(u32::MAX)
+        match scanned.payload {
+            DirectivePayload::Backward {
+                path,
+                line,
+                match_pattern,
+            } => {
+                let call_site = if let Some(line_str) = line {
+                    if line_str == "eof" || line_str == "end" {
+                        // Use u32::MAX as EOF sentinel
+                        CallSiteSpec::Line(u32::MAX)
+                    } else {
+                        // Convert 1-based user input to 0-based internal
+                        let user_line: u32 = line_str.parse().unwrap_or(1);
+                        CallSiteSpec::Line(user_line.saturating_sub(1))
+                    }
+                } else if let Some(match_pattern) = match_pattern {
+                    CallSiteSpec::Match(match_pattern)
                 } else {
-                    // Convert 1-based user input to 0-based internal
-                    let user_line: u32 = line_str.parse().unwrap_or(1);
-                    CallSiteSpec::Line(user_line.saturating_sub(1))
-                }
-            } else if let Some(match_pattern) = caps.get(5) {
-                CallSiteSpec::Match(match_pattern.as_str().to_string())
-            } else {
-                CallSiteSpec::Default
-            };
-            log::trace!(
-                "  Parsed backward directive at line {}: path='{}' call_site={:?}",
-                line_num,
-                path,
-                call_site
-            );
-            meta.sourced_by.push(BackwardDirective {
-                path,
-                call_site,
-                directive_line: line_num,
-            });
-            continue;
-        }
-
-        // Header-only: working directory directive
-        if in_header && let Some(caps) = patterns.working_dir.captures(line) {
-            let path = capture_path(&caps, 1).unwrap_or_default();
-            log::trace!(
-                "  Parsed working directory directive at line {}: path='{}'",
-                line_num,
-                path
-            );
-            meta.working_directory = Some(path);
-            continue;
-        }
-
-        // Header-only: self-contained source directive (issue #479).
-        // File-level, no payload. Like the backward/working-dir directives it
-        // is only honored in the header so a later `self-contained` /
-        // `standalone` token (e.g. inside a string or a later comment) cannot
-        // retroactively change the file's cross-file scoping semantics.
-        if in_header && patterns.standalone.is_match(line) {
-            log::trace!(
-                "  Parsed self-contained/standalone directive at line {}",
-                line_num
-            );
-            meta.standalone = true;
-            continue;
-        }
-
-        // Full-file: forward directive
-        if let Some(caps) = patterns.forward.captures(line) {
-            let path = capture_path(&caps, 1).unwrap_or_default();
-            // Parse line=N parameter from capture group 4 if present
-            // Convert from 1-based user input to 0-based internal (N-1)
-            // Use directive's own line when no line= parameter
-            let (call_site_line, has_explicit_line, is_line_zero) =
-                if let Some(line_match) = caps.get(4) {
-                    let line_str = line_match.as_str();
+                    CallSiteSpec::Default
+                };
+                log::trace!(
+                    "  Parsed backward directive at line {}: path='{}' call_site={:?}",
+                    line_num,
+                    path,
+                    call_site
+                );
+                meta.sourced_by.push(BackwardDirective {
+                    path,
+                    call_site,
+                    directive_line: line_num,
+                });
+            }
+            DirectivePayload::WorkingDirectory { path } => {
+                log::trace!(
+                    "  Parsed working directory directive at line {}: path='{}'",
+                    line_num,
+                    path
+                );
+                meta.working_directory = Some(path);
+            }
+            DirectivePayload::SelfContained => {
+                log::trace!(
+                    "  Parsed self-contained/standalone directive at line {}",
+                    line_num
+                );
+                meta.standalone = true;
+            }
+            DirectivePayload::Forward { path, line } => {
+                // Parse line=N: convert from 1-based user input to 0-based
+                // internal (N-1); use the directive's own line when absent.
+                let (call_site_line, has_explicit_line, is_line_zero) = if let Some(line_str) = line
+                {
                     if line_str == "eof" || line_str == "end" {
                         // Use u32::MAX as EOF sentinel
                         (u32::MAX, true, false)
@@ -791,128 +786,105 @@ where
                 } else {
                     (line_num, false, false)
                 };
-            log::trace!(
-                "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={} user_line_zero={}",
-                line_num,
-                path,
-                call_site_line,
-                has_explicit_line,
-                is_line_zero
-            );
-            meta.sources.push(ForwardSource {
-                path,
-                line: call_site_line,
-                column: 0, // Always 0 for directive-based sources
-                is_directive: true,
-                locality: super::types::SourceLocality::Global,
-                chdir: false,
-                is_sys_source: false,
-                explicit_line: has_explicit_line,
-                directive_line: line_num,
-                user_line_zero: is_line_zero,
-                // `@lsp-source` directives are treated as load-time sources
-                // and are never function-scoped. Note: unlike backward
-                // (`@lsp-sourced-by`) and working-directory (`@lsp-cd`)
-                // directives, forward directives (`@lsp-source`,
-                // `@lsp-run`, `@lsp-include`) are NOT strictly header-only
-                // in this parser — see the parse_directives docstring above
-                // and the "Backward directives and working directory
-                // directives are header-only" learning in AGENTS.md. The
-                // load-time semantics here come from the parser, not from
-                // a header-only restriction: this branch runs in the full-
-                // file pass, and `is_directive: true` (combined with this
-                // `is_function_scoped: false`) is what tags the resulting
-                // ForwardSource as a load-time ordering constraint.
-                is_function_scoped: false,
-                system_file: None,
-                resolved_uri: None,
-                tar_source_ordinal: None,
-                source_batch_kind: None,
-                guarded_by_file_exists: false,
-            });
-            continue;
-        }
-
-        // Full-file: suppression markers (`# raven: ignore*`, `@lsp-ignore*`).
-        // The same-line forms are matched only against the language-specific
-        // scanner's actual comment/marker region, so marker-shaped string
-        // contents never suppress. See `classify_suppression_marker`.
-        if let Some(marker) = classify_suppression_marker(line, same_line_comment(line)) {
-            log::trace!(
-                "  Parsed {:?} suppression marker at line {}",
-                marker.kind,
-                line_num
-            );
-            let SuppressionMarker { kind, what, flavor } = marker;
-            match kind {
-                SuppressionKind::SameLine | SuppressionKind::NextLine => {
-                    let (map, target) = if kind == SuppressionKind::SameLine {
-                        (&mut meta.ignored_lines, line_num)
-                    } else {
-                        (&mut meta.ignored_next_lines, line_num + 1)
-                    };
-                    insert_line_suppression(map, target, what.clone());
-                    meta.suppression_directives.push(SuppressionDirective {
-                        directive_line: line_num,
-                        target_start: target,
-                        target_end: target,
-                        what,
-                        flavor,
-                    });
-                }
-                SuppressionKind::BlockStart => {
-                    // A nested start is ignored until the current block closes
-                    // (mirrors the lint track, which does not nest).
-                    if open_block.is_none() {
+                log::trace!(
+                    "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={} user_line_zero={}",
+                    line_num,
+                    path,
+                    call_site_line,
+                    has_explicit_line,
+                    is_line_zero
+                );
+                meta.sources.push(ForwardSource {
+                    path,
+                    line: call_site_line,
+                    column: 0, // Always 0 for directive-based sources
+                    is_directive: true,
+                    locality: super::types::SourceLocality::Global,
+                    chdir: false,
+                    is_sys_source: false,
+                    explicit_line: has_explicit_line,
+                    directive_line: line_num,
+                    user_line_zero: is_line_zero,
+                    // Forward directives are load-time sources and never
+                    // function-scoped. Unlike backward and working-directory
+                    // directives they are NOT header-only (see
+                    // `parse_directives`); `is_directive: true` with
+                    // `is_function_scoped: false` is what tags the
+                    // ForwardSource as a load-time ordering constraint.
+                    is_function_scoped: false,
+                    system_file: None,
+                    resolved_uri: None,
+                    tar_source_ordinal: None,
+                    source_batch_kind: None,
+                    guarded_by_file_exists: false,
+                });
+            }
+            DirectivePayload::Suppression(marker) => {
+                log::trace!(
+                    "  Parsed {:?} suppression marker at line {}",
+                    marker.kind,
+                    line_num
+                );
+                let SuppressionMarker {
+                    kind, what, flavor, ..
+                } = marker;
+                match kind {
+                    SuppressionKind::SameLine | SuppressionKind::NextLine => {
+                        let (map, target) = if kind == SuppressionKind::SameLine {
+                            (&mut meta.ignored_lines, line_num)
+                        } else {
+                            (&mut meta.ignored_next_lines, line_num + 1)
+                        };
+                        insert_line_suppression(map, target, what.clone());
+                        meta.suppression_directives.push(SuppressionDirective {
+                            directive_line: line_num,
+                            target_start: target,
+                            target_end: target,
+                            what,
+                            flavor,
+                        });
+                    }
+                    SuppressionKind::BlockStart => {
                         open_block = Some((line_num, what, flavor));
                     }
-                }
-                SuppressionKind::BlockEnd => {
-                    if let Some((start, what, flavor)) = open_block.take() {
-                        meta.ignored_ranges.push(SuppressionRange {
-                            start,
-                            end: line_num,
-                            what: what.clone(),
-                        });
+                    SuppressionKind::BlockEnd => {
+                        if let Some((start, what, flavor)) = open_block.take() {
+                            meta.ignored_ranges.push(SuppressionRange {
+                                start,
+                                end: line_num,
+                                what: what.clone(),
+                            });
+                            meta.suppression_directives.push(SuppressionDirective {
+                                directive_line: start,
+                                target_start: start,
+                                target_end: line_num,
+                                what,
+                                flavor,
+                            });
+                        }
+                    }
+                    SuppressionKind::File => {
+                        match &mut meta.ignored_file {
+                            Some(existing) => existing.merge(what.clone()),
+                            None => meta.ignored_file = Some(what.clone()),
+                        }
                         meta.suppression_directives.push(SuppressionDirective {
-                            directive_line: start,
-                            target_start: start,
-                            target_end: line_num,
+                            directive_line: line_num,
+                            target_start: 0,
+                            target_end: u32::MAX,
                             what,
                             flavor,
                         });
                     }
                 }
-                SuppressionKind::File => {
-                    match &mut meta.ignored_file {
-                        Some(existing) => existing.merge(what.clone()),
-                        None => meta.ignored_file = Some(what.clone()),
-                    }
-                    meta.suppression_directives.push(SuppressionDirective {
-                        directive_line: line_num,
-                        target_start: 0,
-                        target_end: u32::MAX,
-                        what,
-                        flavor,
-                    });
-                }
             }
-            continue;
-        }
-
-        // Check variable declaration directives (@lsp-var, @lsp-variable, etc.)
-        // Requirements: 1.1, 1.2, 1.3, 1.4, 1.5
-        if let Some(caps) = patterns.declare_var.captures(line) {
-            if let Some(name) = capture_symbol_name(&caps, 1) {
+            DirectivePayload::Variable { name } => {
                 // Store the name in call-site form (backtick-wrapped if
                 // non-syntactic), mirroring `declare_func`/`nse`, so a declared
                 // non-syntactic variable (`# raven: var "my fn"`) aligns with the
                 // backticked usage text `` `my fn` `` at BOTH the
-                // undefined-variable check and go-to-definition. (The
-                // undefined-variable path also has an unquote fallback, but
-                // go-to-definition compares the stored name exactly, so without
-                // the wrap it would miss a non-syntactic declared variable.)
-                // Variables are not package-qualified, so there is no `::` split.
+                // undefined-variable check and go-to-definition. Variables are
+                // not package-qualified, so there is no `::` split.
                 let name = callee_name_for_match(&name);
                 log::trace!(
                     "  Parsed variable declaration directive at line {}: name='{}'",
@@ -926,37 +898,7 @@ where
                     formals: None,
                 });
             }
-            continue;
-        }
-
-        // Check function declaration directives (@lsp-func, @lsp-function, etc.)
-        // Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
-        if let Some(caps) = patterns.declare_func.captures(line) {
-            if let Some(name) = capture_symbol_name(&caps, 1) {
-                // Reject malformed names. The quoted forms accept any content,
-                // so a malformed `"pkg:::my_func"` is caught by
-                // `is_well_formed_callee_name`. For the unquoted form the regex
-                // stops at the first byte outside its name class, so a
-                // NON-SEPARATOR character immediately after the captured name
-                // means the regex truncated a longer (non-syntactic) name:
-                // `some-func` -> `some`, `obj$method` -> `obj`, `pkg:::name` ->
-                // `pkg`. Storing that truncated prefix would silently declare the
-                // WRONG symbol, so drop it — a non-syntactic name must use the
-                // quoted form. Only an *adjacent* offending byte counts: a
-                // separator (whitespace, the `(` formals opener, or a `#`
-                // comment) is ordinary trailing text the prefix-tolerant `func`
-                // regex legitimately ignores. Together with
-                // `is_well_formed_callee_name` this keeps every stored name
-                // well-formed for `declared_name_matches`'s `rsplit_once`.
-                let unquoted_truncated = caps.get(3).is_some_and(|m| {
-                    line[m.end()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| !c.is_whitespace() && c != '(' && c != '#')
-                });
-                if !is_well_formed_callee_name(&name) || unquoted_truncated {
-                    continue;
-                }
+            DirectivePayload::Function { name, formals } => {
                 // Store the bare name in call-site form (backtick-wrapped if
                 // non-syntactic) so it matches the callee text at use sites and
                 // pairs with a `# raven: nse` reference written the same way.
@@ -969,7 +911,6 @@ where
                     line_num,
                     name
                 );
-                let formals = caps.get(4).and_then(|m| split_formal_list(m.as_str()));
                 meta.declared_functions.push(DeclaredSymbol {
                     name,
                     line: line_num,
@@ -977,55 +918,24 @@ where
                     formals,
                 });
             }
-            continue;
-        }
-
-        // `# raven: nse [pkg::]name[(formals…)]` — NSE argument-policy
-        // declaration. Position-aware (applies to calls after this line).
-        if let Some(caps) = patterns.nse.captures(line) {
-            // Name from the double-quoted / single-quoted / unquoted groups
-            // (1/2/3), then reject a malformed `::` qualifier the same way the
-            // `func` directive does — the quoted forms accept any content, so a
-            // `"pkg:::x"` must be screened out before it could mis-pair.
-            if let Some(raw) =
-                capture_symbol_name(&caps, 1).filter(|n| is_well_formed_callee_name(n))
-            {
-                let (package, name) = match raw.split_once("::") {
-                    // `is_well_formed_callee_name` guarantees both halves are
-                    // non-empty and colon-free, so any `::` split is a valid
-                    // qualifier. The bare name is stored in call-site form
+            DirectivePayload::Nse { name, scope, .. } => {
+                let Some(scope) = scope else { continue };
+                let (package, name) = match name.split_once("::") {
+                    // The scan checked the qualifier with
+                    // `is_well_formed_callee_name`: both halves are non-empty
+                    // and colon-free. The bare name is stored in call-site form
                     // (backtick-wrapped if non-syntactic) so it matches the
                     // callee text at use sites.
                     Some((p, n)) => (Some(p.to_string()), callee_name_for_match(n)),
-                    None => (None, callee_name_for_match(&raw)),
+                    None => (None, callee_name_for_match(&name)),
                 };
-                // No parentheses (`nse f`) and EMPTY parentheses (`nse f()`) both
-                // mean whole-call NSE — `f()` lists zero captured formals, read as
-                // "same as no parens" rather than a silent no-op; both are
-                // deliberate, well-formed forms. A non-empty list is per-formal.
-                //
-                // A non-empty but MALFORMED list (a blank slot like `f(x,,y)`, or
-                // no syntactic formal names at all) makes `split_formal_list`
-                // return `None`: DROP the whole directive rather than broadening
-                // it to whole-call. A typo'd capture list must not silently
-                // suppress every argument and hide real undefined-variable findings
-                // (issue #460 review) — dropping it leaves the callee checked
-                // normally so the user notices and corrects the directive.
-                let scope = match caps.get(4).map(|b| b.as_str()) {
-                    None => Some(NseScope::WholeCall),
-                    Some(body) if body.trim().is_empty() => Some(NseScope::WholeCall),
-                    Some(body) => split_formal_list(body).map(NseScope::Formals),
-                };
-                if let Some(scope) = scope {
-                    meta.nse_declarations.push(NseDeclaration {
-                        name,
-                        package,
-                        scope,
-                        line: line_num,
-                    });
-                }
+                meta.nse_declarations.push(NseDeclaration {
+                    name,
+                    package,
+                    scope,
+                    line: line_num,
+                });
             }
-            continue;
         }
     }
 
@@ -1033,7 +943,7 @@ where
     // track's `# nolint start` behavior so a missing `-end` doesn't silently
     // lose coverage).
     if let Some((start, what, flavor)) = open_block.take() {
-        let end = total_lines.saturating_sub(1);
+        let end = scan.total_lines.saturating_sub(1);
         meta.ignored_ranges.push(SuppressionRange {
             start,
             end,
@@ -1059,6 +969,436 @@ where
     );
 
     meta
+}
+
+/// What a directive says, as the directive grammar reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirectivePayload {
+    /// `sourced-by`, `run-by`, `included-by`. `line` is `line=` as written (a
+    /// number, `eof`, or `end`); `match_pattern` is `match=`'s pattern.
+    Backward {
+        path: String,
+        line: Option<String>,
+        match_pattern: Option<String>,
+    },
+    /// `cd` and its synonyms.
+    WorkingDirectory { path: String },
+    /// `self-contained` / `standalone`.
+    SelfContained,
+    /// `source`, `run`, `include`, with `line=` as written.
+    Forward { path: String, line: Option<String> },
+    /// The `ignore` and `expect` families.
+    Suppression(SuppressionMarker),
+    /// `var` and its synonyms: the name without its quotes.
+    Variable { name: String },
+    /// `func` and its synonyms: the name without its quotes (`pkg::name` when
+    /// qualified) and the formal names, if a usable list was given.
+    Function {
+        name: String,
+        formals: Option<Vec<String>>,
+    },
+    /// `nse`: `declaration` is the payload as written (`helper(x)`), `name`
+    /// the name without its quotes (`pkg::name` when qualified), and `scope`
+    /// what it captures (`None` when the formal list is malformed).
+    Nse {
+        declaration: String,
+        name: String,
+        scope: Option<NseScope>,
+    },
+}
+
+/// What Raven does with one scanned directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectiveStatus {
+    /// Honored where it stands.
+    Honored,
+    /// An honored `-start`. `end_line` is the line of the `-end` that closes
+    /// it, or `None` when none does and the block runs to the last line.
+    BlockStart { end_line: Option<u32> },
+    /// An `-end` that closes the block opened on `start_line`.
+    BlockEnd { start_line: u32 },
+    /// A header-only directive (backward, working directory,
+    /// self-contained) after the header, which Raven ignores.
+    OutsideHeader,
+    /// A `-start` while another block is open, which Raven ignores.
+    NestedStart,
+    /// An `-end` with no open block, which does nothing.
+    UnpairedEnd,
+    /// The grammar matched, but Raven rejects the payload (a malformed name
+    /// or formal list) and ignores the directive.
+    Malformed,
+}
+
+/// One `# raven:` / `@lsp-` directive, as [`scan_directives`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScannedDirective {
+    /// 0-based line.
+    pub(crate) line: u32,
+    /// Byte offset, within the line, of the `#` that opens the comment the
+    /// directive is read from.
+    pub(crate) hash: usize,
+    /// Written with the `@lsp-` alias rather than `# raven:`.
+    pub(crate) lsp_alias: bool,
+    /// The directive word as written: `sourced-by`, `run`, `working-dir`,
+    /// `ignore-next`, `nse`, ...
+    pub(crate) keyword: String,
+    pub(crate) payload: DirectivePayload,
+    pub(crate) status: DirectiveStatus,
+}
+
+/// Every directive in a file, and its line count (as `str::lines` counts).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DirectiveScan {
+    pub(crate) directives: Vec<ScannedDirective>,
+    pub(crate) total_lines: u32,
+}
+
+/// Scan an R file's directives, one per line at most, with what Raven does
+/// with each. [`parse_directives`] is a fold over this scan, so a consumer
+/// that reports directives (such as `raven parse`) and the analysis agree on
+/// every directive's meaning. Directives Raven ignores where they stand
+/// (header-only ones after the header, a nested `-start`, an unpaired
+/// `-end`, a malformed payload) are included with a status saying so.
+pub(crate) fn scan_directives(content: &str) -> DirectiveScan {
+    scan_directives_with_same_line_scanner(content, comment_region_outside_strings)
+}
+
+/// [`scan_directives`] with a language-specific same-line comment scanner.
+pub(crate) fn scan_directives_with_same_line_scanner<F>(
+    content: &str,
+    same_line_comment: F,
+) -> DirectiveScan
+where
+    F: Copy + for<'a> Fn(&'a str) -> Option<&'a str>,
+{
+    // BOM-tolerant scan anchor (see `strip_leading_bom_for_scan`). Directive
+    // positions are line-based — column is always 0 — so this shifts nothing. #346.
+    let content = crate::utf16::strip_leading_bom_for_scan(content);
+
+    // Header tracking: backward and working-dir directives are only recognized
+    // in the file header (consecutive blank/comment lines from the start).
+    let mut in_header = true;
+    let mut scan = DirectiveScan::default();
+    // Index in `scan.directives` of the open `-start`, if any.
+    let mut open_block: Option<usize> = None;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num as u32;
+        scan.total_lines = line_num + 1;
+
+        // Track header boundary before the pre-filter so that code lines
+        // without directives still end the header region.
+        if in_header {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                in_header = false;
+            }
+        }
+
+        // Fast pre-filter: every directive contains "@lsp-" or "raven:", so a
+        // cheap contains() check keeps the regex battery off most lines.
+        if !line.contains("@lsp-") && !line.contains("raven:") {
+            continue;
+        }
+
+        let found = classify_directive_line(line, in_header, same_line_comment).or_else(|| {
+            if in_header {
+                return None;
+            }
+            classify_header_only(line)
+                .map(|(directive, _)| (directive, DirectiveStatus::OutsideHeader))
+        });
+        let Some(((lsp_alias, keyword, hash, payload), mut status)) = found else {
+            continue;
+        };
+        if let DirectivePayload::Suppression(marker) = &payload {
+            match marker.kind {
+                // A nested start is ignored until the current block closes
+                // (mirrors the lint track, which does not nest).
+                SuppressionKind::BlockStart if open_block.is_some() => {
+                    status = DirectiveStatus::NestedStart;
+                }
+                SuppressionKind::BlockStart => {
+                    open_block = Some(scan.directives.len());
+                    status = DirectiveStatus::BlockStart { end_line: None };
+                }
+                SuppressionKind::BlockEnd => match open_block.take() {
+                    Some(index) => {
+                        let start = &mut scan.directives[index];
+                        start.status = DirectiveStatus::BlockStart {
+                            end_line: Some(line_num),
+                        };
+                        status = DirectiveStatus::BlockEnd {
+                            start_line: start.line,
+                        };
+                    }
+                    None => status = DirectiveStatus::UnpairedEnd,
+                },
+                _ => {}
+            }
+        }
+        scan.directives.push(ScannedDirective {
+            line: line_num,
+            hash,
+            lsp_alias,
+            keyword,
+            payload,
+            status,
+        });
+    }
+    scan
+}
+
+/// A classified line: whether it uses the `@lsp-` alias, the directive word
+/// as written, the byte offset of its comment's `#`, and the payload.
+type Classified = (bool, String, usize, DirectivePayload);
+
+/// What a comment would be as a directive if it stood on its own line in the
+/// header: whether it uses the `@lsp-` alias, the directive word, and the
+/// payload. For reporting a full-line directive written as a trailing
+/// comment (`x <- 1 # raven: source a.R`), which Raven doesn't read.
+pub(crate) fn classify_as_own_line(comment: &str) -> Option<(bool, String, DirectivePayload)> {
+    let ((lsp_alias, keyword, _, payload), _) =
+        classify_directive_line(comment, true, comment_region_outside_strings)?;
+    Some((lsp_alias, keyword, payload))
+}
+
+/// Where the directive word starts in a full-line directive: after the `#`,
+/// whitespace, and the `@lsp-` or `raven:` prefix (with the whitespace after
+/// it). Returns whether the prefix is `@lsp-`, and the offset. `None` when the
+/// line's first non-blank text isn't `#` followed by a prefix.
+pub(crate) fn directive_word_start(line: &str) -> Option<(bool, usize)> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if let Some(word) = rest.strip_prefix("@lsp-") {
+        return Some((true, line.len() - word.len()));
+    }
+    let word = rest.strip_prefix("raven:")?.trim_start();
+    Some((false, line.len() - word.len()))
+}
+
+/// The directive word of a full-line directive whose payload starts at byte
+/// `payload_start`: the text between the prefix and the payload, without the
+/// optional `:` separator. This is the alternative the regex matched, so it
+/// is the spelling Raven read (`working-dir`, `run-by`, ...).
+fn written_keyword(line: &str, payload_start: usize) -> (bool, String) {
+    let (lsp_alias, start) = directive_word_start(line).unwrap_or((false, 0));
+    let word = line[start..payload_start.max(start)].trim_end();
+    let word = word.strip_suffix(':').unwrap_or(word).trim_end();
+    (lsp_alias, word.to_string())
+}
+
+/// Start of a quoted-or-unquoted capture (groups `base`, `base + 1`,
+/// `base + 2`: double-quoted, single-quoted, unquoted), including its quote.
+fn capture_start(caps: &regex::Captures, base_group: usize) -> Option<usize> {
+    (0..3).find_map(|i| {
+        caps.get(base_group + i)
+            .map(|m| m.start() - usize::from(i < 2))
+    })
+}
+
+/// End of a quoted-or-unquoted capture, including its quote.
+fn capture_end(caps: &regex::Captures, base_group: usize) -> Option<usize> {
+    (0..3).find_map(|i| {
+        caps.get(base_group + i)
+            .map(|m| m.end() + usize::from(i < 2))
+    })
+}
+
+/// The byte offset of a full-line directive's `#`.
+fn leading_hash(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The header-only directives (backward, working directory,
+/// self-contained), whatever the line's place in the file.
+fn classify_header_only(line: &str) -> Option<(Classified, DirectiveStatus)> {
+    let patterns = patterns();
+    let hash = leading_hash(line);
+    if let Some(caps) = patterns.backward.captures(line) {
+        let path = capture_path(&caps, 1).unwrap_or_default();
+        let (lsp_alias, keyword) = written_keyword(line, capture_start(&caps, 1).unwrap_or(0));
+        let payload = DirectivePayload::Backward {
+            path,
+            line: caps.get(4).map(|m| m.as_str().to_string()),
+            match_pattern: caps.get(5).map(|m| m.as_str().to_string()),
+        };
+        return Some((
+            (lsp_alias, keyword, hash, payload),
+            DirectiveStatus::Honored,
+        ));
+    }
+    if let Some(caps) = patterns.working_dir.captures(line) {
+        let path = capture_path(&caps, 1).unwrap_or_default();
+        let (lsp_alias, keyword) = written_keyword(line, capture_start(&caps, 1).unwrap_or(0));
+        let payload = DirectivePayload::WorkingDirectory { path };
+        return Some((
+            (lsp_alias, keyword, hash, payload),
+            DirectiveStatus::Honored,
+        ));
+    }
+    if patterns.standalone.is_match(line) {
+        let (lsp_alias, start) = directive_word_start(line).unwrap_or((false, 0));
+        let keyword: String = line[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .collect();
+        let payload = DirectivePayload::SelfContained;
+        return Some((
+            (lsp_alias, keyword, hash, payload),
+            DirectiveStatus::Honored,
+        ));
+    }
+    None
+}
+
+/// Classify one line, in the precedence Raven reads it: the header-only
+/// directives (only `in_header`), then forward, suppression, `var`, `func`,
+/// and `nse`. The first family whose grammar matches decides the line, even
+/// when Raven then rejects its payload ([`DirectiveStatus::Malformed`]).
+fn classify_directive_line<F>(
+    line: &str,
+    in_header: bool,
+    same_line_comment: F,
+) -> Option<(Classified, DirectiveStatus)>
+where
+    F: Copy + for<'a> Fn(&'a str) -> Option<&'a str>,
+{
+    let patterns = patterns();
+    if in_header && let Some(found) = classify_header_only(line) {
+        return Some(found);
+    }
+    let hash = leading_hash(line);
+    let honored = |classified: Classified| Some((classified, DirectiveStatus::Honored));
+
+    if let Some(caps) = patterns.forward.captures(line) {
+        let path = capture_path(&caps, 1).unwrap_or_default();
+        let (lsp_alias, keyword) = written_keyword(line, capture_start(&caps, 1).unwrap_or(0));
+        let payload = DirectivePayload::Forward {
+            path,
+            line: caps.get(4).map(|m| m.as_str().to_string()),
+        };
+        return honored((lsp_alias, keyword, hash, payload));
+    }
+
+    // Suppression markers (`# raven: ignore*`, `@lsp-ignore*`). The same-line
+    // forms are matched only against the language-specific scanner's actual
+    // comment/marker region, so marker-shaped string contents never count.
+    // See `classify_suppression_marker`.
+    let comment = same_line_comment(line);
+    if let Some(marker) = classify_suppression_marker(line, comment) {
+        let hash = match (marker.kind, comment) {
+            (SuppressionKind::SameLine, Some(comment)) => line.len() - comment.len(),
+            _ => hash,
+        };
+        return honored((
+            marker.lsp_alias,
+            marker.keyword(),
+            hash,
+            DirectivePayload::Suppression(marker),
+        ));
+    }
+
+    if let Some(caps) = patterns.declare_var.captures(line) {
+        let (lsp_alias, keyword) = written_keyword(line, capture_start(&caps, 1).unwrap_or(0));
+        let usable = capture_symbol_name(&caps, 1);
+        let status = if usable.is_some() {
+            DirectiveStatus::Honored
+        } else {
+            DirectiveStatus::Malformed
+        };
+        let name = usable
+            .or_else(|| capture_path(&caps, 1))
+            .unwrap_or_default();
+        let payload = DirectivePayload::Variable { name };
+        return Some(((lsp_alias, keyword, hash, payload), status));
+    }
+
+    if let Some(caps) = patterns.declare_func.captures(line) {
+        let (lsp_alias, keyword) = written_keyword(line, capture_start(&caps, 1).unwrap_or(0));
+        let usable = capture_symbol_name(&caps, 1);
+        // Reject malformed names. The quoted forms accept any content, so a
+        // malformed `"pkg:::my_func"` is caught by
+        // `is_well_formed_callee_name`. For the unquoted form the regex stops
+        // at the first byte outside its name class, so a NON-SEPARATOR
+        // character immediately after the captured name means the regex
+        // truncated a longer (non-syntactic) name: `some-func` -> `some`,
+        // `obj$method` -> `obj`, `pkg:::name` -> `pkg`. Storing that truncated
+        // prefix would silently declare the WRONG symbol, so drop it — a
+        // non-syntactic name must use the quoted form. Only an *adjacent*
+        // offending byte counts: a separator (whitespace, the `(` formals
+        // opener, or a `#` comment) is ordinary trailing text the
+        // prefix-tolerant `func` regex legitimately ignores. Together with
+        // `is_well_formed_callee_name` this keeps every stored name
+        // well-formed for `declared_name_matches`'s `rsplit_once`.
+        let unquoted_truncated = caps.get(3).is_some_and(|m| {
+            line[m.end()..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && c != '(' && c != '#')
+        });
+        let status = match &usable {
+            Some(name) if is_well_formed_callee_name(name) && !unquoted_truncated => {
+                DirectiveStatus::Honored
+            }
+            _ => DirectiveStatus::Malformed,
+        };
+        let name = usable
+            .or_else(|| capture_path(&caps, 1))
+            .unwrap_or_default();
+        let formals = caps.get(4).and_then(|m| split_formal_list(m.as_str()));
+        let payload = DirectivePayload::Function { name, formals };
+        return Some(((lsp_alias, keyword, hash, payload), status));
+    }
+
+    // `# raven: nse [pkg::]name[(formals…)]` — NSE argument-policy
+    // declaration. Position-aware (applies to calls after this line).
+    if let Some(caps) = patterns.nse.captures(line) {
+        let (lsp_alias, _) = directive_word_start(line).unwrap_or((false, 0));
+        let start = capture_start(&caps, 1).unwrap_or(0);
+        let end = match caps.get(4) {
+            // The formal list's closing `)`.
+            Some(formals) => formals.end() + 1,
+            None => capture_end(&caps, 1).unwrap_or(start),
+        };
+        let declaration = line[start..end].to_string();
+        // Name from the double-quoted / single-quoted / unquoted groups
+        // (1/2/3), then reject a malformed `::` qualifier the same way the
+        // `func` directive does — the quoted forms accept any content, so a
+        // `"pkg:::x"` must be screened out before it could mis-pair.
+        let usable = capture_symbol_name(&caps, 1).filter(|n| is_well_formed_callee_name(n));
+        // No parentheses (`nse f`) and EMPTY parentheses (`nse f()`) both
+        // mean whole-call NSE — `f()` lists zero captured formals, read as
+        // "same as no parens" rather than a silent no-op; both are
+        // deliberate, well-formed forms. A non-empty list is per-formal.
+        //
+        // A non-empty but MALFORMED list (a blank slot like `f(x,,y)`, or no
+        // syntactic formal names at all) makes `split_formal_list` return
+        // `None`: the whole directive is dropped rather than broadened to
+        // whole-call. A typo'd capture list must not silently suppress every
+        // argument and hide real undefined-variable findings (issue #460
+        // review) — dropping it leaves the callee checked normally so the
+        // user notices and corrects the directive.
+        let scope = match caps.get(4).map(|b| b.as_str()) {
+            None => Some(NseScope::WholeCall),
+            Some(body) if body.trim().is_empty() => Some(NseScope::WholeCall),
+            Some(body) => split_formal_list(body).map(NseScope::Formals),
+        };
+        let status = if usable.is_some() && scope.is_some() {
+            DirectiveStatus::Honored
+        } else {
+            DirectiveStatus::Malformed
+        };
+        let name = usable
+            .or_else(|| capture_path(&caps, 1))
+            .unwrap_or_default();
+        let payload = DirectivePayload::Nse {
+            declaration,
+            name,
+            scope,
+        };
+        return Some(((lsp_alias, "nse".to_string(), hash, payload), status));
+    }
+    None
 }
 
 /// Check if a line should have a diagnostic with `code` suppressed.
@@ -1108,6 +1448,63 @@ pub fn is_line_ignored(metadata: &CrossFileMetadata, line: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan reports every directive with the spelling as written, and
+    /// says which ones Raven ignores where they stand; `parse_directives`
+    /// folds only the honored ones.
+    #[test]
+    fn scan_reports_spelling_and_status() {
+        let content = "\
+# @lsp-working-dir: data
+# raven: included-by ../main.R line=3
+x <- 1
+# raven: run-by ../late.R
+# raven: ignore-start
+# raven: expect-start
+# raven: expect-end
+# raven: ignore-end
+# raven: func some-func
+";
+        let scan = scan_directives(content);
+        let summary: Vec<(u32, bool, &str, DirectiveStatus)> = scan
+            .directives
+            .iter()
+            .map(|d| (d.line, d.lsp_alias, d.keyword.as_str(), d.status))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0, true, "working-dir", DirectiveStatus::Honored),
+                (1, false, "included-by", DirectiveStatus::Honored),
+                (3, false, "run-by", DirectiveStatus::OutsideHeader),
+                (
+                    4,
+                    false,
+                    "ignore-start",
+                    DirectiveStatus::BlockStart { end_line: Some(6) }
+                ),
+                (5, false, "expect-start", DirectiveStatus::NestedStart),
+                (
+                    6,
+                    false,
+                    "expect-end",
+                    DirectiveStatus::BlockEnd { start_line: 4 }
+                ),
+                (7, false, "ignore-end", DirectiveStatus::UnpairedEnd),
+                (8, false, "func", DirectiveStatus::Malformed),
+            ]
+        );
+        assert_eq!(scan.total_lines, 9);
+        let meta = parse_directives(content);
+        assert_eq!(meta.working_directory.as_deref(), Some("data"));
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.ignored_ranges.len(), 1);
+        assert_eq!(
+            (meta.ignored_ranges[0].start, meta.ignored_ranges[0].end),
+            (4, 6)
+        );
+        assert!(meta.declared_functions.is_empty());
+    }
 
     #[test]
     fn test_backward_directive_basic() {

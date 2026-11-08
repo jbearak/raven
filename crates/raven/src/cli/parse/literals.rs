@@ -173,10 +173,6 @@ fn scale_by_power_of_two(mut value: f64, mut shift: i64) -> f64 {
 /// location suffix) and the byte range, within the token, of what it
 /// rejects.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the parse-errors list reads these; tests do now")
-)]
 pub(crate) struct LiteralError {
     pub(crate) range: Range<usize>,
     pub(crate) message: String,
@@ -222,6 +218,20 @@ pub(crate) struct StringForm {
 /// Either way a line ending inside the string reads as `\n`, as R reads the
 /// file line by line.
 pub(crate) fn string(text: &str) -> (StringForm, Decoded) {
+    let (form, decoded, _) = string_with_warnings(text);
+    (form, decoded)
+}
+
+/// [`string`], with the warnings R gives while reading it: one per unpaired
+/// surrogate escape (`"\u{d800}"`), with R's message and the escape's range
+/// within the token.
+pub(crate) fn string_with_warnings(text: &str) -> (StringForm, Decoded, Vec<LiteralError>) {
+    let mut warnings = Vec::new();
+    let (form, decoded) = string_into(text, &mut warnings);
+    (form, decoded, warnings)
+}
+
+fn string_into(text: &str, warnings: &mut Vec<LiteralError>) -> (StringForm, Decoded) {
     let first = text.chars().next().unwrap_or('"');
     if first == 'r' || first == 'R' {
         let quote = text[1..].chars().next().unwrap_or('"');
@@ -253,7 +263,7 @@ pub(crate) fn string(text: &str) -> (StringForm, Decoded) {
         open: first.to_string(),
         close: first.to_string(),
     };
-    (form, decode_escapes(content, 1, false))
+    (form, decode_escapes(content, 1, false, warnings))
 }
 
 /// A backticked name's name: the text between the backticks, with escapes
@@ -270,7 +280,9 @@ pub(crate) fn backtick_name(text: &str) -> Decoded {
             message: "attempt to use zero-length variable name".into(),
         });
     }
-    decode_escapes(content, 1, true)
+    // `\u` and `\U` are errors in backticks, so there are no surrogates to
+    // warn about.
+    decode_escapes(content, 1, true, &mut Vec::new())
 }
 
 fn normalize_line_endings(text: &str) -> String {
@@ -278,13 +290,33 @@ fn normalize_line_endings(text: &str) -> String {
 }
 
 /// Decode R's escapes in `content`, which starts at byte `base` of its token.
-/// `for_symbol` is R's mode for backticked names.
-fn decode_escapes(content: &str, base: usize, for_symbol: bool) -> Decoded {
+/// `for_symbol` is R's mode for backticked names. R's warnings (unpaired
+/// surrogates) go to `warnings`.
+///
+/// Like R, a high-surrogate escape directly followed by a low-surrogate
+/// escape (`\u{d83d}\u{de00}`, in either `\u` or `\U` form) is one
+/// character; any other surrogate is unpaired, which R reads with a warning
+/// into a string that isn't valid UTF-8.
+fn decode_escapes(
+    content: &str,
+    base: usize,
+    for_symbol: bool,
+    warnings: &mut Vec<LiteralError>,
+) -> Decoded {
     let bytes = content.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut unicode_escape = false;
     let mut byte_escape = false;
     let mut surrogate = false;
+    // A high-surrogate escape waiting for its low half: its value and range.
+    let mut pending_high: Option<(u32, usize, usize)> = None;
+    let mut unpaired = |value: u32, start: usize, end: usize, surrogate: &mut bool| {
+        *surrogate = true;
+        warnings.push(LiteralError {
+            range: base + start..base + end,
+            message: format!("unpaired surrogate Unicode point {value:x}"),
+        });
+    };
     let mut i = 0;
     let error = |start: usize, end: usize, message: String| {
         Decoded::Error(LiteralError {
@@ -294,6 +326,10 @@ fn decode_escapes(content: &str, base: usize, for_symbol: bool) -> Decoded {
     };
     while i < bytes.len() {
         let b = bytes[i];
+        let unicode_escape_next = b == b'\\' && matches!(bytes.get(i + 1), Some(b'u' | b'U'));
+        if !unicode_escape_next && let Some((value, start, end)) = pending_high.take() {
+            unpaired(value, start, end, &mut surrogate);
+        }
         if b == b'\r' {
             // `\r\n` or a lone `\r` ends a line; R reads it as `\n`.
             out.push(b'\n');
@@ -394,14 +430,30 @@ fn decode_escapes(content: &str, base: usize, for_symbol: bool) -> Decoded {
                 if value == 0 {
                     return error(start, i, "nul character not allowed".into());
                 }
-                match char::from_u32(value) {
-                    Some(ch) => {
-                        let mut buffer = [0; 4];
-                        out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+                let mut value = value;
+                if (0xDC00..=0xDFFF).contains(&value) {
+                    match pending_high.take() {
+                        Some((high, _, end)) if end == start => {
+                            value = 0x10000 + ((high - 0xD800) << 10) + (value - 0xDC00);
+                        }
+                        other => {
+                            if let Some((high, high_start, high_end)) = other {
+                                unpaired(high, high_start, high_end, &mut surrogate);
+                            }
+                            unpaired(value, start, i, &mut surrogate);
+                        }
                     }
-                    // A surrogate: R reads it with a warning, into a string
-                    // that isn't valid UTF-8.
-                    None => surrogate = true,
+                } else {
+                    if let Some((high, high_start, high_end)) = pending_high.take() {
+                        unpaired(high, high_start, high_end, &mut surrogate);
+                    }
+                    if (0xD800..=0xDBFF).contains(&value) {
+                        pending_high = Some((value, start, i));
+                    }
+                }
+                if let Some(ch) = char::from_u32(value) {
+                    let mut buffer = [0; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
                 }
                 unicode_escape = true;
             }
@@ -430,6 +482,9 @@ fn decode_escapes(content: &str, base: usize, for_symbol: bool) -> Decoded {
                 );
             }
         }
+    }
+    if let Some((value, start, end)) = pending_high.take() {
+        unpaired(value, start, end, &mut surrogate);
     }
     if unicode_escape && byte_escape {
         return error(
@@ -623,6 +678,38 @@ mod tests {
             Decoded::Error(e) => assert_eq!(e.range, 3..5),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// R joins a high-surrogate escape and the low-surrogate escape right
+    /// after it into one character, and warns about any other surrogate.
+    /// Checked against R 4.6's parser.
+    #[test]
+    fn surrogate_escapes_pair_as_r_pairs_them() {
+        let read = |text: &str| string_with_warnings(text);
+        let (_, value, warnings) = read(r#""\u{d83d}\u{de00}""#);
+        assert_eq!((value, warnings), (Decoded::Text("😀".into()), vec![]));
+        let (_, value, warnings) = read(r#""\u{d83d}\U{de00}x""#);
+        assert_eq!((value, warnings), (Decoded::Text("😀x".into()), vec![]));
+
+        let unpaired = |range: Range<usize>, point: &str| LiteralError {
+            range,
+            message: format!("unpaired surrogate Unicode point {point}"),
+        };
+        let (_, value, warnings) = read(r#""\u{d800}""#);
+        assert_eq!(value, Decoded::NotUnicode);
+        assert_eq!(warnings, [unpaired(1..9, "d800")]);
+        let (_, value, warnings) = read(r#""\u{d83d}x""#);
+        assert_eq!(value, Decoded::NotUnicode);
+        assert_eq!(warnings, [unpaired(1..9, "d83d")]);
+        // Low before high: neither pairs, warned in order.
+        let (_, _, warnings) = read(r#""\u{de00}\u{d83d}""#);
+        assert_eq!(warnings, [unpaired(1..9, "de00"), unpaired(9..17, "d83d")]);
+        // Two highs then a low: the second high pairs.
+        let (_, value, warnings) = read(r#""\u{d83d}\u{d83d}\u{de00}""#);
+        assert_eq!(value, Decoded::NotUnicode);
+        assert_eq!(warnings, [unpaired(1..9, "d83d")]);
+        // `string` itself drops the warnings.
+        assert_eq!(string(r#""\u{d800}""#).1, Decoded::NotUnicode);
     }
 
     #[test]

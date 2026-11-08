@@ -213,10 +213,39 @@ fn find_marker(line: &str) -> Option<NolintMarker> {
     {
         return Some(NolintMarker::from(marker));
     }
-    if let Some(marker) = classify_nolint(outer_body) {
-        return Some(marker);
+    lintr_marker(line).map(|(_, marker)| marker.into())
+}
+
+/// lintr's `# nolint` markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LintrMarker {
+    /// `# nolint` or `# nolint: rule_a, rule_b`: this line.
+    Line(LineSuppression),
+    /// `# nolint start`, with an optional rule filter.
+    Start(LineSuppression),
+    /// `# nolint end`.
+    End,
+}
+
+impl From<LintrMarker> for NolintMarker {
+    fn from(marker: LintrMarker) -> Self {
+        match marker {
+            LintrMarker::Line(what) => Self::Line(what),
+            LintrMarker::Start(what) => Self::Start(what),
+            LintrMarker::End => Self::End,
+        }
     }
-    find_inline_marker(outer_body)
+}
+
+/// The lintr `# nolint` marker on `line`, as the lint track reads it, with
+/// the byte offset of the `#` that opens the line's comment (for the nested
+/// `# x <- 1 # nolint` shape, the outer one). The lint track tries
+/// `# raven:` / `@lsp-` markers first, so a line holding one of those isn't
+/// read for `nolint` there; callers check that first, as [`find_marker`] does.
+pub(crate) fn lintr_marker(line: &str) -> Option<(usize, LintrMarker)> {
+    let (hash_idx, outer_body) = first_hash_body(line)?;
+    let marker = classify_nolint(outer_body).or_else(|| find_inline_marker(outer_body))?;
+    Some((hash_idx, marker))
 }
 
 impl From<SuppressionMarker> for NolintMarker {
@@ -282,7 +311,7 @@ fn first_hash_body(line: &str) -> Option<(usize, &str)> {
 /// fallback: the shared marker grammar (see [`find_marker`]) already matches
 /// their same-line form anywhere in the comment. Their `-next`, block, and
 /// file forms must be standalone, so a nested one is not a marker.
-fn find_inline_marker(body: &str) -> Option<NolintMarker> {
+fn find_inline_marker(body: &str) -> Option<LintrMarker> {
     if !body.contains("nolint") {
         return None;
     }
@@ -331,7 +360,7 @@ pub(crate) fn first_hash_body_for_parity_test(line: &str) -> Option<(usize, &str
 /// Classify a lintr `# nolint` marker (`nolint`, `nolint: rules`,
 /// `nolint start[: rules]`, `nolint end`). `# raven:` / `@lsp-` markers are
 /// classified by `cross_file::directive::classify_suppression_marker`.
-fn classify_nolint(after_hash: &str) -> Option<NolintMarker> {
+fn classify_nolint(after_hash: &str) -> Option<LintrMarker> {
     // Strip an arbitrary run of leading whitespace and additional `#` chars
     // (people sometimes write `## nolint`).
     let trimmed = after_hash
@@ -340,12 +369,12 @@ fn classify_nolint(after_hash: &str) -> Option<NolintMarker> {
     let rest = matches_keyword(&trimmed, "nolint")?.trim_start();
     if let Some(after) = rest.strip_prefix("start") {
         // `# nolint start` or `# nolint start: rule_a, rule_b`.
-        Some(NolintMarker::Start(parse_colon_codes(after)))
+        Some(LintrMarker::Start(parse_colon_codes(after)))
     } else if rest.starts_with("end") {
-        Some(NolintMarker::End)
+        Some(LintrMarker::End)
     } else {
         // Either bare `# nolint` or `# nolint: rule_a, rule_b`.
-        Some(NolintMarker::Line(parse_colon_codes(rest)))
+        Some(LintrMarker::Line(parse_colon_codes(rest)))
     }
 }
 
