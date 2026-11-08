@@ -1199,12 +1199,12 @@ impl PackageLibrary {
         if is_load_all_sentinel(package) {
             return NamespaceMemberStatus::Unknown;
         }
-        // Base-package datasets/exports are merged into base_exports, not the
-        // per-package lazy_data — positive-only present check.
-        if self.is_base_package(package) && self.is_base_export(member) {
-            return NamespaceMemberStatus::Present;
-        }
-
+        // No `base_exports` shortcut: that set is the union of all seven
+        // default-attached packages, so it would accept `stats::pi`, which R
+        // rejects. `initialize()` gives each base package its own cache entry
+        // holding its datasets too (in `exports` from disk, or `lazy_data` from
+        // the embedded table), so the per-package check below covers them.
+        //
         // A member is "present" if it is an exported symbol, a lazy-loaded data
         // object, OR an object bound by one of the package's data files (the
         // `data_aliases` VALUES — for a non-LazyData package the real dataset
@@ -2597,15 +2597,16 @@ impl PackageLibrary {
         for (pkg_name, exports) in per_package_exports {
             let depends = per_package_depends.remove(&pkg_name).unwrap_or_default();
             // `lazy_data` is intentionally empty here: these are base packages,
-            // whose datasets are merged into `base_exports` above (issue #276) —
+            // whose datasets Steps 3b/3c merged into this package's own export
+            // set (and, for the attached seven, `base_exports`) (issue #276) —
             // so this deliberately does NOT route through `package_info_from_dir`.
+            // `namespace_member_status_sync` relies on that per-package set to
+            // accept `datasets::mtcars` while rejecting `stats::pi`.
             // A base package whose NAMESPACE uses `exportPattern` is only
             // `Complete` when R enumerated it this run; otherwise its export set
             // is the INDEX approximation, so it stays `Partial` and can never
             // drive a false `namespace-member-not-found`. Non-pattern base
-            // packages parse exhaustively from NAMESPACE → `Complete`. (Member
-            // presence is additionally guarded by the positive-only
-            // `base_exports` check in `namespace_member_status_sync`.)
+            // packages parse exhaustively from NAMESPACE → `Complete`.
             let completeness = if pattern_set.contains(&pkg_name) && !r_resolved.contains(&pkg_name)
             {
                 MemberCompleteness::Partial
@@ -8979,6 +8980,81 @@ pub(crate) mod tests {
             .await
             .expect("datasets cached");
         assert!(datasets.lazy_data.contains(&"mtcars".to_string()));
+    }
+
+    /// `pkg::member` on a default-attached base package checks THAT package's
+    /// members, not the union of all seven: R rejects `stats::pi` and
+    /// `utils::median`. CI path: no R and no disk base, so the embedded table
+    /// seeds `Complete` per-package entries (datasets in `lazy_data`).
+    #[tokio::test]
+    async fn base_namespace_member_status_is_package_specific_without_disk_base() {
+        let _env_guard = crate::package_db::RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let empty_lib = dir.path().join("empty-lib");
+        std::fs::create_dir_all(&empty_lib).unwrap();
+        let _user_data_guard =
+            crate::package_db::test_user_data_dir_guard(dir.path().join("missing-data"));
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![empty_lib]);
+        lib.initialize().await.unwrap();
+
+        for (pkg, member, expected) in [
+            ("stats", "pi", NamespaceMemberStatus::Absent),
+            ("utils", "median", NamespaceMemberStatus::Absent),
+            ("base", "pi", NamespaceMemberStatus::Present),
+            ("stats", "median", NamespaceMemberStatus::Present),
+            ("datasets", "mtcars", NamespaceMemberStatus::Present),
+        ] {
+            assert_eq!(
+                lib.namespace_member_status_sync(pkg, member),
+                expected,
+                "{pkg}::{member}"
+            );
+        }
+    }
+
+    /// Same contract when the base packages are on disk: a `Complete` package
+    /// (here `stats` with an explicit NAMESPACE, standing in for one R
+    /// enumerated) rejects another base package's export, while a `Partial`
+    /// one (`base` without R) stays silent and `datasets` resolves its data.
+    #[tokio::test]
+    async fn base_namespace_member_status_is_package_specific_with_disk_base() {
+        let lib_root = tempfile::tempdir().unwrap();
+        write_fake_base_library_with_constants_topic(lib_root.path());
+        std::fs::write(
+            lib_root.path().join("stats").join("NAMESPACE"),
+            "export(median)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib_root.path().join("datasets").join("INDEX"),
+            "mtcars                  Motor Trend Car Road Tests\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        assert!(lib.is_base_export("pi"), "pi stays always-in-scope");
+        for (pkg, member, expected) in [
+            ("stats", "pi", NamespaceMemberStatus::Absent),
+            ("stats", "median", NamespaceMemberStatus::Present),
+            ("base", "pi", NamespaceMemberStatus::Present),
+            (
+                "base",
+                "definitely_not_exported",
+                NamespaceMemberStatus::Partial,
+            ),
+            ("datasets", "mtcars", NamespaceMemberStatus::Present),
+        ] {
+            assert_eq!(
+                lib.namespace_member_status_sync(pkg, member),
+                expected,
+                "{pkg}::{member}"
+            );
+        }
     }
 
     #[test]
