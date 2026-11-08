@@ -364,7 +364,9 @@ The text format is for reading and may change between releases. For scripts, use
 
 The JSON object has `schema_version` (currently `1`), `raven_version`, `root`, `package_mode`, `complete`, `warnings`, `files`, `edges`, and `dropped`. Adding a field or an enum value keeps `schema_version`; removing or renaming a field, or changing its meaning, increments it. Ignore fields you don't know and treat unknown enum values as "other".
 
-Paths are relative to the canonical workspace root with `/` separators, or absolute outside it. Positions are 0-based lines and UTF-16 characters, as in the editor protocol. A file reached through two spellings, such as a symlink, appears once per spelling.
+Paths are relative to the canonical workspace root with `/` separators, or absolute outside it. A file reached through two spellings, such as a symlink, appears once per spelling.
+
+Every line number is 0-based and every character counts UTF-16 code units, as in the editor protocol. That holds for `call_site.position`, `directive.line`, and `position` in `dropped`, so a directive on a file's first line has `line: 0`. A backward directive's `line=N` is 1-based as you write it: `# raven: sourced-by ../main.R line=3` gives a call site whose `position.line` is `2`.
 
 - `package_mode`: Raven analyzed the workspace as an R package.
 - `complete`: every file the workspace scan found went through graph building. When it's `false`, `warnings` says how many files couldn't be read or processed and how many the index's capacity evicted. An oversized file still counts.
@@ -379,7 +381,7 @@ Each entry in `edges` is one stored link, including repeated calls and every fil
 | `kind` | `source`, `sys_source`, `tar_source`, `list_files`, `shiny_global`, `shiny`, `box`, or `tarchetypes_document`. |
 | `origin` | `call`, `directive` (`# raven: source`, `run`, `include`), or `backward_directive` (`# raven: sourced-by`, `run-by`, `included-by`). |
 | `call_site` | Where in `caller` scope treats the call as happening: `basis` (`call`, `directive`, `line`, `line_end`, `eof`, `match`, `inferred`, or `implicit` for Shiny), `position` (`null` for `eof` and for a backward call site that wasn't found; `character` is `null` for `line_end`), and `failure` (`null`, `not_found`, or `parent_content_unavailable`). |
-| `directive` | For a directive, `{"file", "line"}` where it's written; otherwise `null`. |
+| `directive` | For a directive, `{"file", "line"}` where it's written, with `line` 0-based; otherwise `null`. |
 | `raw_path` | The path as Raven read it, for `source()` and `sys.source()` calls, directives, and report documents. `null` for `system.file()` calls, batches, and `box` modules. |
 | `system_file` | For a `system.file()` call, `{"package", "parts"}`; otherwise `null`. |
 | `batch_ordinal` | Order within a `tar_source`, `list_files`, `shiny_global`, or `shiny` batch. |
