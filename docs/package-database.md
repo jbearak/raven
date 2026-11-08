@@ -139,7 +139,7 @@ The CRAN/Bioconductor portion of `names.db` is built from [r-universe](https://r
 
 Base and recommended packages (`base`, `methods`, `utils`, `stats`, `datasets`, and so on) are normally read from your R installation. In CI without R they aren't on disk, so Raven uses base-package data built into the binary for all 14 of R's base-priority packages. Only the seven attached by default (`base`, `methods`, `utils`, `grDevices`, `graphics`, `stats`, `datasets`) are always in scope; the other seven (`compiler`, `grid`, `parallel`, `splines`, `stats4`, `tcltk`, `tools`) resolve offline after an explicit `library()` call.
 
-Recommended packages such as `MASS`, `Matrix`, and `survival` are not built in; they come from `names.db` when it is present. Base **datasets** such as `mtcars` and `iris` come from the built-in `datasets` data, so they resolve in CI too. A real R install still wins: the built-in data is used only when the base packages aren't found locally.
+Recommended packages such as `MASS`, `Matrix`, and `survival` are not built in; they come from `names.db` when it is present. Base **datasets** such as `mtcars` and `iris` come from the built-in `datasets` data, so they resolve in CI too. A real R install still wins: the built-in data is used when the base packages aren't found locally, and otherwise only to fill in base exports that R couldn't list.
 
 <details markdown="1">
 <summary>How package datasets are collected</summary>

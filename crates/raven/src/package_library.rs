@@ -2527,7 +2527,10 @@ impl PackageLibrary {
         // `month.name` and `month.abb`, none of which the static builtin table
         // carries. Without this floor every bare `pi` is reported as undefined.
         // The floor only adds names, and these packages stay `Partial` in Step 5,
-        // so it can suppress findings but never create one.
+        // so it can suppress findings but never create one. Decide the CI
+        // fallback below before this floor runs, so a bare on-disk `base` it
+        // fills does not hide the fallback for packages absent from disk.
+        let use_embedded_fallback = all_base_exports.is_empty();
         for package in pattern_packages.iter().filter(|p| !r_resolved.contains(*p)) {
             let Some(embedded) = crate::package_db::embedded_base::packages()
                 .iter()
@@ -2553,7 +2556,7 @@ impl PackageLibrary {
         // A non-empty disk merge (a real install) always wins and skips this
         // entirely. No sidecar, so initialize() never depends on names.db and
         // the startup ordering problem is gone (ADR 1).
-        if all_base_exports.is_empty() {
+        if use_embedded_fallback {
             let attached: HashSet<String> = crate::r_subprocess::get_fallback_base_packages()
                 .into_iter()
                 .collect();
@@ -5859,6 +5862,30 @@ pub(crate) mod tests {
             base_info.exports_completeness,
             MemberCompleteness::Partial,
             "an export set R did not enumerate must stay Partial"
+        );
+    }
+
+    /// The embedded export floor for an on-disk `base` must not hide the CI
+    /// fallback that fills default-attached packages absent from disk.
+    #[tokio::test]
+    async fn test_initialize_embedded_floor_keeps_fallback_for_absent_packages() {
+        let lib_root = tempfile::tempdir().unwrap();
+        let base_dir = lib_root.path().join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("DESCRIPTION"),
+            "Package: base\nVersion: 4.6.0\nPriority: base\n",
+        )
+        .unwrap();
+
+        let mut lib = PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        lib.initialize().await.expect("initialize() succeeds");
+
+        assert!(lib.is_base_export("pi"), "base floor applies");
+        assert!(
+            lib.is_base_export("median"),
+            "stats is absent from disk, so the embedded fallback must still seed it"
         );
     }
 
