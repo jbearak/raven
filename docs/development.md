@@ -38,6 +38,7 @@ Key code entry points:
 - Parameter resolution: `crates/raven/src/parameter_resolver.rs`
 - Roxygen parsing: `crates/raven/src/roxygen.rs`
 - Content provider: `crates/raven/src/content_provider.rs`
+- `raven parse` (per-file statements, comments and tree as JSON Lines): `crates/raven/src/cli/parse/` — `document.rs` (envelope, error document, the UTF-16 position unit), `statements.rs` (statements and the rule that gives every comment exactly one owner), `tree.rs` (expression nodes). It reuses `raven graph`'s `display_path` so `path` values join the graph's `files[].path`; `crates/raven/tests/cli_parse.rs` checks that, the framing, and the exit codes against the real binary
 
 ## Build from source
 

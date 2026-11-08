@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tower_lsp::lsp_types::Url;
 
-use crate::cli::check::{PreparedWorkspace, WorkspaceSetup, prepare_workspace};
+use crate::cli::check::{
+    PreparedWorkspace, WorkspaceSetup, prepare_workspace, resolve_workspace_root,
+};
 use crate::cli::shared::{EXIT_OK, EXIT_OPERATOR_ERROR};
 use crate::cross_file::dependency::DependencyEdge;
 use crate::cross_file::dependency::DependencyEdgeKind;
@@ -140,24 +142,8 @@ pub async fn run(args: GraphArgs) -> i32 {
 /// Run the shared setup with tracing on and build the report. Startup notes
 /// go to stderr.
 pub(crate) async fn build_graph_report(args: &GraphArgs, cwd: &Path) -> Result<GraphReport, i32> {
-    let abs_workspace = match &args.workspace {
-        Some(path) if path.is_absolute() => path.clone(),
-        Some(path) => cwd.join(path),
-        None => cwd.to_path_buf(),
-    };
-    let root = std::fs::canonicalize(&abs_workspace).unwrap_or(abs_workspace);
-    // A missing workspace would scan as an empty, complete graph.
-    if !root.is_dir() {
-        eprintln!(
-            "raven graph: workspace is not a directory: {}",
-            root.display()
-        );
-        return Err(EXIT_OPERATOR_ERROR);
-    }
-    let Ok(workspace_url) = Url::from_file_path(&root) else {
-        eprintln!("raven graph: invalid workspace path: {}", root.display());
-        return Err(EXIT_OPERATOR_ERROR);
-    };
+    let (root, workspace_url) =
+        resolve_workspace_root("raven graph", args.workspace.as_deref(), cwd)?;
     let prepared = prepare_workspace(WorkspaceSetup {
         command: "raven graph",
         root: &root,
@@ -278,7 +264,10 @@ pub(crate) struct DroppedRow {
 
 /// Paths are relative to the canonicalized root with `/` separators, or
 /// absolute outside it. A URI that isn't a file path prints as the URI.
-fn display_path(uri: &Url, root: &Path) -> String {
+///
+/// `raven parse` prints its `path` values with this function too, so a parsed
+/// document joins the graph's `files[].path` byte for byte.
+pub(crate) fn display_path(uri: &Url, root: &Path) -> String {
     match uri.to_file_path() {
         Ok(path) => display_fs_path(&path, root),
         Err(()) => uri.to_string(),
@@ -286,7 +275,7 @@ fn display_path(uri: &Url, root: &Path) -> String {
 }
 
 /// The root itself (a working directory) is `.`.
-fn display_fs_path(path: &Path, root: &Path) -> String {
+pub(crate) fn display_fs_path(path: &Path, root: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
         Ok(relative) => relative

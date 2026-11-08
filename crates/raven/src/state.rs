@@ -13337,23 +13337,48 @@ pub(crate) async fn read_source_async(path: &Path) -> Result<String, SourceReadE
 /// they read the bytes. Takes an owned `Vec` so the common no-BOM UTF-8 path
 /// moves the buffer straight into the `String` without copying.
 pub(crate) fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    match detect_source_encoding(&bytes) {
         // UTF-8 BOM: strip it; an error's file offset is then `3 + valid_up_to`.
-        return decode_utf8_slice(&bytes[3..], 3);
+        SourceEncoding::Utf8Bom => decode_utf8_slice(&bytes[3..], 3),
+        SourceEncoding::Utf16Le => decode_utf16(&bytes[2..], true),
+        SourceEncoding::Utf16Be => decode_utf16(&bytes[2..], false),
+        SourceEncoding::Utf8 => String::from_utf8(bytes).map_err(|e| {
+            let offset = e.utf8_error().valid_up_to();
+            SourceReadError::InvalidEncoding {
+                offset,
+                byte: e.as_bytes().get(offset).copied().unwrap_or(0),
+            }
+        }),
     }
-    if bytes.starts_with(&[0xFF, 0xFE]) {
-        return decode_utf16(&bytes[2..], true);
+}
+
+/// The encoding [`decode_source`] decodes `bytes` with, chosen by byte-order
+/// mark alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceEncoding {
+    /// UTF-8 without a byte-order mark.
+    Utf8,
+    /// UTF-8 with a byte-order mark, which decoding strips.
+    Utf8Bom,
+    /// UTF-16 little-endian, marked by its byte-order mark.
+    Utf16Le,
+    /// UTF-16 big-endian, marked by its byte-order mark.
+    Utf16Be,
+}
+
+/// Which encoding [`decode_source`] uses for `bytes`. `decode_source`
+/// dispatches on this, so a caller that reports the encoding (`raven parse`)
+/// and the decode can't disagree.
+pub(crate) fn detect_source_encoding(bytes: &[u8]) -> SourceEncoding {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        SourceEncoding::Utf8Bom
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        SourceEncoding::Utf16Le
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        SourceEncoding::Utf16Be
+    } else {
+        SourceEncoding::Utf8
     }
-    if bytes.starts_with(&[0xFE, 0xFF]) {
-        return decode_utf16(&bytes[2..], false);
-    }
-    String::from_utf8(bytes).map_err(|e| {
-        let offset = e.utf8_error().valid_up_to();
-        SourceReadError::InvalidEncoding {
-            offset,
-            byte: e.as_bytes().get(offset).copied().unwrap_or(0),
-        }
-    })
 }
 
 fn decode_utf8_slice(bytes: &[u8], base_offset: usize) -> Result<String, SourceReadError> {

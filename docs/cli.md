@@ -9,6 +9,7 @@ The `raven` binary checks R code from a terminal or CI job, manages the package 
 | [`raven check`](#raven-check) | Indexes the workspace and reports the full diagnostic set, the same diagnostics the editor publishes. |
 | [`raven lint`](#raven-lint) | Runs only the native style linter. |
 | [`raven graph`](#raven-graph) | Prints the links Raven found between files: `source()` calls, directives, and the rest of the cross-file graph. |
+| [`raven parse`](#raven-parse) | Prints each R file's statements and comments as JSON, for tools that read R code. |
 | [`raven packages update`](#raven-packages-update) | Downloads CRAN/Bioconductor export names so `raven check` recognizes package functions without R. |
 | [`raven packages freeze`](#raven-packages-freeze) | Writes a committed `.raven/packages.json` from your installed packages. |
 | [`raven packages fetch`](#raven-packages-fetch) | Writes the same file from r-universe, with no R needed. |
@@ -364,7 +365,7 @@ The text format is for reading and may change between releases. For scripts, use
 
 The JSON object has `schema_version` (currently `1`), `raven_version`, `root`, `package_mode`, `complete`, `warnings`, `files`, `edges`, and `dropped`. Adding a field or an enum value keeps `schema_version`; removing or renaming a field, or changing its meaning, increments it. Ignore fields you don't know and treat unknown enum values as "other".
 
-Paths are relative to the canonical workspace root with `/` separators, or absolute outside it. A file reached through two spellings, such as a symlink, appears once per spelling.
+Paths are relative to the canonical workspace root with `/` separators, or absolute outside it. A file reached through two spellings, such as a symlink, appears once per spelling. These paths are the same strings as [`raven parse`](#raven-parse)'s `path` values for the same workspace and configuration, so a graph row joins a parsed document by path.
 
 Every line number is 0-based and every character counts UTF-16 code units, as in the editor protocol. That holds for `call_site.position`, `directive.line`, and `position` in `dropped`, so a directive on a file's first line has `line: 0`. A backward directive's `line=N` is 1-based as you write it: `# raven: sourced-by ../main.R line=3` gives a call site whose `position.line` is `2`.
 
@@ -408,6 +409,121 @@ Each entry in `dropped` is a call site Raven found that produced no edge: `calle
 - **Implicit scope isn't an edge**: a package's `R/` namespace, testthat helpers, and `.Rprofile`.
 - **Losses before the graph sees a call aren't listed.** Batch expansion drops excluded members, and a failed `list.files()` batch contributes no members; `warnings` names each failed batch and why. Raven also drops a `source()` call on the same line as a `line=N` forward directive's call site, whatever its target, so only the directive's edge appears.
 - **Files indexed from outside the root contribute no edges of their own.**
+
+## `raven parse`
+
+Print what Raven parsed in each R file as JSON: every statement with its exact source text and range, and every comment. A downstream tool, such as one that translates R code into another language, can use it to keep the comments and the layout of the code it reads.
+
+```text
+raven parse [FILES...] [--workspace DIR] [--config FILE | --no-config] [--format json]
+```
+
+`raven parse` indexes the workspace exactly as `raven check` does, with the same configuration, exclusions, and package handling, then prints one document per file:
+
+<!-- example: parse-json -->
+```console
+$ raven parse clean.R
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":2,"statements":[{"text":"x <- 1","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"blank_line_before":false,"comments":{"leading":[{"kind":"comment","text":"# One.","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false}],"trailing":[{"kind":"comment","text":"# two","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}}}],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":6}},"target":{"kind":"identifier","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}}},"value":{"kind":"number","range":{"start":{"line":1,"character":5},"end":{"line":1,"character":6}}}}}],"comments":[]}
+```
+
+The command is new, and its output is growing. The full syntax tree (names, literal types and values, operators as written, argument names), parsed `# raven:` directives on comments, a list of parse errors, and the package each call resolves to are being added. Each arrives as new fields and values under the versioning rule below, so code written against this page keeps working.
+
+### Parse options
+
+- `FILES`: the files to print, in the order given. Relative paths resolve against the workspace root, as `raven check`'s do. A directory stands for the R files under it, sorted by path, with `.gitignore` and `[workspace].exclude` applied. With no `FILES`, Raven prints every `.R` and `.r` file in the workspace, sorted by `path` in byte order.
+- `--workspace DIR`, `--config PATH`, `--no-config`: as for [`raven graph`](#graph-options).
+- `--format json`: the default and, for now, the only format. Any other value is a usage error.
+
+Only R scripts (`.R`, `.r`) are parsed. A named `.Rmd`, `.qmd`, Stan, or JAGS file gets the [error document](#parse-documents) with the message `only .R and .r files are supported`, so the output still lines up with the request. R Markdown and Quarto support may come later as an addition.
+
+### Parse output and exit codes
+
+The output is JSON Lines: one compact JSON document per line, each ending in a newline, in the order requested. Notes about the run, such as a degraded R environment, go to stderr.
+
+- `0`: every requested file has a parsed document. A file with syntax errors still gets a full document.
+- `3`: at least one file couldn't be read or decoded. Its error document is printed in its place, and every other document is still printed.
+- `1`: a usage error, such as an unknown flag or a `--format` other than `json`.
+- `2`: an operator error, such as a config file that fails to load or a `--workspace` that isn't a directory. Nothing is printed on stdout.
+
+<!-- example: parse-unreadable -->
+```console
+$ raven parse clean.R gone.R
+{"schema_version":1,"raven_version":"0.23.7","path":"clean.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"line_count":1,"statements":[{"text":"x <- 1","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}},"target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},"value":{"kind":"number","range":{"start":{"line":0,"character":5},"end":{"line":0,"character":6}}}}}],"comments":[]}
+{"schema_version":1,"raven_version":"0.23.7","path":"gone.R","error":{"message":"No such file or directory (os error 2)"}}
+```
+
+That run exits `3`.
+
+### Parse versioning
+
+Every document has `schema_version` (currently `1`) and `raven_version`. Removing or renaming a field, changing a field's type, or changing what a field or a value means increments `schema_version`. Adding a field, a node kind, or a value to any enum-like field doesn't. The rule applies from the first release that includes `raven parse`.
+
+Every enum-like field is open: node `kind`, comment `kind`, the encoding `name`, `line_endings`, and the fields still to come, such as operators, literal types, directive kinds, resolution kinds, and error sources and severities. When you meet a value you don't know, read it as "other" and carry on; never fail on it. Ignore fields you don't know. Every tree node has `kind` and `range`, so you can still show the source of a node whose kind you don't know.
+
+### Parse positions
+
+Every `range` has a `start` and an `end` position, and the end is exclusive. A position is a 0-based `line` and a `character` offset counted in UTF-16 code units, as in the editor protocol and [`raven graph`](#graph-json). The unit matters for non-ASCII text. In `größe <- "😀"`, the statement ends at character 13: `ö` and `ß` are one UTF-16 unit each but two UTF-8 bytes, and the emoji is two UTF-16 units, one code point, and four bytes. The same line is 12 code points and 17 bytes long.
+
+`\n`, `\r\n`, and a lone `\r` each end a line, and the ending isn't part of the line's characters. Positions are into the decoded text with any byte-order mark removed, so a BOM doesn't shift line 0.
+
+### Parse documents
+
+A parsed document has `schema_version`, `raven_version`, `path`, `encoding`, `line_count`, `statements`, and `comments`.
+
+- `path`: the [graph's](#graph-json) path rule. It is relative to the canonical workspace root with `/` separators, or absolute outside it, and lexical: a file under a symlinked directory keeps the symlink's spelling. For the same workspace and configuration, a file's `path` equals its `files[].path` in `raven graph --format json`, byte for byte. One exception keeps that true: a `FILE` named through another spelling of the root itself, such as macOS's `/var` for `/private/var`, is printed under the canonical root.
+- `encoding`: `name` (`UTF-8`, `UTF-16LE`, or `UTF-16BE`), `bom` (whether a byte-order mark was present and stripped), and `line_endings` (`lf`, `crlf`, `cr`, `mixed`, or `none` for a file without one). Raven reads files as `raven check` does, as described in [File encoding](#file-encoding). A file that isn't valid in its encoding gets the error document, with a message naming the first invalid byte's offset. Raven never substitutes replacement characters.
+- `line_count`: the number of lines. A final line ending doesn't start another line, so `a\nb\n` has 2 lines and an empty file has 0.
+- `statements`: the file's top-level statements. See [Statements and comments](#statements-and-comments).
+- `comments`: the comments no statement owns: every comment in a file without statements, and own-line comments after the last top-level statement.
+
+A file Raven can't open or decode gets the error document instead: `schema_version`, `raven_version`, `path`, and `error` with a `message`. It has no statements. Tell the two shapes apart by the presence of `error`.
+
+### Statements and comments
+
+A statement is each expression in the file's top level and each expression directly inside a pair of braces, wherever they stand: a function body, an `if` or `else` branch, a loop body, a bare block, or a braced argument such as `local({ ... })`, `tryCatch({ ... })`, or `{{ x }}`. Top-level statements are in the document's `statements`; the statements inside braces are in that block node's `statements` in the tree. Both lists are in source order. Each statement has:
+
+- `text`: the exact source of its range, comments and line endings included. `\r\n` stays `\r\n`.
+- `range`: slicing the decoded text by it gives `text`.
+- `blank_line_before`: `true` when a blank line separates the statement, or its first leading comment, from what comes before it in the same sequence: the previous statement, or the start of the block or file.
+- `comments`: `leading`, `trailing`, and `interior` lists.
+- `expression`: the statement's [syntax tree](#parse-syntax-tree).
+
+Two statements on one line, separated by `;`, are two statements. Neither one's text includes the `;`.
+
+Each comment has `kind` (`comment`, or `roxygen` for a `#'` comment), `text` with its `#`, and `range`. Comments on their own line (`leading`, `block_end`, and the file's `comments`) also have `blank_line_before`, measured from the previous comment in the list or from what precedes the list, so blank lines between comment groups are kept. Every comment in the file appears exactly once:
+
+- `trailing`: a comment that starts on the line where a statement ends, after it. With two statements on the line, it is the last one's.
+- `interior`: a comment inside a statement's range that no nested statement or block owns, such as one between two steps of a pipe or two arguments.
+- `leading`: other comments before a statement and after the previous one in the same sequence. A comment after a block's `{`, on the same line, leads the block's first statement.
+- `block_end`: comments in a block after its last statement, or in a block with no statements. They are on the block node, in `comments.block_end`, so each block of an `if ... else` has its own list.
+
+Parsed directives on `# raven:` comments are being added.
+
+### Parse syntax tree
+
+Each statement's `expression` is a tree of nodes. Every node has `kind` and `range`, and its child nodes are in named fields, in source order. A field for an optional part, such as an `if` without `else` or a parameter without a default, is `null`. This version reports the tree's structure; the details of each node are being added.
+
+| `kind` | What it is | Child fields |
+|---|---|---|
+| `identifier` | A name, including `...` and `..1` | |
+| `number`, `string`, `constant` | A literal; `constant` is `TRUE`, `FALSE`, `NULL`, `NA` and its typed forms, `Inf`, or `NaN` | |
+| `call` | `f(...)` | `function`, `arguments` |
+| `index` | `x[...]` or `x[[...]]` | `target`, `arguments` |
+| `namespace`, `extract` | `pkg::name` or `pkg:::name`; `x$name` or `x@name` | `left`, `right` |
+| `assignment` | `<-`, `<<-`, `=`, `->`, `->>`, or `:=` | `target`, `value`, in source order |
+| `pipe`, `binary` | `\|>`; any other binary operator | `left`, `right` |
+| `formula` | `~`, with or without a left side | `left` (`null` when one-sided), `right` |
+| `unary` | `-`, `+`, `!`, or unary `?` | `operand` |
+| `parenthesized` | `( ... )` | `body` |
+| `function` | `function(...)` or `\(...)` | `parameters`, `body` |
+| `if`, `for`, `while`, `repeat` | Control flow | `condition`, `consequence`, `alternative`; `variable`, `sequence`, `body`; `condition`, `body`; `body` |
+| `next`, `break` | Loop control | |
+| `block` | `{ ... }` | `statements`, `comments` (`block_end`) |
+| `unparsed` | Source with a syntax error | |
+
+`arguments` and `parameters` are lists of entries, not nodes: each has the entry's `range` and its `value` (arguments) or `default` (parameters) node. Argument names, empty arguments such as the second in `x[i, ]`, and the pipe placeholder `_` as its own kind are being added.
+
+A file with syntax errors still gets a full document and exit code `0`. For now, a statement with a syntax error anywhere in it is a single `unparsed` node, and comments inside it are its `interior` comments. Narrower `unparsed` spans and an `errors` list are being added.
 
 ## `raven console`
 

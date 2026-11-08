@@ -149,11 +149,13 @@ cd "$REPO_ROOT/editors/vscode"
 npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
 cd "$REPO_ROOT"
 
-# docs/cli.md shows real `raven --version` / `raven check --help` output, and
-# tests/bun/docs/examples.test.ts checks it against the current version.
+# docs/cli.md shows real `raven --version` / `raven check --help` output and
+# `raven parse` documents carrying `"raven_version"`, and the docs examples
+# tests check it against the current version.
 sed -i '' \
     -e "s/^raven $CURRENT_VERSION\$/raven $VERSION/" \
     -e "s/^raven check $CURRENT_VERSION /raven check $VERSION /" \
+    -e "s/\"raven_version\":\"$CURRENT_VERSION\"/\"raven_version\":\"$VERSION\"/g" \
     "$REPO_ROOT/docs/cli.md"
 
 echo "Updated Cargo.toml, Cargo.lock, editors/vscode/package.json, and docs/cli.md"
