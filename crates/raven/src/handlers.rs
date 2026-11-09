@@ -23044,8 +23044,9 @@ fn collect_subset_usages<'a>(
 
 /// The name of a `binary_operator`'s operator when it is one a package can
 /// export and declare: `:=` or a `%op%` special. `None` for `<-`, `+`, `~`,
-/// `|>`, and the rest of R's fixed operators.
-fn declarable_infix_operator<'t>(node: Node<'t>, text: &'t str) -> Option<&'t str> {
+/// `|>`, and the rest of R's fixed operators. `raven parse` resolves the
+/// same operators (`cli::parse::resolve`).
+pub(crate) fn declarable_infix_operator<'t>(node: Node<'t>, text: &'t str) -> Option<&'t str> {
     let op = node.child_by_field_name("operator")?;
     match op.kind() {
         ":=" => Some(":="),

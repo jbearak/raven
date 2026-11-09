@@ -1,5 +1,6 @@
-//! Name resolution: what each call's function, and each name used as a value,
-//! resolves to at its position.
+//! Name resolution: what each call's function, each user-definable operator
+//! (`%op%` and `:=`), and each name used as a value resolves to at its
+//! position.
 //!
 //! Resolution reads the scope `raven check`'s undefined-variable collector
 //! reads: the snapshot `raven check` builds for the file
@@ -96,15 +97,16 @@ impl Resolution {
     }
 }
 
-/// A name to resolve: a call's function name, or a name used as a value.
+/// A name to resolve: a call's function name, an operator's name, or a name
+/// used as a value.
 #[derive(Debug)]
 pub(crate) struct NameQuery {
     /// The name as R reads it (backticks and string quotes decoded).
     pub(crate) name: String,
     /// Byte offset of the name in the decoded text.
     pub(crate) at: usize,
-    /// A value, not a call's function. A value's resolution is kept only when
-    /// it is a package object.
+    /// A value, not a call's function or an operator. A value's resolution
+    /// is kept only when it is a package object.
     pub(crate) value: bool,
 }
 
@@ -119,6 +121,7 @@ pub(crate) trait NameResolver {
 #[derive(Debug, Default)]
 pub(crate) struct Resolutions {
     calls: HashMap<(usize, usize), Resolution>,
+    operators: HashMap<(usize, usize), Resolution>,
     values: HashMap<(usize, usize), Resolution>,
 }
 
@@ -126,6 +129,13 @@ impl Resolutions {
     /// A `call` node's resolution. Present for every call.
     pub(crate) fn call(&self, node: TsNode<'_>) -> Option<&Resolution> {
         self.calls.get(&(node.start_byte(), node.end_byte()))
+    }
+
+    /// A `binary_operator` node's resolution. Present exactly when its
+    /// operator is one a package or the workspace can define: `%op%` or
+    /// `:=` (see [`resolve_tree`]).
+    pub(crate) fn operator(&self, node: TsNode<'_>) -> Option<&Resolution> {
+        self.operators.get(&(node.start_byte(), node.end_byte()))
     }
 
     /// An identifier's resolution, when it is a value resolved to a package
@@ -142,11 +152,28 @@ enum Callee {
     Dynamic,
 }
 
-/// Resolve every call and every value name in the tree under `root`.
+/// What a query's result is for.
+#[derive(Clone, Copy)]
+enum Owner {
+    Call,
+    Operator,
+    Value,
+}
+
+/// Resolve every call, every user-definable operator and every value name in
+/// the tree under `root`.
+///
+/// The user-definable operators are those a package can export, the ones
+/// `handlers::declarable_infix_operator` names: a `%op%` special (looked
+/// up as `` `%op%` ``) and `:=`. R evaluates either as a call of the function
+/// of that name, so either resolves as a call's function does, at the
+/// operator token. R's fixed operators (`+`, `<-`, `|>`, `~`, ...) don't:
+/// a package or the workspace redefining one is rare, and a reader takes
+/// them as base R's.
 pub(crate) fn resolve_tree(root: TsNode<'_>, text: &str, names: &dyn NameResolver) -> Resolutions {
     let mut resolutions = Resolutions::default();
     let mut queries = Vec::new();
-    // Which node each query belongs to: (byte range, is a call).
+    // Which node each query belongs to: its byte range and what it is.
     let mut owners = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -159,7 +186,7 @@ pub(crate) fn resolve_tree(root: TsNode<'_>, text: &str, names: &dyn NameResolve
                         at,
                         value: false,
                     });
-                    owners.push((key, true));
+                    owners.push((key, Owner::Call));
                 }
                 Callee::Namespace(package) => {
                     resolutions
@@ -170,6 +197,20 @@ pub(crate) fn resolve_tree(root: TsNode<'_>, text: &str, names: &dyn NameResolve
                     resolutions.calls.insert(key, Resolution::Dynamic);
                 }
             },
+            "binary_operator" => {
+                let operator = node.child_by_field_name("operator");
+                if let (Some(operator), Some(name)) = (
+                    operator,
+                    crate::handlers::declarable_infix_operator(node, text),
+                ) {
+                    queries.push(NameQuery {
+                        name: name.to_string(),
+                        at: operator.start_byte(),
+                        value: false,
+                    });
+                    owners.push((key, Owner::Operator));
+                }
+            }
             "identifier" if is_value(node, text) => {
                 if let Some(name) = name_of(node, text) {
                     queries.push(NameQuery {
@@ -177,7 +218,7 @@ pub(crate) fn resolve_tree(root: TsNode<'_>, text: &str, names: &dyn NameResolve
                         at: node.start_byte(),
                         value: true,
                     });
-                    owners.push((key, false));
+                    owners.push((key, Owner::Value));
                 }
             }
             _ => {}
@@ -186,19 +227,24 @@ pub(crate) fn resolve_tree(root: TsNode<'_>, text: &str, names: &dyn NameResolve
         stack.extend(node.children(&mut cursor));
     }
     let results = names.resolve(text, &queries);
-    for ((key, is_call), result) in owners.into_iter().zip(results) {
-        match (is_call, result) {
-            (true, result) => {
-                let result = result.unwrap_or(Resolution::Unresolved {
-                    reason: None,
-                    packages: Vec::new(),
-                });
-                resolutions.calls.insert(key, result);
+    let none = || Resolution::Unresolved {
+        reason: None,
+        packages: Vec::new(),
+    };
+    for ((key, owner), result) in owners.into_iter().zip(results) {
+        match (owner, result) {
+            (Owner::Call, result) => {
+                resolutions.calls.insert(key, result.unwrap_or_else(none));
             }
-            (false, Some(result)) => {
+            (Owner::Operator, result) => {
+                resolutions
+                    .operators
+                    .insert(key, result.unwrap_or_else(none));
+            }
+            (Owner::Value, Some(result)) => {
                 resolutions.values.insert(key, result);
             }
-            (false, None) => {}
+            (Owner::Value, None) => {}
         }
     }
     resolutions

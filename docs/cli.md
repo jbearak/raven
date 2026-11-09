@@ -523,9 +523,9 @@ The other nodes:
 | `index` | `x[...]` or `x[[...]]` | `op` (`[` or `[[`), `target`, `arguments` |
 | `extract` | `x$name` or `x@name` | `op` (`$` or `@`), `left`, `right` (an `identifier`) |
 | `namespace` | `pkg::name` or `pkg:::name` | `op` (`::` or `:::`), `left`, `right` (both `identifier`) |
-| `assignment` | `<-`, `<<-`, `=`, `->`, `->>`, or `:=` | `op`, `target`, `value` |
+| `assignment` | `<-`, `<<-`, `=`, `->`, `->>`, or `:=` | `op`, `resolution` for `:=`, `target`, `value` |
 | `pipe` | `\|>` | `op`, `left`, `right` |
-| `binary` | Any other binary operator | `op`, `left`, `right` |
+| `binary` | Any other binary operator | `op`, `resolution` for a `%...%` operator, `left`, `right` |
 | `formula` | `~`, with or without a left side | `op`, `left` (`null` when one-sided), `right` |
 | `unary` | `-`, `+`, `!`, or unary `?` | `op`, `operand` |
 | `parenthesized` | `( ... )` | `body` |
@@ -638,7 +638,7 @@ An `unknown` directive has `honored` `false` and `reason` `null`. `# raven:` and
 
 ### Name resolution
 
-Every `call` node has a `resolution`: what the call's function resolves to at the call. Calls nested anywhere have one too, inside other calls' arguments, inside formulas, and inside function bodies, so a missing `resolution` never stands for "not resolved". An `identifier` used as a value has a `resolution` only when it resolves to a package object, such as `T`, `F`, `pi`, `letters`, or `mean` in `lapply(x, mean)`. Other names, such as `x` in `filter(d, x > 1)`, have none, and that isn't an error.
+Every `call` node has a `resolution`: what the call's function resolves to at the call. Calls nested anywhere have one too, inside other calls' arguments, inside formulas, and inside function bodies, so a missing `resolution` never stands for "not resolved". An `identifier` used as a value has a `resolution` only when it resolves to a package object, such as `T`, `F`, `pi`, `letters`, or `mean` in `lapply(x, mean)`. Other names, such as `x` in `filter(d, x > 1)`, have none, and that isn't an error. A `%...%` or `:=` operator has one too; see [Operators](#operators).
 
 ```json
 {"kind": "package", "package": "dplyr"}
@@ -677,6 +677,25 @@ $ raven parse resolve.R
 ```
 
 `helper(T)` resolves to the definition on line 0 and its `T` to base. The outer call of `f()(1)` is `dynamic`, and the inner `f()` is a call of its own, defined nowhere.
+
+#### Operators
+
+An operator that calls a function a package or the workspace can define has a `resolution` too: a `binary` node whose `op` is a `%...%` operator, such as `%in%`, `%>%`, or `%%`, and an `assignment` node whose `op` is `:=`. It is what the function named by the operator, such as `` `%in%` `` or `` `:=` ``, resolves to at the operator, by the same rules as a call's. Every such node has one. In code that quotes it, such as `dt[, z := 1]`, R may never call that function, but the `resolution` still says which one is in scope there. R's other operators, such as `+`, `<-`, `|>`, and `~`, have no `resolution`.
+
+<!-- example: parse-operator file=ops.R -->
+```r
+`%+%` <- function(a, b) paste0(a, b)
+"a" %+% "b"
+x %in% y
+```
+
+<!-- example: parse-operator -->
+```console
+$ raven parse ops.R
+{"schema_version":1,"raven_version":"0.23.8","path":"ops.R","encoding":{"name":"UTF-8","bom":false,"line_endings":"lf"},"package_data":{"enabled":false,"r_found":false,"names_db":false,"frozen":false},"line_count":3,"statements":[{"text":"`%+%` <- function(a, b) paste0(a, b)","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":36}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"assignment","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":36}},"op":"<-","target":{"kind":"identifier","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"text":"`%+%`","name":"%+%","form":"backtick"},"value":{"kind":"function","range":{"start":{"line":0,"character":9},"end":{"line":0,"character":36}},"keyword":"function","parameters":[{"range":{"start":{"line":0,"character":18},"end":{"line":0,"character":19}},"name":{"kind":"identifier","range":{"start":{"line":0,"character":18},"end":{"line":0,"character":19}},"text":"a","name":"a","form":"plain"},"default":null},{"range":{"start":{"line":0,"character":21},"end":{"line":0,"character":22}},"name":{"kind":"identifier","range":{"start":{"line":0,"character":21},"end":{"line":0,"character":22}},"text":"b","name":"b","form":"plain"},"default":null}],"body":{"kind":"call","range":{"start":{"line":0,"character":24},"end":{"line":0,"character":36}},"function":{"kind":"identifier","range":{"start":{"line":0,"character":24},"end":{"line":0,"character":30}},"text":"paste0","name":"paste0","form":"plain"},"resolution":{"kind":"package","package":"base"},"arguments":[{"range":{"start":{"line":0,"character":31},"end":{"line":0,"character":32}},"name":null,"value":{"kind":"identifier","range":{"start":{"line":0,"character":31},"end":{"line":0,"character":32}},"text":"a","name":"a","form":"plain"}},{"range":{"start":{"line":0,"character":34},"end":{"line":0,"character":35}},"name":null,"value":{"kind":"identifier","range":{"start":{"line":0,"character":34},"end":{"line":0,"character":35}},"text":"b","name":"b","form":"plain"}}]}}}},{"text":"\"a\" %+% \"b\"","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"binary","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":11}},"op":"%+%","resolution":{"kind":"workspace","path":"ops.R","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}},"left":{"kind":"string","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"text":"\"a\"","value":"a","quote":"\"","raw":false,"delimiters":{"open":"\"","close":"\""}},"right":{"kind":"string","range":{"start":{"line":1,"character":8},"end":{"line":1,"character":11}},"text":"\"b\"","value":"b","quote":"\"","raw":false,"delimiters":{"open":"\"","close":"\""}}}},{"text":"x %in% y","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":8}},"blank_line_before":false,"comments":{"leading":[],"trailing":[],"interior":[]},"expression":{"kind":"binary","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":8}},"op":"%in%","resolution":{"kind":"package","package":"base"},"left":{"kind":"identifier","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":1}},"text":"x","name":"x","form":"plain"},"right":{"kind":"identifier","range":{"start":{"line":2,"character":7},"end":{"line":2,"character":8}},"text":"y","name":"y","form":"plain"}}}],"comments":[],"errors":[]}
+```
+
+`"a" %+% "b"` resolves to the `` `%+%` `` defined on line 0, and `x %in% y` to base.
 
 #### How a name resolves
 
