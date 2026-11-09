@@ -355,6 +355,16 @@ struct AttachSites {
     sources: HashMap<Url, (u32, u32)>,
 }
 
+/// A file's attached packages at a position (see
+/// [`FileResolver::search_order`]).
+struct SearchOrder {
+    /// Search order, with where each package came from.
+    order: Vec<(String, Attached)>,
+    /// Every package the file and the files it sources have loaded, callers'
+    /// attachments it repeats included, most recent first.
+    loaded: Vec<String>,
+}
+
 /// When a package was attached, compared in order: a position in the file
 /// being resolved, then, for a package a sourced file attached, its position
 /// in that file.
@@ -484,7 +494,10 @@ impl<'w> FileResolver<'w> {
             }
             Some((symbol, ScopeLayer::Prefix)) => {
                 let merged = self.classify(&symbol, name);
-                Some(self.decided_by_callers(name, merged, line, column))
+                let packages = stream.package_snapshot();
+                let uri = self.names.uri.clone();
+                let loaded = self.search_order(&uri, &packages, line, column).loaded;
+                Some(self.decided_by_callers(name, merged, &loaded, line, column))
             }
             Some((symbol, _)) => Some(self.classify(&symbol, name)),
             None => None,
@@ -574,7 +587,7 @@ impl<'w> FileResolver<'w> {
     ) -> Option<Resolution> {
         let packages = stream.package_snapshot();
         let uri = self.names.uri.clone();
-        let order = self.search_order(&uri, &packages, line, column);
+        let SearchOrder { order, loaded } = self.search_order(&uri, &packages, line, column);
         let library = &self.snapshot().package_library;
         let (owner, attached) = order.into_iter().find_map(|(package, attached)| {
             library
@@ -588,7 +601,7 @@ impl<'w> FileResolver<'w> {
         };
         Some(match attached {
             Attached::Here => found,
-            Attached::Callers => self.decided_by_callers(name, found, line, column),
+            Attached::Callers => self.decided_by_callers(name, found, &loaded, line, column),
         })
     }
 
@@ -607,7 +620,7 @@ impl<'w> FileResolver<'w> {
         scope: &scope::ScopeAtPosition,
         line: u32,
         column: u32,
-    ) -> Vec<(String, Attached)> {
+    ) -> SearchOrder {
         let snapshot = self.snapshot();
         let at = scope::Position::new(line, column);
         let origins: Vec<Url> = scope
@@ -662,18 +675,22 @@ impl<'w> FileResolver<'w> {
                 .min();
             own.into_iter().chain(sourced).min()
         };
-        let mut here: Vec<(Option<AttachRank>, &String)> = scope
+        let mut ranked: Vec<(Option<AttachRank>, &String)> = scope
             .loaded_packages
             .iter()
-            .filter(|package| !scope.inherited_packages.contains(*package))
             .map(|package| (rank(package), package))
             .collect();
         // Most recent first; a package with no known position (attached by a
         // file a sourced file sources) ranks as attached before the rest.
-        here.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        let mut order: Vec<(String, Attached)> = here
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let loaded: Vec<String> = ranked
             .into_iter()
-            .map(|(_, package)| (package.clone(), Attached::Here))
+            .map(|(_, package)| package.clone())
+            .collect();
+        let mut order: Vec<(String, Attached)> = loaded
+            .iter()
+            .filter(|package| !scope.inherited_packages.contains(*package))
+            .map(|package| (package.clone(), Attached::Here))
             .collect();
         let mut imports: Vec<&String> = snapshot
             .scope_contribution
@@ -698,17 +715,19 @@ impl<'w> FileResolver<'w> {
                 .into_iter()
                 .map(|package| (package.clone(), Attached::Callers)),
         );
-        order
+        SearchOrder { order, loaded }
     }
 
     /// A result decided by what the file's callers lend (a caller's
     /// definition or attachment): `merged`, as the file's merged scope has
     /// it, unless the file has callers, whose own views then decide. Callers
-    /// that disagree give `ambiguous`.
+    /// that disagree give `ambiguous`. `loaded` is the file's own
+    /// [`SearchOrder::loaded`].
     fn decided_by_callers(
         &mut self,
         name: &str,
         merged: Resolution,
+        loaded: &[String],
         line: u32,
         column: u32,
     ) -> Resolution {
@@ -719,7 +738,7 @@ impl<'w> FileResolver<'w> {
         let mut candidates: Vec<Candidate> = (0..self.callers.len())
             .map(|index| Candidate {
                 path: self.display(&self.callers[index].0),
-                resolution: self.caller_view(index, late, name),
+                resolution: self.caller_view(index, late, name, loaded),
             })
             .collect();
         if candidates
@@ -732,10 +751,17 @@ impl<'w> FileResolver<'w> {
     }
 
     /// What `name` resolves to in this file as caller `index` alone would
-    /// leave it: the caller's definition, else the first package attached at
-    /// its call site that exports the name, else the default-attached
-    /// packages and R's builtins.
-    fn caller_view(&mut self, index: usize, late: bool, name: &str) -> Resolution {
+    /// leave it: the caller's definition, else the first package that exports
+    /// the name among the file's own attachments the caller hadn't made
+    /// (`loaded`, most recent first) and then the caller's attachments at its
+    /// call site, else the default-attached packages and R's builtins.
+    fn caller_view(
+        &mut self,
+        index: usize,
+        late: bool,
+        name: &str,
+        loaded: &[String],
+    ) -> Resolution {
         let names = self.names;
         let (caller, line, column) = if late {
             (self.callers[index].0.clone(), u32::MAX, u32::MAX)
@@ -756,10 +782,19 @@ impl<'w> FileResolver<'w> {
             self.caller_scopes.insert((index, late), scope);
             return self.classify(symbol, name);
         }
-        let order = self.search_order(&caller, &scope, line, column);
+        let mut order: Vec<String> = loaded
+            .iter()
+            .filter(|package| {
+                !scope.loaded_packages.contains(*package)
+                    && !scope.inherited_packages.contains(*package)
+            })
+            .cloned()
+            .collect();
+        let caller_order = self.search_order(&caller, &scope, line, column).order;
+        order.extend(caller_order.into_iter().map(|(package, _)| package));
         self.caller_scopes.insert((index, late), scope);
         let library = &self.snapshot().package_library;
-        if let Some(owner) = order.into_iter().find_map(|(package, _)| {
+        if let Some(owner) = order.into_iter().find_map(|package| {
             library.find_package_owner_for_symbol(name, std::slice::from_ref(&package))
         }) {
             return if crate::package_library::is_load_all_sentinel(&owner) {

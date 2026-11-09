@@ -432,6 +432,19 @@ fn attaching_a_caller_attached_package_again_doesnt_move_it() {
     assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkgb"));
 }
 
+/// Each caller's view includes the file's own attachments: `kid.R`'s
+/// `library(ravenpkga)` doesn't move `one.R`'s, and masks `two.R`'s
+/// `ravenpkgb`, so both callers agree.
+#[test]
+fn each_caller_sees_the_files_own_attachments() {
+    let (_tmp, ws) = package_workspace();
+    write(&ws, "one.R", b"library(ravenpkga)\nsource(\"kid.R\")\n");
+    write(&ws, "two.R", b"library(ravenpkgb)\nsource(\"kid.R\")\n");
+    write(&ws, "kid.R", b"library(ravenpkga)\nclash()\n");
+    let docs = parse_isolated(&ws, &["kid.R"], None);
+    assert_eq!(*resolution_of(&docs[0], "clash", 1), package("ravenpkga"));
+}
+
 #[test]
 fn nested_calls_formulas_and_t_and_f_resolve() {
     let (_tmp, ws) = package_workspace();
